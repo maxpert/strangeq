@@ -1,0 +1,46 @@
+# Binaries for programs and tests
+*.exe
+*.dll
+*.so
+*.dylib
+*.out
+
+# Build artifacts
+amqp-go
+/src/amqp-go/amqp-go
+/bin/
+/src/*/bin/
+/dist
+
+# Go
+*.test
+*.prof
+/vendor/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+logs/
+
+# Temporary files
+*~
+\#*\#
+*.tmp
+*.temp
+.DS_Store?
+
+# Test coverage
+coverage.out
+cover.html
+
+# Ignore the binary in the amqp-go directory
+/src/amqp-go/amqp-go
