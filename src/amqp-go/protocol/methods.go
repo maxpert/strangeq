@@ -59,6 +59,22 @@ const (
 const (
 	BasicQos       = 10  // 60.10 - class ID 60, method ID 10
 	BasicQosOK     = 11  // 60.11 - class ID 60, method ID 11
+	BasicConsume   = 20  // 60.20 - class ID 60, method ID 20
+	BasicConsumeOK = 21  // 60.21 - class ID 60, method ID 21
+	BasicCancel    = 30  // 60.30 - class ID 60, method ID 30
+	BasicCancelOK  = 31  // 60.31 - class ID 60, method ID 31
+	BasicPublish   = 40  // 60.40 - class ID 60, method ID 40
+	BasicReturn    = 50  // 60.50 - class ID 60, method ID 50
+	BasicDeliver   = 60  // 60.60 - class ID 60, method ID 60
+	BasicGet       = 70  // 60.70 - class ID 60, method ID 70
+	BasicGetOK     = 71  // 60.71 - class ID 60, method ID 71
+	BasicGetEmpty  = 72  // 60.72 - class ID 60, method ID 72
+	BasicAck       = 80  // 60.80 - class ID 60, method ID 80
+	BasicReject    = 90  // 60.90 - class ID 60, method ID 90
+	BasicRecoverAsync = 100 // 60.100 - class ID 60, method ID 100
+	BasicRecover   = 110 // 60.110 - class ID 60, method ID 110
+	BasicRecoverOK = 111 // 60.111 - class ID 60, method ID 111
+	BasicNack      = 120 // 60.120 - class ID 60, method ID 120
 )
 
 // ConnectionStartMethod represents the connection.start method
@@ -1278,6 +1294,649 @@ type BasicQosOKMethod struct {
 // Serialize encodes the BasicQosOKMethod into a byte slice
 func (m *BasicQosOKMethod) Serialize() ([]byte, error) {
 	return []byte{}, nil // basic.qos-ok has no content
+}
+
+// BasicPublishMethod represents the basic.publish method
+type BasicPublishMethod struct {
+	Reserved1   uint16
+	Exchange    string
+	RoutingKey  string
+	Mandatory   bool
+	Immediate   bool
+}
+
+// Serialize encodes the BasicPublishMethod into a byte slice
+func (m *BasicPublishMethod) Serialize() ([]byte, error) {
+	var result []byte
+
+	// Reserved1 (uint16)
+	reservedBytes := make([]byte, 2)
+	binary.BigEndian.PutUint16(reservedBytes, m.Reserved1)
+	result = append(result, reservedBytes...)
+
+	// Exchange (short string)
+	exchangeBytes := encodeShortString(m.Exchange)
+	result = append(result, exchangeBytes...)
+
+	// Routing key (short string)
+	routingKeyBytes := encodeShortString(m.RoutingKey)
+	result = append(result, routingKeyBytes...)
+
+	// Flags (uint16)
+	// bit 0: mandatory
+	// bit 1: immediate
+	// bits 2-15: unused
+	flags := uint16(0)
+	if m.Mandatory {
+		flags |= (1 << 0)
+	}
+	if m.Immediate {
+		flags |= (1 << 1)
+	}
+
+	flagBytes := make([]byte, 2)
+	binary.BigEndian.PutUint16(flagBytes, flags)
+	result = append(result, flagBytes...)
+
+	return result, nil
+}
+
+// Deserialize decodes the BasicPublishMethod from a byte slice
+func (m *BasicPublishMethod) Deserialize(data []byte) error {
+	if len(data) < 4 {  // Need at least reserved(2) + exchange len byte(1)
+		return fmt.Errorf("basic.publish method data too short")
+	}
+
+	offset := 0
+
+	// Reserved1 (uint16)
+	m.Reserved1 = binary.BigEndian.Uint16(data[offset : offset+2])
+	offset += 2
+
+	// Exchange (short string)
+	if offset >= len(data) {
+		return fmt.Errorf("exchange field missing")
+	}
+	exchange, newOffset, err := decodeShortString(data, offset)
+	if err != nil {
+		return fmt.Errorf("failed to decode exchange name: %v", err)
+	}
+	m.Exchange = exchange
+	offset = newOffset
+
+	// Routing key (short string)
+	if offset >= len(data) {
+		return fmt.Errorf("routing key field missing")
+	}
+	routingKey, newOffset, err := decodeShortString(data, offset)
+	if err != nil {
+		return fmt.Errorf("failed to decode routing key: %v", err)
+	}
+	m.RoutingKey = routingKey
+	offset = newOffset
+
+	// Flags (uint16)
+	if offset+2 > len(data) {
+		// If not enough bytes for flags, use defaults (false for both)
+		m.Mandatory = false
+		m.Immediate = false
+		return nil
+	}
+	flags := binary.BigEndian.Uint16(data[offset : offset+2])
+	offset += 2
+
+	// Extract flags
+	m.Mandatory = (flags & (1 << 0)) != 0
+	m.Immediate = (flags & (1 << 1)) != 0
+
+	return nil
+}
+
+// BasicPublishOKMethod represents the basic.publish-ok method (only used in some modes)
+type BasicPublishOKMethod struct {
+}
+
+// Serialize encodes the BasicPublishOKMethod into a byte slice
+func (m *BasicPublishOKMethod) Serialize() ([]byte, error) {
+	return []byte{}, nil // basic.publish-ok has no content (not always sent)
+}
+
+// BasicConsumeMethod represents the basic.consume method
+type BasicConsumeMethod struct {
+	Reserved1   uint16
+	Queue       string
+	ConsumerTag string
+	NoLocal     bool
+	NoAck       bool
+	Exclusive   bool
+	NoWait      bool
+	Arguments   map[string]interface{}
+}
+
+// Serialize encodes the BasicConsumeMethod into a byte slice
+func (m *BasicConsumeMethod) Serialize() ([]byte, error) {
+	var result []byte
+
+	// Reserved1 (uint16)
+	reservedBytes := make([]byte, 2)
+	binary.BigEndian.PutUint16(reservedBytes, m.Reserved1)
+	result = append(result, reservedBytes...)
+
+	// Queue (short string)
+	queueBytes := encodeShortString(m.Queue)
+	result = append(result, queueBytes...)
+
+	// Consumer tag (short string)
+	consumerTagBytes := encodeShortString(m.ConsumerTag)
+	result = append(result, consumerTagBytes...)
+
+	// Flags (uint16)
+	// bit 0: no-local
+	// bit 1: no-ack
+	// bit 2: exclusive
+	// bit 3: no-wait
+	// bits 4-15: unused
+	flags := uint16(0)
+	if m.NoLocal {
+		flags |= (1 << 0)
+	}
+	if m.NoAck {
+		flags |= (1 << 1)
+	}
+	if m.Exclusive {
+		flags |= (1 << 2)
+	}
+	if m.NoWait {
+		flags |= (1 << 3)
+	}
+
+	flagBytes := make([]byte, 2)
+	binary.BigEndian.PutUint16(flagBytes, flags)
+	result = append(result, flagBytes...)
+
+	// Arguments (field table)
+	argsBytes, err := encodeFieldTable(m.Arguments)
+	if err != nil {
+		return nil, err
+	}
+	result = append(result, argsBytes...)
+
+	return result, nil
+}
+
+// Deserialize decodes the BasicConsumeMethod from a byte slice
+func (m *BasicConsumeMethod) Deserialize(data []byte) error {
+	if len(data) < 4 {  // Need at least reserved(2) + queue len byte(1)
+		return fmt.Errorf("basic.consume method data too short")
+	}
+
+	offset := 0
+
+	// Reserved1 (uint16)
+	m.Reserved1 = binary.BigEndian.Uint16(data[offset : offset+2])
+	offset += 2
+
+	// Queue (short string)
+	if offset >= len(data) {
+		return fmt.Errorf("queue field missing")
+	}
+	queue, newOffset, err := decodeShortString(data, offset)
+	if err != nil {
+		return fmt.Errorf("failed to decode queue name: %v", err)
+	}
+	m.Queue = queue
+	offset = newOffset
+
+	// Consumer tag (short string)
+	if offset >= len(data) {
+		// If no consumer tag provided, generate one
+		m.ConsumerTag = fmt.Sprintf("ctag-%s-%d", generateID()[:8], offset)
+	} else {
+		consumerTag, newOffset, err := decodeShortString(data, offset)
+		if err != nil {
+			return fmt.Errorf("failed to decode consumer tag: %v", err)
+		}
+		m.ConsumerTag = consumerTag
+		offset = newOffset
+	}
+
+	// Flags (uint16)
+	if offset+2 > len(data) {
+		// If not enough bytes for flags, use defaults
+		m.NoLocal = false
+		m.NoAck = false
+		m.Exclusive = false
+		m.NoWait = false
+		// Arguments are handled below
+	} else {
+		flags := binary.BigEndian.Uint16(data[offset : offset+2])
+		offset += 2
+
+		// Extract flags
+		m.NoLocal = (flags & (1 << 0)) != 0
+		m.NoAck = (flags & (1 << 1)) != 0
+		m.Exclusive = (flags & (1 << 2)) != 0
+		m.NoWait = (flags & (1 << 3)) != 0
+	}
+
+	// Arguments (field table)
+	if offset+4 <= len(data) { // Need at least 4 bytes for the field table length
+		var err error
+		m.Arguments, offset, err = decodeFieldTable(data, offset)
+		if err != nil {
+			return err
+		}
+	} else {
+		// If not enough data for field table, initialize empty arguments map
+		m.Arguments = make(map[string]interface{})
+	}
+
+	return nil
+}
+
+// BasicConsumeOKMethod represents the basic.consume-ok method
+type BasicConsumeOKMethod struct {
+	ConsumerTag string
+}
+
+// Serialize encodes the BasicConsumeOKMethod into a byte slice
+func (m *BasicConsumeOKMethod) Serialize() ([]byte, error) {
+	var result []byte
+
+	// Consumer tag (short string)
+	consumerTagBytes := encodeShortString(m.ConsumerTag)
+	result = append(result, consumerTagBytes...)
+
+	return result, nil
+}
+
+// BasicCancelMethod represents the basic.cancel method
+type BasicCancelMethod struct {
+	ConsumerTag string
+	NoWait      bool
+}
+
+// Serialize encodes the BasicCancelMethod into a byte slice
+func (m *BasicCancelMethod) Serialize() ([]byte, error) {
+	var result []byte
+
+	// Consumer tag (short string)
+	consumerTagBytes := encodeShortString(m.ConsumerTag)
+	result = append(result, consumerTagBytes...)
+
+	// NoWait (packed into flags)
+	// bit 0: no-wait
+	// bits 1-15: unused
+	flags := uint16(0)
+	if m.NoWait {
+		flags |= (1 << 0)
+	}
+
+	flagBytes := make([]byte, 2)
+	binary.BigEndian.PutUint16(flagBytes, flags)
+	result = append(result, flagBytes...)
+
+	return result, nil
+}
+
+// Deserialize decodes the BasicCancelMethod from a byte slice
+func (m *BasicCancelMethod) Deserialize(data []byte) error {
+	if len(data) < 1 {  // Need at least consumer tag length byte
+		return fmt.Errorf("basic.cancel method data too short")
+	}
+
+	offset := 0
+
+	// Consumer tag (short string)
+	if offset >= len(data) {
+		return fmt.Errorf("consumer tag field missing")
+	}
+	consumerTag, newOffset, err := decodeShortString(data, offset)
+	if err != nil {
+		return fmt.Errorf("failed to decode consumer tag: %v", err)
+	}
+	m.ConsumerTag = consumerTag
+	offset = newOffset
+
+	// Flags (uint16)
+	if offset+2 <= len(data) {
+		flags := binary.BigEndian.Uint16(data[offset : offset+2])
+		offset += 2
+
+		// Extract flags
+		m.NoWait = (flags & (1 << 0)) != 0
+	} else {
+		// Default to false if flags not provided
+		m.NoWait = false
+	}
+
+	return nil
+}
+
+// BasicCancelOKMethod represents the basic.cancel-ok method
+type BasicCancelOKMethod struct {
+	ConsumerTag string
+}
+
+// Serialize encodes the BasicCancelOKMethod into a byte slice
+func (m *BasicCancelOKMethod) Serialize() ([]byte, error) {
+	var result []byte
+
+	// Consumer tag (short string)
+	consumerTagBytes := encodeShortString(m.ConsumerTag)
+	result = append(result, consumerTagBytes...)
+
+	return result, nil
+}
+
+// BasicGetMethod represents the basic.get method
+type BasicGetMethod struct {
+	Reserved1   uint16
+	Queue       string
+	NoAck       bool
+}
+
+// Serialize encodes the BasicGetMethod into a byte slice
+func (m *BasicGetMethod) Serialize() ([]byte, error) {
+	var result []byte
+
+	// Reserved1 (uint16)
+	reservedBytes := make([]byte, 2)
+	binary.BigEndian.PutUint16(reservedBytes, m.Reserved1)
+	result = append(result, reservedBytes...)
+
+	// Queue (short string)
+	queueBytes := encodeShortString(m.Queue)
+	result = append(result, queueBytes...)
+
+	// NoAck (packed into flags)
+	// bit 0: no-ack
+	// bits 1-15: unused
+	flags := uint16(0)
+	if m.NoAck {
+		flags |= (1 << 0)
+	}
+
+	flagBytes := make([]byte, 2)
+	binary.BigEndian.PutUint16(flagBytes, flags)
+	result = append(result, flagBytes...)
+
+	return result, nil
+}
+
+// Deserialize decodes the BasicGetMethod from a byte slice
+func (m *BasicGetMethod) Deserialize(data []byte) error {
+	if len(data) < 3 {  // Need at least reserved(2) + queue length byte(1)
+		return fmt.Errorf("basic.get method data too short")
+	}
+
+	offset := 0
+
+	// Reserved1 (uint16)
+	m.Reserved1 = binary.BigEndian.Uint16(data[offset : offset+2])
+	offset += 2
+
+	// Queue (short string)
+	if offset >= len(data) {
+		return fmt.Errorf("queue field missing")
+	}
+	queue, newOffset, err := decodeShortString(data, offset)
+	if err != nil {
+		return fmt.Errorf("failed to decode queue name: %v", err)
+	}
+	m.Queue = queue
+	offset = newOffset
+
+	// Flags (uint16)
+	if offset+2 <= len(data) {
+		flags := binary.BigEndian.Uint16(data[offset : offset+2])
+		offset += 2
+
+		// Extract flags
+		m.NoAck = (flags & (1 << 0)) != 0
+	} else {
+		// Default to false if flags not provided
+		m.NoAck = false
+	}
+
+	return nil
+}
+
+// BasicGetOKMethod represents the basic.get-ok method
+type BasicGetOKMethod struct {
+	DeliveryTag  uint64
+	Redelivered  bool
+	Exchange     string
+	RoutingKey   string
+	MessageCount uint32
+}
+
+// Serialize encodes the BasicGetOKMethod into a byte slice
+func (m *BasicGetOKMethod) Serialize() ([]byte, error) {
+	var result []byte
+
+	// Delivery tag (long long integer - 64-bit)
+	deliveryTagBytes := make([]byte, 8)
+	binary.BigEndian.PutUint64(deliveryTagBytes, m.DeliveryTag)
+	result = append(result, deliveryTagBytes...)
+
+	// Redelivered (bit packed)
+	var redeliveredByte byte
+	if m.Redelivered {
+		redeliveredByte = 1
+	} else {
+		redeliveredByte = 0
+	}
+	result = append(result, redeliveredByte)
+
+	// Exchange (short string)
+	exchangeBytes := encodeShortString(m.Exchange)
+	result = append(result, exchangeBytes...)
+
+	// Routing key (short string)
+	routingKeyBytes := encodeShortString(m.RoutingKey)
+	result = append(result, routingKeyBytes...)
+
+	// Message count (long integer - 32-bit)
+	messageCountBytes := make([]byte, 4)
+	binary.BigEndian.PutUint32(messageCountBytes, m.MessageCount)
+	result = append(result, messageCountBytes...)
+
+	return result, nil
+}
+
+// BasicGetEmptyMethod represents the basic.get-empty method
+type BasicGetEmptyMethod struct {
+	Reserved1 string  // Should be "amq.empty" or similar
+}
+
+// Serialize encodes the BasicGetEmptyMethod into a byte slice
+func (m *BasicGetEmptyMethod) Serialize() ([]byte, error) {
+	var result []byte
+
+	// Reserved1 (short string)
+	reservedBytes := encodeShortString(m.Reserved1)
+	result = append(result, reservedBytes...)
+
+	return result, nil
+}
+
+// BasicAckMethod represents the basic.ack method
+type BasicAckMethod struct {
+	DeliveryTag uint64
+	Multiple    bool
+}
+
+// Serialize encodes the BasicAckMethod into a byte slice
+func (m *BasicAckMethod) Serialize() ([]byte, error) {
+	var result []byte
+
+	// Delivery tag (long long integer - 64-bit)
+	deliveryTagBytes := make([]byte, 8)
+	binary.BigEndian.PutUint64(deliveryTagBytes, m.DeliveryTag)
+	result = append(result, deliveryTagBytes...)
+
+	// Multiple (packed into flags)
+	// bit 0: multiple
+	// bits 1-15: unused
+	flags := uint16(0)
+	if m.Multiple {
+		flags |= (1 << 0)
+	}
+
+	flagBytes := make([]byte, 2)
+	binary.BigEndian.PutUint16(flagBytes, flags)
+	result = append(result, flagBytes...)
+
+	return result, nil
+}
+
+// Deserialize decodes the BasicAckMethod from a byte slice
+func (m *BasicAckMethod) Deserialize(data []byte) error {
+	if len(data) < 8 {  // Need at least delivery tag (8 bytes)
+		return fmt.Errorf("basic.ack method data too short")
+	}
+
+	offset := 0
+
+	// Delivery tag (long long integer - 64-bit)
+	m.DeliveryTag = binary.BigEndian.Uint64(data[offset : offset+8])
+	offset += 8
+
+	// Flags (uint16)
+	if offset+2 <= len(data) {
+		flags := binary.BigEndian.Uint16(data[offset : offset+2])
+		offset += 2
+
+		// Extract flags
+		m.Multiple = (flags & (1 << 0)) != 0
+	} else {
+		// Default to false if flags not provided
+		m.Multiple = false
+	}
+
+	return nil
+}
+
+// BasicRejectMethod represents the basic.reject method
+type BasicRejectMethod struct {
+	DeliveryTag uint64
+	Requeue     bool
+}
+
+// Serialize encodes the BasicRejectMethod into a byte slice
+func (m *BasicRejectMethod) Serialize() ([]byte, error) {
+	var result []byte
+
+	// Delivery tag (long long integer - 64-bit)
+	deliveryTagBytes := make([]byte, 8)
+	binary.BigEndian.PutUint64(deliveryTagBytes, m.DeliveryTag)
+	result = append(result, deliveryTagBytes...)
+
+	// Requeue (packed into flags)
+	// bit 0: requeue
+	// bits 1-15: unused
+	flags := uint16(0)
+	if m.Requeue {
+		flags |= (1 << 0)
+	}
+
+	flagBytes := make([]byte, 2)
+	binary.BigEndian.PutUint16(flagBytes, flags)
+	result = append(result, flagBytes...)
+
+	return result, nil
+}
+
+// Deserialize decodes the BasicRejectMethod from a byte slice
+func (m *BasicRejectMethod) Deserialize(data []byte) error {
+	if len(data) < 8 {  // Need at least delivery tag (8 bytes)
+		return fmt.Errorf("basic.reject method data too short")
+	}
+
+	offset := 0
+
+	// Delivery tag (long long integer - 64-bit)
+	m.DeliveryTag = binary.BigEndian.Uint64(data[offset : offset+8])
+	offset += 8
+
+	// Flags (uint16)
+	if offset+2 <= len(data) {
+		flags := binary.BigEndian.Uint16(data[offset : offset+2])
+		offset += 2
+
+		// Extract flags
+		m.Requeue = (flags & (1 << 0)) != 0
+	} else {
+		// Default to true if flags not provided (requeue by default)
+		m.Requeue = true
+	}
+
+	return nil
+}
+
+// BasicNackMethod represents the basic.nack method
+type BasicNackMethod struct {
+	DeliveryTag uint64
+	Multiple    bool
+	Requeue     bool
+}
+
+// Serialize encodes the BasicNackMethod into a byte slice
+func (m *BasicNackMethod) Serialize() ([]byte, error) {
+	var result []byte
+
+	// Delivery tag (long long integer - 64-bit)
+	deliveryTagBytes := make([]byte, 8)
+	binary.BigEndian.PutUint64(deliveryTagBytes, m.DeliveryTag)
+	result = append(result, deliveryTagBytes...)
+
+	// Flags (uint16)
+	// bit 0: multiple
+	// bit 1: requeue
+	// bits 2-15: unused
+	flags := uint16(0)
+	if m.Multiple {
+		flags |= (1 << 0)
+	}
+	if m.Requeue {
+		flags |= (1 << 1)
+	}
+
+	flagBytes := make([]byte, 2)
+	binary.BigEndian.PutUint16(flagBytes, flags)
+	result = append(result, flagBytes...)
+
+	return result, nil
+}
+
+// Deserialize decodes the BasicNackMethod from a byte slice
+func (m *BasicNackMethod) Deserialize(data []byte) error {
+	if len(data) < 8 {  // Need at least delivery tag (8 bytes)
+		return fmt.Errorf("basic.nack method data too short")
+	}
+
+	offset := 0
+
+	// Delivery tag (long long integer - 64-bit)
+	m.DeliveryTag = binary.BigEndian.Uint64(data[offset : offset+8])
+	offset += 8
+
+	// Flags (uint16)
+	if offset+2 <= len(data) {
+		flags := binary.BigEndian.Uint16(data[offset : offset+2])
+		offset += 2
+
+		// Extract flags
+		m.Multiple = (flags & (1 << 0)) != 0
+		m.Requeue = (flags & (1 << 1)) != 0
+	} else {
+		// Default values if flags not provided
+		m.Multiple = false
+		m.Requeue = true  // Requeue by default
+	}
+
+	return nil
 }
 
 // encodeMethodFrame encodes a method into a method frame

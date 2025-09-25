@@ -199,11 +199,22 @@ func (s *Server) processConnectionFrames(conn *protocol.Connection) {
 				return
 			}
 		case protocol.FrameHeader:
-			// Handle header frames
+			if err := s.processHeaderFrame(conn, frame); err != nil {
+				s.Log.Error("Error processing header frame", 
+					zap.String("connection_id", conn.ID), 
+					zap.Error(err))
+				return
+			}
 		case protocol.FrameBody:
-			// Handle body frames
+			if err := s.processBodyFrame(conn, frame); err != nil {
+				s.Log.Error("Error processing body frame", 
+					zap.String("connection_id", conn.ID), 
+					zap.Error(err))
+				return
+			}
 		case protocol.FrameHeartbeat:
 			// Handle heartbeat frames
+			s.Log.Debug("Heartbeat frame received", zap.String("connection_id", conn.ID))
 		default:
 			s.Log.Warn("Unknown frame type", 
 				zap.Int("type", int(frame.Type)), 
@@ -840,6 +851,20 @@ func (s *Server) processBasicMethod(conn *protocol.Connection, channelID uint16,
 	switch methodID {
 	case protocol.BasicQos: // Method ID 10 for basic class
 		return s.handleBasicQos(conn, channelID, payload)
+	case protocol.BasicPublish: // Method ID 40 for basic class
+		return s.handleBasicPublish(conn, channelID, payload)
+	case protocol.BasicConsume: // Method ID 20 for basic class
+		return s.handleBasicConsume(conn, channelID, payload)
+	case protocol.BasicCancel: // Method ID 30 for basic class
+		return s.handleBasicCancel(conn, channelID, payload)
+	case protocol.BasicGet: // Method ID 70 for basic class
+		return s.handleBasicGet(conn, channelID, payload)
+	case protocol.BasicAck: // Method ID 80 for basic class
+		return s.handleBasicAck(conn, channelID, payload)
+	case protocol.BasicReject: // Method ID 90 for basic class
+		return s.handleBasicReject(conn, channelID, payload)
+	case protocol.BasicNack: // Method ID 120 for basic class
+		return s.handleBasicNack(conn, channelID, payload)
 	default:
 		s.Log.Warn("Unknown basic method ID", 
 			zap.Uint16("method_id", methodID),
@@ -871,6 +896,46 @@ func (s *Server) handleBasicQos(conn *protocol.Connection, channelID uint16, pay
 	return s.sendBasicQosOK(conn, channelID)
 }
 
+// handleBasicPublish handles the basic.publish method
+func (s *Server) handleBasicPublish(conn *protocol.Connection, channelID uint16, payload []byte) error {
+	// Deserialize the basic.publish method
+	publishMethod := &protocol.BasicPublishMethod{}
+	err := publishMethod.Deserialize(payload)
+	if err != nil {
+		s.Log.Error("Failed to deserialize basic.publish", 
+			zap.Error(err),
+			zap.String("connection_id", conn.ID),
+			zap.Uint16("channel_id", channelID))
+		return err
+	}
+	
+	s.Log.Debug("Basic publish received", 
+		zap.String("exchange", publishMethod.Exchange),
+		zap.String("routing_key", publishMethod.RoutingKey),
+		zap.Bool("mandatory", publishMethod.Mandatory),
+		zap.Bool("immediate", publishMethod.Immediate))
+	
+	// Create a pending message to track this publication
+	// The full message will be completed when we receive the header and body frames
+	pendingMsg := &protocol.PendingMessage{
+		Method:   publishMethod,
+		Body:     make([]byte, 0),
+		Received: 0,
+		Channel:  conn.Channels[channelID], // Get the channel reference
+	}
+	
+	// Store the pending message for this channel
+	conn.Mutex.Lock()
+	conn.PendingMessages[channelID] = pendingMsg
+	conn.Mutex.Unlock()
+	
+	s.Log.Debug("Started tracking pending message", 
+		zap.Uint16("channel_id", channelID),
+		zap.String("connection_id", conn.ID))
+	
+	return nil
+}
+
 // sendBasicQosOK sends the basic.qos-ok method frame
 func (s *Server) sendBasicQosOK(conn *protocol.Connection, channelID uint16) error {
 	qosOKMethod := &protocol.BasicQosOKMethod{}
@@ -883,6 +948,479 @@ func (s *Server) sendBasicQosOK(conn *protocol.Connection, channelID uint16) err
 	frame := protocol.EncodeMethodFrameForChannel(channelID, 60, 11, methodData) // 60.11 = basic.qos-ok
 	
 	return protocol.WriteFrame(conn.Conn, frame)
+}
+
+// processHeaderFrame processes content header frames
+func (s *Server) processHeaderFrame(conn *protocol.Connection, frame *protocol.Frame) error {
+	conn.Mutex.Lock()
+	defer conn.Mutex.Unlock()
+	
+	// Check if there's a pending message for this channel that needs a header
+	pendingMsg, exists := conn.PendingMessages[frame.Channel]
+	if !exists {
+		// This could be a valid scenario - maybe not every header frame is part of a publish
+		s.Log.Warn("Header frame received for channel with no pending message", 
+			zap.Uint16("channel", frame.Channel),
+			zap.String("connection_id", conn.ID))
+		return nil
+	}
+	
+	// Parse the content header
+	contentHeader, err := protocol.ReadContentHeader(frame)
+	if err != nil {
+		s.Log.Error("Failed to parse content header", 
+			zap.Error(err),
+			zap.String("connection_id", conn.ID),
+			zap.Uint16("channel", frame.Channel))
+		return err
+	}
+	
+	// Attach the header to the pending message
+	pendingMsg.Header = contentHeader
+	
+	s.Log.Debug("Content header received for pending message",
+		zap.String("exchange", pendingMsg.Method.Exchange),
+		zap.String("routing_key", pendingMsg.Method.RoutingKey),
+		zap.Uint64("body_size", contentHeader.BodySize))
+	
+	return nil
+}
+
+// processBodyFrame processes content body frames
+func (s *Server) processBodyFrame(conn *protocol.Connection, frame *protocol.Frame) error {
+	conn.Mutex.Lock()
+	defer conn.Mutex.Unlock()
+	
+	// Check if there's a pending message for this channel that needs body content
+	pendingMsg, exists := conn.PendingMessages[frame.Channel]
+	if !exists {
+		s.Log.Warn("Body frame received for channel with no pending message", 
+			zap.Uint16("channel", frame.Channel),
+			zap.String("connection_id", conn.ID))
+		return nil
+	}
+	
+	// Check if we have a header for this message
+	if pendingMsg.Header == nil {
+		s.Log.Warn("Body frame received before header frame", 
+			zap.Uint16("channel", frame.Channel),
+			zap.String("connection_id", conn.ID))
+		return fmt.Errorf("body frame received before header frame")
+	}
+	
+	// Append the body content to the pending message
+	pendingMsg.Body = append(pendingMsg.Body, frame.Payload...)
+	pendingMsg.Received += uint64(len(frame.Payload))
+	
+	s.Log.Debug("Body frame received for pending message",
+		zap.Uint16("channel", frame.Channel),
+		zap.Uint64("received", pendingMsg.Received),
+		zap.Uint64("expected", pendingMsg.Header.BodySize))
+	
+	// Check if we've received the complete message
+	if pendingMsg.Received >= pendingMsg.Header.BodySize {
+		// We have received all the body data
+		if pendingMsg.Received > pendingMsg.Header.BodySize {
+			s.Log.Error("Received more body data than expected", 
+				zap.Uint64("received", pendingMsg.Received),
+				zap.Uint64("expected", pendingMsg.Header.BodySize))
+			return fmt.Errorf("received more body data than expected")
+		}
+		
+		// Finalize the message by trimming any extra bytes
+		if pendingMsg.Received > uint64(len(pendingMsg.Body)) {
+			// This shouldn't happen, but just in case
+			pendingMsg.Body = pendingMsg.Body[:pendingMsg.Header.BodySize]
+		} else if pendingMsg.Received < uint64(len(pendingMsg.Body)) {
+			pendingMsg.Body = pendingMsg.Body[:pendingMsg.Received]
+		}
+		
+		// Process the complete message
+		if err := s.processCompleteMessage(conn, frame.Channel, pendingMsg); err != nil {
+			s.Log.Error("Failed to process complete message", 
+				zap.Error(err),
+				zap.String("connection_id", conn.ID),
+				zap.Uint16("channel", frame.Channel))
+			return err
+		}
+		
+		// Remove the pending message from the map
+		delete(conn.PendingMessages, frame.Channel)
+	}
+	
+	return nil
+}
+
+// processCompleteMessage processes a message that has been fully received (method + header + body)
+func (s *Server) processCompleteMessage(conn *protocol.Connection, channelID uint16, pendingMsg *protocol.PendingMessage) error {
+	s.Log.Info("Processing complete message", 
+		zap.String("exchange", pendingMsg.Method.Exchange),
+		zap.String("routing_key", pendingMsg.Method.RoutingKey),
+		zap.Uint64("body_size", uint64(len(pendingMsg.Body))))
+	
+	// Convert the pending message to a protocol.Message
+	message := &protocol.Message{
+		Body:            pendingMsg.Body,
+		Headers:         pendingMsg.Header.Headers,
+		Exchange:        pendingMsg.Method.Exchange,
+		RoutingKey:      pendingMsg.Method.RoutingKey,
+		ContentType:     pendingMsg.Header.ContentType,
+		ContentEncoding: pendingMsg.Header.ContentEncoding,
+		DeliveryMode:    pendingMsg.Header.DeliveryMode,
+		Priority:        pendingMsg.Header.Priority,
+		CorrelationID:   pendingMsg.Header.CorrelationID,
+		ReplyTo:         pendingMsg.Header.ReplyTo,
+		Expiration:      pendingMsg.Header.Expiration,
+		MessageID:       pendingMsg.Header.MessageID,
+		Timestamp:       pendingMsg.Header.Timestamp,
+		Type:            pendingMsg.Header.Type,
+		UserID:          pendingMsg.Header.UserID,
+		AppID:           pendingMsg.Header.AppID,
+		ClusterID:       pendingMsg.Header.ClusterID,
+	}
+	
+	// Route the message using the broker
+	err := s.Broker.PublishMessage(message.Exchange, message.RoutingKey, message)
+	if err != nil {
+		s.Log.Error("Failed to route message", 
+			zap.Error(err),
+			zap.String("exchange", message.Exchange),
+			zap.String("routing_key", message.RoutingKey))
+		return err
+	}
+	
+	s.Log.Debug("Message successfully routed",
+		zap.String("exchange", message.Exchange),
+		zap.String("routing_key", message.RoutingKey))
+	
+	return nil
+}
+
+// handleBasicConsume handles the basic.consume method
+func (s *Server) handleBasicConsume(conn *protocol.Connection, channelID uint16, payload []byte) error {
+	// Deserialize the basic.consume method
+	consumeMethod := &protocol.BasicConsumeMethod{}
+	err := consumeMethod.Deserialize(payload)
+	if err != nil {
+		s.Log.Error("Failed to deserialize basic.consume", 
+			zap.Error(err),
+			zap.String("connection_id", conn.ID),
+			zap.Uint16("channel_id", channelID))
+		return err
+	}
+	
+	s.Log.Info("Basic consume requested", 
+		zap.String("queue", consumeMethod.Queue),
+		zap.String("consumer_tag", consumeMethod.ConsumerTag),
+		zap.Bool("no_ack", consumeMethod.NoAck),
+		zap.Bool("exclusive", consumeMethod.Exclusive))
+	
+	// Get the channel
+	conn.Mutex.RLock()
+	channel, exists := conn.Channels[channelID]
+	conn.Mutex.RUnlock()
+	
+	if !exists {
+		return fmt.Errorf("channel %d does not exist", channelID)
+	}
+	
+	// Check if queue exists in the broker
+	// This is a simplified check - in a real implementation you'd verify queue exists
+	// For now, we'll proceed assuming the queue exists
+	
+	// Create a new consumer
+	consumer := &protocol.Consumer{
+		Tag:       consumeMethod.ConsumerTag,
+		Channel:   channel,
+		Queue:     consumeMethod.Queue,
+		NoAck:     consumeMethod.NoAck,
+		Exclusive: consumeMethod.Exclusive,
+		Args:      consumeMethod.Arguments,
+		Messages:  make(chan *protocol.Delivery, 100), // Buffer for pending messages
+		Cancel:    make(chan struct{}, 1),             // Channel to signal cancellation
+	}
+	
+	// Add the consumer to the channel
+	channel.Mutex.Lock()
+	channel.Consumers[consumer.Tag] = consumer
+	channel.Mutex.Unlock()
+	
+	// Register the consumer with the broker
+	err = s.Broker.RegisterConsumer(consumeMethod.Queue, consumer.Tag, consumer)
+	if err != nil {
+		s.Log.Error("Failed to register consumer with broker", 
+			zap.Error(err),
+			zap.String("consumer_tag", consumer.Tag),
+			zap.String("queue", consumeMethod.Queue))
+		return err
+	}
+	
+	// Send basic.consume-ok response
+	err = s.sendBasicConsumeOK(conn, channelID, consumer.Tag)
+	if err != nil {
+		s.Log.Error("Failed to send basic.consume-ok", 
+			zap.Error(err),
+			zap.String("connection_id", conn.ID),
+			zap.Uint16("channel_id", channelID))
+		return err
+	}
+	
+	s.Log.Info("Consumer registered", 
+		zap.String("consumer_tag", consumer.Tag),
+		zap.String("queue", consumer.Queue))
+	
+	// In a real implementation, we would now start delivering messages
+	// to this consumer from the specified queue
+	
+	return nil
+}
+
+// handleBasicCancel handles the basic.cancel method
+func (s *Server) handleBasicCancel(conn *protocol.Connection, channelID uint16, payload []byte) error {
+	// Deserialize the basic.cancel method
+	cancelMethod := &protocol.BasicCancelMethod{}
+	err := cancelMethod.Deserialize(payload)
+	if err != nil {
+		s.Log.Error("Failed to deserialize basic.cancel", 
+			zap.Error(err),
+			zap.String("connection_id", conn.ID),
+			zap.Uint16("channel_id", channelID))
+		return err
+	}
+	
+	s.Log.Info("Basic cancel requested", 
+		zap.String("consumer_tag", cancelMethod.ConsumerTag))
+	
+	// Get the channel
+	conn.Mutex.RLock()
+	channel, exists := conn.Channels[channelID]
+	conn.Mutex.RUnlock()
+	
+	if !exists {
+		return fmt.Errorf("channel %d does not exist", channelID)
+	}
+	
+	// Remove the consumer
+	channel.Mutex.Lock()
+	consumer, exists := channel.Consumers[cancelMethod.ConsumerTag]
+	if !exists {
+		channel.Mutex.Unlock()
+		// Consumer doesn't exist, but this might be OK depending on the spec
+		s.Log.Warn("Attempted to cancel non-existent consumer", 
+			zap.String("consumer_tag", cancelMethod.ConsumerTag))
+		return nil
+	}
+	
+	// Close the consumer's message channel and signal cancellation
+	close(consumer.Cancel)
+	delete(channel.Consumers, cancelMethod.ConsumerTag)
+	channel.Mutex.Unlock()
+	
+	// Unregister the consumer with the broker
+	err = s.Broker.UnregisterConsumer(cancelMethod.ConsumerTag)
+	if err != nil {
+		s.Log.Error("Failed to unregister consumer with broker", 
+			zap.Error(err),
+			zap.String("consumer_tag", cancelMethod.ConsumerTag))
+		// Continue anyway since we've already removed it locally
+	}
+	
+	// Send basic.cancel-ok response
+	if !cancelMethod.NoWait {
+		err = s.sendBasicCancelOK(conn, channelID, cancelMethod.ConsumerTag)
+		if err != nil {
+			s.Log.Error("Failed to send basic.cancel-ok", 
+				zap.Error(err),
+				zap.String("connection_id", conn.ID),
+				zap.Uint16("channel_id", channelID))
+			return err
+		}
+	}
+	
+	s.Log.Info("Consumer cancelled", 
+		zap.String("consumer_tag", cancelMethod.ConsumerTag))
+	
+	return nil
+}
+
+// handleBasicGet handles the basic.get method
+func (s *Server) handleBasicGet(conn *protocol.Connection, channelID uint16, payload []byte) error {
+	// Deserialize the basic.get method
+	getMethod := &protocol.BasicGetMethod{}
+	err := getMethod.Deserialize(payload)
+	if err != nil {
+		s.Log.Error("Failed to deserialize basic.get", 
+			zap.Error(err),
+			zap.String("connection_id", conn.ID),
+			zap.Uint16("channel_id", channelID))
+		return err
+	}
+	
+	s.Log.Debug("Basic get requested", 
+		zap.String("queue", getMethod.Queue),
+		zap.Bool("no_ack", getMethod.NoAck))
+	
+	// For now, we'll respond with basic.get-empty since we don't have actual message retrieval implemented yet
+	// In a real implementation, we would try to get the next message from the queue
+	err = s.sendBasicGetEmpty(conn, channelID)
+	if err != nil {
+		s.Log.Error("Failed to send basic.get-empty", 
+			zap.Error(err),
+			zap.String("connection_id", conn.ID),
+			zap.Uint16("channel_id", channelID))
+		return err
+	}
+	
+	return nil
+}
+
+// sendBasicConsumeOK sends the basic.consume-ok method frame
+func (s *Server) sendBasicConsumeOK(conn *protocol.Connection, channelID uint16, consumerTag string) error {
+	consumeOKMethod := &protocol.BasicConsumeOKMethod{
+		ConsumerTag: consumerTag,
+	}
+	
+	methodData, err := consumeOKMethod.Serialize()
+	if err != nil {
+		return fmt.Errorf("error serializing basic.consume-ok: %v", err)
+	}
+	
+	frame := protocol.EncodeMethodFrameForChannel(channelID, 60, 21, methodData) // 60.21 = basic.consume-ok
+	
+	return protocol.WriteFrame(conn.Conn, frame)
+}
+
+// sendBasicCancelOK sends the basic.cancel-ok method frame
+func (s *Server) sendBasicCancelOK(conn *protocol.Connection, channelID uint16, consumerTag string) error {
+	cancelOKMethod := &protocol.BasicCancelOKMethod{
+		ConsumerTag: consumerTag,
+	}
+	
+	methodData, err := cancelOKMethod.Serialize()
+	if err != nil {
+		return fmt.Errorf("error serializing basic.cancel-ok: %v", err)
+	}
+	
+	frame := protocol.EncodeMethodFrameForChannel(channelID, 60, 31, methodData) // 60.31 = basic.cancel-ok
+	
+	return protocol.WriteFrame(conn.Conn, frame)
+}
+
+// sendBasicGetEmpty sends the basic.get-empty method frame
+func (s *Server) sendBasicGetEmpty(conn *protocol.Connection, channelID uint16) error {
+	getEmptyMethod := &protocol.BasicGetEmptyMethod{
+		Reserved1: "amq.empty", // Standard reserved value
+	}
+	
+	methodData, err := getEmptyMethod.Serialize()
+	if err != nil {
+		return fmt.Errorf("error serializing basic.get-empty: %v", err)
+	}
+	
+	frame := protocol.EncodeMethodFrameForChannel(channelID, 60, 72, methodData) // 60.72 = basic.get-empty
+	
+	return protocol.WriteFrame(conn.Conn, frame)
+}
+
+// handleBasicAck handles the basic.ack method
+func (s *Server) handleBasicAck(conn *protocol.Connection, channelID uint16, payload []byte) error {
+	// Deserialize the basic.ack method
+	ackMethod := &protocol.BasicAckMethod{}
+	err := ackMethod.Deserialize(payload)
+	if err != nil {
+		s.Log.Error("Failed to deserialize basic.ack", 
+			zap.Error(err),
+			zap.String("connection_id", conn.ID),
+			zap.Uint16("channel_id", channelID))
+		return err
+	}
+	
+	s.Log.Debug("Basic ack received", 
+		zap.Uint64("delivery_tag", ackMethod.DeliveryTag),
+		zap.Bool("multiple", ackMethod.Multiple))
+	
+	// In a real implementation, we would:
+	// 1. Remove acknowledged messages from unacknowledged message tracking
+	// 2. If multiple=true, acknowledge all messages up to the delivery tag
+	// 3. Update broker state to reflect acknowledged messages
+	
+	// For now, we'll just log the acknowledgment
+	s.Log.Info("Message acknowledged", 
+		zap.Uint64("delivery_tag", ackMethod.DeliveryTag),
+		zap.Bool("multiple", ackMethod.Multiple),
+		zap.String("connection_id", conn.ID),
+		zap.Uint16("channel_id", channelID))
+	
+	return nil
+}
+
+// handleBasicReject handles the basic.reject method
+func (s *Server) handleBasicReject(conn *protocol.Connection, channelID uint16, payload []byte) error {
+	// Deserialize the basic.reject method
+	rejectMethod := &protocol.BasicRejectMethod{}
+	err := rejectMethod.Deserialize(payload)
+	if err != nil {
+		s.Log.Error("Failed to deserialize basic.reject", 
+			zap.Error(err),
+			zap.String("connection_id", conn.ID),
+			zap.Uint16("channel_id", channelID))
+		return err
+	}
+	
+	s.Log.Debug("Basic reject received", 
+		zap.Uint64("delivery_tag", rejectMethod.DeliveryTag),
+		zap.Bool("requeue", rejectMethod.Requeue))
+	
+	// In a real implementation, we would:
+	// 1. Remove the rejected message from unacknowledged message tracking
+	// 2. If requeue=true, put the message back on the queue for redelivery
+	// 3. If requeue=false, discard or dead-letter the message
+	// 4. Update broker state accordingly
+	
+	// For now, we'll just log the rejection
+	s.Log.Info("Message rejected", 
+		zap.Uint64("delivery_tag", rejectMethod.DeliveryTag),
+		zap.Bool("requeue", rejectMethod.Requeue),
+		zap.String("connection_id", conn.ID),
+		zap.Uint16("channel_id", channelID))
+	
+	return nil
+}
+
+// handleBasicNack handles the basic.nack method
+func (s *Server) handleBasicNack(conn *protocol.Connection, channelID uint16, payload []byte) error {
+	// Deserialize the basic.nack method
+	nackMethod := &protocol.BasicNackMethod{}
+	err := nackMethod.Deserialize(payload)
+	if err != nil {
+		s.Log.Error("Failed to deserialize basic.nack", 
+			zap.Error(err),
+			zap.String("connection_id", conn.ID),
+			zap.Uint16("channel_id", channelID))
+		return err
+	}
+	
+	s.Log.Debug("Basic nack received", 
+		zap.Uint64("delivery_tag", nackMethod.DeliveryTag),
+		zap.Bool("multiple", nackMethod.Multiple),
+		zap.Bool("requeue", nackMethod.Requeue))
+	
+	// In a real implementation, we would:
+	// 1. Remove nacked messages from unacknowledged message tracking
+	// 2. If multiple=true, nack all messages up to the delivery tag
+	// 3. If requeue=true, put the messages back on the queue for redelivery
+	// 4. If requeue=false, discard or dead-letter the messages
+	// 5. Update broker state accordingly
+	
+	// For now, we'll just log the negative acknowledgment
+	s.Log.Info("Message negatively acknowledged", 
+		zap.Uint64("delivery_tag", nackMethod.DeliveryTag),
+		zap.Bool("multiple", nackMethod.Multiple),
+		zap.Bool("requeue", nackMethod.Requeue),
+		zap.String("connection_id", conn.ID),
+		zap.Uint16("channel_id", channelID))
+	
+	return nil
 }
 
 // Stop gracefully stops the server
