@@ -1,0 +1,41 @@
+# Binaries
+*.exe
+*.dll
+*.so
+*.dylib
+*.out
+
+# Build artifacts
+amqp-go
+/dist
+/bin
+
+# Go
+*.test
+*.prof
+/vendor/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+logs/
+
+# Temporary files
+*~
+\#*\#
+*.tmp
+*.temp
+.DS_Store?
+
+# Test coverage
+coverage.out
+cover.html
