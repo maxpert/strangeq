@@ -26,12 +26,12 @@ Create a Go package `github.com/maxpert/amqp-go` that implements an AMQP 0.9.1 s
 - [x] Create proper server binary with configuration options
 
 ### Phase 2: Exchange and Queue Management
-- [ ] Implement `exchange.declare` and `exchange.delete` methods
-- [ ] Implement `queue.declare`, `queue.bind`, `queue.unbind`, `queue.delete` methods
-- [ ] Implement core exchange types (direct, fanout, topic, headers) with routing logic
-- [ ] Basic in-memory queue implementation (FIFO)
-- [ ] Basic binding mechanism
-- [ ] Write tests for exchange and queue operations
+- [x] Implement `exchange.declare` and `exchange.delete` methods
+- [x] Implement `queue.declare`, `queue.bind`, `queue.unbind`, `queue.delete` methods
+- [x] Implement core exchange types (direct, fanout, topic, headers) with routing logic
+- [x] Basic in-memory queue implementation (FIFO)
+- [x] Basic binding mechanism
+- [x] Write tests for exchange and queue operations
 
 ### Phase 3: Message Publishing and Consumption
 - [ ] Implement `basic.publish` method (accepting message content and routing)

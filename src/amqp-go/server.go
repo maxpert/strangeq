@@ -9,6 +9,7 @@ import (
 
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
+	"github.com/maxpert/amqp-go/internal/broker"
 	"github.com/maxpert/amqp-go/protocol"
 )
 
@@ -28,6 +29,7 @@ type Server struct {
 	Mutex       sync.RWMutex
 	Shutdown    bool
 	Log         *zap.Logger
+	Broker      *broker.Broker
 }
 
 // NewServer creates a new AMQP server
@@ -37,6 +39,7 @@ func NewServer(addr string) *Server {
 		Addr:        addr,
 		Connections: make(map[string]*protocol.Connection),
 		Log:         logger,
+		Broker:      broker.NewBroker(),
 	}
 }
 
@@ -352,9 +355,13 @@ func (s *Server) processChannelMethod(conn *protocol.Connection, frame *protocol
 	methodID := (uint16(frame.Payload[2]) << 8) | uint16(frame.Payload[3])
 	
 	// Process based on class and method IDs
-	switch {
-	case classID == 20: // Channel class
+	switch classID {
+	case 20: // Channel class
 		return s.processChannelSpecificMethod(conn, frame.Channel, methodID, frame.Payload[4:])
+	case 40: // Exchange class
+		return s.processExchangeMethod(conn, frame.Channel, methodID, frame.Payload[4:])
+	case 50: // Queue class
+		return s.processQueueMethod(conn, frame.Channel, methodID, frame.Payload[4:])
 	default:
 		s.Log.Warn("Unknown class ID", 
 			zap.Uint16("class_id", classID),
@@ -388,6 +395,279 @@ func (s *Server) processChannelSpecificMethod(conn *protocol.Connection, channel
 	}
 }
 
+// processExchangeMethod handles exchange-related methods
+func (s *Server) processExchangeMethod(conn *protocol.Connection, channelID uint16, methodID uint16, payload []byte) error {
+	switch methodID {
+	case protocol.ExchangeDeclare: // Method ID 10 for exchange class
+		return s.handleExchangeDeclare(conn, channelID, payload)
+	case protocol.ExchangeDelete: // Method ID 20 for exchange class
+		return s.handleExchangeDelete(conn, channelID, payload)
+	default:
+		s.Log.Warn("Unknown exchange method ID", 
+			zap.Uint16("method_id", methodID),
+			zap.Uint16("channel_id", channelID),
+			zap.String("connection_id", conn.ID))
+		return fmt.Errorf("unknown exchange method ID: %d", methodID)
+	}
+}
+
+// processQueueMethod handles queue-related methods
+func (s *Server) processQueueMethod(conn *protocol.Connection, channelID uint16, methodID uint16, payload []byte) error {
+	switch methodID {
+	case protocol.QueueDeclare: // Method ID 10 for queue class
+		return s.handleQueueDeclare(conn, channelID, payload)
+	case protocol.QueueBind: // Method ID 20 for queue class
+		return s.handleQueueBind(conn, channelID, payload)
+	case protocol.QueueUnbind: // Method ID 50 for queue class
+		return s.handleQueueUnbind(conn, channelID, payload)
+	case protocol.QueueDelete: // Method ID 40 for queue class
+		return s.handleQueueDelete(conn, channelID, payload)
+	default:
+		s.Log.Warn("Unknown queue method ID", 
+			zap.Uint16("method_id", methodID),
+			zap.Uint16("channel_id", channelID),
+			zap.String("connection_id", conn.ID))
+		return fmt.Errorf("unknown queue method ID: %d", methodID)
+	}
+}
+
+// handleExchangeDeclare handles the exchange.declare method
+func (s *Server) handleExchangeDeclare(conn *protocol.Connection, channelID uint16, payload []byte) error {
+	// Deserialize the exchange.declare method
+	declareMethod := &protocol.ExchangeDeclareMethod{}
+	// We need to implement deserialization from the payload
+	// Since we only have serialization, let's implement a simple approach
+	err := declareMethod.Deserialize(payload)
+	if err != nil {
+		s.Log.Error("Failed to deserialize exchange.declare", 
+			zap.Error(err),
+			zap.String("connection_id", conn.ID),
+			zap.Uint16("channel_id", channelID))
+		return err
+	}
+	
+	s.Log.Info("Exchange declared", 
+		zap.String("exchange", declareMethod.Exchange),
+		zap.String("type", declareMethod.Type),
+		zap.Bool("durable", declareMethod.Durable),
+		zap.Bool("auto_delete", declareMethod.AutoDelete),
+		zap.Bool("internal", declareMethod.Internal))
+	
+	// Call the broker to declare the exchange
+	err = s.Broker.DeclareExchange(
+		declareMethod.Exchange,
+		declareMethod.Type,
+		declareMethod.Durable,
+		declareMethod.AutoDelete,
+		declareMethod.Internal,
+		declareMethod.Arguments,
+	)
+	
+	if err != nil {
+		s.Log.Error("Failed to declare exchange", 
+			zap.Error(err),
+			zap.String("exchange", declareMethod.Exchange))
+		return err
+	}
+	
+	// Send exchange.declare-ok response
+	return s.sendExchangeDeclareOK(conn, channelID)
+}
+
+// handleExchangeDelete handles the exchange.delete method
+func (s *Server) handleExchangeDelete(conn *protocol.Connection, channelID uint16, payload []byte) error {
+	// Deserialize the exchange.delete method
+	deleteMethod := &protocol.ExchangeDeleteMethod{}
+	err := deleteMethod.Deserialize(payload)
+	if err != nil {
+		s.Log.Error("Failed to deserialize exchange.delete", 
+			zap.Error(err),
+			zap.String("connection_id", conn.ID),
+			zap.Uint16("channel_id", channelID))
+		return err
+	}
+	
+	s.Log.Info("Exchange deleted", 
+		zap.String("exchange", deleteMethod.Exchange),
+		zap.Bool("if_unused", deleteMethod.IfUnused))
+	
+	// Call the broker to delete the exchange
+	err = s.Broker.DeleteExchange(deleteMethod.Exchange, deleteMethod.IfUnused)
+	if err != nil {
+		s.Log.Error("Failed to delete exchange", 
+			zap.Error(err),
+			zap.String("exchange", deleteMethod.Exchange))
+		return err
+	}
+	
+	// Send exchange.delete-ok response
+	return s.sendExchangeDeleteOK(conn, channelID)
+}
+
+// handleQueueDeclare handles the queue.declare method
+func (s *Server) handleQueueDeclare(conn *protocol.Connection, channelID uint16, payload []byte) error {
+	// Deserialize the queue.declare method
+	declareMethod := &protocol.QueueDeclareMethod{}
+	err := declareMethod.Deserialize(payload)
+	if err != nil {
+		s.Log.Error("Failed to deserialize queue.declare", 
+			zap.Error(err),
+			zap.String("connection_id", conn.ID),
+			zap.Uint16("channel_id", channelID))
+		return err
+	}
+	
+	s.Log.Info("Queue declared", 
+		zap.String("queue", declareMethod.Queue),
+		zap.Bool("durable", declareMethod.Durable),
+		zap.Bool("auto_delete", declareMethod.AutoDelete),
+		zap.Bool("exclusive", declareMethod.Exclusive))
+	
+	// Call the broker to declare the queue
+	queue, err := s.Broker.DeclareQueue(
+		declareMethod.Queue,
+		declareMethod.Durable,
+		declareMethod.AutoDelete,
+		declareMethod.Exclusive,
+		declareMethod.Arguments,
+	)
+	
+	if err != nil {
+		s.Log.Error("Failed to declare queue", 
+			zap.Error(err),
+			zap.String("queue", declareMethod.Queue))
+		return err
+	}
+	
+	// Send queue.declare-ok response with queue info
+	return s.sendQueueDeclareOK(conn, channelID, queue.Name, uint32(len(queue.Messages)), 0)
+}
+
+// handleQueueBind handles the queue.bind method
+func (s *Server) handleQueueBind(conn *protocol.Connection, channelID uint16, payload []byte) error {
+	// Deserialize the queue.bind method
+	bindMethod := &protocol.QueueBindMethod{}
+	err := bindMethod.Deserialize(payload)
+	if err != nil {
+		s.Log.Error("Failed to deserialize queue.bind", 
+			zap.Error(err),
+			zap.String("connection_id", conn.ID),
+			zap.Uint16("channel_id", channelID))
+		return err
+	}
+	
+	s.Log.Info("Queue bound", 
+		zap.String("queue", bindMethod.Queue),
+		zap.String("exchange", bindMethod.Exchange),
+		zap.String("routing_key", bindMethod.RoutingKey))
+	
+	// Call the broker to bind the queue
+	err = s.Broker.BindQueue(
+		bindMethod.Queue,
+		bindMethod.Exchange,
+		bindMethod.RoutingKey,
+		bindMethod.Arguments,
+	)
+	
+	if err != nil {
+		s.Log.Error("Failed to bind queue", 
+			zap.Error(err),
+			zap.String("queue", bindMethod.Queue),
+			zap.String("exchange", bindMethod.Exchange))
+		return err
+	}
+	
+	// Send queue.bind-ok response
+	return s.sendQueueBindOK(conn, channelID)
+}
+
+// handleQueueUnbind handles the queue.unbind method
+func (s *Server) handleQueueUnbind(conn *protocol.Connection, channelID uint16, payload []byte) error {
+	// Deserialize the queue.unbind method
+	// We need to create a structure for this, but for now we'll implement a basic approach
+	// The queue.unbind method has similar structure to queue.bind but without arguments
+	
+	// Create a temporary approach - reuse QueueBindMethod for deserialization since structure is similar
+	unbindMethod := &protocol.QueueBindMethod{}
+	err := unbindMethod.Deserialize(payload)
+	if err != nil {
+		s.Log.Error("Failed to deserialize queue.unbind", 
+			zap.Error(err),
+			zap.String("connection_id", conn.ID),
+			zap.Uint16("channel_id", channelID))
+		return err
+	}
+	
+	s.Log.Info("Queue unbound", 
+		zap.String("queue", unbindMethod.Queue),
+		zap.String("exchange", unbindMethod.Exchange),
+		zap.String("routing_key", unbindMethod.RoutingKey))
+	
+	// Call the broker to unbind the queue
+	err = s.Broker.UnbindQueue(
+		unbindMethod.Queue,
+		unbindMethod.Exchange,
+		unbindMethod.RoutingKey,
+	)
+	
+	if err != nil {
+		s.Log.Error("Failed to unbind queue", 
+			zap.Error(err),
+			zap.String("queue", unbindMethod.Queue),
+			zap.String("exchange", unbindMethod.Exchange))
+		return err
+	}
+	
+	// Send queue.unbind-ok response
+	return s.sendQueueUnbindOK(conn, channelID)
+}
+
+// sendQueueUnbindOK sends the queue.unbind-ok method frame
+func (s *Server) sendQueueUnbindOK(conn *protocol.Connection, channelID uint16) error {
+	// queue.unbind-ok has no content, similar to bind-ok
+	bindOKMethod := &protocol.QueueBindOKMethod{} // Reuse the same structure since both have no content
+	
+	methodData, err := bindOKMethod.Serialize()
+	if err != nil {
+		return fmt.Errorf("error serializing queue.unbind-ok: %v", err)
+	}
+	
+	frame := protocol.EncodeMethodFrameForChannel(channelID, 50, 51, methodData) // 50.51 = queue.unbind-ok
+	
+	return protocol.WriteFrame(conn.Conn, frame)
+}
+
+// handleQueueDelete handles the queue.delete method
+func (s *Server) handleQueueDelete(conn *protocol.Connection, channelID uint16, payload []byte) error {
+	// Deserialize the queue.delete method
+	deleteMethod := &protocol.QueueDeleteMethod{}
+	err := deleteMethod.Deserialize(payload)
+	if err != nil {
+		s.Log.Error("Failed to deserialize queue.delete", 
+			zap.Error(err),
+			zap.String("connection_id", conn.ID),
+			zap.Uint16("channel_id", channelID))
+		return err
+	}
+	
+	s.Log.Info("Queue deleted", 
+		zap.String("queue", deleteMethod.Queue),
+		zap.Bool("if_unused", deleteMethod.IfUnused),
+		zap.Bool("if_empty", deleteMethod.IfEmpty))
+	
+	// Call the broker to delete the queue
+	err = s.Broker.DeleteQueue(deleteMethod.Queue, deleteMethod.IfUnused, deleteMethod.IfEmpty)
+	if err != nil {
+		s.Log.Error("Failed to delete queue", 
+			zap.Error(err),
+			zap.String("queue", deleteMethod.Queue))
+		return err
+	}
+	
+	// Send queue.delete-ok response with number of deleted messages
+	return s.sendQueueDeleteOK(conn, channelID, 0)
+}
+
 // sendConnectionCloseOK sends the connection.close-ok method frame
 func (s *Server) sendConnectionCloseOK(conn *protocol.Connection) error {
 	closeOKMethod := &protocol.ConnectionCloseOKMethod{}
@@ -414,6 +694,82 @@ func (s *Server) sendChannelOpenOK(conn *protocol.Connection, channelID uint16) 
 	}
 	
 	frame := protocol.EncodeMethodFrameForChannel(channelID, 20, 11, methodData) // 20.11 = channel.open-ok
+	
+	return protocol.WriteFrame(conn.Conn, frame)
+}
+
+// sendExchangeDeclareOK sends the exchange.declare-ok method frame
+func (s *Server) sendExchangeDeclareOK(conn *protocol.Connection, channelID uint16) error {
+	declareOKMethod := &protocol.ExchangeDeclareOKMethod{}
+	
+	methodData, err := declareOKMethod.Serialize()
+	if err != nil {
+		return fmt.Errorf("error serializing exchange.declare-ok: %v", err)
+	}
+	
+	frame := protocol.EncodeMethodFrameForChannel(channelID, 40, 11, methodData) // 40.11 = exchange.declare-ok
+	
+	return protocol.WriteFrame(conn.Conn, frame)
+}
+
+// sendExchangeDeleteOK sends the exchange.delete-ok method frame
+func (s *Server) sendExchangeDeleteOK(conn *protocol.Connection, channelID uint16) error {
+	deleteOKMethod := &protocol.ExchangeDeleteOKMethod{}
+	
+	methodData, err := deleteOKMethod.Serialize()
+	if err != nil {
+		return fmt.Errorf("error serializing exchange.delete-ok: %v", err)
+	}
+	
+	frame := protocol.EncodeMethodFrameForChannel(channelID, 40, 21, methodData) // 40.21 = exchange.delete-ok
+	
+	return protocol.WriteFrame(conn.Conn, frame)
+}
+
+// sendQueueDeclareOK sends the queue.declare-ok method frame
+func (s *Server) sendQueueDeclareOK(conn *protocol.Connection, channelID uint16, queueName string, messageCount, consumerCount uint32) error {
+	declareOKMethod := &protocol.QueueDeclareOKMethod{
+		Queue:         queueName,
+		MessageCount:  messageCount,
+		ConsumerCount: consumerCount,
+	}
+	
+	methodData, err := declareOKMethod.Serialize()
+	if err != nil {
+		return fmt.Errorf("error serializing queue.declare-ok: %v", err)
+	}
+	
+	frame := protocol.EncodeMethodFrameForChannel(channelID, 50, 11, methodData) // 50.11 = queue.declare-ok
+	
+	return protocol.WriteFrame(conn.Conn, frame)
+}
+
+// sendQueueBindOK sends the queue.bind-ok method frame
+func (s *Server) sendQueueBindOK(conn *protocol.Connection, channelID uint16) error {
+	bindOKMethod := &protocol.QueueBindOKMethod{}
+	
+	methodData, err := bindOKMethod.Serialize()
+	if err != nil {
+		return fmt.Errorf("error serializing queue.bind-ok: %v", err)
+	}
+	
+	frame := protocol.EncodeMethodFrameForChannel(channelID, 50, 21, methodData) // 50.21 = queue.bind-ok
+	
+	return protocol.WriteFrame(conn.Conn, frame)
+}
+
+// sendQueueDeleteOK sends the queue.delete-ok method frame
+func (s *Server) sendQueueDeleteOK(conn *protocol.Connection, channelID uint16, messageCount uint32) error {
+	deleteOKMethod := &protocol.QueueDeleteOKMethod{
+		MessageCount: messageCount,
+	}
+	
+	methodData, err := deleteOKMethod.Serialize()
+	if err != nil {
+		return fmt.Errorf("error serializing queue.delete-ok: %v", err)
+	}
+	
+	frame := protocol.EncodeMethodFrameForChannel(channelID, 50, 41, methodData) // 50.41 = queue.delete-ok
 	
 	return protocol.WriteFrame(conn.Conn, frame)
 }

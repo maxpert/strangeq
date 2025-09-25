@@ -52,6 +52,16 @@ type Exchange struct {
 	AutoDelete bool
 	Internal   bool
 	Arguments  map[string]interface{}
+	Bindings   []*Binding // List of bindings to queues
+	Mutex      sync.RWMutex
+}
+
+// Binding represents a binding between an exchange and a queue
+type Binding struct {
+	Exchange   string
+	Queue      string
+	RoutingKey string
+	Arguments  map[string]interface{}
 }
 
 // Queue represents an AMQP queue
@@ -63,16 +73,27 @@ type Queue struct {
 	Arguments  map[string]interface{}
 	Messages   []*Message
 	Mutex      sync.RWMutex
+	Channel    *Channel // Reference back to parent channel
 }
 
 // Message represents an AMQP message
 type Message struct {
-	Body      []byte
-	Headers   map[string]interface{}
-	Exchange  string
+	Body       []byte
+	Headers    map[string]interface{}
+	Exchange   string
 	RoutingKey string
 	DeliveryTag uint64
 	Redelivered bool
+}
+
+// Delivery represents a message delivery to a consumer
+type Delivery struct {
+	Message     *Message
+	DeliveryTag uint64
+	Redelivered bool
+	Exchange    string
+	RoutingKey  string
+	ConsumerTag string
 }
 
 // generateID generates a random ID string
