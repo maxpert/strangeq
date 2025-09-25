@@ -14,6 +14,7 @@ type Connection struct {
 	ID       string
 	Conn     net.Conn
 	Channels map[uint16]*Channel
+	Vhost    string  // Virtual host for this connection
 	Mutex    sync.RWMutex
 	Closed   bool
 }

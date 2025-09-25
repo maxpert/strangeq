@@ -55,6 +55,12 @@ const (
 	QueueUnbindOK    = 51  // 50.51 - class ID 50, method ID 51
 )
 
+// Method IDs for basic class
+const (
+	BasicQos       = 10  // 60.10 - class ID 60, method ID 10
+	BasicQosOK     = 11  // 60.11 - class ID 60, method ID 11
+)
+
 // ConnectionStartMethod represents the connection.start method
 type ConnectionStartMethod struct {
 	VersionMajor    byte
@@ -209,6 +215,39 @@ func (m *ConnectionOpenMethod) Serialize() ([]byte, error) {
 	result = append(result, m.Reserved2)
 
 	return result, nil
+}
+
+// Deserialize decodes the ConnectionOpenMethod from a byte slice
+func (m *ConnectionOpenMethod) Deserialize(data []byte) error {
+	if len(data) < 1 {
+		return fmt.Errorf("connection.open method data too short")
+	}
+
+	offset := 0
+
+	// Virtual host (short string)
+	vhost, newOffset, err := decodeShortString(data, offset)
+	if err != nil {
+		return err
+	}
+	m.VirtualHost = vhost
+	offset = newOffset
+
+	// Reserved1 (short string)
+	res1, newOffset, err := decodeShortString(data, offset)
+	if err != nil {
+		return err
+	}
+	m.Reserved1 = res1
+	offset = newOffset
+
+	// Reserved2 (bit)
+	if offset < len(data) {
+		m.Reserved2 = data[offset]
+		offset++
+	}
+
+	return nil
 }
 
 // ConnectionOpenOKMethod represents the connection.open-ok method
@@ -642,25 +681,26 @@ func (m *ExchangeDeclareMethod) Deserialize(data []byte) error {
 	offset += 2
 
 	// Exchange (short string)
-	exchangeLen := int(data[offset])
-	offset += 1
-	if offset+exchangeLen > len(data) {
-		return fmt.Errorf("exchange name extends beyond data")
+	if offset >= len(data) {
+		return fmt.Errorf("exchange field missing")
 	}
-	m.Exchange = string(data[offset : offset+exchangeLen])
-	offset += exchangeLen
+	exchange, newOffset, err := decodeShortString(data, offset)
+	if err != nil {
+		return fmt.Errorf("failed to decode exchange name: %v", err)
+	}
+	m.Exchange = exchange
+	offset = newOffset
 
 	// Type (short string)
 	if offset >= len(data) {
 		return fmt.Errorf("type field missing")
 	}
-	typeLen := int(data[offset])
-	offset += 1
-	if offset+typeLen > len(data) {
-		return fmt.Errorf("exchange type extends beyond data")
+	exchangeType, newOffset, err := decodeShortString(data, offset)
+	if err != nil {
+		return fmt.Errorf("failed to decode exchange type: %v", err)
 	}
-	m.Type = string(data[offset : offset+typeLen])
-	offset += typeLen
+	m.Type = exchangeType
+	offset = newOffset
 
 	// Flags (uint16)
 	if offset+2 > len(data) {
@@ -677,12 +717,15 @@ func (m *ExchangeDeclareMethod) Deserialize(data []byte) error {
 	m.NoWait = (flags & (1 << 11)) != 0
 
 	// Arguments (field table)
-	if offset < len(data) {
+	if offset+4 <= len(data) { // Need at least 4 bytes for the field table length
 		var err error
 		m.Arguments, offset, err = decodeFieldTable(data, offset)
 		if err != nil {
 			return err
 		}
+	} else {
+		// If not enough data for field table, initialize empty arguments map
+		m.Arguments = make(map[string]interface{})
 	}
 
 	return nil
@@ -741,7 +784,7 @@ func (m *ExchangeDeleteMethod) Serialize() ([]byte, error) {
 
 // Deserialize decodes the ExchangeDeleteMethod from a byte slice
 func (m *ExchangeDeleteMethod) Deserialize(data []byte) error {
-	if len(data) < 4 {
+	if len(data) < 4 {  // Need at least reserved(2) + exchange length byte(1)
 		return fmt.Errorf("exchange.delete method data too short")
 	}
 
@@ -752,16 +795,22 @@ func (m *ExchangeDeleteMethod) Deserialize(data []byte) error {
 	offset += 2
 
 	// Exchange (short string)
+	if offset >= len(data) {
+		return fmt.Errorf("exchange field missing")
+	}
 	exchange, newOffset, err := decodeShortString(data, offset)
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to decode exchange name: %v", err)
 	}
 	m.Exchange = exchange
 	offset = newOffset
 
 	// Flags (uint16)
 	if offset+2 > len(data) {
-		return fmt.Errorf("flags field missing")
+		// If not enough bytes for flags, use defaults (false for both)
+		m.IfUnused = false
+		m.NoWait = false
+		return nil
 	}
 	flags := binary.BigEndian.Uint16(data[offset : offset+2])
 	offset += 2
@@ -860,9 +909,12 @@ func (m *QueueDeclareMethod) Deserialize(data []byte) error {
 	offset += 2
 
 	// Queue (short string)
+	if offset >= len(data) {
+		return fmt.Errorf("queue field missing")
+	}
 	queue, newOffset, err := decodeShortString(data, offset)
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to decode queue name: %v", err)
 	}
 	m.Queue = queue
 	offset = newOffset
@@ -882,12 +934,15 @@ func (m *QueueDeclareMethod) Deserialize(data []byte) error {
 	m.NoWait = (flags & (1 << 11)) != 0
 
 	// Arguments (field table)
-	if offset < len(data) {
+	if offset+4 <= len(data) { // Need at least 4 bytes for the field table length
 		var err error
 		m.Arguments, offset, err = decodeFieldTable(data, offset)
 		if err != nil {
 			return err
 		}
+	} else {
+		// If not enough data for field table, initialize empty arguments map
+		m.Arguments = make(map[string]interface{})
 	}
 
 	return nil
@@ -987,25 +1042,34 @@ func (m *QueueBindMethod) Deserialize(data []byte) error {
 	offset += 2
 
 	// Queue (short string)
+	if offset >= len(data) {
+		return fmt.Errorf("queue field missing")
+	}
 	queue, newOffset, err := decodeShortString(data, offset)
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to decode queue name: %v", err)
 	}
 	m.Queue = queue
 	offset = newOffset
 
 	// Exchange (short string)
+	if offset >= len(data) {
+		return fmt.Errorf("exchange field missing")
+	}
 	exchange, newOffset, err := decodeShortString(data, offset)
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to decode exchange name: %v", err)
 	}
 	m.Exchange = exchange
 	offset = newOffset
 
 	// Routing key (short string)
+	if offset >= len(data) {
+		return fmt.Errorf("routing key field missing")
+	}
 	routingKey, newOffset, err := decodeShortString(data, offset)
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to decode routing key: %v", err)
 	}
 	m.RoutingKey = routingKey
 	offset = newOffset
@@ -1021,12 +1085,15 @@ func (m *QueueBindMethod) Deserialize(data []byte) error {
 	m.NoWait = (flags & (1 << 0)) != 0
 
 	// Arguments (field table)
-	if offset < len(data) {
+	if offset+4 <= len(data) { // Need at least 4 bytes for the field table length
 		var err error
 		m.Arguments, offset, err = decodeFieldTable(data, offset)
 		if err != nil {
 			return err
 		}
+	} else {
+		// If not enough data for field table, initialize empty arguments map
+		m.Arguments = make(map[string]interface{})
 	}
 
 	return nil
@@ -1090,7 +1157,7 @@ func (m *QueueDeleteMethod) Serialize() ([]byte, error) {
 
 // Deserialize decodes the QueueDeleteMethod from a byte slice
 func (m *QueueDeleteMethod) Deserialize(data []byte) error {
-	if len(data) < 4 {
+	if len(data) < 3 {  // Need at least reserved(2) + queue length byte(1)
 		return fmt.Errorf("queue.delete method data too short")
 	}
 
@@ -1101,16 +1168,23 @@ func (m *QueueDeleteMethod) Deserialize(data []byte) error {
 	offset += 2
 
 	// Queue (short string)
+	if offset >= len(data) {
+		return fmt.Errorf("queue field missing")
+	}
 	queue, newOffset, err := decodeShortString(data, offset)
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to decode queue name: %v", err)
 	}
 	m.Queue = queue
 	offset = newOffset
 
 	// Flags (uint16)
 	if offset+2 > len(data) {
-		return fmt.Errorf("flags field missing")
+		// If not enough bytes for flags, use defaults (false for all)
+		m.IfUnused = false
+		m.IfEmpty = false
+		m.NoWait = false
+		return nil
 	}
 	flags := binary.BigEndian.Uint16(data[offset : offset+2])
 	offset += 2
@@ -1138,6 +1212,72 @@ func (m *QueueDeleteOKMethod) Serialize() ([]byte, error) {
 	result = append(result, msgCountBytes...)
 
 	return result, nil
+}
+
+// BasicQosMethod represents the basic.qos method
+type BasicQosMethod struct {
+	PrefetchSize  uint32
+	PrefetchCount uint16
+	Global        bool
+}
+
+// Serialize encodes the BasicQosMethod into a byte slice
+func (m *BasicQosMethod) Serialize() ([]byte, error) {
+	var result []byte
+
+	// Prefetch size (uint32)
+	prefetchSizeBytes := make([]byte, 4)
+	binary.BigEndian.PutUint32(prefetchSizeBytes, m.PrefetchSize)
+	result = append(result, prefetchSizeBytes...)
+
+	// Prefetch count (uint16)
+	prefetchCountBytes := make([]byte, 2)
+	binary.BigEndian.PutUint16(prefetchCountBytes, m.PrefetchCount)
+	result = append(result, prefetchCountBytes...)
+
+	// Global (bit packed)
+	var globalByte byte
+	if m.Global {
+		globalByte = 1
+	} else {
+		globalByte = 0
+	}
+	result = append(result, globalByte)
+
+	return result, nil
+}
+
+// Deserialize decodes the BasicQosMethod from a byte slice
+func (m *BasicQosMethod) Deserialize(data []byte) error {
+	if len(data) < 7 { // 4 bytes + 2 bytes + 1 byte
+		return fmt.Errorf("basic.qos method data too short")
+	}
+
+	offset := 0
+
+	// Prefetch size (uint32)
+	m.PrefetchSize = binary.BigEndian.Uint32(data[offset : offset+4])
+	offset += 4
+
+	// Prefetch count (uint16)
+	m.PrefetchCount = binary.BigEndian.Uint16(data[offset : offset+2])
+	offset += 2
+
+	// Global (bit)
+	if offset < len(data) {
+		m.Global = data[offset] != 0
+	}
+
+	return nil
+}
+
+// BasicQosOKMethod represents the basic.qos-ok method
+type BasicQosOKMethod struct {
+}
+
+// Serialize encodes the BasicQosOKMethod into a byte slice
+func (m *BasicQosOKMethod) Serialize() ([]byte, error) {
+	return []byte{}, nil // basic.qos-ok has no content
 }
 
 // encodeMethodFrame encodes a method into a method frame

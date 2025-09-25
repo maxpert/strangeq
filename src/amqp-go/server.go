@@ -154,21 +154,21 @@ func (s *Server) processConnectionFrames(conn *protocol.Connection) {
 		return
 	}
 	
-	// Send connection.open
-	if err := s.sendConnectionOpen(conn); err != nil {
-		s.Log.Error("Error sending connection open", zap.Error(err))
-		return
-	}
-	
-	// Wait for connection.open-ok from client
+	// Wait for connection.open from client
 	frame, err = protocol.ReadFrame(conn.Conn)
 	if err != nil {
-		s.Log.Error("Error reading connection.open-ok", zap.Error(err))
+		s.Log.Error("Error reading connection.open", zap.Error(err))
 		return
 	}
 	
 	if frame.Type != protocol.FrameMethod {
 		s.Log.Error("Expected method frame", zap.Int("type", int(frame.Type)))
+		return
+	}
+	
+	// Process connection.open method
+	if err := s.processConnectionOpen(conn, frame); err != nil {
+		s.Log.Error("Error processing connection.open", zap.Error(err))
 		return
 	}
 	
@@ -268,6 +268,22 @@ func (s *Server) sendConnectionTune(conn *protocol.Connection) error {
 	return protocol.WriteFrame(conn.Conn, frame)
 }
 
+// sendConnectionOpenOK sends the connection.open-ok method frame
+func (s *Server) sendConnectionOpenOK(conn *protocol.Connection) error {
+	openOKMethod := &protocol.ConnectionOpenOKMethod{
+		Reserved1: "", // Currently unused
+	}
+	
+	methodData, err := openOKMethod.Serialize()
+	if err != nil {
+		return fmt.Errorf("error serializing connection.open-ok: %v", err)
+	}
+	
+	frame := protocol.EncodeMethodFrame(10, 41, methodData) // 10.41 = connection.open-ok
+	
+	return protocol.WriteFrame(conn.Conn, frame)
+}
+
 // sendConnectionOpen sends the connection.open method frame
 func (s *Server) sendConnectionOpen(conn *protocol.Connection) error {
 	// Create the connection.open method
@@ -312,6 +328,49 @@ func (s *Server) processMethodFrame(conn *protocol.Connection, frame *protocol.F
 	default:
 		return fmt.Errorf("unknown class ID: %d", classID)
 	}
+}
+
+// processConnectionOpen handles the connection.open method
+func (s *Server) processConnectionOpen(conn *protocol.Connection, frame *protocol.Frame) error {
+	if len(frame.Payload) < 4 {
+		return fmt.Errorf("method frame payload too short")
+	}
+
+	classID := (uint16(frame.Payload[0]) << 8) | uint16(frame.Payload[1])
+	methodID := (uint16(frame.Payload[2]) << 8) | uint16(frame.Payload[3])
+
+	// Verify this is the connection.open method (class 10, method 40)
+	if classID != 10 || methodID != 40 {
+		return fmt.Errorf("expected connection.open (10.40) but got %d.%d", classID, methodID)
+	}
+
+	// Deserialize the connection.open method
+	openMethod := &protocol.ConnectionOpenMethod{}
+	err := openMethod.Deserialize(frame.Payload[4:])
+	if err != nil {
+		s.Log.Error("Failed to deserialize connection.open", zap.Error(err))
+		return err
+	}
+
+	// Validate the virtual host
+	// For now, allow "/" and empty string (which defaults to "/") 
+	// In a real implementation, we'd have proper vhost management
+	if openMethod.VirtualHost != "/" && openMethod.VirtualHost != "" {
+		return fmt.Errorf("access to vhost %s not allowed", openMethod.VirtualHost)
+	}
+
+	// Set the connection's vhost
+	conn.Vhost = openMethod.VirtualHost
+	if conn.Vhost == "" {
+		conn.Vhost = "/" // Default vhost
+	}
+
+	s.Log.Info("Connection opened", 
+		zap.String("connection_id", conn.ID),
+		zap.String("vhost", conn.Vhost))
+
+	// Send connection.open-ok
+	return s.sendConnectionOpenOK(conn)
 }
 
 // processConnectionMethod processes connection-level methods
@@ -362,6 +421,8 @@ func (s *Server) processChannelMethod(conn *protocol.Connection, frame *protocol
 		return s.processExchangeMethod(conn, frame.Channel, methodID, frame.Payload[4:])
 	case 50: // Queue class
 		return s.processQueueMethod(conn, frame.Channel, methodID, frame.Payload[4:])
+	case 60: // Basic class
+		return s.processBasicMethod(conn, frame.Channel, methodID, frame.Payload[4:])
 	default:
 		s.Log.Warn("Unknown class ID", 
 			zap.Uint16("class_id", classID),
@@ -774,6 +835,56 @@ func (s *Server) sendQueueDeleteOK(conn *protocol.Connection, channelID uint16, 
 	return protocol.WriteFrame(conn.Conn, frame)
 }
 
+// processBasicMethod handles basic-class methods
+func (s *Server) processBasicMethod(conn *protocol.Connection, channelID uint16, methodID uint16, payload []byte) error {
+	switch methodID {
+	case protocol.BasicQos: // Method ID 10 for basic class
+		return s.handleBasicQos(conn, channelID, payload)
+	default:
+		s.Log.Warn("Unknown basic method ID", 
+			zap.Uint16("method_id", methodID),
+			zap.Uint16("channel_id", channelID),
+			zap.String("connection_id", conn.ID))
+		return fmt.Errorf("unknown basic method ID: %d", methodID)
+	}
+}
+
+// handleBasicQos handles the basic.qos method
+func (s *Server) handleBasicQos(conn *protocol.Connection, channelID uint16, payload []byte) error {
+	// Deserialize the basic.qos method
+	qosMethod := &protocol.BasicQosMethod{}
+	err := qosMethod.Deserialize(payload)
+	if err != nil {
+		s.Log.Error("Failed to deserialize basic.qos", 
+			zap.Error(err),
+			zap.String("connection_id", conn.ID),
+			zap.Uint16("channel_id", channelID))
+		return err
+	}
+	
+	s.Log.Debug("Basic QoS settings", 
+		zap.Uint32("prefetch_size", qosMethod.PrefetchSize),
+		zap.Uint16("prefetch_count", qosMethod.PrefetchCount),
+		zap.Bool("global", qosMethod.Global))
+	
+	// For now, just acknowledge the QoS settings by sending basic.qos-ok
+	return s.sendBasicQosOK(conn, channelID)
+}
+
+// sendBasicQosOK sends the basic.qos-ok method frame
+func (s *Server) sendBasicQosOK(conn *protocol.Connection, channelID uint16) error {
+	qosOKMethod := &protocol.BasicQosOKMethod{}
+	
+	methodData, err := qosOKMethod.Serialize()
+	if err != nil {
+		return fmt.Errorf("error serializing basic.qos-ok: %v", err)
+	}
+	
+	frame := protocol.EncodeMethodFrameForChannel(channelID, 60, 11, methodData) // 60.11 = basic.qos-ok
+	
+	return protocol.WriteFrame(conn.Conn, frame)
+}
+
 // Stop gracefully stops the server
 func (s *Server) Stop() error {
 	s.Mutex.Lock()
@@ -784,6 +895,50 @@ func (s *Server) Stop() error {
 		return s.Listener.Close()
 	}
 	return nil
+}
+
+// StartWithQuitChannel starts the server and returns a quit channel that can be used to stop it
+func (s *Server) StartWithQuitChannel(quit <-chan struct{}) error {
+	// Listen on the specified address
+	listener, err := net.Listen("tcp", s.Addr)
+	if err != nil {
+		return fmt.Errorf("failed to start server: %v", err)
+	}
+	
+	s.Listener = listener
+	s.Log.Info("AMQP server listening", zap.String("addr", s.Addr))
+	
+	// Accept connections
+	for {
+		// Use a non-blocking approach with select to check for quit signal
+		connChan := make(chan net.Conn, 1)
+		errChan := make(chan error, 1)
+		
+		go func() {
+			conn, err := s.Listener.Accept()
+			connChan <- conn
+			errChan <- err
+		}()
+		
+		select {
+		case conn := <-connChan:
+			err := <-errChan
+			if err != nil {
+				if s.Shutdown {
+					return nil
+				}
+				s.Log.Error("Error accepting connection", zap.Error(err))
+				continue
+			}
+			
+			// Handle the connection in a goroutine
+			go s.handleConnection(conn)
+		case <-quit:
+			s.Log.Info("Server shutdown requested")
+			s.Listener.Close()
+			return nil
+		}
+	}
 }
 
 func main() {
