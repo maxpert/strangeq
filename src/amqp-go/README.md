@@ -4,7 +4,7 @@ A Go implementation of an AMQP 0.9.1 server based on the official specification.
 
 ## Current Status
 
-This is an early implementation focusing on Phase 1 of our development plan:
+This is an early implementation focusing on Phase 1 and Phase 1.5 of our development plan:
 
 - [x] Project setup and module initialization
 - [x] Core data structures (Connection, Channel, Exchange, Queue, Message)
@@ -16,6 +16,10 @@ This is an early implementation focusing on Phase 1 of our development plan:
 - [x] Simple in-memory storage for connections and channels
 - [x] Unit tests for core protocol parsing and connection/channel management
 - [x] Proper logging implementation using zap
+- [x] Build script for easy compilation
+- [x] Binary output to bin directory
+- [x] Command-line flags for configuration (address, log level, log file, daemonize)
+- [x] Proper server binary with configuration options
 
 ## Architecture
 
