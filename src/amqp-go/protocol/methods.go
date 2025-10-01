@@ -848,6 +848,16 @@ func (m *ExchangeDeleteOKMethod) Serialize() ([]byte, error) {
 	return []byte{}, nil
 }
 
+// ExchangeUnbindOKMethod represents the exchange.unbind-ok method
+type ExchangeUnbindOKMethod struct {
+}
+
+// Serialize encodes the ExchangeUnbindOKMethod into a byte slice
+func (m *ExchangeUnbindOKMethod) Serialize() ([]byte, error) {
+	// exchange.unbind-ok has no content
+	return []byte{}, nil
+}
+
 // QueueDeclareMethod represents the queue.declare method
 type QueueDeclareMethod struct {
 	Reserved1   uint16
@@ -1761,6 +1771,16 @@ func (m *BasicGetEmptyMethod) Serialize() ([]byte, error) {
 	return result, nil
 }
 
+// BasicDeliverOKMethod represents the basic.deliver-ok method (no content)
+type BasicDeliverOKMethod struct {
+}
+
+// Serialize encodes the BasicDeliverOKMethod into a byte slice
+func (m *BasicDeliverOKMethod) Serialize() ([]byte, error) {
+	// basic.deliver-ok has no content
+	return []byte{}, nil
+}
+
 // BasicAckMethod represents the basic.ack method
 type BasicAckMethod struct {
 	DeliveryTag uint64
@@ -1939,6 +1959,239 @@ func (m *BasicNackMethod) Deserialize(data []byte) error {
 	return nil
 }
 
+// BasicDeliverMethod represents the basic.deliver method
+type BasicDeliverMethod struct {
+	ConsumerTag  string
+	DeliveryTag  uint64
+	Redelivered  bool
+	Exchange     string
+	RoutingKey   string
+}
+
+// Serialize encodes the BasicDeliverMethod into a byte slice
+func (m *BasicDeliverMethod) Serialize() ([]byte, error) {
+	var result []byte
+
+	// Consumer tag (short string)
+	consumerTagBytes := encodeShortString(m.ConsumerTag)
+	result = append(result, consumerTagBytes...)
+
+	// Delivery tag (long long integer - 64-bit)
+	deliveryTagBytes := make([]byte, 8)
+	binary.BigEndian.PutUint64(deliveryTagBytes, m.DeliveryTag)
+	result = append(result, deliveryTagBytes...)
+
+	// Redelivered (packed into flags)
+	// bit 0: redelivered
+	// bits 1-15: unused (set to 0)
+	flags := uint16(0)
+	if m.Redelivered {
+		flags |= (1 << 0) // bit 0
+	}
+
+	flagBytes := make([]byte, 2)
+	binary.BigEndian.PutUint16(flagBytes, flags)
+	result = append(result, flagBytes...)
+
+	// Exchange (short string)
+	exchangeBytes := encodeShortString(m.Exchange)
+	result = append(result, exchangeBytes...)
+
+	// Routing key (short string)
+	routingKeyBytes := encodeShortString(m.RoutingKey)
+	result = append(result, routingKeyBytes...)
+
+	return result, nil
+}
+
+// Deserialize decodes the BasicDeliverMethod from a byte slice
+func (m *BasicDeliverMethod) Deserialize(data []byte) error {
+	if len(data) < 1 {  // Need at least consumer tag length byte
+		return fmt.Errorf("basic.deliver method data too short")
+	}
+
+	offset := 0
+
+	// Consumer tag (short string)
+	if offset >= len(data) {
+		return fmt.Errorf("consumer tag field missing")
+	}
+	consumerTag, newOffset, err := decodeShortString(data, offset)
+	if err != nil {
+		return fmt.Errorf("failed to decode consumer tag: %v", err)
+	}
+	m.ConsumerTag = consumerTag
+	offset = newOffset
+
+	// Delivery tag (long long integer - 64-bit)
+	if offset+8 > len(data) {
+		return fmt.Errorf("delivery tag field missing")
+	}
+	m.DeliveryTag = binary.BigEndian.Uint64(data[offset : offset+8])
+	offset += 8
+
+	// Flags (uint16)
+	if offset+2 > len(data) {
+		// If not enough bytes for flags, use defaults (false for redelivered)
+		m.Redelivered = false
+	} else {
+		flags := binary.BigEndian.Uint16(data[offset : offset+2])
+		offset += 2
+
+		// Extract flags
+		m.Redelivered = (flags & (1 << 0)) != 0
+	}
+
+	// Exchange (short string)
+	if offset >= len(data) {
+		return fmt.Errorf("exchange field missing")
+	}
+	exchange, newOffset, err := decodeShortString(data, offset)
+	if err != nil {
+		return fmt.Errorf("failed to decode exchange name: %v", err)
+	}
+	m.Exchange = exchange
+	offset = newOffset
+
+	// Routing key (short string)
+	if offset >= len(data) {
+		return fmt.Errorf("routing key field missing")
+	}
+	routingKey, newOffset, err := decodeShortString(data, offset)
+	if err != nil {
+		return fmt.Errorf("failed to decode routing key: %v", err)
+	}
+	m.RoutingKey = routingKey
+	offset = newOffset
+
+	return nil
+}
+
+// ExchangeUnbindMethod represents the exchange.unbind method
+type ExchangeUnbindMethod struct {
+	Reserved1   uint16
+	Destination string
+	Source      string
+	RoutingKey  string
+	NoWait      bool
+	Arguments   map[string]interface{}
+}
+
+// Serialize encodes the ExchangeUnbindMethod into a byte slice
+func (m *ExchangeUnbindMethod) Serialize() ([]byte, error) {
+	var result []byte
+
+	// Reserved1 (uint16)
+	reservedBytes := make([]byte, 2)
+	binary.BigEndian.PutUint16(reservedBytes, m.Reserved1)
+	result = append(result, reservedBytes...)
+
+	// Destination (short string)
+	destBytes := encodeShortString(m.Destination)
+	result = append(result, destBytes...)
+
+	// Source (short string)
+	sourceBytes := encodeShortString(m.Source)
+	result = append(result, sourceBytes...)
+
+	// Routing key (short string)
+	routingKeyBytes := encodeShortString(m.RoutingKey)
+	result = append(result, routingKeyBytes...)
+
+	// Flags (packed into uint16)
+	// bit 0: no-wait
+	// bits 1-15: unused (set to 0)
+	flags := uint16(0)
+	if m.NoWait {
+		flags |= (1 << 0) // bit 0
+	}
+
+	flagBytes := make([]byte, 2)
+	binary.BigEndian.PutUint16(flagBytes, flags)
+	result = append(result, flagBytes...)
+
+	// Arguments (field table)
+	argsBytes, err := encodeFieldTable(m.Arguments)
+	if err != nil {
+		return nil, err
+	}
+	result = append(result, argsBytes...)
+
+	return result, nil
+}
+
+// Deserialize decodes the ExchangeUnbindMethod from a byte slice
+func (m *ExchangeUnbindMethod) Deserialize(data []byte) error {
+	if len(data) < 4 {  // Need at least reserved(2) + destination length byte(1)
+		return fmt.Errorf("exchange.unbind method data too short")
+	}
+
+	offset := 0
+
+	// Reserved1 (uint16)
+	m.Reserved1 = binary.BigEndian.Uint16(data[offset : offset+2])
+	offset += 2
+
+	// Destination (short string)
+	if offset >= len(data) {
+		return fmt.Errorf("destination field missing")
+	}
+	dest, newOffset, err := decodeShortString(data, offset)
+	if err != nil {
+		return fmt.Errorf("failed to decode destination: %v", err)
+	}
+	m.Destination = dest
+	offset = newOffset
+
+	// Source (short string)
+	if offset >= len(data) {
+		return fmt.Errorf("source field missing")
+	}
+	source, newOffset, err := decodeShortString(data, offset)
+	if err != nil {
+		return fmt.Errorf("failed to decode source: %v", err)
+	}
+	m.Source = source
+	offset = newOffset
+
+	// Routing key (short string)
+	if offset >= len(data) {
+		return fmt.Errorf("routing key field missing")
+	}
+	routingKey, newOffset, err := decodeShortString(data, offset)
+	if err != nil {
+		return fmt.Errorf("failed to decode routing key: %v", err)
+	}
+	m.RoutingKey = routingKey
+	offset = newOffset
+
+	// Flags (uint16)
+	if offset+2 > len(data) {
+		// If not enough bytes for flags, use defaults (false for no-wait)
+		m.NoWait = false
+		return nil
+	}
+	flags := binary.BigEndian.Uint16(data[offset : offset+2])
+	offset += 2
+
+	// Extract flags
+	m.NoWait = (flags & (1 << 0)) != 0
+
+	// Arguments (field table)
+	if offset < len(data) {
+		var err error
+		m.Arguments, offset, err = decodeFieldTable(data, offset)
+		if err != nil {
+			return err
+		}
+	} else {
+		// If no more data, initialize empty arguments map
+		m.Arguments = make(map[string]interface{})
+	}
+
+	return nil
+}
+
 // encodeMethodFrame encodes a method into a method frame
 func EncodeMethodFrame(classID, methodID uint16, methodData []byte) *Frame {
 	// A method frame contains: class ID (2 bytes) + method ID (2 bytes) + method-specific content
@@ -1968,5 +2221,65 @@ func EncodeMethodFrameForChannel(channelID uint16, classID, methodID uint16, met
 		Channel: channelID, // For channel-level methods
 		Size:    uint32(len(methodFrameContent)),
 		Payload: methodFrameContent,
+	}
+}
+
+// EncodeHeaderFrameForChannel encodes a content header into a header frame for a specific channel
+func EncodeHeaderFrameForChannel(channelID uint16, classID uint16, headerData []byte) *Frame {
+	// A content header frame contains: class ID (2 bytes) + weight (2 bytes) + body size (8 bytes) + 
+	// property flags (2 bytes) + properties (variable length based on property flags)
+	
+	// For now, we'll create a minimal header frame
+	// In a real implementation, you'd have proper header data
+	
+	return &Frame{
+		Type:    FrameHeader,
+		Channel: channelID,
+		Size:    uint32(len(headerData)),
+		Payload: headerData,
+	}
+}
+
+// EncodeContentHeaderFrameForChannel properly encodes a content header frame for a specific channel
+func EncodeContentHeaderFrameForChannel(channelID uint16, classID, weight uint16, bodySize uint64, propertyFlags uint16, properties []byte) *Frame {
+	// A content header frame contains:
+	// - Class ID (2 bytes)
+	// - Weight (2 bytes)
+	// - Body size (8 bytes)
+	// - Property flags (2 bytes)
+	// - Properties (variable length)
+	
+	headerContent := make([]byte, 14+len(properties))
+	
+	// Class ID (2 bytes)
+	binary.BigEndian.PutUint16(headerContent[0:2], classID)
+	
+	// Weight (2 bytes)
+	binary.BigEndian.PutUint16(headerContent[2:4], weight)
+	
+	// Body size (8 bytes)
+	binary.BigEndian.PutUint64(headerContent[4:12], bodySize)
+	
+	// Property flags (2 bytes)
+	binary.BigEndian.PutUint16(headerContent[12:14], propertyFlags)
+	
+	// Properties (variable length)
+	copy(headerContent[14:], properties)
+	
+	return &Frame{
+		Type:    FrameHeader,
+		Channel: channelID,
+		Size:    uint32(len(headerContent)),
+		Payload: headerContent,
+	}
+}
+
+// EncodeBodyFrameForChannel encodes a content body into a body frame for a specific channel
+func EncodeBodyFrameForChannel(channelID uint16, bodyData []byte) *Frame {
+	return &Frame{
+		Type:    FrameBody,
+		Channel: channelID,
+		Size:    uint32(len(bodyData)),
+		Payload: bodyData,
 	}
 }

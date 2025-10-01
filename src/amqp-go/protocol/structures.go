@@ -38,6 +38,9 @@ type Channel struct {
 	Mutex      sync.RWMutex
 	Consumers  map[string]*Consumer  // Consumer tag -> Consumer
 	DeliveryTag uint64              // Used for delivery tags in acknowledgements
+	PrefetchCount uint16            // Channel-level prefetch count
+	PrefetchSize  uint32            // Channel-level prefetch size (0 = unlimited)
+	GlobalPrefetch bool             // Apply prefetch settings globally
 }
 
 // NewChannel creates a new AMQP channel
@@ -47,6 +50,9 @@ func NewChannel(id uint16, conn *Connection) *Channel {
 		Connection: conn,
 		Consumers:  make(map[string]*Consumer),
 		DeliveryTag: 0,  // Will be incremented for each delivery
+		PrefetchCount: 0, // No limit by default
+		PrefetchSize: 0,  // No limit by default
+		GlobalPrefetch: false, // Per-consumer by default
 	}
 }
 
@@ -136,6 +142,8 @@ type Consumer struct {
 	Args        map[string]interface{}
 	Messages    chan *Delivery
 	Cancel      chan struct{}
+	PrefetchCount uint16  // Maximum number of unacknowledged messages
+	CurrentUnacked uint64 // Current count of unacknowledged messages
 }
 
 // ConsumerDelivery represents a message delivered to a consumer

@@ -6,6 +6,7 @@ import (
 	"net"
 	"os"
 	"sync"
+	"time"
 
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
@@ -101,6 +102,9 @@ func (s *Server) handleConnection(conn net.Conn) {
 	s.Connections[connection.ID] = connection
 	s.Mutex.Unlock()
 	
+	// Start consumer delivery loop for this connection
+	go s.consumerDeliveryLoop(connection)
+	
 	// Process frames for this connection
 	s.processConnectionFrames(connection)
 	
@@ -108,6 +112,128 @@ func (s *Server) handleConnection(conn net.Conn) {
 	s.Mutex.Lock()
 	delete(s.Connections, connection.ID)
 	s.Mutex.Unlock()
+}
+
+// consumerDeliveryLoop continuously reads from consumer channels and sends messages to clients
+func (s *Server) consumerDeliveryLoop(conn *protocol.Connection) {
+	s.Log.Info("Starting consumer delivery loop", zap.String("connection_id", conn.ID))
+	
+	// This loop reads from consumer channels and sends basic.deliver frames to clients
+	
+	// Create a map to track consumer channels we're reading from
+	consumerChannels := make(map[string]chan *protocol.Delivery)
+	
+	for {
+		// Check if connection is closed
+		conn.Mutex.RLock()
+		closed := conn.Closed
+		conn.Mutex.RUnlock()
+		
+		if closed {
+			s.Log.Debug("Connection closed, stopping consumer delivery loop", zap.String("connection_id", conn.ID))
+			break
+		}
+		
+		// Refresh the list of consumer channels periodically
+		// In a real implementation, you'd use a more sophisticated approach
+		conn.Mutex.Lock()
+		channelCount := len(conn.Channels)
+		consumerCount := 0
+		for _, channel := range conn.Channels {
+			channel.Mutex.RLock()
+			for _, consumer := range channel.Consumers {
+				consumerCount++
+				// Add consumer's message channel to our tracking map if not already there
+				if _, exists := consumerChannels[consumer.Tag]; !exists {
+					consumerChannels[consumer.Tag] = consumer.Messages
+					s.Log.Info("Added consumer to delivery loop", 
+						zap.String("consumer_tag", consumer.Tag),
+						zap.String("queue", consumer.Queue))
+				}
+			}
+			channel.Mutex.RUnlock()
+		}
+		conn.Mutex.Unlock()
+		
+		s.Log.Info("Consumer delivery loop iteration", 
+			zap.String("connection_id", conn.ID),
+			zap.Int("channels", channelCount),
+			zap.Int("consumers", consumerCount),
+			zap.Int("tracked_channels", len(consumerChannels)))
+		
+		// Check each consumer channel for messages
+		for consumerTag, msgChan := range consumerChannels {
+			s.Log.Debug("Checking consumer channel", 
+				zap.String("consumer_tag", consumerTag),
+				zap.Int("buffered_messages", len(msgChan)))
+			
+			select {
+			case delivery := <-msgChan:
+				// Got a message, send it to the client
+				s.Log.Info("Sending message to consumer", 
+					zap.String("consumer_tag", consumerTag),
+					zap.Uint64("delivery_tag", delivery.DeliveryTag),
+					zap.String("exchange", delivery.Exchange),
+					zap.String("routing_key", delivery.RoutingKey))
+				
+				// Find the channel and consumer for this delivery
+				var targetChannel *protocol.Channel
+				var targetConsumer *protocol.Consumer
+				
+				conn.Mutex.RLock()
+				for _, channel := range conn.Channels {
+					channel.Mutex.RLock()
+					if consumer, exists := channel.Consumers[consumerTag]; exists {
+						targetChannel = channel
+						targetConsumer = consumer
+						channel.Mutex.RUnlock()
+						break
+					}
+					channel.Mutex.RUnlock()
+				}
+				conn.Mutex.RUnlock()
+				
+				if targetChannel != nil && targetConsumer != nil {
+					s.Log.Info("About to send basic.deliver", 
+						zap.String("consumer_tag", consumerTag),
+						zap.Uint16("channel_id", targetChannel.ID))
+					
+					// Send basic.deliver frame to the client
+					err := s.sendBasicDeliver(
+						conn,
+						targetChannel.ID,
+						consumerTag,
+						delivery.DeliveryTag,
+						delivery.Redelivered,
+						delivery.Exchange,
+						delivery.RoutingKey,
+						delivery.Message,
+					)
+					if err != nil {
+						s.Log.Error("Failed to send basic.deliver", 
+							zap.Error(err),
+							zap.String("consumer_tag", consumerTag))
+					} else {
+						s.Log.Info("Sent basic.deliver successfully", 
+							zap.String("consumer_tag", consumerTag),
+							zap.Uint64("delivery_tag", delivery.DeliveryTag))
+					}
+				} else {
+					s.Log.Info("Could not find target channel/consumer", 
+						zap.String("consumer_tag", consumerTag))
+				}
+			default:
+				// No message available on this channel, continue to next
+				s.Log.Debug("No message available on consumer channel", 
+					zap.String("consumer_tag", consumerTag))
+			}
+		}
+		
+		// Sleep briefly to prevent busy waiting
+		time.Sleep(10 * time.Millisecond)
+	}
+	
+	s.Log.Debug("Consumer delivery loop stopped", zap.String("connection_id", conn.ID))
 }
 
 // processConnectionFrames reads and processes frames from a connection
@@ -474,6 +600,8 @@ func (s *Server) processExchangeMethod(conn *protocol.Connection, channelID uint
 		return s.handleExchangeDeclare(conn, channelID, payload)
 	case protocol.ExchangeDelete: // Method ID 20 for exchange class
 		return s.handleExchangeDelete(conn, channelID, payload)
+	case protocol.ExchangeUnbind: // Method ID 40 for exchange class
+		return s.handleExchangeUnbind(conn, channelID, payload)
 	default:
 		s.Log.Warn("Unknown exchange method ID", 
 			zap.Uint16("method_id", methodID),
@@ -574,6 +702,32 @@ func (s *Server) handleExchangeDelete(conn *protocol.Connection, channelID uint1
 	
 	// Send exchange.delete-ok response
 	return s.sendExchangeDeleteOK(conn, channelID)
+}
+
+// handleExchangeUnbind handles the exchange.unbind method
+func (s *Server) handleExchangeUnbind(conn *protocol.Connection, channelID uint16, payload []byte) error {
+	// Deserialize the exchange.unbind method
+	unbindMethod := &protocol.ExchangeUnbindMethod{}
+	err := unbindMethod.Deserialize(payload)
+	if err != nil {
+		s.Log.Error("Failed to deserialize exchange.unbind", 
+			zap.Error(err),
+			zap.String("connection_id", conn.ID),
+			zap.Uint16("channel_id", channelID))
+		return err
+	}
+	
+	s.Log.Info("Exchange unbound", 
+		zap.String("destination", unbindMethod.Destination),
+		zap.String("source", unbindMethod.Source),
+		zap.String("routing_key", unbindMethod.RoutingKey))
+	
+	// Call the broker to unbind the exchange
+	// In a real implementation, you'd remove the binding between source and destination exchanges
+	// For now, we'll just log the operation
+	
+	// Send exchange.unbind-ok response
+	return s.sendExchangeUnbindOK(conn, channelID)
 }
 
 // handleQueueDeclare handles the queue.declare method
@@ -798,6 +952,20 @@ func (s *Server) sendExchangeDeleteOK(conn *protocol.Connection, channelID uint1
 	return protocol.WriteFrame(conn.Conn, frame)
 }
 
+// sendExchangeUnbindOK sends the exchange.unbind-ok method frame
+func (s *Server) sendExchangeUnbindOK(conn *protocol.Connection, channelID uint16) error {
+	unbindOKMethod := &protocol.ExchangeUnbindOKMethod{}
+	
+	methodData, err := unbindOKMethod.Serialize()
+	if err != nil {
+		return fmt.Errorf("error serializing exchange.unbind-ok: %v", err)
+	}
+	
+	frame := protocol.EncodeMethodFrameForChannel(channelID, 40, 41, methodData) // 40.41 = exchange.unbind-ok
+	
+	return protocol.WriteFrame(conn.Conn, frame)
+}
+
 // sendQueueDeclareOK sends the queue.declare-ok method frame
 func (s *Server) sendQueueDeclareOK(conn *protocol.Connection, channelID uint16, queueName string, messageCount, consumerCount uint32) error {
 	declareOKMethod := &protocol.QueueDeclareOKMethod{
@@ -892,7 +1060,26 @@ func (s *Server) handleBasicQos(conn *protocol.Connection, channelID uint16, pay
 		zap.Uint16("prefetch_count", qosMethod.PrefetchCount),
 		zap.Bool("global", qosMethod.Global))
 	
-	// For now, just acknowledge the QoS settings by sending basic.qos-ok
+	// Get the channel
+	conn.Mutex.RLock()
+	channel, exists := conn.Channels[channelID]
+	conn.Mutex.RUnlock()
+	
+	if !exists {
+		return fmt.Errorf("channel %d does not exist", channelID)
+	}
+	
+	// Update channel prefetch settings
+	channel.Mutex.Lock()
+	channel.PrefetchCount = qosMethod.PrefetchCount
+	channel.PrefetchSize = qosMethod.PrefetchSize
+	channel.GlobalPrefetch = qosMethod.Global
+	channel.Mutex.Unlock()
+	
+	// If global is true, we would apply these settings to all channels
+	// For now, we'll just apply to this channel
+	
+	// Send basic.qos-ok response
 	return s.sendBasicQosOK(conn, channelID)
 }
 
@@ -1306,6 +1493,212 @@ func (s *Server) sendBasicCancelOK(conn *protocol.Connection, channelID uint16, 
 	return protocol.WriteFrame(conn.Conn, frame)
 }
 
+// sendBasicDeliver sends a basic.deliver method frame to a consumer
+func (s *Server) sendBasicDeliver(conn *protocol.Connection, channelID uint16, consumerTag string, deliveryTag uint64, redelivered bool, exchange, routingKey string, message *protocol.Message) error {
+	s.Log.Debug("Entering sendBasicDeliver", 
+		zap.String("consumer_tag", consumerTag),
+		zap.Uint16("channel_id", channelID),
+		zap.Uint64("delivery_tag", deliveryTag),
+		zap.String("exchange", exchange),
+		zap.String("routing_key", routingKey),
+		zap.Int("message_body_size", len(message.Body)))
+	
+	deliverMethod := &protocol.BasicDeliverMethod{
+		ConsumerTag: consumerTag,
+		DeliveryTag: deliveryTag,
+		Redelivered: redelivered,
+		Exchange:    exchange,
+		RoutingKey:  routingKey,
+	}
+	
+	methodData, err := deliverMethod.Serialize()
+	if err != nil {
+		s.Log.Error("Error serializing basic.deliver", zap.Error(err))
+		return fmt.Errorf("error serializing basic.deliver: %v", err)
+	}
+	
+	frame := protocol.EncodeMethodFrameForChannel(channelID, 60, 60, methodData) // 60.60 = basic.deliver
+	
+	s.Log.Debug("About to send basic.deliver method frame", 
+		zap.String("consumer_tag", consumerTag),
+		zap.Uint16("channel_id", channelID))
+	
+	// Send the method frame first
+	err = protocol.WriteFrame(conn.Conn, frame)
+	if err != nil {
+		s.Log.Error("Error sending basic.deliver method frame", zap.Error(err))
+		return fmt.Errorf("error sending basic.deliver method frame: %v", err)
+	}
+	s.Log.Debug("Sent basic.deliver method frame successfully", 
+		zap.String("consumer_tag", consumerTag),
+		zap.Uint16("channel_id", channelID))
+	
+	// Continue with content header and body frames
+	s.Log.Debug("Continuing with content header and body frames", 
+		zap.String("consumer_tag", consumerTag),
+		zap.Uint16("channel_id", channelID))
+	
+	// Send content header frame
+	// Create a content header frame with the message properties
+	contentHeader := &protocol.ContentHeader{
+		ClassID:       60, // basic class
+		Weight:        0,
+		BodySize:      uint64(len(message.Body)),
+		PropertyFlags: 0,
+		Headers:       message.Headers,
+		ContentType:   message.ContentType,
+		ContentEncoding: message.ContentEncoding,
+		DeliveryMode:  message.DeliveryMode,
+		Priority:      message.Priority,
+		CorrelationID: message.CorrelationID,
+		ReplyTo:       message.ReplyTo,
+		Expiration:    message.Expiration,
+		MessageID:     message.MessageID,
+		Timestamp:     message.Timestamp,
+		Type:          message.Type,
+		UserID:        message.UserID,
+		AppID:         message.AppID,
+		ClusterID:     message.ClusterID,
+	}
+	
+	// Set property flags based on which properties are set
+	propertyFlags := uint16(0)
+	if len(message.Headers) > 0 {
+		propertyFlags |= protocol.FlagHeaders // headers
+	}
+	if message.ContentType != "" {
+		propertyFlags |= protocol.FlagContentType // content-type
+	}
+	if message.ContentEncoding != "" {
+		propertyFlags |= protocol.FlagContentEncoding // content-encoding
+	}
+	if message.DeliveryMode != 0 {
+		propertyFlags |= protocol.FlagDeliveryMode // delivery-mode
+	}
+	if message.Priority != 0 {
+		propertyFlags |= protocol.FlagPriority // priority
+	}
+	if message.CorrelationID != "" {
+		propertyFlags |= protocol.FlagCorrelationID // correlation-id
+	}
+	if message.ReplyTo != "" {
+		propertyFlags |= protocol.FlagReplyTo // reply-to
+	}
+	if message.Expiration != "" {
+		propertyFlags |= protocol.FlagExpiration // expiration
+	}
+	if message.MessageID != "" {
+		propertyFlags |= protocol.FlagMessageID // message-id
+	}
+	if message.Timestamp != 0 {
+		propertyFlags |= protocol.FlagTimestamp // timestamp
+	}
+	if message.Type != "" {
+		propertyFlags |= protocol.FlagType // type
+	}
+	if message.UserID != "" {
+		propertyFlags |= protocol.FlagUserID // user-id
+	}
+	if message.AppID != "" {
+		propertyFlags |= protocol.FlagAppID // app-id
+	}
+	if message.ClusterID != "" {
+		propertyFlags |= protocol.FlagClusterID // cluster-id
+	}
+	
+	contentHeader.PropertyFlags = propertyFlags
+	
+	// Encode the content header using the proper protocol function
+	s.Log.Debug("About to serialize content header", 
+		zap.String("consumer_tag", consumerTag),
+		zap.Uint16("channel_id", channelID),
+		zap.Uint64("body_size", uint64(len(message.Body))))
+	
+	headerData, err := contentHeader.Serialize()
+	if err != nil {
+		s.Log.Error("Error serializing content header", zap.Error(err))
+		return fmt.Errorf("error serializing content header: %v", err)
+	}
+	
+	s.Log.Debug("Serialized content header successfully", 
+		zap.String("consumer_tag", consumerTag),
+		zap.Uint16("channel_id", channelID),
+		zap.Int("header_data_size", len(headerData)))
+	
+	// Create the header frame using the proper protocol function
+	s.Log.Debug("Creating content header frame", 
+		zap.String("consumer_tag", consumerTag),
+		zap.Uint16("channel_id", channelID),
+		zap.Uint64("body_size", uint64(len(message.Body))),
+		zap.Uint16("property_flags", propertyFlags))
+	
+	// The headerData contains: classID(2) + weight(2) + bodySize(8) + propertyFlags(2) + properties(variable)
+	// We only want to pass the properties part (after the fixed header fields)
+	properties := make([]byte, 0)
+	if len(headerData) > 14 { // 2+2+8+2 = 14 bytes for fixed header fields
+		properties = headerData[14:]
+	}
+	
+	headerFrame := protocol.EncodeContentHeaderFrameForChannel(
+		channelID,     // channel ID
+		60,            // class ID (basic class)
+		0,             // weight
+		uint64(len(message.Body)), // body size
+		propertyFlags, // property flags
+		properties,    // properties data
+	)
+	
+	s.Log.Debug("Sending content header frame", 
+		zap.String("consumer_tag", consumerTag),
+		zap.Uint16("channel_id", channelID),
+		zap.Uint64("body_size", contentHeader.BodySize))
+	
+	// Send the content header frame
+	err = protocol.WriteFrame(conn.Conn, headerFrame)
+	if err != nil {
+		s.Log.Error("Error sending content header frame", 
+			zap.Error(err),
+			zap.String("consumer_tag", consumerTag),
+			zap.Uint16("channel_id", channelID))
+		return fmt.Errorf("error sending content header frame: %v", err)
+	}
+	s.Log.Debug("Sent content header frame successfully", 
+		zap.String("consumer_tag", consumerTag),
+		zap.Uint16("channel_id", channelID))
+	
+	// Send content body frame using the proper protocol function
+	s.Log.Debug("Creating body frame", 
+		zap.String("consumer_tag", consumerTag),
+		zap.Uint16("channel_id", channelID),
+		zap.Int("body_size", len(message.Body)))
+	
+	bodyFrame := protocol.EncodeBodyFrameForChannel(channelID, message.Body)
+	
+	s.Log.Debug("Sending body frame", 
+		zap.String("consumer_tag", consumerTag),
+		zap.Uint16("channel_id", channelID),
+		zap.Int("body_size", len(message.Body)))
+	
+	err = protocol.WriteFrame(conn.Conn, bodyFrame)
+	if err != nil {
+		s.Log.Error("Error sending body frame", 
+			zap.Error(err),
+			zap.String("consumer_tag", consumerTag),
+			zap.Uint16("channel_id", channelID))
+		return fmt.Errorf("error sending body frame: %v", err)
+	}
+	s.Log.Debug("Sent body frame successfully", 
+		zap.String("consumer_tag", consumerTag),
+		zap.Uint16("channel_id", channelID),
+		zap.Int("body_size", len(message.Body)))
+	
+	s.Log.Debug("Sent basic.deliver method, header, and body frames successfully", 
+		zap.String("consumer_tag", consumerTag),
+		zap.Uint16("channel_id", channelID))
+	
+	return nil
+}
+
 // sendBasicGetEmpty sends the basic.get-empty method frame
 func (s *Server) sendBasicGetEmpty(conn *protocol.Connection, channelID uint16) error {
 	getEmptyMethod := &protocol.BasicGetEmptyMethod{
@@ -1339,13 +1732,53 @@ func (s *Server) handleBasicAck(conn *protocol.Connection, channelID uint16, pay
 		zap.Uint64("delivery_tag", ackMethod.DeliveryTag),
 		zap.Bool("multiple", ackMethod.Multiple))
 	
-	// In a real implementation, we would:
-	// 1. Remove acknowledged messages from unacknowledged message tracking
-	// 2. If multiple=true, acknowledge all messages up to the delivery tag
-	// 3. Update broker state to reflect acknowledged messages
+	// We need to determine which consumer sent this acknowledgment
+	// In a real implementation, we would have a better way to track this
+	// For now, we'll look through all consumers on this channel
 	
-	// For now, we'll just log the acknowledgment
+	conn.Mutex.RLock()
+	channel, exists := conn.Channels[channelID]
+	conn.Mutex.RUnlock()
+	
+	if !exists {
+		return fmt.Errorf("channel %d does not exist", channelID)
+	}
+	
+	// Find the consumer that sent this acknowledgment
+	// In a real implementation, you'd have a better way to associate deliveries with consumers
+	var consumerTag string
+	channel.Mutex.RLock()
+	for tag, consumer := range channel.Consumers {
+		// Check if this consumer might have sent this delivery
+		// In a real implementation, you'd track delivery tags per consumer
+		if consumer.Channel.DeliveryTag >= ackMethod.DeliveryTag {
+			consumerTag = tag
+			break
+		}
+	}
+	channel.Mutex.RUnlock()
+	
+	if consumerTag == "" {
+		s.Log.Warn("Could not find consumer for acknowledgment", 
+			zap.Uint64("delivery_tag", ackMethod.DeliveryTag),
+			zap.String("connection_id", conn.ID),
+			zap.Uint16("channel_id", channelID))
+		return nil // Not an error, just a warning
+	}
+	
+	// Tell the broker to acknowledge the message
+	err = s.Broker.AcknowledgeMessage(consumerTag, ackMethod.DeliveryTag, ackMethod.Multiple)
+	if err != nil {
+		s.Log.Error("Failed to acknowledge message in broker", 
+			zap.Error(err),
+			zap.String("consumer_tag", consumerTag),
+			zap.Uint64("delivery_tag", ackMethod.DeliveryTag),
+			zap.Bool("multiple", ackMethod.Multiple))
+		return err
+	}
+	
 	s.Log.Info("Message acknowledged", 
+		zap.String("consumer_tag", consumerTag),
 		zap.Uint64("delivery_tag", ackMethod.DeliveryTag),
 		zap.Bool("multiple", ackMethod.Multiple),
 		zap.String("connection_id", conn.ID),
@@ -1371,14 +1804,50 @@ func (s *Server) handleBasicReject(conn *protocol.Connection, channelID uint16, 
 		zap.Uint64("delivery_tag", rejectMethod.DeliveryTag),
 		zap.Bool("requeue", rejectMethod.Requeue))
 	
-	// In a real implementation, we would:
-	// 1. Remove the rejected message from unacknowledged message tracking
-	// 2. If requeue=true, put the message back on the queue for redelivery
-	// 3. If requeue=false, discard or dead-letter the message
-	// 4. Update broker state accordingly
+	// We need to determine which consumer sent this rejection
+	// In a real implementation, we would have a better way to track this
 	
-	// For now, we'll just log the rejection
+	conn.Mutex.RLock()
+	channel, exists := conn.Channels[channelID]
+	conn.Mutex.RUnlock()
+	
+	if !exists {
+		return fmt.Errorf("channel %d does not exist", channelID)
+	}
+	
+	// Find the consumer that sent this rejection
+	var consumerTag string
+	channel.Mutex.RLock()
+	for tag, consumer := range channel.Consumers {
+		// Check if this consumer might have sent this delivery
+		if consumer.Channel.DeliveryTag >= rejectMethod.DeliveryTag {
+			consumerTag = tag
+			break
+		}
+	}
+	channel.Mutex.RUnlock()
+	
+	if consumerTag == "" {
+		s.Log.Warn("Could not find consumer for rejection", 
+			zap.Uint64("delivery_tag", rejectMethod.DeliveryTag),
+			zap.String("connection_id", conn.ID),
+			zap.Uint16("channel_id", channelID))
+		return nil // Not an error, just a warning
+	}
+	
+	// Tell the broker to reject the message
+	err = s.Broker.RejectMessage(consumerTag, rejectMethod.DeliveryTag, rejectMethod.Requeue)
+	if err != nil {
+		s.Log.Error("Failed to reject message in broker", 
+			zap.Error(err),
+			zap.String("consumer_tag", consumerTag),
+			zap.Uint64("delivery_tag", rejectMethod.DeliveryTag),
+			zap.Bool("requeue", rejectMethod.Requeue))
+		return err
+	}
+	
 	s.Log.Info("Message rejected", 
+		zap.String("consumer_tag", consumerTag),
 		zap.Uint64("delivery_tag", rejectMethod.DeliveryTag),
 		zap.Bool("requeue", rejectMethod.Requeue),
 		zap.String("connection_id", conn.ID),
@@ -1405,15 +1874,51 @@ func (s *Server) handleBasicNack(conn *protocol.Connection, channelID uint16, pa
 		zap.Bool("multiple", nackMethod.Multiple),
 		zap.Bool("requeue", nackMethod.Requeue))
 	
-	// In a real implementation, we would:
-	// 1. Remove nacked messages from unacknowledged message tracking
-	// 2. If multiple=true, nack all messages up to the delivery tag
-	// 3. If requeue=true, put the messages back on the queue for redelivery
-	// 4. If requeue=false, discard or dead-letter the messages
-	// 5. Update broker state accordingly
+	// We need to determine which consumer sent this nack
+	// In a real implementation, we would have a better way to track this
 	
-	// For now, we'll just log the negative acknowledgment
+	conn.Mutex.RLock()
+	channel, exists := conn.Channels[channelID]
+	conn.Mutex.RUnlock()
+	
+	if !exists {
+		return fmt.Errorf("channel %d does not exist", channelID)
+	}
+	
+	// Find the consumer that sent this nack
+	var consumerTag string
+	channel.Mutex.RLock()
+	for tag, consumer := range channel.Consumers {
+		// Check if this consumer might have sent this delivery
+		if consumer.Channel.DeliveryTag >= nackMethod.DeliveryTag {
+			consumerTag = tag
+			break
+		}
+	}
+	channel.Mutex.RUnlock()
+	
+	if consumerTag == "" {
+		s.Log.Warn("Could not find consumer for nack", 
+			zap.Uint64("delivery_tag", nackMethod.DeliveryTag),
+			zap.String("connection_id", conn.ID),
+			zap.Uint16("channel_id", channelID))
+		return nil // Not an error, just a warning
+	}
+	
+	// Tell the broker to nack the message
+	err = s.Broker.NacknowledgeMessage(consumerTag, nackMethod.DeliveryTag, nackMethod.Multiple, nackMethod.Requeue)
+	if err != nil {
+		s.Log.Error("Failed to nack message in broker", 
+			zap.Error(err),
+			zap.String("consumer_tag", consumerTag),
+			zap.Uint64("delivery_tag", nackMethod.DeliveryTag),
+			zap.Bool("multiple", nackMethod.Multiple),
+			zap.Bool("requeue", nackMethod.Requeue))
+		return err
+	}
+	
 	s.Log.Info("Message negatively acknowledged", 
+		zap.String("consumer_tag", consumerTag),
 		zap.Uint64("delivery_tag", nackMethod.DeliveryTag),
 		zap.Bool("multiple", nackMethod.Multiple),
 		zap.Bool("requeue", nackMethod.Requeue),
