@@ -7,83 +7,83 @@ import (
 
 // Method IDs for connection class
 const (
-	ConnectionStart     = 10
-	ConnectionStartOK   = 11
-	ConnectionSecure    = 20
-	ConnectionSecureOK  = 21
-	ConnectionTune      = 30
-	ConnectionTuneOK    = 31
-	ConnectionOpen      = 40
-	ConnectionOpenOK    = 41
-	ConnectionClose     = 50
-	ConnectionCloseOK   = 51
+	ConnectionStart    = 10
+	ConnectionStartOK  = 11
+	ConnectionSecure   = 20
+	ConnectionSecureOK = 21
+	ConnectionTune     = 30
+	ConnectionTuneOK   = 31
+	ConnectionOpen     = 40
+	ConnectionOpenOK   = 41
+	ConnectionClose    = 50
+	ConnectionCloseOK  = 51
 )
 
 // Method IDs for channel class
 const (
-	ChannelOpen      = 10
-	ChannelOpenOK    = 11
-	ChannelFlow      = 20
-	ChannelFlowOK    = 21
-	ChannelClose     = 40
-	ChannelCloseOK   = 41
+	ChannelOpen    = 10
+	ChannelOpenOK  = 11
+	ChannelFlow    = 20
+	ChannelFlowOK  = 21
+	ChannelClose   = 40
+	ChannelCloseOK = 41
 )
 
 // Method IDs for exchange class
 const (
-	ExchangeDeclare  = 10  // 40.10 - class ID 40, method ID 10
+	ExchangeDeclare   = 10 // 40.10 - class ID 40, method ID 10
 	ExchangeDeclareOK = 11 // 40.11 - class ID 40, method ID 11
-	ExchangeDelete   = 20  // 40.20 - class ID 40, method ID 20
-	ExchangeDeleteOK = 21  // 40.21 - class ID 40, method ID 21
-	ExchangeBind     = 30  // 40.30 - class ID 40, method ID 30
-	ExchangeBindOK   = 31  // 40.31 - class ID 40, method ID 31
-	ExchangeUnbind   = 40  // 40.40 - class ID 40, method ID 40
-	ExchangeUnbindOK = 41  // 40.41 - class ID 40, method ID 41
+	ExchangeDelete    = 20 // 40.20 - class ID 40, method ID 20
+	ExchangeDeleteOK  = 21 // 40.21 - class ID 40, method ID 21
+	ExchangeBind      = 30 // 40.30 - class ID 40, method ID 30
+	ExchangeBindOK    = 31 // 40.31 - class ID 40, method ID 31
+	ExchangeUnbind    = 40 // 40.40 - class ID 40, method ID 40
+	ExchangeUnbindOK  = 41 // 40.41 - class ID 40, method ID 41
 )
 
 // Method IDs for queue class
 const (
-	QueueDeclare     = 10  // 50.10 - class ID 50, method ID 10
-	QueueDeclareOK   = 11  // 50.11 - class ID 50, method ID 11
-	QueueBind        = 20  // 50.20 - class ID 50, method ID 20
-	QueueBindOK      = 21  // 50.21 - class ID 50, method ID 21
-	QueuePurge       = 30  // 50.30 - class ID 50, method ID 30
-	QueuePurgeOK     = 31  // 50.31 - class ID 50, method ID 31
-	QueueDelete      = 40  // 50.40 - class ID 50, method ID 40
-	QueueDeleteOK    = 41  // 50.41 - class ID 50, method ID 41
-	QueueUnbind      = 50  // 50.50 - class ID 50, method ID 50
-	QueueUnbindOK    = 51  // 50.51 - class ID 50, method ID 51
+	QueueDeclare   = 10 // 50.10 - class ID 50, method ID 10
+	QueueDeclareOK = 11 // 50.11 - class ID 50, method ID 11
+	QueueBind      = 20 // 50.20 - class ID 50, method ID 20
+	QueueBindOK    = 21 // 50.21 - class ID 50, method ID 21
+	QueuePurge     = 30 // 50.30 - class ID 50, method ID 30
+	QueuePurgeOK   = 31 // 50.31 - class ID 50, method ID 31
+	QueueDelete    = 40 // 50.40 - class ID 50, method ID 40
+	QueueDeleteOK  = 41 // 50.41 - class ID 50, method ID 41
+	QueueUnbind    = 50 // 50.50 - class ID 50, method ID 50
+	QueueUnbindOK  = 51 // 50.51 - class ID 50, method ID 51
 )
 
 // Method IDs for basic class
 const (
-	BasicQos       = 10  // 60.10 - class ID 60, method ID 10
-	BasicQosOK     = 11  // 60.11 - class ID 60, method ID 11
-	BasicConsume   = 20  // 60.20 - class ID 60, method ID 20
-	BasicConsumeOK = 21  // 60.21 - class ID 60, method ID 21
-	BasicCancel    = 30  // 60.30 - class ID 60, method ID 30
-	BasicCancelOK  = 31  // 60.31 - class ID 60, method ID 31
-	BasicPublish   = 40  // 60.40 - class ID 60, method ID 40
-	BasicReturn    = 50  // 60.50 - class ID 60, method ID 50
-	BasicDeliver   = 60  // 60.60 - class ID 60, method ID 60
-	BasicGet       = 70  // 60.70 - class ID 60, method ID 70
-	BasicGetOK     = 71  // 60.71 - class ID 60, method ID 71
-	BasicGetEmpty  = 72  // 60.72 - class ID 60, method ID 72
-	BasicAck       = 80  // 60.80 - class ID 60, method ID 80
-	BasicReject    = 90  // 60.90 - class ID 60, method ID 90
+	BasicQos          = 10  // 60.10 - class ID 60, method ID 10
+	BasicQosOK        = 11  // 60.11 - class ID 60, method ID 11
+	BasicConsume      = 20  // 60.20 - class ID 60, method ID 20
+	BasicConsumeOK    = 21  // 60.21 - class ID 60, method ID 21
+	BasicCancel       = 30  // 60.30 - class ID 60, method ID 30
+	BasicCancelOK     = 31  // 60.31 - class ID 60, method ID 31
+	BasicPublish      = 40  // 60.40 - class ID 60, method ID 40
+	BasicReturn       = 50  // 60.50 - class ID 60, method ID 50
+	BasicDeliver      = 60  // 60.60 - class ID 60, method ID 60
+	BasicGet          = 70  // 60.70 - class ID 60, method ID 70
+	BasicGetOK        = 71  // 60.71 - class ID 60, method ID 71
+	BasicGetEmpty     = 72  // 60.72 - class ID 60, method ID 72
+	BasicAck          = 80  // 60.80 - class ID 60, method ID 80
+	BasicReject       = 90  // 60.90 - class ID 60, method ID 90
 	BasicRecoverAsync = 100 // 60.100 - class ID 60, method ID 100
-	BasicRecover   = 110 // 60.110 - class ID 60, method ID 110
-	BasicRecoverOK = 111 // 60.111 - class ID 60, method ID 111
-	BasicNack      = 120 // 60.120 - class ID 60, method ID 120
+	BasicRecover      = 110 // 60.110 - class ID 60, method ID 110
+	BasicRecoverOK    = 111 // 60.111 - class ID 60, method ID 111
+	BasicNack         = 120 // 60.120 - class ID 60, method ID 120
 )
 
 // ConnectionStartMethod represents the connection.start method
 type ConnectionStartMethod struct {
-	VersionMajor    byte
-	VersionMinor    byte
+	VersionMajor     byte
+	VersionMinor     byte
 	ServerProperties map[string]interface{}
-	Mechanisms      []string
-	Locales         []string
+	Mechanisms       []string
+	Locales          []string
 }
 
 // Serialize encodes the ConnectionStartMethod into a byte slice
@@ -284,10 +284,10 @@ func (m *ConnectionOpenOKMethod) Serialize() ([]byte, error) {
 
 // ConnectionCloseMethod represents the connection.close method
 type ConnectionCloseMethod struct {
-	ReplyCode    uint16
-	ReplyText    string
-	ClassID      uint16
-	MethodID     uint16
+	ReplyCode uint16
+	ReplyText string
+	ClassID   uint16
+	MethodID  uint16
 }
 
 // Serialize encodes the ConnectionCloseMethod into a byte slice
@@ -398,10 +398,10 @@ func (m *ChannelFlowOKMethod) Serialize() ([]byte, error) {
 
 // ChannelCloseMethod represents the channel.close method
 type ChannelCloseMethod struct {
-	ReplyCode    uint16
-	ReplyText    string
-	ClassID      uint16
-	MethodID     uint16
+	ReplyCode uint16
+	ReplyText string
+	ClassID   uint16
+	MethodID  uint16
 }
 
 // Serialize encodes the ChannelCloseMethod into a byte slice
@@ -441,7 +441,16 @@ func (m *ChannelCloseOKMethod) Serialize() ([]byte, error) {
 }
 
 // Helper functions for encoding common AMQP types
+// Internal helper functions for backward compatibility
 func encodeShortString(s string) []byte {
+	return EncodeShortString(s)
+}
+
+func encodeFieldTable(fields map[string]interface{}) ([]byte, error) {
+	return EncodeFieldTable(fields)
+}
+
+func EncodeShortString(s string) []byte {
 	// Short strings are prefixed with a byte length
 	if len(s) > 255 {
 		// Truncate if longer than 255 characters
@@ -461,7 +470,7 @@ func encodeLongString(s string) []byte {
 	return result
 }
 
-func encodeFieldTable(table map[string]interface{}) ([]byte, error) {
+func EncodeFieldTable(table map[string]interface{}) ([]byte, error) {
 	var result []byte
 
 	// First, encode the table to binary format
@@ -582,17 +591,17 @@ func decodeShortString(data []byte, offset int) (string, int, error) {
 	if offset >= len(data) {
 		return "", offset, fmt.Errorf("short string length byte missing")
 	}
-	
+
 	strLen := int(data[offset])
 	offset++
-	
+
 	if offset+strLen > len(data) {
 		return "", offset, fmt.Errorf("short string extends beyond data")
 	}
-	
+
 	str := string(data[offset : offset+strLen])
 	offset += strLen
-	
+
 	return str, offset, nil
 }
 
@@ -601,31 +610,31 @@ func decodeLongString(data []byte, offset int) (string, int, error) {
 	if offset+4 > len(data) {
 		return "", offset, fmt.Errorf("long string length field missing")
 	}
-	
+
 	strLen := binary.BigEndian.Uint32(data[offset : offset+4])
 	offset += 4
-	
+
 	if offset+int(strLen) > len(data) {
 		return "", offset, fmt.Errorf("long string extends beyond data")
 	}
-	
+
 	str := string(data[offset : offset+int(strLen)])
 	offset += int(strLen)
-	
+
 	return str, offset, nil
 }
 
 // ExchangeDeclareMethod represents the exchange.declare method
 type ExchangeDeclareMethod struct {
-	Reserved1   uint16
-	Exchange    string
-	Type        string
-	Passive     bool
-	Durable     bool
-	AutoDelete  bool
-	Internal    bool
-	NoWait      bool
-	Arguments   map[string]interface{}
+	Reserved1  uint16
+	Exchange   string
+	Type       string
+	Passive    bool
+	Durable    bool
+	AutoDelete bool
+	Internal   bool
+	NoWait     bool
+	Arguments  map[string]interface{}
 }
 
 // Serialize encodes the ExchangeDeclareMethod into a byte slice
@@ -759,10 +768,10 @@ func (m *ExchangeDeclareOKMethod) Serialize() ([]byte, error) {
 
 // ExchangeDeleteMethod represents the exchange.delete method
 type ExchangeDeleteMethod struct {
-	Reserved1   uint16
-	Exchange    string
-	IfUnused    bool
-	NoWait      bool
+	Reserved1 uint16
+	Exchange  string
+	IfUnused  bool
+	NoWait    bool
 }
 
 // Serialize encodes the ExchangeDeleteMethod into a byte slice
@@ -800,7 +809,7 @@ func (m *ExchangeDeleteMethod) Serialize() ([]byte, error) {
 
 // Deserialize decodes the ExchangeDeleteMethod from a byte slice
 func (m *ExchangeDeleteMethod) Deserialize(data []byte) error {
-	if len(data) < 4 {  // Need at least reserved(2) + exchange length byte(1)
+	if len(data) < 4 { // Need at least reserved(2) + exchange length byte(1)
 		return fmt.Errorf("exchange.delete method data too short")
 	}
 
@@ -860,14 +869,14 @@ func (m *ExchangeUnbindOKMethod) Serialize() ([]byte, error) {
 
 // QueueDeclareMethod represents the queue.declare method
 type QueueDeclareMethod struct {
-	Reserved1   uint16
-	Queue       string
-	Passive     bool
-	Durable     bool
-	Exclusive   bool
-	AutoDelete  bool
-	NoWait      bool
-	Arguments   map[string]interface{}
+	Reserved1  uint16
+	Queue      string
+	Passive    bool
+	Durable    bool
+	Exclusive  bool
+	AutoDelete bool
+	NoWait     bool
+	Arguments  map[string]interface{}
 }
 
 // Serialize encodes the QueueDeclareMethod into a byte slice
@@ -976,8 +985,8 @@ func (m *QueueDeclareMethod) Deserialize(data []byte) error {
 
 // QueueDeclareOKMethod represents the queue.declare-ok method
 type QueueDeclareOKMethod struct {
-	Queue       string
-	MessageCount uint32
+	Queue         string
+	MessageCount  uint32
 	ConsumerCount uint32
 }
 
@@ -1004,12 +1013,12 @@ func (m *QueueDeclareOKMethod) Serialize() ([]byte, error) {
 
 // QueueBindMethod represents the queue.bind method
 type QueueBindMethod struct {
-	Reserved1   uint16
-	Queue       string
-	Exchange    string
-	RoutingKey  string
-	NoWait      bool
-	Arguments   map[string]interface{}
+	Reserved1  uint16
+	Queue      string
+	Exchange   string
+	RoutingKey string
+	NoWait     bool
+	Arguments  map[string]interface{}
 }
 
 // Serialize encodes the QueueBindMethod into a byte slice
@@ -1137,11 +1146,11 @@ func (m *QueueBindOKMethod) Serialize() ([]byte, error) {
 
 // QueueDeleteMethod represents the queue.delete method
 type QueueDeleteMethod struct {
-	Reserved1   uint16
-	Queue       string
-	IfUnused    bool
-	IfEmpty     bool
-	NoWait      bool
+	Reserved1 uint16
+	Queue     string
+	IfUnused  bool
+	IfEmpty   bool
+	NoWait    bool
 }
 
 // Serialize encodes the QueueDeleteMethod into a byte slice
@@ -1183,7 +1192,7 @@ func (m *QueueDeleteMethod) Serialize() ([]byte, error) {
 
 // Deserialize decodes the QueueDeleteMethod from a byte slice
 func (m *QueueDeleteMethod) Deserialize(data []byte) error {
-	if len(data) < 3 {  // Need at least reserved(2) + queue length byte(1)
+	if len(data) < 3 { // Need at least reserved(2) + queue length byte(1)
 		return fmt.Errorf("queue.delete method data too short")
 	}
 
@@ -1308,11 +1317,11 @@ func (m *BasicQosOKMethod) Serialize() ([]byte, error) {
 
 // BasicPublishMethod represents the basic.publish method
 type BasicPublishMethod struct {
-	Reserved1   uint16
-	Exchange    string
-	RoutingKey  string
-	Mandatory   bool
-	Immediate   bool
+	Reserved1  uint16
+	Exchange   string
+	RoutingKey string
+	Mandatory  bool
+	Immediate  bool
 }
 
 // Serialize encodes the BasicPublishMethod into a byte slice
@@ -1353,7 +1362,7 @@ func (m *BasicPublishMethod) Serialize() ([]byte, error) {
 
 // Deserialize decodes the BasicPublishMethod from a byte slice
 func (m *BasicPublishMethod) Deserialize(data []byte) error {
-	if len(data) < 4 {  // Need at least reserved(2) + exchange len byte(1)
+	if len(data) < 4 { // Need at least reserved(2) + exchange len byte(1)
 		return fmt.Errorf("basic.publish method data too short")
 	}
 
@@ -1476,7 +1485,7 @@ func (m *BasicConsumeMethod) Serialize() ([]byte, error) {
 
 // Deserialize decodes the BasicConsumeMethod from a byte slice
 func (m *BasicConsumeMethod) Deserialize(data []byte) error {
-	if len(data) < 4 {  // Need at least reserved(2) + queue len byte(1)
+	if len(data) < 4 { // Need at least reserved(2) + queue len byte(1)
 		return fmt.Errorf("basic.consume method data too short")
 	}
 
@@ -1591,7 +1600,7 @@ func (m *BasicCancelMethod) Serialize() ([]byte, error) {
 
 // Deserialize decodes the BasicCancelMethod from a byte slice
 func (m *BasicCancelMethod) Deserialize(data []byte) error {
-	if len(data) < 1 {  // Need at least consumer tag length byte
+	if len(data) < 1 { // Need at least consumer tag length byte
 		return fmt.Errorf("basic.cancel method data too short")
 	}
 
@@ -1641,9 +1650,9 @@ func (m *BasicCancelOKMethod) Serialize() ([]byte, error) {
 
 // BasicGetMethod represents the basic.get method
 type BasicGetMethod struct {
-	Reserved1   uint16
-	Queue       string
-	NoAck       bool
+	Reserved1 uint16
+	Queue     string
+	NoAck     bool
 }
 
 // Serialize encodes the BasicGetMethod into a byte slice
@@ -1676,7 +1685,7 @@ func (m *BasicGetMethod) Serialize() ([]byte, error) {
 
 // Deserialize decodes the BasicGetMethod from a byte slice
 func (m *BasicGetMethod) Deserialize(data []byte) error {
-	if len(data) < 3 {  // Need at least reserved(2) + queue length byte(1)
+	if len(data) < 3 { // Need at least reserved(2) + queue length byte(1)
 		return fmt.Errorf("basic.get method data too short")
 	}
 
@@ -1757,7 +1766,7 @@ func (m *BasicGetOKMethod) Serialize() ([]byte, error) {
 
 // BasicGetEmptyMethod represents the basic.get-empty method
 type BasicGetEmptyMethod struct {
-	Reserved1 string  // Should be "amq.empty" or similar
+	Reserved1 string // Should be "amq.empty" or similar
 }
 
 // Serialize encodes the BasicGetEmptyMethod into a byte slice
@@ -1813,7 +1822,7 @@ func (m *BasicAckMethod) Serialize() ([]byte, error) {
 
 // Deserialize decodes the BasicAckMethod from a byte slice
 func (m *BasicAckMethod) Deserialize(data []byte) error {
-	if len(data) < 8 {  // Need at least delivery tag (8 bytes)
+	if len(data) < 8 { // Need at least delivery tag (8 bytes)
 		return fmt.Errorf("basic.ack method data too short")
 	}
 
@@ -1870,7 +1879,7 @@ func (m *BasicRejectMethod) Serialize() ([]byte, error) {
 
 // Deserialize decodes the BasicRejectMethod from a byte slice
 func (m *BasicRejectMethod) Deserialize(data []byte) error {
-	if len(data) < 8 {  // Need at least delivery tag (8 bytes)
+	if len(data) < 8 { // Need at least delivery tag (8 bytes)
 		return fmt.Errorf("basic.reject method data too short")
 	}
 
@@ -1932,7 +1941,7 @@ func (m *BasicNackMethod) Serialize() ([]byte, error) {
 
 // Deserialize decodes the BasicNackMethod from a byte slice
 func (m *BasicNackMethod) Deserialize(data []byte) error {
-	if len(data) < 8 {  // Need at least delivery tag (8 bytes)
+	if len(data) < 8 { // Need at least delivery tag (8 bytes)
 		return fmt.Errorf("basic.nack method data too short")
 	}
 
@@ -1953,7 +1962,7 @@ func (m *BasicNackMethod) Deserialize(data []byte) error {
 	} else {
 		// Default values if flags not provided
 		m.Multiple = false
-		m.Requeue = true  // Requeue by default
+		m.Requeue = true // Requeue by default
 	}
 
 	return nil
@@ -1961,11 +1970,11 @@ func (m *BasicNackMethod) Deserialize(data []byte) error {
 
 // BasicDeliverMethod represents the basic.deliver method
 type BasicDeliverMethod struct {
-	ConsumerTag  string
-	DeliveryTag  uint64
-	Redelivered  bool
-	Exchange     string
-	RoutingKey   string
+	ConsumerTag string
+	DeliveryTag uint64
+	Redelivered bool
+	Exchange    string
+	RoutingKey  string
 }
 
 // Serialize encodes the BasicDeliverMethod into a byte slice
@@ -2006,7 +2015,7 @@ func (m *BasicDeliverMethod) Serialize() ([]byte, error) {
 
 // Deserialize decodes the BasicDeliverMethod from a byte slice
 func (m *BasicDeliverMethod) Deserialize(data []byte) error {
-	if len(data) < 1 {  // Need at least consumer tag length byte
+	if len(data) < 1 { // Need at least consumer tag length byte
 		return fmt.Errorf("basic.deliver method data too short")
 	}
 
@@ -2122,7 +2131,7 @@ func (m *ExchangeUnbindMethod) Serialize() ([]byte, error) {
 
 // Deserialize decodes the ExchangeUnbindMethod from a byte slice
 func (m *ExchangeUnbindMethod) Deserialize(data []byte) error {
-	if len(data) < 4 {  // Need at least reserved(2) + destination length byte(1)
+	if len(data) < 4 { // Need at least reserved(2) + destination length byte(1)
 		return fmt.Errorf("exchange.unbind method data too short")
 	}
 
@@ -2226,12 +2235,12 @@ func EncodeMethodFrameForChannel(channelID uint16, classID, methodID uint16, met
 
 // EncodeHeaderFrameForChannel encodes a content header into a header frame for a specific channel
 func EncodeHeaderFrameForChannel(channelID uint16, classID uint16, headerData []byte) *Frame {
-	// A content header frame contains: class ID (2 bytes) + weight (2 bytes) + body size (8 bytes) + 
+	// A content header frame contains: class ID (2 bytes) + weight (2 bytes) + body size (8 bytes) +
 	// property flags (2 bytes) + properties (variable length based on property flags)
-	
+
 	// For now, we'll create a minimal header frame
 	// In a real implementation, you'd have proper header data
-	
+
 	return &Frame{
 		Type:    FrameHeader,
 		Channel: channelID,
@@ -2248,24 +2257,24 @@ func EncodeContentHeaderFrameForChannel(channelID uint16, classID, weight uint16
 	// - Body size (8 bytes)
 	// - Property flags (2 bytes)
 	// - Properties (variable length)
-	
+
 	headerContent := make([]byte, 14+len(properties))
-	
+
 	// Class ID (2 bytes)
 	binary.BigEndian.PutUint16(headerContent[0:2], classID)
-	
+
 	// Weight (2 bytes)
 	binary.BigEndian.PutUint16(headerContent[2:4], weight)
-	
+
 	// Body size (8 bytes)
 	binary.BigEndian.PutUint64(headerContent[4:12], bodySize)
-	
+
 	// Property flags (2 bytes)
 	binary.BigEndian.PutUint16(headerContent[12:14], propertyFlags)
-	
+
 	// Properties (variable length)
 	copy(headerContent[14:], properties)
-	
+
 	return &Frame{
 		Type:    FrameHeader,
 		Channel: channelID,

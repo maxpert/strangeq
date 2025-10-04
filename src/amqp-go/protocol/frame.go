@@ -46,20 +46,20 @@ func (f *Frame) UnmarshalBinary(data []byte) error {
 	f.Type = data[0]
 	f.Channel = binary.BigEndian.Uint16(data[1:3])
 	payloadSize := binary.BigEndian.Uint32(data[3:7])
-	
+
 	// Check if the payload size matches what we expect in the data
 	if len(data) != int(7+payloadSize+1) { // 7 bytes header + payload size + 1 end-byte
 		return fmt.Errorf("frame size mismatch: expected %d bytes but got %d", 7+payloadSize+1, len(data))
 	}
-	
+
 	if len(data) < int(7+payloadSize+1) {
 		return fmt.Errorf("payload too short")
 	}
-	
+
 	f.Size = payloadSize
 	f.Payload = make([]byte, f.Size)
 	copy(f.Payload, data[7:7+f.Size])
-	
+
 	// Verify end-byte
 	if data[7+f.Size] != 0xCE {
 		return fmt.Errorf("invalid frame end-byte")

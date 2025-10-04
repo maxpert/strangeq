@@ -7,24 +7,24 @@ import (
 
 // ContentHeader represents the content header frame
 type ContentHeader struct {
-	ClassID       uint16
-	Weight        uint16
-	BodySize      uint64
-	PropertyFlags uint16
-	ContentType   string
+	ClassID         uint16
+	Weight          uint16
+	BodySize        uint64
+	PropertyFlags   uint16
+	ContentType     string
 	ContentEncoding string
-	Headers       map[string]interface{}
-	DeliveryMode  uint8
-	Priority      uint8
-	CorrelationID string
-	ReplyTo       string
-	Expiration    string
-	MessageID     string
-	Timestamp     uint64
-	Type          string
-	UserID        string
-	AppID         string
-	ClusterID     string
+	Headers         map[string]interface{}
+	DeliveryMode    uint8
+	Priority        uint8
+	CorrelationID   string
+	ReplyTo         string
+	Expiration      string
+	MessageID       string
+	Timestamp       uint64
+	Type            string
+	UserID          string
+	AppID           string
+	ClusterID       string
 }
 
 // Property flags for AMQP content header
@@ -62,13 +62,13 @@ func ReadContentHeader(frame *Frame) (*ContentHeader, error) {
 		Weight:   binary.BigEndian.Uint16(frame.Payload[offset+2 : offset+4]),
 		BodySize: binary.BigEndian.Uint64(frame.Payload[offset+4 : offset+12]),
 	}
-	
+
 	offset += 12
 
 	if offset+2 > len(frame.Payload) {
 		return nil, fmt.Errorf("property flags not present")
 	}
-	
+
 	header.PropertyFlags = binary.BigEndian.Uint16(frame.Payload[offset : offset+2])
 	offset += 2
 
