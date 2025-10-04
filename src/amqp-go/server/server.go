@@ -30,6 +30,7 @@ type Server struct {
 	Log         *zap.Logger
 	Broker      *broker.Broker
 	Config      *config.AMQPConfig
+	Lifecycle   *LifecycleManager
 }
 
 // NewServer creates a new AMQP server

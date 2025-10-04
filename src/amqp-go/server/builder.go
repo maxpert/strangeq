@@ -197,6 +197,9 @@ func (b *ServerBuilder) Build() (*Server, error) {
 		Config:      b.config,
 	}
 
+	// Create and attach lifecycle manager
+	server.Lifecycle = NewLifecycleManager(server, b.config)
+
 	return server, nil
 }
 
@@ -223,6 +226,9 @@ func (b *ServerBuilder) BuildUnsafe() *Server {
 		Broker:      brokerImpl.(*BrokerAdapter).broker,
 		Config:      b.config,
 	}
+
+	// Create and attach lifecycle manager
+	server.Lifecycle = NewLifecycleManager(server, b.config)
 
 	return server
 }
