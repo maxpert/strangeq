@@ -69,6 +69,9 @@ type StorageConfig struct {
 	Persistent bool
 	SyncWrites bool
 	
+	// Message settings
+	MessageTTL int64 // Message TTL in seconds (0 = no TTL)
+	
 	// Performance settings
 	CacheSize      int64
 	MaxOpenFiles   int

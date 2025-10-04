@@ -30,7 +30,7 @@ func exampleWithCustomLogger() {
 		Addr:        ":5672",
 		Connections: make(map[string]*protocol.Connection),
 		Log:         logger,
-		Broker:      broker.NewBroker(),
+		Broker:      server.NewOriginalBrokerAdapter(broker.NewBroker()),
 	}
 
 	// Start the server

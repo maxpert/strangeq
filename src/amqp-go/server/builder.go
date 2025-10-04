@@ -7,6 +7,7 @@ import (
 	"github.com/maxpert/amqp-go/config"
 	"github.com/maxpert/amqp-go/interfaces"
 	"github.com/maxpert/amqp-go/protocol"
+	"github.com/maxpert/amqp-go/storage"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
 )
@@ -99,9 +100,18 @@ func (b *ServerBuilder) WithBroker(broker interfaces.Broker) *ServerBuilder {
 	return b
 }
 
+// WithUnifiedBroker sets a custom unified broker implementation
+func (b *ServerBuilder) WithUnifiedBroker(unifiedBroker UnifiedBroker) *ServerBuilder {
+	// Store as interfaces.Broker to maintain compatibility
+	// We'll handle the type assertion in Build()
+	b.broker = &brokerWrapper{unifiedBroker: unifiedBroker}
+	return b
+}
+
 // WithDefaultBroker uses the default in-memory broker
 func (b *ServerBuilder) WithDefaultBroker() *ServerBuilder {
-	b.broker = &BrokerAdapter{broker: broker.NewBroker()}
+	originalBroker := broker.NewBroker()
+	b.broker = &brokerWrapper{unifiedBroker: NewOriginalBrokerAdapter(originalBroker)}
 	return b
 }
 
@@ -182,10 +192,34 @@ func (b *ServerBuilder) Build() (*Server, error) {
 		logger = &ZapLoggerAdapter{logger: zapLogger}
 	}
 
+	// Create storage
+	var storageImpl interfaces.Storage
+	if b.storage != nil {
+		storageImpl = b.storage
+	} else {
+		storageFactory := storage.NewStorageFactory(b.config)
+		var err error
+		storageImpl, err = storageFactory.CreateStorage()
+		if err != nil {
+			return nil, fmt.Errorf("failed to create storage: %w", err)
+		}
+	}
+	
 	// Create broker if not provided
-	brokerImpl := b.broker
-	if brokerImpl == nil {
-		brokerImpl = &BrokerAdapter{broker: broker.NewBroker()}
+	var unifiedBroker UnifiedBroker
+	if b.broker != nil {
+		// Check if it's a broker wrapper
+		if wrapper, ok := b.broker.(*brokerWrapper); ok {
+			unifiedBroker = wrapper.unifiedBroker
+		} else {
+			// For backward compatibility, wrap interfaces.Broker implementations
+			// This would need a more sophisticated adapter if needed
+			return nil, fmt.Errorf("unsupported broker type - use WithUnifiedBroker or WithDefaultBroker")
+		}
+	} else {
+		// Create storage-backed broker using the storage we just created
+		storageBroker := broker.NewStorageBroker(storageImpl)
+		unifiedBroker = NewStorageBrokerAdapter(storageBroker)
 	}
 
 	// Create the server
@@ -193,8 +227,8 @@ func (b *ServerBuilder) Build() (*Server, error) {
 		Addr:        b.config.Network.Address,
 		Connections: make(map[string]*protocol.Connection),
 		Log:         logger.(*ZapLoggerAdapter).logger, // TODO: Remove this dependency
-		Broker:      brokerImpl.(*BrokerAdapter).broker, // TODO: Remove this dependency
 		Config:      b.config,
+		Broker:      unifiedBroker,
 	}
 
 	// Create and attach lifecycle manager
@@ -213,9 +247,17 @@ func (b *ServerBuilder) BuildUnsafe() *Server {
 	}
 
 	// Create broker if not provided
-	brokerImpl := b.broker
-	if brokerImpl == nil {
-		brokerImpl = &BrokerAdapter{broker: broker.NewBroker()}
+	var unifiedBroker UnifiedBroker
+	if b.broker != nil {
+		// Check if it's a broker wrapper
+		if wrapper, ok := b.broker.(*brokerWrapper); ok {
+			unifiedBroker = wrapper.unifiedBroker
+		} else {
+			// Fallback to default broker
+			unifiedBroker = NewOriginalBrokerAdapter(broker.NewBroker())
+		}
+	} else {
+		unifiedBroker = NewOriginalBrokerAdapter(broker.NewBroker())
 	}
 
 	// Create the server without validation
@@ -223,7 +265,7 @@ func (b *ServerBuilder) BuildUnsafe() *Server {
 		Addr:        b.config.Network.Address,
 		Connections: make(map[string]*protocol.Connection),
 		Log:         logger.(*ZapLoggerAdapter).logger,
-		Broker:      brokerImpl.(*BrokerAdapter).broker,
+		Broker:      unifiedBroker,
 		Config:      b.config,
 	}
 
@@ -274,85 +316,93 @@ func (z *ZapLoggerAdapter) convertFields(fields []interfaces.LogField) []zap.Fie
 	return zapFields
 }
 
-// BrokerAdapter adapts broker.Broker to interfaces.Broker
-type BrokerAdapter struct {
-	broker *broker.Broker
+// brokerWrapper wraps UnifiedBroker to implement interfaces.Broker
+type brokerWrapper struct {
+	unifiedBroker UnifiedBroker
 }
 
-func (b *BrokerAdapter) DeclareExchange(name, exchangeType string, durable, autoDelete, internal bool, arguments map[string]interface{}) error {
-	return b.broker.DeclareExchange(name, exchangeType, durable, autoDelete, internal, arguments)
+// Implement interfaces.Broker methods by delegating to UnifiedBroker
+func (w *brokerWrapper) DeclareExchange(name, exchangeType string, durable, autoDelete, internal bool, arguments map[string]interface{}) error {
+	return w.unifiedBroker.DeclareExchange(name, exchangeType, durable, autoDelete, internal, arguments)
 }
 
-func (b *BrokerAdapter) DeleteExchange(name string, ifUnused bool) error {
-	return b.broker.DeleteExchange(name, ifUnused)
+func (w *brokerWrapper) DeleteExchange(name string, ifUnused bool) error {
+	return w.unifiedBroker.DeleteExchange(name, ifUnused)
 }
 
-func (b *BrokerAdapter) DeclareQueue(name string, durable, autoDelete, exclusive bool, arguments map[string]interface{}) (*protocol.Queue, error) {
-	return b.broker.DeclareQueue(name, durable, autoDelete, exclusive, arguments)
+func (w *brokerWrapper) DeclareQueue(name string, durable, autoDelete, exclusive bool, arguments map[string]interface{}) (*protocol.Queue, error) {
+	return w.unifiedBroker.DeclareQueue(name, durable, autoDelete, exclusive, arguments)
 }
 
-func (b *BrokerAdapter) DeleteQueue(name string, ifUnused, ifEmpty bool) error {
-	return b.broker.DeleteQueue(name, ifUnused, ifEmpty)
+func (w *brokerWrapper) DeleteQueue(name string, ifUnused, ifEmpty bool) error {
+	return w.unifiedBroker.DeleteQueue(name, ifUnused, ifEmpty)
 }
 
-func (b *BrokerAdapter) PurgeQueue(name string) (int, error) {
-	// Not implemented in current broker
-	return 0, fmt.Errorf("purge queue not implemented")
+func (w *brokerWrapper) PurgeQueue(name string) (int, error) {
+	// Not directly supported in UnifiedBroker interface - would need extension
+	return 0, fmt.Errorf("purge queue not supported in unified broker")
 }
 
-func (b *BrokerAdapter) BindQueue(queueName, exchangeName, routingKey string, arguments map[string]interface{}) error {
-	return b.broker.BindQueue(queueName, exchangeName, routingKey, arguments)
+func (w *brokerWrapper) BindQueue(queueName, exchangeName, routingKey string, arguments map[string]interface{}) error {
+	return w.unifiedBroker.BindQueue(queueName, exchangeName, routingKey, arguments)
 }
 
-func (b *BrokerAdapter) UnbindQueue(queueName, exchangeName, routingKey string) error {
-	return b.broker.UnbindQueue(queueName, exchangeName, routingKey)
+func (w *brokerWrapper) UnbindQueue(queueName, exchangeName, routingKey string) error {
+	return w.unifiedBroker.UnbindQueue(queueName, exchangeName, routingKey)
 }
 
-func (b *BrokerAdapter) PublishMessage(exchangeName, routingKey string, message *protocol.Message) error {
-	return b.broker.PublishMessage(exchangeName, routingKey, message)
+func (w *brokerWrapper) PublishMessage(exchangeName, routingKey string, message *protocol.Message) error {
+	return w.unifiedBroker.PublishMessage(exchangeName, routingKey, message)
 }
 
-func (b *BrokerAdapter) GetMessage(queueName string) (*protocol.Message, error) {
-	// Not implemented in current broker
-	return nil, fmt.Errorf("get message not implemented")
+func (w *brokerWrapper) GetMessage(queueName string) (*protocol.Message, error) {
+	// Not directly supported in UnifiedBroker interface
+	return nil, fmt.Errorf("get message not supported in unified broker")
 }
 
-func (b *BrokerAdapter) AckMessage(queueName, messageID string) error {
-	// Not implemented in current broker
-	return fmt.Errorf("ack message not implemented")
+func (w *brokerWrapper) AckMessage(queueName, messageID string) error {
+	// Not directly supported - would need different signature
+	return fmt.Errorf("ack message not supported in unified broker wrapper")
 }
 
-func (b *BrokerAdapter) NackMessage(queueName, messageID string, requeue bool) error {
-	// Not implemented in current broker
-	return fmt.Errorf("nack message not implemented")
+func (w *brokerWrapper) NackMessage(queueName, messageID string, requeue bool) error {
+	// Not directly supported - would need different signature  
+	return fmt.Errorf("nack message not supported in unified broker wrapper")
 }
 
-func (b *BrokerAdapter) RegisterConsumer(queueName, consumerTag string, consumer *protocol.Consumer) error {
-	return b.broker.RegisterConsumer(queueName, consumerTag, consumer)
+func (w *brokerWrapper) RegisterConsumer(queueName, consumerTag string, consumer *protocol.Consumer) error {
+	return w.unifiedBroker.RegisterConsumer(queueName, consumerTag, consumer)
 }
 
-func (b *BrokerAdapter) UnregisterConsumer(consumerTag string) error {
-	return b.broker.UnregisterConsumer(consumerTag)
+func (w *brokerWrapper) UnregisterConsumer(consumerTag string) error {
+	return w.unifiedBroker.UnregisterConsumer(consumerTag)
 }
 
-func (b *BrokerAdapter) GetConsumers(queueName string) []*protocol.Consumer {
-	// Not implemented in current broker
-	return nil
+func (w *brokerWrapper) GetConsumers(queueName string) []*protocol.Consumer {
+	// Not directly supported - UnifiedBroker returns map, not slice
+	allConsumers := w.unifiedBroker.GetConsumers()
+	var result []*protocol.Consumer
+	for _, consumer := range allConsumers {
+		if consumer.Queue == queueName {
+			result = append(result, consumer)
+		}
+	}
+	return result
 }
 
-func (b *BrokerAdapter) GetQueueInfo(queueName string) (*interfaces.QueueInfo, error) {
-	// Not implemented in current broker
-	return nil, fmt.Errorf("get queue info not implemented")
+func (w *brokerWrapper) GetQueueInfo(queueName string) (*interfaces.QueueInfo, error) {
+	// Not supported in UnifiedBroker interface
+	return nil, fmt.Errorf("get queue info not supported in unified broker")
 }
 
-func (b *BrokerAdapter) GetExchangeInfo(exchangeName string) (*interfaces.ExchangeInfo, error) {
-	// Not implemented in current broker
-	return nil, fmt.Errorf("get exchange info not implemented")
+func (w *brokerWrapper) GetExchangeInfo(exchangeName string) (*interfaces.ExchangeInfo, error) {
+	// Not supported in UnifiedBroker interface
+	return nil, fmt.Errorf("get exchange info not supported in unified broker")
 }
 
-func (b *BrokerAdapter) GetBrokerStats() (*interfaces.BrokerStats, error) {
-	// Not implemented in current broker
-	return nil, fmt.Errorf("get broker stats not implemented")
+func (w *brokerWrapper) GetBrokerStats() (*interfaces.BrokerStats, error) {
+	// Not supported in UnifiedBroker interface
+	return nil, fmt.Errorf("get broker stats not supported in unified broker")
 }
 
 // Helper functions

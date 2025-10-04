@@ -337,8 +337,8 @@ func (lm *LifecycleManager) GetStats() *interfaces.ServerStats {
 	// Get broker stats if available
 	var exchangeCount, queueCount int
 	if lm.server.Broker != nil {
-		exchangeCount = len(lm.server.Broker.Exchanges)
-		queueCount = len(lm.server.Broker.Queues)
+		exchangeCount = len(lm.server.Broker.GetExchanges())
+		queueCount = len(lm.server.Broker.GetQueues())
 	}
 	
 	return &interfaces.ServerStats{

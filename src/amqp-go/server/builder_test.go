@@ -153,17 +153,17 @@ func TestBrokerAdapter(t *testing.T) {
 	builder := NewServerBuilder().WithDefaultBroker()
 	assert.NotNil(t, builder.broker)
 	
-	adapter := builder.broker.(*BrokerAdapter)
-	assert.NotNil(t, adapter.broker)
+	wrapper := builder.broker.(*brokerWrapper)
+	assert.NotNil(t, wrapper.unifiedBroker)
 	
 	// Test that basic broker operations don't panic
-	err := adapter.DeclareExchange("test", "direct", false, false, false, nil)
+	err := wrapper.DeclareExchange("test", "direct", false, false, false, nil)
 	assert.NoError(t, err)
 	
-	_, err = adapter.DeclareQueue("test-queue", false, false, false, nil)
+	_, err = wrapper.DeclareQueue("test-queue", false, false, false, nil)
 	assert.NoError(t, err)
 	
-	err = adapter.BindQueue("test-queue", "test", "routing.key", nil)
+	err = wrapper.BindQueue("test-queue", "test", "routing.key", nil)
 	assert.NoError(t, err)
 }
 

@@ -28,7 +28,7 @@ type Server struct {
 	Mutex       sync.RWMutex
 	Shutdown    bool
 	Log         *zap.Logger
-	Broker      *broker.Broker
+	Broker      UnifiedBroker
 	Config      *config.AMQPConfig
 	Lifecycle   *LifecycleManager
 }
@@ -40,7 +40,7 @@ func NewServer(addr string) *Server {
 		Addr:        addr,
 		Connections: make(map[string]*protocol.Connection),
 		Log:         logger,
-		Broker:      broker.NewBroker(),
+		Broker:      NewOriginalBrokerAdapter(broker.NewBroker()),
 	}
 }
 

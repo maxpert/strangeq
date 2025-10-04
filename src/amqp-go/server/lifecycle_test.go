@@ -189,7 +189,7 @@ func TestHealth(t *testing.T) {
 func TestGetStats(t *testing.T) {
 	server := &Server{
 		Connections: make(map[string]*protocol.Connection),
-		Broker:      broker.NewBroker(),
+		Broker:      NewOriginalBrokerAdapter(broker.NewBroker()),
 	}
 	lm := NewLifecycleManager(server, config.DefaultConfig())
 	
