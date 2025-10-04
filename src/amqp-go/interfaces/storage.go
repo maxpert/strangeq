@@ -7,11 +7,20 @@ import (
 	"github.com/maxpert/amqp-go/protocol"
 )
 
+// AtomicStorage interface for atomic operations
+type AtomicStorage interface {
+	// ExecuteAtomic runs multiple operations atomically
+	ExecuteAtomic(operations func(txnStorage Storage) error) error
+}
+
 // Storage defines the interface for message and metadata persistence
 type Storage interface {
 	MessageStore
 	MetadataStore
 	TransactionStore
+	AcknowledgmentStore
+	DurabilityStore
+	AtomicStorage
 }
 
 // MessageStore defines the interface for message durability operations
@@ -152,4 +161,38 @@ var (
 	ErrTransactionNotFound = errors.New("transaction not found")
 	ErrTransactionExists   = errors.New("transaction already exists")
 	ErrTransactionNotActive = errors.New("transaction is not active")
+	ErrPendingAckNotFound  = errors.New("pending acknowledgment not found")
+	ErrCorruptedStorage    = errors.New("storage corruption detected")
+	ErrRecoveryInProgress  = errors.New("recovery operation in progress")
 )
+
+// AcknowledgmentStore interface for handling message acknowledgment persistence
+type AcknowledgmentStore interface {
+	// Pending acknowledgment management
+	StorePendingAck(pendingAck *protocol.PendingAck) error
+	GetPendingAck(queueName string, deliveryTag uint64) (*protocol.PendingAck, error)
+	DeletePendingAck(queueName string, deliveryTag uint64) error
+	
+	// Queue-level acknowledgment operations
+	GetQueuePendingAcks(queueName string) ([]*protocol.PendingAck, error)
+	GetConsumerPendingAcks(consumerTag string) ([]*protocol.PendingAck, error)
+	
+	// Cleanup operations
+	CleanupExpiredAcks(maxAge time.Duration) error
+	GetAllPendingAcks() ([]*protocol.PendingAck, error)
+}
+
+// DurabilityStore interface for handling durability and recovery operations
+type DurabilityStore interface {
+	// Durable entity recovery
+	StoreDurableEntityMetadata(metadata *protocol.DurableEntityMetadata) error
+	GetDurableEntityMetadata() (*protocol.DurableEntityMetadata, error)
+	
+	// Storage validation and repair
+	ValidateStorageIntegrity() (*protocol.RecoveryStats, error)
+	RepairCorruption(autoRepair bool) (*protocol.RecoveryStats, error)
+	
+	// Recovery operations
+	GetRecoverableMessages() (map[string][]*protocol.Message, error) // queueName -> messages
+	MarkRecoveryComplete(stats *protocol.RecoveryStats) error
+}

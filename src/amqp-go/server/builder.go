@@ -233,6 +233,22 @@ func (b *ServerBuilder) Build() (*Server, error) {
 
 	// Create and attach lifecycle manager
 	server.Lifecycle = NewLifecycleManager(server, b.config)
+	
+	// Perform recovery if storage is persistent
+	if b.config.Storage.Persistent {
+		recoveryManager := NewRecoveryManager(storageImpl, unifiedBroker, logger.(*ZapLoggerAdapter).logger)
+		
+		recoveryStats, err := recoveryManager.PerformRecovery()
+		if err != nil {
+			logger.Error("Recovery failed", interfaces.LogField{Key: "error", Value: err})
+			// Continue with server startup even if recovery fails
+		} else {
+			logger.Info("Recovery completed successfully", 
+				interfaces.LogField{Key: "exchanges_recovered", Value: recoveryStats.DurableExchangesRecovered},
+				interfaces.LogField{Key: "queues_recovered", Value: recoveryStats.DurableQueuesRecovered},
+				interfaces.LogField{Key: "messages_recovered", Value: recoveryStats.PersistentMessagesRecovered})
+		}
+	}
 
 	return server, nil
 }

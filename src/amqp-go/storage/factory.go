@@ -2,8 +2,11 @@ package storage
 
 import (
 	"fmt"
+	"os"
+	"path/filepath"
 	"time"
 
+	"github.com/dgraph-io/badger/v4"
 	"github.com/maxpert/amqp-go/config"
 	"github.com/maxpert/amqp-go/interfaces"
 )
@@ -99,6 +102,66 @@ func (f *StorageFactory) CreateTransactionStore() (interfaces.TransactionStore, 
 	}
 }
 
+// CreateAcknowledgmentStore creates an acknowledgment store based on configuration
+func (f *StorageFactory) CreateAcknowledgmentStore() (interfaces.AcknowledgmentStore, error) {
+	backend := f.config.Storage.Backend
+	
+	switch backend {
+	case "memory":
+		return NewMemoryAckStore(), nil
+		
+	case "badger":
+		// Create acknowledgment-specific path
+		ackPath := filepath.Join(f.config.Storage.Path, "ack")
+		if err := os.MkdirAll(ackPath, 0755); err != nil {
+			return nil, fmt.Errorf("failed to create ack storage directory: %w", err)
+		}
+		
+		opts := badger.DefaultOptions(ackPath)
+		opts.Logger = nil // Disable badger's default logging
+		
+		db, err := badger.Open(opts)
+		if err != nil {
+			return nil, fmt.Errorf("failed to open badger ack store: %w", err)
+		}
+		
+		return NewBadgerAckStore(db), nil
+		
+	default:
+		return nil, fmt.Errorf("unsupported acknowledgment store backend: %s", backend)
+	}
+}
+
+// CreateDurabilityStore creates a durability store based on configuration
+func (f *StorageFactory) CreateDurabilityStore() (interfaces.DurabilityStore, error) {
+	backend := f.config.Storage.Backend
+	
+	switch backend {
+	case "memory":
+		return NewMemoryDurabilityStore(), nil
+		
+	case "badger":
+		// Create durability-specific path
+		durabilityPath := filepath.Join(f.config.Storage.Path, "durability")
+		if err := os.MkdirAll(durabilityPath, 0755); err != nil {
+			return nil, fmt.Errorf("failed to create durability storage directory: %w", err)
+		}
+		
+		opts := badger.DefaultOptions(durabilityPath)
+		opts.Logger = nil // Disable badger's default logging
+		
+		db, err := badger.Open(opts)
+		if err != nil {
+			return nil, fmt.Errorf("failed to open badger durability store: %w", err)
+		}
+		
+		return NewBadgerDurabilityStore(db), nil
+		
+	default:
+		return nil, fmt.Errorf("unsupported durability store backend: %s", backend)
+	}
+}
+
 // CreateStorage creates all storage components and returns them as a single interface
 func (f *StorageFactory) CreateStorage() (interfaces.Storage, error) {
 	messageStore, err := f.CreateMessageStore()
@@ -116,11 +179,40 @@ func (f *StorageFactory) CreateStorage() (interfaces.Storage, error) {
 		return nil, fmt.Errorf("failed to create transaction store: %w", err)
 	}
 	
-	return &CompositeStorage{
-		MessageStore:     messageStore,
-		MetadataStore:    metadataStore,
-		TransactionStore: transactionStore,
-	}, nil
+	ackStore, err := f.CreateAcknowledgmentStore()
+	if err != nil {
+		return nil, fmt.Errorf("failed to create acknowledgment store: %w", err)
+	}
+	
+	durabilityStore, err := f.CreateDurabilityStore()
+	if err != nil {
+		return nil, fmt.Errorf("failed to create durability store: %w", err)
+	}
+	
+	composite := &CompositeStorage{
+		MessageStore:        messageStore,
+		MetadataStore:       metadataStore,
+		TransactionStore:    transactionStore,
+		AcknowledgmentStore: ackStore,
+		DurabilityStore:     durabilityStore,
+		backend:            f.config.Storage.Backend,
+	}
+	
+	// Create transaction wrapper for Badger backend
+	if f.config.Storage.Backend == "badger" {
+		// Type assert to get the Badger-specific implementations
+		badgerMsgStore, msgOk := messageStore.(*BadgerMessageStore)
+		badgerMetaStore, metaOk := metadataStore.(*BadgerMetadataStore)
+		badgerAckStore, ackOk := ackStore.(*BadgerAckStore)
+		badgerDurStore, durOk := durabilityStore.(*BadgerDurabilityStore)
+		
+		if msgOk && metaOk && ackOk && durOk {
+			composite.transactionWrapper = NewBadgerTransactionWrapper(
+				badgerMsgStore, badgerMetaStore, badgerAckStore, badgerDurStore)
+		}
+	}
+	
+	return composite, nil
 }
 
 // CompositeStorage combines all storage interfaces into a single implementation
@@ -128,6 +220,10 @@ type CompositeStorage struct {
 	interfaces.MessageStore
 	interfaces.MetadataStore
 	interfaces.TransactionStore
+	interfaces.AcknowledgmentStore
+	interfaces.DurabilityStore
+	backend string // Track backend type for atomic operations
+	transactionWrapper *BadgerTransactionWrapper // For Badger atomic operations
 }
 
 // Close closes all storage components
@@ -196,6 +292,27 @@ func (c *CompositeStorage) GetStorageStats() (*interfaces.StorageStats, error) {
 	}
 	
 	return stats, nil
+}
+
+// ExecuteAtomic runs operations atomically based on the backend type
+func (c *CompositeStorage) ExecuteAtomic(operations func(txnStorage interfaces.Storage) error) error {
+	switch c.backend {
+	case "badger":
+		if c.transactionWrapper != nil {
+			// Use the Badger transaction wrapper for coordinated transactions
+			return c.transactionWrapper.ExecuteAtomic(operations)
+		}
+		// Fallback to sequential execution if transaction wrapper not available
+		return operations(c)
+		
+	case "memory":
+		// For memory backend, operations are already atomic within Go
+		return operations(c)
+		
+	default:
+		// Fallback to non-atomic execution
+		return operations(c)
+	}
 }
 
 // ValidateBackend checks if the specified storage backend is supported

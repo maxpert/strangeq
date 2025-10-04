@@ -1,6 +1,8 @@
 package storage
 
 import (
+	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -443,6 +445,170 @@ func NewMemoryTransactionStore() *MemoryTransactionStore {
 	return &MemoryTransactionStore{
 		transactions: make(map[string]*interfaces.Transaction),
 	}
+}
+
+// MemoryAckStore implements AcknowledgmentStore in memory
+type MemoryAckStore struct {
+	pendingAcks map[string]*protocol.PendingAck
+	mutex       sync.RWMutex
+}
+
+// NewMemoryAckStore creates a new in-memory acknowledgment store
+func NewMemoryAckStore() *MemoryAckStore {
+	return &MemoryAckStore{
+		pendingAcks: make(map[string]*protocol.PendingAck),
+	}
+}
+
+// StorePendingAck stores a pending acknowledgment in memory
+func (s *MemoryAckStore) StorePendingAck(pendingAck *protocol.PendingAck) error {
+	s.mutex.Lock()
+	defer s.mutex.Unlock()
+	
+	key := fmt.Sprintf("%s:%d", pendingAck.QueueName, pendingAck.DeliveryTag)
+	s.pendingAcks[key] = pendingAck
+	return nil
+}
+
+// GetPendingAck retrieves a pending acknowledgment
+func (s *MemoryAckStore) GetPendingAck(queueName string, deliveryTag uint64) (*protocol.PendingAck, error) {
+	s.mutex.RLock()
+	defer s.mutex.RUnlock()
+	
+	key := fmt.Sprintf("%s:%d", queueName, deliveryTag)
+	if ack, exists := s.pendingAcks[key]; exists {
+		return ack, nil
+	}
+	
+	return nil, interfaces.ErrPendingAckNotFound
+}
+
+// DeletePendingAck removes a pending acknowledgment
+func (s *MemoryAckStore) DeletePendingAck(queueName string, deliveryTag uint64) error {
+	s.mutex.Lock()
+	defer s.mutex.Unlock()
+	
+	key := fmt.Sprintf("%s:%d", queueName, deliveryTag)
+	delete(s.pendingAcks, key)
+	return nil
+}
+
+// GetQueuePendingAcks retrieves all pending acknowledgments for a queue
+func (s *MemoryAckStore) GetQueuePendingAcks(queueName string) ([]*protocol.PendingAck, error) {
+	s.mutex.RLock()
+	defer s.mutex.RUnlock()
+	
+	var acks []*protocol.PendingAck
+	for key, ack := range s.pendingAcks {
+		if strings.HasPrefix(key, queueName+":") {
+			acks = append(acks, ack)
+		}
+	}
+	
+	return acks, nil
+}
+
+// GetConsumerPendingAcks retrieves all pending acknowledgments for a consumer
+func (s *MemoryAckStore) GetConsumerPendingAcks(consumerTag string) ([]*protocol.PendingAck, error) {
+	s.mutex.RLock()
+	defer s.mutex.RUnlock()
+	
+	var acks []*protocol.PendingAck
+	for _, ack := range s.pendingAcks {
+		if ack.ConsumerTag == consumerTag {
+			acks = append(acks, ack)
+		}
+	}
+	
+	return acks, nil
+}
+
+// CleanupExpiredAcks removes acknowledgments older than maxAge
+func (s *MemoryAckStore) CleanupExpiredAcks(maxAge time.Duration) error {
+	s.mutex.Lock()
+	defer s.mutex.Unlock()
+	
+	cutoff := time.Now().Add(-maxAge)
+	
+	for key, ack := range s.pendingAcks {
+		if ack.DeliveredAt.Before(cutoff) {
+			delete(s.pendingAcks, key)
+		}
+	}
+	
+	return nil
+}
+
+// GetAllPendingAcks retrieves all pending acknowledgments
+func (s *MemoryAckStore) GetAllPendingAcks() ([]*protocol.PendingAck, error) {
+	s.mutex.RLock()
+	defer s.mutex.RUnlock()
+	
+	var acks []*protocol.PendingAck
+	for _, ack := range s.pendingAcks {
+		acks = append(acks, ack)
+	}
+	
+	return acks, nil
+}
+
+// MemoryDurabilityStore implements DurabilityStore in memory
+type MemoryDurabilityStore struct {
+	metadata *protocol.DurableEntityMetadata
+	mutex    sync.RWMutex
+}
+
+// NewMemoryDurabilityStore creates a new in-memory durability store
+func NewMemoryDurabilityStore() *MemoryDurabilityStore {
+	return &MemoryDurabilityStore{
+		metadata: &protocol.DurableEntityMetadata{
+			Exchanges:   []protocol.Exchange{},
+			Queues:      []protocol.Queue{},
+			Bindings:    []protocol.Binding{},
+			LastUpdated: time.Now(),
+		},
+	}
+}
+
+// StoreDurableEntityMetadata stores durable entity metadata
+func (s *MemoryDurabilityStore) StoreDurableEntityMetadata(metadata *protocol.DurableEntityMetadata) error {
+	s.mutex.Lock()
+	defer s.mutex.Unlock()
+	
+	metadata.LastUpdated = time.Now()
+	s.metadata = metadata
+	return nil
+}
+
+// GetDurableEntityMetadata retrieves durable entity metadata
+func (s *MemoryDurabilityStore) GetDurableEntityMetadata() (*protocol.DurableEntityMetadata, error) {
+	s.mutex.RLock()
+	defer s.mutex.RUnlock()
+	
+	return s.metadata, nil
+}
+
+// ValidateStorageIntegrity validates memory storage (always returns success for memory)
+func (s *MemoryDurabilityStore) ValidateStorageIntegrity() (*protocol.RecoveryStats, error) {
+	return &protocol.RecoveryStats{
+		ValidationErrors: []string{},
+		RecoveryDuration: 0,
+	}, nil
+}
+
+// RepairCorruption repairs memory storage (no-op for memory)
+func (s *MemoryDurabilityStore) RepairCorruption(autoRepair bool) (*protocol.RecoveryStats, error) {
+	return s.ValidateStorageIntegrity()
+}
+
+// GetRecoverableMessages returns empty map for memory storage
+func (s *MemoryDurabilityStore) GetRecoverableMessages() (map[string][]*protocol.Message, error) {
+	return make(map[string][]*protocol.Message), nil
+}
+
+// MarkRecoveryComplete marks recovery as complete (no-op for memory)
+func (s *MemoryDurabilityStore) MarkRecoveryComplete(stats *protocol.RecoveryStats) error {
+	return nil
 }
 
 func (m *MemoryTransactionStore) BeginTransaction(txID string) (*interfaces.Transaction, error) {
