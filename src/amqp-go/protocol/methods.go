@@ -1990,17 +1990,15 @@ func (m *BasicDeliverMethod) Serialize() ([]byte, error) {
 	binary.BigEndian.PutUint64(deliveryTagBytes, m.DeliveryTag)
 	result = append(result, deliveryTagBytes...)
 
-	// Redelivered (packed into flags)
-	// bit 0: redelivered
-	// bits 1-15: unused (set to 0)
-	flags := uint16(0)
+	// Redelivered (bit field - single byte with bit 0 set if redelivered)
+	// AMQP 0.9.1 spec: redelivered is a single bit field, not a 16-bit flags field
+	var redeliveredByte byte
 	if m.Redelivered {
-		flags |= (1 << 0) // bit 0
+		redeliveredByte = 1
+	} else {
+		redeliveredByte = 0
 	}
-
-	flagBytes := make([]byte, 2)
-	binary.BigEndian.PutUint16(flagBytes, flags)
-	result = append(result, flagBytes...)
+	result = append(result, redeliveredByte)
 
 	// Exchange (short string)
 	exchangeBytes := encodeShortString(m.Exchange)
@@ -2039,16 +2037,13 @@ func (m *BasicDeliverMethod) Deserialize(data []byte) error {
 	m.DeliveryTag = binary.BigEndian.Uint64(data[offset : offset+8])
 	offset += 8
 
-	// Flags (uint16)
-	if offset+2 > len(data) {
-		// If not enough bytes for flags, use defaults (false for redelivered)
+	// Redelivered (single bit field)
+	if offset >= len(data) {
+		// If not enough bytes, use default (false for redelivered)
 		m.Redelivered = false
 	} else {
-		flags := binary.BigEndian.Uint16(data[offset : offset+2])
-		offset += 2
-
-		// Extract flags
-		m.Redelivered = (flags & (1 << 0)) != 0
+		m.Redelivered = data[offset] != 0
+		offset++
 	}
 
 	// Exchange (short string)

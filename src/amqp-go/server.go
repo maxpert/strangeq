@@ -584,6 +584,34 @@ func (s *Server) processChannelSpecificMethod(conn *protocol.Connection, channel
 
 		// Send channel.open-ok
 		return s.sendChannelOpenOK(conn, channelID)
+	
+	case protocol.ChannelClose: // Method ID 40 for channel class
+		s.Log.Debug("Channel close requested",
+			zap.Uint16("channel_id", channelID),
+			zap.String("connection_id", conn.ID))
+
+		// Clean up channel resources
+		conn.Mutex.Lock()
+		if channel, exists := conn.Channels[channelID]; exists {
+			// Cancel all consumers on this channel
+			channel.Mutex.Lock()
+			for consumerTag := range channel.Consumers {
+				s.Log.Debug("Canceling consumer due to channel close",
+					zap.String("consumer_tag", consumerTag),
+					zap.Uint16("channel_id", channelID))
+			}
+			channel.Consumers = make(map[string]*protocol.Consumer) // Clear all consumers
+			channel.Closed = true
+			channel.Mutex.Unlock()
+			
+			// Remove channel from connection
+			delete(conn.Channels, channelID)
+		}
+		conn.Mutex.Unlock()
+
+		// Send channel.close-ok
+		return s.sendChannelCloseOK(conn, channelID)
+
 	default:
 		s.Log.Warn("Unknown channel method ID",
 			zap.Uint16("method_id", methodID),
@@ -924,6 +952,20 @@ func (s *Server) sendChannelOpenOK(conn *protocol.Connection, channelID uint16) 
 	return protocol.WriteFrame(conn.Conn, frame)
 }
 
+// sendChannelCloseOK sends the channel.close-ok method frame
+func (s *Server) sendChannelCloseOK(conn *protocol.Connection, channelID uint16) error {
+	closeOKMethod := &protocol.ChannelCloseOKMethod{}
+
+	methodData, err := closeOKMethod.Serialize()
+	if err != nil {
+		return fmt.Errorf("error serializing channel.close-ok: %v", err)
+	}
+
+	frame := protocol.EncodeMethodFrameForChannel(channelID, 20, 41, methodData) // 20.41 = channel.close-ok
+
+	return protocol.WriteFrame(conn.Conn, frame)
+}
+
 // sendExchangeDeclareOK sends the exchange.declare-ok method frame
 func (s *Server) sendExchangeDeclareOK(conn *protocol.Connection, channelID uint16) error {
 	declareOKMethod := &protocol.ExchangeDeclareOKMethod{}
@@ -1169,6 +1211,26 @@ func (s *Server) processHeaderFrame(conn *protocol.Connection, frame *protocol.F
 		zap.String("exchange", pendingMsg.Method.Exchange),
 		zap.String("routing_key", pendingMsg.Method.RoutingKey),
 		zap.Uint64("body_size", contentHeader.BodySize))
+
+	// For empty messages (body_size = 0), no body frame will be sent
+	// We should process the complete message immediately
+	if contentHeader.BodySize == 0 {
+		s.Log.Debug("Empty message detected - processing immediately",
+			zap.String("exchange", pendingMsg.Method.Exchange),
+			zap.String("routing_key", pendingMsg.Method.RoutingKey))
+
+		// Process the complete message immediately
+		if err := s.processCompleteMessage(conn, frame.Channel, pendingMsg); err != nil {
+			s.Log.Error("Failed to process complete empty message",
+				zap.Error(err),
+				zap.String("connection_id", conn.ID),
+				zap.Uint16("channel", frame.Channel))
+			return err
+		}
+
+		// Remove the pending message from the map since it's now complete
+		delete(conn.PendingMessages, frame.Channel)
+	}
 
 	return nil
 }
