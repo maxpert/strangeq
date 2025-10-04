@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/maxpert/amqp-go/broker"
+	"github.com/maxpert/amqp-go/config"
 	"github.com/maxpert/amqp-go/protocol"
 	"go.uber.org/zap"
 )
@@ -28,6 +29,7 @@ type Server struct {
 	Shutdown    bool
 	Log         *zap.Logger
 	Broker      *broker.Broker
+	Config      *config.AMQPConfig
 }
 
 // NewServer creates a new AMQP server
