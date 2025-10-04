@@ -4,6 +4,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/maxpert/amqp-go/server"
 	amqp "github.com/rabbitmq/amqp091-go"
 	"github.com/stretchr/testify/assert"
 )
@@ -11,9 +12,9 @@ import (
 // TestConnectionAndChannel tests basic connection and channel functionality
 func TestConnectionAndChannel(t *testing.T) {
 	// Start a server in a goroutine
-	server := NewServer(":5680") // Use a different port to avoid conflicts
+	srv := server.NewServer(":5680") // Use a different port to avoid conflicts
 	go func() {
-		_ = server.Start()
+		_ = srv.Start()
 	}()
 
 	// Give the server a moment to start
@@ -41,9 +42,9 @@ func TestConnectionAndChannel(t *testing.T) {
 // TestExchangeOperations tests exchange operations using the standard AMQP client
 func TestExchangeOperations(t *testing.T) {
 	// Start a server in a goroutine
-	server := NewServer(":5681") // Use a different port
+	srv := server.NewServer(":5681") // Use a different port
 	go func() {
-		_ = server.Start()
+		_ = srv.Start()
 	}()
 
 	// Give the server a moment to start
@@ -82,9 +83,9 @@ func TestExchangeOperations(t *testing.T) {
 // TestQueueOperations tests queue operations using the standard AMQP client
 func TestQueueOperations(t *testing.T) {
 	// Start a server in a goroutine
-	server := NewServer(":5682") // Use a different port
+	srv := server.NewServer(":5682") // Use a different port
 	go func() {
-		_ = server.Start()
+		_ = srv.Start()
 	}()
 
 	// Give the server a moment to start
@@ -124,9 +125,9 @@ func TestQueueOperations(t *testing.T) {
 // TestQueueBinding tests queue binding operations
 func TestQueueBinding(t *testing.T) {
 	// Start a server in a goroutine
-	server := NewServer(":5683") // Use a different port
+	srv := server.NewServer(":5683") // Use a different port
 	go func() {
-		_ = server.Start()
+		_ = srv.Start()
 	}()
 
 	// Give the server a moment to start

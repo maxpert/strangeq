@@ -87,27 +87,94 @@ Server successfully generates and transmits all AMQP frames correctly, but stand
 - [x] Fix empty message handling for zero-length message bodies
 - [x] Complete integration test passes with standard AMQP clients
 
-### Phase 4: Persistence and Reliability
-- [ ] Choose and integrate a storage backend (e.g., bbolt, badger) for messages and metadata
-- [ ] Implement message persistence (durability, persistence flags)
-- [ ] Implement durable exchanges and queues
-- [ ] Ensure message durability across server restarts
-- [ ] Write integration tests covering persistence scenarios
+### Phase 4: Library Refactoring and Reusability Foundation
+- [ ] **Package Restructuring**: Move from `package main` to proper library structure  
+  - [ ] Separate server implementation from main application
+  - [ ] Move internal packages to public where appropriate
+  - [ ] Create `cmd/` directory for CLI applications
+  - [ ] Add `examples/` directory with usage examples
+- [ ] **Interface-Based Design**: Create abstractions for all pluggable components
+  - [ ] Define `Storage` interface for message and metadata persistence
+  - [ ] Define `MessageStore` interface for message durability
+  - [ ] Define `MetadataStore` interface for exchanges, queues, bindings
+  - [ ] Define `TransactionStore` interface for transactional operations
+  - [ ] Define `Broker` interface for custom message routing implementations
+  - [ ] Define `Logger` interface to decouple from zap dependency  
+  - [ ] Define `ConnectionHandler` interface for custom connection handling
+  - [ ] Define `Authenticator` interface for pluggable auth mechanisms
+- [ ] **Configuration System**: Replace hardcoded values with flexible config
+  - [ ] Create `Config` struct with all server options
+  - [ ] Implement `ServerInfo` configuration for product/version details
+  - [ ] Add `NetworkConfig` for connection settings
+  - [ ] Add `StorageConfig` for storage backend options
+  - [ ] Add `SecurityConfig` for authentication and TLS options
+- [ ] **Builder Pattern**: Implement fluent API for server creation
+  - [ ] `NewServer()` with chainable configuration methods
+  - [ ] `WithAddress()`, `WithLogger()`, `WithStorage()`, `WithBroker()` builders
+  - [ ] `Build()` method for final server construction
+- [ ] **Error Handling**: Define library-specific error types
+  - [ ] Create AMQP-specific error types and codes
+  - [ ] Add storage-specific error types and recovery strategies
+  - [ ] Provide detailed error context and debugging information
+  - [ ] Allow customizable error handling strategies
+- [ ] **Lifecycle Management**: Provide proper server lifecycle control
+  - [ ] `Start()`, `Stop()`, `Shutdown(graceful)` methods
+  - [ ] `Health()` status checking
+  - [ ] Graceful connection termination
+  - [ ] Resource cleanup and memory management
 
-### Phase 5: Advanced Features and Security
-- [ ] Implement transactions (optional for 0.9.1 but part of spec)
-- [ ] Implement access control (vhosts, permissions, authentication - maybe start with simple PLAIN)
-- [ ] Implement TLS/SSL support
-- [ ] Implement basic monitoring/management (optional stats)
-- [ ] Write tests for security and advanced features
+### Phase 5: Storage Implementation with Abstraction
+- [ ] **Storage Implementations**: Create multiple storage backends using defined interfaces
+  - [ ] Implement in-memory storage (default, non-persistent)
+  - [ ] Implement bbolt storage backend
+  - [ ] Implement badger storage backend
+  - [ ] Create storage factory pattern for backend selection
+- [ ] **Storage Integration**: Integrate storage with broker and server using interfaces
+  - [ ] Refactor broker to use Storage interfaces instead of in-memory maps
+  - [ ] Implement storage lifecycle management through configuration system
+  - [ ] Add storage initialization through builder pattern
+  - [ ] Write storage interface tests and benchmarks
 
-### Phase 6: Testing and Refinement
-- [ ] Comprehensive integration tests using AMQP clients (streadway/amqp, rabbitmq/amqp091-go)
-- [ ] Fuzz testing for protocol parsing
-- [ ] Performance benchmarking
-- [ ] Stress test with multiple concurrent clients
-- [ ] Documentation (Go doc, README, examples)
-- [ ] Prepare for release (versioning, release notes)
+### Phase 6: Persistence and Reliability
+- [ ] **Message Durability**: Implement persistent messages using storage interfaces
+  - [ ] Implement message persistence flags and durability
+  - [ ] Implement durable exchanges and queues using MetadataStore interface
+  - [ ] Ensure message durability across server restarts
+  - [ ] Implement message acknowledgment persistence
+- [ ] **Recovery and Consistency**: Handle server restarts and failures
+  - [ ] Implement server restart recovery using storage interfaces
+  - [ ] Handle partially written transactions and rollback
+  - [ ] Implement storage corruption detection and repair
+  - [ ] Write integration tests covering persistence and recovery scenarios
+
+### Phase 7: Advanced Features and Security
+- [ ] **Transactions**: Implement transactional operations using TransactionStore interface
+  - [ ] Implement AMQP transactions (tx.select, tx.commit, tx.rollback)
+  - [ ] Use TransactionStore interface for atomic multi-operation commits
+  - [ ] Implement transaction timeout and cleanup
+- [ ] **Security and Access Control**: Add authentication and authorization using interfaces
+  - [ ] Implement access control using Authenticator interface
+  - [ ] Add user/permission storage using MetadataStore interface
+  - [ ] Implement TLS/SSL support through SecurityConfig
+  - [ ] Add security integration tests
+- [ ] **Monitoring and Management**: Add operational features
+  - [ ] Implement basic monitoring/management using storage interfaces for metrics
+  - [ ] Add storage-backed statistics and reporting
+  - [ ] Write tests for security and advanced features
+
+### Phase 8: Testing and Refinement  
+- [ ] **Comprehensive Testing**: Validate all interface implementations
+  - [ ] Integration tests using all storage backends (memory, bbolt, badger)
+  - [ ] Cross-storage compatibility tests
+  - [ ] Fuzz testing for protocol parsing and storage operations
+  - [ ] Performance benchmarking across different storage backends
+- [ ] **Quality and Documentation**: Prepare for production use
+  - [ ] Stress test with multiple concurrent clients and storage backends
+  - [ ] API Documentation with Godoc comments for all public interfaces
+  - [ ] Usage examples for different scenarios and configurations
+  - [ ] Integration guides for popular frameworks
+  - [ ] Best practices documentation for interface implementations
+  - [ ] Prepare for release (versioning, release notes)
 
 ## Outstanding Questions
 

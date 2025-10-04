@@ -4,6 +4,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/maxpert/amqp-go/server"
 	amqp "github.com/rabbitmq/amqp091-go"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -12,9 +13,9 @@ import (
 // TestSimpleQueueOperations tests basic queue operations with different payload sizes and content types
 func TestSimpleQueueOperations(t *testing.T) {
 	// Start a server in a goroutine
-	server := NewServer(":5673")
+	srv := server.NewServer(":5673")
 	go func() {
-		_ = server.Start()
+		_ = srv.Start()
 	}()
 
 	// Give the server a moment to start

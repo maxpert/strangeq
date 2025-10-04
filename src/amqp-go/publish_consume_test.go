@@ -4,6 +4,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/maxpert/amqp-go/server"
 	amqp "github.com/rabbitmq/amqp091-go"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -12,9 +13,9 @@ import (
 // TestBasicPublishConsume tests basic message publishing and consumption
 func TestBasicPublishConsume(t *testing.T) {
 	// Start a server in a goroutine
-	server := NewServer(":5690") // Use a different port to avoid conflicts
+	srv := server.NewServer(":5690") // Use a different port to avoid conflicts
 	go func() {
-		_ = server.Start()
+		_ = srv.Start()
 	}()
 
 	// Give the server a moment to start
@@ -80,9 +81,9 @@ func TestBasicPublishConsume(t *testing.T) {
 // TestManualAcknowledgment tests manual message acknowledgment
 func TestManualAcknowledgment(t *testing.T) {
 	// Start a server in a goroutine
-	server := NewServer(":5691") // Use a different port to avoid conflicts
+	srv := server.NewServer(":5691") // Use a different port to avoid conflicts
 	go func() {
-		_ = server.Start()
+		_ = srv.Start()
 	}()
 
 	// Give the server a moment to start
@@ -152,9 +153,9 @@ func TestManualAcknowledgment(t *testing.T) {
 // TestMessageRejection tests message rejection with requeuing
 func TestMessageRejection(t *testing.T) {
 	// Start a server in a goroutine
-	server := NewServer(":5692") // Use a different port to avoid conflicts
+	srv := server.NewServer(":5692") // Use a different port to avoid conflicts
 	go func() {
-		_ = server.Start()
+		_ = srv.Start()
 	}()
 
 	// Give the server a moment to start
@@ -224,9 +225,9 @@ func TestMessageRejection(t *testing.T) {
 // TestPrefetchSettings tests prefetch count settings
 func TestPrefetchSettings(t *testing.T) {
 	// Start a server in a goroutine
-	server := NewServer(":5693") // Use a different port to avoid conflicts
+	srv := server.NewServer(":5693") // Use a different port to avoid conflicts
 	go func() {
-		_ = server.Start()
+		_ = srv.Start()
 	}()
 
 	// Give the server a moment to start
@@ -322,9 +323,9 @@ func TestPrefetchSettings(t *testing.T) {
 // TestMultipleConsumers tests multiple consumers on the same queue
 func TestMultipleConsumers(t *testing.T) {
 	// Start a server in a goroutine
-	server := NewServer(":5694") // Use a different port to avoid conflicts
+	srv := server.NewServer(":5694") // Use a different port to avoid conflicts
 	go func() {
-		_ = server.Start()
+		_ = srv.Start()
 	}()
 
 	// Give the server a moment to start
@@ -436,9 +437,9 @@ func TestMultipleConsumers(t *testing.T) {
 // TestNegativeAcknowledgment tests message negative acknowledgment (nack)
 func TestNegativeAcknowledgment(t *testing.T) {
 	// Start a server in a goroutine
-	server := NewServer(":5695") // Use a different port to avoid conflicts
+	srv := server.NewServer(":5695") // Use a different port to avoid conflicts
 	go func() {
-		_ = server.Start()
+		_ = srv.Start()
 	}()
 
 	// Give the server a moment to start
@@ -508,9 +509,9 @@ func TestNegativeAcknowledgment(t *testing.T) {
 // TestNegativeAcknowledgmentMultiple tests message negative acknowledgment with multiple flag
 func TestNegativeAcknowledgmentMultiple(t *testing.T) {
 	// Start a server in a goroutine
-	server := NewServer(":5696") // Use a different port to avoid conflicts
+	srv := server.NewServer(":5696") // Use a different port to avoid conflicts
 	go func() {
-		_ = server.Start()
+		_ = srv.Start()
 	}()
 
 	// Give the server a moment to start

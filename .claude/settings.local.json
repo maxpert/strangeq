@@ -1,0 +1,18 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(timeout 3s go test -run TestSimpleQueueOperations -v)",
+      "Bash(find:*)",
+      "Read(//Users/zohaib.hassan/**)",
+      "Bash(git check-ignore:*)",
+      "Bash(timeout 5s go test -run TestSimpleQueueOperations -v)",
+      "Bash(AMQP_LOG_LEVEL=debug go test -v -run TestSimpleQueueOperations)",
+      "Bash(git commit:*)",
+      "Bash(timeout 10s go test -v -run TestSimpleQueueOperations)",
+      "Bash(timeout 10s go test -run TestSimpleQueueOperations -v)",
+      "Bash(AMQP_LOG_LEVEL=debug go test -run TestSimpleQueueOperations/Empty_message -v)"
+    ],
+    "deny": [],
+    "ask": []
+  }
+}
