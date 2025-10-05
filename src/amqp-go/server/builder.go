@@ -8,6 +8,7 @@ import (
 	"github.com/maxpert/amqp-go/interfaces"
 	"github.com/maxpert/amqp-go/protocol"
 	"github.com/maxpert/amqp-go/storage"
+	"github.com/maxpert/amqp-go/transaction"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
 )
@@ -222,13 +223,26 @@ func (b *ServerBuilder) Build() (*Server, error) {
 		unifiedBroker = NewStorageBrokerAdapter(storageBroker)
 	}
 
+	// Create transaction manager with atomic storage support if available
+	var transactionManager interfaces.TransactionManager
+	if atomicStorage, ok := storageImpl.(interfaces.AtomicStorage); ok {
+		transactionManager = transaction.NewTransactionManagerWithStorage(atomicStorage)
+	} else {
+		transactionManager = transaction.NewTransactionManager()
+	}
+	
+	// Set the broker as the transaction executor
+	executor := transaction.NewUnifiedBrokerExecutor(unifiedBroker)
+	transactionManager.SetExecutor(executor)
+
 	// Create the server
 	server := &Server{
-		Addr:        b.config.Network.Address,
-		Connections: make(map[string]*protocol.Connection),
-		Log:         logger.(*ZapLoggerAdapter).logger, // TODO: Remove this dependency
-		Config:      b.config,
-		Broker:      unifiedBroker,
+		Addr:               b.config.Network.Address,
+		Connections:        make(map[string]*protocol.Connection),
+		Log:                logger.(*ZapLoggerAdapter).logger, // TODO: Remove this dependency
+		Config:             b.config,
+		Broker:             unifiedBroker,
+		TransactionManager: transactionManager,
 	}
 
 	// Create and attach lifecycle manager

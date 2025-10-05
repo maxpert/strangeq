@@ -77,6 +77,16 @@ const (
 	BasicNack         = 120 // 60.120 - class ID 60, method ID 120
 )
 
+// Method IDs for tx class
+const (
+	TxSelect     = 10 // 90.10 - class ID 90, method ID 10
+	TxSelectOK   = 11 // 90.11 - class ID 90, method ID 11
+	TxCommit     = 20 // 90.20 - class ID 90, method ID 20
+	TxCommitOK   = 21 // 90.21 - class ID 90, method ID 21
+	TxRollback   = 30 // 90.30 - class ID 90, method ID 30
+	TxRollbackOK = 31 // 90.31 - class ID 90, method ID 31
+)
+
 // ConnectionStartMethod represents the connection.start method
 type ConnectionStartMethod struct {
 	VersionMajor     byte
