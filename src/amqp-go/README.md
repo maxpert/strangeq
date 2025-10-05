@@ -217,6 +217,155 @@ func main() {
 }
 ```
 
+### Transaction Support
+
+AMQP-Go provides complete AMQP 0.9.1 transaction support with a pluggable architecture for extensibility.
+
+```go
+package main
+
+import (
+    "fmt"
+    "log"
+    
+    "github.com/maxpert/amqp-go/server"
+    "github.com/maxpert/amqp-go/config"
+    "github.com/maxpert/amqp-go/protocol"
+    "github.com/maxpert/amqp-go/transaction"
+)
+
+func main() {
+    // Create server with transaction support
+    cfg := config.DefaultConfig()
+    cfg.Storage.Backend = "memory" // or "badger" for persistence
+    
+    amqpServer, err := server.NewServerBuilder().
+        WithConfig(cfg).
+        WithZapLogger("info").
+        Build()
+    if err != nil {
+        log.Fatalf("Failed to create server: %v", err)
+    }
+    
+    // Set up broker resources
+    err = setupBrokerResources(amqpServer)
+    if err != nil {
+        log.Fatalf("Failed to setup resources: %v", err)
+    }
+    
+    // Demonstrate transaction operations
+    demoTransactions(amqpServer)
+}
+
+func setupBrokerResources(server *server.Server) error {
+    // Create exchange
+    err := server.Broker.DeclareExchange("demo.exchange", "direct", true, false, false, nil)
+    if err != nil {
+        return err
+    }
+    
+    // Create queue and bind to exchange
+    _, err = server.Broker.DeclareQueue("demo.queue", true, false, false, nil)
+    if err != nil {
+        return err
+    }
+    
+    return server.Broker.BindQueue("demo.queue", "demo.exchange", "demo.key", nil)
+}
+
+func demoTransactions(server *server.Server) {
+    tm := server.TransactionManager
+    channelID := uint16(1)
+    
+    // Start transaction
+    err := tm.Select(channelID)
+    if err != nil {
+        log.Printf("Failed to start transaction: %v", err)
+        return
+    }
+    fmt.Println("✅ Transaction started")
+    
+    // Add operations to transaction
+    message := &protocol.Message{
+        Exchange:     "demo.exchange",
+        RoutingKey:   "demo.key", 
+        Body:         []byte("Transactional message"),
+        DeliveryMode: 2, // Persistent
+    }
+    
+    publishOp := transaction.NewPublishOperation("demo.exchange", "demo.key", message)
+    err = tm.AddOperation(channelID, publishOp)
+    if err != nil {
+        log.Printf("Failed to add operation: %v", err)
+        return
+    }
+    fmt.Println("✅ Added publish operation to transaction")
+    
+    // Commit transaction
+    err = tm.Commit(channelID)
+    if err != nil {
+        log.Printf("Transaction commit failed: %v", err)
+        return
+    }
+    fmt.Println("✅ Transaction committed successfully!")
+    
+    // Get transaction statistics
+    stats := tm.GetTransactionStats()
+    fmt.Printf("📊 Statistics: Commits=%d, Rollbacks=%d, Active=%d\n", 
+        stats.TotalCommits, stats.TotalRollbacks, stats.ActiveTransactions)
+}
+```
+
+### Transaction Features
+
+- **AMQP 0.9.1 Compliance**: Full support for `tx.select`, `tx.commit`, and `tx.rollback`
+- **Pluggable Architecture**: Extensible transaction system with interface-based design
+- **Channel Isolation**: Transactions are isolated per channel for concurrent operations
+- **Operation Types**: Support for Publish, Ack, Nack, and Reject operations
+- **Atomic Execution**: All operations in a transaction succeed or fail together
+- **Statistics Tracking**: Comprehensive transaction metrics and monitoring
+- **Thread-Safe**: Concurrent transaction operations with proper synchronization
+- **Storage Integration**: Works with both memory and persistent storage backends
+
+### Transaction Operation Types
+
+```go
+// Publishing messages transactionally
+publishOp := transaction.NewPublishOperation(exchange, routingKey, message)
+tm.AddOperation(channelID, publishOp)
+
+// Acknowledging messages transactionally  
+ackOp := transaction.NewAckOperation(queueName, deliveryTag, false)
+tm.AddOperation(channelID, ackOp)
+
+// Negative acknowledgment transactionally
+nackOp := transaction.NewNackOperation(queueName, deliveryTag, false, true)
+tm.AddOperation(channelID, nackOp)
+
+// Rejecting messages transactionally
+rejectOp := transaction.NewRejectOperation(queueName, deliveryTag, false)
+tm.AddOperation(channelID, rejectOp)
+```
+
+### Advanced Transaction Configuration
+
+```go
+// Create transaction manager with atomic storage
+cfg := config.DefaultConfig()
+cfg.Storage.Backend = "badger"
+cfg.Storage.Path = "./transaction-data"
+
+server, err := server.NewServerBuilder().
+    WithConfig(cfg).
+    Build()
+
+// The transaction manager is automatically configured with:
+// - Atomic storage support for ACID compliance
+// - Unified broker executor for operation execution
+// - Statistics tracking for monitoring
+// - Channel-based isolation for concurrency
+```
+
 ## Configuration
 
 ### Storage Configuration
@@ -318,6 +467,18 @@ go test -bench=BenchmarkStorageOperations -benchmem ./benchmarks/
 go build ./...
 ```
 
+### Running Examples
+
+The `examples/` directory contains various demonstration programs:
+
+```bash
+# Run basic transaction demo
+go run examples/transaction_demo.go
+
+# Run complete transaction flow demo with broker setup
+go run examples/transaction_complete_demo.go
+```
+
 ### Code Formatting
 ```bash
 go fmt ./...
@@ -333,11 +494,13 @@ golangci-lint run
 ├── benchmarks/          # Performance benchmarks
 ├── broker/             # Message broker implementations
 ├── config/             # Configuration management
+├── examples/           # Usage examples and demos
 ├── interfaces/         # Interface definitions
 ├── protocol/           # AMQP protocol implementation
 ├── server/             # Server implementation
-├── storage/            # Storage backend implementations  
-└── tests/              # Integration tests
+├── storage/            # Storage backend implementations
+├── tests/              # Integration tests
+└── transaction/        # Transaction system implementation
 ```
 
 ## Contributing
