@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"os/exec"
 	"os/signal"
 	"strconv"
 	"strings"
@@ -72,8 +73,18 @@ func main() {
 		return
 	}
 
-	// Show banner
-	fmt.Printf(banner, version)
+	// Handle daemon stages first
+	if isDaemonChild() {
+		// Final daemon process - complete daemonization
+		if err := finalizeDaemon(""); err != nil {
+			log.Fatalf("Failed to finalize daemon: %v", err)
+		}
+	}
+
+	// Show banner (only for non-daemon or final daemon process)
+	if !isDaemonChild() {
+		fmt.Printf(banner, version)
+	}
 	
 	// Create configuration
 	var cfg *config.AMQPConfig
@@ -85,7 +96,9 @@ func main() {
 		if err := cfg.Load(*configFile); err != nil {
 			log.Fatalf("Failed to load configuration file %s: %v", *configFile, err)
 		}
-		fmt.Printf("Loaded configuration from: %s\n", *configFile)
+		if !isDaemonChild() {
+			fmt.Printf("Loaded configuration from: %s\n", *configFile)
+		}
 	} else {
 		// Build configuration from command-line flags
 		cfg, err = buildConfigFromFlags(
@@ -98,7 +111,23 @@ func main() {
 		if err != nil {
 			log.Fatalf("Failed to build configuration: %v", err)
 		}
-		fmt.Println("Using configuration from command-line flags")
+		if !isDaemonChild() {
+			fmt.Println("Using configuration from command-line flags")
+		}
+	}
+
+	// Handle daemonization if requested (and not already a daemon)
+	if cfg.Server.Daemonize && !isDaemonChild() {
+		if err := startDaemon(cfg.Server.LogFile); err != nil {
+			log.Fatalf("Failed to daemonize: %v", err)
+		}
+	}
+
+	// Finalize daemon setup if we're the final daemon process
+	if isDaemonChild() {
+		if err := finalizeDaemon(cfg.Server.LogFile); err != nil {
+			log.Fatalf("Failed to finalize daemon: %v", err)
+		}
 	}
 
 	// Create and start server
@@ -119,21 +148,40 @@ func main() {
 	// Setup signal handling for graceful shutdown
 	setupSignalHandling(amqpServer, cfg.Server.PidFile)
 
-	// Start server
-	fmt.Printf("Starting AMQP server on %s\n", cfg.Network.Address)
-	fmt.Printf("Storage backend: %s\n", cfg.Storage.Backend)
-	if cfg.Storage.Persistent {
-		fmt.Printf("Storage path: %s\n", cfg.Storage.Path)
+	// Start server - show startup info only if not daemonizing
+	if !cfg.Server.Daemonize || isDaemonChild() {
+		if isDaemonChild() {
+			log.Printf("Starting AMQP server daemon on %s", cfg.Network.Address)
+			log.Printf("Storage backend: %s", cfg.Storage.Backend)
+			if cfg.Storage.Persistent {
+				log.Printf("Storage path: %s", cfg.Storage.Path)
+			}
+			if cfg.Security.TLSEnabled {
+				log.Println("TLS: Enabled")
+			}
+			if cfg.Security.AuthenticationEnabled {
+				log.Printf("Authentication: Enabled (%s)", cfg.Security.AuthenticationBackend)
+			}
+			log.Printf("Transaction support: Enabled")
+			log.Printf("Log level: %s", cfg.Server.LogLevel)
+			log.Println("AMQP daemon started successfully")
+		} else {
+			fmt.Printf("Starting AMQP server on %s\n", cfg.Network.Address)
+			fmt.Printf("Storage backend: %s\n", cfg.Storage.Backend)
+			if cfg.Storage.Persistent {
+				fmt.Printf("Storage path: %s\n", cfg.Storage.Path)
+			}
+			if cfg.Security.TLSEnabled {
+				fmt.Println("TLS: Enabled")
+			}
+			if cfg.Security.AuthenticationEnabled {
+				fmt.Printf("Authentication: Enabled (%s)\n", cfg.Security.AuthenticationBackend)
+			}
+			fmt.Printf("Transaction support: Enabled\n")
+			fmt.Printf("Log level: %s\n", cfg.Server.LogLevel)
+			fmt.Println("Server ready - Press Ctrl+C to stop")
+		}
 	}
-	if cfg.Security.TLSEnabled {
-		fmt.Println("TLS: Enabled")
-	}
-	if cfg.Security.AuthenticationEnabled {
-		fmt.Printf("Authentication: Enabled (%s)\n", cfg.Security.AuthenticationBackend)
-	}
-	fmt.Printf("Transaction support: Enabled\n")
-	fmt.Printf("Log level: %s\n", cfg.Server.LogLevel)
-	fmt.Println("Server ready - Press Ctrl+C to stop")
 
 	if err := amqpServer.Start(); err != nil {
 		log.Fatalf("Server failed: %v", err)
@@ -244,4 +292,123 @@ func setupSignalHandling(server *server.Server, pidFile string) {
 		fmt.Println("Server stopped")
 		os.Exit(0)
 	}()
+}
+
+// startDaemon turns the process into a proper Unix daemon using double-fork technique
+func startDaemon(logFile string) error {
+	// Check if we're already a daemon (child process)
+	if os.Getenv("_AMQP_DAEMON") == "1" {
+		// We're the final daemon process - just do final setup
+		return setupDaemonEnvironment(logFile)
+	}
+
+	// First fork - create child process
+	args := make([]string, len(os.Args))
+	copy(args, os.Args)
+	
+	cmd := &exec.Cmd{
+		Path: os.Args[0],
+		Args: args,
+		Env:  append(os.Environ(), "_AMQP_DAEMON=1"),
+	}
+
+	if err := cmd.Start(); err != nil {
+		return fmt.Errorf("failed to start daemon process: %v", err)
+	}
+
+	// Parent exits immediately
+	fmt.Printf("AMQP server daemonized with PID %d\n", cmd.Process.Pid)
+	os.Exit(0)
+	return nil // Never reached
+}
+
+// setupDaemonEnvironment sets up the daemon environment for the child process
+func setupDaemonEnvironment(logFile string) error {
+	// Create new session
+	if _, err := syscall.Setsid(); err != nil {
+		return fmt.Errorf("setsid failed: %v", err)
+	}
+
+	// Second fork - prevents daemon from ever acquiring controlling terminal
+	cmd := &exec.Cmd{
+		Path: os.Args[0],
+		Args: os.Args,
+		Env:  append(os.Environ(), "_AMQP_DAEMON=2"),
+	}
+
+	if err := cmd.Start(); err != nil {
+		return fmt.Errorf("second fork failed: %v", err)
+	}
+
+	// First child exits
+	os.Exit(0)
+	return nil // Never reached
+}
+
+// isDaemonChild checks if this is the final daemon process
+func isDaemonChild() bool {
+	return os.Getenv("_AMQP_DAEMON") == "2"
+}
+
+// finalizeDaemon completes the daemonization process
+func finalizeDaemon(logFile string) error {
+	// Change working directory to root
+	if err := os.Chdir("/"); err != nil {
+		return fmt.Errorf("failed to change directory to /: %v", err)
+	}
+
+	// Set file creation mask
+	syscall.Umask(0)
+
+	// Redirect standard file descriptors
+	if err := redirectStdFiles(logFile); err != nil {
+		return fmt.Errorf("failed to redirect standard files: %v", err)
+	}
+
+	return nil
+}
+
+// redirectStdFiles redirects stdin to /dev/null and stdout/stderr to log file or /dev/null
+func redirectStdFiles(logFile string) error {
+	// Redirect stdin to /dev/null
+	devNull, err := os.OpenFile("/dev/null", os.O_RDWR, 0)
+	if err != nil {
+		return fmt.Errorf("failed to open /dev/null: %v", err)
+	}
+
+	// Duplicate stdin to /dev/null
+	if err := syscall.Dup2(int(devNull.Fd()), int(os.Stdin.Fd())); err != nil {
+		devNull.Close()
+		return fmt.Errorf("failed to redirect stdin: %v", err)
+	}
+
+	// Handle stdout and stderr
+	var outputFile *os.File
+	if logFile != "" {
+		// Redirect to log file
+		outputFile, err = os.OpenFile(logFile, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+		if err != nil {
+			devNull.Close()
+			return fmt.Errorf("failed to open log file %s: %v", logFile, err)
+		}
+	} else {
+		// Redirect to /dev/null if no log file specified
+		outputFile = devNull
+	}
+
+	// Redirect stdout and stderr
+	if err := syscall.Dup2(int(outputFile.Fd()), int(os.Stdout.Fd())); err != nil {
+		outputFile.Close()
+		devNull.Close()
+		return fmt.Errorf("failed to redirect stdout: %v", err)
+	}
+
+	if err := syscall.Dup2(int(outputFile.Fd()), int(os.Stderr.Fd())); err != nil {
+		outputFile.Close()
+		devNull.Close()
+		return fmt.Errorf("failed to redirect stderr: %v", err)
+	}
+
+	// Don't close the files as they're now being used by the standard descriptors
+	return nil
 }
