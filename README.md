@@ -368,32 +368,351 @@ server, err := server.NewServerBuilder().
 
 ## Configuration
 
+AMQP-Go uses a comprehensive configuration system with four main sections: Network, Storage, Security, and Server. Configuration can be created programmatically using builders or loaded from JSON files.
+
+### Default Configuration
+
+```go
+import "github.com/maxpert/amqp-go/config"
+
+// Create server with default configuration
+cfg := config.DefaultConfig()
+server, err := server.NewServerBuilder().
+    WithConfig(cfg).
+    Build()
+```
+
+### Configuration Builder Pattern
+
+```go
+import (
+    "time"
+    "github.com/maxpert/amqp-go/config"
+)
+
+// Build configuration using fluent API
+cfg, err := config.NewConfigBuilder().
+    // Network configuration
+    WithAddress(":5672").
+    WithPort(5672).
+    WithMaxConnections(1000).
+    WithHeartbeat(60 * time.Second).
+    WithBufferSizes(8192, 8192).
+    
+    // Storage configuration
+    WithBadgerStorage("./amqp-data").
+    WithCacheSize(64 * 1024 * 1024).
+    WithSyncWrites(false).
+    
+    // Security configuration
+    WithTLS("server.crt", "server.key").
+    WithFileAuthentication("users.json").
+    WithAuthorization(true).
+    
+    // Server configuration  
+    WithLogging("info", "amqp.log").
+    WithProtocolLimits(2047, 131072, 16777216).
+    WithTimeouts(60*time.Second, 30*time.Second, 5*time.Minute).
+    
+    Build()
+```
+
+### Network Configuration
+
+Controls network behavior, connections, and TCP settings.
+
+```go
+type NetworkConfig struct {
+    // Basic network settings
+    Address               string        // Server bind address (default: ":5672")
+    Port                 int           // Server port (default: 5672)
+    MaxConnections       int           // Max concurrent connections (default: 1000)
+    
+    // Timing and keepalive
+    ConnectionTimeout    time.Duration // Connection timeout (default: 30s)
+    HeartbeatInterval    time.Duration // Heartbeat interval (default: 60s)
+    TCPKeepAlive         bool          // Enable TCP keepalive (default: true)
+    TCPKeepAliveInterval time.Duration // Keepalive interval (default: 30s)
+    
+    // Performance buffers
+    ReadBufferSize       int           // Read buffer size (default: 8192)
+    WriteBufferSize      int           // Write buffer size (default: 8192)
+}
+```
+
+**Configuration Examples:**
+
+```go
+// High-performance configuration
+builder.WithBufferSizes(32768, 32768).
+    WithMaxConnections(5000).
+    WithHeartbeat(30 * time.Second)
+
+// Low-resource configuration  
+builder.WithBufferSizes(4096, 4096).
+    WithMaxConnections(100).
+    WithHeartbeat(120 * time.Second)
+```
+
 ### Storage Configuration
+
+Controls persistence, caching, and storage backend behavior.
 
 ```go
 type StorageConfig struct {
-    Backend    string `json:"backend"`      // "memory" or "badger"
-    Path       string `json:"path"`         // Storage directory for Badger
-    MessageTTL int    `json:"message_ttl"`  // Message TTL in seconds
+    // Backend selection
+    Backend      string                 // "memory", "badger" (default: "memory")
+    Path         string                 // Storage directory for persistent backends
+    Options      map[string]interface{} // Backend-specific options
+    
+    // Persistence settings
+    Persistent   bool                   // Enable persistence (auto-set by backend)
+    SyncWrites   bool                   // Synchronous writes (default: false)
+    MessageTTL   int64                  // Message TTL in seconds (0 = no TTL)
+    
+    // Performance settings
+    CacheSize    int64                  // Cache size in bytes (default: 64MB)
+    MaxOpenFiles int                    // Max open files (default: 100)
+    CompactionAge time.Duration         // Compaction age (default: 24h)
 }
+```
+
+**Storage Backend Examples:**
+
+```go
+// Memory storage (development/testing)
+builder.WithMemoryStorage()
+
+// Badger storage (production)
+builder.WithBadgerStorage("./data").
+    WithCacheSize(128 * 1024 * 1024). // 128MB cache
+    WithSyncWrites(true)               // Ensure durability
+
+// Custom storage options
+builder.WithBadgerStorage("./data").
+    WithStorageOptions(map[string]interface{}{
+        "ValueLogFileSize":   1<<28, // 256MB value log files
+        "NumMemtables":       4,     // Number of memtables
+        "NumLevelZeroTables": 2,     // Level 0 tables
+    })
+```
+
+### Security Configuration
+
+Controls TLS, authentication, and authorization.
+
+```go
+type SecurityConfig struct {
+    // TLS configuration
+    TLSEnabled  bool   // Enable TLS (default: false)
+    TLSCertFile string // TLS certificate file path
+    TLSKeyFile  string // TLS private key file path
+    TLSCAFile   string // TLS CA certificate file path
+    
+    // Authentication
+    AuthenticationEnabled bool                   // Enable authentication (default: false)
+    AuthenticationBackend string                 // "file", "ldap", "database"
+    AuthenticationConfig  map[string]interface{} // Backend-specific auth config
+    
+    // Authorization
+    AuthorizationEnabled bool     // Enable authorization (default: false)
+    DefaultVHost        string    // Default virtual host (default: "/")
+    
+    // Access control lists
+    AllowedUsers  []string // Allowed usernames
+    BlockedUsers  []string // Blocked usernames
+    AllowedHosts  []string // Allowed client IP addresses
+    BlockedHosts  []string // Blocked client IP addresses
+}
+```
+
+**Security Examples:**
+
+```go
+// TLS with client certificates
+builder.WithTLS("server.crt", "server.key").
+    WithTLSCA("ca.crt")
+
+// File-based authentication
+builder.WithFileAuthentication("users.json").
+    WithAuthorization(true).
+    WithVirtualHost("/production")
+
+// Access control
+builder.WithAccessControl(
+    []string{"admin", "producer"}, // allowed users
+    []string{"guest"},             // blocked users
+    []string{"192.168.1.0/24"},    // allowed networks
+    []string{"10.0.0.1"},          // blocked IPs
+)
 ```
 
 ### Server Configuration
 
+Controls server behavior, limits, and operational settings.
+
 ```go
-type AMQPConfig struct {
-    Server     ServerConfig  `json:"server"`
-    Storage    StorageConfig `json:"storage"`
+type ServerConfig struct {
+    // Server identification
+    Name      string // Server name (default: "amqp-go-server")
+    Version   string // AMQP version (default: "0.9.1")
+    Product   string // Product name (default: "AMQP-Go")
+    Platform  string // Platform (default: "Go")
+    Copyright string // Copyright notice
     
-    // Connection settings
-    MaxChannels     int `json:"max_channels"`
-    MaxFrameSize    int `json:"max_frame_size"`
-    HeartbeatDelay  int `json:"heartbeat_delay"`
+    // Operational settings
+    LogLevel  string // Log level: debug, info, warn, error (default: "info")
+    LogFile   string // Log file path (empty = stdout)
+    PidFile   string // PID file path
+    Daemonize bool   // Run as daemon (default: false)
     
-    // Performance tuning
-    ReadBufferSize  int `json:"read_buffer_size"`
-    WriteBufferSize int `json:"write_buffer_size"`
+    // Protocol limits
+    MaxChannelsPerConnection int   // Max channels per connection (default: 2047)
+    MaxFrameSize            int   // Max frame size bytes (default: 131072)
+    MaxMessageSize          int64 // Max message size bytes (default: 16777216)
+    
+    // Timeouts and cleanup
+    ChannelTimeout  time.Duration // Channel timeout (default: 60s)
+    MessageTimeout  time.Duration // Message timeout (default: 30s)
+    CleanupInterval time.Duration // Cleanup interval (default: 5m)
 }
+```
+
+**Server Configuration Examples:**
+
+```go
+// Production server
+builder.WithServerInfo(
+    "production-amqp",     // name
+    "0.9.1",              // version
+    "MyCompany-AMQP",     // product
+    "Go/Linux",           // platform
+    "© 2024 MyCompany",   // copyright
+).
+WithLogging("warn", "/var/log/amqp.log").
+WithDaemonize(true, "/var/run/amqp.pid").
+WithProtocolLimits(4095, 262144, 33554432). // Double limits
+WithTimeouts(120*time.Second, 60*time.Second, 10*time.Minute)
+
+// Development server
+builder.WithLogging("debug", "").  // Debug to stdout
+    WithProtocolLimits(1024, 65536, 8388608) // Smaller limits
+```
+
+### JSON Configuration Files
+
+Configuration can be loaded from and saved to JSON files:
+
+```go
+// Load from file
+cfg := &config.AMQPConfig{}
+err := cfg.Load("config.json")
+
+// Save to file
+err = cfg.Save("config.json")
+```
+
+**Example config.json:**
+
+```json
+{
+  "network": {
+    "address": ":5672",
+    "port": 5672,
+    "max_connections": 1000,
+    "connection_timeout": "30s",
+    "heartbeat_interval": "60s",
+    "tcp_keep_alive": true,
+    "tcp_keep_alive_interval": "30s",
+    "read_buffer_size": 8192,
+    "write_buffer_size": 8192
+  },
+  "storage": {
+    "backend": "badger",
+    "path": "./amqp-data",
+    "persistent": true,
+    "sync_writes": false,
+    "message_ttl": 0,
+    "cache_size": 67108864,
+    "max_open_files": 100,
+    "compaction_age": "24h"
+  },
+  "security": {
+    "tls_enabled": true,
+    "tls_cert_file": "server.crt",
+    "tls_key_file": "server.key",
+    "authentication_enabled": true,
+    "authentication_backend": "file",
+    "authentication_config": {
+      "user_file": "users.json"
+    },
+    "authorization_enabled": true,
+    "default_vhost": "/",
+    "allowed_users": ["admin", "producer"],
+    "blocked_users": ["guest"]
+  },
+  "server": {
+    "name": "amqp-go-server",
+    "version": "0.9.1",
+    "product": "AMQP-Go",
+    "platform": "Go",
+    "copyright": "Maxpert AMQP-Go Server",
+    "log_level": "info",
+    "log_file": "",
+    "max_channels_per_connection": 2047,
+    "max_frame_size": 131072,
+    "max_message_size": 16777216,
+    "channel_timeout": "60s",
+    "message_timeout": "30s",
+    "cleanup_interval": "300s"
+  }
+}
+```
+
+### Configuration Validation
+
+All configurations are automatically validated:
+
+```go
+cfg := config.DefaultConfig()
+err := cfg.Validate() // Returns validation errors
+
+// Common validation errors:
+// - Invalid port numbers (<=0 or >65535)
+// - Missing TLS files when TLS is enabled  
+// - Invalid storage backend types
+// - Missing storage paths for persistent backends
+// - Invalid timeout or buffer size values
+```
+
+### Environment-Specific Configurations
+
+```go
+// Development configuration
+devConfig := config.NewConfigBuilder().
+    WithMemoryStorage().
+    WithLogging("debug", "").
+    WithMaxConnections(50).
+    BuildUnsafe()
+
+// Staging configuration  
+stagingConfig := config.NewConfigBuilder().
+    WithBadgerStorage("./staging-data").
+    WithLogging("info", "staging.log").
+    WithTLS("staging.crt", "staging.key").
+    WithMaxConnections(500).
+    BuildUnsafe()
+
+// Production configuration
+prodConfig := config.NewConfigBuilder().
+    WithBadgerStorage("/var/lib/amqp").
+    WithLogging("warn", "/var/log/amqp.log").
+    WithTLS("prod.crt", "prod.key").
+    WithFileAuthentication("/etc/amqp/users.json").
+    WithMaxConnections(5000).
+    WithSyncWrites(true).
+    WithDaemonize(true, "/var/run/amqp.pid").
+    BuildUnsafe()
 ```
 
 ## Testing
