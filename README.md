@@ -22,6 +22,8 @@ A high-performance AMQP 0.9.1 server implementation written in Go, providing ful
 - **Storage Validation**: Integrity validation and auto-repair of storage on startup
 - **TTL Support**: Configurable message time-to-live with automatic cleanup
 - **High Concurrency**: Optimized for concurrent operations with minimal locking
+- **Authentication**: SASL authentication with PLAIN and ANONYMOUS mechanisms
+- **Security**: File-based authentication with bcrypt password hashing
 
 ### Storage Backends
 - **Memory**: High-performance in-memory storage for development and testing
@@ -508,16 +510,18 @@ type SecurityConfig struct {
     TLSCertFile string // TLS certificate file path
     TLSKeyFile  string // TLS private key file path
     TLSCAFile   string // TLS CA certificate file path
-    
+
     // Authentication
-    AuthenticationEnabled bool                   // Enable authentication (default: false)
-    AuthenticationBackend string                 // "file", "ldap", "database"
-    AuthenticationConfig  map[string]interface{} // Backend-specific auth config
-    
+    AuthenticationEnabled  bool                   // Enable authentication (default: false)
+    AuthenticationBackend  string                 // "file", "ldap", "database" (default: "file")
+    AuthenticationConfig   map[string]interface{} // Backend-specific auth config
+    AuthenticationFilePath string                 // Path to auth file for file backend (default: "./auth.json")
+    AuthMechanisms         []string               // Enabled SASL mechanisms (default: ["PLAIN"])
+
     // Authorization
     AuthorizationEnabled bool     // Enable authorization (default: false)
     DefaultVHost        string    // Default virtual host (default: "/")
-    
+
     // Access control lists
     AllowedUsers  []string // Allowed usernames
     BlockedUsers  []string // Blocked usernames
@@ -526,26 +530,152 @@ type SecurityConfig struct {
 }
 ```
 
+#### Authentication
+
+AMQP-Go supports SASL authentication with pluggable mechanisms. Currently supported mechanisms:
+
+**PLAIN Mechanism (RFC 4616)**
+- Standard username/password authentication
+- Credentials transmitted in `\0username\0password` format
+- Requires TLS in production to protect credentials
+- Default mechanism for secure environments
+
+**ANONYMOUS Mechanism (RFC 4505)**
+- Guest user authentication for development/testing
+- No credentials required - creates guest user with minimal permissions
+- Should be disabled in production environments
+- Useful for local development and testing
+
+**File-Based Authentication Backend**
+
+The file authentication backend uses JSON files with bcrypt-hashed passwords:
+
+```json
+{
+  "users": [
+    {
+      "username": "admin",
+      "password_hash": "$2a$10$...",
+      "permissions": [
+        {
+          "resource": ".*",
+          "action": "configure",
+          "pattern": ".*"
+        },
+        {
+          "resource": ".*",
+          "action": "write",
+          "pattern": ".*"
+        },
+        {
+          "resource": ".*",
+          "action": "read",
+          "pattern": ".*"
+        }
+      ],
+      "groups": ["admin"],
+      "metadata": {
+        "created": "2024-10-07",
+        "description": "Administrator account"
+      }
+    }
+  ]
+}
+```
+
+**Creating Password Hashes:**
+
+```go
+import "golang.org/x/crypto/bcrypt"
+
+// Generate bcrypt hash for password
+hash, err := bcrypt.GenerateFromPassword([]byte("password"), bcrypt.DefaultCost)
+if err != nil {
+    log.Fatal(err)
+}
+fmt.Printf("Password hash: %s\n", string(hash))
+```
+
 **Security Examples:**
 
 ```go
-// TLS with client certificates
-builder.WithTLS("server.crt", "server.key").
-    WithTLSCA("ca.crt")
+// Enable PLAIN authentication with TLS
+cfg := config.DefaultConfig()
+cfg.Security.TLSEnabled = true
+cfg.Security.TLSCertFile = "server.crt"
+cfg.Security.TLSKeyFile = "server.key"
+cfg.Security.AuthenticationEnabled = true
+cfg.Security.AuthenticationBackend = "file"
+cfg.Security.AuthenticationFilePath = "./users.json"
+cfg.Security.AuthMechanisms = []string{"PLAIN"}
 
-// File-based authentication
-builder.WithFileAuthentication("users.json").
-    WithAuthorization(true).
-    WithVirtualHost("/production")
+// Development with ANONYMOUS (no auth required)
+cfg := config.DefaultConfig()
+cfg.Security.AuthenticationEnabled = true
+cfg.Security.AuthMechanisms = []string{"ANONYMOUS"}
 
-// Access control
-builder.WithAccessControl(
-    []string{"admin", "producer"}, // allowed users
-    []string{"guest"},             // blocked users
-    []string{"192.168.1.0/24"},    // allowed networks
-    []string{"10.0.0.1"},          // blocked IPs
-)
+// Multiple mechanisms (PLAIN with ANONYMOUS fallback)
+cfg := config.DefaultConfig()
+cfg.Security.AuthenticationEnabled = true
+cfg.Security.AuthenticationFilePath = "./users.json"
+cfg.Security.AuthMechanisms = []string{"PLAIN", "ANONYMOUS"}
+
+// Access control with authentication
+cfg.Security.AuthenticationEnabled = true
+cfg.Security.AuthorizationEnabled = true
+cfg.Security.AllowedUsers = []string{"admin", "producer"}
+cfg.Security.BlockedUsers = []string{"guest"}
 ```
+
+**Authentication Integration:**
+
+```go
+package main
+
+import (
+    "log"
+    "github.com/maxpert/amqp-go/auth"
+    "github.com/maxpert/amqp-go/server"
+    "github.com/maxpert/amqp-go/config"
+)
+
+func main() {
+    // Create configuration with authentication
+    cfg := config.DefaultConfig()
+    cfg.Security.AuthenticationEnabled = true
+    cfg.Security.AuthenticationFilePath = "./auth.json"
+    cfg.Security.AuthMechanisms = []string{"PLAIN"}
+
+    // Create file authenticator
+    authenticator, err := auth.NewFileAuthenticator(cfg.Security.AuthenticationFilePath)
+    if err != nil {
+        log.Fatalf("Failed to create authenticator: %v", err)
+    }
+
+    // Create mechanism registry
+    registry := auth.DefaultRegistry() // Includes PLAIN and ANONYMOUS
+
+    // Create server with authentication
+    srv := server.NewServerBuilder().
+        WithConfig(cfg).
+        WithAuthenticator(authenticator).
+        WithMechanismRegistry(server.NewMechanismRegistryAdapter(registry)).
+        Build()
+
+    log.Println("Starting authenticated AMQP server")
+    if err := srv.ListenAndServe(":5672"); err != nil {
+        log.Fatal(err)
+    }
+}
+```
+
+**Default Auth File:**
+
+If the auth file doesn't exist, AMQP-Go automatically creates one with a default guest user:
+- Username: `guest`
+- Password: `guest`
+- Permissions: Full read/write/configure access
+- Should be changed immediately in production!
 
 ### Server Configuration
 

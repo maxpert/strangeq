@@ -262,11 +262,23 @@ func (s *Server) processConnectionFrames(conn *protocol.Connection) {
 		return
 	}
 
-	// Process the method frame to validate it's connection.start-ok
-	// This is a simplified check - in reality we'd decode the method ID
-	// and verify it matches connection.start-ok
+	// Process connection.start-ok and perform authentication
+	if len(frame.Payload) >= 4 {
+		classID := (uint16(frame.Payload[0]) << 8) | uint16(frame.Payload[1])
+		methodID := (uint16(frame.Payload[2]) << 8) | uint16(frame.Payload[3])
 
-	// For now, assume it's valid and send tune parameters
+		if classID == 10 && methodID == protocol.ConnectionStartOK {
+			// Handle authentication
+			if err := s.handleConnectionStartOK(conn, frame.Payload[4:]); err != nil {
+				s.Log.Error("Authentication failed",
+					zap.String("connection_id", conn.ID),
+					zap.Error(err))
+				return
+			}
+		}
+	}
+
+	// Send tune parameters
 	if err := s.sendConnectionTune(conn); err != nil {
 		s.Log.Error("Error sending connection tune", zap.Error(err))
 		return
