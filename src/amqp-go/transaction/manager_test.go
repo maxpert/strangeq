@@ -105,7 +105,7 @@ func (m *MockExecutor) Reset() {
 func TestNewTransactionManager(t *testing.T) {
 	tm := NewTransactionManager()
 	assert.NotNil(t, tm)
-	
+
 	stats := tm.GetTransactionStats()
 	assert.Equal(t, 0, stats.ActiveTransactions)
 	assert.Equal(t, int64(0), stats.TotalCommits)
@@ -138,9 +138,9 @@ func TestTransactionManagerOperations(t *testing.T) {
 	tm := NewTransactionManager()
 	executor := &MockExecutor{}
 	tm.SetExecutor(executor)
-	
+
 	channelID := uint16(1)
-	
+
 	// Start transaction
 	err := tm.Select(channelID)
 	require.NoError(t, err)
@@ -189,9 +189,9 @@ func TestTransactionManagerCommit(t *testing.T) {
 	tm := NewTransactionManager()
 	executor := &MockExecutor{}
 	tm.SetExecutor(executor)
-	
+
 	channelID := uint16(1)
-	
+
 	// Start transaction and add operations
 	err := tm.Select(channelID)
 	require.NoError(t, err)
@@ -204,7 +204,7 @@ func TestTransactionManagerCommit(t *testing.T) {
 
 	publishOp := NewPublishOperation("test.exchange", "test.key", message)
 	ackOp := NewAckOperation("test.queue", 123, false)
-	
+
 	err = tm.AddOperation(channelID, publishOp)
 	require.NoError(t, err)
 	err = tm.AddOperation(channelID, ackOp)
@@ -218,14 +218,14 @@ func TestTransactionManagerCommit(t *testing.T) {
 	assert.Len(t, executor.publishes, 1)
 	assert.Equal(t, "test.exchange", executor.publishes[0].Exchange)
 	assert.Equal(t, "test.key", executor.publishes[0].RoutingKey)
-	
+
 	assert.Len(t, executor.acks, 1)
 	assert.Equal(t, "test.queue", executor.acks[0].QueueName)
 	assert.Equal(t, uint64(123), executor.acks[0].DeliveryTag)
 
 	// Transaction should be back to active state (still in transactional mode)
 	assert.Equal(t, interfaces.TransactionStateActive, tm.GetState(channelID))
-	
+
 	// No pending operations
 	operations, err := tm.GetPendingOperations(channelID)
 	assert.NoError(t, err)
@@ -241,9 +241,9 @@ func TestTransactionManagerRollback(t *testing.T) {
 	tm := NewTransactionManager()
 	executor := &MockExecutor{}
 	tm.SetExecutor(executor)
-	
+
 	channelID := uint16(1)
-	
+
 	// Start transaction and add operations
 	err := tm.Select(channelID)
 	require.NoError(t, err)
@@ -256,7 +256,7 @@ func TestTransactionManagerRollback(t *testing.T) {
 
 	publishOp := NewPublishOperation("test.exchange", "test.key", message)
 	ackOp := NewAckOperation("test.queue", 123, false)
-	
+
 	err = tm.AddOperation(channelID, publishOp)
 	require.NoError(t, err)
 	err = tm.AddOperation(channelID, ackOp)
@@ -272,7 +272,7 @@ func TestTransactionManagerRollback(t *testing.T) {
 
 	// Transaction should be back to active state (still in transactional mode)
 	assert.Equal(t, interfaces.TransactionStateActive, tm.GetState(channelID))
-	
+
 	// No pending operations
 	operations, err := tm.GetPendingOperations(channelID)
 	assert.NoError(t, err)
@@ -288,9 +288,9 @@ func TestTransactionManagerCommitFailure(t *testing.T) {
 	tm := NewTransactionManager()
 	executor := &MockExecutor{fail: true, failOn: "publish"}
 	tm.SetExecutor(executor)
-	
+
 	channelID := uint16(1)
-	
+
 	// Start transaction and add operation
 	err := tm.Select(channelID)
 	require.NoError(t, err)
@@ -368,7 +368,7 @@ func TestTransactionManagerMultipleChannels(t *testing.T) {
 	// Only channel 1's operation should have been executed
 	assert.Len(t, executor.publishes, 1)
 	assert.Equal(t, "ex1", executor.publishes[0].Exchange)
-	
+
 	// Statistics
 	stats := tm.GetTransactionStats()
 	assert.Equal(t, 2, stats.ActiveTransactions) // Both channels still in transactional mode
@@ -428,7 +428,7 @@ func TestTransactionManagerNoExecutor(t *testing.T) {
 func TestTransactionOperationHelpers(t *testing.T) {
 	// Test operation helper functions
 	message := &protocol.Message{Exchange: "test", Body: []byte("test")}
-	
+
 	publishOp := NewPublishOperation("exchange", "key", message)
 	assert.Equal(t, interfaces.OpPublish, publishOp.Type)
 	assert.Equal(t, "exchange", publishOp.Exchange)
@@ -475,7 +475,7 @@ func TestTransactionManagerStatistics(t *testing.T) {
 	// Add operations
 	publishOp := NewPublishOperation("ex", "key", &protocol.Message{})
 	ackOp := NewAckOperation("queue", 1, false)
-	
+
 	tm.AddOperation(channel1, publishOp)
 	tm.AddOperation(channel1, ackOp)
 	tm.AddOperation(channel2, publishOp)

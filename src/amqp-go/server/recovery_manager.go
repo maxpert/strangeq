@@ -28,47 +28,47 @@ func NewRecoveryManager(storage interfaces.Storage, broker UnifiedBroker, logger
 // PerformRecovery performs complete server startup recovery
 func (r *RecoveryManager) PerformRecovery() (*protocol.RecoveryStats, error) {
 	startTime := time.Now()
-	
+
 	r.logger.Info("Starting server recovery process...")
-	
+
 	// Step 1: Validate storage integrity and repair if needed
 	stats, err := r.validateAndRepairStorage()
 	if err != nil {
 		return stats, fmt.Errorf("storage validation failed: %w", err)
 	}
-	
+
 	// Step 2: Recover durable exchanges
 	if err := r.recoverDurableExchanges(stats); err != nil {
 		return stats, fmt.Errorf("exchange recovery failed: %w", err)
 	}
-	
+
 	// Step 3: Recover durable queues
 	if err := r.recoverDurableQueues(stats); err != nil {
 		return stats, fmt.Errorf("queue recovery failed: %w", err)
 	}
-	
+
 	// Step 4: Recover bindings
 	if err := r.recoverBindings(stats); err != nil {
 		return stats, fmt.Errorf("binding recovery failed: %w", err)
 	}
-	
+
 	// Step 5: Recover persistent messages
 	if err := r.recoverPersistentMessages(stats); err != nil {
 		return stats, fmt.Errorf("message recovery failed: %w", err)
 	}
-	
+
 	// Step 6: Recover pending acknowledgments
 	if err := r.recoverPendingAcknowledgments(stats); err != nil {
 		return stats, fmt.Errorf("acknowledgment recovery failed: %w", err)
 	}
-	
+
 	stats.RecoveryDuration = time.Since(startTime)
-	
+
 	// Step 7: Mark recovery as complete
 	if err := r.storage.MarkRecoveryComplete(stats); err != nil {
 		r.logger.Warn("Failed to mark recovery complete", zap.Error(err))
 	}
-	
+
 	r.logger.Info("Server recovery completed",
 		zap.Duration("duration", stats.RecoveryDuration),
 		zap.Int("exchanges_recovered", stats.DurableExchangesRecovered),
@@ -79,49 +79,49 @@ func (r *RecoveryManager) PerformRecovery() (*protocol.RecoveryStats, error) {
 		zap.Int("corrupted_entries_repaired", stats.CorruptedEntriesRepaired),
 		zap.Strings("validation_errors", stats.ValidationErrors),
 	)
-	
+
 	return stats, nil
 }
 
 // validateAndRepairStorage validates storage integrity and repairs corruption
 func (r *RecoveryManager) validateAndRepairStorage() (*protocol.RecoveryStats, error) {
 	r.logger.Info("Validating storage integrity...")
-	
+
 	// First validate storage integrity
 	stats, err := r.storage.ValidateStorageIntegrity()
 	if err != nil {
 		return stats, err
 	}
-	
+
 	// If validation errors were found, attempt auto-repair
 	if len(stats.ValidationErrors) > 0 {
 		r.logger.Warn("Storage validation errors found, attempting auto-repair",
 			zap.Int("error_count", len(stats.ValidationErrors)))
-		
+
 		repairStats, err := r.storage.RepairCorruption(true) // auto-repair enabled
 		if err != nil {
 			return stats, err
 		}
-		
+
 		// Merge repair stats
 		stats.CorruptedEntriesRepaired = repairStats.CorruptedEntriesRepaired
 		if len(repairStats.ValidationErrors) > 0 {
 			stats.ValidationErrors = append(stats.ValidationErrors, repairStats.ValidationErrors...)
 		}
 	}
-	
+
 	return stats, nil
 }
 
 // recoverDurableExchanges recovers all durable exchanges from storage
 func (r *RecoveryManager) recoverDurableExchanges(stats *protocol.RecoveryStats) error {
 	r.logger.Info("Recovering durable exchanges...")
-	
+
 	metadata, err := r.storage.GetDurableEntityMetadata()
 	if err != nil {
 		return err
 	}
-	
+
 	for _, exchange := range metadata.Exchanges {
 		if exchange.Durable {
 			err := r.broker.DeclareExchange(
@@ -146,19 +146,19 @@ func (r *RecoveryManager) recoverDurableExchanges(stats *protocol.RecoveryStats)
 			}
 		}
 	}
-	
+
 	return nil
 }
 
 // recoverDurableQueues recovers all durable queues from storage
 func (r *RecoveryManager) recoverDurableQueues(stats *protocol.RecoveryStats) error {
 	r.logger.Info("Recovering durable queues...")
-	
+
 	metadata, err := r.storage.GetDurableEntityMetadata()
 	if err != nil {
 		return err
 	}
-	
+
 	for _, queue := range metadata.Queues {
 		if queue.Durable {
 			_, err := r.broker.DeclareQueue(
@@ -181,19 +181,19 @@ func (r *RecoveryManager) recoverDurableQueues(stats *protocol.RecoveryStats) er
 			}
 		}
 	}
-	
+
 	return nil
 }
 
 // recoverBindings recovers all bindings from storage
 func (r *RecoveryManager) recoverBindings(stats *protocol.RecoveryStats) error {
 	r.logger.Info("Recovering bindings...")
-	
+
 	metadata, err := r.storage.GetDurableEntityMetadata()
 	if err != nil {
 		return err
 	}
-	
+
 	for _, binding := range metadata.Bindings {
 		err := r.broker.BindQueue(
 			binding.Queue,
@@ -217,19 +217,19 @@ func (r *RecoveryManager) recoverBindings(stats *protocol.RecoveryStats) error {
 				zap.String("routing_key", binding.RoutingKey))
 		}
 	}
-	
+
 	return nil
 }
 
 // recoverPersistentMessages recovers all persistent messages from storage
 func (r *RecoveryManager) recoverPersistentMessages(stats *protocol.RecoveryStats) error {
 	r.logger.Info("Recovering persistent messages...")
-	
+
 	recoverableMessages, err := r.storage.GetRecoverableMessages()
 	if err != nil {
 		return err
 	}
-	
+
 	for queueName, messages := range recoverableMessages {
 		for _, message := range messages {
 			// Only recover messages with DeliveryMode=2 (persistent)
@@ -252,26 +252,26 @@ func (r *RecoveryManager) recoverPersistentMessages(stats *protocol.RecoveryStat
 			}
 		}
 	}
-	
+
 	return nil
 }
 
 // recoverPendingAcknowledgments recovers all pending acknowledgments from storage
 func (r *RecoveryManager) recoverPendingAcknowledgments(stats *protocol.RecoveryStats) error {
 	r.logger.Info("Recovering pending acknowledgments...")
-	
+
 	pendingAcks, err := r.storage.GetAllPendingAcks()
 	if err != nil {
 		return err
 	}
-	
+
 	// Clean up expired acknowledgments (older than 1 hour)
 	expiredCutoff := 1 * time.Hour
 	err = r.storage.CleanupExpiredAcks(expiredCutoff)
 	if err != nil {
 		r.logger.Warn("Failed to cleanup expired acknowledgments", zap.Error(err))
 	}
-	
+
 	// For each pending acknowledgment, we need to decide what to do
 	for _, pendingAck := range pendingAcks {
 		// Check if the acknowledgment is too old (potential zombie)
@@ -287,7 +287,7 @@ func (r *RecoveryManager) recoverPendingAcknowledgments(stats *protocol.Recovery
 			}
 			continue
 		}
-		
+
 		stats.PendingAcksRecovered++
 		r.logger.Debug("Recovered pending acknowledgment",
 			zap.String("queue", pendingAck.QueueName),
@@ -295,7 +295,7 @@ func (r *RecoveryManager) recoverPendingAcknowledgments(stats *protocol.Recovery
 			zap.Uint64("delivery_tag", pendingAck.DeliveryTag),
 			zap.Duration("age", age))
 	}
-	
+
 	return nil
 }
 
@@ -307,25 +307,25 @@ func (r *RecoveryManager) UpdateDurableEntityMetadata(exchanges map[string]*prot
 		Bindings:    []protocol.Binding{},
 		LastUpdated: time.Now(),
 	}
-	
+
 	// Collect durable exchanges
 	for _, exchange := range exchanges {
 		if exchange.Durable {
 			metadata.Exchanges = append(metadata.Exchanges, *exchange)
-			
+
 			// Collect bindings for this exchange
 			for _, binding := range exchange.Bindings {
 				metadata.Bindings = append(metadata.Bindings, *binding)
 			}
 		}
 	}
-	
+
 	// Collect durable queues
 	for _, queue := range queues {
 		if queue.Durable {
 			metadata.Queues = append(metadata.Queues, *queue)
 		}
 	}
-	
+
 	return r.storage.StoreDurableEntityMetadata(metadata)
 }

@@ -75,7 +75,7 @@ func (a *OriginalBrokerAdapter) GetConsumers() map[string]*protocol.Consumer {
 	return a.broker.Consumers
 }
 
-// StorageBrokerAdapter wraps the storage-backed broker to implement UnifiedBroker  
+// StorageBrokerAdapter wraps the storage-backed broker to implement UnifiedBroker
 type StorageBrokerAdapter struct {
 	broker *broker.StorageBroker
 }

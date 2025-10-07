@@ -2,7 +2,7 @@ package transaction
 
 import (
 	"fmt"
-	
+
 	"github.com/maxpert/amqp-go/interfaces"
 	"github.com/maxpert/amqp-go/protocol"
 )
@@ -24,7 +24,7 @@ func (be *BrokerExecutor) ExecutePublish(exchange, routingKey string, message *p
 	if be.broker == nil {
 		return fmt.Errorf("no broker available for executing publish")
 	}
-	
+
 	return be.broker.PublishMessage(exchange, routingKey, message)
 }
 
@@ -33,7 +33,7 @@ func (be *BrokerExecutor) ExecuteAck(queueName string, deliveryTag uint64, multi
 	if be.broker == nil {
 		return fmt.Errorf("no broker available for executing ack")
 	}
-	
+
 	// Use the interfaces.Broker method signature
 	// Convert deliveryTag to string as expected by the interface
 	messageID := fmt.Sprintf("%d", deliveryTag)
@@ -45,7 +45,7 @@ func (be *BrokerExecutor) ExecuteNack(queueName string, deliveryTag uint64, mult
 	if be.broker == nil {
 		return fmt.Errorf("no broker available for executing nack")
 	}
-	
+
 	// Use the interfaces.Broker method signature
 	messageID := fmt.Sprintf("%d", deliveryTag)
 	return be.broker.NackMessage(queueName, messageID, requeue)
@@ -56,7 +56,7 @@ func (be *BrokerExecutor) ExecuteReject(queueName string, deliveryTag uint64, re
 	if be.broker == nil {
 		return fmt.Errorf("no broker available for executing reject")
 	}
-	
+
 	// For the original broker interface, reject is equivalent to nack
 	messageID := fmt.Sprintf("%d", deliveryTag)
 	return be.broker.NackMessage(queueName, messageID, requeue)
@@ -87,7 +87,7 @@ func (ube *UnifiedBrokerExecutor) ExecutePublish(exchange, routingKey string, me
 	if ube.broker == nil {
 		return fmt.Errorf("no unified broker available for executing publish")
 	}
-	
+
 	return ube.broker.PublishMessage(exchange, routingKey, message)
 }
 
@@ -96,17 +96,17 @@ func (ube *UnifiedBrokerExecutor) ExecuteAck(queueName string, deliveryTag uint6
 	if ube.broker == nil {
 		return fmt.Errorf("no unified broker available for executing ack")
 	}
-	
+
 	// For ack operations, we need to find the consumer by delivery tag
 	return ube.broker.AcknowledgeMessage("", deliveryTag, multiple)
 }
 
-// ExecuteNack executes a negative acknowledgment operation  
+// ExecuteNack executes a negative acknowledgment operation
 func (ube *UnifiedBrokerExecutor) ExecuteNack(queueName string, deliveryTag uint64, multiple, requeue bool) error {
 	if ube.broker == nil {
 		return fmt.Errorf("no unified broker available for executing nack")
 	}
-	
+
 	return ube.broker.NacknowledgeMessage("", deliveryTag, multiple, requeue)
 }
 
@@ -115,6 +115,6 @@ func (ube *UnifiedBrokerExecutor) ExecuteReject(queueName string, deliveryTag ui
 	if ube.broker == nil {
 		return fmt.Errorf("no unified broker available for executing reject")
 	}
-	
+
 	return ube.broker.RejectMessage("", deliveryTag, requeue)
 }

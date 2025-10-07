@@ -12,7 +12,7 @@ import (
 
 func TestDefaultConfig(t *testing.T) {
 	config := DefaultConfig()
-	
+
 	// Test default values
 	assert.Equal(t, ":5672", config.Network.Address)
 	assert.Equal(t, 5672, config.Network.Port)
@@ -20,7 +20,7 @@ func TestDefaultConfig(t *testing.T) {
 	assert.Equal(t, "memory", config.Storage.Backend)
 	assert.Equal(t, false, config.Security.TLSEnabled)
 	assert.Equal(t, "amqp-go-server", config.Server.Name)
-	
+
 	// Test validation passes
 	err := config.Validate()
 	assert.NoError(t, err)
@@ -96,7 +96,7 @@ func TestConfigValidation(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			config := DefaultConfig()
 			tt.modify(config)
-			
+
 			err := config.Validate()
 			if tt.wantErr {
 				assert.Error(t, err)
@@ -111,7 +111,7 @@ func TestConfigSaveLoad(t *testing.T) {
 	// Create a temporary file
 	tmpDir := t.TempDir()
 	configFile := filepath.Join(tmpDir, "test-config.json")
-	
+
 	// Create a config with custom values
 	originalConfig := DefaultConfig()
 	originalConfig.Network.Address = ":8080"
@@ -119,19 +119,19 @@ func TestConfigSaveLoad(t *testing.T) {
 	originalConfig.Storage.Backend = "bbolt"
 	originalConfig.Storage.Path = "/tmp/amqp.db"
 	originalConfig.Server.LogLevel = "debug"
-	
+
 	// Save the config
 	err := originalConfig.Save(configFile)
 	require.NoError(t, err)
-	
+
 	// Verify file was created
 	assert.FileExists(t, configFile)
-	
+
 	// Load the config
 	loadedConfig := &AMQPConfig{}
 	err = loadedConfig.Load(configFile)
 	require.NoError(t, err)
-	
+
 	// Verify values were preserved
 	assert.Equal(t, ":8080", loadedConfig.Network.Address)
 	assert.Equal(t, 500, loadedConfig.Network.MaxConnections)
@@ -150,10 +150,10 @@ func TestConfigLoadInvalidJSON(t *testing.T) {
 	// Create a temporary file with invalid JSON
 	tmpDir := t.TempDir()
 	configFile := filepath.Join(tmpDir, "invalid.json")
-	
+
 	err := os.WriteFile(configFile, []byte("invalid json content"), 0644)
 	require.NoError(t, err)
-	
+
 	config := &AMQPConfig{}
 	err = config.Load(configFile)
 	assert.Error(t, err)
@@ -162,10 +162,10 @@ func TestConfigLoadInvalidJSON(t *testing.T) {
 func TestConfigLoadUnsupportedFormat(t *testing.T) {
 	tmpDir := t.TempDir()
 	configFile := filepath.Join(tmpDir, "test.yaml")
-	
+
 	err := os.WriteFile(configFile, []byte("test: value"), 0644)
 	require.NoError(t, err)
-	
+
 	config := &AMQPConfig{}
 	err = config.Load(configFile)
 	assert.Error(t, err)
@@ -182,9 +182,9 @@ func TestConfigBuilder(t *testing.T) {
 		WithLogging("debug", "/var/log/amqp.log").
 		WithServerInfo("test-server", "1.0.0", "Test AMQP", "Test", "Test Corp").
 		Build()
-	
+
 	require.NoError(t, err)
-	
+
 	assert.Equal(t, ":9090", config.Network.Address)
 	assert.Equal(t, 9090, config.Network.Port)
 	assert.Equal(t, 2000, config.Network.MaxConnections)
@@ -198,13 +198,13 @@ func TestConfigBuilder(t *testing.T) {
 func TestConfigBuilderFromExisting(t *testing.T) {
 	originalConfig := DefaultConfig()
 	originalConfig.Network.Address = ":8080"
-	
+
 	newConfig, err := FromConfig(originalConfig).
 		WithPort(9090).
 		Build()
-	
+
 	require.NoError(t, err)
-	
+
 	// Should preserve original address
 	assert.Equal(t, ":8080", newConfig.Network.Address)
 	// Should have new port
@@ -216,18 +216,18 @@ func TestConfigBuilderTLS(t *testing.T) {
 	tmpDir := t.TempDir()
 	certFile := filepath.Join(tmpDir, "cert.pem")
 	keyFile := filepath.Join(tmpDir, "key.pem")
-	
+
 	err := os.WriteFile(certFile, []byte("fake cert"), 0644)
 	require.NoError(t, err)
 	err = os.WriteFile(keyFile, []byte("fake key"), 0644)
 	require.NoError(t, err)
-	
+
 	config, err := NewConfigBuilder().
 		WithTLS(certFile, keyFile).
 		Build()
-	
+
 	require.NoError(t, err)
-	
+
 	assert.True(t, config.Security.TLSEnabled)
 	assert.Equal(t, certFile, config.Security.TLSCertFile)
 	assert.Equal(t, keyFile, config.Security.TLSKeyFile)
@@ -237,7 +237,7 @@ func TestConfigBuilderValidationError(t *testing.T) {
 	_, err := NewConfigBuilder().
 		WithPort(0). // Invalid port
 		Build()
-	
+
 	assert.Error(t, err)
 }
 
@@ -245,10 +245,10 @@ func TestConfigBuilderBuildUnsafe(t *testing.T) {
 	config := NewConfigBuilder().
 		WithPort(0). // Invalid port
 		BuildUnsafe()
-	
+
 	// Should return config without validation
 	assert.Equal(t, 0, config.Network.Port)
-	
+
 	// But validation should fail
 	err := config.Validate()
 	assert.Error(t, err)

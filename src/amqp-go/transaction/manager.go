@@ -11,27 +11,27 @@ import (
 
 // DefaultTransactionManager provides the default implementation of TransactionManager
 type DefaultTransactionManager struct {
-	mutex             sync.RWMutex
-	channels          map[uint16]*ChannelTransaction
-	executor          interfaces.TransactionExecutor
-	stats             *TransactionStats
-	atomicStorage     interfaces.AtomicStorage // For atomic operations when available
+	mutex         sync.RWMutex
+	channels      map[uint16]*ChannelTransaction
+	executor      interfaces.TransactionExecutor
+	stats         *TransactionStats
+	atomicStorage interfaces.AtomicStorage // For atomic operations when available
 }
 
 // ChannelTransaction holds the transaction state for a single channel
 type ChannelTransaction struct {
-	channelID         uint16
-	state             interfaces.TransactionState
-	operations        []*interfaces.TransactionOperation
-	mutex             sync.RWMutex
+	channelID  uint16
+	state      interfaces.TransactionState
+	operations []*interfaces.TransactionOperation
+	mutex      sync.RWMutex
 }
 
 // TransactionStats holds statistics for the transaction manager
 type TransactionStats struct {
-	totalCommits      int64
-	totalRollbacks    int64
-	operationCounts   map[interfaces.TransactionOperationType]int64
-	operationMutex    sync.RWMutex
+	totalCommits    int64
+	totalRollbacks  int64
+	operationCounts map[interfaces.TransactionOperationType]int64
+	operationMutex  sync.RWMutex
 }
 
 // NewTransactionManager creates a new default transaction manager
@@ -317,7 +317,7 @@ func (tm *DefaultTransactionManager) GetTransactionStats() *interfaces.Transacti
 	tm.stats.operationMutex.RUnlock()
 
 	return &interfaces.TransactionStats{
-		ActiveTransactions:   activeCount,
+		ActiveTransactions:  activeCount,
 		TotalCommits:        atomic.LoadInt64(&tm.stats.totalCommits),
 		TotalRollbacks:      atomic.LoadInt64(&tm.stats.totalRollbacks),
 		PendingOperations:   pendingOpsCount,

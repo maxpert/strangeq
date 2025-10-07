@@ -15,7 +15,7 @@ type BadgerTransactionWrapper struct {
 	metadataStore   *BadgerMetadataStore
 	ackStore        *BadgerAckStore
 	durabilityStore *BadgerDurabilityStore
-	mutex          sync.RWMutex
+	mutex           sync.RWMutex
 }
 
 // NewBadgerTransactionWrapper creates a new transaction wrapper

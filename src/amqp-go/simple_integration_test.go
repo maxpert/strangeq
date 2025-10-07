@@ -72,7 +72,7 @@ func TestSimpleQueueOperations(t *testing.T) {
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Logf("Testing: %s - ContentType: %s, BodyLength: %d", tc.name, tc.contentType, len(tc.body))
-			
+
 			// Publish the test message
 			err = channel.Publish(
 				"",         // exchange (empty = default direct exchange)
@@ -89,17 +89,17 @@ func TestSimpleQueueOperations(t *testing.T) {
 			// Try to receive the message with a timeout
 			select {
 			case msg := <-msgs:
-				t.Logf("Received - Body: '%s' (%d bytes), ContentType: '%s'", 
+				t.Logf("Received - Body: '%s' (%d bytes), ContentType: '%s'",
 					string(msg.Body), len(msg.Body), msg.ContentType)
-				
+
 				// Verify the message content
 				assert.Equal(t, tc.body, string(msg.Body), "Body should match expected content")
 				assert.Equal(t, tc.contentType, msg.ContentType, "ContentType should match expected type")
-				
+
 				// Log additional message properties for debugging
 				t.Logf("Additional properties - DeliveryTag: %d, Redelivered: %v, Exchange: '%s', RoutingKey: '%s'",
 					msg.DeliveryTag, msg.Redelivered, msg.Exchange, msg.RoutingKey)
-					
+
 			case <-time.After(2 * time.Second):
 				t.Fatalf("Did not receive message within timeout for test case: %s", tc.name)
 			}

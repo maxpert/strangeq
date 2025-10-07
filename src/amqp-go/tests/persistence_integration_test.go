@@ -46,7 +46,7 @@ func TestMessagePersistenceIntegration(t *testing.T) {
 	}
 
 	// Test scenario: Create durable exchange and queue, publish persistent message
-	
+
 	// 1. Create durable exchange
 	err = storageBroker.DeclareExchange("test.exchange", "direct", true, false, false, nil)
 	if err != nil {
@@ -64,7 +64,7 @@ func TestMessagePersistenceIntegration(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to bind queue: %v", err)
 	}
-	
+
 	_ = queue // Mark as used to avoid compilation error
 
 	// 4. Create persistent message (DeliveryMode=2)
@@ -87,7 +87,7 @@ func TestMessagePersistenceIntegration(t *testing.T) {
 
 	// Verify message was stored by accessing the broker's storage directly
 	// storageBroker is already a *server.StorageBrokerAdapter
-	
+
 	// For now, we'll just verify the message was published successfully
 	// In a complete test, we'd access the underlying storage to verify persistence
 	// The fact that PublishMessage succeeded indicates the message was stored
@@ -95,18 +95,18 @@ func TestMessagePersistenceIntegration(t *testing.T) {
 	// Create a separate storage instance to verify persistence (this is a simplified check)
 	// In practice, you'd verify by restarting the server and checking recovery
 	t.Logf("Message published successfully - persistence verified")
-	
+
 	// Simplified verification: just check that the exchange and queue exist
 	exchanges := storageBroker.GetExchanges()
 	if _, exists := exchanges["test.exchange"]; !exists {
 		t.Errorf("Expected exchange 'test.exchange' to exist")
 	}
-	
+
 	queues := storageBroker.GetQueues()
 	if _, exists := queues["test.queue"]; !exists {
 		t.Errorf("Expected queue 'test.queue' to exist")
 	}
-	
+
 	// For message verification, we would need to simulate message consumption or check storage directly
 	// Since we have access to the StorageBrokerAdapter, we can assume persistence worked if no errors occurred
 }
@@ -182,7 +182,7 @@ func TestDurableEntityRecoveryIntegration(t *testing.T) {
 		// In a real implementation, you'd have a proper Close() method on the server
 		// For now, we'll give the system time to release locks
 		t.Logf("✓ First server created durable entities and messages")
-		
+
 		// Allow time for any background operations to complete
 		time.Sleep(100 * time.Millisecond)
 	}
@@ -197,7 +197,7 @@ func TestDurableEntityRecoveryIntegration(t *testing.T) {
 			t.Fatalf("Failed to create second temp dir: %v", err)
 		}
 		defer os.RemoveAll(tempDir2)
-		
+
 		cfg2 := config.DefaultConfig()
 		cfg2.Storage.Backend = "badger"
 		cfg2.Storage.Path = tempDir2
@@ -304,15 +304,15 @@ func TestAcknowledmentPersistenceIntegration(t *testing.T) {
 		Consumers: make(map[string]*protocol.Consumer),
 		// Note: Transactions field doesn't exist in the struct, removing it
 	}
-	
+
 	consumer := &protocol.Consumer{
-		Tag:           "test.consumer",
-		Channel:       channel, // Set the channel to avoid nil pointer
-		Queue:         "ack.queue",
-		NoAck:         false, // Require acknowledgments
-		Exclusive:     false,
-		Args:          nil,
-		Messages:      make(chan *protocol.Delivery, 100),
+		Tag:       "test.consumer",
+		Channel:   channel, // Set the channel to avoid nil pointer
+		Queue:     "ack.queue",
+		NoAck:     false, // Require acknowledgments
+		Exclusive: false,
+		Args:      nil,
+		Messages:  make(chan *protocol.Delivery, 100),
 	}
 
 	err = storageBroker.RegisterConsumer("ack.queue", "test.consumer", consumer)
@@ -439,12 +439,12 @@ func TestAtomicOperations(t *testing.T) {
 	err = storageImpl.ExecuteAtomic(func(txnStorage interfaces.Storage) error {
 		// Create queue within transaction
 		queue := &protocol.Queue{
-			Name:        "atomic.test.queue",
-			Durable:     true,
-			AutoDelete:  false,
-			Exclusive:   false,
-			Arguments:   make(map[string]interface{}),
-			Messages:    []*protocol.Message{},
+			Name:       "atomic.test.queue",
+			Durable:    true,
+			AutoDelete: false,
+			Exclusive:  false,
+			Arguments:  make(map[string]interface{}),
+			Messages:   []*protocol.Message{},
 		}
 
 		err := txnStorage.StoreQueue(queue)

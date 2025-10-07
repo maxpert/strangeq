@@ -21,11 +21,11 @@ func TestMessageStore(t *testing.T) {
 			tmpDir := t.TempDir()
 			store, err := NewBadgerMessageStore(tmpDir, 1*time.Hour)
 			require.NoError(t, err)
-			
+
 			t.Cleanup(func() {
 				store.Close()
 			})
-			
+
 			return store
 		},
 	}
@@ -119,11 +119,11 @@ func TestMetadataStore(t *testing.T) {
 			tmpDir := t.TempDir()
 			store, err := NewBadgerMetadataStore(tmpDir)
 			require.NoError(t, err)
-			
+
 			t.Cleanup(func() {
 				store.Close()
 			})
-			
+
 			return store
 		},
 	}
@@ -379,7 +379,7 @@ func TestStorageFactory(t *testing.T) {
 // TestBadgerCleanup tests TTL cleanup functionality
 func TestBadgerCleanup(t *testing.T) {
 	tmpDir := t.TempDir()
-	
+
 	// Create store with very short TTL
 	store, err := NewBadgerMessageStore(tmpDir, 100*time.Millisecond)
 	require.NoError(t, err)
@@ -422,7 +422,6 @@ func TestBadgerCleanup(t *testing.T) {
 	}
 }
 
-
 // Benchmark tests
 func BenchmarkMessageStore(b *testing.B) {
 	stores := map[string]func(b *testing.B) interfaces.MessageStore{
@@ -433,11 +432,11 @@ func BenchmarkMessageStore(b *testing.B) {
 			tmpDir := b.TempDir()
 			store, err := NewBadgerMessageStore(tmpDir, 1*time.Hour)
 			require.NoError(b, err)
-			
+
 			b.Cleanup(func() {
 				store.Close()
 			})
-			
+
 			return store
 		},
 	}

@@ -24,12 +24,12 @@ func NewBadgerDurabilityStore(db *badger.DB) *BadgerDurabilityStore {
 func (s *BadgerDurabilityStore) StoreDurableEntityMetadata(metadata *protocol.DurableEntityMetadata) error {
 	key := []byte("durable_metadata")
 	metadata.LastUpdated = time.Now()
-	
+
 	data, err := json.Marshal(metadata)
 	if err != nil {
 		return fmt.Errorf("failed to marshal durable metadata: %w", err)
 	}
-	
+
 	return s.db.Update(func(txn *badger.Txn) error {
 		return txn.Set(key, data)
 	})
@@ -38,7 +38,7 @@ func (s *BadgerDurabilityStore) StoreDurableEntityMetadata(metadata *protocol.Du
 // GetDurableEntityMetadata retrieves durable entity metadata
 func (s *BadgerDurabilityStore) GetDurableEntityMetadata() (*protocol.DurableEntityMetadata, error) {
 	key := []byte("durable_metadata")
-	
+
 	var metadata protocol.DurableEntityMetadata
 	err := s.db.View(func(txn *badger.Txn) error {
 		item, err := txn.Get(key)
@@ -55,16 +55,16 @@ func (s *BadgerDurabilityStore) GetDurableEntityMetadata() (*protocol.DurableEnt
 			}
 			return err
 		}
-		
+
 		return item.Value(func(val []byte) error {
 			return json.Unmarshal(val, &metadata)
 		})
 	})
-	
+
 	if err != nil {
 		return nil, err
 	}
-	
+
 	return &metadata, nil
 }
 
@@ -74,53 +74,53 @@ func (s *BadgerDurabilityStore) ValidateStorageIntegrity() (*protocol.RecoverySt
 	stats := &protocol.RecoveryStats{
 		ValidationErrors: []string{},
 	}
-	
+
 	err := s.db.View(func(txn *badger.Txn) error {
 		it := txn.NewIterator(badger.DefaultIteratorOptions)
 		defer it.Close()
-		
+
 		// Validate different key types
 		for it.Rewind(); it.Valid(); it.Next() {
 			item := it.Item()
 			key := string(item.Key())
-			
+
 			// Validate based on key prefix
 			switch {
 			case strings.HasPrefix(key, "message:"):
 				if err := s.validateMessageEntry(item, stats); err != nil {
-					stats.ValidationErrors = append(stats.ValidationErrors, 
+					stats.ValidationErrors = append(stats.ValidationErrors,
 						fmt.Sprintf("Message validation error for key %s: %v", key, err))
 				}
-				
+
 			case strings.HasPrefix(key, "exchange:"):
 				if err := s.validateExchangeEntry(item, stats); err != nil {
-					stats.ValidationErrors = append(stats.ValidationErrors, 
+					stats.ValidationErrors = append(stats.ValidationErrors,
 						fmt.Sprintf("Exchange validation error for key %s: %v", key, err))
 				}
-				
+
 			case strings.HasPrefix(key, "queue:"):
 				if err := s.validateQueueEntry(item, stats); err != nil {
-					stats.ValidationErrors = append(stats.ValidationErrors, 
+					stats.ValidationErrors = append(stats.ValidationErrors,
 						fmt.Sprintf("Queue validation error for key %s: %v", key, err))
 				}
-				
+
 			case strings.HasPrefix(key, "pending_ack:"):
 				if err := s.validatePendingAckEntry(item, stats); err != nil {
-					stats.ValidationErrors = append(stats.ValidationErrors, 
+					stats.ValidationErrors = append(stats.ValidationErrors,
 						fmt.Sprintf("Pending ack validation error for key %s: %v", key, err))
 				}
 			}
 		}
-		
+
 		return nil
 	})
-	
+
 	stats.RecoveryDuration = time.Since(startTime)
-	
+
 	if err != nil {
 		return stats, fmt.Errorf("validation failed: %w", err)
 	}
-	
+
 	return stats, nil
 }
 
@@ -130,23 +130,23 @@ func (s *BadgerDurabilityStore) RepairCorruption(autoRepair bool) (*protocol.Rec
 	stats := &protocol.RecoveryStats{
 		ValidationErrors: []string{},
 	}
-	
+
 	if !autoRepair {
 		// Just validate without repairing
 		return s.ValidateStorageIntegrity()
 	}
-	
+
 	// Perform repair operations
 	err := s.db.Update(func(txn *badger.Txn) error {
 		it := txn.NewIterator(badger.DefaultIteratorOptions)
 		defer it.Close()
-		
+
 		var keysToDelete [][]byte
-		
+
 		for it.Rewind(); it.Valid(); it.Next() {
 			item := it.Item()
 			key := string(item.Key())
-			
+
 			// Try to unmarshal and validate each entry
 			corrupted := false
 			item.Value(func(val []byte) error {
@@ -159,7 +159,7 @@ func (s *BadgerDurabilityStore) RepairCorruption(autoRepair bool) (*protocol.Rec
 				}
 				return nil
 			})
-			
+
 			if corrupted {
 				keyBytes := make([]byte, len(item.Key()))
 				copy(keyBytes, item.Key())
@@ -167,23 +167,23 @@ func (s *BadgerDurabilityStore) RepairCorruption(autoRepair bool) (*protocol.Rec
 				stats.CorruptedEntriesRepaired++
 			}
 		}
-		
+
 		// Delete corrupted keys
 		for _, key := range keysToDelete {
 			if err := txn.Delete(key); err != nil {
 				return fmt.Errorf("failed to delete corrupted key: %w", err)
 			}
 		}
-		
+
 		return nil
 	})
-	
+
 	stats.RecoveryDuration = time.Since(startTime)
-	
+
 	if err != nil {
 		return stats, fmt.Errorf("repair failed: %w", err)
 	}
-	
+
 	return stats, nil
 }
 
@@ -191,20 +191,20 @@ func (s *BadgerDurabilityStore) RepairCorruption(autoRepair bool) (*protocol.Rec
 func (s *BadgerDurabilityStore) GetRecoverableMessages() (map[string][]*protocol.Message, error) {
 	messages := make(map[string][]*protocol.Message)
 	prefix := []byte("message:")
-	
+
 	err := s.db.View(func(txn *badger.Txn) error {
 		it := txn.NewIterator(badger.DefaultIteratorOptions)
 		defer it.Close()
-		
+
 		for it.Seek(prefix); it.ValidForPrefix(prefix); it.Next() {
 			item := it.Item()
-			
+
 			err := item.Value(func(val []byte) error {
 				var message protocol.Message
 				if err := json.Unmarshal(val, &message); err != nil {
 					return err
 				}
-				
+
 				// Only recover persistent messages (DeliveryMode=2)
 				if message.DeliveryMode == 2 {
 					// Extract queue name from key: "message:queueName:deliveryTag"
@@ -216,27 +216,27 @@ func (s *BadgerDurabilityStore) GetRecoverableMessages() (map[string][]*protocol
 				}
 				return nil
 			})
-			
+
 			if err != nil {
 				return err
 			}
 		}
-		
+
 		return nil
 	})
-	
+
 	return messages, err
 }
 
 // MarkRecoveryComplete marks the recovery process as complete and stores stats
 func (s *BadgerDurabilityStore) MarkRecoveryComplete(stats *protocol.RecoveryStats) error {
 	key := []byte("recovery_stats")
-	
+
 	data, err := json.Marshal(stats)
 	if err != nil {
 		return fmt.Errorf("failed to marshal recovery stats: %w", err)
 	}
-	
+
 	return s.db.Update(func(txn *badger.Txn) error {
 		// Store with TTL of 7 days to avoid indefinite accumulation
 		entry := badger.NewEntry(key, data).WithTTL(7 * 24 * time.Hour)
@@ -252,12 +252,12 @@ func (s *BadgerDurabilityStore) validateMessageEntry(item *badger.Item, stats *p
 		if err := json.Unmarshal(val, &message); err != nil {
 			return err
 		}
-		
+
 		// Validate message structure
 		if message.DeliveryTag == 0 {
 			return fmt.Errorf("invalid delivery tag")
 		}
-		
+
 		stats.PersistentMessagesRecovered++
 		return nil
 	})
@@ -269,12 +269,12 @@ func (s *BadgerDurabilityStore) validateExchangeEntry(item *badger.Item, stats *
 		if err := json.Unmarshal(val, &exchange); err != nil {
 			return err
 		}
-		
+
 		// Validate exchange structure
 		if exchange.Name == "" {
 			return fmt.Errorf("exchange name cannot be empty")
 		}
-		
+
 		if exchange.Durable {
 			stats.DurableExchangesRecovered++
 		}
@@ -288,12 +288,12 @@ func (s *BadgerDurabilityStore) validateQueueEntry(item *badger.Item, stats *pro
 		if err := json.Unmarshal(val, &queue); err != nil {
 			return err
 		}
-		
+
 		// Validate queue structure
 		if queue.Name == "" {
 			return fmt.Errorf("queue name cannot be empty")
 		}
-		
+
 		if queue.Durable {
 			stats.DurableQueuesRecovered++
 		}
@@ -307,12 +307,12 @@ func (s *BadgerDurabilityStore) validatePendingAckEntry(item *badger.Item, stats
 		if err := json.Unmarshal(val, &pendingAck); err != nil {
 			return err
 		}
-		
+
 		// Validate pending ack structure
 		if pendingAck.QueueName == "" || pendingAck.DeliveryTag == 0 {
 			return fmt.Errorf("invalid pending acknowledgment")
 		}
-		
+
 		stats.PendingAcksRecovered++
 		return nil
 	})

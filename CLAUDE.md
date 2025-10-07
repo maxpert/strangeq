@@ -19,4 +19,13 @@ The project aims to create a Go package `github.com/maxpert/amqp-go` that implem
 This is intended to be a **Go code project** implementing an AMQP 0.9.1 server library.
 
 ## Memories
-- The user wants me to follow specific rules for the AMQP server project: Never write bogus test cases that don't actually test the code, Follow broadly followed Go community guidelines, Always have performance considerations when using a particular approach or library, Always commit changes on every major step, update the corresponding plan file before a commit, Commit messages should be detailed and opensource standard, Prefer TDD, if the test doesn't work it can't be a commit!, When in doubt ask questions, first look internet for what is most obvious answer and then ask question with recommendation, Always format changes according to go standards before compiling.
+
+- Never write bogus test cases that don't actually test the code
+- Follow broadly followed Go community guidelines
+- Always have performance considerations when using a particular approach or library
+- Always commit changes on every major step, update the corresponding plan file before a commit
+- Commit messages should be detailed and opensource standard
+- Prefer TDD, if the test doesn't work it can't be a commit! 
+- When in doubt ask questions, first look internet for what is most obvious answer and then ask question with recommendation
+- Always format changes according to go standards before compiling.
+- always update plan.md file after you have completed a step. No checkin should go without updated plan.md

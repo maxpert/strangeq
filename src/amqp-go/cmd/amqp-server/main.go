@@ -34,34 +34,34 @@ func main() {
 	// Define command-line flags
 	var (
 		// Configuration file
-		configFile = flag.String("config", "", "Configuration file path (JSON)")
+		configFile  = flag.String("config", "", "Configuration file path (JSON)")
 		showVersion = flag.Bool("version", false, "Show version and exit")
-		
+
 		// Network configuration
-		addr = flag.String("addr", ":5672", "Server bind address")
-		port = flag.Int("port", 5672, "Server port")
+		addr           = flag.String("addr", ":5672", "Server bind address")
+		port           = flag.Int("port", 5672, "Server port")
 		maxConnections = flag.Int("max-connections", 1000, "Maximum concurrent connections")
-		
+
 		// Storage configuration
 		storageBackend = flag.String("storage", "memory", "Storage backend (memory, badger)")
-		storagePath = flag.String("storage-path", "", "Storage directory path (required for persistent backends)")
-		syncWrites = flag.Bool("sync-writes", false, "Enable synchronous writes for durability")
-		cacheSize = flag.String("cache-size", "64MB", "Storage cache size (e.g., 64MB, 128MB)")
-		
+		storagePath    = flag.String("storage-path", "", "Storage directory path (required for persistent backends)")
+		syncWrites     = flag.Bool("sync-writes", false, "Enable synchronous writes for durability")
+		cacheSize      = flag.String("cache-size", "64MB", "Storage cache size (e.g., 64MB, 128MB)")
+
 		// Security configuration
-		tlsEnabled = flag.Bool("tls", false, "Enable TLS")
-		tlsCert = flag.String("tls-cert", "", "TLS certificate file")
-		tlsKey = flag.String("tls-key", "", "TLS private key file")
+		tlsEnabled  = flag.Bool("tls", false, "Enable TLS")
+		tlsCert     = flag.String("tls-cert", "", "TLS certificate file")
+		tlsKey      = flag.String("tls-key", "", "TLS private key file")
 		authEnabled = flag.Bool("auth", false, "Enable authentication")
-		authFile = flag.String("auth-file", "", "Authentication file path")
-		
+		authFile    = flag.String("auth-file", "", "Authentication file path")
+
 		// Server configuration
-		logLevel = flag.String("log-level", "info", "Log level (debug, info, warn, error)")
-		logFile = flag.String("log-file", "", "Log file path (empty = stdout)")
-		pidFile = flag.String("pid-file", "", "PID file path")
-		daemonize = flag.Bool("daemonize", false, "Run as daemon")
-		maxChannels = flag.Int("max-channels", 2047, "Maximum channels per connection")
-		maxFrameSize = flag.Int("max-frame-size", 131072, "Maximum frame size in bytes")
+		logLevel       = flag.String("log-level", "info", "Log level (debug, info, warn, error)")
+		logFile        = flag.String("log-file", "", "Log file path (empty = stdout)")
+		pidFile        = flag.String("pid-file", "", "PID file path")
+		daemonize      = flag.Bool("daemonize", false, "Run as daemon")
+		maxChannels    = flag.Int("max-channels", 2047, "Maximum channels per connection")
+		maxFrameSize   = flag.Int("max-frame-size", 131072, "Maximum frame size in bytes")
 		maxMessageSize = flag.String("max-message-size", "16MB", "Maximum message size (e.g., 16MB)")
 	)
 
@@ -85,7 +85,7 @@ func main() {
 	if !isDaemonChild() {
 		fmt.Printf(banner, version)
 	}
-	
+
 	// Create configuration
 	var cfg *config.AMQPConfig
 	var err error
@@ -132,7 +132,7 @@ func main() {
 
 	// Create and start server
 	serverBuilder := server.NewServerBuilder().WithConfig(cfg)
-	
+
 	amqpServer, err := serverBuilder.Build()
 	if err != nil {
 		log.Fatalf("Failed to create server: %v", err)
@@ -195,13 +195,13 @@ func buildConfigFromFlags(
 	logLevel, logFile, pidFile string, daemonize bool,
 	maxChannels, maxFrameSize int, maxMessageSize string,
 ) (*config.AMQPConfig, error) {
-	
+
 	builder := config.NewConfigBuilder().
 		// Network configuration
 		WithAddress(addr).
 		WithPort(port).
 		WithMaxConnections(maxConnections).
-		
+
 		// Server configuration
 		WithLogging(logLevel, logFile).
 		WithDaemonize(daemonize, pidFile).
@@ -242,7 +242,7 @@ func buildConfigFromFlags(
 
 func parseSize(sizeStr string) int64 {
 	sizeStr = strings.ToUpper(sizeStr)
-	
+
 	var multiplier int64 = 1
 	if strings.HasSuffix(sizeStr, "KB") {
 		multiplier = 1024
@@ -275,7 +275,7 @@ func setupSignalHandling(server *server.Server, pidFile string) {
 	go func() {
 		<-c
 		fmt.Println("\nShutting down server gracefully...")
-		
+
 		// Clean up PID file
 		if pidFile != "" {
 			os.Remove(pidFile)
@@ -305,7 +305,7 @@ func startDaemon(logFile string) error {
 	// First fork - create child process
 	args := make([]string, len(os.Args))
 	copy(args, os.Args)
-	
+
 	cmd := &exec.Cmd{
 		Path: os.Args[0],
 		Args: args,

@@ -15,22 +15,22 @@ import (
 
 // ServerBuilder provides a fluent API for building AMQP servers
 type ServerBuilder struct {
-	config          *config.AMQPConfig
-	logger          interfaces.Logger
-	broker          interfaces.Broker
-	storage         interfaces.Storage
-	authenticator   interfaces.Authenticator
+	config            *config.AMQPConfig
+	logger            interfaces.Logger
+	broker            interfaces.Broker
+	storage           interfaces.Storage
+	authenticator     interfaces.Authenticator
 	connectionHandler interfaces.ConnectionHandler
 }
 
 // NewServerBuilder creates a new server builder with default configuration
 func NewServerBuilder() *ServerBuilder {
 	return &ServerBuilder{
-		config: config.DefaultConfig(),
-		logger: nil,
-		broker: nil,
-		storage: nil,
-		authenticator: nil,
+		config:            config.DefaultConfig(),
+		logger:            nil,
+		broker:            nil,
+		storage:           nil,
+		authenticator:     nil,
 		connectionHandler: nil,
 	}
 }
@@ -38,11 +38,11 @@ func NewServerBuilder() *ServerBuilder {
 // NewServerBuilderWithConfig creates a server builder with the given configuration
 func NewServerBuilderWithConfig(cfg *config.AMQPConfig) *ServerBuilder {
 	return &ServerBuilder{
-		config: cfg,
-		logger: nil,
-		broker: nil,
-		storage: nil,
-		authenticator: nil,
+		config:            cfg,
+		logger:            nil,
+		broker:            nil,
+		storage:           nil,
+		authenticator:     nil,
 		connectionHandler: nil,
 	}
 }
@@ -74,7 +74,7 @@ func (b *ServerBuilder) WithLogger(logger interfaces.Logger) *ServerBuilder {
 // WithZapLogger creates a logger using zap with the specified level
 func (b *ServerBuilder) WithZapLogger(level string) *ServerBuilder {
 	var zapConfig zap.Config
-	
+
 	switch level {
 	case "debug":
 		zapConfig = zap.NewDevelopmentConfig()
@@ -84,13 +84,13 @@ func (b *ServerBuilder) WithZapLogger(level string) *ServerBuilder {
 	default:
 		zapConfig = zap.NewProductionConfig()
 	}
-	
+
 	logger, err := zapConfig.Build()
 	if err != nil {
 		// Fallback to a basic logger if configuration fails
 		logger, _ = zap.NewProduction()
 	}
-	
+
 	b.logger = &ZapLoggerAdapter{logger: logger}
 	return b
 }
@@ -205,7 +205,7 @@ func (b *ServerBuilder) Build() (*Server, error) {
 			return nil, fmt.Errorf("failed to create storage: %w", err)
 		}
 	}
-	
+
 	// Create broker if not provided
 	var unifiedBroker UnifiedBroker
 	if b.broker != nil {
@@ -230,7 +230,7 @@ func (b *ServerBuilder) Build() (*Server, error) {
 	} else {
 		transactionManager = transaction.NewTransactionManager()
 	}
-	
+
 	// Set the broker as the transaction executor
 	executor := transaction.NewUnifiedBrokerExecutor(unifiedBroker)
 	transactionManager.SetExecutor(executor)
@@ -247,17 +247,17 @@ func (b *ServerBuilder) Build() (*Server, error) {
 
 	// Create and attach lifecycle manager
 	server.Lifecycle = NewLifecycleManager(server, b.config)
-	
+
 	// Perform recovery if storage is persistent
 	if b.config.Storage.Persistent {
 		recoveryManager := NewRecoveryManager(storageImpl, unifiedBroker, logger.(*ZapLoggerAdapter).logger)
-		
+
 		recoveryStats, err := recoveryManager.PerformRecovery()
 		if err != nil {
 			logger.Error("Recovery failed", interfaces.LogField{Key: "error", Value: err})
 			// Continue with server startup even if recovery fails
 		} else {
-			logger.Info("Recovery completed successfully", 
+			logger.Info("Recovery completed successfully",
 				interfaces.LogField{Key: "exchanges_recovered", Value: recoveryStats.DurableExchangesRecovered},
 				interfaces.LogField{Key: "queues_recovered", Value: recoveryStats.DurableQueuesRecovered},
 				interfaces.LogField{Key: "messages_recovered", Value: recoveryStats.PersistentMessagesRecovered})
@@ -396,7 +396,7 @@ func (w *brokerWrapper) AckMessage(queueName, messageID string) error {
 }
 
 func (w *brokerWrapper) NackMessage(queueName, messageID string, requeue bool) error {
-	// Not directly supported - would need different signature  
+	// Not directly supported - would need different signature
 	return fmt.Errorf("nack message not supported in unified broker wrapper")
 }
 
@@ -454,17 +454,17 @@ func parseZapLevel(level string) zap.AtomicLevel {
 
 func createZapLogger(level, logFile string) (*zap.Logger, error) {
 	var zapConfig zap.Config
-	
+
 	if level == "debug" {
 		zapConfig = zap.NewDevelopmentConfig()
 	} else {
 		zapConfig = zap.NewProductionConfig()
 		zapConfig.Level = parseZapLevel(level)
 	}
-	
+
 	if logFile != "" {
 		zapConfig.OutputPaths = []string{logFile}
 	}
-	
+
 	return zapConfig.Build()
 }

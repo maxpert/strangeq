@@ -279,7 +279,7 @@ func BenchmarkMessageSizes(b *testing.B) {
 					b.Fatalf("Failed to publish message: %v", err)
 				}
 			}
-			
+
 			// Report throughput
 			mbps := float64(size*b.N) / float64(1024*1024) / b.Elapsed().Seconds()
 			b.ReportMetric(mbps, "MB/s")
@@ -377,7 +377,7 @@ func BenchmarkStorageOperations(b *testing.B) {
 
 	b.Run("MessageStorage", func(b *testing.B) {
 		queueName := "bench.storage.queue"
-		
+
 		b.ResetTimer()
 		for i := 0; i < b.N; i++ {
 			message := &protocol.Message{
@@ -424,13 +424,13 @@ func BenchmarkStorageOperations(b *testing.B) {
 				// Simulate atomic acknowledgment: delete pending ack + delete message
 				queueName := "atomic.bench.queue"
 				deliveryTag := uint64(i + 1)
-				
+
 				// Delete pending ack
 				err := txnStorage.DeletePendingAck(queueName, deliveryTag)
 				if err != nil {
 					return err
 				}
-				
+
 				// Delete message
 				return txnStorage.DeleteMessage(queueName, deliveryTag)
 			})

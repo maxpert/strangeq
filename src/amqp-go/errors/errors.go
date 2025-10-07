@@ -35,34 +35,34 @@ func (e *AMQPError) As(target interface{}) bool {
 // AMQP Error Codes (from AMQP 0.9.1 specification)
 const (
 	// Connection errors
-	ConnectionForced    = 320
+	ConnectionForced   = 320
 	InvalidPath        = 402
 	AccessRefused      = 403
 	NotFound           = 404
 	ResourceLocked     = 405
 	PreconditionFailed = 406
-	
+
 	// Channel errors
-	ContentTooLarge    = 311
-	NoRoute           = 312
-	NoConsumers       = 313
-	ConnectionForced2 = 320
-	InvalidPath2      = 402
-	AccessRefused2    = 403
-	NotFound2         = 404
-	ResourceLocked2   = 405
+	ContentTooLarge     = 311
+	NoRoute             = 312
+	NoConsumers         = 313
+	ConnectionForced2   = 320
+	InvalidPath2        = 402
+	AccessRefused2      = 403
+	NotFound2           = 404
+	ResourceLocked2     = 405
 	PreconditionFailed2 = 406
-	
+
 	// Frame errors
-	FrameError        = 501
-	SyntaxError       = 502
-	CommandInvalid    = 503
-	ChannelErrorCode  = 504
-	UnexpectedFrame   = 505
-	ResourceError     = 506
-	NotAllowed        = 530
-	NotImplemented    = 540
-	InternalError     = 541
+	FrameError       = 501
+	SyntaxError      = 502
+	CommandInvalid   = 503
+	ChannelErrorCode = 504
+	UnexpectedFrame  = 505
+	ResourceError    = 506
+	NotAllowed       = 530
+	NotImplemented   = 540
+	InternalError    = 541
 )
 
 // Connection Errors
