@@ -35,36 +35,38 @@ func DefaultConfig() *AMQPConfig {
 			CompactionAge: 24 * time.Hour,
 		},
 		Security: interfaces.SecurityConfig{
-			TLSEnabled:            false,
-			TLSCertFile:           "",
-			TLSKeyFile:            "",
-			TLSCAFile:             "",
-			AuthenticationEnabled: false,
-			AuthenticationBackend: "file",
-			AuthenticationConfig:  make(map[string]interface{}),
-			AuthorizationEnabled:  false,
-			DefaultVHost:          "/",
-			AllowedUsers:          []string{},
-			BlockedUsers:          []string{},
-			AllowedHosts:          []string{},
-			BlockedHosts:          []string{},
+			TLSEnabled:             false,
+			TLSCertFile:            "",
+			TLSKeyFile:             "",
+			TLSCAFile:              "",
+			AuthenticationEnabled:  false,
+			AuthenticationBackend:  "file",
+			AuthenticationConfig:   make(map[string]interface{}),
+			AuthenticationFilePath: "./auth.json",
+			AuthMechanisms:         []string{"PLAIN"},
+			AuthorizationEnabled:   false,
+			DefaultVHost:           "/",
+			AllowedUsers:           []string{},
+			BlockedUsers:           []string{},
+			AllowedHosts:           []string{},
+			BlockedHosts:           []string{},
 		},
 		Server: interfaces.ServerConfig{
-			Name:                      "amqp-go-server",
-			Version:                   "0.9.1",
-			Product:                   "AMQP-Go",
-			Platform:                  "Go",
-			Copyright:                 "Maxpert AMQP-Go Server",
-			LogLevel:                  "info",
-			LogFile:                   "",
-			PidFile:                   "",
-			Daemonize:                 false,
-			MaxChannelsPerConnection:  2047,
-			MaxFrameSize:              131072, // 128KB
-			MaxMessageSize:            16777216, // 16MB
-			ChannelTimeout:            60 * time.Second,
-			MessageTimeout:            30 * time.Second,
-			CleanupInterval:           5 * time.Minute,
+			Name:                     "amqp-go-server",
+			Version:                  "0.9.1",
+			Product:                  "AMQP-Go",
+			Platform:                 "Go",
+			Copyright:                "Maxpert AMQP-Go Server",
+			LogLevel:                 "info",
+			LogFile:                  "",
+			PidFile:                  "",
+			Daemonize:                false,
+			MaxChannelsPerConnection: 2047,
+			MaxFrameSize:             131072,   // 128KB
+			MaxMessageSize:           16777216, // 16MB
+			ChannelTimeout:           60 * time.Second,
+			MessageTimeout:           30 * time.Second,
+			CleanupInterval:          5 * time.Minute,
 		},
 	}
 }
@@ -103,11 +105,11 @@ func (c *AMQPConfig) Validate() error {
 	if c.Network.Port <= 0 || c.Network.Port > 65535 {
 		return fmt.Errorf("invalid network port: %d", c.Network.Port)
 	}
-	
+
 	if c.Network.MaxConnections <= 0 {
 		return fmt.Errorf("max connections must be positive: %d", c.Network.MaxConnections)
 	}
-	
+
 	if c.Network.ConnectionTimeout <= 0 {
 		return fmt.Errorf("connection timeout must be positive: %v", c.Network.ConnectionTimeout)
 	}
@@ -116,7 +118,7 @@ func (c *AMQPConfig) Validate() error {
 	if c.Storage.Backend == "" {
 		return fmt.Errorf("storage backend cannot be empty")
 	}
-	
+
 	if c.Storage.Backend != "memory" && c.Storage.Path == "" {
 		return fmt.Errorf("storage path required for backend: %s", c.Storage.Backend)
 	}
@@ -126,11 +128,11 @@ func (c *AMQPConfig) Validate() error {
 		if c.Security.TLSCertFile == "" || c.Security.TLSKeyFile == "" {
 			return fmt.Errorf("TLS cert and key files required when TLS is enabled")
 		}
-		
+
 		if _, err := os.Stat(c.Security.TLSCertFile); os.IsNotExist(err) {
 			return fmt.Errorf("TLS cert file does not exist: %s", c.Security.TLSCertFile)
 		}
-		
+
 		if _, err := os.Stat(c.Security.TLSKeyFile); os.IsNotExist(err) {
 			return fmt.Errorf("TLS key file does not exist: %s", c.Security.TLSKeyFile)
 		}
@@ -140,11 +142,11 @@ func (c *AMQPConfig) Validate() error {
 	if c.Server.MaxChannelsPerConnection <= 0 {
 		return fmt.Errorf("max channels per connection must be positive: %d", c.Server.MaxChannelsPerConnection)
 	}
-	
+
 	if c.Server.MaxFrameSize <= 0 {
 		return fmt.Errorf("max frame size must be positive: %d", c.Server.MaxFrameSize)
 	}
-	
+
 	if c.Server.MaxMessageSize <= 0 {
 		return fmt.Errorf("max message size must be positive: %d", c.Server.MaxMessageSize)
 	}

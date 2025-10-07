@@ -23,16 +23,18 @@ const (
 
 // Server represents the AMQP server
 type Server struct {
-	Addr        string
-	Listener    net.Listener
-	Connections map[string]*protocol.Connection
-	Mutex       sync.RWMutex
-	Shutdown    bool
-	Log         *zap.Logger
-	Broker      UnifiedBroker
-	Config      *config.AMQPConfig
-	Lifecycle   *LifecycleManager
+	Addr               string
+	Listener           net.Listener
+	Connections        map[string]*protocol.Connection
+	Mutex              sync.RWMutex
+	Shutdown           bool
+	Log                *zap.Logger
+	Broker             UnifiedBroker
+	Config             *config.AMQPConfig
+	Lifecycle          *LifecycleManager
 	TransactionManager interfaces.TransactionManager
+	Authenticator      interfaces.Authenticator
+	MechanismRegistry  MechanismRegistry
 }
 
 // NewServer creates a new AMQP server
@@ -369,12 +371,26 @@ func (s *Server) sendConnectionStart(conn *protocol.Connection) error {
 		},
 	}
 
+	// Determine available mechanisms
+	mechanisms := "PLAIN" // Default
+	if s.MechanismRegistry != nil {
+		mechanisms = s.MechanismRegistry.String()
+	} else if s.Config != nil && len(s.Config.Security.AuthMechanisms) > 0 {
+		// Use configured mechanisms
+		for i, mech := range s.Config.Security.AuthMechanisms {
+			if i > 0 {
+				mechanisms += " "
+			}
+			mechanisms += mech
+		}
+	}
+
 	// Create the connection.start method
 	startMethod := &protocol.ConnectionStartMethod{
 		VersionMajor:     0,
 		VersionMinor:     9,
 		ServerProperties: serverProperties,
-		Mechanisms:       []string{"PLAIN"},
+		Mechanisms:       []string{mechanisms},
 		Locales:          []string{"en_US"},
 	}
 
@@ -512,13 +528,83 @@ func (s *Server) processConnectionOpen(conn *protocol.Connection, frame *protoco
 	return s.sendConnectionOpenOK(conn)
 }
 
+// handleConnectionStartOK handles the connection.start-ok method and performs authentication
+func (s *Server) handleConnectionStartOK(conn *protocol.Connection, payload []byte) error {
+	// Parse connection.start-ok
+	startOK, err := protocol.ParseConnectionStartOK(payload)
+	if err != nil {
+		s.Log.Error("Failed to parse connection.start-ok",
+			zap.String("connection_id", conn.ID),
+			zap.Error(err))
+		return s.sendConnectionClose(conn, 503, "COMMAND_INVALID", "Failed to parse connection.start-ok")
+	}
+
+	s.Log.Debug("Connection.start-ok parsed",
+		zap.String("connection_id", conn.ID),
+		zap.String("mechanism", startOK.Mechanism),
+		zap.String("locale", startOK.Locale))
+
+	// Check if authentication is enabled
+	if s.Config != nil && !s.Config.Security.AuthenticationEnabled {
+		// Authentication disabled, allow connection
+		conn.Username = "guest"
+		s.Log.Info("Authentication disabled, allowing connection as guest",
+			zap.String("connection_id", conn.ID))
+		return nil
+	}
+
+	// Perform authentication if authenticator is available
+	if s.Authenticator != nil && s.MechanismRegistry != nil {
+		// Get the mechanism
+		mechanism, err := s.MechanismRegistry.Get(startOK.Mechanism)
+		if err != nil {
+			s.Log.Warn("Unsupported authentication mechanism",
+				zap.String("connection_id", conn.ID),
+				zap.String("mechanism", startOK.Mechanism),
+				zap.Error(err))
+			return s.sendConnectionClose(conn, 403, "ACCESS_REFUSED", fmt.Sprintf("Unsupported mechanism: %s", startOK.Mechanism))
+		}
+
+		// Authenticate using the mechanism
+		userInterface, err := mechanism.Authenticate(startOK.Response, s.Authenticator)
+		if err != nil {
+			s.Log.Warn("Authentication failed",
+				zap.String("connection_id", conn.ID),
+				zap.String("mechanism", startOK.Mechanism),
+				zap.Error(err))
+			return s.sendConnectionClose(conn, 403, "ACCESS_REFUSED", "Authentication failed")
+		}
+
+		// Extract username from authenticated user
+		if user, ok := userInterface.(*interfaces.User); ok {
+			conn.Username = user.Username
+			s.Log.Info("User authenticated successfully",
+				zap.String("connection_id", conn.ID),
+				zap.String("username", user.Username),
+				zap.String("mechanism", startOK.Mechanism))
+		} else {
+			conn.Username = "authenticated"
+			s.Log.Info("Authentication successful",
+				zap.String("connection_id", conn.ID),
+				zap.String("mechanism", startOK.Mechanism))
+		}
+	} else {
+		// No authenticator configured, allow connection as guest
+		conn.Username = "guest"
+		s.Log.Info("No authenticator configured, allowing connection as guest",
+			zap.String("connection_id", conn.ID))
+	}
+
+	return nil
+}
+
 // processConnectionMethod processes connection-level methods
 func (s *Server) processConnectionMethod(conn *protocol.Connection, methodID uint16, payload []byte) error {
 	switch methodID {
 	case protocol.ConnectionStartOK: // Method ID 11 for connection class
-		// Process connection.start-ok
+		// Process connection.start-ok and authenticate
 		s.Log.Debug("Received connection.start-ok", zap.String("connection_id", conn.ID))
-		return nil
+		return s.handleConnectionStartOK(conn, payload)
 	case protocol.ConnectionTuneOK: // Method ID 31 for connection class
 		// Process connection.tune-ok
 		s.Log.Debug("Received connection.tune-ok", zap.String("connection_id", conn.ID))
@@ -588,7 +674,7 @@ func (s *Server) processChannelSpecificMethod(conn *protocol.Connection, channel
 
 		// Send channel.open-ok
 		return s.sendChannelOpenOK(conn, channelID)
-	
+
 	case protocol.ChannelClose: // Method ID 40 for channel class
 		s.Log.Debug("Channel close requested",
 			zap.Uint16("channel_id", channelID),
@@ -607,7 +693,7 @@ func (s *Server) processChannelSpecificMethod(conn *protocol.Connection, channel
 			channel.Consumers = make(map[string]*protocol.Consumer) // Clear all consumers
 			channel.Closed = true
 			channel.Mutex.Unlock()
-			
+
 			// Remove channel from connection
 			delete(conn.Channels, channelID)
 		}
@@ -926,6 +1012,34 @@ func (s *Server) handleQueueDelete(conn *protocol.Connection, channelID uint16, 
 	return s.sendQueueDeleteOK(conn, channelID, 0)
 }
 
+// sendConnectionClose sends the connection.close method frame
+func (s *Server) sendConnectionClose(conn *protocol.Connection, replyCode uint16, replyText, classMethod string) error {
+	closeMethod := &protocol.ConnectionCloseMethod{
+		ReplyCode: replyCode,
+		ReplyText: replyText,
+		ClassID:   0,  // Set based on classMethod if needed
+		MethodID:  0,  // Set based on classMethod if needed
+	}
+
+	methodData, err := closeMethod.Serialize()
+	if err != nil {
+		return fmt.Errorf("error serializing connection.close: %v", err)
+	}
+
+	frame := protocol.EncodeMethodFrame(10, 50, methodData) // 10.50 = connection.close
+
+	if err := protocol.WriteFrame(conn.Conn, frame); err != nil {
+		return err
+	}
+
+	// Mark connection as closed
+	conn.Mutex.Lock()
+	conn.Closed = true
+	conn.Mutex.Unlock()
+
+	return nil
+}
+
 // sendConnectionCloseOK sends the connection.close-ok method frame
 func (s *Server) sendConnectionCloseOK(conn *protocol.Connection) error {
 	closeOKMethod := &protocol.ConnectionCloseOKMethod{}
@@ -1093,7 +1207,7 @@ func (s *Server) processTransactionMethod(conn *protocol.Connection, channelID u
 	switch methodID {
 	case protocol.TxSelect: // Method ID 10 for tx class
 		return s.handleTxSelect(conn, channelID, payload)
-	case protocol.TxCommit: // Method ID 20 for tx class  
+	case protocol.TxCommit: // Method ID 20 for tx class
 		return s.handleTxCommit(conn, channelID, payload)
 	case protocol.TxRollback: // Method ID 30 for tx class
 		return s.handleTxRollback(conn, channelID, payload)
@@ -1727,7 +1841,7 @@ func (s *Server) sendBasicDeliver(conn *protocol.Connection, channelID uint16, c
 	s.Log.Info("Creating content header structure",
 		zap.String("consumer_tag", consumerTag),
 		zap.String("content_type", message.ContentType))
-	
+
 	contentHeader := &protocol.ContentHeader{
 		ClassID:         60, // basic class
 		Weight:          0,
@@ -1795,7 +1909,7 @@ func (s *Server) sendBasicDeliver(conn *protocol.Connection, channelID uint16, c
 	}
 
 	contentHeader.PropertyFlags = propertyFlags
-	
+
 	s.Log.Info("Property flags set",
 		zap.String("consumer_tag", consumerTag),
 		zap.Uint16("property_flags", propertyFlags))
@@ -1803,13 +1917,13 @@ func (s *Server) sendBasicDeliver(conn *protocol.Connection, channelID uint16, c
 	// Use ContentHeader.Serialize() to get properly formatted header payload
 	s.Log.Info("About to serialize content header",
 		zap.String("consumer_tag", consumerTag))
-	
+
 	headerPayload, err := contentHeader.Serialize()
 	if err != nil {
 		s.Log.Error("Error serializing content header", zap.Error(err))
 		return fmt.Errorf("error serializing content header: %v", err)
 	}
-	
+
 	s.Log.Info("Content header serialized successfully",
 		zap.String("consumer_tag", consumerTag),
 		zap.Int("payload_length", len(headerPayload)))
@@ -1836,7 +1950,7 @@ func (s *Server) sendBasicDeliver(conn *protocol.Connection, channelID uint16, c
 		Size:    uint32(len(headerPayload)),
 		Payload: headerPayload,
 	}
-	
+
 	s.Log.Info("Header frame created",
 		zap.String("consumer_tag", consumerTag))
 
@@ -2209,4 +2323,3 @@ func (s *Server) StartWithQuitChannel(quit <-chan struct{}) error {
 		}
 	}
 }
-

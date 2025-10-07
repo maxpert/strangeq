@@ -8,22 +8,22 @@ import (
 type Config interface {
 	// GetNetwork returns network configuration
 	GetNetwork() NetworkConfig
-	
+
 	// GetStorage returns storage configuration
 	GetStorage() StorageConfig
-	
+
 	// GetSecurity returns security configuration
 	GetSecurity() SecurityConfig
-	
+
 	// GetServer returns server information configuration
 	GetServer() ServerConfig
-	
+
 	// Validate validates the configuration
 	Validate() error
-	
+
 	// Load loads configuration from a source
 	Load(source string) error
-	
+
 	// Save saves configuration to a destination
 	Save(destination string) error
 }
@@ -32,23 +32,23 @@ type Config interface {
 type NetworkConfig struct {
 	// Address to bind the server to
 	Address string
-	
+
 	// Port to listen on
 	Port int
-	
+
 	// Maximum number of connections
 	MaxConnections int
-	
+
 	// Connection timeout
 	ConnectionTimeout time.Duration
-	
+
 	// Heartbeat interval
 	HeartbeatInterval time.Duration
-	
+
 	// TCP keepalive settings
-	TCPKeepAlive bool
+	TCPKeepAlive         bool
 	TCPKeepAliveInterval time.Duration
-	
+
 	// Buffer sizes
 	ReadBufferSize  int
 	WriteBufferSize int
@@ -58,24 +58,24 @@ type NetworkConfig struct {
 type StorageConfig struct {
 	// Backend type ("memory", "bbolt", "badger", etc.)
 	Backend string
-	
+
 	// Connection string or file path
 	Path string
-	
+
 	// Storage-specific options
 	Options map[string]interface{}
-	
+
 	// Persistence settings
 	Persistent bool
 	SyncWrites bool
-	
+
 	// Message settings
 	MessageTTL int64 // Message TTL in seconds (0 = no TTL)
-	
+
 	// Performance settings
-	CacheSize      int64
-	MaxOpenFiles   int
-	CompactionAge  time.Duration
+	CacheSize     int64
+	MaxOpenFiles  int
+	CompactionAge time.Duration
 }
 
 // SecurityConfig holds security-related configuration
@@ -85,45 +85,47 @@ type SecurityConfig struct {
 	TLSCertFile string
 	TLSKeyFile  string
 	TLSCAFile   string
-	
+
 	// Authentication settings
-	AuthenticationEnabled bool
-	AuthenticationBackend string // "file", "ldap", "database", etc.
-	AuthenticationConfig  map[string]interface{}
-	
-	// Authorization settings  
+	AuthenticationEnabled  bool
+	AuthenticationBackend  string // "file", "ldap", "database", etc.
+	AuthenticationConfig   map[string]interface{}
+	AuthenticationFilePath string   // Path to auth file for file backend
+	AuthMechanisms         []string // Enabled SASL mechanisms (PLAIN, ANONYMOUS, etc.)
+
+	// Authorization settings
 	AuthorizationEnabled bool
 	DefaultVHost         string
-	
+
 	// Access control
-	AllowedUsers  []string
-	BlockedUsers  []string
-	AllowedHosts  []string
-	BlockedHosts  []string
+	AllowedUsers []string
+	BlockedUsers []string
+	AllowedHosts []string
+	BlockedHosts []string
 }
 
 // ServerConfig holds server information configuration
 type ServerConfig struct {
 	// Server identification
-	Name     string
-	Version  string
-	Product  string
-	Platform string
+	Name      string
+	Version   string
+	Product   string
+	Platform  string
 	Copyright string
-	
+
 	// Operational settings
-	LogLevel     string
-	LogFile      string
-	PidFile      string
-	Daemonize    bool
-	
+	LogLevel  string
+	LogFile   string
+	PidFile   string
+	Daemonize bool
+
 	// Performance settings
 	MaxChannelsPerConnection int
-	MaxFrameSize            int
-	MaxMessageSize          int64
-	
+	MaxFrameSize             int
+	MaxMessageSize           int64
+
 	// Timeouts and intervals
-	ChannelTimeout   time.Duration
-	MessageTimeout   time.Duration
-	CleanupInterval  time.Duration
+	ChannelTimeout  time.Duration
+	MessageTimeout  time.Duration
+	CleanupInterval time.Duration
 }

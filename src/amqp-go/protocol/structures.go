@@ -15,6 +15,7 @@ type Connection struct {
 	Conn            net.Conn
 	Channels        map[uint16]*Channel
 	Vhost           string                     // Virtual host for this connection
+	Username        string                     // Authenticated username
 	PendingMessages map[uint16]*PendingMessage // Track messages being published on each channel
 	Mutex           sync.RWMutex
 	Closed          bool

@@ -192,10 +192,15 @@ Create a Go package `github.com/maxpert/amqp-go` that implements an AMQP 0.9.1 s
   - [x] Integrate with server builder for automatic transaction manager configuration
   - [x] Support atomic storage operations for transactional guarantees
 - [ ] **Security and Access Control**: Add authentication and authorization using interfaces
-  - [ ] Implement access control using Authenticator interface
-  - [ ] Add user/permission storage using MetadataStore interface
-  - [ ] Implement TLS/SSL support through SecurityConfig
-  - [ ] Add security integration tests
+  - [ ] Design and implement SASL authentication framework with Authenticator interface
+  - [ ] Implement PLAIN authentication mechanism (username/password)
+  - [ ] Implement file-based user credential storage using MetadataStore interface
+  - [ ] Implement ANONYMOUS authentication mechanism (development/testing only, disabled by default)
+  - [ ] Integrate authentication with connection handshake (connection.start-ok)
+  - [ ] Add authentication configuration through SecurityConfig
+  - [ ] Add security integration tests for PLAIN and ANONYMOUS mechanisms
+  - [ ] Document authentication configuration in README.md
+  - [ ] Implement TLS/SSL support through SecurityConfig (future)
 - [ ] **Monitoring and Management**: Add operational features
   - [x] Implement proper daemonization with process forking and daemon mode ✅ **COMPLETED**
   - [ ] Implement basic monitoring/management using storage interfaces for metrics

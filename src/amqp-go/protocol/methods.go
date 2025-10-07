@@ -160,6 +160,59 @@ func (m *ConnectionStartOKMethod) Serialize() ([]byte, error) {
 	return result, nil
 }
 
+// ParseConnectionStartOK parses a connection.start-ok method from bytes
+func ParseConnectionStartOK(data []byte) (*ConnectionStartOKMethod, error) {
+	method := &ConnectionStartOKMethod{}
+	offset := 0
+
+	// Parse client properties (field table)
+	var err error
+	method.ClientProperties, offset, err = decodeFieldTable(data, offset)
+	if err != nil {
+		return nil, fmt.Errorf("failed to decode client properties: %w", err)
+	}
+
+	// Parse mechanism (short string)
+	if len(data) < offset+1 {
+		return nil, fmt.Errorf("insufficient data for mechanism length")
+	}
+	mechLen := int(data[offset])
+	offset++
+
+	if len(data) < offset+mechLen {
+		return nil, fmt.Errorf("insufficient data for mechanism")
+	}
+	method.Mechanism = string(data[offset : offset+mechLen])
+	offset += mechLen
+
+	// Parse response (long string)
+	if len(data) < offset+4 {
+		return nil, fmt.Errorf("insufficient data for response length")
+	}
+	respLen := binary.BigEndian.Uint32(data[offset : offset+4])
+	offset += 4
+
+	if len(data) < offset+int(respLen) {
+		return nil, fmt.Errorf("insufficient data for response")
+	}
+	method.Response = data[offset : offset+int(respLen)]
+	offset += int(respLen)
+
+	// Parse locale (short string)
+	if len(data) < offset+1 {
+		return nil, fmt.Errorf("insufficient data for locale length")
+	}
+	localeLen := int(data[offset])
+	offset++
+
+	if len(data) < offset+localeLen {
+		return nil, fmt.Errorf("insufficient data for locale")
+	}
+	method.Locale = string(data[offset : offset+localeLen])
+
+	return method, nil
+}
+
 // ConnectionTuneMethod represents the connection.tune method
 type ConnectionTuneMethod struct {
 	ChannelMax uint16
