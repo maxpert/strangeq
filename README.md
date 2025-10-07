@@ -952,6 +952,270 @@ golangci-lint run
 └── transaction/        # Transaction system implementation
 ```
 
+## Monitoring and Metrics
+
+AMQP-Go provides comprehensive Prometheus metrics for monitoring server health, performance, and operational statistics. The metrics system integrates with the Prometheus ecosystem and can be visualized using Grafana dashboards.
+
+### Metrics Overview
+
+The server exposes the following metric categories:
+
+**Connection Metrics:**
+- `amqp_connections_total` - Current number of active connections (Gauge)
+- `amqp_connections_created_total` - Total connections created since startup (Counter)
+- `amqp_connections_closed_total` - Total connections closed (Counter)
+
+**Channel Metrics:**
+- `amqp_channels_total` - Current number of active channels (Gauge)
+- `amqp_channels_created_total` - Total channels created (Counter)
+- `amqp_channels_closed_total` - Total channels closed (Counter)
+
+**Queue Metrics:**
+- `amqp_queues_declared_total` - Total queues declared (Counter)
+- `amqp_queues_deleted_total` - Total queues deleted (Counter)
+- `amqp_queue_messages_ready` - Messages ready for delivery per queue (GaugeVec with queue, vhost labels)
+- `amqp_queue_messages_unacked` - Unacknowledged messages per queue (GaugeVec with queue, vhost labels)
+- `amqp_queue_consumers` - Number of consumers per queue (GaugeVec with queue, vhost labels)
+
+**Exchange Metrics:**
+- `amqp_exchanges_declared_total` - Total exchanges declared (Counter)
+- `amqp_exchanges_deleted_total` - Total exchanges deleted (Counter)
+
+**Message Metrics:**
+- `amqp_messages_published_total` - Total messages published (Counter)
+- `amqp_messages_published_bytes_total` - Total bytes published (Counter)
+- `amqp_messages_delivered_total` - Total messages delivered (Counter)
+- `amqp_messages_delivered_bytes_total` - Total bytes delivered (Counter)
+- `amqp_messages_acknowledged_total` - Total messages acknowledged (Counter)
+- `amqp_messages_redelivered_total` - Total messages redelivered (Counter)
+- `amqp_messages_rejected_total` - Total messages rejected (Counter)
+- `amqp_messages_unroutable_total` - Total unroutable messages (Counter)
+
+**Consumer Metrics:**
+- `amqp_consumers_total` - Current number of active consumers (Gauge)
+
+**Transaction Metrics:**
+- `amqp_transactions_started_total` - Total transactions started (Counter)
+- `amqp_transactions_committed_total` - Total transactions committed (Counter)
+- `amqp_transactions_rolledback_total` - Total transactions rolled back (Counter)
+
+**Server Metrics:**
+- `amqp_server_uptime_seconds` - Server uptime in seconds (Gauge)
+
+### Enabling Metrics
+
+#### Basic Metrics Setup
+
+```go
+package main
+
+import (
+    "context"
+    "log"
+    "time"
+
+    "github.com/maxpert/amqp-go/config"
+    "github.com/maxpert/amqp-go/metrics"
+    "github.com/maxpert/amqp-go/server"
+)
+
+func main() {
+    // Create configuration
+    cfg := config.DefaultConfig()
+    cfg.Network.Address = ":5672"
+
+    // Create metrics collector
+    metricsCollector := metrics.NewCollector("amqp")
+
+    // Create metrics HTTP server (port 9419 - standard AMQP exporter port)
+    metricsServer := metrics.NewServer(9419)
+
+    // Start metrics server
+    go func() {
+        log.Printf("Starting Prometheus metrics server on :%d", metricsServer.Port())
+        log.Printf("Metrics available at http://localhost:%d/metrics", metricsServer.Port())
+        if err := metricsServer.Start(); err != nil {
+            log.Printf("Metrics server error: %v", err)
+        }
+    }()
+
+    // Create AMQP server with metrics
+    amqpServer := server.NewServer(cfg.Network.Address)
+    amqpServer.Config = cfg
+    amqpServer.MetricsCollector = metricsCollector
+
+    // Update server uptime periodically
+    ctx, cancel := context.WithCancel(context.Background())
+    defer cancel()
+
+    go func() {
+        ticker := time.NewTicker(10 * time.Second)
+        defer ticker.Stop()
+
+        for {
+            select {
+            case <-ticker.C:
+                uptime := time.Since(amqpServer.StartTime).Seconds()
+                metricsCollector.UpdateServerUptime(uptime)
+            case <-ctx.Done():
+                return
+            }
+        }
+    }()
+
+    // Start AMQP server
+    log.Printf("Starting AMQP server on %s", cfg.Network.Address)
+    if err := amqpServer.Start(); err != nil {
+        log.Fatalf("AMQP server error: %v", err)
+    }
+}
+```
+
+#### Custom Metrics Port
+
+```go
+// Use custom port for metrics endpoint
+metricsServer := metrics.NewServer(8080)
+
+// Or use the default AMQP exporter port (9419)
+metricsServer := metrics.NewServer(0) // Uses default 9419
+```
+
+### Metrics Endpoints
+
+The metrics server provides several HTTP endpoints:
+
+- `GET /metrics` - Prometheus metrics in text format
+- `GET /health` - Health check endpoint (returns 200 OK)
+- `GET /` - HTML documentation page with endpoint links
+
+### Prometheus Configuration
+
+Add the AMQP-Go server as a scrape target in your `prometheus.yml`:
+
+```yaml
+scrape_configs:
+  - job_name: 'amqp-go'
+    static_configs:
+      - targets: ['localhost:9419']
+    scrape_interval: 15s
+    scrape_timeout: 10s
+```
+
+### Grafana Dashboard
+
+Create a Grafana dashboard with the following sample queries:
+
+**Connection Rate:**
+```promql
+rate(amqp_connections_created_total[5m])
+```
+
+**Message Throughput:**
+```promql
+rate(amqp_messages_published_total[5m])
+```
+
+**Queue Depth:**
+```promql
+amqp_queue_messages_ready
+```
+
+**Consumer Count by Queue:**
+```promql
+sum by (queue) (amqp_queue_consumers)
+```
+
+**Transaction Success Rate:**
+```promql
+rate(amqp_transactions_committed_total[5m]) /
+(rate(amqp_transactions_committed_total[5m]) + rate(amqp_transactions_rolledback_total[5m]))
+```
+
+**Average Message Size:**
+```promql
+rate(amqp_messages_published_bytes_total[5m]) / rate(amqp_messages_published_total[5m])
+```
+
+### Alerting Rules
+
+Example Prometheus alerting rules:
+
+```yaml
+groups:
+  - name: amqp_alerts
+    rules:
+      - alert: HighConnectionRate
+        expr: rate(amqp_connections_created_total[1m]) > 100
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High connection creation rate detected"
+
+      - alert: QueueBacklog
+        expr: amqp_queue_messages_ready > 10000
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Queue {{ $labels.queue }} has {{ $value }} messages ready"
+
+      - alert: HighTransactionRollbackRate
+        expr: rate(amqp_transactions_rolledback_total[5m]) > rate(amqp_transactions_committed_total[5m])
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Transaction rollback rate exceeds commit rate"
+
+      - alert: NoConsumers
+        expr: amqp_queue_messages_ready > 0 and amqp_queue_consumers == 0
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Queue {{ $labels.queue }} has messages but no consumers"
+```
+
+### Metrics Integration
+
+The metrics collector integrates automatically with server operations:
+
+```go
+// Metrics are automatically recorded by the server when:
+// - Connections are created/closed
+// - Channels are opened/closed
+// - Queues are declared/deleted
+// - Exchanges are declared/deleted
+// - Messages are published/delivered/acknowledged
+// - Transactions are started/committed/rolled back
+
+// You can also manually record metrics:
+metricsCollector.RecordMessagePublished(messageSize)
+metricsCollector.RecordQueueDeclared()
+metricsCollector.UpdateQueueMetrics("my-queue", "/", readyCount, unackedCount, consumerCount)
+```
+
+### Disabling Metrics
+
+To run the server without metrics collection:
+
+```go
+// Don't set MetricsCollector field - server will use NoOpMetricsCollector
+amqpServer := server.NewServer(cfg.Network.Address)
+amqpServer.Config = cfg
+// MetricsCollector not set - no metrics collected
+```
+
+### Performance Impact
+
+The Prometheus metrics system has minimal performance impact:
+- Metrics use atomic operations for thread-safe updates
+- No additional allocations for counter/gauge updates
+- GaugeVec metrics use label-based indexing for O(1) lookups
+- Metrics scraping is handled by separate HTTP server on different port
+
 ## Contributing
 
 1. Fork the repository

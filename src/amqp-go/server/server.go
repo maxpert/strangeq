@@ -35,16 +35,20 @@ type Server struct {
 	TransactionManager interfaces.TransactionManager
 	Authenticator      interfaces.Authenticator
 	MechanismRegistry  MechanismRegistry
+	MetricsCollector   MetricsCollector
+	StartTime          time.Time
 }
 
 // NewServer creates a new AMQP server
 func NewServer(addr string) *Server {
 	logger, _ := zap.NewProduction()
 	return &Server{
-		Addr:        addr,
-		Connections: make(map[string]*protocol.Connection),
-		Log:         logger,
-		Broker:      NewOriginalBrokerAdapter(broker.NewBroker()),
+		Addr:             addr,
+		Connections:      make(map[string]*protocol.Connection),
+		Log:              logger,
+		Broker:           NewOriginalBrokerAdapter(broker.NewBroker()),
+		MetricsCollector: &NoOpMetricsCollector{},
+		StartTime:        time.Now(),
 	}
 }
 
@@ -106,6 +110,11 @@ func (s *Server) handleConnection(conn net.Conn) {
 	s.Connections[connection.ID] = connection
 	s.Mutex.Unlock()
 
+	// Record connection created
+	if s.MetricsCollector != nil {
+		s.MetricsCollector.RecordConnectionCreated()
+	}
+
 	// Start consumer delivery loop for this connection
 	go s.consumerDeliveryLoop(connection)
 
@@ -116,6 +125,11 @@ func (s *Server) handleConnection(conn net.Conn) {
 	s.Mutex.Lock()
 	delete(s.Connections, connection.ID)
 	s.Mutex.Unlock()
+
+	// Record connection closed
+	if s.MetricsCollector != nil {
+		s.MetricsCollector.RecordConnectionClosed()
+	}
 }
 
 // consumerDeliveryLoop continuously reads from consumer channels and sends messages to clients
@@ -1029,8 +1043,8 @@ func (s *Server) sendConnectionClose(conn *protocol.Connection, replyCode uint16
 	closeMethod := &protocol.ConnectionCloseMethod{
 		ReplyCode: replyCode,
 		ReplyText: replyText,
-		ClassID:   0,  // Set based on classMethod if needed
-		MethodID:  0,  // Set based on classMethod if needed
+		ClassID:   0, // Set based on classMethod if needed
+		MethodID:  0, // Set based on classMethod if needed
 	}
 
 	methodData, err := closeMethod.Serialize()
