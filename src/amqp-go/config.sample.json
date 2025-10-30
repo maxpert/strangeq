@@ -1,0 +1,57 @@
+{
+  "network": {
+    "address": ":5672",
+    "port": 5672,
+    "max_connections": 1000,
+    "connection_timeout": "30s",
+    "heartbeat_interval": "60s",
+    "tcp_keep_alive": true,
+    "tcp_keep_alive_interval": "30s",
+    "read_buffer_size": 8192,
+    "write_buffer_size": 8192
+  },
+  "storage": {
+    "backend": "memory",
+    "path": "./data",
+    "persistent": false,
+    "sync_writes": false,
+    "message_ttl": 0,
+    "cache_size": 67108864,
+    "max_open_files": 100,
+    "compaction_age": "24h"
+  },
+  "security": {
+    "tls_enabled": false,
+    "tls_cert_file": "",
+    "tls_key_file": "",
+    "tls_ca_file": "",
+    "authentication_enabled": false,
+    "authentication_backend": "file",
+    "authentication_config": {
+      "user_file": "users.json"
+    },
+    "authorization_enabled": false,
+    "default_vhost": "/",
+    "allowed_users": [],
+    "blocked_users": [],
+    "allowed_hosts": [],
+    "blocked_hosts": []
+  },
+  "server": {
+    "name": "amqp-go-server",
+    "version": "0.9.1",
+    "product": "AMQP-Go",
+    "platform": "Go",
+    "copyright": "AMQP-Go Server",
+    "log_level": "info",
+    "log_file": "",
+    "pid_file": "",
+    "daemonize": false,
+    "max_channels_per_connection": 2047,
+    "max_frame_size": 131072,
+    "max_message_size": 16777216,
+    "channel_timeout": "1m",
+    "message_timeout": "30s",
+    "cleanup_interval": "5m"
+  }
+}
