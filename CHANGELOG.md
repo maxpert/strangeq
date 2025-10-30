@@ -9,8 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 - GitHub Actions workflow for automated multi-platform releases
-- Docker support with multi-architecture builds (amd64, arm64)
-- Comprehensive build automation for macOS (arm64, amd64), Linux (amd64, arm64, 386), Windows (amd64, 386)
+- Comprehensive build automation for macOS (arm64, amd64), Linux (amd64, arm64, 386)
 - Issue and PR templates for better contribution workflow
 
 ## [0.1.0] - TBD

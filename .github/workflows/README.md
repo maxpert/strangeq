@@ -14,15 +14,12 @@ This directory contains automated workflows for the AMQP-Go project.
 - Builds binaries for all supported platforms:
   - macOS: arm64, amd64
   - Linux: amd64, arm64, 386
-  - Windows: amd64, 386
 - Generates SHA256 checksums for each binary
 - Uploads all binaries to the GitHub release
-- Builds and pushes multi-architecture Docker images
-- Tags Docker images with version and latest
 
 **Platforms:**
 - macOS builds run on: `macos-latest`
-- Linux/Windows cross-compilation runs on: `ubuntu-latest`
+- Linux cross-compilation runs on: `ubuntu-latest`
 
 **Usage:**
 ```bash
@@ -81,19 +78,6 @@ git push origin v0.1.0
 - Keeps dependencies secure and up-to-date
 
 ## Secrets Required
-
-### For Docker Publishing
-
-Set these in repository settings → Secrets and variables → Actions:
-
-- `DOCKER_USERNAME`: Your Docker Hub username
-- `DOCKER_PASSWORD`: Your Docker Hub access token
-
-**Creating Docker Hub token:**
-1. Go to hub.docker.com
-2. Account Settings → Security → Access Tokens
-3. Create new token with Read & Write permissions
-4. Add to GitHub secrets
 
 ### For Codecov (Optional)
 
@@ -160,12 +144,6 @@ done
 2. Verify all tests pass locally: `go test ./...`
 3. Check for platform-specific issues
 
-### Docker push failing
-
-1. Verify secrets are set correctly
-2. Check Docker Hub token hasn't expired
-3. Verify repository name matches
-
 ### Codecov upload failing
 
 1. This is non-critical - workflow will continue
@@ -200,25 +178,6 @@ matrix:
       goarch: amd64
 ```
 
-### Change Docker registry
-
-Replace Docker Hub with GitHub Container Registry in `release.yml`:
-
-```yaml
-- name: Login to GitHub Container Registry
-  uses: docker/login-action@v3
-  with:
-    registry: ghcr.io
-    username: ${{ github.actor }}
-    password: ${{ secrets.GITHUB_TOKEN }}
-
-- name: Extract metadata
-  id: meta
-  uses: docker/metadata-action@v5
-  with:
-    images: ghcr.io/${{ github.repository }}
-```
-
 ## Best Practices
 
 1. **Always test locally** before pushing
@@ -233,6 +192,5 @@ Replace Docker Hub with GitHub Container Registry in `release.yml`:
 
 - [GitHub Actions Documentation](https://docs.github.com/en/actions)
 - [Go GitHub Actions](https://github.com/actions/setup-go)
-- [Docker Build Push Action](https://github.com/docker/build-push-action)
 - [CodeQL Documentation](https://codeql.github.com/docs/)
 

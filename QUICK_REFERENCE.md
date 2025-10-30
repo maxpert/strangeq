@@ -16,9 +16,7 @@ git push origin v0.1.0
 
 ### What Gets Built Automatically
 - macOS: arm64, amd64
-- Linux: amd64, arm64, 386  
-- Windows: amd64, 386
-- Docker: multi-arch (amd64, arm64)
+- Linux: amd64, arm64, 386
 
 ## Make Commands
 
@@ -32,7 +30,6 @@ make bench             # Run benchmarks
 make lint              # Run linters
 make fmt               # Format code
 make clean             # Clean builds
-make docker-build      # Build Docker image
 make release-local     # Build release locally
 ```
 
@@ -64,20 +61,6 @@ make build-all
 
 # Results in build/ directory
 ls -lh build/
-```
-
-## Docker
-
-```bash
-# Build image
-make docker-build
-
-# Run container
-make docker-run
-
-# Or manually
-docker build -t amqp-go src/amqp-go/
-docker run -p 5672:5672 amqp-go
 ```
 
 ## GitHub Actions
@@ -150,16 +133,6 @@ chmod +x amqp-server-linux-amd64
 ./amqp-server-linux-amd64 -version
 ```
 
-## Secrets to Add (GitHub)
-
-Settings → Secrets and variables → Actions:
-
-```
-DOCKER_USERNAME     # Docker Hub username
-DOCKER_PASSWORD     # Docker Hub access token
-CODECOV_TOKEN       # Optional: Codecov token
-```
-
 ## Version Numbers
 
 - **Major** (1.0.0): Breaking changes
@@ -177,11 +150,6 @@ CODECOV_TOKEN       # Optional: Codecov token
 - Run locally: `make build-all`
 - Check logs in Actions tab
 - Verify Go version matches (1.25.1)
-
-### Docker push failing?
-- Verify secrets are set
-- Check Docker Hub token
-- Test locally: `make docker-build`
 
 ## Support Files
 
