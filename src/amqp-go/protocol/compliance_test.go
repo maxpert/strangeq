@@ -253,9 +253,9 @@ func TestAMQPCompliance_ContentEncoding(t *testing.T) {
 // TestAMQPCompliance_FrameTypes validates all AMQP frame types
 func TestAMQPCompliance_FrameTypes(t *testing.T) {
 	tests := []struct {
-		name     string
+		name      string
 		frameType byte
-		expected byte
+		expected  byte
 	}{
 		{"Method", FrameMethod, 1},
 		{"Header", FrameHeader, 2},
@@ -355,9 +355,9 @@ func TestAMQPCompliance_PropertyFlags(t *testing.T) {
 // TestAMQPCompliance_DeliveryModes validates delivery mode values
 func TestAMQPCompliance_DeliveryModes(t *testing.T) {
 	tests := []struct {
-		name         string
-		mode         uint8
-		persistent   bool
+		name       string
+		mode       uint8
+		persistent bool
 	}{
 		{"NonPersistent", 1, false},
 		{"Persistent", 2, true},

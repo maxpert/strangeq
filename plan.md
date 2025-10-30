@@ -80,6 +80,15 @@ Create a Go package `github.com/maxpert/amqp-go` that implements an AMQP 0.9.1 s
   - WriteFrame: 20.0 ns/op, 0 allocs (optimized)
   - Buffer Pooling: 7.5 ns/op, 0 allocs (vs 13.8 ns, 1 alloc)
 - ✅ **Zero Crashes**: All tests and benchmarks passing
+- ✅ **Code Readability Improvements**:
+  - Added comprehensive package-level documentation to buffer_pool.go and frame_optimized.go
+  - Defined `FrameEnd` constant (0xCE) for frame end marker to replace magic numbers
+  - Enhanced function documentation with performance characteristics
+  - Improved error messages with detailed formatting
+  - Fixed benchmark naming (100B, 1024B instead of Unicode characters)
+  - Added descriptive comments to all benchmark functions
+  - Applied `gofmt` formatting to all modified files
+  - All tests passing after readability improvements
 
 **Performance Files Added:**
 - `protocol/buffer_pool.go` - Buffer pooling infrastructure

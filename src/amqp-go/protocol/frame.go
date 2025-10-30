@@ -12,6 +12,7 @@ const (
 	FrameHeader    = 2
 	FrameBody      = 3
 	FrameHeartbeat = 8
+	FrameEnd       = 0xCE // Frame end marker byte
 )
 
 // Frame represents an AMQP frame

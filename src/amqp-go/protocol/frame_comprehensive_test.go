@@ -9,33 +9,33 @@ import (
 // Test all frame types
 func TestAllFrameTypes(t *testing.T) {
 	tests := []struct {
-		name     string
-		frameType byte
-		payload  []byte
+		name        string
+		frameType   byte
+		payload     []byte
 		description string
 	}{
 		{
-			name:     "method_frame",
-			frameType: FrameMethod,
-			payload:  []byte{0x00, 0x0A, 0x00, 0x0A}, // connection.start
+			name:        "method_frame",
+			frameType:   FrameMethod,
+			payload:     []byte{0x00, 0x0A, 0x00, 0x0A}, // connection.start
 			description: "Method frame with connection.start",
 		},
 		{
-			name:     "header_frame",
-			frameType: FrameHeader,
-			payload:  []byte{0x00, 0x3C, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x64}, // basic class, body size 100
+			name:        "header_frame",
+			frameType:   FrameHeader,
+			payload:     []byte{0x00, 0x3C, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x64}, // basic class, body size 100
 			description: "Header frame for basic class",
 		},
 		{
-			name:     "body_frame",
-			frameType: FrameBody,
-			payload:  []byte("Hello, AMQP!"),
+			name:        "body_frame",
+			frameType:   FrameBody,
+			payload:     []byte("Hello, AMQP!"),
 			description: "Body frame with message content",
 		},
 		{
-			name:     "heartbeat_frame",
-			frameType: FrameHeartbeat,
-			payload:  []byte{},
+			name:        "heartbeat_frame",
+			frameType:   FrameHeartbeat,
+			payload:     []byte{},
 			description: "Heartbeat frame (empty payload)",
 		},
 	}
