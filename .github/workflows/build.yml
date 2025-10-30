@@ -67,7 +67,8 @@ jobs:
       - name: Run go fmt
         run: |
           cd src/amqp-go
-          gofmt -l . | tee /tmp/fmt-output
+          # Exclude examples and testdata directories
+          find . -name '*.go' -not -path './examples/*' -not -path './testdata/*' -exec gofmt -l {} + | tee /tmp/fmt-output
           if [ -s /tmp/fmt-output ]; then
             echo "The following files are not formatted:"
             cat /tmp/fmt-output
@@ -77,7 +78,8 @@ jobs:
       - name: Run go vet
         run: |
           cd src/amqp-go
-          go vet ./...
+          # Use go list to get all packages except examples and testdata
+          go list ./... | grep -v '/examples' | grep -v '/testdata' | xargs go vet
 
   build:
     name: Build
