@@ -1,0 +1,196 @@
+name: Release Build
+
+on:
+  release:
+    types: [created]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version tag (e.g., v1.0.0)'
+        required: true
+        default: 'v0.0.0-dev'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build ${{ matrix.os }} - ${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      matrix:
+        include:
+          # macOS builds
+          - os: darwin
+            arch: amd64
+            runner: macos-latest
+            goos: darwin
+            goarch: amd64
+          - os: darwin
+            arch: arm64
+            runner: macos-latest
+            goos: darwin
+            goarch: arm64
+          
+          # Linux builds
+          - os: linux
+            arch: amd64
+            runner: ubuntu-latest
+            goos: linux
+            goarch: amd64
+          - os: linux
+            arch: arm64
+            runner: ubuntu-latest
+            goos: linux
+            goarch: arm64
+          - os: linux
+            arch: '386'
+            runner: ubuntu-latest
+            goos: linux
+            goarch: '386'
+          
+          # Windows builds
+          - os: windows
+            arch: amd64
+            runner: ubuntu-latest
+            goos: windows
+            goarch: amd64
+          - os: windows
+            arch: '386'
+            runner: ubuntu-latest
+            goos: windows
+            goarch: '386'
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.25.1'
+
+      - name: Get version
+        id: version
+        run: |
+          if [ "${{ github.event_name }}" = "release" ]; then
+            echo "version=${{ github.event.release.tag_name }}" >> $GITHUB_OUTPUT
+          else
+            echo "version=${{ github.event.inputs.version }}" >> $GITHUB_OUTPUT
+          fi
+        shell: bash
+
+      - name: Build binary
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: 0
+        run: |
+          cd src/amqp-go
+          VERSION="${{ steps.version.outputs.version }}"
+          BINARY_NAME="amqp-server-${{ matrix.os }}-${{ matrix.arch }}"
+          
+          if [ "${{ matrix.os }}" = "windows" ]; then
+            BINARY_NAME="${BINARY_NAME}.exe"
+          fi
+          
+          # Build with version information
+          go build \
+            -ldflags="-s -w -X main.version=${VERSION}" \
+            -o "${BINARY_NAME}" \
+            ./cmd/amqp-server
+          
+          # Create checksum
+          if command -v sha256sum &> /dev/null; then
+            sha256sum "${BINARY_NAME}" > "${BINARY_NAME}.sha256"
+          else
+            shasum -a 256 "${BINARY_NAME}" > "${BINARY_NAME}.sha256"
+          fi
+          
+          ls -lh "${BINARY_NAME}"
+        shell: bash
+
+      - name: Upload binary artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: amqp-server-${{ matrix.os }}-${{ matrix.arch }}
+          path: |
+            src/amqp-go/amqp-server-*
+          retention-days: 5
+
+  release:
+    name: Create Release Assets
+    needs: build
+    runs-on: ubuntu-latest
+    if: github.event_name == 'release'
+    
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Display structure
+        run: ls -R artifacts
+
+      - name: Upload release assets
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          for dir in artifacts/*/; do
+            for file in "${dir}"*; do
+              if [ -f "$file" ]; then
+                echo "Uploading: $file"
+                gh release upload ${{ github.event.release.tag_name }} "$file" --clobber
+              fi
+            done
+          done
+        shell: bash
+
+  docker:
+    name: Build and Push Docker Image
+    needs: build
+    runs-on: ubuntu-latest
+    if: github.event_name == 'release'
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+        if: secrets.DOCKER_USERNAME != '' && secrets.DOCKER_PASSWORD != ''
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: |
+            ${{ secrets.DOCKER_USERNAME }}/amqp-go
+          tags: |
+            type=ref,event=tag
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{major}}
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Build and push
+        uses: docker/build-push-action@v5
+        with:
+          context: ./src/amqp-go
+          platforms: linux/amd64,linux/arm64
+          push: ${{ secrets.DOCKER_USERNAME != '' && secrets.DOCKER_PASSWORD != '' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
