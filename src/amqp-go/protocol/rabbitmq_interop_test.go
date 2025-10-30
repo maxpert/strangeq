@@ -58,7 +58,7 @@ func connectToRabbitMQ(t *testing.T) net.Conn {
 
 	host := getEnvOrDefault("RABBITMQ_HOST", "localhost")
 	port := getEnvOrDefault("RABBITMQ_PORT", "5672")
-	address := fmt.Sprintf("%s:%s", host, port)
+	address := net.JoinHostPort(host, port) // Handles IPv6 correctly
 
 	conn, err := net.DialTimeout("tcp", address, 5*time.Second)
 	if err != nil {

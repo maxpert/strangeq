@@ -158,7 +158,7 @@ func (m *MemoryMetadataStore) StoreExchange(exchange *protocol.Exchange) error {
 	defer m.mutex.Unlock()
 
 	// Make a copy to avoid external modifications
-	exchCopy := *exchange
+	exchCopy := exchange.Copy()
 	m.exchanges[exchange.Name] = &exchCopy
 
 	return nil
@@ -174,7 +174,7 @@ func (m *MemoryMetadataStore) GetExchange(name string) (*protocol.Exchange, erro
 	}
 
 	// Return a copy
-	exchCopy := *exchange
+	exchCopy := exchange.Copy()
 	return &exchCopy, nil
 }
 
@@ -196,7 +196,7 @@ func (m *MemoryMetadataStore) ListExchanges() ([]*protocol.Exchange, error) {
 
 	exchanges := make([]*protocol.Exchange, 0, len(m.exchanges))
 	for _, exchange := range m.exchanges {
-		exchCopy := *exchange
+		exchCopy := exchange.Copy()
 		exchanges = append(exchanges, &exchCopy)
 	}
 
@@ -209,7 +209,7 @@ func (m *MemoryMetadataStore) StoreQueue(queue *protocol.Queue) error {
 	defer m.mutex.Unlock()
 
 	// Make a copy
-	queueCopy := *queue
+	queueCopy := queue.Copy()
 	m.queues[queue.Name] = &queueCopy
 
 	return nil
@@ -225,7 +225,7 @@ func (m *MemoryMetadataStore) GetQueue(name string) (*protocol.Queue, error) {
 	}
 
 	// Return a copy
-	queueCopy := *queue
+	queueCopy := queue.Copy()
 	return &queueCopy, nil
 }
 
@@ -247,7 +247,7 @@ func (m *MemoryMetadataStore) ListQueues() ([]*protocol.Queue, error) {
 
 	queues := make([]*protocol.Queue, 0, len(m.queues))
 	for _, queue := range m.queues {
-		queueCopy := *queue
+		queueCopy := queue.Copy()
 		queues = append(queues, &queueCopy)
 	}
 

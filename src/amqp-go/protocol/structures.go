@@ -69,6 +69,31 @@ type Exchange struct {
 	Mutex      sync.RWMutex
 }
 
+// Copy returns a copy of the Exchange without the mutex.
+// This is safe to use when you need to pass Exchange by value.
+func (e *Exchange) Copy() Exchange {
+	// Copy bindings
+	bindingsCopy := make([]*Binding, len(e.Bindings))
+	copy(bindingsCopy, e.Bindings)
+
+	// Copy arguments
+	argsCopy := make(map[string]interface{}, len(e.Arguments))
+	for k, v := range e.Arguments {
+		argsCopy[k] = v
+	}
+
+	return Exchange{
+		Name:       e.Name,
+		Kind:       e.Kind,
+		Durable:    e.Durable,
+		AutoDelete: e.AutoDelete,
+		Internal:   e.Internal,
+		Arguments:  argsCopy,
+		Bindings:   bindingsCopy,
+		// Mutex is intentionally not copied
+	}
+}
+
 // Binding represents a binding between an exchange and a queue
 type Binding struct {
 	Exchange   string
@@ -87,6 +112,31 @@ type Queue struct {
 	Messages   []*Message
 	Mutex      sync.RWMutex
 	Channel    *Channel // Reference back to parent channel
+}
+
+// Copy returns a copy of the Queue without the mutex.
+// This is safe to use when you need to pass Queue by value.
+func (q *Queue) Copy() Queue {
+	// Copy messages
+	messagesCopy := make([]*Message, len(q.Messages))
+	copy(messagesCopy, q.Messages)
+
+	// Copy arguments
+	argsCopy := make(map[string]interface{}, len(q.Arguments))
+	for k, v := range q.Arguments {
+		argsCopy[k] = v
+	}
+
+	return Queue{
+		Name:       q.Name,
+		Durable:    q.Durable,
+		AutoDelete: q.AutoDelete,
+		Exclusive:  q.Exclusive,
+		Arguments:  argsCopy,
+		Messages:   messagesCopy,
+		Channel:    q.Channel,
+		// Mutex is intentionally not copied
+	}
 }
 
 // Message represents an AMQP message

@@ -712,14 +712,14 @@ func (b *StorageBroker) updateDurableMetadata() error {
 	// Filter durable exchanges
 	for _, exchange := range exchanges {
 		if exchange.Durable {
-			metadata.Exchanges = append(metadata.Exchanges, *exchange)
+			metadata.Exchanges = append(metadata.Exchanges, exchange.Copy())
 		}
 	}
 
 	// Filter durable queues
 	for _, queue := range queues {
 		if queue.Durable {
-			metadata.Queues = append(metadata.Queues, *queue)
+			metadata.Queues = append(metadata.Queues, queue.Copy())
 		}
 	}
 

@@ -122,7 +122,8 @@ func (r *RecoveryManager) recoverDurableExchanges(stats *protocol.RecoveryStats)
 		return err
 	}
 
-	for _, exchange := range metadata.Exchanges {
+	for i := range metadata.Exchanges {
+		exchange := &metadata.Exchanges[i]
 		if exchange.Durable {
 			err := r.broker.DeclareExchange(
 				exchange.Name,
@@ -159,7 +160,8 @@ func (r *RecoveryManager) recoverDurableQueues(stats *protocol.RecoveryStats) er
 		return err
 	}
 
-	for _, queue := range metadata.Queues {
+	for i := range metadata.Queues {
+		queue := &metadata.Queues[i]
 		if queue.Durable {
 			_, err := r.broker.DeclareQueue(
 				queue.Name,
@@ -311,7 +313,7 @@ func (r *RecoveryManager) UpdateDurableEntityMetadata(exchanges map[string]*prot
 	// Collect durable exchanges
 	for _, exchange := range exchanges {
 		if exchange.Durable {
-			metadata.Exchanges = append(metadata.Exchanges, *exchange)
+			metadata.Exchanges = append(metadata.Exchanges, exchange.Copy())
 
 			// Collect bindings for this exchange
 			for _, binding := range exchange.Bindings {
@@ -323,7 +325,7 @@ func (r *RecoveryManager) UpdateDurableEntityMetadata(exchanges map[string]*prot
 	// Collect durable queues
 	for _, queue := range queues {
 		if queue.Durable {
-			metadata.Queues = append(metadata.Queues, *queue)
+			metadata.Queues = append(metadata.Queues, queue.Copy())
 		}
 	}
 
