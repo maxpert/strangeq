@@ -14,6 +14,7 @@ import (
 
 	"github.com/maxpert/amqp-go/config"
 	"github.com/maxpert/amqp-go/server"
+	"golang.org/x/sys/unix"
 )
 
 const (
@@ -325,7 +326,7 @@ func startDaemon(logFile string) error {
 // setupDaemonEnvironment sets up the daemon environment for the child process
 func setupDaemonEnvironment(logFile string) error {
 	// Create new session
-	if _, err := syscall.Setsid(); err != nil {
+	if _, err := unix.Setsid(); err != nil {
 		return fmt.Errorf("setsid failed: %v", err)
 	}
 
@@ -358,7 +359,7 @@ func finalizeDaemon(logFile string) error {
 	}
 
 	// Set file creation mask
-	syscall.Umask(0)
+	unix.Umask(0)
 
 	// Redirect standard file descriptors
 	if err := redirectStdFiles(logFile); err != nil {
@@ -377,7 +378,7 @@ func redirectStdFiles(logFile string) error {
 	}
 
 	// Duplicate stdin to /dev/null
-	if err := syscall.Dup2(int(devNull.Fd()), int(os.Stdin.Fd())); err != nil {
+	if err := unix.Dup2(int(devNull.Fd()), int(os.Stdin.Fd())); err != nil {
 		devNull.Close()
 		return fmt.Errorf("failed to redirect stdin: %v", err)
 	}
@@ -397,13 +398,13 @@ func redirectStdFiles(logFile string) error {
 	}
 
 	// Redirect stdout and stderr
-	if err := syscall.Dup2(int(outputFile.Fd()), int(os.Stdout.Fd())); err != nil {
+	if err := unix.Dup2(int(outputFile.Fd()), int(os.Stdout.Fd())); err != nil {
 		outputFile.Close()
 		devNull.Close()
 		return fmt.Errorf("failed to redirect stdout: %v", err)
 	}
 
-	if err := syscall.Dup2(int(outputFile.Fd()), int(os.Stderr.Fd())); err != nil {
+	if err := unix.Dup2(int(outputFile.Fd()), int(os.Stderr.Fd())); err != nil {
 		outputFile.Close()
 		devNull.Close()
 		return fmt.Errorf("failed to redirect stderr: %v", err)

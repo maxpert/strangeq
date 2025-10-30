@@ -51,18 +51,6 @@ jobs:
             runner: ubuntu-latest
             goos: linux
             goarch: '386'
-          
-          # Windows builds
-          - os: windows
-            arch: amd64
-            runner: ubuntu-latest
-            goos: windows
-            goarch: amd64
-          - os: windows
-            arch: '386'
-            runner: ubuntu-latest
-            goos: windows
-            goarch: '386'
 
     steps:
       - name: Checkout code
@@ -94,11 +82,7 @@ jobs:
           cd src/amqp-go
           VERSION="${{ steps.version.outputs.version }}"
           BINARY_NAME="amqp-server-${{ matrix.os }}-${{ matrix.arch }}"
-          
-          if [ "${{ matrix.os }}" = "windows" ]; then
-            BINARY_NAME="${BINARY_NAME}.exe"
-          fi
-          
+
           # Build with version information
           go build \
             -ldflags="-s -w -X main.version=${VERSION}" \
