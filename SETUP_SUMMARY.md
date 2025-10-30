@@ -8,13 +8,11 @@ This document summarizes the complete release automation setup for AMQP-Go.
 
 1. **`release.yml`** - Multi-platform Release Build
    - Triggered on GitHub release creation
-   - Builds for 7 platforms:
+   - Builds for 5 platforms:
      - macOS: arm64, amd64
      - Linux: amd64, arm64, 386
-     - Windows: amd64, 386
    - Generates SHA256 checksums
    - Uploads binaries to GitHub release
-   - Builds multi-arch Docker images
    - Supports manual dispatch for testing
 
 2. **`build.yml`** - Continuous Integration
@@ -45,16 +43,6 @@ This document summarizes the complete release automation setup for AMQP-Go.
 7. **`QUICKSTART.md`** - Quick installation and usage guide
 8. **`SETUP_SUMMARY.md`** - This file
 
-### Docker Support
-
-1. **`src/amqp-go/Dockerfile`** - Multi-stage Docker build
-   - Optimized for size (Alpine-based)
-   - Non-root user
-   - Health checks
-   - Multi-architecture support
-
-2. **`src/amqp-go/.dockerignore`** - Build optimization
-
 ### Deployment
 
 1. **`deployment/systemd/amqp-server.service`** - systemd service file
@@ -77,7 +65,6 @@ This document summarizes the complete release automation setup for AMQP-Go.
    - `make build` - Build binary
    - `make test` - Run tests
    - `make build-all` - Build all platforms
-   - `make docker-build` - Build Docker image
    - And more...
 
 2. **`src/amqp-go/.golangci.yml`** - Linter configuration
@@ -115,23 +102,6 @@ This document summarizes the complete release automation setup for AMQP-Go.
      - Build all platform binaries
      - Generate checksums
      - Upload to release
-     - Build and push Docker images
-
-### Setting Up Docker Publishing
-
-To enable Docker publishing, add these secrets in GitHub:
-
-1. Go to: Repository Settings → Secrets and variables → Actions
-2. Add secrets:
-   - `DOCKER_USERNAME`: Your Docker Hub username
-   - `DOCKER_PASSWORD`: Docker Hub access token
-
-**Getting Docker Hub token:**
-```bash
-# Go to hub.docker.com
-# Account Settings → Security → Access Tokens
-# Create new token with Read & Write permissions
-```
 
 ### Testing Locally
 
@@ -145,9 +115,6 @@ make test
 # Run benchmarks
 make bench
 
-# Build Docker image
-make docker-build
-
 # Clean up
 make clean
 ```
@@ -158,8 +125,6 @@ Before creating your first release:
 
 ### Required
 - [ ] Update `YOUR-ORG` placeholder in workflow files
-- [ ] Update `YOUR-DOCKERHUB-USERNAME` in documentation
-- [ ] Set up Docker Hub secrets (if using Docker)
 - [ ] Update CHANGELOG.md with version info
 - [ ] Test workflows with manual dispatch
 - [ ] Verify all tests pass
@@ -188,19 +153,6 @@ matrix:
       goarch: amd64
 ```
 
-### Change Docker Registry
-
-To use GitHub Container Registry instead of Docker Hub:
-
-```yaml
-- name: Login to GitHub Container Registry
-  uses: docker/login-action@v3
-  with:
-    registry: ghcr.io
-    username: ${{ github.actor }}
-    password: ${{ secrets.GITHUB_TOKEN }}
-```
-
 ### Modify Build Flags
 
 Edit the build command in `release.yml`:
@@ -218,11 +170,6 @@ go build \
 - View workflow runs: Repository → Actions
 - Check build logs for errors
 - Monitor artifact uploads
-
-### Docker Hub
-- View image pulls: hub.docker.com → Repositories
-- Check image sizes
-- Monitor tags
 
 ### Downloads
 - GitHub Insights → Traffic
@@ -251,16 +198,6 @@ go build \
 3. Test locally: `GOOS=linux GOARCH=amd64 go build`
 4. Check error logs in Actions tab
 
-### Docker Push Failing
-
-**Problem:** Docker build succeeds but push fails
-
-**Solution:**
-1. Verify secrets are set correctly
-2. Check Docker Hub token hasn't expired
-3. Ensure repository name matches
-4. Check Docker Hub permissions
-
 ### Checksums Don't Match
 
 **Problem:** Downloaded binary checksum verification fails
@@ -274,7 +211,6 @@ go build \
 ## 📚 Resources
 
 - [GitHub Actions Documentation](https://docs.github.com/en/actions)
-- [Docker Multi-Platform Builds](https://docs.docker.com/build/building/multi-platform/)
 - [Go Cross Compilation](https://golang.org/doc/install/source#environment)
 - [Semantic Versioning](https://semver.org/)
 - [Keep a Changelog](https://keepachangelog.com/)
@@ -313,9 +249,8 @@ After initial setup:
 ## 🎉 Success!
 
 You now have a complete automated release pipeline that:
-- ✅ Builds binaries for 7 platforms automatically
+- ✅ Builds binaries for 5 platforms automatically
 - ✅ Generates checksums for security
-- ✅ Creates Docker images with multi-arch support
 - ✅ Runs comprehensive CI/CD
 - ✅ Scans for security issues
 - ✅ Keeps dependencies updated
