@@ -2,7 +2,10 @@ name: Release Build
 
 on:
   release:
-    types: [created]
+    types: [created, published]
+  push:
+    tags:
+      - 'v*'
   workflow_dispatch:
     inputs:
       version:
@@ -75,6 +78,8 @@ jobs:
         run: |
           if [ "${{ github.event_name }}" = "release" ]; then
             echo "version=${{ github.event.release.tag_name }}" >> $GITHUB_OUTPUT
+          elif [ "${{ github.event_name }}" = "push" ]; then
+            echo "version=${{ github.ref_name }}" >> $GITHUB_OUTPUT
           else
             echo "version=${{ github.event.inputs.version }}" >> $GITHUB_OUTPUT
           fi
@@ -122,9 +127,22 @@ jobs:
     name: Create Release Assets
     needs: build
     runs-on: ubuntu-latest
-    if: github.event_name == 'release'
-    
+    if: github.event_name == 'release' || github.event_name == 'push'
+
     steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Get version tag
+        id: version
+        run: |
+          if [ "${{ github.event_name }}" = "release" ]; then
+            echo "tag=${{ github.event.release.tag_name }}" >> $GITHUB_OUTPUT
+          else
+            echo "tag=${{ github.ref_name }}" >> $GITHUB_OUTPUT
+          fi
+        shell: bash
+
       - name: Download all artifacts
         uses: actions/download-artifact@v4
         with:
@@ -133,15 +151,33 @@ jobs:
       - name: Display structure
         run: ls -R artifacts
 
+      - name: Create release if needed
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${{ steps.version.outputs.tag }}"
+          # Check if release exists, create if it doesn't
+          if ! gh release view "$TAG" &>/dev/null; then
+            echo "Creating release for tag $TAG"
+            gh release create "$TAG" \
+              --title "Release $TAG" \
+              --notes "Automated release for $TAG" \
+              --draft=false
+          else
+            echo "Release $TAG already exists"
+          fi
+        shell: bash
+
       - name: Upload release assets
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          TAG="${{ steps.version.outputs.tag }}"
           for dir in artifacts/*/; do
             for file in "${dir}"*; do
               if [ -f "$file" ]; then
                 echo "Uploading: $file"
-                gh release upload ${{ github.event.release.tag_name }} "$file" --clobber
+                gh release upload "$TAG" "$file" --clobber
               fi
             done
           done
@@ -151,7 +187,7 @@ jobs:
     name: Build and Push Docker Image
     needs: build
     runs-on: ubuntu-latest
-    if: github.event_name == 'release'
+    if: github.event_name == 'release' || github.event_name == 'push'
     
     steps:
       - name: Checkout code
