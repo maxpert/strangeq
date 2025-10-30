@@ -81,16 +81,6 @@ wget https://github.com/YOUR-ORG/strangeq/releases/download/v0.1.0/amqp-server-l
 sha256sum -c amqp-server-linux-amd64.sha256
 ```
 
-### Docker
-- [ ] Verify Docker image was pushed
-- [ ] Pull and test Docker image
-
-```bash
-docker pull YOUR-USERNAME/amqp-go:v0.1.0
-docker pull YOUR-USERNAME/amqp-go:latest
-docker run --rm YOUR-USERNAME/amqp-go:v0.1.0 -version
-```
-
 ## Post-Release
 
 ### Communication
@@ -213,11 +203,6 @@ We're excited to announce the release of AMQP-Go v0.1.0!
 ### Download Binary
 Download the appropriate binary for your platform from the assets below.
 
-### Docker
-```bash
-docker pull YOUR-USERNAME/amqp-go:v0.1.0
-```
-
 ### Go Install
 ```bash
 go install github.com/maxpert/amqp-go/cmd/amqp-server@v0.1.0
@@ -266,7 +251,6 @@ If a critical issue is found:
 ## Success Criteria
 
 - [ ] All binaries available for download
-- [ ] Docker images accessible
 - [ ] No critical bugs reported in first 48 hours
 - [ ] Documentation is clear and helpful
 - [ ] Users can successfully install and run

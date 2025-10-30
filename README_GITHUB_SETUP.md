@@ -2,14 +2,13 @@
 
 ## What You Now Have
 
-A **production-ready, automated release pipeline** that builds binaries for **7 platforms** every time you create a GitHub release!
+A **production-ready, automated release pipeline** that builds binaries for **5 platforms** every time you create a GitHub release!
 
 ### ✅ Automated Multi-Platform Builds
 
 Every release automatically builds:
 - 🍎 **macOS**: arm64 (Apple Silicon), amd64 (Intel)
 - 🐧 **Linux**: amd64, arm64, 386 (32-bit)
-- 🪟 **Windows**: amd64, 386 (32-bit)
 
 ### ✅ Complete CI/CD Pipeline
 
@@ -17,7 +16,6 @@ Every release automatically builds:
 - **Code Quality**: golangci-lint checks on every commit
 - **Security Scanning**: Weekly CodeQL security analysis
 - **Dependency Updates**: Automated Dependabot updates
-- **Docker Images**: Multi-architecture Docker builds
 
 ### ✅ Professional Documentation
 
@@ -52,8 +50,6 @@ strangeq/
 │       └── README.md             # Deployment guide
 │
 ├── src/amqp-go/
-│   ├── Dockerfile                # Multi-stage Docker build
-│   ├── .dockerignore            # Docker build optimization
 │   └── .golangci.yml            # Linter configuration
 │
 ├── CHANGELOG.md                  # Version history
@@ -95,7 +91,7 @@ git push origin v0.1.0
    - Starts multi-platform build workflow
 
 2. **Builds All Platforms**
-   - Compiles 7 different binaries
+   - Compiles 5 different binaries
    - Optimizes with `-ldflags="-s -w"`
    - Embeds version information
 
@@ -106,12 +102,6 @@ git push origin v0.1.0
 4. **Uploads Everything**
    - Attaches binaries to release
    - Attaches checksums
-   - Updates Docker Hub
-
-5. **Builds Docker Images**
-   - Multi-architecture builds
-   - Tags with version and latest
-   - Pushes to registry
 
 ## ⚙️ One-Time Setup Required
 
@@ -119,7 +109,6 @@ git push origin v0.1.0
 
 Replace these in the files:
 - `YOUR-ORG` → Your GitHub organization/username
-- `YOUR-DOCKERHUB-USERNAME` → Your Docker Hub username
 
 Files to update:
 - `.github/workflows/release.yml`
@@ -127,23 +116,7 @@ Files to update:
 - `SETUP_SUMMARY.md`
 - All documentation mentioning URLs
 
-### 2. Set GitHub Secrets (Optional, for Docker)
-
-Go to: Repository Settings → Secrets and variables → Actions
-
-Add these secrets:
-- `DOCKER_USERNAME` - Your Docker Hub username
-- `DOCKER_PASSWORD` - Docker Hub access token
-
-**How to get Docker Hub token:**
-1. Go to hub.docker.com
-2. Account Settings → Security → Access Tokens  
-3. Create new token with Read & Write permissions
-4. Copy token and add to GitHub secrets
-
-> **Note:** If you skip Docker setup, the workflow still works - it just won't push Docker images.
-
-### 3. Test the Workflow
+### 2. Test the Workflow
 
 Test before your first real release:
 
@@ -167,27 +140,7 @@ make bench             # Run benchmarks
 make lint              # Run code linters
 make fmt               # Format code
 make clean             # Clean all builds
-make docker-build      # Build Docker image
-make docker-run        # Run Docker container
 make release-local     # Create local release (binaries + checksums)
-```
-
-## 🐳 Docker Support
-
-### Build Image
-```bash
-make docker-build
-```
-
-### Run Container
-```bash
-docker run -p 5672:5672 amqp-go:latest
-```
-
-### With Persistent Storage
-```bash
-docker run -p 5672:5672 -v $(pwd)/data:/data amqp-go:latest \
-  --storage badger --storage-path /data
 ```
 
 ## 🔄 CI/CD Workflows
@@ -199,10 +152,9 @@ docker run -p 5672:5672 -v $(pwd)/data:/data amqp-go:latest \
 - ✅ Verifies build
 
 ### On Release (`release.yml`)
-- ✅ Builds all 7 platforms
+- ✅ Builds all 5 platforms
 - ✅ Generates checksums
 - ✅ Uploads to release
-- ✅ Builds Docker images
 
 ### Weekly (`codeql.yml`)
 - ✅ Security analysis
@@ -257,7 +209,6 @@ For detailed steps, see `RELEASE_CHECKLIST.md`. Quick version:
 
 ### Build Tools
 - **`Makefile`**: Build automation (try `make help`)
-- **`Dockerfile`**: Docker image definition
 - **`.golangci.yml`**: Linter rules
 
 ### Deployment
@@ -293,14 +244,6 @@ make build-all
 # Go to: Actions → Failed workflow → View logs
 ```
 
-### Docker Issues?
-```bash
-# Test Docker build locally
-make docker-build
-
-# Verify secrets are set
-# Settings → Secrets → DOCKER_USERNAME & DOCKER_PASSWORD
-```
 
 ## 💡 Pro Tips
 
@@ -329,7 +272,7 @@ golangci-lint configuration with 20+ linters
 
 ## ✨ What Makes This Special
 
-- **Zero Manual Work**: Tag → Release → 7 Binaries Automatically
+- **Zero Manual Work**: Tag → Release → 5 Binaries Automatically
 - **Professional**: Industry-standard documentation and workflows
 - **Secure**: Security scanning, checksums, best practices
 - **Fast**: Parallel builds, caching, optimizations
@@ -341,9 +284,8 @@ golangci-lint configuration with 20+ linters
 
 1. **Update placeholders** (YOUR-ORG, etc.)
 2. **Test the workflow** with manual dispatch
-3. **Add Docker secrets** (optional)
-4. **Create your first release** (v0.1.0)
-5. **Share with the world!** 🌍
+3. **Create your first release** (v0.1.0)
+4. **Share with the world!** 🌍
 
 ## 📚 Full Documentation
 
@@ -360,7 +302,7 @@ Everything is set up and ready to go. Just:
 3. Create a GitHub release
 4. Watch the magic happen! ✨
 
-The automation will handle building 7 platform binaries, generating checksums, uploading everything, and even building Docker images!
+The automation will handle building 5 platform binaries, generating checksums, and uploading everything!
 
 ---
 

@@ -37,7 +37,7 @@ Create a Go package `github.com/maxpert/amqp-go` that implements an AMQP 0.9.1 s
   - Message consumption (Basic.Get)
   - Heartbeat frames
   - Multiple concurrent channels
-  - Docker Compose setup for easy testing
+  - RabbitMQ docker-compose setup for interoperability testing
   - Comprehensive documentation (RABBITMQ_TESTS.md)
   - Automated test runner script (run-rabbitmq-tests.sh)
 - ✅ **Parser Functions**: Added ParseConnectionStart and ParseConnectionTune for complete handshake support
@@ -200,9 +200,8 @@ Create a Go package `github.com/maxpert/amqp-go` that implements an AMQP 0.9.1 s
 **Next Phase:** Phase 11 - Production Hardening (TLS, Authorization, Performance Tuning)
 
 ## Completed Release Preparation:
-- ✅ **GitHub Actions Workflows**: Multi-platform release builds for macOS (arm64, amd64), Linux (amd64, arm64, 386), Windows (amd64, 386)
+- ✅ **GitHub Actions Workflows**: Multi-platform release builds for macOS (arm64, amd64), Linux (amd64, arm64, 386)
 - ✅ **Continuous Integration**: Automated testing, linting, and code quality checks
-- ✅ **Docker Support**: Multi-architecture Docker images with automated builds
 - ✅ **Security Scanning**: CodeQL integration for vulnerability detection
 - ✅ **Dependency Management**: Dependabot configuration for automated updates
 - ✅ **Project Documentation**: LICENSE (MIT), CHANGELOG, CONTRIBUTING, SECURITY, RELEASE guides
@@ -378,7 +377,6 @@ Create a Go package `github.com/maxpert/amqp-go` that implements an AMQP 0.9.1 s
   - [x] Documented performance benchmarks in README ✅
   - [x] Validated all packages build successfully ✅
   - [x] GitHub Actions release workflow with multi-platform builds ✅
-  - [x] Docker support with multi-architecture images ✅
   - [x] Complete release documentation (CHANGELOG, RELEASE.md, CONTRIBUTING.md) ✅
   - [x] Security policy and best practices documentation ✅
   - [x] Issue and PR templates for community contributions ✅
