@@ -31,22 +31,7 @@ Get AMQP-Go up and running in 5 minutes!
    sudo mv amqp-server-YOUR-PLATFORM /usr/local/bin/amqp-server
    ```
 
-### Option 2: Docker
-
-```bash
-docker pull YOUR-DOCKERHUB-USERNAME/amqp-go:latest
-
-# Run with in-memory storage
-docker run -p 5672:5672 YOUR-DOCKERHUB-USERNAME/amqp-go:latest
-
-# Run with persistent storage
-docker run -p 5672:5672 \
-  -v $(pwd)/data:/data \
-  YOUR-DOCKERHUB-USERNAME/amqp-go:latest \
-  --storage badger --storage-path /data
-```
-
-### Option 3: Build from Source
+### Option 2: Build from Source
 
 ```bash
 git clone https://github.com/YOUR-ORG/strangeq.git
@@ -55,7 +40,7 @@ go build -o amqp-server ./cmd/amqp-server
 sudo mv amqp-server /usr/local/bin/
 ```
 
-### Option 4: Go Install
+### Option 3: Go Install
 
 ```bash
 go install github.com/maxpert/amqp-go/cmd/amqp-server@latest
@@ -349,25 +334,6 @@ sudo systemctl status amqp-server
 
 # View logs
 sudo journalctl -u amqp-server -f
-```
-
-### Docker Compose
-
-```yaml
-version: '3.8'
-
-services:
-  amqp:
-    image: YOUR-DOCKERHUB-USERNAME/amqp-go:latest
-    ports:
-      - "5672:5672"
-    volumes:
-      - ./data:/data
-      - ./config:/etc/amqp
-    command: 
-      - --config
-      - /etc/amqp/config.json
-    restart: unless-stopped
 ```
 
 ## Monitoring
