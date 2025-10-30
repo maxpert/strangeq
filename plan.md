@@ -97,6 +97,19 @@ Create a Go package `github.com/maxpert/amqp-go` that implements an AMQP 0.9.1 s
 - `protocol/protocol_bench_optimized_test.go` - Optimization comparison benchmarks
 - `protocol/PERFORMANCE.md` - Complete performance documentation
 
+**Code Quality & CI/CD Improvements:**
+- ✅ **Linting Fixes**: Resolved all 11 go vet errors (mutex lock copying)
+  - Added `Copy()` methods to Exchange and Queue structs for safe value copying
+  - Fixed mutex copying in broker/storage_broker.go (2 locations)
+  - Fixed mutex copying in storage/memory_stores.go (6 locations)
+  - Fixed mutex copying in server/recovery_manager.go (4 locations)
+  - Fixed IPv6 address handling in protocol/rabbitmq_interop_test.go
+- ✅ **CI/CD Workflow Update**: Adapted for Go 1.25.1 compatibility
+  - Replaced golangci-lint with standard Go tools (go fmt, go vet)
+  - Added explicit formatting checks that fail on unformatted code
+  - Maintained same quality standards with native Go tooling
+  - All checks passing in GitHub Actions
+
 **Test Files Added:**
 - `protocol/frame_comprehensive_test.go` - Complete frame testing suite
 - `protocol/methods_test.go` - Comprehensive method serialization tests
