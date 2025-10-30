@@ -73,7 +73,7 @@ jobs:
           fi
         shell: bash
 
-      - name: Build binary
+      - name: Build binary and create package
         env:
           GOOS: ${{ matrix.goos }}
           GOARCH: ${{ matrix.goarch }}
@@ -81,30 +81,46 @@ jobs:
         run: |
           cd src/amqp-go
           VERSION="${{ steps.version.outputs.version }}"
-          BINARY_NAME="amqp-server-${{ matrix.os }}-${{ matrix.arch }}"
+          BINARY_NAME="amqp-server"
+          PACKAGE_NAME="amqp-server-${VERSION}-${{ matrix.os }}-${{ matrix.arch }}"
 
           # Build with version information
           go build \
             -ldflags="-s -w -X main.version=${VERSION}" \
             -o "${BINARY_NAME}" \
             ./cmd/amqp-server
-          
-          # Create checksum
+
+          # Create package directory
+          mkdir -p "${PACKAGE_NAME}"
+
+          # Copy files into package
+          cp "${BINARY_NAME}" "${PACKAGE_NAME}/"
+          cp config.sample.json "${PACKAGE_NAME}/"
+          cp README.release.txt "${PACKAGE_NAME}/README.txt"
+          cp ../../LICENSE "${PACKAGE_NAME}/"
+
+          # Create tar.gz package
+          tar -czf "${PACKAGE_NAME}.tar.gz" "${PACKAGE_NAME}"
+
+          # Create checksum for the package
           if command -v sha256sum &> /dev/null; then
-            sha256sum "${BINARY_NAME}" > "${BINARY_NAME}.sha256"
+            sha256sum "${PACKAGE_NAME}.tar.gz" > "${PACKAGE_NAME}.tar.gz.sha256"
           else
-            shasum -a 256 "${BINARY_NAME}" > "${BINARY_NAME}.sha256"
+            shasum -a 256 "${PACKAGE_NAME}.tar.gz" > "${PACKAGE_NAME}.tar.gz.sha256"
           fi
-          
-          ls -lh "${BINARY_NAME}"
+
+          # List package contents
+          echo "Package contents:"
+          tar -tzf "${PACKAGE_NAME}.tar.gz"
+          ls -lh "${PACKAGE_NAME}.tar.gz"
         shell: bash
 
-      - name: Upload binary artifact
+      - name: Upload release package
         uses: actions/upload-artifact@v4
         with:
           name: amqp-server-${{ matrix.os }}-${{ matrix.arch }}
           path: |
-            src/amqp-go/amqp-server-*
+            src/amqp-go/amqp-server-*.tar.gz*
           retention-days: 5
 
   release:
