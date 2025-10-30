@@ -20,7 +20,8 @@
       "Bash(go tool cover:*)",
       "Bash(awk:*)",
       "Bash(mv:*)",
-      "Bash(rm:*)"
+      "Bash(rm:*)",
+      "Bash(chmod:*)"
     ],
     "deny": [],
     "ask": []

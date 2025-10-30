@@ -126,6 +126,58 @@ func (m *ConnectionStartMethod) Serialize() ([]byte, error) {
 	return result, nil
 }
 
+// ParseConnectionStart parses a connection.start method from bytes
+func ParseConnectionStart(data []byte) (*ConnectionStartMethod, error) {
+	method := &ConnectionStartMethod{}
+	offset := 0
+
+	// Parse version major and minor (1 byte each)
+	if len(data) < 2 {
+		return nil, fmt.Errorf("insufficient data for version")
+	}
+	method.VersionMajor = data[0]
+	method.VersionMinor = data[1]
+	offset = 2
+
+	// Parse server properties (field table)
+	var err error
+	method.ServerProperties, offset, err = decodeFieldTable(data, offset)
+	if err != nil {
+		return nil, fmt.Errorf("failed to decode server properties: %w", err)
+	}
+
+	// Parse mechanisms (long string)
+	if len(data) < offset+4 {
+		return nil, fmt.Errorf("insufficient data for mechanisms length")
+	}
+	mechLen := binary.BigEndian.Uint32(data[offset : offset+4])
+	offset += 4
+
+	if len(data) < offset+int(mechLen) {
+		return nil, fmt.Errorf("insufficient data for mechanisms")
+	}
+	// Mechanisms are space-separated
+	mechanismsStr := string(data[offset : offset+int(mechLen)])
+	method.Mechanisms = []string{mechanismsStr}
+	offset += int(mechLen)
+
+	// Parse locales (long string)
+	if len(data) < offset+4 {
+		return nil, fmt.Errorf("insufficient data for locales length")
+	}
+	localeLen := binary.BigEndian.Uint32(data[offset : offset+4])
+	offset += 4
+
+	if len(data) < offset+int(localeLen) {
+		return nil, fmt.Errorf("insufficient data for locales")
+	}
+	// Locales are space-separated
+	localesStr := string(data[offset : offset+int(localeLen)])
+	method.Locales = []string{localesStr}
+
+	return method, nil
+}
+
 // ConnectionStartOKMethod represents the connection.start-ok method
 type ConnectionStartOKMethod struct {
 	ClientProperties map[string]interface{}
@@ -240,6 +292,31 @@ func (m *ConnectionTuneMethod) Serialize() ([]byte, error) {
 	result = append(result, heartbeatBytes...)
 
 	return result, nil
+}
+
+// ParseConnectionTune parses a connection.tune method from bytes
+func ParseConnectionTune(data []byte) (*ConnectionTuneMethod, error) {
+	method := &ConnectionTuneMethod{}
+
+	// Parse channel max (uint16)
+	if len(data) < 2 {
+		return nil, fmt.Errorf("insufficient data for channel max")
+	}
+	method.ChannelMax = binary.BigEndian.Uint16(data[0:2])
+
+	// Parse frame max (uint32)
+	if len(data) < 6 {
+		return nil, fmt.Errorf("insufficient data for frame max")
+	}
+	method.FrameMax = binary.BigEndian.Uint32(data[2:6])
+
+	// Parse heartbeat (uint16)
+	if len(data) < 8 {
+		return nil, fmt.Errorf("insufficient data for heartbeat")
+	}
+	method.Heartbeat = binary.BigEndian.Uint16(data[6:8])
+
+	return method, nil
 }
 
 // ConnectionTuneOKMethod represents the connection.tune-ok method
