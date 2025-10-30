@@ -13,7 +13,14 @@
       "Bash(AMQP_LOG_LEVEL=debug go test -run TestSimpleQueueOperations/Empty_message -v)",
       "WebSearch",
       "WebFetch(domain:www.rabbitmq.com)",
-      "Bash(timeout:*)"
+      "Bash(timeout:*)",
+      "Bash(tee:*)",
+      "Bash(go list:*)",
+      "Bash(xargs go test:*)",
+      "Bash(go tool cover:*)",
+      "Bash(awk:*)",
+      "Bash(mv:*)",
+      "Bash(rm:*)"
     ],
     "deny": [],
     "ask": []
