@@ -1,26 +1,24 @@
 # Quick Start Guide
 
-Get AMQP-Go up and running in 5 minutes!
+Get StrangeQ up and running in 5 minutes!
 
 ## Installation
 
 ### Option 1: Download Pre-built Binary (Recommended)
 
-1. Go to the [Releases page](https://github.com/YOUR-ORG/strangeq/releases)
+1. Go to the [Releases page](https://github.com/maxpert/strangeq/releases)
 2. Download the binary for your platform:
    - macOS ARM64: `amqp-server-darwin-arm64`
    - macOS Intel: `amqp-server-darwin-amd64`
    - Linux AMD64: `amqp-server-linux-amd64`
    - Linux ARM64: `amqp-server-linux-arm64`
    - Linux 32-bit: `amqp-server-linux-386`
-   - Windows 64-bit: `amqp-server-windows-amd64.exe`
-   - Windows 32-bit: `amqp-server-windows-386.exe`
 
 3. Verify the checksum:
    ```bash
    # Linux/macOS
    sha256sum -c amqp-server-YOUR-PLATFORM.sha256
-   
+
    # macOS (alternative)
    shasum -a 256 -c amqp-server-YOUR-PLATFORM.sha256
    ```
@@ -34,7 +32,7 @@ Get AMQP-Go up and running in 5 minutes!
 ### Option 2: Build from Source
 
 ```bash
-git clone https://github.com/YOUR-ORG/strangeq.git
+git clone https://github.com/maxpert/strangeq.git
 cd strangeq/src/amqp-go
 go build -o amqp-server ./cmd/amqp-server
 sudo mv amqp-server /usr/local/bin/
@@ -46,9 +44,9 @@ sudo mv amqp-server /usr/local/bin/
 go install github.com/maxpert/amqp-go/cmd/amqp-server@latest
 ```
 
-## Basic Usage
+## Start Server
 
-### Start Server (In-Memory)
+### In-Memory Mode (Development)
 
 ```bash
 amqp-server
@@ -56,7 +54,7 @@ amqp-server
 
 The server will start on port 5672 with in-memory storage.
 
-### Start Server (Persistent Storage)
+### Persistent Storage (Production)
 
 ```bash
 amqp-server --storage badger --storage-path ./data
@@ -74,36 +72,35 @@ amqp-server --log-level debug
 # With authentication
 amqp-server --auth --auth-file users.json
 
-# With TLS
-amqp-server --tls --tls-cert server.crt --tls-key server.key
-
 # All together
 amqp-server \
   --storage badger \
   --storage-path /var/lib/amqp \
   --auth --auth-file /etc/amqp/users.json \
-  --tls --tls-cert /etc/amqp/certs/server.crt --tls-key /etc/amqp/certs/server.key \
   --log-level info \
   --log-file /var/log/amqp/server.log
 ```
 
-## First Steps
+## Test Connection
 
-### 1. Test with Python
+Choose your language and try a quick test:
+
+### Python
+
+```bash
+pip install pika
+```
 
 ```python
 import pika
 
-# Connect to server
 connection = pika.BlockingConnection(
     pika.ConnectionParameters('localhost')
 )
 channel = connection.channel()
 
-# Declare queue
 channel.queue_declare(queue='hello')
 
-# Publish message
 channel.basic_publish(
     exchange='',
     routing_key='hello',
@@ -111,24 +108,38 @@ channel.basic_publish(
 )
 
 print(" [x] Sent 'Hello World!'")
-
-# Consume message
-def callback(ch, method, properties, body):
-    print(f" [x] Received {body}")
-
-channel.basic_consume(
-    queue='hello',
-    on_message_callback=callback,
-    auto_ack=True
-)
-
-print(' [*] Waiting for messages. To exit press CTRL+C')
-channel.start_consuming()
-
 connection.close()
 ```
 
-### 2. Test with Go
+### Node.js
+
+```bash
+npm install amqplib
+```
+
+```javascript
+const amqp = require('amqplib');
+
+async function main() {
+    const connection = await amqp.connect('amqp://localhost');
+    const channel = await connection.createChannel();
+
+    await channel.assertQueue('hello', { durable: false });
+
+    channel.sendToQueue('hello', Buffer.from('Hello World!'));
+    console.log(" [x] Sent 'Hello World!'");
+
+    await connection.close();
+}
+
+main().catch(console.error);
+```
+
+### Go
+
+```bash
+go get github.com/rabbitmq/amqp091-go
+```
 
 ```go
 package main
@@ -139,77 +150,33 @@ import (
 )
 
 func main() {
-    // Connect to server
     conn, err := amqp.Dial("amqp://guest:guest@localhost:5672/")
     if err != nil {
         log.Fatal(err)
     }
     defer conn.Close()
 
-    // Create channel
     ch, err := conn.Channel()
     if err != nil {
         log.Fatal(err)
     }
     defer ch.Close()
 
-    // Declare queue
-    q, err := ch.QueueDeclare(
-        "hello", // name
-        false,   // durable
-        false,   // delete when unused
-        false,   // exclusive
-        false,   // no-wait
-        nil,     // arguments
-    )
+    q, err := ch.QueueDeclare("hello", false, false, false, false, nil)
     if err != nil {
         log.Fatal(err)
     }
 
-    // Publish message
-    err = ch.Publish(
-        "",     // exchange
-        q.Name, // routing key
-        false,  // mandatory
-        false,  // immediate
-        amqp.Publishing{
-            ContentType: "text/plain",
-            Body:        []byte("Hello World!"),
-        },
-    )
+    err = ch.Publish("", q.Name, false, false, amqp.Publishing{
+        ContentType: "text/plain",
+        Body:        []byte("Hello World!"),
+    })
     if err != nil {
         log.Fatal(err)
     }
 
-    log.Println("Message sent!")
+    log.Println(" [x] Sent 'Hello World!'")
 }
-```
-
-### 3. Test with Node.js
-
-```javascript
-const amqp = require('amqplib');
-
-async function main() {
-    // Connect to server
-    const connection = await amqp.connect('amqp://localhost');
-    const channel = await connection.createChannel();
-
-    // Declare queue
-    const queue = 'hello';
-    await channel.assertQueue(queue, { durable: false });
-
-    // Publish message
-    channel.sendToQueue(queue, Buffer.from('Hello World!'));
-    console.log(" [x] Sent 'Hello World!'");
-
-    // Consume message
-    channel.consume(queue, (msg) => {
-        console.log(" [x] Received:", msg.content.toString());
-    }, { noAck: true });
-}
-
-main().catch(console.error);
 ```
 
 ## Configuration File
@@ -239,75 +206,6 @@ Run with config:
 
 ```bash
 amqp-server --config config.json
-```
-
-## Setting up Authentication
-
-1. Create `users.json`:
-
-```json
-{
-  "users": [
-    {
-      "username": "admin",
-      "password_hash": "$2a$10$YOUR_BCRYPT_HASH_HERE",
-      "permissions": [
-        {
-          "resource": ".*",
-          "action": "configure",
-          "pattern": ".*"
-        },
-        {
-          "resource": ".*",
-          "action": "write",
-          "pattern": ".*"
-        },
-        {
-          "resource": ".*",
-          "action": "read",
-          "pattern": ".*"
-        }
-      ]
-    }
-  ]
-}
-```
-
-2. Generate password hash:
-
-```go
-package main
-
-import (
-    "fmt"
-    "log"
-    "golang.org/x/crypto/bcrypt"
-)
-
-func main() {
-    password := "your-password"
-    hash, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
-    if err != nil {
-        log.Fatal(err)
-    }
-    fmt.Println(string(hash))
-}
-```
-
-3. Start server with authentication:
-
-```bash
-amqp-server --auth --auth-file users.json
-```
-
-4. Connect with credentials:
-
-```python
-# Python
-credentials = pika.PlainCredentials('admin', 'your-password')
-connection = pika.BlockingConnection(
-    pika.ConnectionParameters('localhost', credentials=credentials)
-)
 ```
 
 ## Production Deployment
@@ -347,11 +245,10 @@ curl http://localhost:9419/metrics
 
 ## Next Steps
 
-- Read the [Configuration Guide](README.md#configuration)
-- Set up [Authentication](README.md#authentication)
-- Configure [TLS/SSL](README.md#security-configuration)
-- Enable [Metrics](README.md#monitoring-and-metrics)
-- Review [Security Best Practices](SECURITY.md)
+- Read [CLIENT_EXAMPLES.md](CLIENT_EXAMPLES.md) for complete examples with consumers, exchanges, and patterns
+- Review [README.md](README.md) for configuration options
+- Check [SECURITY.md](SECURITY.md) for authentication setup
+- See [CONTRIBUTING.md](CONTRIBUTING.md) to contribute
 
 ## Troubleshooting
 
@@ -390,4 +287,3 @@ amqp-server --help
 ```
 
 For more detailed documentation, see [README.md](README.md).
-
