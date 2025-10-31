@@ -13,14 +13,24 @@ import (
 
 // BadgerMessageStore implements MessageStore interface using Badger database
 type BadgerMessageStore struct {
-	db  *badger.DB
-	ttl time.Duration // Default TTL for messages
+	db          *badger.DB
+	ttl         time.Duration // Default TTL for messages
+	asyncWriter *AsyncWriteBuffer // Async write buffer for batching
 }
 
 // NewBadgerMessageStore creates a new BadgerMessageStore instance
 func NewBadgerMessageStore(dbPath string, ttl time.Duration) (*BadgerMessageStore, error) {
 	opts := badger.DefaultOptions(dbPath)
 	opts.Logger = nil // Disable badger's default logging to avoid noise
+
+	// Performance tuning for RabbitMQ-style workloads
+	opts.NumVersionsToKeep = 1           // We don't need MVCC history
+	opts.NumLevelZeroTables = 2          // Reduce memory for L0 tables
+	opts.NumLevelZeroTablesStall = 3     // Allow more L0 before stalling
+	opts.ValueThreshold = 1024           // Store values > 1KB in value log
+	opts.NumCompactors = 2               // Parallel compaction
+	opts.CompactL0OnClose = true         // Compact on shutdown
+	opts.BlockCacheSize = 64 * 1024 * 1024 // 64MB block cache
 
 	db, err := badger.Open(opts)
 	if err != nil {
@@ -32,6 +42,9 @@ func NewBadgerMessageStore(dbPath string, ttl time.Duration) (*BadgerMessageStor
 		ttl: ttl,
 	}
 
+	// Initialize async write buffer
+	store.asyncWriter = NewAsyncWriteBuffer(db, 100*time.Millisecond, 1000, ttl)
+
 	// Start background cleanup goroutine
 	go store.runTTLCleanup()
 
@@ -39,6 +52,8 @@ func NewBadgerMessageStore(dbPath string, ttl time.Duration) (*BadgerMessageStor
 }
 
 // StoreMessage stores a message in the database with TTL
+// Uses synchronous write by default for backward compatibility
+// For async batched writes, enable via configuration
 func (b *BadgerMessageStore) StoreMessage(queueName string, message *protocol.Message) error {
 	key := b.messageKey(queueName, message.DeliveryTag)
 
@@ -48,7 +63,40 @@ func (b *BadgerMessageStore) StoreMessage(queueName string, message *protocol.Me
 		return fmt.Errorf("failed to serialize message: %w", err)
 	}
 
-	// Store with TTL
+	// Store with TTL (synchronous for now - backward compatible)
+	err = b.db.Update(func(txn *badger.Txn) error {
+		entry := badger.NewEntry(key, data).WithTTL(b.ttl)
+		return txn.SetEntry(entry)
+	})
+
+	if err != nil {
+		return fmt.Errorf("failed to store message: %w", err)
+	}
+
+	return nil
+}
+
+// StoreMessageAsync stores a message using async write buffer (non-blocking)
+// This is much faster but writes are eventually consistent
+func (b *BadgerMessageStore) StoreMessageAsync(queueName string, message *protocol.Message) error {
+	if b.asyncWriter != nil {
+		b.asyncWriter.Write(queueName, message)
+		return nil
+	}
+	// Fall back to sync write if async not available
+	return b.StoreMessage(queueName, message)
+}
+
+// StoreMessageSync stores a message synchronously (bypasses async buffer)
+// Use this when you need guaranteed durability (e.g., publisher confirms)
+func (b *BadgerMessageStore) StoreMessageSync(queueName string, message *protocol.Message) error {
+	key := b.messageKey(queueName, message.DeliveryTag)
+
+	data, err := b.serializeMessage(message)
+	if err != nil {
+		return fmt.Errorf("failed to serialize message: %w", err)
+	}
+
 	err = b.db.Update(func(txn *badger.Txn) error {
 		entry := badger.NewEntry(key, data).WithTTL(b.ttl)
 		return txn.SetEntry(entry)
@@ -191,7 +239,56 @@ func (b *BadgerMessageStore) PurgeQueue(queueName string) (int, error) {
 
 // Close closes the database connection
 func (b *BadgerMessageStore) Close() error {
+	// Flush any pending writes
+	if b.asyncWriter != nil {
+		if err := b.asyncWriter.Close(); err != nil {
+			log.Printf("Error closing async writer: %v", err)
+		}
+	}
 	return b.db.Close()
+}
+
+// GetMessageBatch retrieves multiple messages in a single transaction
+// This is much faster than individual GetMessage calls for sequential reads
+func (b *BadgerMessageStore) GetMessageBatch(queueName string, deliveryTags []uint64) ([]*protocol.Message, error) {
+	messages := make([]*protocol.Message, len(deliveryTags))
+
+	err := b.db.View(func(txn *badger.Txn) error {
+		for i, tag := range deliveryTags {
+			key := b.messageKey(queueName, tag)
+			item, err := txn.Get(key)
+			if err != nil {
+				if err == badger.ErrKeyNotFound {
+					messages[i] = nil // Mark as not found
+					continue
+				}
+				return err
+			}
+
+			err = item.Value(func(val []byte) error {
+				msg, err := b.deserializeMessage(val)
+				if err != nil {
+					return err
+				}
+				messages[i] = msg
+				return nil
+			})
+			if err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+
+	return messages, err
+}
+
+// Flush forces a flush of the async write buffer
+func (b *BadgerMessageStore) Flush() error {
+	if b.asyncWriter != nil {
+		return b.asyncWriter.Flush()
+	}
+	return nil
 }
 
 // GetStats returns storage statistics

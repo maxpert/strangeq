@@ -197,13 +197,15 @@ func (b *StorageBroker) DeclareQueue(name string, durable, autoDelete, exclusive
 		AutoDelete: autoDelete,
 		Exclusive:  exclusive,
 		Arguments:  make(map[string]interface{}),
-		Messages:   make([]*protocol.Message, 0), // This will not be persisted
 	}
 
 	// Copy arguments
 	for k, v := range arguments {
 		queue.Arguments[k] = v
 	}
+
+	// Initialize unified storage architecture
+	queue.InitializeStorage(128 * 1024 * 1024) // 128MB cache per queue
 
 	// Store queue
 	err = b.storage.StoreQueue(queue)

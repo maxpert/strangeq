@@ -67,6 +67,8 @@ func DefaultConfig() *AMQPConfig {
 			ChannelTimeout:           60 * time.Second,
 			MessageTimeout:           30 * time.Second,
 			CleanupInterval:          5 * time.Minute,
+			MemoryLimitPercent:       60, // 60% of RAM (RabbitMQ default)
+			MemoryLimitBytes:         0,  // 0 = use percentage
 		},
 	}
 }

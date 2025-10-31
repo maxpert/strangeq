@@ -128,4 +128,15 @@ type ServerConfig struct {
 	ChannelTimeout  time.Duration
 	MessageTimeout  time.Duration
 	CleanupInterval time.Duration
+
+	// Memory management
+	// MemoryLimitPercent sets memory threshold as percentage of system RAM (0-100)
+	// Default: 60 (60% of RAM)
+	// Set to 0 to use absolute limit instead
+	MemoryLimitPercent int `json:"memory_limit_percent"`
+
+	// MemoryLimitBytes sets absolute memory limit in bytes
+	// Used when MemoryLimitPercent is 0
+	// Default: 0 (use percentage instead)
+	MemoryLimitBytes int64 `json:"memory_limit_bytes"`
 }

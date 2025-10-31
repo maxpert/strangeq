@@ -17,13 +17,13 @@ import (
 
 // Metrics tracks benchmark statistics
 type Metrics struct {
-	published  atomic.Int64
-	consumed   atomic.Int64
-	confirmed  atomic.Int64
-	returned   atomic.Int64
-	latencies  []time.Duration
-	latencyMu  sync.Mutex
-	startTime  time.Time
+	published atomic.Int64
+	consumed  atomic.Int64
+	confirmed atomic.Int64
+	returned  atomic.Int64
+	latencies []time.Duration
+	latencyMu sync.Mutex
+	startTime time.Time
 }
 
 func (m *Metrics) recordLatency(d time.Duration) {
@@ -34,17 +34,17 @@ func (m *Metrics) recordLatency(d time.Duration) {
 
 func main() {
 	var (
-		uri         = flag.String("uri", "amqp://guest:guest@localhost:5672/", "AMQP URI")
-		producers   = flag.Int("producers", 1, "Number of producers")
-		consumers   = flag.Int("consumers", 1, "Number of consumers")
-		duration    = flag.Duration("duration", 30*time.Second, "Test duration")
-		rate        = flag.Int("rate", 0, "Publishing rate limit (msg/s, 0 = unlimited)")
-		size        = flag.Int("size", 1024, "Message size in bytes")
-		persistent  = flag.Bool("persistent", false, "Use persistent messages")
-		queueName   = flag.String("queue", "perftest", "Queue name")
-		autoAck     = flag.Bool("auto-ack", false, "Auto-acknowledge messages")
-		prefetch    = flag.Int("prefetch", 1, "Consumer prefetch count")
-		confirms    = flag.Bool("confirms", false, "Enable publisher confirms")
+		uri        = flag.String("uri", "amqp://guest:guest@localhost:5672/", "AMQP URI")
+		producers  = flag.Int("producers", 1, "Number of producers")
+		consumers  = flag.Int("consumers", 1, "Number of consumers")
+		duration   = flag.Duration("duration", 30*time.Second, "Test duration")
+		rate       = flag.Int("rate", 0, "Publishing rate limit (msg/s, 0 = unlimited)")
+		size       = flag.Int("size", 1024, "Message size in bytes")
+		persistent = flag.Bool("persistent", false, "Use persistent messages")
+		queueName  = flag.String("queue", "perftest", "Queue name")
+		autoAck    = flag.Bool("auto-ack", false, "Auto-acknowledge messages")
+		prefetch   = flag.Int("prefetch", 1, "Consumer prefetch count")
+		confirms   = flag.Bool("confirms", false, "Enable publisher confirms")
 	)
 	flag.Parse()
 

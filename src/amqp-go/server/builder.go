@@ -109,8 +109,15 @@ func (b *ServerBuilder) WithUnifiedBroker(unifiedBroker UnifiedBroker) *ServerBu
 	return b
 }
 
-// WithDefaultBroker uses the default in-memory broker
+// WithDefaultBroker uses the high-performance BrokerV2 (RabbitMQ-style architecture)
 func (b *ServerBuilder) WithDefaultBroker() *ServerBuilder {
+	brokerV2 := broker.NewBrokerV2()
+	b.broker = &brokerWrapper{unifiedBroker: NewBrokerV2Adapter(brokerV2)}
+	return b
+}
+
+// WithBrokerV1 uses the original broker implementation (for backward compatibility)
+func (b *ServerBuilder) WithBrokerV1() *ServerBuilder {
 	originalBroker := broker.NewBroker()
 	b.broker = &brokerWrapper{unifiedBroker: NewOriginalBrokerAdapter(originalBroker)}
 	return b
@@ -182,6 +189,9 @@ func (b *ServerBuilder) Build() (*Server, error) {
 	if err := b.config.Validate(); err != nil {
 		return nil, fmt.Errorf("invalid configuration: %w", err)
 	}
+
+	// Set memory configuration before creating any mailboxes
+	protocol.SetMemoryConfig(b.config.Server.MemoryLimitPercent, b.config.Server.MemoryLimitBytes)
 
 	// Create logger if not provided
 	logger := b.logger

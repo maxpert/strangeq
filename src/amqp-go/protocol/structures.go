@@ -17,8 +17,11 @@ type Connection struct {
 	Vhost           string                     // Virtual host for this connection
 	Username        string                     // Authenticated username
 	PendingMessages map[uint16]*PendingMessage // Track messages being published on each channel
-	Mutex           sync.RWMutex
+	Mailboxes       *ConnectionMailboxes       // Three separate mailboxes (RabbitMQ-style: Heartbeat, Channel, Connection)
+	Mutex           sync.RWMutex               // Protects connection state
+	WriteMutex      sync.Mutex                 // Protects socket writes (heartbeat sender + frame processor both write)
 	Closed          bool
+	Blocked         bool // RabbitMQ-style memory alarm: true when queue usage > 90%, false when < 80%
 }
 
 // NewConnection creates a new AMQP connection
@@ -28,6 +31,7 @@ func NewConnection(conn net.Conn) *Connection {
 		Conn:            conn,
 		Channels:        make(map[uint16]*Channel),
 		PendingMessages: make(map[uint16]*PendingMessage),
+		Mailboxes:       NewConnectionMailboxes(), // RabbitMQ-style: three separate unbounded mailboxes
 	}
 }
 
@@ -109,18 +113,19 @@ type Queue struct {
 	AutoDelete bool
 	Exclusive  bool
 	Arguments  map[string]interface{}
-	Messages   []*Message
-	Mutex      sync.RWMutex
-	Channel    *Channel // Reference back to parent channel
+
+	// Storage: Index+cache architecture (always enabled)
+	IndexManager *MessageIndexManager // Lightweight metadata (~64 bytes per message)
+	Cache        *MessageCache        // Bounded LRU cache for message bodies
+	MemoryLimit  int64                // Max cache size (bytes)
+
+	Mutex   sync.RWMutex
+	Channel *Channel // Reference back to parent channel
 }
 
 // Copy returns a copy of the Queue without the mutex.
 // This is safe to use when you need to pass Queue by value.
 func (q *Queue) Copy() Queue {
-	// Copy messages
-	messagesCopy := make([]*Message, len(q.Messages))
-	copy(messagesCopy, q.Messages)
-
 	// Copy arguments
 	argsCopy := make(map[string]interface{}, len(q.Arguments))
 	for k, v := range q.Arguments {
@@ -133,10 +138,64 @@ func (q *Queue) Copy() Queue {
 		AutoDelete: q.AutoDelete,
 		Exclusive:  q.Exclusive,
 		Arguments:  argsCopy,
-		Messages:   messagesCopy,
 		Channel:    q.Channel,
-		// Mutex is intentionally not copied
+		// Mutex, IndexManager, Cache not copied (reference types)
 	}
+}
+
+// InitializeStorage initializes the index+cache storage architecture
+func (q *Queue) InitializeStorage(maxCacheSize int64) {
+	if maxCacheSize <= 0 {
+		maxCacheSize = DefaultMaxCacheSize
+	}
+
+	q.IndexManager = NewMessageIndexManager()
+	q.Cache = NewMessageCache(maxCacheSize)
+	q.MemoryLimit = maxCacheSize
+}
+
+// AddMessage adds a message to the queue storage
+func (q *Queue) AddMessage(deliveryTag uint64, message *Message) {
+	idx := NewMessageIndex(deliveryTag, message, q.Name)
+	q.IndexManager.Add(idx)
+	q.Cache.Put(idx.CacheKey, deliveryTag, message)
+}
+
+// GetMessage retrieves a message by delivery tag
+// Returns the message from cache if available, nil if not found
+func (q *Queue) GetMessage(deliveryTag uint64) (*Message, *MessageIndex) {
+	idx, found := q.IndexManager.Get(deliveryTag)
+	if !found {
+		return nil, nil
+	}
+
+	if message, ok := q.Cache.Get(idx.CacheKey); ok {
+		return message, idx
+	}
+
+	// Cache miss - caller should load from disk
+	return nil, idx
+}
+
+// RemoveMessage removes a message from the queue storage
+func (q *Queue) RemoveMessage(deliveryTag uint64) bool {
+	idx, found := q.IndexManager.Get(deliveryTag)
+	if !found {
+		return false
+	}
+
+	q.Cache.Remove(idx.CacheKey)
+	return q.IndexManager.Remove(deliveryTag)
+}
+
+// MessageCount returns the number of messages in the queue
+func (q *Queue) MessageCount() int {
+	return q.IndexManager.Len()
+}
+
+// CacheStats returns cache statistics for this queue
+func (q *Queue) CacheStats() CacheStats {
+	return q.Cache.GetStats()
 }
 
 // Message represents an AMQP message

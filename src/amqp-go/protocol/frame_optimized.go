@@ -14,9 +14,10 @@ import (
 //
 // Performance improvements over standard operations:
 //   - ReadFrameOptimized: 25% fewer allocations (4 → 3)
-//   - WriteFrameOptimized: 100% fewer allocations (zero-allocation)
 //   - MarshalBinaryOptimized: Precise pre-allocation
 //   - UnmarshalBinaryOptimized: Payload slice reuse
+//
+// Note: WriteFrame (in frame.go) uses buffer pooling by default for optimal performance.
 //
 // Use these functions in high-throughput scenarios where every allocation matters.
 // For typical use cases, the standard frame operations are sufficient.
@@ -77,37 +78,6 @@ func (f *Frame) MarshalBinaryOptimized() ([]byte, error) {
 	data[7+payloadLen] = FrameEnd
 
 	return data, nil
-}
-
-// WriteFrameOptimized writes a frame with buffer reuse.
-// Uses a pooled buffer to achieve zero allocations for write operations.
-// This is the most efficient way to write frames in high-throughput scenarios.
-func WriteFrameOptimized(writer io.Writer, frame *Frame) error {
-	// Use a pooled buffer for encoding
-	buf := getBuffer()
-	defer putBuffer(buf)
-
-	// Pre-allocate capacity
-	payloadLen := len(frame.Payload)
-	buf.Grow(8 + payloadLen)
-
-	// Write frame header
-	buf.WriteByte(frame.Type)
-
-	var header [6]byte
-	binary.BigEndian.PutUint16(header[0:2], frame.Channel)
-	binary.BigEndian.PutUint32(header[2:6], uint32(payloadLen))
-	buf.Write(header[:])
-
-	// Write payload
-	buf.Write(frame.Payload)
-
-	// Write frame end marker
-	buf.WriteByte(FrameEnd)
-
-	// Write to io.Writer
-	_, err := buf.WriteTo(writer)
-	return err
 }
 
 // UnmarshalBinaryOptimized decodes with reduced allocations.

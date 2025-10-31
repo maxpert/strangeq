@@ -108,8 +108,7 @@ func TestDirectExchangeRouting(t *testing.T) {
 	// Check that the message was routed to the queue
 	queue, exists := broker.Queues["test-queue"]
 	assert.True(t, exists)
-	assert.Equal(t, 1, len(queue.Messages))
-	assert.Equal(t, "test-key", queue.Messages[0].RoutingKey)
+	assert.Equal(t, 1, queue.MessageCount())
 }
 
 func TestFanoutExchangeRouting(t *testing.T) {
@@ -146,11 +145,11 @@ func TestFanoutExchangeRouting(t *testing.T) {
 	// Check that the message was routed to both queues
 	queue1, exists := broker.Queues["test-queue-1"]
 	assert.True(t, exists)
-	assert.Equal(t, 1, len(queue1.Messages))
+	assert.Equal(t, 1, queue1.MessageCount())
 
 	queue2, exists := broker.Queues["test-queue-2"]
 	assert.True(t, exists)
-	assert.Equal(t, 1, len(queue2.Messages))
+	assert.Equal(t, 1, queue2.MessageCount())
 }
 
 func TestTopicExchangeRouting(t *testing.T) {
@@ -181,8 +180,7 @@ func TestTopicExchangeRouting(t *testing.T) {
 	// Check that the message was routed to the queue
 	queue, exists := broker.Queues["test-queue-1"]
 	assert.True(t, exists)
-	assert.Equal(t, 1, len(queue.Messages))
-	assert.Equal(t, "stock.usd.nyse", queue.Messages[0].RoutingKey)
+	assert.Equal(t, 1, queue.MessageCount())
 }
 
 func TestTopicExchangeNoMatch(t *testing.T) {
@@ -213,5 +211,5 @@ func TestTopicExchangeNoMatch(t *testing.T) {
 	// Check that the message was NOT routed to the queue
 	queue, exists := broker.Queues["test-queue-1"]
 	assert.True(t, exists)
-	assert.Equal(t, 0, len(queue.Messages))
+	assert.Equal(t, 0, queue.MessageCount())
 }

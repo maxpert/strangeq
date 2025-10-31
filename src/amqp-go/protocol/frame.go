@@ -102,15 +102,44 @@ func ReadFrame(reader io.Reader) (*Frame, error) {
 	}, nil
 }
 
-// WriteFrame writes a frame to an io.Writer
+// WriteFrame writes a frame to an io.Writer with buffer pooling for optimal performance.
+// Uses a pooled buffer to achieve zero allocations for write operations.
+// This is the most efficient way to write frames in high-throughput scenarios.
 func WriteFrame(writer io.Writer, frame *Frame) error {
-	// Calculate frame size
-	data, err := frame.MarshalBinary()
-	if err != nil {
-		return err
-	}
+	// Use a pooled buffer for encoding
+	buf := getBuffer()
+	defer putBuffer(buf)
 
-	// Write the frame
-	_, err = writer.Write(data)
+	// Pre-allocate capacity
+	payloadLen := len(frame.Payload)
+	buf.Grow(8 + payloadLen)
+
+	// Write frame header
+	buf.WriteByte(frame.Type)
+
+	var header [6]byte
+	binary.BigEndian.PutUint16(header[0:2], frame.Channel)
+	binary.BigEndian.PutUint32(header[2:6], uint32(payloadLen))
+	buf.Write(header[:])
+
+	// Write payload
+	buf.Write(frame.Payload)
+
+	// Write frame end marker
+	buf.WriteByte(FrameEnd)
+
+	// Write to io.Writer
+	_, err := buf.WriteTo(writer)
 	return err
+}
+
+// WriteFrameToConnection writes a frame to a connection with mutex protection for thread-safe writes.
+// This should be used when writing to a *Connection to ensure thread-safety.
+func WriteFrameToConnection(conn *Connection, frame *Frame) error {
+	// Lock for thread-safe socket writes
+	conn.WriteMutex.Lock()
+	defer conn.WriteMutex.Unlock()
+
+	// Write the frame using the optimized writer
+	return WriteFrame(conn.Conn, frame)
 }

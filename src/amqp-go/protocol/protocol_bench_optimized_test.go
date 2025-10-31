@@ -70,8 +70,8 @@ func BenchmarkReadFrameOptimized(b *testing.B) {
 	}
 }
 
-// BenchmarkWriteFrameOptimized measures zero-allocation frame writing with pooled buffers.
-func BenchmarkWriteFrameOptimized(b *testing.B) {
+// BenchmarkWriteFrame measures zero-allocation frame writing with pooled buffers.
+func BenchmarkWriteFrame(b *testing.B) {
 	frame := &Frame{
 		Type:    FrameMethod,
 		Channel: 1,
@@ -84,7 +84,7 @@ func BenchmarkWriteFrameOptimized(b *testing.B) {
 	b.ReportAllocs()
 	for i := 0; i < b.N; i++ {
 		buf.Reset()
-		err := WriteFrameOptimized(buf, frame)
+		err := WriteFrame(buf, frame)
 		if err != nil {
 			b.Fatal(err)
 		}

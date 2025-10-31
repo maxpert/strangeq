@@ -64,6 +64,10 @@ func main() {
 		maxChannels    = flag.Int("max-channels", 2047, "Maximum channels per connection")
 		maxFrameSize   = flag.Int("max-frame-size", 131072, "Maximum frame size in bytes")
 		maxMessageSize = flag.String("max-message-size", "16MB", "Maximum message size (e.g., 16MB)")
+
+		// Memory management
+		memoryLimitPercent = flag.Int("memory-limit-percent", 60, "Memory limit as percentage of RAM (0-100, 0=use absolute)")
+		memoryLimitBytes   = flag.String("memory-limit-bytes", "0", "Absolute memory limit (e.g., 4GB, 0=use percent)")
 	)
 
 	flag.Parse()
@@ -108,6 +112,7 @@ func main() {
 			*tlsEnabled, *tlsCert, *tlsKey, *authEnabled, *authFile,
 			*logLevel, *logFile, *pidFile, *daemonize,
 			*maxChannels, *maxFrameSize, *maxMessageSize,
+			*memoryLimitPercent, *memoryLimitBytes,
 		)
 		if err != nil {
 			log.Fatalf("Failed to build configuration: %v", err)
@@ -195,30 +200,41 @@ func buildConfigFromFlags(
 	tlsEnabled bool, tlsCert, tlsKey string, authEnabled bool, authFile string,
 	logLevel, logFile, pidFile string, daemonize bool,
 	maxChannels, maxFrameSize int, maxMessageSize string,
+	memoryLimitPercent int, memoryLimitBytes string,
 ) (*config.AMQPConfig, error) {
 
-	builder := config.NewConfigBuilder().
-		// Network configuration
-		WithAddress(addr).
-		WithPort(port).
-		WithMaxConnections(maxConnections).
+	cfg := config.DefaultConfig()
 
-		// Server configuration
-		WithLogging(logLevel, logFile).
-		WithDaemonize(daemonize, pidFile).
-		WithProtocolLimits(maxChannels, maxFrameSize, parseSize(maxMessageSize))
+	// Network configuration
+	cfg.Network.Address = addr
+	cfg.Network.Port = port
+	cfg.Network.MaxConnections = maxConnections
+
+	// Server configuration
+	cfg.Server.LogLevel = logLevel
+	cfg.Server.LogFile = logFile
+	cfg.Server.PidFile = pidFile
+	cfg.Server.Daemonize = daemonize
+	cfg.Server.MaxChannelsPerConnection = maxChannels
+	cfg.Server.MaxFrameSize = maxFrameSize
+	cfg.Server.MaxMessageSize = parseSize(maxMessageSize)
+	cfg.Server.MemoryLimitPercent = memoryLimitPercent
+	cfg.Server.MemoryLimitBytes = parseSize(memoryLimitBytes)
 
 	// Storage configuration
 	switch storageBackend {
 	case "memory":
-		builder = builder.WithMemoryStorage()
+		cfg.Storage.Backend = "memory"
+		cfg.Storage.Persistent = false
 	case "badger":
 		if storagePath == "" {
 			return nil, fmt.Errorf("storage path required for badger backend")
 		}
-		builder = builder.WithBadgerStorage(storagePath).
-			WithSyncWrites(syncWrites).
-			WithCacheSize(parseSize(cacheSize))
+		cfg.Storage.Backend = "badger"
+		cfg.Storage.Path = storagePath
+		cfg.Storage.Persistent = true
+		cfg.Storage.SyncWrites = syncWrites
+		cfg.Storage.CacheSize = parseSize(cacheSize)
 	default:
 		return nil, fmt.Errorf("unsupported storage backend: %s", storageBackend)
 	}
@@ -228,17 +244,20 @@ func buildConfigFromFlags(
 		if tlsCert == "" || tlsKey == "" {
 			return nil, fmt.Errorf("TLS certificate and key files required when TLS is enabled")
 		}
-		builder = builder.WithTLS(tlsCert, tlsKey)
+		cfg.Security.TLSEnabled = true
+		cfg.Security.TLSCertFile = tlsCert
+		cfg.Security.TLSKeyFile = tlsKey
 	}
 
 	if authEnabled {
 		if authFile == "" {
 			return nil, fmt.Errorf("authentication file required when authentication is enabled")
 		}
-		builder = builder.WithFileAuthentication(authFile)
+		cfg.Security.AuthenticationEnabled = true
+		cfg.Security.AuthenticationFilePath = authFile
 	}
 
-	return builder.Build()
+	return cfg, nil
 }
 
 func parseSize(sizeStr string) int64 {
