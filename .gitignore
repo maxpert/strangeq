@@ -20,8 +20,8 @@ go.work
 # Build artifacts
 bin/
 dist/
-amqp-go
-amqp-server
+/amqp-go
+/amqp-server
 amqp-server-*
 
 # IDE
