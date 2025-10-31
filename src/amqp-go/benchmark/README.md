@@ -92,8 +92,11 @@ Test basic throughput with minimal overhead:
 ```
 
 Expected results on Apple M4 Max:
-- Throughput: ~15,000 msg/s
-- Latency p50: <1ms
+- Throughput: 20,000-25,000 msg/s sustained
+- Peak throughput: 50,000+ msg/s
+- Latency p50: ~1-2ms
+
+Note: Without rate limiting, producer may outpace consumer causing queue buildup
 
 ### Scenario 2: Multiple Producers/Consumers (In-Memory)
 
@@ -103,9 +106,9 @@ Test concurrent operations:
 ./perftest -producers 10 -consumers 10 -duration 60s
 ```
 
-Expected results:
-- Throughput: ~100,000 msg/s
-- Latency p50: <2ms
+Expected results (to be benchmarked):
+- Throughput: TBD
+- Latency p50: TBD
 
 ### Scenario 3: Persistent Messages (Badger Storage)
 
@@ -119,9 +122,9 @@ amqp-server --storage badger --storage-path ./bench-data
 ./perftest -persistent -producers 5 -consumers 5 -duration 60s
 ```
 
-Expected results:
-- Throughput: ~15,000 msg/s (limited by disk I/O)
-- Latency p50: ~2-5ms
+Expected results (to be benchmarked):
+- Throughput: TBD (limited by disk I/O)
+- Latency p50: TBD
 
 ### Scenario 4: Large Messages
 
