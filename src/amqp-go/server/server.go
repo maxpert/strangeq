@@ -173,22 +173,23 @@ func (s *Server) consumerDeliveryLoop(conn *protocol.Connection) {
 		}
 		conn.Mutex.Unlock()
 
-		s.Log.Info("Consumer delivery loop iteration",
+		s.Log.Debug("Consumer delivery loop iteration",
 			zap.String("connection_id", conn.ID),
 			zap.Int("channels", channelCount),
 			zap.Int("consumers", consumerCount),
 			zap.Int("tracked_channels", len(consumerChannels)))
 
 		// Check each consumer channel for messages
-		for consumerTag, msgChan := range consumerChannels {
-			s.Log.Debug("Checking consumer channel",
-				zap.String("consumer_tag", consumerTag),
-				zap.Int("buffered_messages", len(msgChan)))
+		// Use a short timeout to balance responsiveness and CPU usage
+		timeout := time.NewTimer(1 * time.Millisecond)
+		messageProcessed := false
 
+		for consumerTag, msgChan := range consumerChannels {
 			select {
 			case delivery := <-msgChan:
+				messageProcessed = true
 				// Got a message, send it to the client
-				s.Log.Info("Sending message to consumer",
+				s.Log.Debug("Sending message to consumer",
 					zap.String("consumer_tag", consumerTag),
 					zap.Uint64("delivery_tag", delivery.DeliveryTag),
 					zap.String("exchange", delivery.Exchange),
@@ -212,7 +213,7 @@ func (s *Server) consumerDeliveryLoop(conn *protocol.Connection) {
 				conn.Mutex.RUnlock()
 
 				if targetChannel != nil && targetConsumer != nil {
-					s.Log.Info("About to send basic.deliver",
+					s.Log.Debug("About to send basic.deliver",
 						zap.String("consumer_tag", consumerTag),
 						zap.Uint16("channel_id", targetChannel.ID))
 
@@ -232,12 +233,12 @@ func (s *Server) consumerDeliveryLoop(conn *protocol.Connection) {
 							zap.Error(err),
 							zap.String("consumer_tag", consumerTag))
 					} else {
-						s.Log.Info("Sent basic.deliver successfully",
+						s.Log.Debug("Sent basic.deliver successfully",
 							zap.String("consumer_tag", consumerTag),
 							zap.Uint64("delivery_tag", delivery.DeliveryTag))
 					}
 				} else {
-					s.Log.Info("Could not find target channel/consumer",
+					s.Log.Warn("Could not find target channel/consumer",
 						zap.String("consumer_tag", consumerTag))
 				}
 			default:
@@ -247,8 +248,12 @@ func (s *Server) consumerDeliveryLoop(conn *protocol.Connection) {
 			}
 		}
 
-		// Sleep briefly to prevent busy waiting
-		time.Sleep(10 * time.Millisecond)
+		timeout.Stop()
+
+		// Only sleep if no messages were processed to prevent busy waiting
+		if !messageProcessed {
+			time.Sleep(1 * time.Millisecond)
+		}
 	}
 
 	s.Log.Debug("Consumer delivery loop stopped", zap.String("connection_id", conn.ID))

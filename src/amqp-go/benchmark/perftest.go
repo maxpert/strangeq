@@ -44,6 +44,7 @@ func main() {
 		queueName   = flag.String("queue", "perftest", "Queue name")
 		autoAck     = flag.Bool("auto-ack", false, "Auto-acknowledge messages")
 		prefetch    = flag.Int("prefetch", 1, "Consumer prefetch count")
+		confirms    = flag.Bool("confirms", false, "Enable publisher confirms")
 	)
 	flag.Parse()
 
@@ -70,7 +71,7 @@ func main() {
 		wg.Add(1)
 		go func(id int) {
 			defer wg.Done()
-			runProducer(ctx, *uri, *queueName, *size, *persistent, *rate / *producers, metrics)
+			runProducer(ctx, *uri, *queueName, *size, *persistent, *rate / *producers, *confirms, metrics)
 		}(i)
 	}
 
@@ -110,7 +111,7 @@ func main() {
 	printResults(metrics)
 }
 
-func runProducer(ctx context.Context, uri, queueName string, size int, persistent bool, rateLimit int, metrics *Metrics) {
+func runProducer(ctx context.Context, uri, queueName string, size int, persistent bool, rateLimit int, useConfirms bool, metrics *Metrics) {
 	conn, err := amqp.Dial(uri)
 	if err != nil {
 		log.Printf("Producer failed to connect: %v", err)
@@ -132,18 +133,20 @@ func runProducer(ctx context.Context, uri, queueName string, size int, persisten
 		return
 	}
 
-	// Enable publisher confirms
-	if err := ch.Confirm(false); err != nil {
-		log.Printf("Producer failed to enable confirms: %v", err)
-		return
-	}
-
-	confirms := ch.NotifyPublish(make(chan amqp.Confirmation, 100))
-	go func() {
-		for range confirms {
-			metrics.confirmed.Add(1)
+	// Enable publisher confirms (optional)
+	if useConfirms {
+		if err := ch.Confirm(false); err != nil {
+			log.Printf("Producer failed to enable confirms: %v", err)
+			return
 		}
-	}()
+
+		confirms := ch.NotifyPublish(make(chan amqp.Confirmation, 100))
+		go func() {
+			for range confirms {
+				metrics.confirmed.Add(1)
+			}
+		}()
+	}
 
 	body := make([]byte, size)
 	for i := range body {
