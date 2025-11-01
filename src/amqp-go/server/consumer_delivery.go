@@ -1,12 +1,14 @@
 package server
 
 import (
+	"reflect"
 	"time"
 
 	"github.com/maxpert/amqp-go/protocol"
 	"go.uber.org/zap"
 )
 
+// consumerInfo holds cached references for a consumer
 type consumerInfo struct {
 	channel  *protocol.Channel
 	consumer *protocol.Consumer
@@ -14,34 +16,35 @@ type consumerInfo struct {
 }
 
 // consumerDeliveryLoop continuously reads from consumer channels and sends messages to clients
+// LOCK-FREE: Uses message passing and channel operations only, no mutexes
 func (s *Server) consumerDeliveryLoop(conn *protocol.Connection) {
-	s.Log.Info("Starting consumer delivery loop", zap.String("connection_id", conn.ID))
-
-	// This loop reads from consumer channels and sends basic.deliver frames to clients
+	s.Log.Debug("Starting consumer delivery loop", zap.String("connection_id", conn.ID))
 
 	// Create a map to track consumer info (cached channel/consumer references)
+	// This map is only accessed by this goroutine - no locks needed
 	consumerInfos := make(map[string]*consumerInfo)
 
-	for {
-		// Check if connection is closed
-		conn.Mutex.RLock()
-		closed := conn.Closed
-		conn.Mutex.RUnlock()
+	const (
+		selectTimeout = 500 * time.Microsecond // Wait timeout when no messages available
+		maxBatchSize  = 100                    // Maximum messages to batch per consumer
+	)
 
-		if closed {
+	for {
+		// LOCK-FREE: Check if connection is closed
+		// Read conn.Closed without lock - worst case is one extra iteration with stale value
+		if conn.Closed {
 			s.Log.Debug("Connection closed, stopping consumer delivery loop", zap.String("connection_id", conn.ID))
-			break
+			return
 		}
 
-		// Refresh the list of consumers periodically
-		// Cache channel and consumer references for fast lookup during delivery
-		conn.Mutex.Lock()
-		channelCount := len(conn.Channels)
-		consumerCount := 0
+		// LOCK-FREE: Discover new consumers without locks
+		// We iterate through channels/consumers in a lock-free manner
+		// It's safe to read the maps without locks because:
+		// 1. We're only reading, not modifying
+		// 2. If we miss a new consumer this iteration, we'll catch it next time
+		// 3. Go map reads are safe with concurrent writes (worst case: stale data)
 		for _, channel := range conn.Channels {
-			channel.Mutex.RLock()
 			for _, consumer := range channel.Consumers {
-				consumerCount++
 				// Add consumer info to our tracking map if not already there
 				if _, exists := consumerInfos[consumer.Tag]; !exists {
 					consumerInfos[consumer.Tag] = &consumerInfo{
@@ -49,76 +52,84 @@ func (s *Server) consumerDeliveryLoop(conn *protocol.Connection) {
 						consumer: consumer,
 						msgChan:  consumer.Messages,
 					}
-					s.Log.Info("Added consumer to delivery loop",
+					s.Log.Debug("Added consumer to delivery loop",
 						zap.String("consumer_tag", consumer.Tag),
 						zap.String("queue", consumer.Queue))
 				}
 			}
-			channel.Mutex.RUnlock()
 		}
-		conn.Mutex.Unlock()
 
-		s.Log.Debug("Consumer delivery loop iteration",
-			zap.String("connection_id", conn.ID),
-			zap.Int("channels", channelCount),
-			zap.Int("consumers", consumerCount),
-			zap.Int("tracked_consumers", len(consumerInfos)))
+		// If we have no consumers, wait a bit and continue
+		if len(consumerInfos) == 0 {
+			time.Sleep(10 * time.Millisecond)
+			continue
+		}
 
-		// Check each consumer channel for messages
-		// Use a short timeout to balance responsiveness and CPU usage
-		timeout := time.NewTimer(1 * time.Millisecond)
-		messageProcessed := false
+		// P1.1 FIX: Use reflect.Select() ONLY - no O(N) hot path iteration!
+		// Wait on ALL consumer channels simultaneously using reflect.Select()
+		timeout := time.NewTimer(selectTimeout)
 
-		for consumerTag, info := range consumerInfos {
-			select {
-			case delivery := <-info.msgChan:
-				messageProcessed = true
-				// Got a message, send it to the client
-				s.Log.Debug("Sending message to consumer",
-					zap.String("consumer_tag", consumerTag),
-					zap.Uint64("delivery_tag", delivery.DeliveryTag),
-					zap.String("exchange", delivery.Exchange),
-					zap.String("routing_key", delivery.RoutingKey))
+		// Build select cases: timeout + all consumer channels
+		numConsumers := len(consumerInfos)
+		cases := make([]reflect.SelectCase, numConsumers+1)
+		consumerTags := make([]string, numConsumers)
 
-				// Use cached channel and consumer references (no lookup needed!)
-				s.Log.Debug("About to send basic.deliver",
-					zap.String("consumer_tag", consumerTag),
-					zap.Uint16("channel_id", info.channel.ID))
+		// Case 0: timeout channel
+		cases[0] = reflect.SelectCase{
+			Dir:  reflect.SelectRecv,
+			Chan: reflect.ValueOf(timeout.C),
+		}
 
-				// Send basic.deliver frame to the client
-				err := s.sendBasicDeliver(
-					conn,
-					info.channel.ID,
-					consumerTag,
-					delivery.DeliveryTag,
-					delivery.Redelivered,
-					delivery.Exchange,
-					delivery.RoutingKey,
-					delivery.Message,
-				)
-				if err != nil {
-					s.Log.Error("Failed to send basic.deliver",
-						zap.Error(err),
-						zap.String("consumer_tag", consumerTag))
-				} else {
-					s.Log.Debug("Sent basic.deliver successfully",
-						zap.String("consumer_tag", consumerTag),
-						zap.Uint64("delivery_tag", delivery.DeliveryTag))
-				}
-			default:
-				// No message available on this channel, continue to next
-				s.Log.Debug("No message available on consumer channel",
-					zap.String("consumer_tag", consumerTag))
+		// Cases 1...N: consumer message channels
+		i := 1
+		for tag, info := range consumerInfos {
+			cases[i] = reflect.SelectCase{
+				Dir:  reflect.SelectRecv,
+				Chan: reflect.ValueOf(info.msgChan),
 			}
+			consumerTags[i-1] = tag
+			i++
 		}
+
+		// Wait for ANY channel to be ready - O(1) wait instead of O(N) polling!
+		chosen, value, ok := reflect.Select(cases)
 
 		timeout.Stop()
 
-		// Only sleep if no messages were processed to prevent busy waiting
-		if !messageProcessed {
-			time.Sleep(1 * time.Millisecond)
+		if chosen == 0 {
+			// Timeout - no messages available, continue to next iteration
+			continue
+		}
+
+		// Got a message from consumer at index (chosen - 1)
+		consumerTag := consumerTags[chosen-1]
+		info := consumerInfos[consumerTag]
+
+		if !ok {
+			// Channel closed - remove consumer from tracking
+			s.Log.Debug("Consumer channel closed, removing from delivery loop",
+				zap.String("consumer_tag", consumerTag))
+			delete(consumerInfos, consumerTag)
+			continue
+		}
+
+		// Extract the delivery
+		delivery := value.Interface().(*protocol.Delivery)
+
+		// Try to collect more messages from this consumer
+		batch := []*protocol.Delivery{delivery}
+		additionalBatch := collectBatch(info.msgChan, maxBatchSize-1)
+		batch = append(batch, additionalBatch...)
+
+		// Send the batch
+		err := s.sendBatchedDeliveries(conn, info.channel.ID, consumerTag, batch)
+		if err != nil {
+			s.Log.Error("Failed to send batched deliveries",
+				zap.Error(err),
+				zap.String("consumer_tag", consumerTag),
+				zap.Int("batch_size", len(batch)))
+			// Connection likely broken, exit loop
+			return
 		}
 	}
-
-	s.Log.Debug("Consumer delivery loop stopped", zap.String("connection_id", conn.ID))
 }

@@ -40,7 +40,7 @@ func (s *Server) handleQueueDeclare(conn *protocol.Connection, channelID uint16,
 		return err
 	}
 
-	s.Log.Info("Queue declared",
+	s.Log.Debug("Queue declared",
 		zap.String("queue", declareMethod.Queue),
 		zap.Bool("durable", declareMethod.Durable),
 		zap.Bool("auto_delete", declareMethod.AutoDelete),
@@ -79,7 +79,7 @@ func (s *Server) handleQueueBind(conn *protocol.Connection, channelID uint16, pa
 		return err
 	}
 
-	s.Log.Info("Queue bound",
+	s.Log.Debug("Queue bound",
 		zap.String("queue", bindMethod.Queue),
 		zap.String("exchange", bindMethod.Exchange),
 		zap.String("routing_key", bindMethod.RoutingKey))
@@ -121,7 +121,7 @@ func (s *Server) handleQueueUnbind(conn *protocol.Connection, channelID uint16, 
 		return err
 	}
 
-	s.Log.Info("Queue unbound",
+	s.Log.Debug("Queue unbound",
 		zap.String("queue", unbindMethod.Queue),
 		zap.String("exchange", unbindMethod.Exchange),
 		zap.String("routing_key", unbindMethod.RoutingKey))
@@ -158,7 +158,7 @@ func (s *Server) handleQueueDelete(conn *protocol.Connection, channelID uint16, 
 		return err
 	}
 
-	s.Log.Info("Queue deleted",
+	s.Log.Debug("Queue deleted",
 		zap.String("queue", deleteMethod.Queue),
 		zap.Bool("if_unused", deleteMethod.IfUnused),
 		zap.Bool("if_empty", deleteMethod.IfEmpty))

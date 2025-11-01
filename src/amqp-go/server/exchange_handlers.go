@@ -40,7 +40,7 @@ func (s *Server) handleExchangeDeclare(conn *protocol.Connection, channelID uint
 		return err
 	}
 
-	s.Log.Info("Exchange declared",
+	s.Log.Debug("Exchange declared",
 		zap.String("exchange", declareMethod.Exchange),
 		zap.String("type", declareMethod.Type),
 		zap.Bool("durable", declareMethod.Durable),
@@ -81,7 +81,7 @@ func (s *Server) handleExchangeDelete(conn *protocol.Connection, channelID uint1
 		return err
 	}
 
-	s.Log.Info("Exchange deleted",
+	s.Log.Debug("Exchange deleted",
 		zap.String("exchange", deleteMethod.Exchange),
 		zap.Bool("if_unused", deleteMethod.IfUnused))
 
@@ -111,7 +111,7 @@ func (s *Server) handleExchangeUnbind(conn *protocol.Connection, channelID uint1
 		return err
 	}
 
-	s.Log.Info("Exchange unbound",
+	s.Log.Debug("Exchange unbound",
 		zap.String("destination", unbindMethod.Destination),
 		zap.String("source", unbindMethod.Source),
 		zap.String("routing_key", unbindMethod.RoutingKey))

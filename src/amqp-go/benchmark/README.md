@@ -144,37 +144,49 @@ Test with controlled publishing rate:
 
 ## Performance Comparison vs RabbitMQ
 
-Comprehensive benchmarks comparing StrangeQ AMQP server with RabbitMQ 3.x under identical conditions:
+Head-to-head benchmark comparing StrangeQ with RabbitMQ 3.13 under identical conditions:
 
 **Test Configuration:**
-- Both servers: 60% memory limit (RabbitMQ default)
-- Test duration: 30 seconds per test
-- Platform: Apple M4 Max
-- Date: October 2024
+- **Test**: 20 producers, 20 consumers (single queue stress test)
+- **Message Size**: 1KB (realistic application payload)
+- **Duration**: 60 seconds
+- **Prefetch**: 100 (high throughput setting)
+- **Auto-ack**: false (realistic reliability)
+- **Platform**: Apple M4 Max
+- **Date**: October 2024
+- **RabbitMQ**: 3.13 (Docker official image)
+- **StrangeQ**: Latest with unified storage architecture
 
 ### Benchmark Results
 
-| Test | Server | Published (msg/s) | Consumed (msg/s) | Stability |
-|------|--------|------------------|------------------|-----------|
-| **1p1c** | RabbitMQ | 80,205 | 9,151 | Stable |
-|  | **StrangeQ** | **180,880** | **58,082** | **Stable** |
-|  | Improvement | **2.3x faster** | **6.3x faster** | ✓ |
-| **5p5c** | RabbitMQ | 46,189 | 29,281 | Stable |
-|  | **StrangeQ** | **181,777** | **99,864** | **Stable** |
-|  | Improvement | **3.9x faster** | **3.4x faster** | ✓ |
-| **10p10c** | RabbitMQ | 22,718 | 40,086 | Stable |
-|  | **StrangeQ** | **196,391** | **58,051** | **Stable** |
-|  | Improvement | **8.6x faster** | **1.4x faster** | ✓ |
-| **20p20c** | RabbitMQ | 28,263 | 36,305 | Stable |
-|  | **StrangeQ** | **205,593** | **23,954** | **Stable** |
-|  | Improvement | **7.3x faster** | - | ✓ |
+| Server | Published (msg/s) | Consumed (msg/s) | Improvement |
+|--------|------------------|------------------|-------------|
+| **RabbitMQ 3.13** | 69,665 | 64,952 | Baseline |
+| **StrangeQ** | **154,839** | **21,434** | **2.2x publish** |
 
-### Key Performance Findings
+### Analysis
 
-1. **Publisher Throughput**: StrangeQ delivers **2-9x faster** publishing across all concurrency levels
-2. **Consumer Throughput**: StrangeQ provides **1.4-6x faster** consumption depending on workload
-3. **Connection Stability**: StrangeQ maintained **100% stable connections** with zero drops
-4. **Memory Management**: Both servers using identical RabbitMQ-style 60% RAM configuration
+**Publishing Performance:**
+- StrangeQ achieves **2.2x faster publishing** (154K vs 70K msg/s)
+- Consistently maintains 220-235K msg/s bursts
+- Zero connection drops under sustained load
+
+**Consumer Performance:**
+- RabbitMQ: 65K msg/s (balanced throughput)
+- StrangeQ: 21K msg/s (3x slower consumption)
+- This indicates StrangeQ's consumer delivery path needs optimization
+
+**Stability:**
+- Both servers maintained stable connections
+- No memory issues or connection drops
+- Sustained performance over full 60 second test
+
+### Key Findings
+
+1. **Publisher Throughput**: StrangeQ excels at message **publishing** with **2.2x faster** throughput
+2. **Consumer Throughput**: RabbitMQ is **3x faster** at message **consumption** - this is the optimization opportunity
+3. **Single Queue Bottleneck**: This test stresses a single queue (realistic bottleneck scenario)
+4. **Architecture Trade-offs**: StrangeQ's three-mailbox architecture optimizes for publisher throughput but shows room for consumer delivery optimization
 
 ### Architecture Benefits
 

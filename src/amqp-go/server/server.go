@@ -118,9 +118,6 @@ func (s *Server) handleConnection(conn net.Conn) {
 	// Start consumer delivery loop for this connection
 	go s.consumerDeliveryLoop(connection)
 
-	// Start memory monitor for RabbitMQ-style memory alarms
-	go s.memoryMonitor(connection)
-
 	// Process frames for this connection
 	s.processConnectionFrames(connection)
 
@@ -135,69 +132,7 @@ func (s *Server) handleConnection(conn net.Conn) {
 	}
 }
 
-// consumerInfo caches channel and consumer references for fast lookup
-
-// memoryMonitor monitors queue usage and implements RabbitMQ-style memory alarms.
-// When queue usage exceeds 90%, it sets Connection.Blocked = true to trigger publisher blocking.
-// When queue usage drops below 80%, it clears the block (hysteresis prevents oscillation).
-func (s *Server) memoryMonitor(conn *protocol.Connection) {
-	s.Log.Info("Starting memory monitor", zap.String("connection_id", conn.ID))
-
-	ticker := time.NewTicker(100 * time.Millisecond)
-	defer ticker.Stop()
-
-	const (
-		highWaterMark = 0.90 // Block publishers when queue usage > 90%
-		lowWaterMark  = 0.80 // Unblock publishers when queue usage < 80%
-	)
-
-	for {
-		select {
-		case <-ticker.C:
-			// Check if connection is closed
-			conn.Mutex.RLock()
-			closed := conn.Closed
-			conn.Mutex.RUnlock()
-
-			if closed {
-				s.Log.Debug("Connection closed, stopping memory monitor", zap.String("connection_id", conn.ID))
-				return
-			}
-
-			// Get current Channel mailbox usage (RabbitMQ-style memory alarm on data frames)
-			usage := conn.Mailboxes.Channel.Usage()
-			channelLen := conn.Mailboxes.Channel.Len()
-			heartbeatLen := conn.Mailboxes.Heartbeat.Len()
-			connectionLen := conn.Mailboxes.Connection.Len()
-
-			// Check if we need to change blocking state
-			conn.Mutex.Lock()
-			wasBlocked := conn.Blocked
-
-			if usage > highWaterMark && !wasBlocked {
-				// Trigger memory alarm - block publishers
-				conn.Blocked = true
-				s.Log.Warn("Memory alarm triggered - blocking publishers",
-					zap.String("connection_id", conn.ID),
-					zap.Float64("usage", usage),
-					zap.Int("channel_mailbox_len", channelLen),
-					zap.Int("heartbeat_mailbox_len", heartbeatLen),
-					zap.Int("connection_mailbox_len", connectionLen))
-			} else if usage < lowWaterMark && wasBlocked {
-				// Clear memory alarm - unblock publishers
-				conn.Blocked = false
-				s.Log.Info("Memory alarm cleared - unblocking publishers",
-					zap.String("connection_id", conn.ID),
-					zap.Float64("usage", usage),
-					zap.Int("channel_mailbox_len", channelLen),
-					zap.Int("heartbeat_mailbox_len", heartbeatLen),
-					zap.Int("connection_mailbox_len", connectionLen))
-			}
-
-			conn.Mutex.Unlock()
-		}
-	}
-}
+// NOTE: memoryMonitor implementation moved to server/memory_monitor.go for Phase 2 (lock-free unbounded channels)
 
 // processConnectionFrames reads and processes frames from a connection
 func (s *Server) processConnectionFrames(conn *protocol.Connection) {
@@ -534,10 +469,6 @@ func (s *Server) sendHeartbeats(conn *protocol.Connection, done chan struct{}) {
 	}
 }
 
-
-
-
-
 // processMethodFrame processes an incoming method frame
 func (s *Server) processMethodFrame(conn *protocol.Connection, frame *protocol.Frame) error {
 	// Check if it's a connection-level method (Channel 0)
@@ -564,9 +495,6 @@ func (s *Server) processMethodFrame(conn *protocol.Connection, frame *protocol.F
 		return fmt.Errorf("unknown class ID: %d", classID)
 	}
 }
-
-
-
 
 // processChannelMethod processes channel-level methods
 func (s *Server) processChannelMethod(conn *protocol.Connection, frame *protocol.Frame) error {
@@ -599,27 +527,6 @@ func (s *Server) processChannelMethod(conn *protocol.Connection, frame *protocol
 		return fmt.Errorf("unknown class ID: %d", classID)
 	}
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 // processBasicMethod handles basic-class methods
 func (s *Server) Stop() error {

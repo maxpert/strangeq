@@ -208,9 +208,8 @@ func (m *MemoryMetadataStore) StoreQueue(queue *protocol.Queue) error {
 	m.mutex.Lock()
 	defer m.mutex.Unlock()
 
-	// Make a copy
-	queueCopy := queue.Copy()
-	m.queues[queue.Name] = &queueCopy
+	// Store queue directly (actor model - no copy needed)
+	m.queues[queue.Name] = queue
 
 	return nil
 }
@@ -224,9 +223,8 @@ func (m *MemoryMetadataStore) GetQueue(name string) (*protocol.Queue, error) {
 		return nil, interfaces.ErrQueueNotFound
 	}
 
-	// Return a copy
-	queueCopy := queue.Copy()
-	return &queueCopy, nil
+	// Return queue directly (actor model handles concurrency)
+	return queue, nil
 }
 
 func (m *MemoryMetadataStore) DeleteQueue(name string) error {
@@ -247,8 +245,7 @@ func (m *MemoryMetadataStore) ListQueues() ([]*protocol.Queue, error) {
 
 	queues := make([]*protocol.Queue, 0, len(m.queues))
 	for _, queue := range m.queues {
-		queueCopy := queue.Copy()
-		queues = append(queues, &queueCopy)
+		queues = append(queues, queue)
 	}
 
 	return queues, nil

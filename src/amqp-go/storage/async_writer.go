@@ -14,12 +14,12 @@ import (
 // AsyncWriteBuffer batches writes for better performance
 // This eliminates synchronous disk I/O on the publish path
 type AsyncWriteBuffer struct {
-	db           *badger.DB
-	buffer       map[string]*protocol.Message // key -> message
-	bufferMutex  sync.RWMutex
-	flushChan    chan struct{}
-	stopChan     chan struct{}
-	wg           sync.WaitGroup
+	db          *badger.DB
+	buffer      map[string]*protocol.Message // key -> message
+	bufferMutex sync.RWMutex
+	flushChan   chan struct{}
+	stopChan    chan struct{}
+	wg          sync.WaitGroup
 
 	// Configuration
 	flushInterval time.Duration // How often to flush (default: 100ms)

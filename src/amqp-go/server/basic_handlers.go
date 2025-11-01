@@ -6,6 +6,7 @@ import (
 	"github.com/maxpert/amqp-go/protocol"
 	"go.uber.org/zap"
 )
+
 func (s *Server) processBasicMethod(conn *protocol.Connection, channelID uint16, methodID uint16, payload []byte) error {
 	switch methodID {
 	case protocol.BasicQos: // Method ID 10 for basic class
@@ -32,10 +33,6 @@ func (s *Server) processBasicMethod(conn *protocol.Connection, channelID uint16,
 		return fmt.Errorf("unknown basic method ID: %d", methodID)
 	}
 }
-
-
-
-
 
 // handleBasicQos handles the basic.qos method
 func (s *Server) handleBasicQos(conn *protocol.Connection, channelID uint16, payload []byte) error {
@@ -133,7 +130,6 @@ func (s *Server) handleBasicPublish(conn *protocol.Connection, channelID uint16,
 
 	return nil
 }
-
 
 // processHeaderFrame processes content header frames
 func (s *Server) processHeaderFrame(conn *protocol.Connection, frame *protocol.Frame) error {
@@ -273,7 +269,7 @@ func (s *Server) processBodyFrame(conn *protocol.Connection, frame *protocol.Fra
 
 // processCompleteMessage processes a message that has been fully received (method + header + body)
 func (s *Server) processCompleteMessage(conn *protocol.Connection, channelID uint16, pendingMsg *protocol.PendingMessage) error {
-	s.Log.Info("Processing complete message",
+	s.Log.Debug("Processing complete message",
 		zap.String("exchange", pendingMsg.Method.Exchange),
 		zap.String("routing_key", pendingMsg.Method.RoutingKey),
 		zap.Uint64("body_size", uint64(len(pendingMsg.Body))))
@@ -339,7 +335,7 @@ func (s *Server) handleBasicConsume(conn *protocol.Connection, channelID uint16,
 	channel, exists := conn.Channels[channelID]
 	conn.Mutex.RUnlock()
 
-	s.Log.Info("Basic consume requested",
+	s.Log.Debug("Basic consume requested",
 		zap.String("queue", consumeMethod.Queue),
 		zap.String("consumer_tag", consumeMethod.ConsumerTag),
 		zap.Bool("no_ack", consumeMethod.NoAck),
@@ -354,15 +350,14 @@ func (s *Server) handleBasicConsume(conn *protocol.Connection, channelID uint16,
 	// This is a simplified check - in a real implementation you'd verify queue exists
 	// For now, we'll proceed assuming the queue exists
 
-	// Determine buffer size based on prefetch count
-	// The buffer should accommodate prefetch messages plus a safety margin
-	// If prefetch is 0 (unlimited), use a reasonable default
+	// BOUNDED CHANNELS: Buffer size based on prefetch count
+	// This provides backpressure to prevent unbounded memory growth
 	bufferSize := int(channel.PrefetchCount)
 	if bufferSize == 0 {
 		// Default to 1000 for unlimited prefetch (RabbitMQ behavior)
 		bufferSize = 1000
 	} else {
-		// Add 50% margin to prefetch for better throughput
+		// 1.5x margin to prefetch for backpressure
 		bufferSize = bufferSize + (bufferSize / 2)
 	}
 
@@ -371,7 +366,7 @@ func (s *Server) handleBasicConsume(conn *protocol.Connection, channelID uint16,
 		bufferSize = 100
 	}
 
-	s.Log.Info("Creating consumer with buffer",
+	s.Log.Debug("Creating consumer with bounded channel",
 		zap.String("consumer_tag", consumeMethod.ConsumerTag),
 		zap.Uint16("prefetch_count", channel.PrefetchCount),
 		zap.Int("buffer_size", bufferSize))
@@ -384,7 +379,7 @@ func (s *Server) handleBasicConsume(conn *protocol.Connection, channelID uint16,
 		NoAck:     consumeMethod.NoAck,
 		Exclusive: consumeMethod.Exclusive,
 		Args:      consumeMethod.Arguments,
-		Messages:  make(chan *protocol.Delivery, bufferSize), // Buffer based on prefetch + margin
+		Messages:  make(chan *protocol.Delivery, bufferSize), // BOUNDED: Buffer based on prefetch + margin
 		Cancel:    make(chan struct{}, 1),                    // Channel to signal cancellation
 	}
 
@@ -413,12 +408,9 @@ func (s *Server) handleBasicConsume(conn *protocol.Connection, channelID uint16,
 		return err
 	}
 
-	s.Log.Info("Consumer registered",
+	s.Log.Debug("Consumer registered",
 		zap.String("consumer_tag", consumer.Tag),
 		zap.String("queue", consumer.Queue))
-
-	// In a real implementation, we would now start delivering messages
-	// to this consumer from the specified queue
 
 	return nil
 }
@@ -485,7 +477,7 @@ func (s *Server) handleBasicCancel(conn *protocol.Connection, channelID uint16, 
 		}
 	}
 
-	s.Log.Info("Consumer cancelled",
+	s.Log.Debug("Consumer cancelled",
 		zap.String("consumer_tag", cancelMethod.ConsumerTag))
 
 	return nil
@@ -522,11 +514,9 @@ func (s *Server) handleBasicGet(conn *protocol.Connection, channelID uint16, pay
 	return nil
 }
 
-
-
 // sendBasicDeliver sends a basic.deliver method frame to a consumer
 func (s *Server) sendBasicDeliver(conn *protocol.Connection, channelID uint16, consumerTag string, deliveryTag uint64, redelivered bool, exchange, routingKey string, message *protocol.Message) error {
-	s.Log.Info("ENTERING sendBasicDeliver function",
+	s.Log.Debug("ENTERING sendBasicDeliver function",
 		zap.String("consumer_tag", consumerTag),
 		zap.Uint16("channel_id", channelID),
 		zap.Uint64("delivery_tag", deliveryTag),
@@ -557,13 +547,13 @@ func (s *Server) sendBasicDeliver(conn *protocol.Connection, channelID uint16, c
 	// NOTE: We'll prepare all frames first, then send them atomically
 
 	// Continue with content header and body frames
-	s.Log.Info("Continuing with content header and body frames",
+	s.Log.Debug("Continuing with content header and body frames",
 		zap.String("consumer_tag", consumerTag),
 		zap.Uint16("channel_id", channelID))
 
 	// Send content header frame
 	// Create a content header frame with the message properties
-	s.Log.Info("Creating content header structure",
+	s.Log.Debug("Creating content header structure",
 		zap.String("consumer_tag", consumerTag),
 		zap.String("content_type", message.ContentType))
 
@@ -635,12 +625,12 @@ func (s *Server) sendBasicDeliver(conn *protocol.Connection, channelID uint16, c
 
 	contentHeader.PropertyFlags = propertyFlags
 
-	s.Log.Info("Property flags set",
+	s.Log.Debug("Property flags set",
 		zap.String("consumer_tag", consumerTag),
 		zap.Uint16("property_flags", propertyFlags))
 
 	// Use ContentHeader.Serialize() to get properly formatted header payload
-	s.Log.Info("About to serialize content header",
+	s.Log.Debug("About to serialize content header",
 		zap.String("consumer_tag", consumerTag))
 
 	headerPayload, err := contentHeader.Serialize()
@@ -649,7 +639,7 @@ func (s *Server) sendBasicDeliver(conn *protocol.Connection, channelID uint16, c
 		return fmt.Errorf("error serializing content header: %v", err)
 	}
 
-	s.Log.Info("Content header serialized successfully",
+	s.Log.Debug("Content header serialized successfully",
 		zap.String("consumer_tag", consumerTag),
 		zap.Int("payload_length", len(headerPayload)))
 
@@ -661,7 +651,7 @@ func (s *Server) sendBasicDeliver(conn *protocol.Connection, channelID uint16, c
 		zap.String("content_type", contentHeader.ContentType),
 		zap.Int("header_payload_length", len(headerPayload)))
 
-	s.Log.Info("Creating content header frame",
+	s.Log.Debug("Creating content header frame",
 		zap.String("consumer_tag", consumerTag),
 		zap.Uint16("channel_id", channelID),
 		zap.Uint64("body_size", uint64(len(message.Body))),
@@ -676,16 +666,16 @@ func (s *Server) sendBasicDeliver(conn *protocol.Connection, channelID uint16, c
 		Payload: headerPayload,
 	}
 
-	s.Log.Info("Header frame created",
+	s.Log.Debug("Header frame created",
 		zap.String("consumer_tag", consumerTag))
 
-	s.Log.Info("Sending content header frame",
+	s.Log.Debug("Sending content header frame",
 		zap.String("consumer_tag", consumerTag),
 		zap.Uint16("channel_id", channelID),
 		zap.Uint64("body_size", contentHeader.BodySize))
 
 	// Prepare all frames for atomic transmission
-	s.Log.Info("Preparing all frames for atomic transmission",
+	s.Log.Debug("Preparing all frames for atomic transmission",
 		zap.String("consumer_tag", consumerTag),
 		zap.Uint16("channel_id", channelID))
 
@@ -703,7 +693,7 @@ func (s *Server) sendBasicDeliver(conn *protocol.Connection, channelID uint16, c
 	}
 
 	// Send content body frame using the proper protocol function
-	s.Log.Info("Creating body frame",
+	s.Log.Debug("Creating body frame",
 		zap.String("consumer_tag", consumerTag),
 		zap.Uint16("channel_id", channelID),
 		zap.Int("body_size", len(message.Body)),
@@ -734,7 +724,7 @@ func (s *Server) sendBasicDeliver(conn *protocol.Connection, channelID uint16, c
 	allFrames = append(allFrames, headerFrameData...)
 	allFrames = append(allFrames, bodyFrameData...)
 
-	s.Log.Info("Writing all frames atomically",
+	s.Log.Debug("Writing all frames atomically",
 		zap.String("consumer_tag", consumerTag),
 		zap.Uint16("channel_id", channelID),
 		zap.Int("total_bytes", len(allFrames)),
@@ -752,12 +742,12 @@ func (s *Server) sendBasicDeliver(conn *protocol.Connection, channelID uint16, c
 		return fmt.Errorf("error sending frames atomically: %v", err)
 	}
 
-	s.Log.Info("Sent all frames atomically",
+	s.Log.Debug("Sent all frames atomically",
 		zap.String("consumer_tag", consumerTag),
 		zap.Uint16("channel_id", channelID),
 		zap.Int("body_size", len(message.Body)))
 
-	s.Log.Info("basic.deliver complete - all frames sent atomically",
+	s.Log.Debug("basic.deliver complete - all frames sent atomically",
 		zap.String("consumer_tag", consumerTag),
 		zap.Uint16("channel_id", channelID))
 
@@ -828,7 +818,7 @@ func (s *Server) handleBasicAck(conn *protocol.Connection, channelID uint16, pay
 		return err
 	}
 
-	s.Log.Info("Message acknowledged",
+	s.Log.Debug("Message acknowledged",
 		zap.String("consumer_tag", consumerTag),
 		zap.Uint64("delivery_tag", ackMethod.DeliveryTag),
 		zap.Bool("multiple", ackMethod.Multiple),
@@ -897,7 +887,7 @@ func (s *Server) handleBasicReject(conn *protocol.Connection, channelID uint16, 
 		return err
 	}
 
-	s.Log.Info("Message rejected",
+	s.Log.Debug("Message rejected",
 		zap.String("consumer_tag", consumerTag),
 		zap.Uint64("delivery_tag", rejectMethod.DeliveryTag),
 		zap.Bool("requeue", rejectMethod.Requeue),
@@ -968,7 +958,7 @@ func (s *Server) handleBasicNack(conn *protocol.Connection, channelID uint16, pa
 		return err
 	}
 
-	s.Log.Info("Message negatively acknowledged",
+	s.Log.Debug("Message negatively acknowledged",
 		zap.String("consumer_tag", consumerTag),
 		zap.Uint64("delivery_tag", nackMethod.DeliveryTag),
 		zap.Bool("multiple", nackMethod.Multiple),

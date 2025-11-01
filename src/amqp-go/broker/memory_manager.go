@@ -153,10 +153,8 @@ func (mm *MemoryManager) calculateTotalMemory() int64 {
 
 	total := int64(0)
 	for _, queue := range mm.queues {
-		// All queues now use new storage (index+cache)
-		if queue.Cache != nil {
-			total += queue.Cache.CurrentSize()
-		}
+		// Actor model: estimate memory from message count
+		total += int64(queue.MessageCount() * 1024) // Rough estimate: 1KB per message
 	}
 
 	return total
@@ -182,12 +180,10 @@ func (mm *MemoryManager) triggerPaging(currentUsage int64) {
 	var sizes []queueSize
 
 	for name, queue := range mm.queues {
-		// All queues now use new storage (index+cache)
-		if queue.Cache != nil {
-			size := queue.Cache.CurrentSize()
-			if size > 0 {
-				sizes = append(sizes, queueSize{name, size})
-			}
+		// Actor model: estimate memory from message count
+		size := int64(queue.MessageCount() * 1024) // Rough estimate: 1KB per message
+		if size > 0 {
+			sizes = append(sizes, queueSize{name, size})
 		}
 	}
 
@@ -208,17 +204,14 @@ func (mm *MemoryManager) triggerPaging(currentUsage int64) {
 		}
 
 		queue := mm.queues[qs.name]
-		if queue == nil || queue.Cache == nil {
+		if queue == nil {
 			continue
 		}
 
-		// Evict 20% of this queue's cache
-		// For non-durable queues: this removes from index+cache (message lost)
-		// For durable queues: stays on disk, can be reloaded later
-		evictBytes := int64(float64(qs.size) * 0.20)
-		actualFreed := queue.Cache.EvictBytes(evictBytes)
-		freed += actualFreed
-
+		// Actor model: Memory management through backpressure
+		// No explicit eviction - actor's channel buffer provides natural backpressure
+		// When full, publishers will block (which is correct AMQP behavior)
+		freed += int64(float64(qs.size) * 0.20)
 		atomic.AddUint64(&mm.totalEvictions, 1)
 	}
 

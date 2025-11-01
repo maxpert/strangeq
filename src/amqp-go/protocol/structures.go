@@ -106,96 +106,69 @@ type Binding struct {
 	Arguments  map[string]interface{}
 }
 
-// Queue represents an AMQP queue
+// Queue represents an AMQP queue using actor model (NO LOCKS!)
 type Queue struct {
 	Name       string
 	Durable    bool
 	AutoDelete bool
 	Exclusive  bool
 	Arguments  map[string]interface{}
+	Channel    *Channel // Reference back to parent channel
 
-	// Storage: Index+cache architecture (always enabled)
-	IndexManager *MessageIndexManager // Lightweight metadata (~64 bytes per message)
-	Cache        *MessageCache        // Bounded LRU cache for message bodies
-	MemoryLimit  int64                // Max cache size (bytes)
-
-	Mutex   sync.RWMutex
-	Channel *Channel // Reference back to parent channel
+	// Actor model - single goroutine processes all commands
+	Actor *QueueActor
 }
 
-// Copy returns a copy of the Queue without the mutex.
-// This is safe to use when you need to pass Queue by value.
-func (q *Queue) Copy() Queue {
-	// Copy arguments
-	argsCopy := make(map[string]interface{}, len(q.Arguments))
-	for k, v := range q.Arguments {
-		argsCopy[k] = v
+// NewQueue creates a new queue with actor model
+func NewQueue(name string, durable, autoDelete, exclusive bool, arguments map[string]interface{}) *Queue {
+	q := &Queue{
+		Name:       name,
+		Durable:    durable,
+		AutoDelete: autoDelete,
+		Exclusive:  exclusive,
+		Arguments:  arguments,
+		Actor:      NewQueueActor(name),
 	}
+	return q
+}
 
-	return Queue{
-		Name:       q.Name,
-		Durable:    q.Durable,
-		AutoDelete: q.AutoDelete,
-		Exclusive:  q.Exclusive,
-		Arguments:  argsCopy,
-		Channel:    q.Channel,
-		// Mutex, IndexManager, Cache not copied (reference types)
+// Enqueue adds a message to the queue (async, non-blocking)
+func (q *Queue) Enqueue(deliveryTag uint64, message *Message) {
+	q.Actor.Inbox <- &EnqueueCmd{
+		DeliveryTag: deliveryTag,
+		Message:     message,
 	}
 }
 
-// InitializeStorage initializes the index+cache storage architecture
-func (q *Queue) InitializeStorage(maxCacheSize int64) {
-	if maxCacheSize <= 0 {
-		maxCacheSize = DefaultMaxCacheSize
+// RegisterConsumer registers a consumer with the queue
+func (q *Queue) RegisterConsumer(consumer *Consumer) {
+	q.Actor.Inbox <- &RegisterConsumerCmd{
+		Consumer: consumer,
 	}
-
-	q.IndexManager = NewMessageIndexManager()
-	q.Cache = NewMessageCache(maxCacheSize)
-	q.MemoryLimit = maxCacheSize
 }
 
-// AddMessage adds a message to the queue storage
-func (q *Queue) AddMessage(deliveryTag uint64, message *Message) {
-	idx := NewMessageIndex(deliveryTag, message, q.Name)
-	q.IndexManager.Add(idx)
-	q.Cache.Put(idx.CacheKey, deliveryTag, message)
+// UnregisterConsumer removes a consumer from the queue
+func (q *Queue) UnregisterConsumer(consumerTag string) {
+	q.Actor.Inbox <- &UnregisterConsumerCmd{
+		ConsumerTag: consumerTag,
+	}
 }
 
-// GetMessage retrieves a message by delivery tag
-// Returns the message from cache if available, nil if not found
-func (q *Queue) GetMessage(deliveryTag uint64) (*Message, *MessageIndex) {
-	idx, found := q.IndexManager.Get(deliveryTag)
-	if !found {
-		return nil, nil
+// Ack acknowledges a message delivery
+func (q *Queue) Ack(consumerTag string) {
+	q.Actor.Inbox <- &AckCmd{
+		ConsumerTag: consumerTag,
 	}
-
-	if message, ok := q.Cache.Get(idx.CacheKey); ok {
-		return message, idx
-	}
-
-	// Cache miss - caller should load from disk
-	return nil, idx
 }
 
-// RemoveMessage removes a message from the queue storage
-func (q *Queue) RemoveMessage(deliveryTag uint64) bool {
-	idx, found := q.IndexManager.Get(deliveryTag)
-	if !found {
-		return false
-	}
-
-	q.Cache.Remove(idx.CacheKey)
-	return q.IndexManager.Remove(deliveryTag)
-}
-
-// MessageCount returns the number of messages in the queue
+// MessageCount returns the current queue depth
 func (q *Queue) MessageCount() int {
-	return q.IndexManager.Len()
+	return q.Actor.MessageCount()
 }
 
-// CacheStats returns cache statistics for this queue
-func (q *Queue) CacheStats() CacheStats {
-	return q.Cache.GetStats()
+// Stop stops the queue actor
+func (q *Queue) Stop() {
+	q.Actor.Stop()
 }
 
 // Message represents an AMQP message
@@ -254,14 +227,6 @@ type Consumer struct {
 	Cancel         chan struct{}
 	PrefetchCount  uint16 // Maximum number of unacknowledged messages
 	CurrentUnacked uint64 // Current count of unacknowledged messages
-}
-
-// ConsumerDelivery represents a message delivered to a consumer
-type ConsumerDelivery struct {
-	Tag          string
-	Delivery     *Delivery
-	Consumer     *Consumer
-	NotifyCancel chan string
 }
 
 // generateID generates a random ID string

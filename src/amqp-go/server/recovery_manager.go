@@ -325,7 +325,7 @@ func (r *RecoveryManager) UpdateDurableEntityMetadata(exchanges map[string]*prot
 	// Collect durable queues
 	for _, queue := range queues {
 		if queue.Durable {
-			metadata.Queues = append(metadata.Queues, queue.Copy())
+			metadata.Queues = append(metadata.Queues, *queue)
 		}
 	}
 

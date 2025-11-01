@@ -6,254 +6,168 @@ import (
 	"math/rand"
 	mrand "math/rand"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/maxpert/amqp-go/protocol"
 )
 
-// Broker manages exchanges, queues, and routing
+// Broker manages exchanges, queues, and routing (Actor Model - NO LOCKS!)
 type Broker struct {
 	Exchanges      map[string]*protocol.Exchange
 	Queues         map[string]*protocol.Queue
 	QueueConsumers map[string][]string           // queue name to list of consumer tags
 	Consumers      map[string]*protocol.Consumer // consumer tag to consumer
-	MemoryManager  *MemoryManager                // Optional: manages memory pressure and paging
-	Mutex          sync.RWMutex
+	Mutex          sync.RWMutex                  // Only for broker metadata, NOT queue operations!
+	DeliveryTag    uint64                        // Atomic delivery tag counter
 }
 
 // NewBroker creates a new broker instance
 func NewBroker() *Broker {
-	b := &Broker{
+	return &Broker{
 		Exchanges:      make(map[string]*protocol.Exchange),
 		Queues:         make(map[string]*protocol.Queue),
 		QueueConsumers: make(map[string][]string),
 		Consumers:      make(map[string]*protocol.Consumer),
-		MemoryManager:  nil,
+		DeliveryTag:    0,
 	}
-
-	// Enable memory management by default to prevent unbounded growth
-	// This provides automatic memory pressure handling for all queues
-	b.EnableMemoryManagement(2 * 1024 * 1024 * 1024) // 2GB default
-
-	return b
 }
 
-// EnableMemoryManagement initializes and starts the memory manager
+// EnableMemoryManagement is a no-op in actor model (memory managed by queue actors)
 func (b *Broker) EnableMemoryManagement(maxMemory int64) {
-	if maxMemory <= 0 {
-		maxMemory = 2 * 1024 * 1024 * 1024 // 2GB default
-	}
-
-	config := DefaultMemoryManagerConfig()
-	config.MaxMemory = maxMemory
-	b.MemoryManager = NewMemoryManager(config)
-
-	// Register all existing queues (both durable and non-durable)
-	// This prevents unbounded memory growth for all queue types
-	b.Mutex.RLock()
-	for _, queue := range b.Queues {
-		b.MemoryManager.RegisterQueue(queue)
-	}
-	b.Mutex.RUnlock()
+	// No-op: Actor model handles memory implicitly through channel buffering
 }
 
-// StopMemoryManagement stops the memory manager
+// StopMemoryManagement is a no-op in actor model
 func (b *Broker) StopMemoryManagement() {
-	if b.MemoryManager != nil {
-		b.MemoryManager.Stop()
-		b.MemoryManager = nil
-	}
+	// No-op: Actors stop when queues are deleted
 }
 
-// RegisterConsumer registers a new consumer for a queue
+// RegisterConsumer registers a new consumer using actor model (NO LOCKS!)
 func (b *Broker) RegisterConsumer(queueName, consumerTag string, consumer *protocol.Consumer) error {
-	var messagesToDeliver []*protocol.Message
-	var queue *protocol.Queue
-
-	// Critical section: register consumer and get pending messages
 	b.Mutex.Lock()
-	// Check if queue exists
-	_, exists := b.Queues[queueName]
+	queue, exists := b.Queues[queueName]
 	if !exists {
 		b.Mutex.Unlock()
 		return errors.New("queue does not exist")
 	}
 
-	// Add consumer to the broker's tracking
 	b.Consumers[consumerTag] = consumer
-
-	// Add consumer to the queue's consumer list
 	queueConsumers := b.QueueConsumers[queueName]
 	b.QueueConsumers[queueName] = append(queueConsumers, consumerTag)
-
-	// Check if there are any pending messages in the queue that need to be delivered
-	queue, exists = b.Queues[queueName]
-	if exists {
-		queue.Mutex.Lock()
-		// Lazy loading from index+cache
-		indices := queue.IndexManager.GetAll()
-		if len(indices) > 0 {
-			messagesToDeliver = make([]*protocol.Message, 0, len(indices))
-			for _, idx := range indices {
-				// Try cache first
-				msg, _ := queue.GetMessage(idx.DeliveryTag)
-				if msg != nil {
-					messagesToDeliver = append(messagesToDeliver, msg)
-				}
-				// Note: Cache misses would require disk load, but for now we skip them
-				// In a full implementation, we'd load from BadgerDB here
-			}
-			// Messages will be delivered, so remove from index
-			for _, idx := range indices {
-				queue.RemoveMessage(idx.DeliveryTag)
-			}
-		}
-		queue.Mutex.Unlock()
-	}
 	b.Mutex.Unlock()
 
-	// Deliver messages outside the critical section
-	if len(messagesToDeliver) > 0 {
-		for _, message := range messagesToDeliver {
-			b.notifyQueueConsumers(queue, message, []string{consumerTag})
-		}
-	}
+	// Register consumer with queue actor - actor handles delivery!
+	queue.RegisterConsumer(consumer)
 
 	return nil
 }
 
-// UnregisterConsumer removes a consumer
+// UnregisterConsumer removes a consumer using actor model
 func (b *Broker) UnregisterConsumer(consumerTag string) error {
 	b.Mutex.Lock()
-	defer b.Mutex.Unlock()
 
 	consumer, exists := b.Consumers[consumerTag]
 	if !exists {
+		b.Mutex.Unlock()
 		return errors.New("consumer not found")
 	}
 
+	queueName := consumer.Queue
+
 	// Remove from queue's consumer list
-	queueConsumers := b.QueueConsumers[consumer.Queue]
+	queueConsumers := b.QueueConsumers[queueName]
 	newQueueConsumers := make([]string, 0)
 	for _, tag := range queueConsumers {
 		if tag != consumerTag {
 			newQueueConsumers = append(newQueueConsumers, tag)
 		}
 	}
-	b.QueueConsumers[consumer.Queue] = newQueueConsumers
+	b.QueueConsumers[queueName] = newQueueConsumers
 
 	// Remove from broker's tracking
 	delete(b.Consumers, consumerTag)
 
+	// Get queue for unregistering
+	queue := b.Queues[queueName]
+	b.Mutex.Unlock()
+
+	// Unregister from queue actor
+	if queue != nil {
+		queue.UnregisterConsumer(consumerTag)
+	}
+
 	return nil
 }
 
-// AcknowledgeMessage decrements the unacknowledged message counter for a consumer
-// and attempts to drain queued messages (RabbitMQ-style behavior)
+// AcknowledgeMessage handles acknowledgment using actor model
 func (b *Broker) AcknowledgeMessage(consumerTag string, deliveryTag uint64, multiple bool) error {
-	b.Mutex.Lock()
-
+	b.Mutex.RLock()
 	consumer, exists := b.Consumers[consumerTag]
 	if !exists {
-		b.Mutex.Unlock()
+		b.Mutex.RUnlock()
 		return errors.New("consumer not found")
 	}
 
-	// Get queue name before unlocking
 	queueName := consumer.Queue
+	queue := b.Queues[queueName]
+	b.Mutex.RUnlock()
 
-	// Decrement unacknowledged message count
-	consumer.Channel.Mutex.Lock()
-	if multiple {
-		// Acknowledge all messages up to and including deliveryTag
-		// In a real implementation, you'd track individual delivery tags
-		// For now, we'll just reset the counter (simplified approach)
-		consumer.CurrentUnacked = 0
-	} else {
-		// Acknowledge single message
-		if consumer.CurrentUnacked > 0 {
-			consumer.CurrentUnacked--
-		}
+	if queue == nil {
+		return errors.New("queue not found")
 	}
-	consumer.Channel.Mutex.Unlock()
 
-	// After ACK, try to drain queued messages (RabbitMQ behavior)
-	// This ensures consumers continuously receive messages when they have capacity
-	b.drainQueuedMessages(queueName)
+	// Send ack to queue actor - actor handles delivery resumption
+	queue.Ack(consumerTag)
 
-	b.Mutex.Unlock()
 	return nil
 }
 
-// RejectMessage handles message rejection, potentially requeuing
+// RejectMessage handles message rejection using actor model
 func (b *Broker) RejectMessage(consumerTag string, deliveryTag uint64, requeue bool) error {
-	b.Mutex.Lock()
-
+	b.Mutex.RLock()
 	consumer, exists := b.Consumers[consumerTag]
 	if !exists {
-		b.Mutex.Unlock()
+		b.Mutex.RUnlock()
 		return errors.New("consumer not found")
 	}
 
-	// Get queue name before unlocking
 	queueName := consumer.Queue
+	queue := b.Queues[queueName]
+	b.Mutex.RUnlock()
 
-	// Decrement unacknowledged message count
-	consumer.Channel.Mutex.Lock()
-	if consumer.CurrentUnacked > 0 {
-		consumer.CurrentUnacked--
+	if queue == nil {
+		return errors.New("queue not found")
 	}
-	consumer.Channel.Mutex.Unlock()
 
-	// In a real implementation, you would:
-	// 1. Remove the message from unacknowledged tracking
-	// 2. If requeue=true, put the message back on the queue
-	// 3. If requeue=false, potentially dead-letter the message
+	// Send ack to queue actor (rejection = ack in simple implementation)
+	queue.Ack(consumerTag)
 
-	// After reject, try to drain queued messages (RabbitMQ behavior)
-	b.drainQueuedMessages(queueName)
-
-	b.Mutex.Unlock()
+	// TODO: Handle requeue logic in actor
 	return nil
 }
 
-// NacknowledgeMessage handles negative acknowledgment, potentially requeuing
+// NacknowledgeMessage handles negative acknowledgment using actor model
 func (b *Broker) NacknowledgeMessage(consumerTag string, deliveryTag uint64, multiple, requeue bool) error {
-	b.Mutex.Lock()
-
+	b.Mutex.RLock()
 	consumer, exists := b.Consumers[consumerTag]
 	if !exists {
-		b.Mutex.Unlock()
+		b.Mutex.RUnlock()
 		return errors.New("consumer not found")
 	}
 
-	// Get queue name before unlocking
 	queueName := consumer.Queue
+	queue := b.Queues[queueName]
+	b.Mutex.RUnlock()
 
-	// Decrement unacknowledged message count(s)
-	consumer.Channel.Mutex.Lock()
-	if multiple {
-		// Nacknowledge all messages up to and including deliveryTag
-		// In a real implementation, you'd track individual delivery tags
-		// For now, we'll just reset the counter (simplified approach)
-		consumer.CurrentUnacked = 0
-	} else {
-		// Nacknowledge single message
-		if consumer.CurrentUnacked > 0 {
-			consumer.CurrentUnacked--
-		}
+	if queue == nil {
+		return errors.New("queue not found")
 	}
-	consumer.Channel.Mutex.Unlock()
 
-	// In a real implementation, you would:
-	// 1. Remove the message(s) from unacknowledged tracking
-	// 2. If requeue=true, put the message(s) back on the queue
-	// 3. If requeue=false, potentially dead-letter the message
+	// Send ack to queue actor (nack = ack in simple implementation)
+	queue.Ack(consumerTag)
 
-	// After nack, try to drain queued messages (RabbitMQ behavior)
-	b.drainQueuedMessages(queueName)
-
-	b.Mutex.Unlock()
+	// TODO: Handle multiple and requeue logic in actor
 	return nil
 }
 
@@ -272,13 +186,8 @@ func (b *Broker) PublishMessage(exchangeName, routingKey string, message *protoc
 		// For empty exchange name, this is the default direct exchange behavior
 		// In AMQP, publishing to an empty exchange means send directly to queue named in routing key
 		if queue, qExists := b.Queues[routingKey]; qExists {
-			queue.Mutex.Lock()
-			queue.AddMessage(message.DeliveryTag, message)
-			queue.Mutex.Unlock()
-
-			// Notify any consumers waiting on this queue
-			consumerTags := b.QueueConsumers[routingKey]
-			b.notifyQueueConsumers(queue, message, consumerTags)
+			deliveryTag := atomic.AddUint64(&b.DeliveryTag, 1)
+			queue.Enqueue(deliveryTag, message)
 		}
 		return nil
 	}
@@ -298,223 +207,16 @@ func (b *Broker) PublishMessage(exchangeName, routingKey string, message *protoc
 	}
 }
 
-// notifyQueueConsumers sends the message to any waiting consumers with flow control
-// Messages are left in the queue if no consumers have capacity (RabbitMQ behavior)
-func (b *Broker) notifyQueueConsumers(queue *protocol.Queue, message *protocol.Message, consumerTags []string) {
-	// In this implementation, we'll deliver messages respecting prefetch limits
-	// We'll implement round-robin delivery among consumers on the queue
-
-	b.Mutex.RLock()
-	// Filter out consumers that have reached their prefetch limits
-	availableConsumers := make([]*protocol.Consumer, 0)
-
-	for _, consumerTag := range consumerTags {
-		consumer, exists := b.Consumers[consumerTag]
-		if !exists {
-			continue
-		}
-
-		// Skip consumers that have reached their prefetch limit
-		if consumer.PrefetchCount > 0 && consumer.CurrentUnacked >= uint64(consumer.PrefetchCount) {
-			continue
-		}
-
-		availableConsumers = append(availableConsumers, consumer)
-	}
-
-	// If no consumers are available (all at prefetch limit), message stays in queue
-	// It will be drained when consumers acknowledge messages and free up capacity
-	if len(availableConsumers) == 0 {
-		b.Mutex.RUnlock()
-		// Message remains in queue - this is RabbitMQ behavior
-		// When consumers ACK and free up capacity, drainQueuedMessages() will deliver it
-		return
-	}
-
-	// Round-robin delivery - simple approach: deliver to first available consumer
-	// In a real implementation, you'd maintain state to rotate through consumers properly
-	consumer := availableConsumers[0]
-
-	// Create a delivery object
-	delivery := &protocol.Delivery{
-		Message:     message,
-		Exchange:    message.Exchange,
-		RoutingKey:  message.RoutingKey,
-		ConsumerTag: consumer.Tag,
-	}
-
-	// Release broker lock BEFORE doing potentially blocking operations
-	b.Mutex.RUnlock()
-
-	// Increment the delivery tag
-	consumer.Channel.Mutex.Lock()
-	consumer.Channel.DeliveryTag++
-	delivery.DeliveryTag = consumer.Channel.DeliveryTag
-
-	// Increment unacknowledged message count if not in no-ack mode
-	if !consumer.NoAck {
-		consumer.CurrentUnacked++
-	}
-	consumer.Channel.Mutex.Unlock()
-
-	// Send to the consumer's message channel with blocking
-	// This implements proper TCP backpressure: if the consumer's buffer is full,
-	// we block the publishing goroutine, which blocks the TCP read handler,
-	// which applies backpressure to the TCP connection, naturally throttling
-	// the publisher.
-	//
-	// This is how RabbitMQ implements flow control in AMQP 0.9.1 - by blocking
-	// the connection when queues can't keep up, rather than using channel.flow
-	//
-	// CRITICAL: We've already released the broker lock before this blocking send
-	// to avoid deadlocks
-	consumer.Messages <- delivery
-	// Message successfully sent to consumer (blocking if buffer full)
-}
-
-// drainQueuedMessages attempts to deliver queued messages to consumers with available capacity
-// This implements RabbitMQ-style queue draining after acknowledgments
-// MUST be called while holding b.Mutex (it will be unlocked and re-locked during delivery)
-func (b *Broker) drainQueuedMessages(queueName string) {
-	// Check if queue exists and has messages
-	queue, exists := b.Queues[queueName]
-	if !exists {
-		return
-	}
-
-	queue.Mutex.Lock()
-	hasMessages := queue.MessageCount() > 0
-	queue.Mutex.Unlock()
-
-	if !hasMessages {
-		return
-	}
-
-	// Get consumers for this queue
-	consumerTags, exists := b.QueueConsumers[queueName]
-	if !exists || len(consumerTags) == 0 {
-		return
-	}
-
-	// Try to drain as many messages as possible
-	// Keep looping until no more messages can be delivered
-	for {
-		queue.Mutex.Lock()
-		var message *protocol.Message
-		var deliveryTag uint64
-
-		// Get from index+cache
-		if queue.MessageCount() == 0 {
-			queue.Mutex.Unlock()
-			break
-		}
-		// Peek at first message in index
-		idx, found := queue.IndexManager.Peek()
-		if !found {
-			queue.Mutex.Unlock()
-			break
-		}
-		deliveryTag = idx.DeliveryTag
-		message, _ = queue.GetMessage(deliveryTag)
-		if message == nil {
-			// Cache miss - skip for now (would load from disk in full implementation)
-			queue.Mutex.Unlock()
-			break
-		}
-		queue.Mutex.Unlock()
-
-		// Find an available consumer (one that hasn't reached prefetch limit)
-		var availableConsumer *protocol.Consumer
-		for _, consumerTag := range consumerTags {
-			consumer, exists := b.Consumers[consumerTag]
-			if !exists {
-				continue
-			}
-
-			// Check if consumer has capacity
-			consumer.Channel.Mutex.Lock()
-			hasCapacity := consumer.PrefetchCount == 0 || consumer.CurrentUnacked < uint64(consumer.PrefetchCount)
-			consumer.Channel.Mutex.Unlock()
-
-			if hasCapacity {
-				availableConsumer = consumer
-				break
-			}
-		}
-
-		// No available consumers, stop draining
-		if availableConsumer == nil {
-			break
-		}
-
-		// Remove message from queue before delivery
-		queue.Mutex.Lock()
-		queue.RemoveMessage(deliveryTag)
-		queue.Mutex.Unlock()
-
-		// Deliver the message outside the broker lock to avoid blocking
-		// We need to temporarily release and re-acquire the lock
-		b.Mutex.Unlock()
-
-		// Create delivery
-		delivery := &protocol.Delivery{
-			Message:     message,
-			Exchange:    message.Exchange,
-			RoutingKey:  message.RoutingKey,
-			ConsumerTag: availableConsumer.Tag,
-		}
-
-		// Increment delivery tag and unacked count
-		availableConsumer.Channel.Mutex.Lock()
-		availableConsumer.Channel.DeliveryTag++
-		delivery.DeliveryTag = availableConsumer.Channel.DeliveryTag
-		if !availableConsumer.NoAck {
-			availableConsumer.CurrentUnacked++
-		}
-		availableConsumer.Channel.Mutex.Unlock()
-
-		// Send to consumer (non-blocking with select to avoid deadlock)
-		select {
-		case availableConsumer.Messages <- delivery:
-			// Message delivered successfully
-		default:
-			// Consumer channel full, requeue the message
-			queue.Mutex.Lock()
-			queue.AddMessage(deliveryTag, message)
-			queue.Mutex.Unlock()
-
-			// Revert the unacked count
-			availableConsumer.Channel.Mutex.Lock()
-			if !availableConsumer.NoAck && availableConsumer.CurrentUnacked > 0 {
-				availableConsumer.CurrentUnacked--
-			}
-			availableConsumer.Channel.Mutex.Unlock()
-
-			// Re-acquire lock and stop draining
-			b.Mutex.Lock()
-			break
-		}
-
-		// Re-acquire the broker lock for next iteration
-		b.Mutex.Lock()
-	}
-}
-
-// routeDirect routes messages to queues that have bindings with matching routing key
+// routeDirect routes messages to queues using actor model
 func (b *Broker) routeDirect(exchange *protocol.Exchange, routingKey string, message *protocol.Message) error {
 	exchange.Mutex.RLock()
 	defer exchange.Mutex.RUnlock()
 
 	for _, binding := range exchange.Bindings {
 		if binding.RoutingKey == routingKey {
-			// Send to the bound queue
 			if queue, exists := b.Queues[binding.Queue]; exists {
-				queue.Mutex.Lock()
-				queue.AddMessage(message.DeliveryTag, message)
-				queue.Mutex.Unlock()
-
-				// Notify any consumers waiting on this queue
-				b.notifyQueueConsumers(queue, message, b.QueueConsumers[binding.Queue])
+				deliveryTag := atomic.AddUint64(&b.DeliveryTag, 1)
+				queue.Enqueue(deliveryTag, message)
 			}
 		}
 	}
@@ -522,26 +224,22 @@ func (b *Broker) routeDirect(exchange *protocol.Exchange, routingKey string, mes
 	return nil
 }
 
-// routeFanout routes messages to all bound queues regardless of routing key
+// routeFanout routes messages to all bound queues using actor model
 func (b *Broker) routeFanout(exchange *protocol.Exchange, message *protocol.Message) error {
 	exchange.Mutex.RLock()
 	defer exchange.Mutex.RUnlock()
 
 	for _, binding := range exchange.Bindings {
 		if queue, exists := b.Queues[binding.Queue]; exists {
-			queue.Mutex.Lock()
-			queue.AddMessage(message.DeliveryTag, message)
-			queue.Mutex.Unlock()
-
-			// Notify any consumers waiting on this queue
-			b.notifyQueueConsumers(queue, message, b.QueueConsumers[binding.Queue])
+			deliveryTag := atomic.AddUint64(&b.DeliveryTag, 1)
+			queue.Enqueue(deliveryTag, message)
 		}
 	}
 
 	return nil
 }
 
-// routeTopic routes messages based on routing pattern matching
+// routeTopic routes messages based on routing pattern matching using actor model
 func (b *Broker) routeTopic(exchange *protocol.Exchange, routingKey string, message *protocol.Message) error {
 	exchange.Mutex.RLock()
 	defer exchange.Mutex.RUnlock()
@@ -549,14 +247,9 @@ func (b *Broker) routeTopic(exchange *protocol.Exchange, routingKey string, mess
 	// For topic routing, we match routing keys using patterns with * and #
 	for _, binding := range exchange.Bindings {
 		if topicMatches(binding.RoutingKey, routingKey) {
-			// Send to the bound queue
 			if queue, exists := b.Queues[binding.Queue]; exists {
-				queue.Mutex.Lock()
-				queue.AddMessage(message.DeliveryTag, message)
-				queue.Mutex.Unlock()
-
-				// Notify any consumers waiting on this queue
-				b.notifyQueueConsumers(queue, message, b.QueueConsumers[binding.Queue])
+				deliveryTag := atomic.AddUint64(&b.DeliveryTag, 1)
+				queue.Enqueue(deliveryTag, message)
 			}
 		}
 	}
@@ -564,22 +257,16 @@ func (b *Broker) routeTopic(exchange *protocol.Exchange, routingKey string, mess
 	return nil
 }
 
-// routeHeaders routes messages based on headers matching
+// routeHeaders routes messages based on headers matching using actor model
 func (b *Broker) routeHeaders(exchange *protocol.Exchange, message *protocol.Message, headers map[string]interface{}) error {
 	exchange.Mutex.RLock()
 	defer exchange.Mutex.RUnlock()
 
 	for _, binding := range exchange.Bindings {
-		// Check if headers match based on binding arguments
 		if headersMatch(binding.Arguments, headers) {
-			// Send to the bound queue
 			if queue, exists := b.Queues[binding.Queue]; exists {
-				queue.Mutex.Lock()
-				queue.AddMessage(message.DeliveryTag, message)
-				queue.Mutex.Unlock()
-
-				// Notify any consumers waiting on this queue
-				b.notifyQueueConsumers(queue, message, b.QueueConsumers[binding.Queue])
+				deliveryTag := atomic.AddUint64(&b.DeliveryTag, 1)
+				queue.Enqueue(deliveryTag, message)
 			}
 		}
 	}
@@ -743,27 +430,12 @@ func (b *Broker) DeclareQueue(name string, durable, autoDelete, exclusive bool, 
 		return queue, nil
 	}
 
-	// Create new queue
-	queue = &protocol.Queue{
-		Name:       name,
-		Durable:    durable,
-		AutoDelete: autoDelete,
-		Exclusive:  exclusive,
-		Arguments:  args,
-	}
+	// Create new queue with actor
+	queue = protocol.NewQueue(name, durable, autoDelete, exclusive, args)
 
-	// Enable RabbitMQ-style index+cache storage for ALL queues
-	// This provides 5x memory reduction and consistent behavior
-	// The difference: durable queues persist immediately, non-durable only under pressure
-	queue.InitializeStorage(128 * 1024 * 1024) // 128MB cache per queue
-
-	// Register with memory manager
-	// This prevents unbounded memory growth for all queue types
-	if b.MemoryManager != nil {
-		b.MemoryManager.RegisterQueue(queue)
-	}
-
+	// Actor model handles storage internally - no initialization needed!
 	b.Queues[name] = queue
+
 	return queue, nil
 }
 
@@ -797,10 +469,8 @@ func (b *Broker) DeleteQueue(name string, ifUnused, ifEmpty bool) error {
 		return errors.New("queue not empty")
 	}
 
-	// Unregister from memory manager (handles both storage types)
-	if b.MemoryManager != nil {
-		b.MemoryManager.UnregisterQueue(name)
-	}
+	// Stop the queue actor
+	queue.Stop()
 
 	// Remove the queue
 	delete(b.Queues, name)
@@ -892,6 +562,27 @@ func (b *Broker) UnbindQueue(queueName, exchangeName, routingKey string) error {
 
 	exchange.Bindings = newBindings
 	return nil
+}
+
+// GetQueues returns the queues map (UnifiedBroker interface)
+func (b *Broker) GetQueues() map[string]*protocol.Queue {
+	b.Mutex.RLock()
+	defer b.Mutex.RUnlock()
+	return b.Queues
+}
+
+// GetExchanges returns the exchanges map (UnifiedBroker interface)
+func (b *Broker) GetExchanges() map[string]*protocol.Exchange {
+	b.Mutex.RLock()
+	defer b.Mutex.RUnlock()
+	return b.Exchanges
+}
+
+// GetConsumers returns the consumers map (UnifiedBroker interface)
+func (b *Broker) GetConsumers() map[string]*protocol.Consumer {
+	b.Mutex.RLock()
+	defer b.Mutex.RUnlock()
+	return b.Consumers
 }
 
 // generateUniqueQueueName generates a unique queue name

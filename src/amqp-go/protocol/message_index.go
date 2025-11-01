@@ -280,6 +280,17 @@ func (m *MessageIndexManager) GetAll() []*MessageIndex {
 	return result
 }
 
+// GetByIndex returns the message index at the given position (not delivery tag)
+func (m *MessageIndexManager) GetByIndex(pos int) *MessageIndex {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	if pos < 0 || pos >= len(m.indices) {
+		return nil
+	}
+	return m.indices[pos]
+}
+
 // Clear removes all indices
 func (m *MessageIndexManager) Clear() {
 	m.mu.Lock()

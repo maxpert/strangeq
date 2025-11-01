@@ -14,7 +14,7 @@ import (
 // BadgerMessageStore implements MessageStore interface using Badger database
 type BadgerMessageStore struct {
 	db          *badger.DB
-	ttl         time.Duration // Default TTL for messages
+	ttl         time.Duration     // Default TTL for messages
 	asyncWriter *AsyncWriteBuffer // Async write buffer for batching
 }
 
@@ -24,12 +24,12 @@ func NewBadgerMessageStore(dbPath string, ttl time.Duration) (*BadgerMessageStor
 	opts.Logger = nil // Disable badger's default logging to avoid noise
 
 	// Performance tuning for RabbitMQ-style workloads
-	opts.NumVersionsToKeep = 1           // We don't need MVCC history
-	opts.NumLevelZeroTables = 2          // Reduce memory for L0 tables
-	opts.NumLevelZeroTablesStall = 3     // Allow more L0 before stalling
-	opts.ValueThreshold = 1024           // Store values > 1KB in value log
-	opts.NumCompactors = 2               // Parallel compaction
-	opts.CompactL0OnClose = true         // Compact on shutdown
+	opts.NumVersionsToKeep = 1             // We don't need MVCC history
+	opts.NumLevelZeroTables = 2            // Reduce memory for L0 tables
+	opts.NumLevelZeroTablesStall = 3       // Allow more L0 before stalling
+	opts.ValueThreshold = 1024             // Store values > 1KB in value log
+	opts.NumCompactors = 2                 // Parallel compaction
+	opts.CompactL0OnClose = true           // Compact on shutdown
 	opts.BlockCacheSize = 64 * 1024 * 1024 // 64MB block cache
 
 	db, err := badger.Open(opts)

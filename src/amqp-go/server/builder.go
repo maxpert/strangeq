@@ -109,10 +109,10 @@ func (b *ServerBuilder) WithUnifiedBroker(unifiedBroker UnifiedBroker) *ServerBu
 	return b
 }
 
-// WithDefaultBroker uses the high-performance BrokerV2 (RabbitMQ-style architecture)
+// WithDefaultBroker uses the actor-based broker (RabbitMQ-style architecture)
 func (b *ServerBuilder) WithDefaultBroker() *ServerBuilder {
-	brokerV2 := broker.NewBrokerV2()
-	b.broker = &brokerWrapper{unifiedBroker: NewBrokerV2Adapter(brokerV2)}
+	simpleBroker := broker.NewBroker()
+	b.broker = &brokerWrapper{unifiedBroker: simpleBroker}
 	return b
 }
 

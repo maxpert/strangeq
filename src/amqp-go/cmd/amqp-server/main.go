@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/maxpert/amqp-go/config"
+	"github.com/maxpert/amqp-go/metrics"
 	"github.com/maxpert/amqp-go/server"
 	"golang.org/x/sys/unix"
 )
@@ -68,6 +69,10 @@ func main() {
 		// Memory management
 		memoryLimitPercent = flag.Int("memory-limit-percent", 60, "Memory limit as percentage of RAM (0-100, 0=use absolute)")
 		memoryLimitBytes   = flag.String("memory-limit-bytes", "0", "Absolute memory limit (e.g., 4GB, 0=use percent)")
+
+		// Telemetry (Prometheus metrics + pprof profiling)
+		enableTelemetry = flag.Bool("enable-telemetry", false, "Enable telemetry endpoint (Prometheus + pprof profiling)")
+		telemetryPort   = flag.Int("telemetry-port", 9419, "Telemetry HTTP server port")
 	)
 
 	flag.Parse()
@@ -134,6 +139,31 @@ func main() {
 		if err := finalizeDaemon(cfg.Server.LogFile); err != nil {
 			log.Fatalf("Failed to finalize daemon: %v", err)
 		}
+	}
+
+	// Start telemetry server if enabled
+	if *enableTelemetry {
+		telemetryServer := metrics.NewServer(*telemetryPort, true)
+
+		go func() {
+			if !cfg.Server.Daemonize || isDaemonChild() {
+				if isDaemonChild() {
+					log.Printf("Telemetry server listening on http://localhost:%d", *telemetryPort)
+					log.Printf("  Prometheus metrics: http://localhost:%d/metrics", *telemetryPort)
+					log.Printf("  Profiling enabled: http://localhost:%d/debug/pprof/", *telemetryPort)
+				} else {
+					fmt.Printf("Telemetry server listening on http://localhost:%d\n", *telemetryPort)
+					fmt.Printf("  Prometheus metrics: http://localhost:%d/metrics\n", *telemetryPort)
+					fmt.Printf("  Health check: http://localhost:%d/health\n", *telemetryPort)
+					fmt.Printf("  Profiling index: http://localhost:%d/debug/pprof/\n", *telemetryPort)
+					fmt.Printf("  CPU profile: curl -o cpu.prof http://localhost:%d/debug/pprof/profile?seconds=30\n", *telemetryPort)
+					fmt.Printf("  Mutex profile: curl -o mutex.prof http://localhost:%d/debug/pprof/mutex\n", *telemetryPort)
+				}
+			}
+			if err := telemetryServer.Start(); err != nil {
+				log.Printf("Telemetry server failed: %v", err)
+			}
+		}()
 	}
 
 	// Create and start server
