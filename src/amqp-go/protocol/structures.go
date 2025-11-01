@@ -6,6 +6,7 @@ import (
 	mrand "math/rand"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -113,10 +114,10 @@ type Queue struct {
 	AutoDelete bool
 	Exclusive  bool
 	Arguments  map[string]interface{}
-	Channel    *Channel // Reference back to parent channel
+	Channel    *Channel `json:"-"` // Reference back to parent channel (not serialized)
 
-	// Actor model - single goroutine processes all commands
-	Actor *QueueActor
+	// Actor model - single goroutine processes all commands (runtime state, not persisted)
+	Actor *QueueActor `json:"-"`
 }
 
 // NewQueue creates a new queue with actor model
@@ -134,6 +135,7 @@ func NewQueue(name string, durable, autoDelete, exclusive bool, arguments map[st
 
 // Enqueue adds a message to the queue (async, non-blocking)
 func (q *Queue) Enqueue(deliveryTag uint64, message *Message) {
+	q.EnsureActorInitialized()
 	q.Actor.Inbox <- &EnqueueCmd{
 		DeliveryTag: deliveryTag,
 		Message:     message,
@@ -142,6 +144,7 @@ func (q *Queue) Enqueue(deliveryTag uint64, message *Message) {
 
 // RegisterConsumer registers a consumer with the queue
 func (q *Queue) RegisterConsumer(consumer *Consumer) {
+	q.EnsureActorInitialized()
 	q.Actor.Inbox <- &RegisterConsumerCmd{
 		Consumer: consumer,
 	}
@@ -149,6 +152,7 @@ func (q *Queue) RegisterConsumer(consumer *Consumer) {
 
 // UnregisterConsumer removes a consumer from the queue
 func (q *Queue) UnregisterConsumer(consumerTag string) {
+	q.EnsureActorInitialized()
 	q.Actor.Inbox <- &UnregisterConsumerCmd{
 		ConsumerTag: consumerTag,
 	}
@@ -156,19 +160,30 @@ func (q *Queue) UnregisterConsumer(consumerTag string) {
 
 // Ack acknowledges a message delivery
 func (q *Queue) Ack(consumerTag string) {
+	q.EnsureActorInitialized()
 	q.Actor.Inbox <- &AckCmd{
 		ConsumerTag: consumerTag,
 	}
 }
 
+// EnsureActorInitialized ensures the Actor is initialized (called after deserialization or creation)
+func (q *Queue) EnsureActorInitialized() {
+	if q.Actor == nil {
+		q.Actor = NewQueueActor(q.Name)
+	}
+}
+
 // MessageCount returns the current queue depth
 func (q *Queue) MessageCount() int {
+	q.EnsureActorInitialized()
 	return q.Actor.MessageCount()
 }
 
 // Stop stops the queue actor
 func (q *Queue) Stop() {
-	q.Actor.Stop()
+	if q.Actor != nil {
+		q.Actor.Stop()
+	}
 }
 
 // Message represents an AMQP message
@@ -225,8 +240,8 @@ type Consumer struct {
 	Args           map[string]interface{}
 	Messages       chan *Delivery
 	Cancel         chan struct{}
-	PrefetchCount  uint16 // Maximum number of unacknowledged messages
-	CurrentUnacked uint64 // Current count of unacknowledged messages
+	PrefetchCount  uint16         // Maximum number of unacknowledged messages
+	CurrentUnacked atomic.Uint64  // Current count of unacknowledged messages (atomic for lock-free access)
 }
 
 // generateID generates a random ID string

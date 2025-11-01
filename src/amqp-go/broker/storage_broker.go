@@ -757,10 +757,7 @@ func (b *StorageBroker) AcknowledgeMessage(consumerTag string, deliveryTag uint6
 	}
 	consumer := val.(*protocol.Consumer)
 
-	// Update consumer's unacked count
-	consumer.Channel.Mutex.Lock()
-	defer consumer.Channel.Mutex.Unlock()
-
+	// Update consumer's unacked count atomically (lock-free!)
 	if multiple {
 		// Acknowledge all messages up to and including deliveryTag
 		// Get all pending acks for this consumer
@@ -776,7 +773,7 @@ func (b *StorageBroker) AcknowledgeMessage(consumerTag string, deliveryTag uint6
 				}
 			}
 		}
-		consumer.CurrentUnacked = 0
+		consumer.CurrentUnacked.Store(0)  // Atomic reset
 	} else {
 		// Acknowledge single message
 		// Atomic operation: remove pending ack and message together
@@ -795,8 +792,10 @@ func (b *StorageBroker) AcknowledgeMessage(consumerTag string, deliveryTag uint6
 			// Log error but don't fail acknowledgment completely
 		}
 
-		if consumer.CurrentUnacked > 0 {
-			consumer.CurrentUnacked--
+		// Atomic decrement (lock-free!)
+		current := consumer.CurrentUnacked.Load()
+		if current > 0 {
+			consumer.CurrentUnacked.Add(^uint64(0))  // Atomic decrement by 1 (two's complement of 1)
 		}
 	}
 
@@ -812,12 +811,10 @@ func (b *StorageBroker) RejectMessage(consumerTag string, deliveryTag uint64, re
 	}
 	consumer := val.(*protocol.Consumer)
 
-	// Update consumer's unacked count
-	consumer.Channel.Mutex.Lock()
-	defer consumer.Channel.Mutex.Unlock()
-
-	if consumer.CurrentUnacked > 0 {
-		consumer.CurrentUnacked--
+	// Update consumer's unacked count atomically (lock-free!)
+	current := consumer.CurrentUnacked.Load()
+	if current > 0 {
+		consumer.CurrentUnacked.Add(^uint64(0)) // Atomic decrement by 1
 	}
 
 	// Handle acknowledgment tracking for rejected message
@@ -850,10 +847,7 @@ func (b *StorageBroker) NacknowledgeMessage(consumerTag string, deliveryTag uint
 	}
 	consumer := val.(*protocol.Consumer)
 
-	// Update consumer's unacked count
-	consumer.Channel.Mutex.Lock()
-	defer consumer.Channel.Mutex.Unlock()
-
+	// Update consumer's unacked count atomically (lock-free!)
 	if multiple {
 		// Nacknowledge all messages up to and including deliveryTag
 		pendingAcks, err := b.storage.GetConsumerPendingAcks(consumerTag)
@@ -877,7 +871,7 @@ func (b *StorageBroker) NacknowledgeMessage(consumerTag string, deliveryTag uint
 				}
 			}
 		}
-		consumer.CurrentUnacked = 0
+		consumer.CurrentUnacked.Store(0) // Atomic reset
 	} else {
 		// Nacknowledge single message
 		pendingAck, err := b.storage.GetPendingAck(consumer.Queue, deliveryTag)
@@ -897,8 +891,10 @@ func (b *StorageBroker) NacknowledgeMessage(consumerTag string, deliveryTag uint
 			}
 		}
 
-		if consumer.CurrentUnacked > 0 {
-			consumer.CurrentUnacked--
+		// Atomic decrement (lock-free!)
+		current := consumer.CurrentUnacked.Load()
+		if current > 0 {
+			consumer.CurrentUnacked.Add(^uint64(0)) // Atomic decrement by 1
 		}
 	}
 

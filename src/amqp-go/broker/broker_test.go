@@ -2,6 +2,7 @@ package broker
 
 import (
 	"testing"
+	"time"
 
 	"github.com/maxpert/amqp-go/protocol"
 	"github.com/stretchr/testify/assert"
@@ -105,6 +106,9 @@ func TestDirectExchangeRouting(t *testing.T) {
 	err = broker.PublishMessage("test-exchange", "test-key", message)
 	assert.NoError(t, err)
 
+	// Give actor time to process (async)
+	time.Sleep(10 * time.Millisecond)
+
 	// Check that the message was routed to the queue
 	queue, exists := broker.Queues["test-queue"]
 	assert.True(t, exists)
@@ -142,6 +146,9 @@ func TestFanoutExchangeRouting(t *testing.T) {
 	err = broker.PublishMessage("test-exchange", "any-key", message)
 	assert.NoError(t, err)
 
+	// Give actor time to process (async)
+	time.Sleep(10 * time.Millisecond)
+
 	// Check that the message was routed to both queues
 	queue1, exists := broker.Queues["test-queue-1"]
 	assert.True(t, exists)
@@ -176,6 +183,9 @@ func TestTopicExchangeRouting(t *testing.T) {
 	// Publish message
 	err = broker.PublishMessage("test-exchange", "stock.usd.nyse", message)
 	assert.NoError(t, err)
+
+	// Give actor time to process (async)
+	time.Sleep(10 * time.Millisecond)
 
 	// Check that the message was routed to the queue
 	queue, exists := broker.Queues["test-queue-1"]

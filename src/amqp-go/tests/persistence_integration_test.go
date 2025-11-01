@@ -444,8 +444,8 @@ func TestAtomicOperations(t *testing.T) {
 			AutoDelete: false,
 			Exclusive:  false,
 			Arguments:  make(map[string]interface{}),
+			Actor:      protocol.NewQueueActor("atomic.test.queue"), // Initialize actor for queue
 		}
-		queue.InitializeStorage(0) // Initialize index+cache storage
 
 		err := txnStorage.StoreQueue(queue)
 		if err != nil {

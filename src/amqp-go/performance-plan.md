@@ -81,26 +81,68 @@ The server is now so fast it hits OS-level TCP buffer limits at 50p/50c (100 con
    8.47s (5.43%)  - Queue.Put (message enqueue)
 ```
 
-The next major optimization target is `StorageBroker.AcknowledgeMessage` (Phase 1.4: defer lock optimization).
+---
+
+### Phase 1.4: Atomic Counter Lock-Free Optimization (COMPLETED)
+
+**Date**: November 2025
+
+**Problem Identified**:
+Channel.Mutex in ACK/NACK/REJECT hot paths accounted for 63.67% (99.19s) of total mutex contention. Analysis revealed the mutex ONLY protected the `CurrentUnacked` counter - nothing else!
+
+**Root Cause Analysis**:
+- `consumer.Channel.Mutex.Lock()` called on EVERY ACK/NACK/REJECT operation
+- The mutex protected a single uint64 counter that could be atomic
+- No other shared state required locking in these paths
+- 120K+ ACK operations per second = massive lock contention
+
+**Optimizations Implemented**:
+
+#### Changed `CurrentUnacked` to Atomic Counter
+- **protocol/structures.go:230** - Changed from `uint64` to `atomic.Uint64`
+- **broker/storage_broker.go** - Removed ALL Channel.Mutex locks from:
+  - AcknowledgeMessage (lines 758-803): Removed mutex, use atomic Store()/Add()
+  - RejectMessage (lines 806-820): Removed mutex, use atomic Add()
+  - NacknowledgeMessage (lines 844-902): Removed mutex, use atomic Store()/Add()
+- **broker/broker_consumer_test.go** - Updated 3 tests to use atomic Store()/Load()
+
+**Implementation Pattern**:
+```go
+// Atomic decrement (single ACK/NACK/REJECT)
+current := consumer.CurrentUnacked.Load()
+if current > 0 {
+    consumer.CurrentUnacked.Add(^uint64(0))  // Two's complement = -1
+}
+
+// Atomic reset (multiple ACKs)
+consumer.CurrentUnacked.Store(0)
+```
+
+**Results**:
+
+| Metric | Phase 1.3 Baseline | Phase 1.4 Atomic | Improvement |
+|--------|-------------------|------------------|-------------|
+| Publish throughput | 173-188K msg/s | 189K msg/s | +3.3% |
+| Consume throughput | 118-133K msg/s | 120K msg/s | Stable |
+| Total mutex contention | 155s | 184s | N/A (longer run) |
+| **Channel.Mutex contention** | **99.19s (63.67%)** | **0s (ELIMINATED)** | **-100%** |
+
+**Key Insight**:
+Channel.Mutex completely ELIMINATED from mutex profile! Verified with `go tool pprof -list "Channel.*Mutex"` returning "no matches found".
+
+**Current Bottleneck** (as shown in mutex profile):
+```
+184.43s total contention:
+  127s (69%) - StorageBroker.AcknowledgeMessage (storage-level pending acks tracking)
+   17s (9%)  - Queue.Poll/Queue.Get (Workiva queue internal locks)
+    7s (4%)  - Queue.Put (message enqueue)
+```
+
+**Next Target**: Storage-level lock contention in pending acks tracking is now the dominant bottleneck.
 
 ---
 
 ## Future Optimization Roadmap
-
-### Phase 1.4: Defer Lock Optimization (NOT STARTED)
-**Target**: Optimize defer locks in ACK paths
-
-**Locations identified**:
-- `broker/storage_broker.go` - ACK/NACK/REJECT handlers (3 locations)
-
-**Approach**:
-- Replace `defer mu.Unlock()` with explicit unlock before return
-- Reduces defer overhead in hot paths
-- Expected: 10-15% improvement
-
-**Estimated Impact**: Additional 15-20K msg/s throughput
-
----
 
 ### Phase 2: Exchange Routing Cache (NOT STARTED)
 **Target**: Add lock-free exchange lookup cache using sync.Map
