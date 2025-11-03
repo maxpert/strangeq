@@ -3,7 +3,7 @@ module github.com/maxpert/amqp-go
 go 1.25.1
 
 require (
-	github.com/Workiva/go-datastructures v1.1.6
+	github.com/Workiva/go-datastructures v1.1.7
 	github.com/dgraph-io/badger/v4 v4.8.0
 	github.com/prometheus/client_golang v1.23.2
 	github.com/rabbitmq/amqp091-go v1.10.0
