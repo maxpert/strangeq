@@ -221,6 +221,7 @@ func TestMessageRejection(t *testing.T) {
 		t.Fatal("Did not receive message within timeout")
 	}
 }
+
 // TestMultipleConsumers tests multiple consumers on the same queue
 func TestMultipleConsumers(t *testing.T) {
 	// Start a server in a goroutine

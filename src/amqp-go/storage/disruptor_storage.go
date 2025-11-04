@@ -946,8 +946,8 @@ func (ds *DisruptorStorage) GetDurableEntityMetadata() (*protocol.DurableEntityM
 	}
 
 	metadata := &protocol.DurableEntityMetadata{
-		Exchanges:   []protocol.Exchange{},
-		Queues:      []protocol.Queue{},
+		Exchanges:   []*protocol.Exchange{},
+		Queues:      []*protocol.Queue{},
 		Bindings:    []protocol.Binding{},
 		LastUpdated: time.Now(),
 	}
@@ -959,7 +959,7 @@ func (ds *DisruptorStorage) GetDurableEntityMetadata() (*protocol.DurableEntityM
 	}
 	for _, exchange := range exchanges {
 		if exchange.Durable {
-			metadata.Exchanges = append(metadata.Exchanges, *exchange)
+			metadata.Exchanges = append(metadata.Exchanges, exchange)
 		}
 	}
 
@@ -970,7 +970,7 @@ func (ds *DisruptorStorage) GetDurableEntityMetadata() (*protocol.DurableEntityM
 	}
 	for _, queue := range queues {
 		if queue.Durable {
-			metadata.Queues = append(metadata.Queues, *queue)
+			metadata.Queues = append(metadata.Queues, queue)
 		}
 	}
 

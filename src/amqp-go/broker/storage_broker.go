@@ -821,8 +821,8 @@ func (b *StorageBroker) updateDurableMetadata() error {
 
 	// Create metadata structure
 	metadata := &protocol.DurableEntityMetadata{
-		Exchanges:   []protocol.Exchange{},
-		Queues:      []protocol.Queue{},
+		Exchanges:   []*protocol.Exchange{},
+		Queues:      []*protocol.Queue{},
 		Bindings:    allBindings,
 		LastUpdated: time.Now(),
 	}
@@ -830,14 +830,15 @@ func (b *StorageBroker) updateDurableMetadata() error {
 	// Filter durable exchanges
 	for _, exchange := range exchanges {
 		if exchange.Durable {
-			metadata.Exchanges = append(metadata.Exchanges, exchange.Copy())
+			exchangeCopy := exchange.Copy()
+			metadata.Exchanges = append(metadata.Exchanges, &exchangeCopy)
 		}
 	}
 
 	// Filter durable queues
 	for _, queue := range queues {
 		if queue.Durable {
-			metadata.Queues = append(metadata.Queues, *queue)
+			metadata.Queues = append(metadata.Queues, queue)
 		}
 	}
 

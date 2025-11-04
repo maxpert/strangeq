@@ -17,11 +17,11 @@ type PendingAck struct {
 
 // DurableEntityMetadata contains metadata about durable entities for recovery
 type DurableEntityMetadata struct {
-	// Exchange metadata
-	Exchanges []Exchange `json:"exchanges"`
+	// Exchange metadata (pointers to avoid copying sync primitives)
+	Exchanges []*Exchange `json:"exchanges"`
 
-	// Queue metadata
-	Queues []Queue `json:"queues"`
+	// Queue metadata (pointers to avoid copying sync primitives)
+	Queues []*Queue `json:"queues"`
 
 	// Binding metadata
 	Bindings []Binding `json:"bindings"`
