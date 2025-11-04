@@ -16,7 +16,8 @@ type consumerInfo struct {
 }
 
 // consumerDeliveryLoop continuously reads from consumer channels and sends messages to clients
-// LOCK-FREE: Uses message passing and channel operations only, no mutexes
+// Uses proper synchronization to safely access connection/channel state, then uses
+// lock-free channel operations for actual message delivery
 func (s *Server) consumerDeliveryLoop(conn *protocol.Connection) {
 	s.Log.Debug("Starting consumer delivery loop", zap.String("connection_id", conn.ID))
 
@@ -30,21 +31,37 @@ func (s *Server) consumerDeliveryLoop(conn *protocol.Connection) {
 	)
 
 	for {
-		// LOCK-FREE: Check if connection is closed
-		// Read conn.Closed without lock - worst case is one extra iteration with stale value
-		if conn.Closed {
+		// Check if connection is closed (with proper locking)
+		conn.Mutex.RLock()
+		closed := conn.Closed
+		conn.Mutex.RUnlock()
+
+		if closed {
 			s.Log.Debug("Connection closed, stopping consumer delivery loop", zap.String("connection_id", conn.ID))
 			return
 		}
 
-		// LOCK-FREE: Discover new consumers without locks
-		// We iterate through channels/consumers in a lock-free manner
-		// It's safe to read the maps without locks because:
-		// 1. We're only reading, not modifying
-		// 2. If we miss a new consumer this iteration, we'll catch it next time
-		// 3. Go map reads are safe with concurrent writes (worst case: stale data)
+		// Take a snapshot of channels while holding the lock
+		// This prevents data races with concurrent channel creation/deletion
+		conn.Mutex.RLock()
+		channelSnapshot := make([]*protocol.Channel, 0, len(conn.Channels))
 		for _, channel := range conn.Channels {
+			channelSnapshot = append(channelSnapshot, channel)
+		}
+		conn.Mutex.RUnlock()
+
+		// Now iterate through the snapshot (no locks needed on conn)
+		for _, channel := range channelSnapshot {
+			// Take a snapshot of consumers for this channel
+			channel.Mutex.RLock()
+			consumerSnapshot := make([]*protocol.Consumer, 0, len(channel.Consumers))
 			for _, consumer := range channel.Consumers {
+				consumerSnapshot = append(consumerSnapshot, consumer)
+			}
+			channel.Mutex.RUnlock()
+
+			// Process the consumer snapshot
+			for _, consumer := range consumerSnapshot {
 				// Add consumer info to our tracking map if not already there
 				if _, exists := consumerInfos[consumer.Tag]; !exists {
 					consumerInfos[consumer.Tag] = &consumerInfo{
