@@ -268,9 +268,7 @@ func (s *Server) readFrames(conn *protocol.Connection, done chan struct{}) {
 			}
 
 			// Mark connection as closed
-			conn.Mutex.Lock()
-			conn.Closed = true
-			conn.Mutex.Unlock()
+			conn.Closed.Store(true)
 
 			return
 		}
@@ -312,9 +310,7 @@ func (s *Server) processFrames(conn *protocol.Connection, done chan struct{}) {
 					zap.Error(err))
 
 				// Mark connection as closed on error
-				conn.Mutex.Lock()
-				conn.Closed = true
-				conn.Mutex.Unlock()
+				conn.Closed.Store(true)
 
 				return
 			}
@@ -368,13 +364,10 @@ func (s *Server) sendHeartbeats(conn *protocol.Connection, done chan struct{}) {
 		select {
 		case <-ticker.C:
 			// Check if connection is closed
-			conn.Mutex.RLock()
-			if conn.Closed {
-				conn.Mutex.RUnlock()
+			if conn.Closed.Load() {
 				s.Log.Debug("Connection closed, stopping heartbeat sender", zap.String("connection_id", conn.ID))
 				return
 			}
-			conn.Mutex.RUnlock()
 
 			// Send heartbeat frame
 			heartbeatFrame := &protocol.Frame{
@@ -390,9 +383,7 @@ func (s *Server) sendHeartbeats(conn *protocol.Connection, done chan struct{}) {
 					zap.Error(err))
 
 				// Mark connection as closed
-				conn.Mutex.Lock()
-				conn.Closed = true
-				conn.Mutex.Unlock()
+				conn.Closed.Store(true)
 
 				return
 			}

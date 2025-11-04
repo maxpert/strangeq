@@ -53,13 +53,11 @@ func (s *Server) handleBasicQos(conn *protocol.Connection, channelID uint16, pay
 		zap.Bool("global", qosMethod.Global))
 
 	// Get the channel
-	conn.Mutex.RLock()
-	channel, exists := conn.Channels[channelID]
-	conn.Mutex.RUnlock()
-
+	value, exists := conn.Channels.Load(channelID)
 	if !exists {
 		return fmt.Errorf("channel %d does not exist", channelID)
 	}
+	channel := value.(*protocol.Channel)
 
 	// Update channel prefetch settings
 	channel.Mutex.Lock()
@@ -112,11 +110,15 @@ func (s *Server) handleBasicPublish(conn *protocol.Connection, channelID uint16,
 
 	// Create a pending message to track this publication
 	// The full message will be completed when we receive the header and body frames
+	var channelRef *protocol.Channel
+	if value, ok := conn.Channels.Load(channelID); ok {
+		channelRef = value.(*protocol.Channel)
+	}
 	pendingMsg := &protocol.PendingMessage{
 		Method:   publishMethod,
 		Body:     make([]byte, 0),
 		Received: 0,
-		Channel:  conn.Channels[channelID], // Get the channel reference
+		Channel:  channelRef, // Get the channel reference
 	}
 
 	// Store the pending message for this channel
@@ -331,9 +333,11 @@ func (s *Server) handleBasicConsume(conn *protocol.Connection, channelID uint16,
 	}
 
 	// Get the channel
-	conn.Mutex.RLock()
-	channel, exists := conn.Channels[channelID]
-	conn.Mutex.RUnlock()
+	value, exists := conn.Channels.Load(channelID)
+	if !exists {
+		return fmt.Errorf("channel %d does not exist", channelID)
+	}
+	channel := value.(*protocol.Channel)
 
 	s.Log.Debug("Basic consume requested",
 		zap.String("queue", consumeMethod.Queue),
@@ -341,10 +345,6 @@ func (s *Server) handleBasicConsume(conn *protocol.Connection, channelID uint16,
 		zap.Bool("no_ack", consumeMethod.NoAck),
 		zap.Bool("exclusive", consumeMethod.Exclusive),
 		zap.Uint16("prefetch_count", channel.PrefetchCount))
-
-	if !exists {
-		return fmt.Errorf("channel %d does not exist", channelID)
-	}
 
 	// Check if queue exists in the broker
 	// This is a simplified check - in a real implementation you'd verify queue exists
@@ -434,13 +434,11 @@ func (s *Server) handleBasicCancel(conn *protocol.Connection, channelID uint16, 
 		zap.String("consumer_tag", cancelMethod.ConsumerTag))
 
 	// Get the channel
-	conn.Mutex.RLock()
-	channel, exists := conn.Channels[channelID]
-	conn.Mutex.RUnlock()
-
+	value, exists := conn.Channels.Load(channelID)
 	if !exists {
 		return fmt.Errorf("channel %d does not exist", channelID)
 	}
+	channel := value.(*protocol.Channel)
 
 	// Remove the consumer
 	channel.Mutex.Lock()

@@ -30,20 +30,17 @@ func (s *Server) consumerDeliveryLoop(conn *protocol.Connection) {
 	)
 
 	for {
-		// LOCK-FREE: Check if connection is closed
-		// Read conn.Closed without lock - worst case is one extra iteration with stale value
-		if conn.Closed {
+		// LOCK-FREE: Check if connection is closed using atomic operation
+		if conn.Closed.Load() {
 			s.Log.Debug("Connection closed, stopping consumer delivery loop", zap.String("connection_id", conn.ID))
 			return
 		}
 
-		// LOCK-FREE: Discover new consumers without locks
-		// We iterate through channels/consumers in a lock-free manner
-		// It's safe to read the maps without locks because:
-		// 1. We're only reading, not modifying
-		// 2. If we miss a new consumer this iteration, we'll catch it next time
-		// 3. Go map reads are safe with concurrent writes (worst case: stale data)
-		for _, channel := range conn.Channels {
+		// LOCK-FREE: Discover new consumers using sync.Map
+		// sync.Map.Range is concurrent-safe and lock-free for reads
+		conn.Channels.Range(func(key, value interface{}) bool {
+			channel := value.(*protocol.Channel)
+			channel.Mutex.RLock()
 			for _, consumer := range channel.Consumers {
 				// Add consumer info to our tracking map if not already there
 				if _, exists := consumerInfos[consumer.Tag]; !exists {
@@ -57,7 +54,9 @@ func (s *Server) consumerDeliveryLoop(conn *protocol.Connection) {
 						zap.String("queue", consumer.Queue))
 				}
 			}
-		}
+			channel.Mutex.RUnlock()
+			return true // continue iteration
+		})
 
 		// If we have no consumers, wait a bit and continue
 		if len(consumerInfos) == 0 {

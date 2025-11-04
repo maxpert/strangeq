@@ -8,6 +8,7 @@ import (
 
 	"github.com/maxpert/amqp-go/config"
 	"github.com/maxpert/amqp-go/interfaces"
+	"github.com/maxpert/amqp-go/protocol"
 )
 
 // LifecycleState represents the current state of the server
@@ -328,10 +329,14 @@ func (lm *LifecycleManager) GetStats() *interfaces.ServerStats {
 	consumerCount := 0
 
 	for _, conn := range lm.server.Connections {
-		channelCount += len(conn.Channels)
-		for _, ch := range conn.Channels {
+		conn.Channels.Range(func(key, value interface{}) bool {
+			channelCount++
+			ch := value.(*protocol.Channel)
+			ch.Mutex.RLock()
 			consumerCount += len(ch.Consumers)
-		}
+			ch.Mutex.RUnlock()
+			return true
+		})
 	}
 
 	// Get broker stats if available
@@ -369,12 +374,19 @@ func (lm *LifecycleManager) GetConnections() []interfaces.ConnectionInfo {
 			remoteAddr = conn.Conn.RemoteAddr().String()
 		}
 
+		// Count channels for this connection
+		channelCount := 0
+		conn.Channels.Range(func(key, value interface{}) bool {
+			channelCount++
+			return true
+		})
+
 		connInfo := interfaces.ConnectionInfo{
 			ID:            id,
 			RemoteAddress: remoteAddr,
 			Username:      "guest", // TODO: Add username field to Connection struct
 			VirtualHost:   conn.Vhost,
-			Channels:      len(conn.Channels),
+			Channels:      channelCount,
 			ConnectedAt:   time.Now(), // TODO: Add ConnectedAt field to Connection struct
 			LastActivity:  time.Now(), // TODO: Add LastActivity field to Connection struct
 		}

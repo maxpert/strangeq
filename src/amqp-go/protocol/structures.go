@@ -14,15 +14,15 @@ import (
 type Connection struct {
 	ID              string
 	Conn            net.Conn
-	Channels        map[uint16]*Channel
+	Channels        sync.Map                   // map[uint16]*Channel - concurrent-safe map
 	Vhost           string                     // Virtual host for this connection
 	Username        string                     // Authenticated username
 	PendingMessages map[uint16]*PendingMessage // Track messages being published on each channel
 	FrameQueue      chan *Frame                // Buffer frames between reader and processor goroutines
 	Mutex           sync.RWMutex               // Protects connection state
 	WriteMutex      sync.Mutex                 // Protects socket writes (heartbeat sender + frame processor both write)
-	Closed          bool
-	Blocked         bool // Back-pressure flag: true when queue usage > 90%, false when < 80%
+	Closed          atomic.Bool                // Atomic flag for connection closure
+	Blocked         bool                       // Back-pressure flag: true when queue usage > 90%, false when < 80%
 }
 
 // NewConnection creates a new AMQP connection
@@ -30,7 +30,7 @@ func NewConnection(conn net.Conn) *Connection {
 	return &Connection{
 		ID:              generateID(),
 		Conn:            conn,
-		Channels:        make(map[uint16]*Channel),
+		// Channels: sync.Map needs no initialization
 		PendingMessages: make(map[uint16]*PendingMessage),
 		FrameQueue:      make(chan *Frame, 10000), // 10K frame buffer for reader/processor separation
 	}

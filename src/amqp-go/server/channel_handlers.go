@@ -13,9 +13,7 @@ func (s *Server) processChannelSpecificMethod(conn *protocol.Connection, channel
 	case protocol.ChannelOpen: // Method ID 10 for channel class
 		// Create new channel
 		newChannel := protocol.NewChannel(channelID, conn)
-		conn.Mutex.Lock()
-		conn.Channels[channelID] = newChannel
-		conn.Mutex.Unlock()
+		conn.Channels.Store(channelID, newChannel)
 
 		s.Log.Debug("Channel opened",
 			zap.Uint16("channel_id", channelID),
@@ -30,8 +28,8 @@ func (s *Server) processChannelSpecificMethod(conn *protocol.Connection, channel
 			zap.String("connection_id", conn.ID))
 
 		// Clean up channel resources
-		conn.Mutex.Lock()
-		if channel, exists := conn.Channels[channelID]; exists {
+		if value, exists := conn.Channels.Load(channelID); exists {
+			channel := value.(*protocol.Channel)
 			// Cancel all consumers on this channel
 			channel.Mutex.Lock()
 			for consumerTag := range channel.Consumers {
@@ -44,9 +42,8 @@ func (s *Server) processChannelSpecificMethod(conn *protocol.Connection, channel
 			channel.Mutex.Unlock()
 
 			// Remove channel from connection
-			delete(conn.Channels, channelID)
+			conn.Channels.Delete(channelID)
 		}
-		conn.Mutex.Unlock()
 
 		// Send channel.close-ok
 		return s.sendChannelCloseOK(conn, channelID)

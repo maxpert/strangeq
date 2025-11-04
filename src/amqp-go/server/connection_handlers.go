@@ -275,9 +275,7 @@ func (s *Server) sendConnectionClose(conn *protocol.Connection, replyCode uint16
 	}
 
 	// Mark connection as closed
-	conn.Mutex.Lock()
-	conn.Closed = true
-	conn.Mutex.Unlock()
+	conn.Closed.Store(true)
 
 	return nil
 }
