@@ -1,0 +1,43 @@
+# Example AMQP-Go Server Configuration
+# Minimal configuration for getting started
+
+network:
+  address: :5672
+  port: 5672
+  maxconnections: 1000
+
+storage:
+  backend: badger
+  path: ./data
+  persistent: true
+  # Disable sync writes for better performance (less durable)
+  syncwrites: false
+
+security:
+  # Enable TLS in production
+  tlsenabled: false
+  # tlscertfile: /path/to/cert.pem
+  # tlskey file: /path/to/key.pem
+
+  # Enable authentication in production
+  authenticationenabled: false
+  # authenticationfilepath: ./auth.json
+
+server:
+  loglevel: info
+  # Uncomment to write logs to file
+  # logfile: /var/log/amqp-server.log
+
+  # Run as daemon (background process)
+  daemonize: false
+  # pidfile: /var/run/amqp-server.pid
+
+# Optional: Tune engine parameters for your workload
+# See config.sample.yaml for all available options
+engine:
+  # Larger ring buffer = less disk I/O (more memory usage)
+  ringbuffersize: 65536  # 64K messages
+
+  # WAL batch settings (balance throughput vs latency)
+  walbatchsize: 1000
+  walbatchtimeout: 10ms

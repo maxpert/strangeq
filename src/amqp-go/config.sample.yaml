@@ -1,0 +1,238 @@
+# AMQP-Go Server Configuration
+# Complete configuration file with all available options and their defaults
+# Load with: amqp-server --config config.yaml
+# Override any setting with environment variables: AMQP_NETWORK_PORT=15672
+
+# ============================================================================
+# Network Configuration
+# ============================================================================
+network:
+  # Server bind address (format: "host:port" or ":port")
+  address: :5672
+
+  # AMQP protocol port (standard: 5672, TLS: 5671)
+  port: 5672
+
+  # Maximum concurrent client connections
+  maxconnections: 1000
+
+  # Connection timeout for initial handshake
+  connectiontimeout: 30s
+
+  # AMQP heartbeat interval (0 = disabled)
+  heartbeatinterval: 1m0s
+
+  # Enable TCP keep-alive probes
+  tcpkeepalive: true
+
+  # TCP keep-alive probe interval
+  tcpkeepaliveinterval: 30s
+
+  # TCP read buffer size (bytes)
+  readbuffersize: 8192
+
+  # TCP write buffer size (bytes)
+  writebuffersize: 8192
+
+# ============================================================================
+# Storage Configuration
+# ============================================================================
+storage:
+  # Storage backend type (currently only "badger" is supported)
+  backend: badger
+
+  # Directory path for persistent storage
+  path: ./data
+
+  # Backend-specific options (map of key-value pairs)
+  options: {}
+
+  # Enable persistent storage (false = in-memory only)
+  persistent: true
+
+  # Enable synchronous writes (impacts performance, increases durability)
+  syncwrites: false
+
+  # Message TTL in milliseconds (0 = no expiration)
+  messagettl: 0
+
+  # Storage cache size in bytes (default: 64 MB)
+  cachesize: 67108864
+
+  # Maximum number of open files for storage backend
+  maxopenfiles: 100
+
+  # Interval between automatic compaction runs
+  compactionage: 24h0m0s
+
+  # Interval for checkpointing consumer offsets to disk
+  offsetcheckpointinterval: 5s
+
+# ============================================================================
+# Security Configuration
+# ============================================================================
+security:
+  # Enable TLS/SSL encryption
+  tlsenabled: false
+
+  # Path to TLS certificate file (required if TLS enabled)
+  tlscertfile: ""
+
+  # Path to TLS private key file (required if TLS enabled)
+  tlskeyfile: ""
+
+  # Path to TLS CA certificate file (optional, for client verification)
+  tlscafile: ""
+
+  # Enable client authentication
+  authenticationenabled: false
+
+  # Authentication backend type ("file" or "ldap")
+  authenticationbackend: file
+
+  # Backend-specific authentication configuration
+  authenticationconfig: {}
+
+  # Path to authentication credentials file (for file backend)
+  authenticationfilepath: ./auth.json
+
+  # Supported SASL authentication mechanisms
+  authmechanisms:
+    - PLAIN
+
+  # Enable authorization (access control)
+  authorizationenabled: false
+
+  # Default virtual host for connections
+  defaultvhost: /
+
+  # Whitelist of allowed usernames (empty = all allowed)
+  allowedusers: []
+
+  # Blacklist of blocked usernames
+  blockedusers: []
+
+  # Whitelist of allowed client hostnames/IPs (empty = all allowed)
+  allowedhosts: []
+
+  # Blacklist of blocked client hostnames/IPs
+  blockedhosts: []
+
+# ============================================================================
+# Server Configuration
+# ============================================================================
+server:
+  # Server identification name
+  name: amqp-go-server
+
+  # Server version string
+  version: 0.9.1
+
+  # Product name
+  product: AMQP-Go
+
+  # Platform identifier
+  platform: Go
+
+  # Copyright notice
+  copyright: Maxpert AMQP-Go Server
+
+  # Logging level (debug, info, warn, error)
+  loglevel: info
+
+  # Log file path (empty = stdout)
+  logfile: ""
+
+  # PID file path for daemon mode (empty = no PID file)
+  pidfile: ""
+
+  # Run as background daemon process
+  daemonize: false
+
+  # Maximum channels per client connection (AMQP spec max: 2047)
+  maxchannelsperconnection: 2047
+
+  # Maximum AMQP frame size in bytes (default: 128 KB)
+  maxframesize: 131072
+
+  # Maximum message size in bytes (default: 16 MB)
+  maxmessagesize: 16777216
+
+  # Channel operation timeout
+  channeltimeout: 1m0s
+
+  # Message delivery timeout
+  messagetimeout: 30s
+
+  # Interval for cleanup tasks (expired messages, etc.)
+  cleanupinterval: 5m0s
+
+  # Memory limit as percentage of total RAM (0-100, 0 = use absolute)
+  # RabbitMQ default: 60% (triggers flow control when exceeded)
+  memorylimitpercent: 60
+
+  # Absolute memory limit in bytes (0 = use percentage)
+  memorylimitbytes: 0
+
+# ============================================================================
+# Engine Configuration (Performance Tuning)
+# ============================================================================
+engine:
+  # Available channel buffer size (queue state management)
+  # Phase 6E: 10M slots = ~80 MB per queue
+  availablechannelbuffer: 10000000
+
+  # Ring buffer size for hot-path message storage (must be power of 2)
+  # Phase 6G: 64K messages = ~6.5 MB per queue (increased from 64K)
+  # Larger sizes reduce disk I/O by keeping more messages in memory
+  ringbuffersize: 65536
+
+  # Spill threshold percentage (when to start writing to WAL)
+  # 80% = start spilling at 51,200 messages (for 64K ring)
+  spillthresholdpercent: 80
+
+  # Write-Ahead Log (WAL) batch size for fsync
+  # Higher = better throughput, slightly higher latency
+  walbatchsize: 1000
+
+  # Maximum time to wait before flushing WAL batch
+  # Lower = lower latency, slightly lower throughput
+  walbatchtimeout: 10ms
+
+  # Maximum size of each WAL file before rotation
+  walfilesize: 536870912  # 512 MB
+
+  # WAL write request channel buffer size
+  walchannelbuffer: 10000
+
+  # Segment file size for cold storage
+  segmentsize: 1073741824  # 1 GB
+
+  # Interval for segment checkpoint operations
+  segmentcheckpointinterval: 5m0s
+
+  # Compaction threshold (0.0-1.0, fraction of deleted messages)
+  # 0.5 = compact when 50% of segment is deleted messages
+  compactionthreshold: 0.5
+
+  # Interval between compaction checks
+  compactioninterval: 30m0s
+
+  # Consumer select timeout (how long to wait for messages)
+  # Lower = more responsive but higher CPU usage
+  consumerselecttimeout: 500µs
+
+  # Maximum messages to deliver to a consumer per batch
+  consumermaxbatchsize: 100
+
+  # Interval for checking and removing expired messages
+  expiredmessagecheckinterval: 1m0s
+
+  # Interval for WAL cleanup (removing fully-processed WAL files)
+  walcleanupcheckinterval: 5m0s
+
+  # Number of acknowledged offsets to delete per cleanup cycle
+  offsetcleanupbatchsize: 1000
+
+  # Interval for cleaning up acknowledged message offsets
+  offsetcleanupinterval: 30s

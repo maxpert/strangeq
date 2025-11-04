@@ -17,7 +17,8 @@ func TestDefaultConfig(t *testing.T) {
 	assert.Equal(t, ":5672", config.Network.Address)
 	assert.Equal(t, 5672, config.Network.Port)
 	assert.Equal(t, 1000, config.Network.MaxConnections)
-	assert.Equal(t, "memory", config.Storage.Backend)
+	assert.Equal(t, "badger", config.Storage.Backend)
+	assert.Equal(t, "./data", config.Storage.Path)
 	assert.Equal(t, false, config.Security.TLSEnabled)
 	assert.Equal(t, "amqp-go-server", config.Server.Name)
 
@@ -64,14 +65,6 @@ func TestConfigValidation(t *testing.T) {
 			name: "empty storage backend",
 			modify: func(c *AMQPConfig) {
 				c.Storage.Backend = ""
-			},
-			wantErr: true,
-		},
-		{
-			name: "persistent storage without path",
-			modify: func(c *AMQPConfig) {
-				c.Storage.Backend = "bbolt"
-				c.Storage.Path = ""
 			},
 			wantErr: true,
 		},
@@ -159,17 +152,51 @@ func TestConfigLoadInvalidJSON(t *testing.T) {
 	assert.Error(t, err)
 }
 
-func TestConfigLoadUnsupportedFormat(t *testing.T) {
+func TestConfigLoadYAML(t *testing.T) {
 	tmpDir := t.TempDir()
 	configFile := filepath.Join(tmpDir, "test.yaml")
 
-	err := os.WriteFile(configFile, []byte("test: value"), 0644)
+	yamlContent := `
+network:
+  address: ":8080"
+  port: 8080
+  maxconnections: 1000
+  connectiontimeout: 30s
+storage:
+  backend: badger
+  path: ./test-data
+server:
+  loglevel: debug
+  maxchannelsperconnection: 2047
+  maxframesize: 131072
+  maxmessagesize: 16777216
+engine:
+  availablechannelbuffer: 10000000
+  ringbuffersize: 65536
+  spillthresholdpercent: 80
+  walbatchsize: 1000
+  walbatchtimeout: 10ms
+  walfilesize: 536870912
+  walchannelbuffer: 10000
+  segmentsize: 1073741824
+  segmentcheckpointinterval: 5m
+  compactionthreshold: 0.5
+  compactioninterval: 30m
+  consumerselecttimeout: 500µs
+  consumermaxbatchsize: 100
+  expiredmessagecheckinterval: 1m
+  walcleanupcheckinterval: 5m
+  offsetcleanupbatchsize: 1000
+  offsetcleanupinterval: 30s
+`
+	err := os.WriteFile(configFile, []byte(yamlContent), 0644)
 	require.NoError(t, err)
 
 	config := &AMQPConfig{}
 	err = config.Load(configFile)
-	assert.Error(t, err)
-	assert.Contains(t, err.Error(), "unsupported configuration format")
+	assert.NoError(t, err)
+	assert.Equal(t, ":8080", config.Network.Address)
+	assert.Equal(t, "debug", config.Server.LogLevel)
 }
 
 func TestConfigBuilder(t *testing.T) {

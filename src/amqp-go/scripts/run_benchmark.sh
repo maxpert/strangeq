@@ -11,6 +11,7 @@ CONSUMERS=${3:-50}
 DURATION=${4:-30s}
 PREFETCH=${5:-100}
 SIZE=${6:-1024}
+STORAGE_PATH="/tmp/amqp-storage-$VERSION"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
@@ -31,6 +32,7 @@ echo ""
 echo "[1/8] Cleaning up existing processes..."
 pkill -9 amqp-server || true
 pkill -9 perftest || true
+rm -rf /tmp/amqp-storage-* || true
 sleep 1
 
 # Step 2: Build
@@ -46,9 +48,9 @@ fi
 echo "[3/8] Creating results directory..."
 mkdir -p "$PROFILE_DIR"
 
-# Step 4: Start server with telemetry enabled
-echo "[4/8] Starting server with telemetry enabled..."
-./amqp-server --enable-telemetry --telemetry-port 9419 > "$PROFILE_DIR/server.log" 2>&1 &
+# Step 4: Start server with telemetry and persistence enabled
+echo "[4/8] Starting server with telemetry and persistence enabled..."
+./amqp-server --storage badger --storage-path "$STORAGE_PATH" --enable-telemetry --telemetry-port 9419 > "$PROFILE_DIR/server.log" 2>&1 &
 SERVER_PID=$!
 echo "Server PID: $SERVER_PID"
 sleep 2

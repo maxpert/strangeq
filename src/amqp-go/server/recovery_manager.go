@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/maxpert/amqp-go/broker"
 	"github.com/maxpert/amqp-go/interfaces"
 	"github.com/maxpert/amqp-go/protocol"
 	"go.uber.org/zap"
@@ -236,18 +237,19 @@ func (r *RecoveryManager) recoverPersistentMessages(stats *protocol.RecoveryStat
 		for _, message := range messages {
 			// Only recover messages with DeliveryMode=2 (persistent)
 			if message.DeliveryMode == 2 {
-				// For recovery, we need to republish the message to ensure proper routing
-				err := r.broker.PublishMessage(message.Exchange, message.RoutingKey, message)
+				// Load message directly into ring buffer WITHOUT re-writing to WAL
+				// Messages are already in WAL, we're loading FROM WAL into memory
+				err := r.storage.LoadMessageFromRecovery(queueName, message)
 				if err != nil {
-					r.logger.Error("Failed to recover persistent message",
+					r.logger.Error("Failed to load recovered message into ring buffer",
 						zap.String("queue", queueName),
 						zap.Uint64("delivery_tag", message.DeliveryTag),
 						zap.Error(err))
 					stats.ValidationErrors = append(stats.ValidationErrors,
-						fmt.Sprintf("Failed to recover message in queue %s: %v", queueName, err))
+						fmt.Sprintf("Failed to load message in queue %s: %v", queueName, err))
 				} else {
 					stats.PersistentMessagesRecovered++
-					r.logger.Debug("Recovered persistent message",
+					r.logger.Debug("Loaded recovered message into ring buffer",
 						zap.String("queue", queueName),
 						zap.Uint64("delivery_tag", message.DeliveryTag))
 				}
@@ -274,28 +276,51 @@ func (r *RecoveryManager) recoverPendingAcknowledgments(stats *protocol.Recovery
 		r.logger.Warn("Failed to cleanup expired acknowledgments", zap.Error(err))
 	}
 
-	// For each pending acknowledgment, we need to decide what to do
-	for _, pendingAck := range pendingAcks {
-		// Check if the acknowledgment is too old (potential zombie)
-		age := time.Since(pendingAck.DeliveredAt)
-		if age > expiredCutoff {
-			// Remove expired acknowledgment
-			err := r.storage.DeletePendingAck(pendingAck.QueueName, pendingAck.DeliveryTag)
-			if err != nil {
-				r.logger.Warn("Failed to delete expired pending ack",
-					zap.String("queue", pendingAck.QueueName),
-					zap.Uint64("delivery_tag", pendingAck.DeliveryTag),
-					zap.Error(err))
+	// CRITICAL FIX: Rebuild global delivery index during crash recovery
+	// This ensures ACKs can be routed correctly after server restart
+	if storageBroker, ok := r.broker.(*broker.StorageBroker); ok {
+		for _, pendingAck := range pendingAcks {
+			// Check if the acknowledgment is too old (potential zombie)
+			age := time.Since(pendingAck.DeliveredAt)
+			if age > expiredCutoff {
+				// Remove expired acknowledgment (don't rebuild index for it)
+				err := r.storage.DeletePendingAck(pendingAck.QueueName, pendingAck.DeliveryTag)
+				if err != nil {
+					r.logger.Warn("Failed to delete expired pending ack",
+						zap.String("queue", pendingAck.QueueName),
+						zap.Uint64("delivery_tag", pendingAck.DeliveryTag),
+						zap.Error(err))
+				}
+				continue
 			}
-			continue
-		}
 
-		stats.PendingAcksRecovered++
-		r.logger.Debug("Recovered pending acknowledgment",
-			zap.String("queue", pendingAck.QueueName),
-			zap.String("consumer", pendingAck.ConsumerTag),
-			zap.Uint64("delivery_tag", pendingAck.DeliveryTag),
-			zap.Duration("age", age))
+			// Rebuild global delivery index for this pending ack
+			storageBroker.RebuildDeliveryIndex(pendingAck.DeliveryTag, pendingAck.ConsumerTag)
+
+			stats.PendingAcksRecovered++
+			r.logger.Debug("Recovered pending acknowledgment",
+				zap.String("queue", pendingAck.QueueName),
+				zap.String("consumer", pendingAck.ConsumerTag),
+				zap.Uint64("delivery_tag", pendingAck.DeliveryTag),
+				zap.Duration("age", age))
+		}
+	} else {
+		// If not using StorageBroker, just count the pending acks
+		for _, pendingAck := range pendingAcks {
+			age := time.Since(pendingAck.DeliveredAt)
+			if age > expiredCutoff {
+				err := r.storage.DeletePendingAck(pendingAck.QueueName, pendingAck.DeliveryTag)
+				if err != nil {
+					r.logger.Warn("Failed to delete expired pending ack",
+						zap.String("queue", pendingAck.QueueName),
+						zap.Uint64("delivery_tag", pendingAck.DeliveryTag),
+						zap.Error(err))
+				}
+				continue
+			}
+
+			stats.PendingAcksRecovered++
+		}
 	}
 
 	return nil

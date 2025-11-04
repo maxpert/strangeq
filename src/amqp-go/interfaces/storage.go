@@ -28,6 +28,10 @@ type MessageStore interface {
 	// StoreMessage persists a message
 	StoreMessage(queueName string, message *protocol.Message) error
 
+	// LoadMessageFromRecovery loads a message directly into memory during recovery
+	// Does NOT write to WAL (message is already in WAL, we're loading FROM WAL)
+	LoadMessageFromRecovery(queueName string, message *protocol.Message) error
+
 	// GetMessage retrieves a specific message by delivery tag
 	GetMessage(queueName string, deliveryTag uint64) (*protocol.Message, error)
 
@@ -42,6 +46,28 @@ type MessageStore interface {
 
 	// PurgeQueue removes all messages from a queue
 	PurgeQueue(queueName string) (int, error)
+
+	// GetMessageRange retrieves messages in a specific delivery tag range (for pull-based delivery)
+	GetMessageRange(queueName string, startTag, endTag uint64) ([]*protocol.Message, error)
+
+	// DeleteMessageRange deletes messages below a specific delivery tag (for GC)
+	DeleteMessageRange(queueName string, startTag, endTag uint64) error
+
+	// Queue head counter operations (atomic delivery tag assignment)
+	GetQueueHead(queueName string) (uint64, error)
+	SetQueueHead(queueName string, head uint64) error
+	IncrementQueueHead(queueName string) (uint64, error)
+
+	// Consumer position tracking (for pull-based delivery)
+	GetConsumerPosition(queueName, consumerTag string) (uint64, error)
+	SetConsumerPosition(queueName, consumerTag string, position uint64) error
+
+	// Unacked message tracking (for prefetch limit enforcement)
+	AddUnacked(queueName, consumerTag string, deliveryTag uint64) error
+	RemoveUnacked(queueName, consumerTag string, deliveryTag uint64) error
+	GetUnackedCount(queueName, consumerTag string) (int, error)
+	GetUnackedTags(queueName, consumerTag string) ([]uint64, error)
+	GetLowestUnackedAcrossConsumers(queueName string) (uint64, error)
 }
 
 // MetadataStore defines the interface for exchanges, queues, and bindings persistence

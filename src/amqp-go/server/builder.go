@@ -109,32 +109,9 @@ func (b *ServerBuilder) WithUnifiedBroker(unifiedBroker UnifiedBroker) *ServerBu
 	return b
 }
 
-// WithDefaultBroker uses the actor-based broker (RabbitMQ-style architecture)
-func (b *ServerBuilder) WithDefaultBroker() *ServerBuilder {
-	simpleBroker := broker.NewBroker()
-	b.broker = &brokerWrapper{unifiedBroker: simpleBroker}
-	return b
-}
-
-// WithBrokerV1 uses the original broker implementation (for backward compatibility)
-func (b *ServerBuilder) WithBrokerV1() *ServerBuilder {
-	originalBroker := broker.NewBroker()
-	b.broker = &brokerWrapper{unifiedBroker: NewOriginalBrokerAdapter(originalBroker)}
-	return b
-}
-
 // WithStorage sets a custom storage implementation
 func (b *ServerBuilder) WithStorage(storage interfaces.Storage) *ServerBuilder {
 	b.storage = storage
-	return b
-}
-
-// WithMemoryStorage uses in-memory storage (non-persistent)
-func (b *ServerBuilder) WithMemoryStorage() *ServerBuilder {
-	// For now, memory storage is implicit in the default broker
-	// Future implementations will provide explicit memory storage
-	b.config.Storage.Backend = "memory"
-	b.config.Storage.Persistent = false
 	return b
 }
 
@@ -190,8 +167,8 @@ func (b *ServerBuilder) Build() (*Server, error) {
 		return nil, fmt.Errorf("invalid configuration: %w", err)
 	}
 
-	// Set memory configuration before creating any mailboxes
-	protocol.SetMemoryConfig(b.config.Server.MemoryLimitPercent, b.config.Server.MemoryLimitBytes)
+	// Memory configuration removed - no longer using mailboxes
+	// TODO: Implement memory limits at disruptor/queue level
 
 	// Create logger if not provided
 	logger := b.logger
@@ -203,16 +180,22 @@ func (b *ServerBuilder) Build() (*Server, error) {
 		logger = &ZapLoggerAdapter{logger: zapLogger}
 	}
 
-	// Create storage
+	// Phase 1: Use disruptor-based in-memory storage
 	var storageImpl interfaces.Storage
 	if b.storage != nil {
 		storageImpl = b.storage
 	} else {
-		storageFactory := storage.NewStorageFactory(b.config)
-		var err error
-		storageImpl, err = storageFactory.CreateStorage()
-		if err != nil {
-			return nil, fmt.Errorf("failed to create storage: %w", err)
+		// Create new disruptor storage with configurable checkpoint interval (Phase 4)
+		checkpointInterval := b.config.Storage.OffsetCheckpointInterval
+		storageImpl = storage.NewDisruptorStorageWithCheckpointInterval(
+			b.config.Storage.Path,
+			checkpointInterval,
+		)
+		if checkpointInterval == 0 {
+			logger.Info("Using disruptor-based storage with offset checkpointing disabled")
+		} else {
+			logger.Info("Using disruptor-based storage",
+				interfaces.LogField{Key: "offset_checkpoint_interval", Value: checkpointInterval})
 		}
 	}
 
@@ -229,7 +212,8 @@ func (b *ServerBuilder) Build() (*Server, error) {
 		}
 	} else {
 		// Create storage-backed broker using the storage we just created
-		storageBroker := broker.NewStorageBroker(storageImpl)
+		// Phase 6G: Pass engine config for tunable parameters
+		storageBroker := broker.NewStorageBroker(storageImpl, b.config.GetEngine())
 		unifiedBroker = NewStorageBrokerAdapter(storageBroker)
 	}
 
@@ -275,44 +259,6 @@ func (b *ServerBuilder) Build() (*Server, error) {
 	}
 
 	return server, nil
-}
-
-// BuildUnsafe constructs the server without validation
-func (b *ServerBuilder) BuildUnsafe() *Server {
-	// Create logger if not provided
-	logger := b.logger
-	if logger == nil {
-		zapLogger, _ := createZapLogger(b.config.Server.LogLevel, b.config.Server.LogFile)
-		logger = &ZapLoggerAdapter{logger: zapLogger}
-	}
-
-	// Create broker if not provided
-	var unifiedBroker UnifiedBroker
-	if b.broker != nil {
-		// Check if it's a broker wrapper
-		if wrapper, ok := b.broker.(*brokerWrapper); ok {
-			unifiedBroker = wrapper.unifiedBroker
-		} else {
-			// Fallback to default broker
-			unifiedBroker = NewOriginalBrokerAdapter(broker.NewBroker())
-		}
-	} else {
-		unifiedBroker = NewOriginalBrokerAdapter(broker.NewBroker())
-	}
-
-	// Create the server without validation
-	server := &Server{
-		Addr:        b.config.Network.Address,
-		Connections: make(map[string]*protocol.Connection),
-		Log:         logger.(*ZapLoggerAdapter).logger,
-		Broker:      unifiedBroker,
-		Config:      b.config,
-	}
-
-	// Create and attach lifecycle manager
-	server.Lifecycle = NewLifecycleManager(server, b.config)
-
-	return server
 }
 
 // ZapLoggerAdapter adapts zap.Logger to interfaces.Logger

@@ -7,8 +7,6 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
-	"strconv"
-	"strings"
 	"syscall"
 	"time"
 
@@ -35,42 +33,9 @@ Version: %s
 func main() {
 	// Define command-line flags
 	var (
-		// Configuration file
-		configFile  = flag.String("config", "", "Configuration file path (JSON)")
-		showVersion = flag.Bool("version", false, "Show version and exit")
-
-		// Network configuration
-		addr           = flag.String("addr", ":5672", "Server bind address")
-		port           = flag.Int("port", 5672, "Server port")
-		maxConnections = flag.Int("max-connections", 1000, "Maximum concurrent connections")
-
-		// Storage configuration
-		storageBackend = flag.String("storage", "memory", "Storage backend (memory, badger)")
-		storagePath    = flag.String("storage-path", "", "Storage directory path (required for persistent backends)")
-		syncWrites     = flag.Bool("sync-writes", false, "Enable synchronous writes for durability")
-		cacheSize      = flag.String("cache-size", "64MB", "Storage cache size (e.g., 64MB, 128MB)")
-
-		// Security configuration
-		tlsEnabled  = flag.Bool("tls", false, "Enable TLS")
-		tlsCert     = flag.String("tls-cert", "", "TLS certificate file")
-		tlsKey      = flag.String("tls-key", "", "TLS private key file")
-		authEnabled = flag.Bool("auth", false, "Enable authentication")
-		authFile    = flag.String("auth-file", "", "Authentication file path")
-
-		// Server configuration
-		logLevel       = flag.String("log-level", "info", "Log level (debug, info, warn, error)")
-		logFile        = flag.String("log-file", "", "Log file path (empty = stdout)")
-		pidFile        = flag.String("pid-file", "", "PID file path")
-		daemonize      = flag.Bool("daemonize", false, "Run as daemon")
-		maxChannels    = flag.Int("max-channels", 2047, "Maximum channels per connection")
-		maxFrameSize   = flag.Int("max-frame-size", 131072, "Maximum frame size in bytes")
-		maxMessageSize = flag.String("max-message-size", "16MB", "Maximum message size (e.g., 16MB)")
-
-		// Memory management
-		memoryLimitPercent = flag.Int("memory-limit-percent", 60, "Memory limit as percentage of RAM (0-100, 0=use absolute)")
-		memoryLimitBytes   = flag.String("memory-limit-bytes", "0", "Absolute memory limit (e.g., 4GB, 0=use percent)")
-
-		// Telemetry (Prometheus metrics + pprof profiling)
+		configFile      = flag.String("config", "", "Configuration file path (YAML/JSON)")
+		showVersion     = flag.Bool("version", false, "Show version and exit")
+		generateConfig  = flag.String("generate-config", "", "Generate default config file and exit (e.g., config.yaml)")
 		enableTelemetry = flag.Bool("enable-telemetry", false, "Enable telemetry endpoint (Prometheus + pprof profiling)")
 		telemetryPort   = flag.Int("telemetry-port", 9419, "Telemetry HTTP server port")
 	)
@@ -80,6 +45,17 @@ func main() {
 	// Show version and exit
 	if *showVersion {
 		fmt.Printf("AMQP-Go Server version %s\n", version)
+		return
+	}
+
+	// Generate default config and exit
+	if *generateConfig != "" {
+		cfg := config.DefaultConfig()
+		if err := cfg.Save(*generateConfig); err != nil {
+			log.Fatalf("Failed to generate config file: %v", err)
+		}
+		fmt.Printf("Generated default configuration: %s\n", *generateConfig)
+		fmt.Println("Edit the file and start server with: amqp-server --config " + *generateConfig)
 		return
 	}
 
@@ -96,10 +72,8 @@ func main() {
 		fmt.Printf(banner, version)
 	}
 
-	// Create configuration
+	// Load configuration
 	var cfg *config.AMQPConfig
-	var err error
-
 	if *configFile != "" {
 		// Load from configuration file
 		cfg = &config.AMQPConfig{}
@@ -110,20 +84,10 @@ func main() {
 			fmt.Printf("Loaded configuration from: %s\n", *configFile)
 		}
 	} else {
-		// Build configuration from command-line flags
-		cfg, err = buildConfigFromFlags(
-			*addr, *port, *maxConnections,
-			*storageBackend, *storagePath, *syncWrites, *cacheSize,
-			*tlsEnabled, *tlsCert, *tlsKey, *authEnabled, *authFile,
-			*logLevel, *logFile, *pidFile, *daemonize,
-			*maxChannels, *maxFrameSize, *maxMessageSize,
-			*memoryLimitPercent, *memoryLimitBytes,
-		)
-		if err != nil {
-			log.Fatalf("Failed to build configuration: %v", err)
-		}
+		// Use default configuration (can be overridden by AMQP_* environment variables)
+		cfg = config.DefaultConfig()
 		if !isDaemonChild() {
-			fmt.Println("Using configuration from command-line flags")
+			fmt.Println("Using default configuration (override with --config or AMQP_* env vars)")
 		}
 	}
 
@@ -222,95 +186,6 @@ func main() {
 	if err := amqpServer.Start(); err != nil {
 		log.Fatalf("Server failed: %v", err)
 	}
-}
-
-func buildConfigFromFlags(
-	addr string, port, maxConnections int,
-	storageBackend, storagePath string, syncWrites bool, cacheSize string,
-	tlsEnabled bool, tlsCert, tlsKey string, authEnabled bool, authFile string,
-	logLevel, logFile, pidFile string, daemonize bool,
-	maxChannels, maxFrameSize int, maxMessageSize string,
-	memoryLimitPercent int, memoryLimitBytes string,
-) (*config.AMQPConfig, error) {
-
-	cfg := config.DefaultConfig()
-
-	// Network configuration
-	cfg.Network.Address = addr
-	cfg.Network.Port = port
-	cfg.Network.MaxConnections = maxConnections
-
-	// Server configuration
-	cfg.Server.LogLevel = logLevel
-	cfg.Server.LogFile = logFile
-	cfg.Server.PidFile = pidFile
-	cfg.Server.Daemonize = daemonize
-	cfg.Server.MaxChannelsPerConnection = maxChannels
-	cfg.Server.MaxFrameSize = maxFrameSize
-	cfg.Server.MaxMessageSize = parseSize(maxMessageSize)
-	cfg.Server.MemoryLimitPercent = memoryLimitPercent
-	cfg.Server.MemoryLimitBytes = parseSize(memoryLimitBytes)
-
-	// Storage configuration
-	switch storageBackend {
-	case "memory":
-		cfg.Storage.Backend = "memory"
-		cfg.Storage.Persistent = false
-	case "badger":
-		if storagePath == "" {
-			return nil, fmt.Errorf("storage path required for badger backend")
-		}
-		cfg.Storage.Backend = "badger"
-		cfg.Storage.Path = storagePath
-		cfg.Storage.Persistent = true
-		cfg.Storage.SyncWrites = syncWrites
-		cfg.Storage.CacheSize = parseSize(cacheSize)
-	default:
-		return nil, fmt.Errorf("unsupported storage backend: %s", storageBackend)
-	}
-
-	// Security configuration
-	if tlsEnabled {
-		if tlsCert == "" || tlsKey == "" {
-			return nil, fmt.Errorf("TLS certificate and key files required when TLS is enabled")
-		}
-		cfg.Security.TLSEnabled = true
-		cfg.Security.TLSCertFile = tlsCert
-		cfg.Security.TLSKeyFile = tlsKey
-	}
-
-	if authEnabled {
-		if authFile == "" {
-			return nil, fmt.Errorf("authentication file required when authentication is enabled")
-		}
-		cfg.Security.AuthenticationEnabled = true
-		cfg.Security.AuthenticationFilePath = authFile
-	}
-
-	return cfg, nil
-}
-
-func parseSize(sizeStr string) int64 {
-	sizeStr = strings.ToUpper(sizeStr)
-
-	var multiplier int64 = 1
-	if strings.HasSuffix(sizeStr, "KB") {
-		multiplier = 1024
-		sizeStr = strings.TrimSuffix(sizeStr, "KB")
-	} else if strings.HasSuffix(sizeStr, "MB") {
-		multiplier = 1024 * 1024
-		sizeStr = strings.TrimSuffix(sizeStr, "MB")
-	} else if strings.HasSuffix(sizeStr, "GB") {
-		multiplier = 1024 * 1024 * 1024
-		sizeStr = strings.TrimSuffix(sizeStr, "GB")
-	}
-
-	size, err := strconv.ParseInt(sizeStr, 10, 64)
-	if err != nil {
-		return 0
-	}
-
-	return size * multiplier
 }
 
 func writePIDFile(pidFile string) error {

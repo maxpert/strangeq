@@ -18,11 +18,11 @@ type Connection struct {
 	Vhost           string                     // Virtual host for this connection
 	Username        string                     // Authenticated username
 	PendingMessages map[uint16]*PendingMessage // Track messages being published on each channel
-	Mailboxes       *ConnectionMailboxes       // Three separate mailboxes (RabbitMQ-style: Heartbeat, Channel, Connection)
+	FrameQueue      chan *Frame                // Buffer frames between reader and processor goroutines
 	Mutex           sync.RWMutex               // Protects connection state
 	WriteMutex      sync.Mutex                 // Protects socket writes (heartbeat sender + frame processor both write)
 	Closed          bool
-	Blocked         bool // RabbitMQ-style memory alarm: true when queue usage > 90%, false when < 80%
+	Blocked         bool // Back-pressure flag: true when queue usage > 90%, false when < 80%
 }
 
 // NewConnection creates a new AMQP connection
@@ -32,7 +32,7 @@ func NewConnection(conn net.Conn) *Connection {
 		Conn:            conn,
 		Channels:        make(map[uint16]*Channel),
 		PendingMessages: make(map[uint16]*PendingMessage),
-		Mailboxes:       NewConnectionMailboxes(), // RabbitMQ-style: three separate unbounded mailboxes
+		FrameQueue:      make(chan *Frame, 10000), // 10K frame buffer for reader/processor separation
 	}
 }
 
@@ -109,18 +109,16 @@ type Binding struct {
 
 // Queue represents an AMQP queue using actor model (NO LOCKS!)
 type Queue struct {
-	Name       string
-	Durable    bool
-	AutoDelete bool
-	Exclusive  bool
-	Arguments  map[string]interface{}
-	Channel    *Channel `json:"-"` // Reference back to parent channel (not serialized)
-
-	// Actor model - single goroutine processes all commands (runtime state, not persisted)
-	Actor *QueueActor `json:"-"`
+	Name         string
+	Durable      bool
+	AutoDelete   bool
+	Exclusive    bool
+	Arguments    map[string]interface{}
+	Channel      *Channel      // Reference back to parent channel (runtime state, not persisted)
+	MessageCount atomic.Uint64 // In-memory message count (runtime state, not persisted)
 }
 
-// NewQueue creates a new queue with actor model
+// NewQueue creates a new queue
 func NewQueue(name string, durable, autoDelete, exclusive bool, arguments map[string]interface{}) *Queue {
 	q := &Queue{
 		Name:       name,
@@ -128,62 +126,8 @@ func NewQueue(name string, durable, autoDelete, exclusive bool, arguments map[st
 		AutoDelete: autoDelete,
 		Exclusive:  exclusive,
 		Arguments:  arguments,
-		Actor:      NewQueueActor(name),
 	}
 	return q
-}
-
-// Enqueue adds a message to the queue (async, non-blocking)
-func (q *Queue) Enqueue(deliveryTag uint64, message *Message) {
-	q.EnsureActorInitialized()
-	q.Actor.Inbox <- &EnqueueCmd{
-		DeliveryTag: deliveryTag,
-		Message:     message,
-	}
-}
-
-// RegisterConsumer registers a consumer with the queue
-func (q *Queue) RegisterConsumer(consumer *Consumer) {
-	q.EnsureActorInitialized()
-	q.Actor.Inbox <- &RegisterConsumerCmd{
-		Consumer: consumer,
-	}
-}
-
-// UnregisterConsumer removes a consumer from the queue
-func (q *Queue) UnregisterConsumer(consumerTag string) {
-	q.EnsureActorInitialized()
-	q.Actor.Inbox <- &UnregisterConsumerCmd{
-		ConsumerTag: consumerTag,
-	}
-}
-
-// Ack acknowledges a message delivery
-func (q *Queue) Ack(consumerTag string) {
-	q.EnsureActorInitialized()
-	q.Actor.Inbox <- &AckCmd{
-		ConsumerTag: consumerTag,
-	}
-}
-
-// EnsureActorInitialized ensures the Actor is initialized (called after deserialization or creation)
-func (q *Queue) EnsureActorInitialized() {
-	if q.Actor == nil {
-		q.Actor = NewQueueActor(q.Name)
-	}
-}
-
-// MessageCount returns the current queue depth
-func (q *Queue) MessageCount() int {
-	q.EnsureActorInitialized()
-	return q.Actor.MessageCount()
-}
-
-// Stop stops the queue actor
-func (q *Queue) Stop() {
-	if q.Actor != nil {
-		q.Actor.Stop()
-	}
 }
 
 // Message represents an AMQP message
@@ -240,8 +184,8 @@ type Consumer struct {
 	Args           map[string]interface{}
 	Messages       chan *Delivery
 	Cancel         chan struct{}
-	PrefetchCount  uint16         // Maximum number of unacknowledged messages
-	CurrentUnacked atomic.Uint64  // Current count of unacknowledged messages (atomic for lock-free access)
+	PrefetchCount  uint16        // Maximum number of unacknowledged messages
+	CurrentUnacked atomic.Uint64 // Current count of unacknowledged messages (atomic for lock-free access)
 }
 
 // generateID generates a random ID string

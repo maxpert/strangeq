@@ -6,7 +6,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/maxpert/amqp-go/broker"
 	"github.com/maxpert/amqp-go/config"
 	"github.com/maxpert/amqp-go/interfaces"
 	"github.com/maxpert/amqp-go/protocol"
@@ -39,17 +38,27 @@ type Server struct {
 	StartTime          time.Time
 }
 
-// NewServer creates a new AMQP server
+// NewServer creates a new AMQP server with default in-memory storage
 func NewServer(addr string) *Server {
-	logger, _ := zap.NewProduction()
-	return &Server{
-		Addr:             addr,
-		Connections:      make(map[string]*protocol.Connection),
-		Log:              logger,
-		Broker:           NewOriginalBrokerAdapter(broker.NewBroker()),
-		MetricsCollector: &NoOpMetricsCollector{},
-		StartTime:        time.Now(),
+	cfg := config.DefaultConfig()
+	cfg.Network.Address = addr
+	cfg.Storage.Backend = "memory"
+	cfg.Storage.Persistent = false
+
+	serverBuilder := NewServerBuilder().WithConfig(cfg)
+	srv, err := serverBuilder.Build()
+	if err != nil {
+		// Fallback to minimal configuration
+		logger, _ := zap.NewProduction()
+		return &Server{
+			Addr:             addr,
+			Connections:      make(map[string]*protocol.Connection),
+			Log:              logger,
+			MetricsCollector: &NoOpMetricsCollector{},
+			StartTime:        time.Now(),
+		}
 	}
+	return srv
 }
 
 // Start starts the AMQP server
@@ -211,54 +220,44 @@ func (s *Server) processConnectionFrames(conn *protocol.Connection) {
 	// At this point, the connection handshake is complete
 	s.Log.Info("Connection handshake completed", zap.String("connection_id", conn.ID))
 
-	// RabbitMQ-style architecture: Three separate mailboxes with handlers, reader, and heartbeat sender
-	// This ensures connection stays alive even during backpressure
-
-	// Start frame reader goroutine (reads from TCP → routes to mailboxes)
+	// Reader/processor separation: Reader enqueues frames, processor handles them
+	// This allows the reader to keep draining TCP socket even when processor blocks on fsync
 	readerDone := make(chan struct{})
 	go s.readFrames(conn, readerDone)
 
-	// Start three handler goroutines (RabbitMQ-style: one per mailbox)
-	heartbeatHandlerDone := make(chan struct{})
-	go s.processHeartbeatMailbox(conn, heartbeatHandlerDone)
-
-	channelHandlerDone := make(chan struct{})
-	go s.processChannelMailbox(conn, channelHandlerDone)
-
-	connectionHandlerDone := make(chan struct{})
-	go s.processConnectionMailbox(conn, connectionHandlerDone)
+	// Start frame processor goroutine (can block on WAL fsync without affecting reader)
+	processorDone := make(chan struct{})
+	go s.processFrames(conn, processorDone)
 
 	// Start heartbeat sender goroutine (sends heartbeat frames to client periodically)
-	// This keeps connection alive independently of frame processing
 	heartbeatSenderDone := make(chan struct{})
 	go s.sendHeartbeats(conn, heartbeatSenderDone)
+
+	// Start consumer delivery loop
+	consumerDeliveryDone := make(chan struct{})
+	go s.consumerDeliveryLoop(conn)
 
 	// Wait for any goroutine to finish (connection close or error)
 	select {
 	case <-readerDone:
 		s.Log.Info("Frame reader completed", zap.String("connection_id", conn.ID))
-	case <-heartbeatHandlerDone:
-		s.Log.Info("Heartbeat handler completed", zap.String("connection_id", conn.ID))
-	case <-channelHandlerDone:
-		s.Log.Info("Channel handler completed", zap.String("connection_id", conn.ID))
-	case <-connectionHandlerDone:
-		s.Log.Info("Connection handler completed", zap.String("connection_id", conn.ID))
+	case <-processorDone:
+		s.Log.Info("Frame processor completed", zap.String("connection_id", conn.ID))
 	case <-heartbeatSenderDone:
 		s.Log.Info("Heartbeat sender completed", zap.String("connection_id", conn.ID))
+	case <-consumerDeliveryDone:
+		s.Log.Info("Consumer delivery completed", zap.String("connection_id", conn.ID))
 	}
-
-	// Close mailboxes to signal handlers to stop
-	conn.Mailboxes.Close()
 }
 
-// readFrames reads frames from TCP connection and enqueues them to FrameQueue
-// This goroutine NEVER blocks on frame processing - only on enqueue when queue is full
-// RabbitMQ-style: When queue fills, blocks reader → blocks TCP → natural backpressure
+// readFrames reads frames from TCP connection and enqueues them for processing
+// This goroutine NEVER blocks on frame processing - it only reads and enqueues
 func (s *Server) readFrames(conn *protocol.Connection, done chan struct{}) {
 	defer close(done)
+	defer close(conn.FrameQueue) // Signal processor to stop
 
 	for {
-		// Read frame from TCP connection
+		// Read frame from TCP connection (never blocks on processing)
 		frame, err := protocol.ReadFrame(conn.Conn)
 		if err != nil {
 			if err.Error() == "EOF" {
@@ -277,133 +276,72 @@ func (s *Server) readFrames(conn *protocol.Connection, done chan struct{}) {
 			return
 		}
 
-		// Route frame to appropriate mailbox (RabbitMQ-style architecture)
-		// Reader NEVER blocks - unbounded queues ensure frames always enqueue
-		//
-		// Frame routing:
-		// - Heartbeat frames → Heartbeat mailbox (processed independently)
-		// - Method/Header/Body frames on channel 0 → Connection mailbox (connection control)
-		// - Method/Header/Body frames on channel > 0 → Channel mailbox (data frames)
-		//
-		// This ensures:
-		// 1. Heartbeats are always processed (never starved)
-		// 2. Connection control is separated from data processing
-		// 3. Data frames don't block heartbeat or connection control
-		if frame.Type == protocol.FrameHeartbeat {
-			err = conn.Mailboxes.Heartbeat.Enqueue(frame)
-		} else if frame.Channel == 0 {
-			// Channel 0 is reserved for connection control
-			err = conn.Mailboxes.Connection.Enqueue(frame)
-		} else {
-			// All other frames are channel data frames
-			err = conn.Mailboxes.Channel.Enqueue(frame)
-		}
-
-		if err != nil {
-			// Mailbox closed, connection is closing
+		// Enqueue for processing (blocks only if queue is full)
+		select {
+		case conn.FrameQueue <- frame:
+			// Frame queued successfully
+		case <-done:
 			return
 		}
 	}
 }
 
-// processHeartbeatMailbox processes frames from the heartbeat mailbox (RabbitMQ-style)
-// This handler is independent and ensures heartbeats are never starved
-func (s *Server) processHeartbeatMailbox(conn *protocol.Connection, done chan struct{}) {
+// processFrames processes frames from the queue
+// This goroutine CAN block on WAL fsync without affecting the reader
+func (s *Server) processFrames(conn *protocol.Connection, done chan struct{}) {
 	defer close(done)
 
 	for {
-		// Dequeue next frame from heartbeat mailbox
-		_, ok := conn.Mailboxes.Heartbeat.Dequeue()
-		if !ok {
-			// Mailbox closed, connection is closing
-			s.Log.Info("Heartbeat mailbox closed", zap.String("connection_id", conn.ID))
-			return
-		}
+		select {
+		case frame, ok := <-conn.FrameQueue:
+			if !ok {
+				// Reader closed the queue
+				s.Log.Info("Frame queue closed", zap.String("connection_id", conn.ID))
+				return
+			}
 
-		// Heartbeat frames don't need processing - just log them
-		s.Log.Debug("Received heartbeat", zap.String("connection_id", conn.ID))
-	}
-}
+			// Handle heartbeats immediately (lightweight, no processing needed)
+			if frame.Type == protocol.FrameHeartbeat {
+				continue
+			}
 
-// processConnectionMailbox processes frames from the connection mailbox (RabbitMQ-style)
-// This handler processes channel 0 frames (connection control)
-func (s *Server) processConnectionMailbox(conn *protocol.Connection, done chan struct{}) {
-	defer close(done)
+			// Process frame (can block on WAL fsync)
+			if err := s.processFrame(conn, frame); err != nil {
+				s.Log.Error("Error processing frame",
+					zap.String("connection_id", conn.ID),
+					zap.Uint16("channel", frame.Channel),
+					zap.Error(err))
 
-	for {
-		// Dequeue next frame from connection mailbox
-		frame, ok := conn.Mailboxes.Connection.Dequeue()
-		if !ok {
-			// Mailbox closed, connection is closing
-			s.Log.Info("Connection mailbox closed", zap.String("connection_id", conn.ID))
-			return
-		}
+				// Mark connection as closed on error
+				conn.Mutex.Lock()
+				conn.Closed = true
+				conn.Mutex.Unlock()
 
-		// Process connection frames (same logic as channel frames, just on channel 0)
-		if err := s.processFrame(conn, frame); err != nil {
-			s.Log.Error("Error processing connection frame",
-				zap.String("connection_id", conn.ID),
-				zap.Error(err))
+				return
+			}
 
-			// Mark connection as closed
-			conn.Mutex.Lock()
-			conn.Closed = true
-			conn.Mutex.Unlock()
-
+		case <-done:
 			return
 		}
 	}
 }
 
-// processChannelMailbox processes frames from the channel mailbox (RabbitMQ-style)
-// This handler processes data frames (channel > 0) and MAY block on body frames
-func (s *Server) processChannelMailbox(conn *protocol.Connection, done chan struct{}) {
-	defer close(done)
-
-	for {
-		// Dequeue next frame from channel mailbox
-		frame, ok := conn.Mailboxes.Channel.Dequeue()
-		if !ok {
-			// Mailbox closed, connection is closing
-			s.Log.Info("Channel mailbox closed", zap.String("connection_id", conn.ID))
-			return
-		}
-
-		// Process channel frames
-		if err := s.processFrame(conn, frame); err != nil {
-			s.Log.Error("Error processing channel frame",
-				zap.String("connection_id", conn.ID),
-				zap.Error(err))
-
-			// Mark connection as closed
-			conn.Mutex.Lock()
-			conn.Closed = true
-			conn.Mutex.Unlock()
-
-			return
-		}
-	}
-}
-
-// processFrame processes a single frame (common logic for both channel and connection frames)
+// processFrame processes a single frame directly (no mailbox queuing)
 func (s *Server) processFrame(conn *protocol.Connection, frame *protocol.Frame) error {
 	// Process the frame based on its type
-	// Process synchronously to maintain frame ordering (AMQP requirement)
+	// Processed synchronously to maintain frame ordering (AMQP requirement)
 	switch frame.Type {
 	case protocol.FrameMethod:
 		return s.processMethodFrame(conn, frame)
 	case protocol.FrameHeader:
 		return s.processHeaderFrame(conn, frame)
 	case protocol.FrameBody:
-		// Process body frames synchronously (MAY block on broker backpressure)
-		// This is OK because:
-		// 1. Reader goroutine continues reading into mailboxes (including heartbeats)
-		// 2. Unbounded mailboxes ensure reader never blocks
-		// 3. We maintain AMQP frame ordering requirement
+		// Process body frames synchronously
+		// Note: This may block on broker operations, but that's acceptable
+		// as it provides natural TCP back-pressure
 		return s.processBodyFrame(conn, frame)
 	case protocol.FrameHeartbeat:
-		// Handle heartbeat frames immediately (never blocks)
-		// Heartbeats are processed inline to maintain connection liveness
+		// Heartbeats already handled in readFrames
 		s.Log.Debug("Heartbeat frame received", zap.String("connection_id", conn.ID))
 		return nil
 	default:

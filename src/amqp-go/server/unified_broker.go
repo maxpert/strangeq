@@ -29,6 +29,9 @@ type UnifiedBroker interface {
 	RejectMessage(consumerTag string, deliveryTag uint64, requeue bool) error
 	NacknowledgeMessage(consumerTag string, deliveryTag uint64, multiple, requeue bool) error
 
+	// Delivery lookup (NEW - for O(1) ACK routing)
+	GetConsumerForDelivery(deliveryTag uint64) (string, bool)
+
 	// Management operations (optional for some implementations)
 	GetQueues() map[string]*protocol.Queue
 	GetExchanges() map[string]*protocol.Exchange

@@ -63,7 +63,8 @@ func (s *Server) handleQueueDeclare(conn *protocol.Connection, channelID uint16,
 	}
 
 	// Send queue.declare-ok response with queue info
-	return s.sendQueueDeclareOK(conn, channelID, queue.Name, uint32(queue.MessageCount()), 0)
+	msgCount := uint32(queue.MessageCount.Load())
+	return s.sendQueueDeclareOK(conn, channelID, queue.Name, msgCount, 0)
 }
 
 // handleQueueBind handles the queue.bind method
