@@ -635,7 +635,7 @@ func (b *StorageBroker) PublishMessage(exchangeName, routingKey string, message 
 		msgID := queueState.nextMsgID.Add(1)
 		message.DeliveryTag = msgID
 
-		// Store to BadgerDB
+		// Store to persistent storage
 		err := b.storage.StoreMessage(queueName, message)
 		if err != nil {
 			return fmt.Errorf("failed to store message to queue '%s': %w", queueName, err)

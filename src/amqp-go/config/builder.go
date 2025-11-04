@@ -46,20 +46,20 @@ func (b *ConfigBuilder) WithMaxConnections(max int) *ConfigBuilder {
 
 // WithConnectionTimeout sets the connection timeout
 func (b *ConfigBuilder) WithConnectionTimeout(timeout time.Duration) *ConfigBuilder {
-	b.config.Network.ConnectionTimeout = timeout
+	b.config.Network.ConnectionTimeoutMS = timeout.Milliseconds()
 	return b
 }
 
 // WithHeartbeat sets the heartbeat interval
 func (b *ConfigBuilder) WithHeartbeat(interval time.Duration) *ConfigBuilder {
-	b.config.Network.HeartbeatInterval = interval
+	b.config.Network.HeartbeatIntervalMS = interval.Milliseconds()
 	return b
 }
 
 // WithTCPKeepAlive enables/disables TCP keep-alive
 func (b *ConfigBuilder) WithTCPKeepAlive(enabled bool, interval time.Duration) *ConfigBuilder {
 	b.config.Network.TCPKeepAlive = enabled
-	b.config.Network.TCPKeepAliveInterval = interval
+	b.config.Network.TCPKeepAliveIntervalMS = interval.Milliseconds()
 	return b
 }
 
@@ -72,50 +72,39 @@ func (b *ConfigBuilder) WithBufferSizes(readSize, writeSize int) *ConfigBuilder 
 
 // Storage Configuration
 
-// WithMemoryStorage configures in-memory storage
-func (b *ConfigBuilder) WithMemoryStorage() *ConfigBuilder {
-	b.config.Storage.Backend = "memory"
-	b.config.Storage.Path = ""
-	b.config.Storage.Persistent = false
-	return b
-}
-
-// WithBBoltStorage configures BBolt storage
-func (b *ConfigBuilder) WithBBoltStorage(path string) *ConfigBuilder {
-	b.config.Storage.Backend = "bbolt"
+// WithStoragePath sets the data directory path
+func (b *ConfigBuilder) WithStoragePath(path string) *ConfigBuilder {
 	b.config.Storage.Path = path
-	b.config.Storage.Persistent = true
 	return b
 }
 
-// WithBadgerStorage configures Badger storage
-func (b *ConfigBuilder) WithBadgerStorage(path string) *ConfigBuilder {
-	b.config.Storage.Backend = "badger"
-	b.config.Storage.Path = path
-	b.config.Storage.Persistent = true
+// WithFsync enables/disables fsync for writes
+func (b *ConfigBuilder) WithFsync(enabled bool) *ConfigBuilder {
+	b.config.Storage.Fsync = enabled
 	return b
 }
 
-// WithStorageOptions sets storage-specific options
-func (b *ConfigBuilder) WithStorageOptions(options map[string]interface{}) *ConfigBuilder {
-	if b.config.Storage.Options == nil {
-		b.config.Storage.Options = make(map[string]interface{})
-	}
-	for k, v := range options {
-		b.config.Storage.Options[k] = v
-	}
+// WithCacheSize sets the storage cache size in megabytes
+func (b *ConfigBuilder) WithCacheSize(sizeMB int64) *ConfigBuilder {
+	b.config.Storage.CacheMB = sizeMB
 	return b
 }
 
-// WithSyncWrites enables/disables synchronous writes
-func (b *ConfigBuilder) WithSyncWrites(enabled bool) *ConfigBuilder {
-	b.config.Storage.SyncWrites = enabled
+// WithMaxFiles sets the maximum number of open file handles
+func (b *ConfigBuilder) WithMaxFiles(maxFiles int) *ConfigBuilder {
+	b.config.Storage.MaxFiles = maxFiles
 	return b
 }
 
-// WithCacheSize sets the storage cache size
-func (b *ConfigBuilder) WithCacheSize(size int64) *ConfigBuilder {
-	b.config.Storage.CacheSize = size
+// WithRetention sets the segment retention period
+func (b *ConfigBuilder) WithRetention(retention time.Duration) *ConfigBuilder {
+	b.config.Storage.RetentionMS = retention.Milliseconds()
+	return b
+}
+
+// WithCheckpointInterval sets the consumer offset checkpoint interval
+func (b *ConfigBuilder) WithCheckpointInterval(interval time.Duration) *ConfigBuilder {
+	b.config.Storage.CheckpointIntervalMS = interval.Milliseconds()
 	return b
 }
 
@@ -207,9 +196,9 @@ func (b *ConfigBuilder) WithProtocolLimits(maxChannels int, maxFrameSize int, ma
 
 // WithTimeouts sets various timeout settings
 func (b *ConfigBuilder) WithTimeouts(channelTimeout, messageTimeout, cleanupInterval time.Duration) *ConfigBuilder {
-	b.config.Server.ChannelTimeout = channelTimeout
-	b.config.Server.MessageTimeout = messageTimeout
-	b.config.Server.CleanupInterval = cleanupInterval
+	b.config.Server.ChannelTimeoutMS = channelTimeout.Milliseconds()
+	b.config.Server.MessageTimeoutMS = messageTimeout.Milliseconds()
+	b.config.Server.CleanupIntervalMS = cleanupInterval.Milliseconds()
 	return b
 }
 

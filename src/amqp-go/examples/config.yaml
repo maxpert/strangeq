@@ -1,23 +1,41 @@
 # Example AMQP-Go Server Configuration
 # Minimal configuration for getting started
+#
+# This config provides a balance of performance and ease of use.
+# For production, see config.sample.yaml for all available options.
+#
+# Quick Start:
+#   ./amqp-server --config examples/config.yaml
+#
+# Performance Features:
+# - All metadata (exchanges, queues, bindings) cached in memory
+# - Ring buffer keeps hot messages in memory (zero disk reads)
+# - WAL provides durability with batch fsync (10ms timeout)
+# - Lock-free concurrent metadata access
 
 network:
   address: :5672
   port: 5672
   maxconnections: 1000
+  connectiontimeoutms: 30000      # 30 seconds
+  heartbeatintervalms: 60000      # 60 seconds
+  tcpkeepalive: true
+  tcpkeepaliveintervalms: 30000   # 30 seconds
 
 storage:
-  backend: badger
   path: ./data
-  persistent: true
-  # Disable sync writes for better performance (less durable)
-  syncwrites: false
+  # Disable fsync for better performance (less durable)
+  fsync: false
+  cachemb: 64                      # 64 MB metadata cache
+  maxfiles: 100                    # Max open file handles
+  retentionms: 86400000            # 24 hours
+  checkpointintervalms: 5000       # 5 seconds
 
 security:
   # Enable TLS in production
   tlsenabled: false
   # tlscertfile: /path/to/cert.pem
-  # tlskey file: /path/to/key.pem
+  # tlskeyfile: /path/to/key.pem
 
   # Enable authentication in production
   authenticationenabled: false
@@ -32,12 +50,44 @@ server:
   daemonize: false
   # pidfile: /var/run/amqp-server.pid
 
+  # Protocol limits
+  maxchannelsperconnection: 2047
+  maxframesize: 131072             # 128KB
+  maxmessagesize: 16777216         # 16MB
+
+  # Timeouts and intervals
+  channeltimeoutms: 60000          # 60 seconds
+  messagetimeoutms: 30000          # 30 seconds
+  cleanupintervalms: 300000        # 5 minutes
+
 # Optional: Tune engine parameters for your workload
 # See config.sample.yaml for all available options
 engine:
-  # Larger ring buffer = less disk I/O (more memory usage)
-  ringbuffersize: 65536  # 64K messages
+  # Queue State Management
+  availablechannelbuffer: 10000000  # 10M = 80 MB per queue
 
-  # WAL batch settings (balance throughput vs latency)
+  # Ring Buffer (Hot Path)
+  ringbuffersize: 65536             # 64K messages
+  spillthresholdpercent: 80         # Start spilling at 80%
+
+  # WAL settings (balance throughput vs latency)
   walbatchsize: 1000
-  walbatchtimeout: 10ms
+  walbatchtimeoutms: 10             # 10 milliseconds
+  walfilesize: 536870912            # 512 MB
+  walchannelbuffer: 10000           # 10K buffered requests
+
+  # Segment Storage
+  segmentsize: 1073741824           # 1 GB
+  segmentcheckpointintervalms: 300000  # 5 minutes
+  compactionthreshold: 0.5          # Compact at 50% deleted
+  compactionintervalms: 1800000     # 30 minutes
+
+  # Consumer Delivery
+  consumerselecttimeoutms: 1        # 1 millisecond
+  consumermaxbatchsize: 100         # Max 100 messages per poll
+
+  # Background Maintenance
+  expiredmessagecheckintervalms: 60000   # 60 seconds
+  walcleanupcheckintervalms: 300000      # 5 minutes
+  offsetcleanupbatchsize: 1000           # 1,000 offsets per cycle
+  offsetcleanupintervalms: 30000         # 30 seconds

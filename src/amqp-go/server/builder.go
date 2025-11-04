@@ -2,6 +2,7 @@ package server
 
 import (
 	"fmt"
+	"time"
 
 	"github.com/maxpert/amqp-go/broker"
 	"github.com/maxpert/amqp-go/config"
@@ -186,7 +187,7 @@ func (b *ServerBuilder) Build() (*Server, error) {
 		storageImpl = b.storage
 	} else {
 		// Create new disruptor storage with configurable checkpoint interval (Phase 4)
-		checkpointInterval := b.config.Storage.OffsetCheckpointInterval
+		checkpointInterval := time.Duration(b.config.Storage.CheckpointIntervalMS) * time.Millisecond
 		storageImpl = storage.NewDisruptorStorageWithCheckpointInterval(
 			b.config.Storage.Path,
 			checkpointInterval,
@@ -195,7 +196,7 @@ func (b *ServerBuilder) Build() (*Server, error) {
 			logger.Info("Using disruptor-based storage with offset checkpointing disabled")
 		} else {
 			logger.Info("Using disruptor-based storage",
-				interfaces.LogField{Key: "offset_checkpoint_interval", Value: checkpointInterval})
+				interfaces.LogField{Key: "offset_checkpoint_interval", Value: b.config.Storage.CheckpointIntervalMS})
 		}
 	}
 
@@ -242,20 +243,18 @@ func (b *ServerBuilder) Build() (*Server, error) {
 	// Create and attach lifecycle manager
 	server.Lifecycle = NewLifecycleManager(server, b.config)
 
-	// Perform recovery if storage is persistent
-	if b.config.Storage.Persistent {
-		recoveryManager := NewRecoveryManager(storageImpl, unifiedBroker, logger.(*ZapLoggerAdapter).logger)
+	// Always perform recovery (storage is always persistent)
+	recoveryManager := NewRecoveryManager(storageImpl, unifiedBroker, logger.(*ZapLoggerAdapter).logger)
 
-		recoveryStats, err := recoveryManager.PerformRecovery()
-		if err != nil {
-			logger.Error("Recovery failed", interfaces.LogField{Key: "error", Value: err})
-			// Continue with server startup even if recovery fails
-		} else {
-			logger.Info("Recovery completed successfully",
-				interfaces.LogField{Key: "exchanges_recovered", Value: recoveryStats.DurableExchangesRecovered},
-				interfaces.LogField{Key: "queues_recovered", Value: recoveryStats.DurableQueuesRecovered},
-				interfaces.LogField{Key: "messages_recovered", Value: recoveryStats.PersistentMessagesRecovered})
-		}
+	recoveryStats, err := recoveryManager.PerformRecovery()
+	if err != nil {
+		logger.Error("Recovery failed", interfaces.LogField{Key: "error", Value: err})
+		// Continue with server startup even if recovery fails
+	} else {
+		logger.Info("Recovery completed successfully",
+			interfaces.LogField{Key: "exchanges_recovered", Value: recoveryStats.DurableExchangesRecovered},
+			interfaces.LogField{Key: "queues_recovered", Value: recoveryStats.DurableQueuesRecovered},
+			interfaces.LogField{Key: "messages_recovered", Value: recoveryStats.PersistentMessagesRecovered})
 	}
 
 	return server, nil

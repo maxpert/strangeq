@@ -175,21 +175,30 @@ Head-to-head benchmark comparing StrangeQ with RabbitMQ 3.13 under identical con
 | Server | Published (msg/s) | Consumed (msg/s) | Notes |
 |--------|------------------|------------------|-------|
 | **RabbitMQ 3.13** | 69,665 | 64,952 | Baseline |
-| **StrangeQ (Phase 6G)** | **110,000-120,000** | **110,000-117,000** | **1.7-1.8x faster** |
+| **StrangeQ (Latest)** | **114,178** | **107,572** | **1.7x faster** |
 
 ### Analysis
 
 **Publishing Performance:**
-- StrangeQ achieves **1.7-1.8x faster publishing** (110-120K vs 70K msg/s)
-- Peak bursts: 230,000+ msg/s
+- StrangeQ: **114,178 msg/s** (1.7x faster than RabbitMQ)
+- Peak bursts: 220,000+ msg/s
 - Zero connection drops under sustained load
+- Zero metadata disk I/O (all cached in memory)
 - Batch synchronous WAL writes with fsync per batch
 
 **Consumer Performance:**
-- StrangeQ: 110-117K msg/s (1.7-1.8x faster than RabbitMQ)
+- StrangeQ: 107,572 msg/s (1.7x faster than RabbitMQ)
 - RabbitMQ: 65K msg/s
-- **Balanced throughput** after reader/processor separation fix
+- **Balanced throughput** with reader/processor separation
 - Zero TCP blocking during WAL fsync operations
+- O(1) binding lookups for message routing
+
+**Metadata Caching:**
+- All exchanges, queues, and bindings cached in memory
+- Lock-free concurrent access with sync.Map
+- O(1) routing decisions (previously O(n) disk scans)
+- Zero disk reads for routing metadata
+- CPU profile shows no metadata bottlenecks
 
 **Stability:**
 - Both servers maintained stable connections
@@ -208,12 +217,14 @@ Head-to-head benchmark comparing StrangeQ with RabbitMQ 3.13 under identical con
 
 StrangeQ's superior performance comes from:
 
-1. **Reader/Processor Separation**: TCP reader and frame processor run in separate goroutines with 10K frame buffer, preventing fsync from blocking socket reads
-2. **Lock-Free Per-Queue Isolation**: Using `sync.Map` eliminates global lock contention
-3. **Optimized Ring Buffer**: 256K message ring buffer (6.5 MB per queue) eliminates disk I/O for hot messages
-4. **Batch Synchronous WAL**: Groups fsync operations for durability without individual write latency
-5. **Dynamic Memory Management**: RabbitMQ-style 60% RAM threshold with proper flow control
-6. **Connection Stability**: Blocks publishers during memory pressure without closing connections
+1. **Metadata Caching**: All routing metadata cached in memory with O(1) lock-free lookups, eliminating disk I/O on message routing hot path
+2. **Reader/Processor Separation**: TCP reader and frame processor run in separate goroutines with 10K frame buffer, preventing fsync from blocking socket reads
+3. **Lock-Free Per-Queue Isolation**: Using `sync.Map` eliminates global lock contention
+4. **Optimized Ring Buffer**: 64K message ring buffer (6.5 MB per queue) eliminates disk I/O for hot messages
+5. **Batch Synchronous WAL**: Groups fsync operations for durability without individual write latency
+6. **Dynamic Memory Management**: RabbitMQ-style 60% RAM threshold with proper flow control
+7. **Connection Stability**: Blocks publishers during memory pressure without closing connections
+8. **CBOR Serialization**: 2-3x faster metadata persistence compared to JSON
 
 ## Comparison with RabbitMQ
 

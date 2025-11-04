@@ -29,14 +29,14 @@ echo "Size: $SIZE bytes"
 echo ""
 
 # Step 1: Cleanup
-echo "[1/9] Cleaning up existing processes..."
+echo "[1/8] Cleaning up existing processes..."
 pkill -9 amqp-server || true
 pkill -9 perftest || true
 rm -rf /tmp/amqp-storage-* || true
 sleep 1
 
 # Step 2: Build
-echo "[2/9] Building server..."
+echo "[2/8] Building server..."
 cd "$PROJECT_DIR"
 go build -o amqp-server ./cmd/amqp-server
 if [ $? -ne 0 ]; then
@@ -45,76 +45,55 @@ if [ $? -ne 0 ]; then
 fi
 
 # Step 3: Create results directory
-echo "[3/9] Creating results directory..."
+echo "[3/8] Creating results directory..."
 mkdir -p "$PROFILE_DIR"
 
-# Step 4: Create benchmark config file
-echo "[4/9] Creating benchmark config..."
-cat > "$PROFILE_DIR/benchmark-config.yaml" <<YAML_END
+# Step 4: Generate config file and start server
+echo "[4/8] Generating config and starting server..."
+cat > "$PROFILE_DIR/benchmark-config.yaml" <<EOF
 network:
-  address: ":5672"
+  address: :5672
   port: 5672
   maxconnections: 1000
-  connectiontimeout: 30s
-  heartbeatinterval: 60s
+  connectiontimeoutms: 30000
+  heartbeatintervalms: 60000
   tcpkeepalive: true
-  tcpkeepaliveinterval: 30s
-  readbuffersize: 8192
-  writebuffersize: 8192
+  tcpkeepaliveintervalms: 30000
 storage:
-  backend: badger
-  path: "$STORAGE_PATH"
-  persistent: true
-  syncwrites: false
-  cachesize: 67108864
-  maxopenfiles: 100
-  compactionage: 24h
-  offsetcheckpointinterval: 5s
-security:
-  tlsenabled: false
-  authenticationenabled: false
-  authorizationenabled: false
-  defaultvhost: /
+  path: $STORAGE_PATH
+  fsync: false
+  cachemb: 64
+  maxfiles: 100
+  retentionms: 86400000
+  checkpointintervalms: 5000
 server:
-  name: amqp-go-server
-  version: 0.9.1
-  product: AMQP-Go
-  platform: Go
-  copyright: Maxpert AMQP-Go Server
   loglevel: info
-  logfile: ""
-  pidfile: ""
-  daemonize: false
   maxchannelsperconnection: 2047
   maxframesize: 131072
   maxmessagesize: 16777216
-  channeltimeout: 60s
-  messagetimeout: 30s
-  cleanupinterval: 5m
-  memorylimitpercent: 60
-  memorylimitbytes: 0
+  channeltimeoutms: 60000
+  messagetimeoutms: 30000
+  cleanupintervalms: 300000
 engine:
   availablechannelbuffer: 10000000
   ringbuffersize: 65536
   spillthresholdpercent: 80
   walbatchsize: 1000
-  walbatchtimeout: 10ms
+  walbatchtimeoutms: 10
   walfilesize: 536870912
   walchannelbuffer: 10000
   segmentsize: 1073741824
-  segmentcheckpointinterval: 5m
+  segmentcheckpointintervalms: 300000
   compactionthreshold: 0.5
-  compactioninterval: 30m
-  consumerselecttimeout: 500µs
+  compactionintervalms: 1800000
+  consumerselecttimeoutms: 1
   consumermaxbatchsize: 100
-  expiredmessagecheckinterval: 60s
-  walcleanupcheckinterval: 5m
+  expiredmessagecheckintervalms: 60000
+  walcleanupcheckintervalms: 300000
   offsetcleanupbatchsize: 1000
-  offsetcleanupinterval: 30s
-YAML_END
+  offsetcleanupintervalms: 30000
+EOF
 
-# Step 5: Start server with telemetry and persistence enabled
-echo "[5/9] Starting server with telemetry and persistence enabled..."
 ./amqp-server --config "$PROFILE_DIR/benchmark-config.yaml" --enable-telemetry --telemetry-port 9419 > "$PROFILE_DIR/server.log" 2>&1 &
 SERVER_PID=$!
 echo "Server PID: $SERVER_PID"
@@ -127,8 +106,8 @@ if ! kill -0 $SERVER_PID 2>/dev/null; then
     exit 1
 fi
 
-# Step 6: Start CPU profiling (in background)
-echo "[6/9] Starting CPU profiling (${DURATION})..."
+# Step 5: Start CPU profiling (in background)
+echo "[5/8] Starting CPU profiling (${DURATION})..."
 # Extract numeric duration for profiling
 DURATION_SECS=$(echo "$DURATION" | sed 's/[^0-9]*//g')
 curl -s -o "$PROFILE_DIR/cpu.prof" "http://localhost:9419/debug/pprof/profile?seconds=$DURATION_SECS" &
@@ -137,8 +116,8 @@ CURL_PID=$!
 # Give profiling a moment to start
 sleep 1
 
-# Step 7: Run benchmark
-echo "[7/9] Running benchmark..."
+# Step 6: Run benchmark
+echo "[6/8] Running benchmark..."
 cd "$PROJECT_DIR/benchmark"
 ./perftest \
     -producers $PRODUCERS \
@@ -168,8 +147,8 @@ else
     BENCHMARK_EXIT_CODE=$?
 fi
 
-# Step 8: Capture all profiles
-echo "[8/9] Capturing all profiles from telemetry endpoint..."
+# Step 7: Capture all profiles
+echo "[7/8] Capturing all profiles from telemetry endpoint..."
 wait $CURL_PID  # Wait for CPU profiling to finish
 curl -s -o "$PROFILE_DIR/heap.prof" "http://localhost:9419/debug/pprof/heap"
 curl -s -o "$PROFILE_DIR/allocs.prof" "http://localhost:9419/debug/pprof/allocs"
@@ -178,8 +157,8 @@ curl -s -o "$PROFILE_DIR/block.prof" "http://localhost:9419/debug/pprof/block"
 curl -s -o "$PROFILE_DIR/goroutine.prof" "http://localhost:9419/debug/pprof/goroutine"
 curl -s -o "$PROFILE_DIR/threadcreate.prof" "http://localhost:9419/debug/pprof/threadcreate"
 
-# Step 9: Cleanup and results
-echo "[9/9] Cleaning up..."
+# Step 8: Cleanup and results
+echo "[8/8] Cleaning up..."
 kill $SERVER_PID 2>/dev/null || true
 sleep 1
 

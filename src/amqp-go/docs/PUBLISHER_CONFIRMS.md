@@ -25,7 +25,7 @@ Publisher confirms provide delivery guarantees by acknowledging messages after t
 
 **Current Code**:
 ```go
-// Store to BadgerDB
+// Store to persistent storage
 err := b.storage.StoreMessage(queueName, message)
 if err != nil {
     return fmt.Errorf("failed to store message to queue '%s': %w", queueName, err)

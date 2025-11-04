@@ -46,7 +46,7 @@ fi
 
 # Step 4: Start server (first session)
 echo "[4/7] Starting server (first session)..."
-./amqp-server --storage badger --storage-path "$STORAGE_PATH" > /tmp/amqp-crash-test.log 2>&1 &
+./amqp-server --storage-path "$STORAGE_PATH" > /tmp/amqp-crash-test.log 2>&1 &
 SERVER_PID=$!
 echo "Server PID: $SERVER_PID"
 sleep 2
@@ -85,7 +85,7 @@ echo "✓ Server killed"
 
 # Step 7: Restart and verify recovery
 echo "[7/7] Restarting server and verifying recovery..."
-./amqp-server --storage badger --storage-path "$STORAGE_PATH" > /tmp/amqp-crash-test-recovery.log 2>&1 &
+./amqp-server --storage-path "$STORAGE_PATH" > /tmp/amqp-crash-test-recovery.log 2>&1 &
 SERVER_PID=$!
 echo "Server PID: $SERVER_PID"
 sleep 3

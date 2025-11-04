@@ -27,6 +27,7 @@ const (
 // Phase 3: Simple, debuggable file-based metadata
 // Phase 6D: In-memory cache for hot path optimization
 // Phase 6F: Migrated from JSON to CBOR for 2-3x faster serialization
+// Phase 6H: Added binding cache for routing performance
 type PersistentMetadataStore struct {
 	baseDir string
 	mutex   sync.RWMutex
@@ -34,7 +35,13 @@ type PersistentMetadataStore struct {
 	// In-memory cache for hot path (Phase 6D)
 	exchangeCache sync.Map // name -> *protocol.Exchange
 	queueCache    sync.Map // name -> *protocol.Queue
-	cacheEnabled  bool
+
+	// Binding cache (Phase 6H) - critical for routing performance
+	bindingCache         sync.Map // "queue:exchange:key" -> *interfaces.QueueBinding
+	queueBindingsCache   sync.Map // queueName -> []*interfaces.QueueBinding
+	exchangeBindingsCache sync.Map // exchangeName -> []*interfaces.QueueBinding
+
+	cacheEnabled bool
 }
 
 // NewPersistentMetadataStore creates a new persistent metadata store
@@ -95,6 +102,72 @@ func (pm *PersistentMetadataStore) loadCacheFromDisk() {
 			}
 		}
 	}
+
+	// Load all bindings into cache (Phase 6H)
+	if bindings, err := pm.loadBindingsFromDisk(); err == nil {
+		// Build per-queue and per-exchange indexes
+		queueBindings := make(map[string][]*interfaces.QueueBinding)
+		exchangeBindings := make(map[string][]*interfaces.QueueBinding)
+
+		for _, binding := range bindings {
+			// Cache individual binding
+			cacheKey := makeBindingCacheKey(binding.QueueName, binding.ExchangeName, binding.RoutingKey)
+			pm.bindingCache.Store(cacheKey, binding)
+
+			// Index by queue
+			queueBindings[binding.QueueName] = append(queueBindings[binding.QueueName], binding)
+
+			// Index by exchange
+			exchangeBindings[binding.ExchangeName] = append(exchangeBindings[binding.ExchangeName], binding)
+		}
+
+		// Store indexed caches
+		for queueName, bindings := range queueBindings {
+			pm.queueBindingsCache.Store(queueName, bindings)
+		}
+		for exchangeName, bindings := range exchangeBindings {
+			pm.exchangeBindingsCache.Store(exchangeName, bindings)
+		}
+	}
+}
+
+// makeBindingCacheKey creates a unique cache key for a binding
+func makeBindingCacheKey(queueName, exchangeName, routingKey string) string {
+	return fmt.Sprintf("%s:%s:%s", queueName, exchangeName, routingKey)
+}
+
+// loadBindingsFromDisk loads all bindings from disk (helper for cache preload)
+func (pm *PersistentMetadataStore) loadBindingsFromDisk() ([]*interfaces.QueueBinding, error) {
+	dir := filepath.Join(pm.baseDir, BindingsDir)
+	files, err := os.ReadDir(dir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return []*interfaces.QueueBinding{}, nil
+		}
+		return nil, fmt.Errorf("failed to read bindings directory: %w", err)
+	}
+
+	bindings := make([]*interfaces.QueueBinding, 0, len(files))
+	for _, file := range files {
+		if file.IsDir() || !strings.HasSuffix(file.Name(), FileExtension) {
+			continue
+		}
+
+		path := filepath.Join(dir, file.Name())
+		data, err := os.ReadFile(path)
+		if err != nil {
+			continue // Skip unreadable files
+		}
+
+		var binding interfaces.QueueBinding
+		if err := cbor.Unmarshal(data, &binding); err != nil {
+			continue // Skip corrupted files
+		}
+
+		bindings = append(bindings, &binding)
+	}
+
+	return bindings, nil
 }
 
 // atomicWrite writes data to a file atomically using temp file + rename
@@ -366,7 +439,7 @@ func makeBindingFilename(queueName, exchangeName, routingKey string) string {
 		FileExtension)
 }
 
-// StoreBinding persists a binding to disk
+// StoreBinding persists a binding to disk and updates cache
 func (pm *PersistentMetadataStore) StoreBinding(queueName, exchangeName, routingKey string, arguments map[string]interface{}) error {
 	pm.mutex.Lock()
 	defer pm.mutex.Unlock()
@@ -385,11 +458,34 @@ func (pm *PersistentMetadataStore) StoreBinding(queueName, exchangeName, routing
 
 	filename := makeBindingFilename(queueName, exchangeName, routingKey)
 	path := filepath.Join(pm.baseDir, BindingsDir, filename)
-	return pm.atomicWrite(path, data)
+	if err := pm.atomicWrite(path, data); err != nil {
+		return err
+	}
+
+	// Update cache (Phase 6H)
+	if pm.cacheEnabled {
+		cacheKey := makeBindingCacheKey(queueName, exchangeName, routingKey)
+		pm.bindingCache.Store(cacheKey, binding)
+
+		// Invalidate queue and exchange binding caches to force rebuild on next access
+		pm.queueBindingsCache.Delete(queueName)
+		pm.exchangeBindingsCache.Delete(exchangeName)
+	}
+
+	return nil
 }
 
-// GetBinding loads a binding from disk
+// GetBinding loads a binding from cache or disk
 func (pm *PersistentMetadataStore) GetBinding(queueName, exchangeName, routingKey string) (*interfaces.QueueBinding, error) {
+	// Try cache first (Phase 6H: lock-free hot path!)
+	if pm.cacheEnabled {
+		cacheKey := makeBindingCacheKey(queueName, exchangeName, routingKey)
+		if cached, ok := pm.bindingCache.Load(cacheKey); ok {
+			return cached.(*interfaces.QueueBinding), nil
+		}
+	}
+
+	// Cache miss - load from disk
 	pm.mutex.RLock()
 	defer pm.mutex.RUnlock()
 
@@ -409,10 +505,16 @@ func (pm *PersistentMetadataStore) GetBinding(queueName, exchangeName, routingKe
 		return nil, fmt.Errorf("failed to unmarshal binding: %w", err)
 	}
 
+	// Update cache on load (Phase 6H)
+	if pm.cacheEnabled {
+		cacheKey := makeBindingCacheKey(queueName, exchangeName, routingKey)
+		pm.bindingCache.Store(cacheKey, &binding)
+	}
+
 	return &binding, nil
 }
 
-// DeleteBinding removes a binding file
+// DeleteBinding removes a binding file and cache entry
 func (pm *PersistentMetadataStore) DeleteBinding(queueName, exchangeName, routingKey string) error {
 	pm.mutex.Lock()
 	defer pm.mutex.Unlock()
@@ -422,6 +524,16 @@ func (pm *PersistentMetadataStore) DeleteBinding(queueName, exchangeName, routin
 
 	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
 		return fmt.Errorf("failed to delete binding file: %w", err)
+	}
+
+	// Remove from cache (Phase 6H)
+	if pm.cacheEnabled {
+		cacheKey := makeBindingCacheKey(queueName, exchangeName, routingKey)
+		pm.bindingCache.Delete(cacheKey)
+
+		// Invalidate queue and exchange binding caches to force rebuild
+		pm.queueBindingsCache.Delete(queueName)
+		pm.exchangeBindingsCache.Delete(exchangeName)
 	}
 
 	return nil
@@ -464,8 +576,16 @@ func (pm *PersistentMetadataStore) ListBindings() ([]*interfaces.QueueBinding, e
 	return bindings, nil
 }
 
-// GetQueueBindings returns all bindings for a specific queue
+// GetQueueBindings returns all bindings for a specific queue (cached)
 func (pm *PersistentMetadataStore) GetQueueBindings(queueName string) ([]*interfaces.QueueBinding, error) {
+	// Try cache first (Phase 6H: O(1) lookup instead of O(n) scan!)
+	if pm.cacheEnabled {
+		if cached, ok := pm.queueBindingsCache.Load(queueName); ok {
+			return cached.([]*interfaces.QueueBinding), nil
+		}
+	}
+
+	// Cache miss - load all bindings and rebuild index
 	allBindings, err := pm.ListBindings()
 	if err != nil {
 		return nil, err
@@ -478,11 +598,24 @@ func (pm *PersistentMetadataStore) GetQueueBindings(queueName string) ([]*interf
 		}
 	}
 
+	// Update cache with result (Phase 6H)
+	if pm.cacheEnabled {
+		pm.queueBindingsCache.Store(queueName, result)
+	}
+
 	return result, nil
 }
 
-// GetExchangeBindings returns all bindings for a specific exchange
+// GetExchangeBindings returns all bindings for a specific exchange (cached)
 func (pm *PersistentMetadataStore) GetExchangeBindings(exchangeName string) ([]*interfaces.QueueBinding, error) {
+	// Try cache first (Phase 6H: O(1) lookup instead of O(n) scan!)
+	if pm.cacheEnabled {
+		if cached, ok := pm.exchangeBindingsCache.Load(exchangeName); ok {
+			return cached.([]*interfaces.QueueBinding), nil
+		}
+	}
+
+	// Cache miss - load all bindings and rebuild index
 	allBindings, err := pm.ListBindings()
 	if err != nil {
 		return nil, err
@@ -493,6 +626,11 @@ func (pm *PersistentMetadataStore) GetExchangeBindings(exchangeName string) ([]*
 		if binding.ExchangeName == exchangeName {
 			result = append(result, binding)
 		}
+	}
+
+	// Update cache with result (Phase 6H)
+	if pm.cacheEnabled {
+		pm.exchangeBindingsCache.Store(exchangeName, result)
 	}
 
 	return result, nil

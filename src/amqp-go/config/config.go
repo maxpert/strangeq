@@ -5,7 +5,6 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"time"
 
 	"github.com/knadh/koanf/parsers/yaml"
 	"github.com/knadh/koanf/providers/env/v2"
@@ -19,26 +18,23 @@ import (
 func DefaultConfig() *AMQPConfig {
 	return &AMQPConfig{
 		Network: interfaces.NetworkConfig{
-			Address:              ":5672",
-			Port:                 5672,
-			MaxConnections:       1000,
-			ConnectionTimeout:    30 * time.Second,
-			HeartbeatInterval:    60 * time.Second,
-			TCPKeepAlive:         true,
-			TCPKeepAliveInterval: 30 * time.Second,
-			ReadBufferSize:       8192,
-			WriteBufferSize:      8192,
+			Address:                ":5672",
+			Port:                   5672,
+			MaxConnections:         1000,
+			ConnectionTimeoutMS:    30000, // 30 seconds
+			HeartbeatIntervalMS:    60000, // 60 seconds
+			TCPKeepAlive:           true,
+			TCPKeepAliveIntervalMS: 30000, // 30 seconds
+			ReadBufferSize:         8192,
+			WriteBufferSize:        8192,
 		},
 		Storage: interfaces.StorageConfig{
-			Backend:                  "badger",
-			Path:                     "./data",
-			Options:                  make(map[string]interface{}),
-			Persistent:               true,
-			SyncWrites:               false,
-			CacheSize:                64 * 1024 * 1024, // 64MB
-			MaxOpenFiles:             100,
-			CompactionAge:            24 * time.Hour,
-			OffsetCheckpointInterval: 5 * time.Second, // Phase 4: Default 5s checkpoint interval
+			Path:                 "./data",
+			Fsync:                false,
+			CacheMB:              64,      // 64 MB metadata cache
+			MaxFiles:             100,     // Max open file handles
+			RetentionMS:          86400000, // 24 hours
+			CheckpointIntervalMS: 5000,    // 5 seconds
 		},
 		Security: interfaces.SecurityConfig{
 			TLSEnabled:             false,
@@ -70,11 +66,11 @@ func DefaultConfig() *AMQPConfig {
 			MaxChannelsPerConnection: 2047,
 			MaxFrameSize:             131072,   // 128KB
 			MaxMessageSize:           16777216, // 16MB
-			ChannelTimeout:           60 * time.Second,
-			MessageTimeout:           30 * time.Second,
-			CleanupInterval:          5 * time.Minute,
-			MemoryLimitPercent:       60, // 60% of RAM (RabbitMQ default)
-			MemoryLimitBytes:         0,  // 0 = use percentage
+			ChannelTimeoutMS:         60000,    // 60 seconds
+			MessageTimeoutMS:         30000,    // 30 seconds
+			CleanupIntervalMS:        300000,   // 5 minutes
+			MemoryLimitPercent:       60,       // 60% of RAM (RabbitMQ default)
+			MemoryLimitBytes:         0,        // 0 = use percentage
 		},
 		Engine: interfaces.EngineConfig{
 			// Queue State Management
@@ -85,26 +81,26 @@ func DefaultConfig() *AMQPConfig {
 			SpillThresholdPercent: 80,    // Start spilling at 80% = 51,200 messages
 
 			// Write-Ahead Log (WAL)
-			WALBatchSize:     1000,                  // 1,000 messages per batch
-			WALBatchTimeout:  10 * time.Millisecond, // 10ms max wait
-			WALFileSize:      512 * 1024 * 1024,     // 512 MB per WAL file
-			WALChannelBuffer: 10000,                 // 10K buffered requests
+			WALBatchSize:      1000,             // 1,000 messages per batch
+			WALBatchTimeoutMS: 10,               // 10 milliseconds max wait
+			WALFileSize:       512 * 1024 * 1024, // 512 MB per WAL file
+			WALChannelBuffer:  10000,            // 10K buffered requests
 
 			// Segment Storage (Cold Path)
-			SegmentSize:               1024 * 1024 * 1024, // 1 GB per segment
-			SegmentCheckpointInterval: 5 * time.Minute,    // Checkpoint every 5 minutes
-			CompactionThreshold:       0.5,                // Compact at 50% deleted
-			CompactionInterval:        30 * time.Minute,   // Check every 30 minutes
+			SegmentSize:                    1024 * 1024 * 1024, // 1 GB per segment
+			SegmentCheckpointIntervalMS:    300000,            // 5 minutes
+			CompactionThreshold:            0.5,               // Compact at 50% deleted
+			CompactionIntervalMS:           1800000,           // 30 minutes
 
 			// Consumer Delivery
-			ConsumerSelectTimeout: 500 * time.Microsecond, // 500µs wait when no messages
-			ConsumerMaxBatchSize:  100,                    // Max 100 messages per consumer per poll
+			ConsumerSelectTimeoutMS: 1,   // 1 millisecond (500µs rounded up)
+			ConsumerMaxBatchSize:    100, // Max 100 messages per consumer per poll
 
 			// Background Maintenance
-			ExpiredMessageCheckInterval: 60 * time.Second, // Check for expired messages every 60s
-			WALCleanupCheckInterval:     5 * time.Minute,  // Check for old WAL files every 5 minutes
-			OffsetCleanupBatchSize:      1000,             // Delete 1,000 offsets per cycle
-			OffsetCleanupInterval:       30 * time.Second, // Cleanup ACKed offsets every 30s
+			ExpiredMessageCheckIntervalMS: 60000,  // 60 seconds
+			WALCleanupCheckIntervalMS:     300000, // 5 minutes
+			OffsetCleanupBatchSize:        1000,   // Delete 1,000 offsets per cycle
+			OffsetCleanupIntervalMS:       30000,  // 30 seconds
 		},
 	}
 }
@@ -154,17 +150,13 @@ func (c *AMQPConfig) Validate() error {
 		return fmt.Errorf("max connections must be positive: %d", c.Network.MaxConnections)
 	}
 
-	if c.Network.ConnectionTimeout <= 0 {
-		return fmt.Errorf("connection timeout must be positive: %v", c.Network.ConnectionTimeout)
+	if c.Network.ConnectionTimeoutMS <= 0 {
+		return fmt.Errorf("connection timeout must be positive: %d ms", c.Network.ConnectionTimeoutMS)
 	}
 
 	// Validate storage configuration
-	if c.Storage.Backend == "" {
-		return fmt.Errorf("storage backend cannot be empty")
-	}
-
-	if c.Storage.Backend == "badger" && c.Storage.Path == "" {
-		return fmt.Errorf("storage path required for badger backend")
+	if c.Storage.Path == "" {
+		return fmt.Errorf("storage path cannot be empty")
 	}
 
 	// Validate security configuration
@@ -212,8 +204,8 @@ func (c *AMQPConfig) Validate() error {
 		return fmt.Errorf("WAL batch size must be positive: %d", c.Engine.WALBatchSize)
 	}
 
-	if c.Engine.WALBatchTimeout <= 0 {
-		return fmt.Errorf("WAL batch timeout must be positive: %v", c.Engine.WALBatchTimeout)
+	if c.Engine.WALBatchTimeoutMS <= 0 {
+		return fmt.Errorf("WAL batch timeout must be positive: %d ms", c.Engine.WALBatchTimeoutMS)
 	}
 
 	if c.Engine.WALFileSize <= 0 {
@@ -228,40 +220,40 @@ func (c *AMQPConfig) Validate() error {
 		return fmt.Errorf("segment size must be positive: %d", c.Engine.SegmentSize)
 	}
 
-	if c.Engine.SegmentCheckpointInterval <= 0 {
-		return fmt.Errorf("segment checkpoint interval must be positive: %v", c.Engine.SegmentCheckpointInterval)
+	if c.Engine.SegmentCheckpointIntervalMS <= 0 {
+		return fmt.Errorf("segment checkpoint interval must be positive: %d ms", c.Engine.SegmentCheckpointIntervalMS)
 	}
 
 	if c.Engine.CompactionThreshold < 0 || c.Engine.CompactionThreshold > 1 {
 		return fmt.Errorf("compaction threshold must be between 0.0-1.0: %f", c.Engine.CompactionThreshold)
 	}
 
-	if c.Engine.CompactionInterval <= 0 {
-		return fmt.Errorf("compaction interval must be positive: %v", c.Engine.CompactionInterval)
+	if c.Engine.CompactionIntervalMS <= 0 {
+		return fmt.Errorf("compaction interval must be positive: %d ms", c.Engine.CompactionIntervalMS)
 	}
 
-	if c.Engine.ConsumerSelectTimeout <= 0 {
-		return fmt.Errorf("consumer select timeout must be positive: %v", c.Engine.ConsumerSelectTimeout)
+	if c.Engine.ConsumerSelectTimeoutMS < 0 {
+		return fmt.Errorf("consumer select timeout must be non-negative: %d ms", c.Engine.ConsumerSelectTimeoutMS)
 	}
 
 	if c.Engine.ConsumerMaxBatchSize <= 0 {
 		return fmt.Errorf("consumer max batch size must be positive: %d", c.Engine.ConsumerMaxBatchSize)
 	}
 
-	if c.Engine.ExpiredMessageCheckInterval <= 0 {
-		return fmt.Errorf("expired message check interval must be positive: %v", c.Engine.ExpiredMessageCheckInterval)
+	if c.Engine.ExpiredMessageCheckIntervalMS <= 0 {
+		return fmt.Errorf("expired message check interval must be positive: %d ms", c.Engine.ExpiredMessageCheckIntervalMS)
 	}
 
-	if c.Engine.WALCleanupCheckInterval <= 0 {
-		return fmt.Errorf("WAL cleanup check interval must be positive: %v", c.Engine.WALCleanupCheckInterval)
+	if c.Engine.WALCleanupCheckIntervalMS <= 0 {
+		return fmt.Errorf("WAL cleanup check interval must be positive: %d ms", c.Engine.WALCleanupCheckIntervalMS)
 	}
 
 	if c.Engine.OffsetCleanupBatchSize <= 0 {
 		return fmt.Errorf("offset cleanup batch size must be positive: %d", c.Engine.OffsetCleanupBatchSize)
 	}
 
-	if c.Engine.OffsetCleanupInterval <= 0 {
-		return fmt.Errorf("offset cleanup interval must be positive: %v", c.Engine.OffsetCleanupInterval)
+	if c.Engine.OffsetCleanupIntervalMS <= 0 {
+		return fmt.Errorf("offset cleanup interval must be positive: %d ms", c.Engine.OffsetCleanupIntervalMS)
 	}
 
 	return nil

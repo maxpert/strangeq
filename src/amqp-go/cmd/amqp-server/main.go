@@ -152,10 +152,7 @@ func main() {
 	if !cfg.Server.Daemonize || isDaemonChild() {
 		if isDaemonChild() {
 			log.Printf("Starting AMQP server daemon on %s", cfg.Network.Address)
-			log.Printf("Storage backend: %s", cfg.Storage.Backend)
-			if cfg.Storage.Persistent {
-				log.Printf("Storage path: %s", cfg.Storage.Path)
-			}
+			log.Printf("Storage path: %s (persistent)", cfg.Storage.Path)
 			if cfg.Security.TLSEnabled {
 				log.Println("TLS: Enabled")
 			}
@@ -167,10 +164,7 @@ func main() {
 			log.Println("AMQP daemon started successfully")
 		} else {
 			fmt.Printf("Starting AMQP server on %s\n", cfg.Network.Address)
-			fmt.Printf("Storage backend: %s\n", cfg.Storage.Backend)
-			if cfg.Storage.Persistent {
-				fmt.Printf("Storage path: %s\n", cfg.Storage.Path)
-			}
+			fmt.Printf("Storage path: %s (persistent)\n", cfg.Storage.Path)
 			if cfg.Security.TLSEnabled {
 				fmt.Println("TLS: Enabled")
 			}

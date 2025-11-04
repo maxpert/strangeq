@@ -423,8 +423,9 @@ func (lm *LifecycleManager) setError(err error) {
 
 // getShutdownTimeout returns the shutdown timeout from configuration
 func (lm *LifecycleManager) getShutdownTimeout() time.Duration {
-	if lm.config != nil && lm.config.Server.CleanupInterval > 0 {
-		return lm.config.Server.CleanupInterval * 2 // Use 2x cleanup interval as shutdown timeout
+	if lm.config != nil && lm.config.Server.CleanupIntervalMS > 0 {
+		cleanupInterval := time.Duration(lm.config.Server.CleanupIntervalMS) * time.Millisecond
+		return cleanupInterval * 2 // Use 2x cleanup interval as shutdown timeout
 	}
 	return 30 * time.Second // Default timeout
 }

@@ -17,7 +17,6 @@ func TestDefaultConfig(t *testing.T) {
 	assert.Equal(t, ":5672", config.Network.Address)
 	assert.Equal(t, 5672, config.Network.Port)
 	assert.Equal(t, 1000, config.Network.MaxConnections)
-	assert.Equal(t, "badger", config.Storage.Backend)
 	assert.Equal(t, "./data", config.Storage.Path)
 	assert.Equal(t, false, config.Security.TLSEnabled)
 	assert.Equal(t, "amqp-go-server", config.Server.Name)
@@ -62,9 +61,9 @@ func TestConfigValidation(t *testing.T) {
 			wantErr: true,
 		},
 		{
-			name: "empty storage backend",
+			name: "empty storage path",
 			modify: func(c *AMQPConfig) {
-				c.Storage.Backend = ""
+				c.Storage.Path = ""
 			},
 			wantErr: true,
 		},
@@ -109,8 +108,8 @@ func TestConfigSaveLoad(t *testing.T) {
 	originalConfig := DefaultConfig()
 	originalConfig.Network.Address = ":8080"
 	originalConfig.Network.MaxConnections = 500
-	originalConfig.Storage.Backend = "bbolt"
-	originalConfig.Storage.Path = "/tmp/amqp.db"
+	originalConfig.Storage.Path = "/tmp/amqp-data"
+	originalConfig.Storage.Fsync = true
 	originalConfig.Server.LogLevel = "debug"
 
 	// Save the config
@@ -128,8 +127,8 @@ func TestConfigSaveLoad(t *testing.T) {
 	// Verify values were preserved
 	assert.Equal(t, ":8080", loadedConfig.Network.Address)
 	assert.Equal(t, 500, loadedConfig.Network.MaxConnections)
-	assert.Equal(t, "bbolt", loadedConfig.Storage.Backend)
-	assert.Equal(t, "/tmp/amqp.db", loadedConfig.Storage.Path)
+	assert.Equal(t, "/tmp/amqp-data", loadedConfig.Storage.Path)
+	assert.Equal(t, true, loadedConfig.Storage.Fsync)
 	assert.Equal(t, "debug", loadedConfig.Server.LogLevel)
 }
 
@@ -161,33 +160,43 @@ network:
   address: ":8080"
   port: 8080
   maxconnections: 1000
-  connectiontimeout: 30s
+  connectiontimeoutms: 30000
+  heartbeatintervalms: 60000
+  tcpkeepalive: true
+  tcpkeepaliveintervalms: 30000
 storage:
-  backend: badger
   path: ./test-data
+  fsync: false
+  cachemb: 64
+  maxfiles: 100
+  retentionms: 86400000
+  checkpointintervalms: 5000
 server:
   loglevel: debug
   maxchannelsperconnection: 2047
   maxframesize: 131072
   maxmessagesize: 16777216
+  channeltimeoutms: 60000
+  messagetimeoutms: 30000
+  cleanupintervalms: 300000
 engine:
   availablechannelbuffer: 10000000
   ringbuffersize: 65536
   spillthresholdpercent: 80
   walbatchsize: 1000
-  walbatchtimeout: 10ms
+  walbatchtimeoutms: 10
   walfilesize: 536870912
   walchannelbuffer: 10000
   segmentsize: 1073741824
-  segmentcheckpointinterval: 5m
+  segmentcheckpointintervalms: 300000
   compactionthreshold: 0.5
-  compactioninterval: 30m
-  consumerselecttimeout: 500µs
+  compactionintervalms: 1800000
+  consumerselecttimeoutms: 1
   consumermaxbatchsize: 100
-  expiredmessagecheckinterval: 1m
-  walcleanupcheckinterval: 5m
+  expiredmessagecheckintervalms: 60000
+  walcleanupcheckintervalms: 300000
   offsetcleanupbatchsize: 1000
-  offsetcleanupinterval: 30s
+  offsetcleanupintervalms: 30000
 `
 	err := os.WriteFile(configFile, []byte(yamlContent), 0644)
 	require.NoError(t, err)
@@ -197,6 +206,8 @@ engine:
 	assert.NoError(t, err)
 	assert.Equal(t, ":8080", config.Network.Address)
 	assert.Equal(t, "debug", config.Server.LogLevel)
+	assert.Equal(t, int64(30000), config.Network.ConnectionTimeoutMS)
+	assert.Equal(t, false, config.Storage.Fsync)
 }
 
 func TestConfigBuilder(t *testing.T) {
@@ -205,7 +216,8 @@ func TestConfigBuilder(t *testing.T) {
 		WithPort(9090).
 		WithMaxConnections(2000).
 		WithConnectionTimeout(45*time.Second).
-		WithMemoryStorage().
+		WithStoragePath("/tmp/test-storage").
+		WithFsync(true).
 		WithLogging("debug", "/var/log/amqp.log").
 		WithServerInfo("test-server", "1.0.0", "Test AMQP", "Test", "Test Corp").
 		Build()
@@ -215,8 +227,9 @@ func TestConfigBuilder(t *testing.T) {
 	assert.Equal(t, ":9090", config.Network.Address)
 	assert.Equal(t, 9090, config.Network.Port)
 	assert.Equal(t, 2000, config.Network.MaxConnections)
-	assert.Equal(t, 45*time.Second, config.Network.ConnectionTimeout)
-	assert.Equal(t, "memory", config.Storage.Backend)
+	assert.Equal(t, int64(45000), config.Network.ConnectionTimeoutMS)
+	assert.Equal(t, "/tmp/test-storage", config.Storage.Path)
+	assert.Equal(t, true, config.Storage.Fsync)
 	assert.Equal(t, "debug", config.Server.LogLevel)
 	assert.Equal(t, "/var/log/amqp.log", config.Server.LogFile)
 	assert.Equal(t, "test-server", config.Server.Name)

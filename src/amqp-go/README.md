@@ -5,10 +5,11 @@ High-performance AMQP 0.9.1 server implementation in Go, compatible with RabbitM
 ## Features
 
 - **AMQP 0.9.1 Protocol**: Full compatibility with RabbitMQ clients
-- **High Performance**: 1.7-1.8x faster than RabbitMQ (110-120K msg/s on Apple M4 Max)
+- **High Performance**: 1.7-1.8x faster than RabbitMQ (114K msg/s on Apple M4 Max)
+- **Metadata Caching**: O(1) lock-free lookups for all routing metadata
 - **Persistent Storage**: Write-Ahead Log (WAL) with batch synchronous writes
 - **Lock-Free Architecture**: Per-queue isolation eliminates global contention
-- **Memory Efficient**: Optimized 256K ring buffer with zero disk reads for hot messages
+- **Memory Efficient**: Optimized ring buffer (64K messages) with zero disk reads
 - **Zero TCP Blocking**: Reader/processor separation prevents fsync from blocking connections
 - **TLS Support**: Secure connections with certificate-based authentication
 - **Crash Recovery**: Fast recovery (476K msg/s) with metadata integrity checks
@@ -163,19 +164,36 @@ Benchmarked on Apple M4 Max with 20 producers / 20 consumers:
 
 | Metric | Value |
 |--------|-------|
-| **Throughput** | 110,000-120,000 msg/s |
-| **Peak Bursts** | 230,000+ msg/s |
+| **Published Throughput** | 114,178 msg/s sustained |
+| **Consumed Throughput** | 107,572 msg/s sustained |
+| **Peak Bursts** | 220,000+ msg/s |
 | **vs RabbitMQ** | **1.7-1.8x faster** |
 | **Recovery Rate** | 476,000 msg/s |
+| **Metadata Lookups** | O(1) lock-free (zero disk I/O) |
 | **Ring Buffer Hits** | 100% (zero disk reads) |
+
+**Latest Benchmark Results (30 seconds, 1KB messages):**
+- Total Published: 3,521,091 messages
+- Total Consumed: 3,317,355 messages
+- CPU Profile: 49% syscalls (I/O), 29% consumer polling
+- Zero metadata disk reads (all cached)
 
 See `benchmark/README.md` for detailed performance testing guide.
 
 ## Architecture
 
+### Metadata Caching
+
+- **Three-Tier Binding Cache**: Individual lookups, queue-indexed, exchange-indexed
+- **Exchange/Queue Cache**: All definitions cached in memory
+- **Lock-Free Access**: sync.Map for concurrent O(1) lookups
+- **Warm Cache**: All metadata preloaded on startup (zero cold starts)
+- **CBOR Serialization**: 2-3x faster than JSON for metadata persistence
+- **Cache Invalidation**: Automatic on create/update/delete operations
+
 ### Storage Engine
 
-- **Ring Buffer**: 256K message circular buffer (6.5 MB per queue)
+- **Ring Buffer**: 64K message circular buffer (6.5 MB per queue)
 - **Write-Ahead Log**: Batch synchronous writes with fsync per batch
 - **Segment Storage**: 1 GB segments for cold message storage
 - **Lock-Free Design**: Per-queue isolation using sync.Map

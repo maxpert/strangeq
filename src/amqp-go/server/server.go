@@ -38,12 +38,11 @@ type Server struct {
 	StartTime          time.Time
 }
 
-// NewServer creates a new AMQP server with default in-memory storage
+// NewServer creates a new AMQP server with default storage
 func NewServer(addr string) *Server {
 	cfg := config.DefaultConfig()
 	cfg.Network.Address = addr
-	cfg.Storage.Backend = "memory"
-	cfg.Storage.Persistent = false
+	// Storage is always persistent - use default path from config
 
 	serverBuilder := NewServerBuilder().WithConfig(cfg)
 	srv, err := serverBuilder.Build()

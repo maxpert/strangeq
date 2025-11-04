@@ -1,9 +1,5 @@
 package interfaces
 
-import (
-	"time"
-)
-
 // Config defines the interface for server configuration
 type Config interface {
 	// GetNetwork returns network configuration
@@ -42,15 +38,15 @@ type NetworkConfig struct {
 	// Maximum number of connections
 	MaxConnections int
 
-	// Connection timeout
-	ConnectionTimeout time.Duration
+	// Connection timeout in milliseconds
+	ConnectionTimeoutMS int64
 
-	// Heartbeat interval
-	HeartbeatInterval time.Duration
+	// Heartbeat interval in milliseconds
+	HeartbeatIntervalMS int64
 
 	// TCP keepalive settings
-	TCPKeepAlive         bool
-	TCPKeepAliveInterval time.Duration
+	TCPKeepAlive           bool
+	TCPKeepAliveIntervalMS int64 // TCP keepalive interval in milliseconds
 
 	// Buffer sizes
 	ReadBufferSize  int
@@ -59,30 +55,29 @@ type NetworkConfig struct {
 
 // StorageConfig holds storage-related configuration
 type StorageConfig struct {
-	// Backend type ("memory", "bbolt", "badger", etc.)
-	Backend string
-
-	// Connection string or file path
+	// Path is the directory where all persistent data is stored
 	Path string
 
-	// Storage-specific options
-	Options map[string]interface{}
-
-	// Persistence settings
-	Persistent bool
-	SyncWrites bool
+	// Fsync forces disk sync after each WAL batch write
+	// true = safer but slower (fsync after each batch)
+	// false = faster but less durable (relies on OS page cache)
+	Fsync bool
 
 	// Message settings
 	MessageTTL int64 // Message TTL in seconds (0 = no TTL)
 
 	// Performance settings
-	CacheSize     int64
-	MaxOpenFiles  int
-	CompactionAge time.Duration
+	CacheMB  int64 // Metadata cache size in megabytes
+	MaxFiles int   // Maximum open file handles
 
-	// Offset checkpoint interval (Phase 4)
+	// RetentionMS is how long to keep old segments before compaction (milliseconds)
+	// Example: 86400000 = 24 hours
+	RetentionMS int64
+
+	// CheckpointIntervalMS is how often to save consumer offset positions (milliseconds)
 	// Set to 0 to disable background checkpointing (manual checkpoint only)
-	OffsetCheckpointInterval time.Duration
+	// Example: 5000 = 5 seconds
+	CheckpointIntervalMS int64
 }
 
 // SecurityConfig holds security-related configuration
@@ -131,10 +126,10 @@ type ServerConfig struct {
 	MaxFrameSize             int
 	MaxMessageSize           int64
 
-	// Timeouts and intervals
-	ChannelTimeout  time.Duration
-	MessageTimeout  time.Duration
-	CleanupInterval time.Duration
+	// Timeouts and intervals (in milliseconds)
+	ChannelTimeoutMS  int64 // Channel operation timeout
+	MessageTimeoutMS  int64 // Message handling timeout
+	CleanupIntervalMS int64 // Background cleanup interval
 
 	// Memory management
 	// MemoryLimitPercent sets memory threshold as percentage of system RAM (0-100)
@@ -190,11 +185,11 @@ type EngineConfig struct {
 	// Default: 1,000 messages
 	WALBatchSize int `json:"wal_batch_size"`
 
-	// WALBatchTimeout is max time to wait before flushing partial WAL batch
+	// WALBatchTimeoutMS is max time to wait before flushing partial WAL batch (milliseconds)
 	// Longer = better batching, higher latency
 	// Shorter = lower latency, less efficient batching
-	// Default: 10ms
-	WALBatchTimeout time.Duration `json:"wal_batch_timeout"`
+	// Default: 10 (10ms)
+	WALBatchTimeoutMS int64 `json:"wal_batch_timeout_ms"`
 
 	// WALFileSize is the max size of each WAL file before rotation
 	// Larger = fewer files, longer replay on restart
@@ -218,11 +213,11 @@ type EngineConfig struct {
 	// Default: 1,073,741,824 (1 GB)
 	SegmentSize int64 `json:"segment_size"`
 
-	// SegmentCheckpointInterval is how often to checkpoint segment metadata
+	// SegmentCheckpointIntervalMS is how often to checkpoint segment metadata (milliseconds)
 	// Longer = less I/O overhead, more replay on restart
 	// Shorter = more I/O overhead, faster restart
-	// Default: 5 minutes
-	SegmentCheckpointInterval time.Duration `json:"segment_checkpoint_interval"`
+	// Default: 300000 (5 minutes)
+	SegmentCheckpointIntervalMS int64 `json:"segment_checkpoint_interval_ms"`
 
 	// CompactionThreshold is the fraction of deleted messages to trigger compaction (0.0-1.0)
 	// Higher = less frequent compaction, more wasted space
@@ -230,21 +225,21 @@ type EngineConfig struct {
 	// Default: 0.5 (50% deleted)
 	CompactionThreshold float64 `json:"compaction_threshold"`
 
-	// CompactionInterval is how often to check for segments needing compaction
+	// CompactionIntervalMS is how often to check for segments needing compaction (milliseconds)
 	// Longer = less overhead checking, slower space reclamation
 	// Shorter = more frequent checks, faster space reclamation
-	// Default: 30 minutes
-	CompactionInterval time.Duration `json:"compaction_interval"`
+	// Default: 1800000 (30 minutes)
+	CompactionIntervalMS int64 `json:"compaction_interval_ms"`
 
 	// ========================================
 	// Consumer Delivery
 	// ========================================
 
-	// ConsumerSelectTimeout is how long to wait when no messages available
+	// ConsumerSelectTimeoutMS is how long to wait when no messages available (milliseconds)
 	// Longer = less CPU spinning, higher latency when messages arrive
 	// Shorter = lower latency, more CPU usage
-	// Default: 500 microseconds
-	ConsumerSelectTimeout time.Duration `json:"consumer_select_timeout"`
+	// Default: 1 (500 microseconds rounded up to 1ms)
+	ConsumerSelectTimeoutMS int64 `json:"consumer_select_timeout_ms"`
 
 	// ConsumerMaxBatchSize is max messages to deliver per consumer per poll
 	// Larger = better throughput, potential unfairness between consumers
@@ -256,17 +251,17 @@ type EngineConfig struct {
 	// Background Maintenance
 	// ========================================
 
-	// ExpiredMessageCheckInterval is how often to scan for expired messages
+	// ExpiredMessageCheckIntervalMS is how often to scan for expired messages (milliseconds)
 	// Longer = less overhead, slower TTL enforcement
 	// Shorter = more overhead, stricter TTL enforcement
-	// Default: 60 seconds
-	ExpiredMessageCheckInterval time.Duration `json:"expired_message_check_interval"`
+	// Default: 60000 (60 seconds)
+	ExpiredMessageCheckIntervalMS int64 `json:"expired_message_check_interval_ms"`
 
-	// WALCleanupCheckInterval is how often to check for old WAL files to delete
+	// WALCleanupCheckIntervalMS is how often to check for old WAL files to delete (milliseconds)
 	// Longer = slower cleanup, more disk usage
 	// Shorter = faster cleanup, more overhead
-	// Default: 5 minutes
-	WALCleanupCheckInterval time.Duration `json:"wal_cleanup_check_interval"`
+	// Default: 300000 (5 minutes)
+	WALCleanupCheckIntervalMS int64 `json:"wal_cleanup_check_interval_ms"`
 
 	// OffsetCleanupBatchSize is how many old offsets to delete per cleanup cycle
 	// Larger = faster cleanup, more I/O per cycle
@@ -274,9 +269,9 @@ type EngineConfig struct {
 	// Default: 1,000
 	OffsetCleanupBatchSize int `json:"offset_cleanup_batch_size"`
 
-	// OffsetCleanupInterval is how often to cleanup acknowledged message offsets
+	// OffsetCleanupIntervalMS is how often to cleanup acknowledged message offsets (milliseconds)
 	// Longer = less overhead, more stale offsets in memory
 	// Shorter = more overhead, cleaner memory
-	// Default: 30 seconds
-	OffsetCleanupInterval time.Duration `json:"offset_cleanup_interval"`
+	// Default: 30000 (30 seconds)
+	OffsetCleanupIntervalMS int64 `json:"offset_cleanup_interval_ms"`
 }

@@ -48,7 +48,7 @@ type MessageIndex struct {
 
 	// Storage
 	CacheKey   string // Key for cache lookup (usually: queueName:deliveryTag)
-	DiskOffset uint64 // BadgerDB key offset for paged messages
+	DiskOffset uint64 // Storage offset for paged messages
 
 	// LRU tracking
 	Timestamp  int64 // Unix timestamp for LRU eviction

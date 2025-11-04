@@ -2,6 +2,38 @@
 # Complete configuration file with all available options and their defaults
 # Load with: amqp-server --config config.yaml
 # Override any setting with environment variables: AMQP_NETWORK_PORT=15672
+#
+# ============================================================================
+# Metadata Caching Architecture
+# ============================================================================
+#
+# All metadata (exchanges, queues, bindings) is cached in memory using lock-free
+# sync.Map structures for O(1) lookup performance. This eliminates disk I/O on
+# the critical message routing path.
+#
+# Benefits:
+# - Zero disk reads for routing lookups during message publish
+# - Lock-free concurrent access for high-throughput routing
+# - Warm cache preloaded on startup (all metadata in memory)
+# - O(1) binding lookups (previously O(n) disk scans)
+#
+# Memory Impact:
+# - Exchange metadata: ~1-2 KB per exchange
+# - Queue metadata: ~1-2 KB per queue
+# - Binding metadata: ~500 bytes per binding
+# - Typical setup (100 queues, 200 bindings): ~200 KB total
+#
+# Cached Metadata:
+# ✓ Exchanges - All exchange definitions with properties
+# ✓ Queues - All queue definitions with properties
+# ✓ Bindings - Three-tier cache (individual, queue-indexed, exchange-indexed)
+# ✓ Consumers - Lock-free sync.Map in broker
+#
+# Cache Invalidation:
+# - Automatic on create/update/delete operations
+# - Persisted to disk atomically (CBOR format for speed)
+# - Rebuilt on server restart (warm cache)
+#
 
 # ============================================================================
 # Network Configuration
@@ -16,17 +48,17 @@ network:
   # Maximum concurrent client connections
   maxconnections: 1000
 
-  # Connection timeout for initial handshake
-  connectiontimeout: 30s
+  # Connection timeout for initial handshake (milliseconds)
+  connectiontimeoutms: 30000  # 30 seconds
 
-  # AMQP heartbeat interval (0 = disabled)
-  heartbeatinterval: 1m0s
+  # AMQP heartbeat interval (milliseconds, 0 = disabled)
+  heartbeatintervalms: 60000  # 60 seconds
 
   # Enable TCP keep-alive probes
   tcpkeepalive: true
 
-  # TCP keep-alive probe interval
-  tcpkeepaliveinterval: 30s
+  # TCP keep-alive probe interval (milliseconds)
+  tcpkeepaliveintervalms: 30000  # 30 seconds
 
   # TCP read buffer size (bytes)
   readbuffersize: 8192
@@ -38,35 +70,30 @@ network:
 # Storage Configuration
 # ============================================================================
 storage:
-  # Storage backend type (currently only "badger" is supported)
-  backend: badger
-
   # Directory path for persistent storage
   path: ./data
 
-  # Backend-specific options (map of key-value pairs)
-  options: {}
+  # Enable synchronous writes (fsync after each WAL batch write)
+  # true = safer but slower (fsync after each batch)
+  # false = faster but less durable (relies on OS page cache)
+  fsync: false
 
-  # Enable persistent storage (false = in-memory only)
-  persistent: true
-
-  # Enable synchronous writes (impacts performance, increases durability)
-  syncwrites: false
-
-  # Message TTL in milliseconds (0 = no expiration)
+  # Message TTL in seconds (0 = no expiration)
   messagettl: 0
 
-  # Storage cache size in bytes (default: 64 MB)
-  cachesize: 67108864
+  # Metadata cache size in megabytes
+  cachemb: 64
 
-  # Maximum number of open files for storage backend
-  maxopenfiles: 100
+  # Maximum number of open file handles
+  maxfiles: 100
 
-  # Interval between automatic compaction runs
-  compactionage: 24h0m0s
+  # Retention period for old segments (milliseconds)
+  # Example: 86400000 = 24 hours
+  retentionms: 86400000
 
-  # Interval for checkpointing consumer offsets to disk
-  offsetcheckpointinterval: 5s
+  # Interval for checkpointing consumer offsets to disk (milliseconds)
+  # Set to 0 to disable background checkpointing (manual checkpoint only)
+  checkpointintervalms: 5000  # 5 seconds
 
 # ============================================================================
 # Security Configuration
@@ -158,14 +185,14 @@ server:
   # Maximum message size in bytes (default: 16 MB)
   maxmessagesize: 16777216
 
-  # Channel operation timeout
-  channeltimeout: 1m0s
+  # Channel operation timeout (milliseconds)
+  channeltimeoutms: 60000  # 60 seconds
 
-  # Message delivery timeout
-  messagetimeout: 30s
+  # Message delivery timeout (milliseconds)
+  messagetimeoutms: 30000  # 30 seconds
 
-  # Interval for cleanup tasks (expired messages, etc.)
-  cleanupinterval: 5m0s
+  # Interval for cleanup tasks (milliseconds)
+  cleanupintervalms: 300000  # 5 minutes
 
   # Memory limit as percentage of total RAM (0-100, 0 = use absolute)
   # RabbitMQ default: 60% (triggers flow control when exceeded)
@@ -176,63 +203,132 @@ server:
 
 # ============================================================================
 # Engine Configuration (Performance Tuning)
+# Configurable hot-path parameters for performance optimization
 # ============================================================================
 engine:
-  # Available channel buffer size (queue state management)
-  # Phase 6E: 10M slots = ~80 MB per queue
+  # ========================================
+  # Queue State Management
+  # ========================================
+
+  # Available channel buffer size - lock-free queue of available message IDs
+  # Optimized to 10M entries (80 MB per queue) for balanced memory usage
+  # Larger buffer = more memory, more headroom for bursts
+  # Smaller buffer = less memory, must be sized for throughput
+  # Default: 10,000,000 (10M entries = 80 MB per queue)
   availablechannelbuffer: 10000000
 
-  # Ring buffer size for hot-path message storage (must be power of 2)
-  # Phase 6G: 64K messages = ~6.5 MB per queue (increased from 64K)
-  # Larger sizes reduce disk I/O by keeping more messages in memory
+  # ========================================
+  # Ring Buffer (Hot Path)
+  # ========================================
+
+  # Ring buffer size for in-memory message storage (must be power of 2)
+  # Larger = more messages in fast memory before spilling to WAL
+  # Smaller = less memory, more frequent WAL writes
+  # Default: 65,536 (64K messages = ~6.5 MB per queue)
   ringbuffersize: 65536
 
-  # Spill threshold percentage (when to start writing to WAL)
-  # 80% = start spilling at 51,200 messages (for 64K ring)
+  # Spill threshold percentage (when to start writing to WAL, 0-100)
+  # Higher = more tolerance for bursts, but less safety margin
+  # Lower = more conservative, earlier WAL writes
+  # Default: 80 (start spilling at 80% full = 51,200 messages for 64K ring)
   spillthresholdpercent: 80
 
-  # Write-Ahead Log (WAL) batch size for fsync
-  # Higher = better throughput, slightly higher latency
+  # ========================================
+  # Write-Ahead Log (WAL)
+  # ========================================
+
+  # WAL batch size - how many messages to batch before flushing WAL
+  # Larger = better throughput, higher latency, more data loss risk on crash
+  # Smaller = lower latency, more fsync calls, lower throughput
+  # Default: 1,000 messages
   walbatchsize: 1000
 
-  # Maximum time to wait before flushing WAL batch
-  # Lower = lower latency, slightly lower throughput
-  walbatchtimeout: 10ms
+  # Maximum time to wait before flushing partial WAL batch (milliseconds)
+  # Longer = better batching, higher latency
+  # Shorter = lower latency, less efficient batching
+  # Default: 10 (10ms)
+  walbatchtimeoutms: 10
 
-  # Maximum size of each WAL file before rotation
-  walfilesize: 536870912  # 512 MB
+  # Maximum size of each WAL file before rotation (bytes)
+  # Larger = fewer files, longer replay on restart
+  # Smaller = more files, faster replay, more file handles
+  # Default: 536,870,912 (512 MB)
+  walfilesize: 536870912
 
-  # WAL write request channel buffer size
+  # WAL channel buffer size - buffered write/ack requests to WAL
+  # Larger = more buffering for bursts, more memory
+  # Smaller = less memory, potential blocking under load
+  # Default: 10,000
   walchannelbuffer: 10000
 
-  # Segment file size for cold storage
-  segmentsize: 1073741824  # 1 GB
+  # ========================================
+  # Segment Storage (Cold Path)
+  # ========================================
 
-  # Interval for segment checkpoint operations
-  segmentcheckpointinterval: 5m0s
+  # Segment file size - max size of each segment file (bytes)
+  # Larger = fewer files, longer compaction time
+  # Smaller = more files, faster compaction, more file handles
+  # Default: 1,073,741,824 (1 GB)
+  segmentsize: 1073741824
 
-  # Compaction threshold (0.0-1.0, fraction of deleted messages)
-  # 0.5 = compact when 50% of segment is deleted messages
+  # Segment checkpoint interval - how often to checkpoint metadata (milliseconds)
+  # Longer = less I/O overhead, more replay on restart
+  # Shorter = more I/O overhead, faster restart
+  # Default: 300000 (5 minutes)
+  segmentcheckpointintervalms: 300000
+
+  # Compaction threshold - fraction of deleted messages to trigger compaction (0.0-1.0)
+  # Higher = less frequent compaction, more wasted space
+  # Lower = more frequent compaction, less wasted space, more I/O
+  # Default: 0.5 (50% deleted)
   compactionthreshold: 0.5
 
-  # Interval between compaction checks
-  compactioninterval: 30m0s
+  # Compaction interval - how often to check for segments needing compaction (milliseconds)
+  # Longer = less overhead checking, slower space reclamation
+  # Shorter = more frequent checks, faster space reclamation
+  # Default: 1800000 (30 minutes)
+  compactionintervalms: 1800000
 
-  # Consumer select timeout (how long to wait for messages)
-  # Lower = more responsive but higher CPU usage
-  consumerselecttimeout: 500µs
+  # ========================================
+  # Consumer Delivery
+  # ========================================
 
-  # Maximum messages to deliver to a consumer per batch
+  # Consumer select timeout - how long to wait when no messages available (milliseconds)
+  # Longer = less CPU spinning, higher latency when messages arrive
+  # Shorter = lower latency, more CPU usage
+  # Default: 1 (500 microseconds rounded up to 1ms)
+  consumerselecttimeoutms: 1
+
+  # Consumer max batch size - max messages to deliver per consumer per poll
+  # Larger = better throughput, potential unfairness between consumers
+  # Smaller = better fairness, lower throughput
+  # Default: 100
   consumermaxbatchsize: 100
 
-  # Interval for checking and removing expired messages
-  expiredmessagecheckinterval: 1m0s
+  # ========================================
+  # Background Maintenance
+  # ========================================
 
-  # Interval for WAL cleanup (removing fully-processed WAL files)
-  walcleanupcheckinterval: 5m0s
+  # Interval for checking and removing expired messages (milliseconds)
+  # Longer = less overhead, slower TTL enforcement
+  # Shorter = more overhead, stricter TTL enforcement
+  # Default: 60000 (60 seconds)
+  expiredmessagecheckintervalms: 60000
+
+  # Interval for WAL cleanup - removing fully-processed WAL files (milliseconds)
+  # Longer = slower cleanup, more disk usage
+  # Shorter = faster cleanup, more overhead
+  # Default: 300000 (5 minutes)
+  walcleanupcheckintervalms: 300000
 
   # Number of acknowledged offsets to delete per cleanup cycle
+  # Larger = faster cleanup, more I/O per cycle
+  # Smaller = slower cleanup, less I/O impact
+  # Default: 1,000
   offsetcleanupbatchsize: 1000
 
-  # Interval for cleaning up acknowledged message offsets
-  offsetcleanupinterval: 30s
+  # Interval for cleaning up acknowledged message offsets (milliseconds)
+  # Longer = less overhead, more stale offsets in memory
+  # Shorter = more overhead, cleaner memory
+  # Default: 30000 (30 seconds)
+  offsetcleanupintervalms: 30000
