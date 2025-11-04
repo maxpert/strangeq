@@ -28,8 +28,8 @@ type Connection struct {
 // NewConnection creates a new AMQP connection
 func NewConnection(conn net.Conn) *Connection {
 	return &Connection{
-		ID:              generateID(),
-		Conn:            conn,
+		ID:   generateID(),
+		Conn: conn,
 		// Channels: sync.Map needs no initialization
 		PendingMessages: make(map[uint16]*PendingMessage),
 		FrameQueue:      make(chan *Frame, 10000), // 10K frame buffer for reader/processor separation
