@@ -37,8 +37,8 @@ type PersistentMetadataStore struct {
 	queueCache    sync.Map // name -> *protocol.Queue
 
 	// Binding cache (Phase 6H) - critical for routing performance
-	bindingCache         sync.Map // "queue:exchange:key" -> *interfaces.QueueBinding
-	queueBindingsCache   sync.Map // queueName -> []*interfaces.QueueBinding
+	bindingCache          sync.Map // "queue:exchange:key" -> *interfaces.QueueBinding
+	queueBindingsCache    sync.Map // queueName -> []*interfaces.QueueBinding
 	exchangeBindingsCache sync.Map // exchangeName -> []*interfaces.QueueBinding
 
 	cacheEnabled bool

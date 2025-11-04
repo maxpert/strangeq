@@ -31,10 +31,10 @@ func DefaultConfig() *AMQPConfig {
 		Storage: interfaces.StorageConfig{
 			Path:                 "./data",
 			Fsync:                false,
-			CacheMB:              64,      // 64 MB metadata cache
-			MaxFiles:             100,     // Max open file handles
+			CacheMB:              64,       // 64 MB metadata cache
+			MaxFiles:             100,      // Max open file handles
 			RetentionMS:          86400000, // 24 hours
-			CheckpointIntervalMS: 5000,    // 5 seconds
+			CheckpointIntervalMS: 5000,     // 5 seconds
 		},
 		Security: interfaces.SecurityConfig{
 			TLSEnabled:             false,
@@ -81,16 +81,16 @@ func DefaultConfig() *AMQPConfig {
 			SpillThresholdPercent: 80,    // Start spilling at 80% = 51,200 messages
 
 			// Write-Ahead Log (WAL)
-			WALBatchSize:      1000,             // 1,000 messages per batch
-			WALBatchTimeoutMS: 10,               // 10 milliseconds max wait
+			WALBatchSize:      1000,              // 1,000 messages per batch
+			WALBatchTimeoutMS: 10,                // 10 milliseconds max wait
 			WALFileSize:       512 * 1024 * 1024, // 512 MB per WAL file
-			WALChannelBuffer:  10000,            // 10K buffered requests
+			WALChannelBuffer:  10000,             // 10K buffered requests
 
 			// Segment Storage (Cold Path)
-			SegmentSize:                    1024 * 1024 * 1024, // 1 GB per segment
-			SegmentCheckpointIntervalMS:    300000,            // 5 minutes
-			CompactionThreshold:            0.5,               // Compact at 50% deleted
-			CompactionIntervalMS:           1800000,           // 30 minutes
+			SegmentSize:                 1024 * 1024 * 1024, // 1 GB per segment
+			SegmentCheckpointIntervalMS: 300000,             // 5 minutes
+			CompactionThreshold:         0.5,                // Compact at 50% deleted
+			CompactionIntervalMS:        1800000,            // 30 minutes
 
 			// Consumer Delivery
 			ConsumerSelectTimeoutMS: 1,   // 1 millisecond (500µs rounded up)

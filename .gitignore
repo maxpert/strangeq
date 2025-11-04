@@ -27,6 +27,7 @@ amqp-server-*
 # IDE
 .idea/
 .vscode/
+.cursor/
 *.swp
 *.swo
 *~
