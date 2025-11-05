@@ -374,21 +374,11 @@ func (s *Server) handleBasicConsume(conn *protocol.Connection, channelID uint16,
 	// This is a simplified check - in a real implementation you'd verify queue exists
 	// For now, we'll proceed assuming the queue exists
 
-	// BOUNDED CHANNELS: Buffer size based on prefetch count
-	// This provides backpressure to prevent unbounded memory growth
-	bufferSize := int(channel.PrefetchCount)
-	if bufferSize == 0 {
-		// Default to 1000 for unlimited prefetch (RabbitMQ behavior)
-		bufferSize = 1000
-	} else {
-		// 1.5x margin to prefetch for backpressure
-		bufferSize = bufferSize + (bufferSize / 2)
-	}
-
-	// Ensure minimum buffer size for performance
-	if bufferSize < 100 {
-		bufferSize = 100
-	}
+	// FIXED BUFFER SIZE: Consumer.Messages channel is for TCP buffering only
+	// Prefetch flow control is now handled by semaphore in broker layer
+	// Small fixed buffer provides TCP/transport buffering without memory bloat
+	// Blocking send provides natural backpressure to broker when consumer is slow
+	bufferSize := 100 // Fixed size for all consumers
 
 	s.Log.Debug("Creating consumer with bounded channel",
 		zap.String("consumer_tag", consumeMethod.ConsumerTag),

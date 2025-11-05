@@ -1,15 +1,16 @@
 package broker
 
 import (
+	"context"
 	"errors"
 	"fmt"
-	"runtime"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/maxpert/amqp-go/interfaces"
 	"github.com/maxpert/amqp-go/protocol"
+	"golang.org/x/sync/semaphore"
 )
 
 // ErrConsumerChannelFull is returned when a consumer channel is full and cannot accept more messages
@@ -34,10 +35,12 @@ func NewQueueState(bufferSize int) *QueueState {
 
 // ConsumerState tracks the state of an active consumer for pull-based delivery
 type ConsumerState struct {
-	consumer     *protocol.Consumer
-	queueName    string
-	unackedCount atomic.Uint32 // Number of unacknowledged messages
-	stopCh       chan struct{}
+	consumer    *protocol.Consumer
+	queueName   string
+	prefetchSem *semaphore.Weighted // Prefetch flow control (nil for unlimited)
+	semCtx      context.Context     // Context for semaphore cancellation
+	semCancel   context.CancelFunc  // Cancel function for semaphore
+	stopCh      chan struct{}       // Stop signal for goroutine
 }
 
 // StorageBroker manages exchanges, queues, and routing using persistent storage
@@ -137,106 +140,45 @@ func (b *StorageBroker) getOrCreateQueueState(queueName string) *QueueState {
 	return actual.(*QueueState)
 }
 
-// tryDeliverNext attempts to deliver the next message to a consumer
-// Returns true if a message was delivered, false otherwise
-func (b *StorageBroker) tryDeliverNext(queueState *QueueState, state *ConsumerState) bool {
-	// Check: Does consumer have capacity? (cast uint32 to uint16 for comparison)
-	// NOTE: PrefetchCount == 0 means unlimited (AMQP spec)
-	if state.consumer.PrefetchCount > 0 && state.unackedCount.Load() >= uint32(state.consumer.PrefetchCount) {
-		return false // Consumer at prefetch limit
-	}
-
-	// Try to get next message (non-blocking)
-	// Channel itself is the source of truth for availability
-	select {
-	case msgID := <-queueState.available:
-
-		// Mark as in-flight in both queue-level and global index
-		queueState.inflight.Store(msgID, state.consumer.Tag)
-		b.deliveryIndex.Store(msgID, state.consumer.Tag) // CRITICAL FIX: Global O(1) lookup for ACK routing
-
-		// Get message from storage
-		message, err := b.storage.GetMessage(state.queueName, msgID)
-		if err != nil {
-			// Message not found, skip it
-			return false
-		}
-
-		// Set delivery tag
-		message.DeliveryTag = msgID
-
-		// Create pending ack record
-		pendingAck := &protocol.PendingAck{
-			QueueName:       state.queueName,
-			DeliveryTag:     msgID,
-			ConsumerTag:     state.consumer.Tag,
-			MessageID:       fmt.Sprintf("%s:%d", state.queueName, msgID),
-			DeliveredAt:     time.Now(),
-			RedeliveryCount: 0,
-			Redelivered:     false,
-		}
-
-		// Write pending ack before delivery
-		b.storage.StorePendingAck(pendingAck)
-
-		// Increment consumer's unacked count
-		state.unackedCount.Add(1)
-
-		// Create delivery
-		delivery := &protocol.Delivery{
-			Message:     message,
-			DeliveryTag: msgID,
-			Redelivered: false,
-			Exchange:    message.Exchange,
-			RoutingKey:  message.RoutingKey,
-			ConsumerTag: state.consumer.Tag,
-		}
-
-		// Send to consumer channel (non-blocking)
-		select {
-		case state.consumer.Messages <- delivery:
-			return true
-		default:
-			// Consumer channel full - put message back
-			queueState.available <- msgID
-			queueState.inflight.Delete(msgID)
-			b.deliveryIndex.Delete(msgID) // Clean up global index
-			state.unackedCount.Add(^uint32(0))
-			b.storage.DeletePendingAck(state.queueName, msgID)
-			return false
-		}
-
-	default:
-		// No messages available in channel
-		return false
-	}
-}
-
-// consumerPollLoop runs a lightweight polling loop for a consumer
-// Phase 6D: Use blocking reads to avoid CPU spinning
+// consumerPollLoop implements three-stage pipeline with semaphore-based flow control
+// Stage 1: Acquire semaphore permit (blocks if at prefetch limit)
+// Stage 2: Pull message ID from available channel (only after capacity confirmed)
+// Stage 3: Deliver message with blocking send (provides TCP backpressure)
 func (b *StorageBroker) consumerPollLoop(state *ConsumerState, queueState *QueueState) {
 	for {
-		// Block waiting for message ID (avoids CPU spinning)
+		// STAGE 1: Acquire capacity permit (blocks if at prefetch limit)
+		// This eliminates CPU spinning when consumer is at capacity
+		if state.prefetchSem != nil {
+			if err := state.prefetchSem.Acquire(state.semCtx, 1); err != nil {
+				// Context cancelled (consumer unregistered)
+				return
+			}
+		}
+
+		// STAGE 2: Pull message ID from available channel
+		// Only reached after semaphore acquired, ensuring we have capacity
+		var msgID uint64
 		select {
 		case <-state.stopCh:
+			// Consumer stopped, release unused permit and exit
+			if state.prefetchSem != nil {
+				state.prefetchSem.Release(1)
+			}
 			return
-		case msgID := <-queueState.available:
-			// Got a message ID - try to deliver it
-			b.tryDeliverMessage(queueState, state, msgID)
+		case msgID = <-queueState.available:
+			// Got message ID, proceed to delivery
 		}
+
+		// STAGE 3: Deliver message (blocking send provides backpressure)
+		b.deliverMessage(queueState, state, msgID)
 	}
 }
 
-// tryDeliverMessage attempts to deliver a specific message ID
-func (b *StorageBroker) tryDeliverMessage(queueState *QueueState, state *ConsumerState, msgID uint64) {
-	// Check: Does consumer have capacity?
-	if state.consumer.PrefetchCount > 0 && state.unackedCount.Load() >= uint32(state.consumer.PrefetchCount) {
-		// Consumer at prefetch limit - put message back
-		queueState.available <- msgID
-		runtime.Gosched() // Yield to let ACKs process
-		return
-	}
-
+// deliverMessage delivers a message to a consumer with blocking send
+// This provides natural TCP backpressure when consumer is slow
+// Messages are never put back in normal operation, preserving FIFO order
+// Put-backs only occur on shutdown/cancellation (rare events)
+func (b *StorageBroker) deliverMessage(queueState *QueueState, state *ConsumerState, msgID uint64) {
 	// Mark as in-flight
 	queueState.inflight.Store(msgID, state.consumer.Tag)
 	b.deliveryIndex.Store(msgID, state.consumer.Tag)
@@ -244,9 +186,12 @@ func (b *StorageBroker) tryDeliverMessage(queueState *QueueState, state *Consume
 	// Get message from storage
 	message, err := b.storage.GetMessage(state.queueName, msgID)
 	if err != nil {
-		// Message not found - skip it
+		// Message not found - clean up and release permit
 		queueState.inflight.Delete(msgID)
 		b.deliveryIndex.Delete(msgID)
+		if state.prefetchSem != nil {
+			state.prefetchSem.Release(1)
+		}
 		return
 	}
 
@@ -264,12 +209,6 @@ func (b *StorageBroker) tryDeliverMessage(queueState *QueueState, state *Consume
 		Redelivered:     false,
 	}
 
-	// Write pending ack before delivery
-	b.storage.StorePendingAck(pendingAck)
-
-	// Increment consumer's unacked count
-	state.unackedCount.Add(1)
-
 	// Create delivery
 	delivery := &protocol.Delivery{
 		Message:     message,
@@ -280,17 +219,32 @@ func (b *StorageBroker) tryDeliverMessage(queueState *QueueState, state *Consume
 		ConsumerTag: state.consumer.Tag,
 	}
 
-	// Send to consumer channel (non-blocking)
+	// BLOCKING send to consumer channel with cancellation support
+	// This provides TCP backpressure - if consumer is slow, we block here
+	// Semaphore permit is held until ACK arrives
 	select {
 	case state.consumer.Messages <- delivery:
-		// Success
-	default:
-		// Consumer channel full - put message back
+		// Success! Write pending ack after successful delivery
+		b.storage.StorePendingAck(pendingAck)
+		// Semaphore permit remains held until ACK/NACK/Reject
+
+	case <-state.stopCh:
+		// Consumer stopped - put message back (acceptable on shutdown)
 		queueState.available <- msgID
 		queueState.inflight.Delete(msgID)
 		b.deliveryIndex.Delete(msgID)
-		state.unackedCount.Add(^uint32(0))
-		b.storage.DeletePendingAck(state.queueName, msgID)
+		if state.prefetchSem != nil {
+			state.prefetchSem.Release(1)
+		}
+
+	case <-state.semCtx.Done():
+		// Context cancelled - put message back
+		queueState.available <- msgID
+		queueState.inflight.Delete(msgID)
+		b.deliveryIndex.Delete(msgID)
+		if state.prefetchSem != nil {
+			state.prefetchSem.Release(1)
+		}
 	}
 }
 
@@ -540,11 +494,30 @@ func (b *StorageBroker) RegisterConsumer(queueName, consumerTag string, consumer
 	// Get or create queue state (lock-free)
 	queueState := b.getOrCreateQueueState(queueName)
 
+	// Calculate semaphore capacity for prefetch flow control
+	var prefetchSem *semaphore.Weighted
+	var semCtx context.Context
+	var semCancel context.CancelFunc
+
+	prefetchCount := consumer.PrefetchCount
+	if prefetchCount == 0 {
+		// Unlimited prefetch: use RabbitMQ quorum queue limit (2000)
+		prefetchSem = semaphore.NewWeighted(2000)
+		semCtx, semCancel = context.WithCancel(context.Background())
+	} else {
+		// Limited prefetch: use exact prefetch count
+		prefetchSem = semaphore.NewWeighted(int64(prefetchCount))
+		semCtx, semCancel = context.WithCancel(context.Background())
+	}
+
 	// Create consumer state
 	state := &ConsumerState{
-		consumer:  consumer,
-		queueName: queueName,
-		stopCh:    make(chan struct{}),
+		consumer:    consumer,
+		queueName:   queueName,
+		prefetchSem: prefetchSem,
+		semCtx:      semCtx,
+		semCancel:   semCancel,
+		stopCh:      make(chan struct{}),
 	}
 
 	// Store in sync.Map (lock-free)
@@ -577,7 +550,12 @@ func (b *StorageBroker) UnregisterConsumer(consumerTag string) error {
 	}
 	state := val.(*ConsumerState)
 
-	// Stop polling goroutine
+	// Cancel semaphore context first to unblock any waiting goroutines
+	if state.semCancel != nil {
+		state.semCancel()
+	}
+
+	// Then stop polling goroutine
 	close(state.stopCh)
 
 	// Remove from activeConsumers
@@ -862,6 +840,7 @@ func (b *StorageBroker) AcknowledgeMessage(consumerTag string, deliveryTag uint6
 
 	if multiple {
 		// Acknowledge all messages up to and including deliveryTag
+		ackedCount := 0
 		pendingAcks, err := b.storage.GetConsumerPendingAcks(consumerTag)
 		if err == nil {
 			for _, pendingAck := range pendingAcks {
@@ -872,12 +851,15 @@ func (b *StorageBroker) AcknowledgeMessage(consumerTag string, deliveryTag uint6
 
 					// Remove from inflight and delivery index
 					queueState.inflight.Delete(pendingAck.DeliveryTag)
-					b.deliveryIndex.Delete(pendingAck.DeliveryTag) // Clean up global index
+					b.deliveryIndex.Delete(pendingAck.DeliveryTag)
+					ackedCount++
 				}
 			}
 		}
-		// Reset unacked count
-		state.unackedCount.Store(0)
+		// Release semaphore permits for all ACKed messages
+		if state.prefetchSem != nil && ackedCount > 0 {
+			state.prefetchSem.Release(int64(ackedCount))
+		}
 	} else {
 		// Acknowledge single message
 		// Delete message and pending ack from storage
@@ -886,13 +868,15 @@ func (b *StorageBroker) AcknowledgeMessage(consumerTag string, deliveryTag uint6
 
 		// Remove from inflight and delivery index
 		queueState.inflight.Delete(deliveryTag)
-		b.deliveryIndex.Delete(deliveryTag) // Clean up global index after ACK
+		b.deliveryIndex.Delete(deliveryTag)
 
-		// Decrement unacked count
-		state.unackedCount.Add(^uint32(0))
+		// Release semaphore permit (frees capacity for next message)
+		if state.prefetchSem != nil {
+			state.prefetchSem.Release(1)
+		}
 	}
 
-	// Done - polling loop will pull next message (NO manual triggering needed)
+	// Done - polling loop will acquire permit and pull next message
 	return nil
 }
 
@@ -910,13 +894,7 @@ func (b *StorageBroker) RejectMessage(consumerTag string, deliveryTag uint64, re
 
 	// Remove from inflight and delivery index
 	queueState.inflight.Delete(deliveryTag)
-	b.deliveryIndex.Delete(deliveryTag) // Clean up global index
-
-	// Decrement unacked count
-	current := state.unackedCount.Load()
-	if current > 0 {
-		state.unackedCount.Add(^uint32(0))
-	}
+	b.deliveryIndex.Delete(deliveryTag)
 
 	// Handle acknowledgment tracking for rejected message
 	pendingAck, err := b.storage.GetPendingAck(state.queueName, deliveryTag)
@@ -932,6 +910,11 @@ func (b *StorageBroker) RejectMessage(consumerTag string, deliveryTag uint64, re
 			b.storage.DeletePendingAck(state.queueName, deliveryTag)
 			b.storage.DeleteMessage(state.queueName, deliveryTag)
 		}
+	}
+
+	// Release semaphore permit (frees capacity for next message)
+	if state.prefetchSem != nil {
+		state.prefetchSem.Release(1)
 	}
 
 	return nil
@@ -951,13 +934,14 @@ func (b *StorageBroker) NacknowledgeMessage(consumerTag string, deliveryTag uint
 
 	if multiple {
 		// Nacknowledge all messages up to and including deliveryTag
+		nackedCount := 0
 		pendingAcks, err := b.storage.GetConsumerPendingAcks(consumerTag)
 		if err == nil {
 			for _, pendingAck := range pendingAcks {
 				if pendingAck.DeliveryTag <= deliveryTag {
 					// Remove from inflight and delivery index
 					queueState.inflight.Delete(pendingAck.DeliveryTag)
-					b.deliveryIndex.Delete(pendingAck.DeliveryTag) // Clean up global index
+					b.deliveryIndex.Delete(pendingAck.DeliveryTag)
 
 					// Handle requeue vs discard
 					if requeue {
@@ -971,16 +955,19 @@ func (b *StorageBroker) NacknowledgeMessage(consumerTag string, deliveryTag uint
 						b.storage.DeletePendingAck(pendingAck.QueueName, pendingAck.DeliveryTag)
 						b.storage.DeleteMessage(pendingAck.QueueName, pendingAck.DeliveryTag)
 					}
+					nackedCount++
 				}
 			}
 		}
-		// Reset unacked count
-		state.unackedCount.Store(0)
+		// Release semaphore permits for all NACKed messages
+		if state.prefetchSem != nil && nackedCount > 0 {
+			state.prefetchSem.Release(int64(nackedCount))
+		}
 	} else {
 		// Nacknowledge single message
 		// Remove from inflight and delivery index
 		queueState.inflight.Delete(deliveryTag)
-		b.deliveryIndex.Delete(deliveryTag) // Clean up global index
+		b.deliveryIndex.Delete(deliveryTag)
 
 		pendingAck, err := b.storage.GetPendingAck(state.queueName, deliveryTag)
 		if err == nil && pendingAck != nil {
@@ -997,10 +984,9 @@ func (b *StorageBroker) NacknowledgeMessage(consumerTag string, deliveryTag uint
 			}
 		}
 
-		// Decrement unacked count
-		current := state.unackedCount.Load()
-		if current > 0 {
-			state.unackedCount.Add(^uint32(0))
+		// Release semaphore permit (frees capacity for next message)
+		if state.prefetchSem != nil {
+			state.prefetchSem.Release(1)
 		}
 	}
 

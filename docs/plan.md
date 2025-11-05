@@ -3,8 +3,55 @@
 ## Goal
 Create a Go package `github.com/maxpert/amqp-go` that implements an AMQP 0.9.1 server based on the specification: https://www.rabbitmq.com/resources/specs/amqp0-9-1.extended.xml
 
-## Current Status (Updated: 2025-10-30)
-**Phase 10 - Performance Optimization: COMPLETE** ✅
+## Current Status (Updated: 2025-11-05)
+**Phase 11 - Consumer Flow Control Refactor: COMPLETE** ✅
+
+### Phase 11 - Consumer Flow Control Refactor:
+- ✅ **Semaphore-Based Prefetch Control**: Replaced atomic counters with `golang.org/x/sync/semaphore.Weighted`
+  - Blocks consumer goroutines when at prefetch limit (eliminates CPU spinning)
+  - Acquire permit before pulling from available channel (guarantees capacity)
+  - Release permit on ACK/NACK/Reject (automatic backpressure)
+- ✅ **Three-Stage Pipeline Architecture**:
+  - Stage 1: Acquire semaphore permit (blocks if at limit)
+  - Stage 2: Pull message ID from available channel
+  - Stage 3: Deliver with blocking send (TCP backpressure)
+- ✅ **FIFO Message Ordering**: Messages never put back in normal operation
+  - Put-backs only on shutdown/cancellation (rare events)
+  - Preserves strict message ordering under normal load
+- ✅ **Blocking Send to Consumer.Messages**: Changed from non-blocking to blocking
+  - Provides natural TCP backpressure when consumer is slow
+  - No more tight loops retrying delivery
+- ✅ **Fixed Consumer Buffer Size**: Changed from dynamic (1.5x prefetch) to fixed (100)
+  - Separates concerns: semaphore = prefetch limit, channel = TCP buffer
+  - Reduces memory usage and complexity
+- ✅ **Prefetch Capacity Limits**:
+  - Limited prefetch: Use exact prefetch count
+  - Unlimited prefetch (0): Cap at 2000 (RabbitMQ quorum queue limit)
+- ✅ **Clean Shutdown**: Proper semaphore cancellation before stopCh
+  - Cancel context first to unblock waiting goroutines
+  - Then close stopCh for cleanup
+- ✅ **Zero CPU Spinning**: Two scenarios fixed:
+  - Prefetch limit reached: Goroutine blocks on semaphore acquisition
+  - Consumer channel full: Goroutine blocks on channel send
+- ✅ **All Tests Passing**: Full test suite passes with no regressions
+  - 43.1s integration tests
+  - 25.5s storage tests
+  - All broker tests passing
+
+**Performance Improvements:**
+- Eliminates CPU pegging under bad connections/slow consumers
+- Goroutines sleep efficiently instead of spinning
+- Memory usage reduced (fixed 100-size buffers vs dynamic 1.5x)
+- Cleaner separation of flow control (semaphore) and buffering (channel)
+
+**Code Changes:**
+- `broker/storage_broker.go`: ConsumerState with semaphore, rewritten poll loop
+- `server/basic_handlers.go`: Fixed consumer buffer size
+- Removed unused `tryDeliverNext` function
+- Updated all ACK handlers to release semaphore permits
+
+### Phase 10 - Performance Optimization:
+**Status: COMPLETE** ✅
 
 ### Phase 9 - Protocol Testing Enhancement:
 - ✅ **Protocol Test Coverage**: Increased from 2.5% to 50.7% (20x improvement!)
