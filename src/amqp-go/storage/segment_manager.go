@@ -26,11 +26,19 @@ const (
 	SegmentHeaderSize = 16
 )
 
+// SegmentMetrics interface for metrics collection
+type SegmentMetrics interface {
+	UpdateSegmentMetrics(queueName string, count, sizeBytes float64)
+	RecordSegmentCompaction()
+	RecordSegmentReadError()
+}
+
 // SegmentManager manages long-term cold storage with compaction
 // Messages are checkpointed from WAL to segments periodically
 type SegmentManager struct {
 	dataDir       string
 	queueSegments sync.Map // queueName -> *QueueSegments
+	metrics       SegmentMetrics
 }
 
 // QueueSegments manages segments for a single queue
@@ -58,6 +66,9 @@ type QueueSegments struct {
 	// Checkpoint state
 	lastCheckpoint       time.Time
 	lastCheckpointOffset uint64
+
+	// Metrics collector
+	metrics SegmentMetrics
 
 	// Background goroutines
 	stopChan chan struct{}
@@ -100,6 +111,18 @@ func NewSegmentManager(dataDir string) (*SegmentManager, error) {
 	return &SegmentManager{
 		dataDir: segDir,
 	}, nil
+}
+
+// SetMetrics sets the metrics collector for the segment manager
+func (sm *SegmentManager) SetMetrics(metrics SegmentMetrics) {
+	sm.metrics = metrics
+	// Update metrics for existing queues
+	sm.queueSegments.Range(func(key, value interface{}) bool {
+		if qs, ok := value.(*QueueSegments); ok {
+			qs.metrics = metrics
+		}
+		return true
+	})
 }
 
 // Write writes a message to segments (called during checkpoint from WAL)
@@ -159,6 +182,7 @@ func (sm *SegmentManager) getOrCreateQueueSegments(queueName string) *QueueSegme
 		sealedSegments: make(map[uint64]*SegmentFile),
 		ackBitmap:      roaring.New(),
 		stopChan:       make(chan struct{}),
+		metrics:        sm.metrics,
 	}
 
 	// Create first segment
@@ -240,7 +264,11 @@ func (qs *QueueSegments) readMessage(offset uint64) (*protocol.Message, error) {
 		currentIdx.mutex.RUnlock()
 
 		if found {
-			return readSegmentMessageAt(currentSeg.file, position)
+			msg, err := readSegmentMessageAt(currentSeg.file, position)
+			if err != nil && qs.metrics != nil {
+				qs.metrics.RecordSegmentReadError()
+			}
+			return msg, err
 		}
 	}
 
@@ -255,11 +283,19 @@ func (qs *QueueSegments) readMessage(offset uint64) (*protocol.Message, error) {
 			segment.mutex.RUnlock()
 
 			if found {
-				return readSegmentMessageAt(segment.file, position)
+				msg, err := readSegmentMessageAt(segment.file, position)
+				if err != nil && qs.metrics != nil {
+					qs.metrics.RecordSegmentReadError()
+				}
+				return msg, err
 			}
 		}
 	}
 
+	// Record as error since message wasn't found
+	if qs.metrics != nil {
+		qs.metrics.RecordSegmentReadError()
+	}
 	return nil, fmt.Errorf("message not in segments")
 }
 
@@ -376,6 +412,11 @@ func (qs *QueueSegments) tryCompaction() {
 func (qs *QueueSegments) compactSegment(segment *SegmentFile) {
 	qs.compactionMux.Lock()
 	defer qs.compactionMux.Unlock()
+
+	// Record compaction start
+	if qs.metrics != nil {
+		qs.metrics.RecordSegmentCompaction()
+	}
 
 	// Create new temporary segment
 	tempPath := segment.path + ".compact"

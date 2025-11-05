@@ -51,6 +51,45 @@ type Collector struct {
 
 	// Server metrics
 	ServerUptime prometheus.Gauge
+
+	// Latency metrics
+	MessagePublishDuration  prometheus.Histogram
+	MessageDeliveryDuration prometheus.Histogram
+	MessageAge              *prometheus.GaugeVec
+
+	// Disk metrics
+	DiskFreeBytes  prometheus.Gauge
+	DiskUsageBytes prometheus.Gauge
+
+	// WAL metrics
+	WALSizeBytes        prometheus.Gauge
+	WALWriteTotal       prometheus.Counter
+	WALFsyncTotal       prometheus.Counter
+	WALFsyncDuration    prometheus.Histogram
+	WALWriteErrorsTotal prometheus.Counter
+
+	// Segment metrics
+	SegmentCount           *prometheus.GaugeVec
+	SegmentSizeBytes       *prometheus.GaugeVec
+	SegmentCompactionTotal prometheus.Counter
+	SegmentReadErrorsTotal prometheus.Counter
+
+	// Ring buffer metrics
+	RingBufferUtilization *prometheus.GaugeVec
+
+	// Memory metrics
+	MemoryUsedBytes prometheus.Gauge
+	MemoryHeapBytes prometheus.Gauge
+	MemoryGCPause   prometheus.Summary
+
+	// System resource metrics
+	GoroutinesTotal     prometheus.Gauge
+	FileDescriptorsOpen prometheus.Gauge
+
+	// Error metrics
+	ConnectionErrorsTotal *prometheus.CounterVec
+	ChannelErrorsTotal    *prometheus.CounterVec
+	MessagesDroppedTotal  *prometheus.CounterVec
 }
 
 // NewCollector creates a new metrics collector with all Prometheus metrics
@@ -220,6 +259,145 @@ func NewCollector(namespace string) *Collector {
 			Name:      "server_uptime_seconds",
 			Help:      "Server uptime in seconds",
 		}),
+
+		// Latency metrics
+		MessagePublishDuration: promauto.NewHistogram(prometheus.HistogramOpts{
+			Namespace: namespace,
+			Name:      "message_publish_duration_seconds",
+			Help:      "Time taken to publish a message",
+			Buckets:   prometheus.ExponentialBuckets(0.0001, 2, 15), // 0.1ms to ~3s
+		}),
+		MessageDeliveryDuration: promauto.NewHistogram(prometheus.HistogramOpts{
+			Namespace: namespace,
+			Name:      "message_delivery_duration_seconds",
+			Help:      "Time taken to deliver a message to consumer",
+			Buckets:   prometheus.ExponentialBuckets(0.0001, 2, 15), // 0.1ms to ~3s
+		}),
+		MessageAge: promauto.NewGaugeVec(prometheus.GaugeOpts{
+			Namespace: namespace,
+			Name:      "message_age_seconds",
+			Help:      "Age of oldest message in queue",
+		}, []string{"queue", "vhost"}),
+
+		// Disk metrics
+		DiskFreeBytes: promauto.NewGauge(prometheus.GaugeOpts{
+			Namespace: namespace,
+			Name:      "disk_free_bytes",
+			Help:      "Free disk space in data directory",
+		}),
+		DiskUsageBytes: promauto.NewGauge(prometheus.GaugeOpts{
+			Namespace: namespace,
+			Name:      "disk_usage_bytes",
+			Help:      "Total disk used by server data",
+		}),
+
+		// WAL metrics
+		WALSizeBytes: promauto.NewGauge(prometheus.GaugeOpts{
+			Namespace: namespace,
+			Name:      "wal_size_bytes",
+			Help:      "Total size of WAL files",
+		}),
+		WALWriteTotal: promauto.NewCounter(prometheus.CounterOpts{
+			Namespace: namespace,
+			Name:      "wal_write_total",
+			Help:      "Total number of messages written to WAL",
+		}),
+		WALFsyncTotal: promauto.NewCounter(prometheus.CounterOpts{
+			Namespace: namespace,
+			Name:      "wal_fsync_total",
+			Help:      "Total number of fsync operations on WAL",
+		}),
+		WALFsyncDuration: promauto.NewHistogram(prometheus.HistogramOpts{
+			Namespace: namespace,
+			Name:      "wal_fsync_duration_seconds",
+			Help:      "Time taken for WAL fsync operations",
+			Buckets:   prometheus.ExponentialBuckets(0.0001, 2, 15), // 0.1ms to ~3s
+		}),
+		WALWriteErrorsTotal: promauto.NewCounter(prometheus.CounterOpts{
+			Namespace: namespace,
+			Name:      "wal_write_errors_total",
+			Help:      "Total number of WAL write failures",
+		}),
+
+		// Segment metrics
+		SegmentCount: promauto.NewGaugeVec(prometheus.GaugeOpts{
+			Namespace: namespace,
+			Name:      "segment_count",
+			Help:      "Number of segment files per queue",
+		}, []string{"queue"}),
+		SegmentSizeBytes: promauto.NewGaugeVec(prometheus.GaugeOpts{
+			Namespace: namespace,
+			Name:      "segment_size_bytes",
+			Help:      "Total size of segment files per queue",
+		}, []string{"queue"}),
+		SegmentCompactionTotal: promauto.NewCounter(prometheus.CounterOpts{
+			Namespace: namespace,
+			Name:      "segment_compaction_total",
+			Help:      "Total number of segment compactions performed",
+		}),
+		SegmentReadErrorsTotal: promauto.NewCounter(prometheus.CounterOpts{
+			Namespace: namespace,
+			Name:      "segment_read_errors_total",
+			Help:      "Total number of segment read failures",
+		}),
+
+		// Ring buffer metrics
+		RingBufferUtilization: promauto.NewGaugeVec(prometheus.GaugeOpts{
+			Namespace: namespace,
+			Name:      "ring_buffer_utilization_ratio",
+			Help:      "Ring buffer utilization ratio (0-1)",
+		}, []string{"queue"}),
+
+		// Memory metrics
+		MemoryUsedBytes: promauto.NewGauge(prometheus.GaugeOpts{
+			Namespace: namespace,
+			Name:      "memory_used_bytes",
+			Help:      "Total memory used by Go runtime",
+		}),
+		MemoryHeapBytes: promauto.NewGauge(prometheus.GaugeOpts{
+			Namespace: namespace,
+			Name:      "memory_heap_bytes",
+			Help:      "Heap memory in use",
+		}),
+		MemoryGCPause: promauto.NewSummary(prometheus.SummaryOpts{
+			Namespace: namespace,
+			Name:      "memory_gc_pause_seconds",
+			Help:      "GC pause duration",
+			Objectives: map[float64]float64{
+				0.5:  0.05,  // 50th percentile with 5% error
+				0.9:  0.01,  // 90th percentile with 1% error
+				0.99: 0.001, // 99th percentile with 0.1% error
+			},
+		}),
+
+		// System resource metrics
+		GoroutinesTotal: promauto.NewGauge(prometheus.GaugeOpts{
+			Namespace: namespace,
+			Name:      "goroutines_total",
+			Help:      "Number of active goroutines",
+		}),
+		FileDescriptorsOpen: promauto.NewGauge(prometheus.GaugeOpts{
+			Namespace: namespace,
+			Name:      "file_descriptors_open",
+			Help:      "Number of open file descriptors",
+		}),
+
+		// Error metrics
+		ConnectionErrorsTotal: promauto.NewCounterVec(prometheus.CounterOpts{
+			Namespace: namespace,
+			Name:      "connection_errors_total",
+			Help:      "Total number of connection errors by type",
+		}, []string{"error_type"}),
+		ChannelErrorsTotal: promauto.NewCounterVec(prometheus.CounterOpts{
+			Namespace: namespace,
+			Name:      "channel_errors_total",
+			Help:      "Total number of channel errors by type",
+		}, []string{"error_type"}),
+		MessagesDroppedTotal: promauto.NewCounterVec(prometheus.CounterOpts{
+			Namespace: namespace,
+			Name:      "messages_dropped_total",
+			Help:      "Total number of messages dropped by reason",
+		}, []string{"queue", "reason"}),
 	}
 }
 
@@ -344,4 +522,122 @@ func (c *Collector) RecordTransactionRolledback() {
 // UpdateServerUptime updates the server uptime metric
 func (c *Collector) UpdateServerUptime(seconds float64) {
 	c.ServerUptime.Set(seconds)
+}
+
+// RecordPublishLatency records the time taken to publish a message
+func (c *Collector) RecordPublishLatency(duration float64) {
+	c.MessagePublishDuration.Observe(duration)
+}
+
+// RecordDeliveryLatency records the time taken to deliver a message
+func (c *Collector) RecordDeliveryLatency(duration float64) {
+	c.MessageDeliveryDuration.Observe(duration)
+}
+
+// UpdateMessageAge updates the age of the oldest message in a queue
+func (c *Collector) UpdateMessageAge(queueName, vhost string, ageSeconds float64) {
+	labels := prometheus.Labels{"queue": queueName, "vhost": vhost}
+	c.MessageAge.With(labels).Set(ageSeconds)
+}
+
+// DeleteMessageAge removes message age metric for a deleted queue
+func (c *Collector) DeleteMessageAge(queueName, vhost string) {
+	labels := prometheus.Labels{"queue": queueName, "vhost": vhost}
+	c.MessageAge.Delete(labels)
+}
+
+// UpdateDiskMetrics updates disk usage metrics
+func (c *Collector) UpdateDiskMetrics(freeBytes, usedBytes float64) {
+	c.DiskFreeBytes.Set(freeBytes)
+	c.DiskUsageBytes.Set(usedBytes)
+}
+
+// UpdateWALSize updates the total WAL file size
+func (c *Collector) UpdateWALSize(bytes float64) {
+	c.WALSizeBytes.Set(bytes)
+}
+
+// RecordWALWrite records a write to the WAL
+func (c *Collector) RecordWALWrite() {
+	c.WALWriteTotal.Inc()
+}
+
+// RecordWALFsync records an fsync operation
+func (c *Collector) RecordWALFsync(duration float64) {
+	c.WALFsyncTotal.Inc()
+	c.WALFsyncDuration.Observe(duration)
+}
+
+// RecordWALWriteError records a WAL write error
+func (c *Collector) RecordWALWriteError() {
+	c.WALWriteErrorsTotal.Inc()
+}
+
+// UpdateSegmentMetrics updates segment count and size for a queue
+func (c *Collector) UpdateSegmentMetrics(queueName string, count, sizeBytes float64) {
+	c.SegmentCount.With(prometheus.Labels{"queue": queueName}).Set(count)
+	c.SegmentSizeBytes.With(prometheus.Labels{"queue": queueName}).Set(sizeBytes)
+}
+
+// DeleteSegmentMetrics removes segment metrics for a deleted queue
+func (c *Collector) DeleteSegmentMetrics(queueName string) {
+	c.SegmentCount.Delete(prometheus.Labels{"queue": queueName})
+	c.SegmentSizeBytes.Delete(prometheus.Labels{"queue": queueName})
+}
+
+// RecordSegmentCompaction records a segment compaction
+func (c *Collector) RecordSegmentCompaction() {
+	c.SegmentCompactionTotal.Inc()
+}
+
+// RecordSegmentReadError records a segment read error
+func (c *Collector) RecordSegmentReadError() {
+	c.SegmentReadErrorsTotal.Inc()
+}
+
+// UpdateRingBufferUtilization updates ring buffer utilization for a queue
+func (c *Collector) UpdateRingBufferUtilization(queueName string, utilization float64) {
+	c.RingBufferUtilization.With(prometheus.Labels{"queue": queueName}).Set(utilization)
+}
+
+// DeleteRingBufferUtilization removes ring buffer metric for a deleted queue
+func (c *Collector) DeleteRingBufferUtilization(queueName string) {
+	c.RingBufferUtilization.Delete(prometheus.Labels{"queue": queueName})
+}
+
+// UpdateMemoryMetrics updates memory usage metrics
+func (c *Collector) UpdateMemoryMetrics(usedBytes, heapBytes float64) {
+	c.MemoryUsedBytes.Set(usedBytes)
+	c.MemoryHeapBytes.Set(heapBytes)
+}
+
+// RecordGCPause records a GC pause duration
+func (c *Collector) RecordGCPause(duration float64) {
+	c.MemoryGCPause.Observe(duration)
+}
+
+// UpdateGoroutines updates the goroutine count
+func (c *Collector) UpdateGoroutines(count float64) {
+	c.GoroutinesTotal.Set(count)
+}
+
+// UpdateFileDescriptors updates the file descriptor count
+func (c *Collector) UpdateFileDescriptors(count float64) {
+	c.FileDescriptorsOpen.Set(count)
+}
+
+// RecordConnectionError records a connection error
+func (c *Collector) RecordConnectionError(errorType string) {
+	c.ConnectionErrorsTotal.With(prometheus.Labels{"error_type": errorType}).Inc()
+}
+
+// RecordChannelError records a channel error
+func (c *Collector) RecordChannelError(errorType string) {
+	c.ChannelErrorsTotal.With(prometheus.Labels{"error_type": errorType}).Inc()
+}
+
+// RecordMessageDropped records a dropped message
+func (c *Collector) RecordMessageDropped(queueName, reason string) {
+	labels := prometheus.Labels{"queue": queueName, "reason": reason}
+	c.MessagesDroppedTotal.With(labels).Inc()
 }

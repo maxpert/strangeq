@@ -105,8 +105,10 @@ func main() {
 		}
 	}
 
-	// Start telemetry server if enabled
+	// Create metrics collector if telemetry is enabled
+	var metricsCollector *metrics.Collector
 	if *enableTelemetry {
+		metricsCollector = metrics.NewCollector("amqp")
 		telemetryServer := metrics.NewServer(*telemetryPort, true)
 
 		go func() {
@@ -132,6 +134,11 @@ func main() {
 
 	// Create and start server
 	serverBuilder := server.NewServerBuilder().WithConfig(cfg)
+
+	// Add metrics collector if telemetry is enabled
+	if metricsCollector != nil {
+		serverBuilder = serverBuilder.WithMetrics(metricsCollector)
+	}
 
 	amqpServer, err := serverBuilder.Build()
 	if err != nil {

@@ -64,6 +64,11 @@ func (s *Server) handleExchangeDeclare(conn *protocol.Connection, channelID uint
 		return err
 	}
 
+	// Record exchange declared metric
+	if s.MetricsCollector != nil {
+		s.MetricsCollector.RecordExchangeDeclared()
+	}
+
 	// Send exchange.declare-ok response
 	return s.sendExchangeDeclareOK(conn, channelID)
 }
@@ -92,6 +97,11 @@ func (s *Server) handleExchangeDelete(conn *protocol.Connection, channelID uint1
 			zap.Error(err),
 			zap.String("exchange", deleteMethod.Exchange))
 		return err
+	}
+
+	// Record exchange deleted metric
+	if s.MetricsCollector != nil {
+		s.MetricsCollector.RecordExchangeDeleted()
 	}
 
 	// Send exchange.delete-ok response

@@ -146,6 +146,13 @@ func (lm *LifecycleManager) Start(ctx context.Context) error {
 		}
 	}
 
+	// Start system metrics collection in background
+	lm.wg.Add(1)
+	go func() {
+		defer lm.wg.Done()
+		lm.server.startSystemMetricsCollection(lm.ctx)
+	}()
+
 	// Start the server in a goroutine
 	lm.wg.Add(1)
 	go func() {

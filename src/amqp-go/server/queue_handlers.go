@@ -62,6 +62,11 @@ func (s *Server) handleQueueDeclare(conn *protocol.Connection, channelID uint16,
 		return err
 	}
 
+	// Record queue declared metric
+	if s.MetricsCollector != nil {
+		s.MetricsCollector.RecordQueueDeclared()
+	}
+
 	// Send queue.declare-ok response with queue info
 	msgCount := uint32(queue.MessageCount.Load())
 	return s.sendQueueDeclareOK(conn, channelID, queue.Name, msgCount, 0)
@@ -171,6 +176,11 @@ func (s *Server) handleQueueDelete(conn *protocol.Connection, channelID uint16, 
 			zap.Error(err),
 			zap.String("queue", deleteMethod.Queue))
 		return err
+	}
+
+	// Record queue deleted metric
+	if s.MetricsCollector != nil {
+		s.MetricsCollector.RecordQueueDeleted()
 	}
 
 	// Send queue.delete-ok response with number of deleted messages

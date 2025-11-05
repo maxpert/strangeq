@@ -2,6 +2,7 @@ package server
 
 import (
 	"fmt"
+	"time"
 
 	"github.com/maxpert/amqp-go/protocol"
 	"go.uber.org/zap"
@@ -271,6 +272,15 @@ func (s *Server) processBodyFrame(conn *protocol.Connection, frame *protocol.Fra
 
 // processCompleteMessage processes a message that has been fully received (method + header + body)
 func (s *Server) processCompleteMessage(conn *protocol.Connection, channelID uint16, pendingMsg *protocol.PendingMessage) error {
+	// Track publish latency
+	startTime := time.Now()
+	defer func() {
+		if s.MetricsCollector != nil {
+			duration := time.Since(startTime).Seconds()
+			s.MetricsCollector.RecordPublishLatency(duration)
+		}
+	}()
+
 	s.Log.Debug("Processing complete message",
 		zap.String("exchange", pendingMsg.Method.Exchange),
 		zap.String("routing_key", pendingMsg.Method.RoutingKey),
@@ -303,13 +313,27 @@ func (s *Server) processCompleteMessage(conn *protocol.Connection, channelID uin
 	}
 
 	// Route the message using the broker
+	// Track publish latency
+	publishStart := time.Now()
 	err := s.Broker.PublishMessage(message.Exchange, message.RoutingKey, message)
+	publishDuration := time.Since(publishStart).Seconds()
+
+	// Record publish latency metric
+	if s.MetricsCollector != nil {
+		s.MetricsCollector.RecordPublishLatency(publishDuration)
+	}
+
 	if err != nil {
 		s.Log.Error("Failed to route message",
 			zap.Error(err),
 			zap.String("exchange", message.Exchange),
 			zap.String("routing_key", message.RoutingKey))
 		return err
+	}
+
+	// Record message published metric (count and bytes)
+	if s.MetricsCollector != nil {
+		s.MetricsCollector.RecordMessagePublished(len(message.Body))
 	}
 
 	s.Log.Debug("Message successfully routed",
@@ -516,6 +540,15 @@ func (s *Server) handleBasicGet(conn *protocol.Connection, channelID uint16, pay
 
 // sendBasicDeliver sends a basic.deliver method frame to a consumer
 func (s *Server) sendBasicDeliver(conn *protocol.Connection, channelID uint16, consumerTag string, deliveryTag uint64, redelivered bool, exchange, routingKey string, message *protocol.Message) error {
+	// Track delivery latency
+	startTime := time.Now()
+	defer func() {
+		if s.MetricsCollector != nil {
+			duration := time.Since(startTime).Seconds()
+			s.MetricsCollector.RecordDeliveryLatency(duration)
+		}
+	}()
+
 	s.Log.Debug("ENTERING sendBasicDeliver function",
 		zap.String("consumer_tag", consumerTag),
 		zap.Uint16("channel_id", channelID),
@@ -750,6 +783,11 @@ func (s *Server) sendBasicDeliver(conn *protocol.Connection, channelID uint16, c
 	s.Log.Debug("basic.deliver complete - all frames sent atomically",
 		zap.String("consumer_tag", consumerTag),
 		zap.Uint16("channel_id", channelID))
+
+	// Record message delivered metric (count and bytes)
+	if s.MetricsCollector != nil {
+		s.MetricsCollector.RecordMessageDelivered(len(message.Body))
+	}
 
 	return nil
 }

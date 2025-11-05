@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"fmt"
 	"net"
 	"sync"
@@ -71,6 +72,13 @@ func (s *Server) Start() error {
 	s.Listener = listener
 	s.Log.Info("AMQP server listening", zap.String("addr", s.Addr))
 
+	// Start system metrics collection in background
+	if s.MetricsCollector != nil {
+		ctx := context.Background()
+		go s.startSystemMetricsCollection(ctx)
+		s.Log.Info("Started system metrics collection")
+	}
+
 	// Accept connections
 	for {
 		conn, err := s.Listener.Accept()
@@ -129,7 +137,37 @@ func (s *Server) handleConnection(conn net.Conn) {
 	// Process frames for this connection
 	s.processConnectionFrames(connection)
 
-	// Clean up on connection close
+	// Clean up on connection close - iterate all channels and cancel consumers
+	connection.Channels.Range(func(key, value interface{}) bool {
+		channel := value.(*protocol.Channel)
+		channel.Mutex.Lock()
+		// Collect consumer tags to unregister
+		consumerTags := make([]string, 0, len(channel.Consumers))
+		for consumerTag := range channel.Consumers {
+			consumerTags = append(consumerTags, consumerTag)
+		}
+		channel.Consumers = make(map[string]*protocol.Consumer)
+		channel.Closed = true
+		channel.Mutex.Unlock()
+
+		// Unregister from broker (stops poll goroutines)
+		for _, consumerTag := range consumerTags {
+			err := s.Broker.UnregisterConsumer(consumerTag)
+			if err != nil {
+				s.Log.Warn("Failed to unregister consumer on connection close",
+					zap.String("consumer_tag", consumerTag),
+					zap.String("connection_id", connection.ID),
+					zap.Error(err))
+			} else {
+				s.Log.Debug("Unregistered consumer on connection close",
+					zap.String("consumer_tag", consumerTag),
+					zap.String("connection_id", connection.ID))
+			}
+		}
+
+		return true // continue iteration
+	})
+
 	s.Mutex.Lock()
 	delete(s.Connections, connection.ID)
 	s.Mutex.Unlock()

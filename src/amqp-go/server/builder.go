@@ -22,6 +22,7 @@ type ServerBuilder struct {
 	storage           interfaces.Storage
 	authenticator     interfaces.Authenticator
 	connectionHandler interfaces.ConnectionHandler
+	metrics           MetricsCollector
 }
 
 // NewServerBuilder creates a new server builder with default configuration
@@ -93,6 +94,12 @@ func (b *ServerBuilder) WithZapLogger(level string) *ServerBuilder {
 	}
 
 	b.logger = &ZapLoggerAdapter{logger: logger}
+	return b
+}
+
+// WithMetrics sets a custom metrics collector implementation
+func (b *ServerBuilder) WithMetrics(metrics MetricsCollector) *ServerBuilder {
+	b.metrics = metrics
 	return b
 }
 
@@ -230,6 +237,12 @@ func (b *ServerBuilder) Build() (*Server, error) {
 	executor := transaction.NewUnifiedBrokerExecutor(unifiedBroker)
 	transactionManager.SetExecutor(executor)
 
+	// Use provided metrics collector or default to NoOp
+	metricsCollector := b.metrics
+	if metricsCollector == nil {
+		metricsCollector = &NoOpMetricsCollector{}
+	}
+
 	// Create the server
 	server := &Server{
 		Addr:               b.config.Network.Address,
@@ -238,6 +251,8 @@ func (b *ServerBuilder) Build() (*Server, error) {
 		Config:             b.config,
 		Broker:             unifiedBroker,
 		TransactionManager: transactionManager,
+		MetricsCollector:   metricsCollector,
+		StartTime:          time.Now(),
 	}
 
 	// Create and attach lifecycle manager

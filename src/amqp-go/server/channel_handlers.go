@@ -19,6 +19,11 @@ func (s *Server) processChannelSpecificMethod(conn *protocol.Connection, channel
 			zap.Uint16("channel_id", channelID),
 			zap.String("connection_id", conn.ID))
 
+		// Record channel created metric
+		if s.MetricsCollector != nil {
+			s.MetricsCollector.RecordChannelCreated()
+		}
+
 		// Send channel.open-ok
 		return s.sendChannelOpenOK(conn, channelID)
 
@@ -32,17 +37,36 @@ func (s *Server) processChannelSpecificMethod(conn *protocol.Connection, channel
 			channel := value.(*protocol.Channel)
 			// Cancel all consumers on this channel
 			channel.Mutex.Lock()
+			consumerTags := make([]string, 0, len(channel.Consumers))
 			for consumerTag := range channel.Consumers {
-				s.Log.Debug("Canceling consumer due to channel close",
-					zap.String("consumer_tag", consumerTag),
-					zap.Uint16("channel_id", channelID))
+				consumerTags = append(consumerTags, consumerTag)
 			}
 			channel.Consumers = make(map[string]*protocol.Consumer) // Clear all consumers
 			channel.Closed = true
 			channel.Mutex.Unlock()
 
+			// Unregister consumers from broker (stops poll goroutines)
+			for _, consumerTag := range consumerTags {
+				err := s.Broker.UnregisterConsumer(consumerTag)
+				if err != nil {
+					s.Log.Warn("Failed to unregister consumer on channel close",
+						zap.String("consumer_tag", consumerTag),
+						zap.Uint16("channel_id", channelID),
+						zap.Error(err))
+				} else {
+					s.Log.Debug("Unregistered consumer on channel close",
+						zap.String("consumer_tag", consumerTag),
+						zap.Uint16("channel_id", channelID))
+				}
+			}
+
 			// Remove channel from connection
 			conn.Channels.Delete(channelID)
+
+			// Record channel closed metric
+			if s.MetricsCollector != nil {
+				s.MetricsCollector.RecordChannelClosed()
+			}
 		}
 
 		// Send channel.close-ok

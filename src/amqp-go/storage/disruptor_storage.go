@@ -20,6 +20,14 @@ const (
 	SpillThreshold = uint64(209715) // 80% of 256K = 209,715
 )
 
+// StorageMetrics interface for metrics collection
+type StorageMetrics interface {
+	UpdateDiskMetrics(freeBytes, usedBytes float64)
+	UpdateRingBufferUtilization(queueName string, utilization float64)
+	WALMetrics
+	SegmentMetrics
+}
+
 // DisruptorStorage implements an in-memory message queue using LMAX Disruptor pattern
 // Phase 1: Pure in-memory, zero-GC, lock-free ring buffer
 // Phase 2-5: Various optimizations
@@ -47,6 +55,9 @@ type DisruptorStorage struct {
 	// Transaction storage (simple in-memory for now)
 	transactions map[string]*interfaces.Transaction
 	txMutex      sync.RWMutex
+
+	// Metrics collector
+	metrics StorageMetrics
 
 	// Data directory
 	dataDir string
@@ -150,6 +161,17 @@ func NewDisruptorStorageWithCheckpointInterval(dataDir string, checkpointInterva
 		deliveryTagCounters: make(map[string]*atomic.Uint64),
 		transactions:        make(map[string]*interfaces.Transaction),
 		dataDir:             dataDir,
+	}
+}
+
+// SetMetrics sets the metrics collector for storage and propagates to WAL and segments
+func (ds *DisruptorStorage) SetMetrics(metrics StorageMetrics) {
+	ds.metrics = metrics
+	if ds.wal != nil {
+		ds.wal.SetMetrics(metrics)
+	}
+	if ds.segments != nil {
+		ds.segments.SetMetrics(metrics)
 	}
 }
 

@@ -27,6 +27,14 @@ const (
 	// Note: Header is variable-length (depends on queue name, exchange, and routing key lengths)
 )
 
+// WALMetrics interface for metrics collection
+type WALMetrics interface {
+	UpdateWALSize(bytes float64)
+	RecordWALWrite()
+	RecordWALFsync(duration float64)
+	RecordWALWriteError()
+}
+
 // WALManager manages a single shared Write-Ahead Log for ALL queues
 // Shared WAL architecture (RabbitMQ quorum queue style):
 // - One WAL serves all queues (more efficient fsync)
@@ -36,6 +44,7 @@ type WALManager struct {
 	dataDir   string
 	sharedWAL *QueueWAL // Single WAL for all queues
 	mu        sync.Mutex
+	metrics   WALMetrics
 }
 
 // QueueWAL manages a SHARED Write-Ahead Log with lock-free write path
@@ -70,6 +79,9 @@ type QueueWAL struct {
 
 	// Segment manager for checkpointing
 	segmentMgr *SegmentManager
+
+	// Metrics collector
+	metrics WALMetrics
 
 	// Background goroutines
 	stopChan chan struct{}
@@ -130,6 +142,17 @@ func (wm *WALManager) SetSegmentManager(segmentMgr *SegmentManager) {
 
 	if wm.sharedWAL != nil {
 		wm.sharedWAL.segmentMgr = segmentMgr
+	}
+}
+
+// SetMetrics sets the metrics collector for the WAL manager
+func (wm *WALManager) SetMetrics(metrics WALMetrics) {
+	wm.mu.Lock()
+	defer wm.mu.Unlock()
+
+	wm.metrics = metrics
+	if wm.sharedWAL != nil {
+		wm.sharedWAL.metrics = metrics
 	}
 }
 
@@ -475,6 +498,10 @@ func (qw *QueueWAL) flushBatch(batch []*writeRequest) {
 	// Single write (O_APPEND makes this atomic across processes)
 	n, err := qw.currentFile.Write(buf)
 	if err != nil {
+		// Record WAL write error
+		if qw.metrics != nil {
+			qw.metrics.RecordWALWriteError()
+		}
 		// Write failed - signal all callers with error
 		for _, req := range batch {
 			if req.done != nil {
@@ -484,9 +511,26 @@ func (qw *QueueWAL) flushBatch(batch []*writeRequest) {
 		return
 	}
 
+	// Record successful WAL writes
+	if qw.metrics != nil {
+		for range batch {
+			qw.metrics.RecordWALWrite()
+		}
+	}
+
 	// Fsync for durability (one sync per batch!)
 	// This is the critical durability guarantee - messages are only durable after this completes
+	fsyncStart := time.Now()
 	fsyncErr := qw.currentFile.Sync()
+	fsyncDuration := time.Since(fsyncStart).Seconds()
+
+	// Record fsync metrics
+	if qw.metrics != nil {
+		qw.metrics.RecordWALFsync(fsyncDuration)
+		if fsyncErr != nil {
+			qw.metrics.RecordWALWriteError()
+		}
+	}
 
 	// Signal ALL callers in this batch with the fsync result
 	// This unblocks all Write() calls waiting for this batch
