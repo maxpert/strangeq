@@ -95,7 +95,7 @@ jobs:
 
           # Copy files into package
           cp "${BINARY_NAME}" "${PACKAGE_NAME}/"
-          cp config.sample.json "${PACKAGE_NAME}/"
+          cp config.sample.yaml "${PACKAGE_NAME}/"
           cp README.release.txt "${PACKAGE_NAME}/README.txt"
           cp ../../LICENSE "${PACKAGE_NAME}/"
 
