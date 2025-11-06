@@ -99,3 +99,104 @@ func getSmallBuffer() *[]byte {
 func putSmallBuffer(b *[]byte) {
 	smallBufferPool.Put(b)
 }
+
+// Tiered buffer pools for frame serialization to reduce allocations in hot paths.
+// These pools are specifically designed for sendBasicDeliver frame encoding.
+
+// frameSerializationPool is for method/header frame buffers (~1KB typical)
+var frameSerializationPool = sync.Pool{
+	New: func() interface{} {
+		b := make([]byte, 0, 1024)
+		return &b
+	},
+}
+
+// GetFrameSerializationBuffer gets a buffer for frame serialization (method/header frames)
+func GetFrameSerializationBuffer() *[]byte {
+	b := frameSerializationPool.Get().(*[]byte)
+	*b = (*b)[:0] // Reset to zero length
+	return b
+}
+
+// PutFrameSerializationBuffer returns a frame serialization buffer to the pool
+func PutFrameSerializationBuffer(b *[]byte) {
+	if cap(*b) > 64*1024 {
+		return // Don't pool oversized buffers
+	}
+	frameSerializationPool.Put(b)
+}
+
+// mediumBodyPool is for small message bodies (~64KB)
+var mediumBodyPool = sync.Pool{
+	New: func() interface{} {
+		b := make([]byte, 0, 65536) // 64KB
+		return &b
+	},
+}
+
+// GetMediumBodyBuffer gets a medium-sized buffer for body frames
+func GetMediumBodyBuffer() *[]byte {
+	b := mediumBodyPool.Get().(*[]byte)
+	*b = (*b)[:0]
+	return b
+}
+
+// PutMediumBodyBuffer returns a medium body buffer to the pool
+func PutMediumBodyBuffer(b *[]byte) {
+	if cap(*b) > 64*1024 {
+		return
+	}
+	mediumBodyPool.Put(b)
+}
+
+// largeFramePool is for maxFrameSize chunks (~131KB for body frame fragments)
+var largeFramePool = sync.Pool{
+	New: func() interface{} {
+		b := make([]byte, 0, 131072) // 128KB maxFrameSize
+		return &b
+	},
+}
+
+// GetLargeFrameBuffer gets a large buffer for max-sized body frames
+func GetLargeFrameBuffer() *[]byte {
+	b := largeFramePool.Get().(*[]byte)
+	*b = (*b)[:0]
+	return b
+}
+
+// PutLargeFrameBuffer returns a large frame buffer to the pool
+// Note: This pool accepts buffers up to 131KB (slightly above the 64KB general limit)
+// because it's specifically for AMQP maxFrameSize chunks
+func PutLargeFrameBuffer(b *[]byte) {
+	if cap(*b) > 131*1024 {
+		return // Don't pool if larger than maxFrameSize + overhead
+	}
+	largeFramePool.Put(b)
+}
+
+// GetBufferForSize returns an appropriately-sized buffer from the tiered pools
+// This is a convenience function that selects the right pool based on size
+func GetBufferForSize(size int) *[]byte {
+	switch {
+	case size <= 1024:
+		return GetFrameSerializationBuffer()
+	case size <= 65536:
+		return GetMediumBodyBuffer()
+	default:
+		return GetLargeFrameBuffer()
+	}
+}
+
+// PutBufferForSize returns a buffer to the appropriate tiered pool
+func PutBufferForSize(b *[]byte) {
+	capacity := cap(*b)
+	switch {
+	case capacity <= 1024:
+		PutFrameSerializationBuffer(b)
+	case capacity <= 65536:
+		PutMediumBodyBuffer(b)
+	case capacity <= 131*1024:
+		PutLargeFrameBuffer(b)
+		// else: let GC handle oversized buffers
+	}
+}

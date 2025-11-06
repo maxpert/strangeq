@@ -2427,3 +2427,44 @@ func EncodeBodyFrameForChannel(channelID uint16, bodyData []byte) *Frame {
 		Payload: bodyData,
 	}
 }
+
+// FragmentBodyIntoFrames fragments a message body into multiple body frames
+// respecting the AMQP maxFrameSize constraint. Each frame payload must be
+// <= (maxFrameSize - 8) bytes to account for frame header overhead.
+//
+// AMQP 0.9.1 Specification:
+// - Large message bodies MUST be split into multiple body frames
+// - Each body frame MUST NOT exceed the negotiated max-frame-size
+// - Frame overhead is 8 bytes: 1 (type) + 2 (channel) + 4 (size) + 1 (end marker)
+//
+// For a 16MB message with 128KB maxFrameSize, this creates ~122 body frames.
+// Returns empty slice for zero-length bodies (method + header frames only).
+func FragmentBodyIntoFrames(channelID uint16, body []byte, maxFrameSize uint32) []*Frame {
+	if len(body) == 0 {
+		return nil // No body frames for empty bodies
+	}
+
+	// Calculate max payload size per frame (frame size - 8 byte overhead)
+	maxBodyPerFrame := int(maxFrameSize) - 8
+	if maxBodyPerFrame <= 0 {
+		// Should never happen with valid maxFrameSize, but handle defensively
+		maxBodyPerFrame = 4096 // Minimum safe frame size
+	}
+
+	// Pre-allocate slice with expected capacity
+	numFrames := (len(body) + maxBodyPerFrame - 1) / maxBodyPerFrame
+	frames := make([]*Frame, 0, numFrames)
+
+	// Fragment body into chunks
+	for offset := 0; offset < len(body); offset += maxBodyPerFrame {
+		end := offset + maxBodyPerFrame
+		if end > len(body) {
+			end = len(body)
+		}
+
+		chunk := body[offset:end]
+		frames = append(frames, EncodeBodyFrameForChannel(channelID, chunk))
+	}
+
+	return frames
+}

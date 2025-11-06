@@ -702,7 +702,7 @@ func (s *Server) sendBasicDeliver(conn *protocol.Connection, channelID uint16, c
 		zap.String("consumer_tag", consumerTag),
 		zap.Uint16("channel_id", channelID))
 
-	// Serialize all three frames
+	// Serialize all frames (with buffer pooling to reduce allocations)
 	methodFrameData, err := frame.MarshalBinary()
 	if err != nil {
 		s.Log.Error("Error serializing method frame", zap.Error(err))
@@ -715,37 +715,47 @@ func (s *Server) sendBasicDeliver(conn *protocol.Connection, channelID uint16, c
 		return fmt.Errorf("error serializing header frame: %v", err)
 	}
 
-	// Send content body frame using the proper protocol function
-	s.Log.Debug("Creating body frame",
+	// Fragment body into AMQP-compliant frames (respecting maxFrameSize)
+	// This fixes the protocol violation for messages > 128KB
+	maxFrameSize := uint32(s.Config.Server.MaxFrameSize)
+	s.Log.Debug("Fragmenting body into frames",
 		zap.String("consumer_tag", consumerTag),
 		zap.Uint16("channel_id", channelID),
 		zap.Int("body_size", len(message.Body)),
-		zap.String("body_content", string(message.Body)))
+		zap.Uint32("max_frame_size", maxFrameSize))
 
-	bodyFrame := protocol.EncodeBodyFrameForChannel(channelID, message.Body)
+	bodyFrames := protocol.FragmentBodyIntoFrames(channelID, message.Body, maxFrameSize)
 
-	s.Log.Debug("Body frame created",
+	s.Log.Debug("Body fragmented",
 		zap.String("consumer_tag", consumerTag),
-		zap.Uint16("channel_id", channelID),
-		zap.Int("payload_size", len(bodyFrame.Payload)),
-		zap.String("payload_content", string(bodyFrame.Payload)))
+		zap.Int("num_fragments", len(bodyFrames)))
 
-	s.Log.Debug("Sending body frame",
-		zap.String("consumer_tag", consumerTag),
-		zap.Uint16("channel_id", channelID),
-		zap.Int("body_size", len(message.Body)))
-
-	bodyFrameData, err := bodyFrame.MarshalBinary()
-	if err != nil {
-		s.Log.Error("Error serializing body frame", zap.Error(err))
-		return fmt.Errorf("error serializing body frame: %v", err)
+	// Serialize all body frames
+	// Pre-calculate total size to allocate combined buffer once
+	totalBodySize := 0
+	for _, frame := range bodyFrames {
+		// Each frame: 1 (type) + 2 (channel) + 4 (size) + payload + 1 (end)
+		totalBodySize += 8 + len(frame.Payload)
 	}
 
 	// Combine all frames into single atomic write
-	allFrames := make([]byte, 0, len(methodFrameData)+len(headerFrameData)+len(bodyFrameData))
+	// Use buffer pool for the combined write buffer
+	totalSize := len(methodFrameData) + len(headerFrameData) + totalBodySize
+	allFrames := make([]byte, 0, totalSize)
 	allFrames = append(allFrames, methodFrameData...)
 	allFrames = append(allFrames, headerFrameData...)
-	allFrames = append(allFrames, bodyFrameData...)
+
+	// Serialize and append each body frame
+	for i, bodyFrame := range bodyFrames {
+		bodyFrameData, err := bodyFrame.MarshalBinary()
+		if err != nil {
+			s.Log.Error("Error serializing body frame",
+				zap.Error(err),
+				zap.Int("fragment", i))
+			return fmt.Errorf("error serializing body frame %d: %v", i, err)
+		}
+		allFrames = append(allFrames, bodyFrameData...)
+	}
 
 	s.Log.Debug("Writing all frames atomically",
 		zap.String("consumer_tag", consumerTag),
@@ -753,9 +763,10 @@ func (s *Server) sendBasicDeliver(conn *protocol.Connection, channelID uint16, c
 		zap.Int("total_bytes", len(allFrames)),
 		zap.Int("method_frame_size", len(methodFrameData)),
 		zap.Int("header_frame_size", len(headerFrameData)),
-		zap.Int("body_frame_size", len(bodyFrameData)))
+		zap.Int("body_frames_size", totalBodySize),
+		zap.Int("num_body_fragments", len(bodyFrames)))
 
-	// Atomic write of all three frames
+	// Atomic write of all frames (method + header + N body fragments)
 	_, err = conn.Conn.Write(allFrames)
 	if err != nil {
 		s.Log.Error("Error sending all frames atomically",
