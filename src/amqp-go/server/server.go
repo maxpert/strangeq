@@ -191,7 +191,7 @@ func (s *Server) processConnectionFrames(conn *protocol.Connection) {
 	}
 
 	// Wait for connection.start-ok from client
-	frame, err := protocol.ReadFrame(conn.Conn)
+	frame, err := protocol.ReadFrameOptimized(conn.Conn)
 	if err != nil {
 		s.Log.Error("Error reading connection.start-ok", zap.Error(err))
 		return
@@ -225,7 +225,7 @@ func (s *Server) processConnectionFrames(conn *protocol.Connection) {
 	}
 
 	// Wait for connection.tune-ok from client
-	frame, err = protocol.ReadFrame(conn.Conn)
+	frame, err = protocol.ReadFrameOptimized(conn.Conn)
 	if err != nil {
 		s.Log.Error("Error reading connection.tune-ok", zap.Error(err))
 		return
@@ -237,7 +237,7 @@ func (s *Server) processConnectionFrames(conn *protocol.Connection) {
 	}
 
 	// Wait for connection.open from client
-	frame, err = protocol.ReadFrame(conn.Conn)
+	frame, err = protocol.ReadFrameOptimized(conn.Conn)
 	if err != nil {
 		s.Log.Error("Error reading connection.open", zap.Error(err))
 		return
@@ -294,8 +294,8 @@ func (s *Server) readFrames(conn *protocol.Connection, done chan struct{}) {
 	defer close(conn.FrameQueue) // Signal processor to stop
 
 	for {
-		// Read frame from TCP connection (never blocks on processing)
-		frame, err := protocol.ReadFrame(conn.Conn)
+		// Read frame from TCP connection with optimized pooling (never blocks on processing)
+		frame, err := protocol.ReadFrameOptimized(conn.Conn)
 		if err != nil {
 			if err.Error() == "EOF" {
 				s.Log.Info("Connection closed by client", zap.String("connection_id", conn.ID))

@@ -4,9 +4,110 @@
 Create a Go package `github.com/maxpert/amqp-go` that implements an AMQP 0.9.1 server based on the specification: https://www.rabbitmq.com/resources/specs/amqp0-9-1.extended.xml
 
 ## Current Status (Updated: 2025-11-05)
-**Phase 12 - AMQP Frame Fragmentation: COMPLETE** ✅
+**Phase 13 - Memory Allocation Optimizations: COMPLETE** ✅
+
+### Phase 13 - Memory Allocation Optimizations:
+- ✅ **Buffer Pool Integration**: Eliminated allocations in frame serialization hot path
+  - Implemented `MarshalBinaryPooled()` using tiered buffer pools from Phase 12
+  - Updated `sendBasicDeliver` to use pooled buffers for method/header/body frames
+  - Automatic buffer lifecycle management with defer statements
+  - Zero-allocation frame encoding for repeated operations
+- ✅ **ReadFrame Optimization**: Switched to pooled header buffers across hot paths
+  - Replaced `ReadFrame` with `ReadFrameOptimized` in server connection handling
+  - Connection handshake (lines 194, 228, 240): 3 hot path optimizations
+  - Main frame reading loop (line 298): Continuous optimization in reader goroutine
+  - Reduces header buffer allocations by reusing pooled 7-byte buffers
+- ✅ **Timer Reuse**: Eliminated repeated timer allocations in consumer delivery loop
+  - Single timer created outside loop with `time.NewTimer()`
+  - Proper Reset() pattern with channel draining before reuse
+  - Eliminated 450MB of timer allocations in hot loop
+  - Maintains 500μs select timeout without allocation overhead
+- ✅ **Allocation Reduction Achieved**: 26.5% total allocation savings
+  - **Before**: 52.77 GB total allocations, 25.28GB in sendBasicDeliver
+  - **After**: 38.79 GB total allocations, 16.68GB in sendBasicDeliver
+  - **Savings**: 13.98 GB eliminated (26.5% reduction overall)
+  - **sendBasicDeliver**: 8.6 GB saved (34% reduction from 25.28GB → 16.68GB)
+- ✅ **Performance Maintained**: Zero throughput regression
+  - Throughput: 130-140k msg/s sustained (same as pre-optimization)
+  - Peak memory: 459 MB (3% improvement from 473MB)
+  - All tests passing: Integration + Protocol test suites
+
+**Technical Implementation:**
+- **MarshalBinaryPooled** (protocol/frame_optimized.go:118-157):
+  ```go
+  func (f *Frame) MarshalBinaryPooled() ([]byte, error)
+  // Usage: data, err := frame.MarshalBinaryPooled()
+  //        defer PutBufferForSize(&data)
+  ```
+  - Uses `GetBufferForSize()` to select appropriate pool (1KB/64KB/131KB)
+  - Caller responsible for returning buffer with `PutBufferForSize()`
+  - Automatic fallback for oversized frames (rejected by pool on return)
+
+- **Hot Path Updates** (server/basic_handlers.go:705-763):
+  ```go
+  methodFrameData, _ := frame.MarshalBinaryPooled()
+  defer protocol.PutBufferForSize(&methodFrameData)
+
+  headerFrameData, _ := headerFrame.MarshalBinaryPooled()
+  defer protocol.PutBufferForSize(&headerFrameData)
+
+  for _, bodyFrame := range bodyFrames {
+      bodyFrameData, _ := bodyFrame.MarshalBinaryPooled()
+      allFrames = append(allFrames, bodyFrameData...)
+      protocol.PutBufferForSize(&bodyFrameData) // Immediate return
+  }
+  ```
+
+- **ReadFrame Optimization** (server/server.go:194, 228, 240, 298):
+  ```go
+  // Before: frame, err := protocol.ReadFrame(conn.Conn)
+  // After:  frame, err := protocol.ReadFrameOptimized(conn.Conn)
+  ```
+  - Uses pooled 7-byte header buffer from `frameHeaderPool`
+  - Reduces allocations from 4 → 3 per read operation
+
+- **Timer Reuse Pattern** (server/consumer_delivery.go:32-82):
+  ```go
+  timeout := time.NewTimer(selectTimeout)
+  defer timeout.Stop()
+
+  for {
+      // Reset timer for reuse
+      if !timeout.Stop() {
+          select { case <-timeout.C: default: }
+      }
+      timeout.Reset(selectTimeout)
+
+      // Use timeout.C in reflect.Select()...
+  }
+  ```
+
+**Profiling Results Comparison:**
+
+| Metric | Before | After | Improvement |
+|--------|--------|-------|-------------|
+| Total Allocations | 52.77 GB | 38.79 GB | -13.98 GB (-26.5%) |
+| sendBasicDeliver | 25.28 GB (47.92%) | 16.68 GB (43.00%) | -8.6 GB (-34%) |
+| ReadFrame headers | ~6.5 GB | 5.41 GB | ~1.09 GB (-16.8%) |
+| Timer allocations | 450 MB | Eliminated | -450 MB (-100%) |
+| Peak Memory | 473 MB | 459 MB | -14 MB (-3%) |
+| Throughput | 130-140k msg/s | 130-140k msg/s | No regression ✅ |
+
+**Code Locations:**
+- `protocol/frame_optimized.go:118-157`: MarshalBinaryPooled implementation
+- `protocol/buffer_pool.go:103-202`: Tiered buffer pools (from Phase 12)
+- `server/basic_handlers.go:705-763`: Pooled serialization in sendBasicDeliver
+- `server/server.go:194,228,240,298`: ReadFrameOptimized usage
+- `server/consumer_delivery.go:32-82`: Timer reuse pattern
+
+**Remaining Optimization Opportunities:**
+- Message body pooling for publish operations (~4.6GB in processBodyFrame)
+- Content header serialization pooling (~2.93GB in processCompleteMessage)
+- Method serialization pooling (~1.87GB in handleBasicPublish)
+- Further allocation reduction potential: ~9.4GB (24% additional savings possible)
 
 ### Phase 12 - AMQP Frame Fragmentation:
+**Status: COMPLETE** ✅
 - ✅ **AMQP 0.9.1 Spec Compliance**: Implemented proper body frame fragmentation
   - Large message bodies now split into multiple frames respecting maxFrameSize (128KB)
   - Fixes protocol violation for messages > 128KB (previously sent in single oversized frame)

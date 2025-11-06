@@ -29,6 +29,11 @@ func (s *Server) consumerDeliveryLoop(conn *protocol.Connection) {
 		maxBatchSize  = 100                    // Maximum messages to batch per consumer
 	)
 
+	// TIMER REUSE: Create timer once and reuse to avoid 450MB allocations
+	// Using Reset() eliminates repeated timer/channel allocations in hot loop
+	timeout := time.NewTimer(selectTimeout)
+	defer timeout.Stop()
+
 	for {
 		// LOCK-FREE: Check if connection is closed using atomic operation
 		if conn.Closed.Load() {
@@ -66,7 +71,15 @@ func (s *Server) consumerDeliveryLoop(conn *protocol.Connection) {
 
 		// P1.1 FIX: Use reflect.Select() ONLY - no O(N) hot path iteration!
 		// Wait on ALL consumer channels simultaneously using reflect.Select()
-		timeout := time.NewTimer(selectTimeout)
+
+		// Reset timer for reuse (must drain if Stop() returned false)
+		if !timeout.Stop() {
+			select {
+			case <-timeout.C:
+			default:
+			}
+		}
+		timeout.Reset(selectTimeout)
 
 		// Build select cases: timeout + all consumer channels
 		numConsumers := len(consumerInfos)
@@ -93,7 +106,7 @@ func (s *Server) consumerDeliveryLoop(conn *protocol.Connection) {
 		// Wait for ANY channel to be ready - O(1) wait instead of O(N) polling!
 		chosen, value, ok := reflect.Select(cases)
 
-		timeout.Stop()
+		// Note: Timer is managed with Reset() at loop start, no Stop() needed here
 
 		if chosen == 0 {
 			// Timeout - no messages available, continue to next iteration
