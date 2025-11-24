@@ -14,8 +14,9 @@ require (
 	github.com/smartystreets-prototypes/go-disruptor v0.0.0-20231024205940-61200af675a1
 	github.com/stretchr/testify v1.11.1
 	go.uber.org/zap v1.27.0
-	golang.org/x/crypto v0.42.0
-	golang.org/x/sys v0.36.0
+	golang.org/x/crypto v0.45.0
+	golang.org/x/sync v0.17.0
+	golang.org/x/sys v0.38.0
 	gopkg.in/yaml.v3 v3.0.1
 )
 
@@ -40,6 +41,5 @@ require (
 	go.uber.org/multierr v1.11.0 // indirect
 	go.yaml.in/yaml/v2 v2.4.2 // indirect
 	go.yaml.in/yaml/v3 v3.0.3 // indirect
-	golang.org/x/sync v0.17.0 // indirect
 	google.golang.org/protobuf v1.36.8 // indirect
 )
