@@ -36,11 +36,16 @@ rm -rf /tmp/amqp-storage-* || true
 sleep 1
 
 # Step 2: Build
-echo "[2/8] Building server..."
+echo "[2/8] Building server and perftest..."
 cd "$PROJECT_DIR"
 go build -o amqp-server ./cmd/amqp-server
 if [ $? -ne 0 ]; then
-    echo "ERROR: Build failed"
+    echo "ERROR: Server build failed"
+    exit 1
+fi
+go build -o "$PROFILE_DIR/perftest" ./cmd/perftest
+if [ $? -ne 0 ]; then
+    echo "ERROR: perftest build failed"
     exit 1
 fi
 
@@ -118,8 +123,8 @@ sleep 1
 
 # Step 6: Run benchmark
 echo "[6/8] Running benchmark..."
-cd "$PROJECT_DIR/benchmark"
-./perftest \
+cd "$PROJECT_DIR"
+"$PROFILE_DIR/perftest" \
     -producers $PRODUCERS \
     -consumers $CONSUMERS \
     -duration $DURATION \
@@ -170,16 +175,7 @@ echo "=================================================="
 # Extract and display results
 if [ $BENCHMARK_EXIT_CODE -eq 0 ]; then
     echo ""
-    grep -A 5 "=== Performance Test Results ===" "$PROFILE_DIR/benchmark.txt" || echo "No results found"
-
-    # Extract throughput numbers
-    CONSUMED=$(grep "Consumed:" "$PROFILE_DIR/benchmark.txt" | awk '{print $2, $3}')
-    PUBLISHED=$(grep "Published:" "$PROFILE_DIR/benchmark.txt" | awk '{print $2, $3}')
-
-    echo ""
-    echo "Quick Stats:"
-    echo "  Published: $PUBLISHED"
-    echo "  Consumed: $CONSUMED"
+    grep -A 10 "=== SUMMARY" "$PROFILE_DIR/benchmark.txt" || echo "No results found"
 else
     echo "ERROR: Benchmark failed with exit code $BENCHMARK_EXIT_CODE"
     echo "Check logs at: $PROFILE_DIR/server.log"
