@@ -104,7 +104,8 @@ type QueueWAL struct {
 	offsetIndexMutex sync.RWMutex
 
 	// Segment manager for checkpointing
-	segmentMgr *SegmentManager
+	segmentMgr      *SegmentManager
+	segmentMgrMutex sync.RWMutex
 
 	// Metrics collector
 	metrics WALMetrics
@@ -171,8 +172,17 @@ func (wm *WALManager) SetSegmentManager(segmentMgr *SegmentManager) {
 	defer wm.mu.Unlock()
 
 	if wm.sharedWAL != nil {
+		wm.sharedWAL.segmentMgrMutex.Lock()
 		wm.sharedWAL.segmentMgr = segmentMgr
+		wm.sharedWAL.segmentMgrMutex.Unlock()
 	}
+}
+
+// getSegmentMgr returns the segment manager (thread-safe)
+func (qw *QueueWAL) getSegmentMgr() *SegmentManager {
+	qw.segmentMgrMutex.RLock()
+	defer qw.segmentMgrMutex.RUnlock()
+	return qw.segmentMgr
 }
 
 // SetMetrics sets the metrics collector for the WAL manager
@@ -766,7 +776,8 @@ func (qw *QueueWAL) tryDeleteOldFiles() {
 // do not prevent file deletion (the retention contract takes priority).
 // NOTE: Caller must hold bitmapMutex (RLock) and oldFilesMutex (Lock).
 func (qw *QueueWAL) forceCheckpointFile(info *walFileInfo) {
-	if qw.segmentMgr == nil {
+	segMgr := qw.getSegmentMgr()
+	if segMgr == nil {
 		return
 	}
 
@@ -785,7 +796,7 @@ func (qw *QueueWAL) forceCheckpointFile(info *walFileInfo) {
 
 	// Write to segments (best-effort — errors are ignored)
 	for queueName, queueMsgs := range byQueue {
-		_ = qw.segmentMgr.CheckpointBatch(queueName, queueMsgs)
+		_ = segMgr.CheckpointBatch(queueName, queueMsgs)
 	}
 }
 
@@ -1116,8 +1127,8 @@ func (qw *QueueWAL) checkpointLoop() {
 
 	// Use checkpoint interval from segment config if available, default to 5 minutes
 	interval := 5 * time.Minute
-	if qw.segmentMgr != nil {
-		interval = qw.segmentMgr.cfg.CheckpointInterval
+	if segMgr := qw.getSegmentMgr(); segMgr != nil {
+		interval = segMgr.cfg.CheckpointInterval
 	}
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
@@ -1140,7 +1151,8 @@ func (qw *QueueWAL) checkpointLoop() {
 // For each old file: scan messages, filter out ACKed ones, write unACKed
 // messages to segments, then delete the WAL file and clean up the offset index.
 func (qw *QueueWAL) performCheckpoint() {
-	if qw.segmentMgr == nil {
+	segMgr := qw.getSegmentMgr()
+	if segMgr == nil {
 		return
 	}
 
@@ -1176,7 +1188,7 @@ func (qw *QueueWAL) performCheckpoint() {
 		// Write unACKed messages to segments
 		checkpointOK := true
 		for queueName, queueMsgs := range byQueue {
-			if err := qw.segmentMgr.CheckpointBatch(queueName, queueMsgs); err != nil {
+			if err := segMgr.CheckpointBatch(queueName, queueMsgs); err != nil {
 				checkpointOK = false
 				break
 			}
