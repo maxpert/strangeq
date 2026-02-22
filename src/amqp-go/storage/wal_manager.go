@@ -10,7 +10,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/RoaringBitmap/roaring"
+	"github.com/RoaringBitmap/roaring/roaring64"
 	"github.com/maxpert/amqp-go/protocol"
 )
 
@@ -58,15 +58,17 @@ type QueueWAL struct {
 	ackChan   chan *ackRequest   // Buffered channel for ACKs (queue+offset)
 
 	// ACK tracking
-	ackBitmap      *roaring.Bitmap
+	ackBitmap      *roaring64.Bitmap
 	bitmapMutex    sync.RWMutex
 	lastCheckpoint uint64 // Last offset checkpointed to segments
 
 	// Current active file
-	currentFile *os.File
-	fileNum     atomic.Uint64
-	fileOffset  atomic.Int64
-	fileMutex   sync.Mutex
+	currentFile             *os.File
+	fileNum                 atomic.Uint64
+	fileOffset              atomic.Int64
+	fileMutex               sync.Mutex
+	currentFileOffsets      *roaring64.Bitmap // actual offsets written to current file
+	currentFileOffsetsMutex sync.Mutex
 
 	// Old inactive files
 	oldFiles      map[uint64]*walFileInfo
@@ -107,11 +109,8 @@ type ackRequest struct {
 }
 
 type walFileInfo struct {
-	path      string
-	minOffset uint64
-	maxOffset uint64
-	totalMsgs int
-	ackedMsgs int
+	path    string
+	offsets *roaring64.Bitmap // actual message offsets in this file
 }
 
 // NewWALManager creates a new WAL manager with shared WAL
@@ -258,7 +257,7 @@ func (wm *WALManager) RecoverFromWAL() ([]*RecoveryMessage, error) {
 		// Filter out acknowledged messages
 		for _, msg := range messages {
 			wm.sharedWAL.bitmapMutex.RLock()
-			isAcked := wm.sharedWAL.ackBitmap.Contains(uint32(msg.Offset))
+			isAcked := wm.sharedWAL.ackBitmap.Contains(msg.Offset)
 			wm.sharedWAL.bitmapMutex.RUnlock()
 
 			if !isAcked {
@@ -414,14 +413,15 @@ func (wm *WALManager) createSharedWAL() (*QueueWAL, error) {
 	}
 
 	wal := &QueueWAL{
-		name:        "shared",
-		dataDir:     sharedDir,
-		writeChan:   make(chan *writeRequest, 10000), // Large buffer for high throughput
-		ackChan:     make(chan *ackRequest, 10000),   // Now holds queue+offset
-		ackBitmap:   roaring.New(),
-		oldFiles:    make(map[uint64]*walFileInfo),
-		offsetIndex: make(map[uint64]*offsetLocation), // Phase 6D: Offset index for O(1) reads
-		stopChan:    make(chan struct{}),
+		name:               "shared",
+		dataDir:            sharedDir,
+		writeChan:          make(chan *writeRequest, 10000), // Large buffer for high throughput
+		ackChan:            make(chan *ackRequest, 10000),   // Now holds queue+offset
+		ackBitmap:          roaring64.New(),
+		currentFileOffsets: roaring64.New(),
+		oldFiles:           make(map[uint64]*walFileInfo),
+		offsetIndex:        make(map[uint64]*offsetLocation), // Phase 6D: Offset index for O(1) reads
+		stopChan:           make(chan struct{}),
 	}
 
 	// Open first WAL file
@@ -555,12 +555,19 @@ func (qw *QueueWAL) flushBatch(batch []*writeRequest) {
 	}
 	qw.offsetIndexMutex.Unlock()
 
+	// Track offsets written to current file
+	qw.currentFileOffsetsMutex.Lock()
+	for _, req := range batch {
+		qw.currentFileOffsets.Add(req.offset)
+	}
+	qw.currentFileOffsetsMutex.Unlock()
+
 	// Update offset
 	newOffset := qw.fileOffset.Add(int64(n))
 
 	// Check if we need to roll to new file
 	if newOffset >= DefaultWALFileSize {
-		qw.rollFile(batch[0].offset, batch[len(batch)-1].offset, len(batch))
+		qw.rollFile()
 	}
 }
 
@@ -617,10 +624,16 @@ func (qw *QueueWAL) serializeMessage(queueName string, message *protocol.Message
 }
 
 // rollFile rolls to a new WAL file when size limit reached
-func (qw *QueueWAL) rollFile(minOffset, maxOffset uint64, totalMsgs int) {
+func (qw *QueueWAL) rollFile() {
 	// Get current file info
 	currentFileNum := qw.fileNum.Load()
 	currentPath := qw.currentFile.Name()
+
+	// Capture current file's offsets and reset for new file
+	qw.currentFileOffsetsMutex.Lock()
+	fileOffsets := qw.currentFileOffsets
+	qw.currentFileOffsets = roaring64.New()
+	qw.currentFileOffsetsMutex.Unlock()
 
 	// Close current file
 	_ = qw.currentFile.Close()
@@ -628,11 +641,8 @@ func (qw *QueueWAL) rollFile(minOffset, maxOffset uint64, totalMsgs int) {
 	// Move to old files map
 	qw.oldFilesMutex.Lock()
 	qw.oldFiles[currentFileNum] = &walFileInfo{
-		path:      currentPath,
-		minOffset: minOffset,
-		maxOffset: maxOffset,
-		totalMsgs: totalMsgs,
-		ackedMsgs: 0,
+		path:    currentPath,
+		offsets: fileOffsets,
 	}
 	qw.oldFilesMutex.Unlock()
 
@@ -666,7 +676,7 @@ func (qw *QueueWAL) cleanupLoop() {
 		select {
 		case ack := <-qw.ackChan:
 			qw.bitmapMutex.Lock()
-			qw.ackBitmap.Add(uint32(ack.offset))
+			qw.ackBitmap.Add(ack.offset)
 			qw.bitmapMutex.Unlock()
 
 			// Clean up offset index (Phase 6D)
@@ -694,14 +704,11 @@ func (qw *QueueWAL) tryDeleteOldFiles() {
 	defer qw.bitmapMutex.RUnlock()
 
 	for fileNum, info := range qw.oldFiles {
-		// Check if all messages in this file are ACKed
-		allAcked := true
-		for offset := info.minOffset; offset <= info.maxOffset; offset++ {
-			if !qw.ackBitmap.Contains(uint32(offset)) {
-				allAcked = false
-				break
-			}
-		}
+		// Check if all actual message offsets in this file are ACKed
+		// Uses bitmap intersection: file offsets ⊆ ackBitmap iff |file ∩ ack| == |file|
+		allAcked := info.offsets != nil &&
+			info.offsets.GetCardinality() > 0 &&
+			roaring64.And(info.offsets, qw.ackBitmap).GetCardinality() == info.offsets.GetCardinality()
 
 		if allAcked {
 			// Delete the WAL file
@@ -894,7 +901,7 @@ func (qw *QueueWAL) readMessageSequential(queueName string, offset uint64) (*pro
 	defer qw.oldFilesMutex.RUnlock()
 
 	for _, fileInfo := range qw.oldFiles {
-		if offset >= fileInfo.minOffset && offset <= fileInfo.maxOffset {
+		if fileInfo.offsets != nil && fileInfo.offsets.Contains(offset) {
 			// Found the file containing this offset
 			return qw.readMessageFromFile(queueName, fileInfo.path, offset)
 		}

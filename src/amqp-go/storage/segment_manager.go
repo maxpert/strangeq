@@ -10,7 +10,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/RoaringBitmap/roaring"
+	"github.com/RoaringBitmap/roaring/roaring64"
 	"github.com/maxpert/amqp-go/protocol"
 )
 
@@ -56,7 +56,7 @@ type QueueSegments struct {
 	sealedMutex    sync.RWMutex
 
 	// ACK tracking for compaction
-	ackBitmap   *roaring.Bitmap
+	ackBitmap   *roaring64.Bitmap
 	bitmapMutex sync.RWMutex
 
 	// Compaction state
@@ -151,7 +151,7 @@ func (sm *SegmentManager) Acknowledge(queueName string, offset uint64) {
 	segments := val.(*QueueSegments)
 
 	segments.bitmapMutex.Lock()
-	segments.ackBitmap.Add(uint32(offset))
+	segments.ackBitmap.Add(offset)
 	segments.bitmapMutex.Unlock()
 }
 
@@ -180,7 +180,7 @@ func (sm *SegmentManager) getOrCreateQueueSegments(queueName string) *QueueSegme
 		queueName:      queueName,
 		dataDir:        queueDir,
 		sealedSegments: make(map[uint64]*SegmentFile),
-		ackBitmap:      roaring.New(),
+		ackBitmap:      roaring64.New(),
 		stopChan:       make(chan struct{}),
 		metrics:        sm.metrics,
 	}
@@ -440,7 +440,7 @@ func (qs *QueueSegments) compactSegment(segment *SegmentFile) {
 
 	qs.bitmapMutex.RLock()
 	for offset, oldPosition := range oldIndex {
-		if !qs.ackBitmap.Contains(uint32(offset)) {
+		if !qs.ackBitmap.Contains(offset) {
 			// Message not ACKed - copy to new segment
 			msg, err := readSegmentMessageAt(segment.file, oldPosition)
 			if err == nil {

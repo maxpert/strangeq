@@ -3,7 +3,23 @@
 ## Goal
 Create a Go package `github.com/maxpert/amqp-go` that implements an AMQP 0.9.1 server based on the specification: https://www.rabbitmq.com/resources/specs/amqp0-9-1.extended.xml
 
-## Current Status (Updated: 2025-11-05)
+## Current Status (Updated: 2026-02-22)
+**Phase 14 - Log Compaction: IN PROGRESS** 🔧
+
+### Phase 14 - Log Compaction (Storage Reliability):
+- ✅ **Commit 1: Fix roaring64 bitmap and WAL offset tracking bug**
+  - Replaced `roaring.Bitmap` → `roaring64.Bitmap` in WAL and segment managers (removes uint32 truncation at ~4.29B messages)
+  - Fixed `tryDeleteOldFiles()` offset iteration bug: now tracks actual message offsets per file via `roaring64.Bitmap` instead of iterating [minOffset, maxOffset] range
+  - Removed dead `ackedMsgs`/`minOffset`/`maxOffset` fields from `walFileInfo`, replaced with `offsets *roaring64.Bitmap`
+  - Added `currentFileOffsets` tracking in `QueueWAL` to capture offsets during `flushBatch()` and pass to `rollFile()`
+  - Updated `readMessageSequential()` to use bitmap `Contains()` instead of range check
+  - 5 new tests in `wal_compaction_test.go`: large offsets, sparse offsets, partial ACK, false positive regression, large offset recovery
+- ⬜ **Commit 2: Wire EngineConfig to storage layer constructors**
+- ⬜ **Commit 3: Fix segment deletedCount tracking**
+- ⬜ **Commit 4: Implement WAL → Segment checkpointing**
+- ⬜ **Commit 5: Add time-based WAL retention**
+- ⬜ **Commit 6: Integration test and plan update**
+
 **Phase 13 - Memory Allocation Optimizations: COMPLETE** ✅
 
 ### Phase 13 - Memory Allocation Optimizations:
