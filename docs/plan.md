@@ -4,7 +4,7 @@
 Create a Go package `github.com/maxpert/amqp-go` that implements an AMQP 0.9.1 server based on the specification: https://www.rabbitmq.com/resources/specs/amqp0-9-1.extended.xml
 
 ## Current Status (Updated: 2026-02-22)
-**Phase 14 - Log Compaction: IN PROGRESS** 🔧
+**Phase 14 - Log Compaction: COMPLETE** ✅
 
 ### Phase 14 - Log Compaction (Storage Reliability):
 - ✅ **Commit 1: Fix roaring64 bitmap and WAL offset tracking bug**
@@ -43,7 +43,12 @@ Create a Go package `github.com/maxpert/amqp-go` that implements an AMQP 0.9.1 s
   - Fixed segment `openNextSegment()` to use `O_RDWR` instead of `O_WRONLY` so checkpointed messages are readable from current segment
   - Retention disabled by default (`RetentionPeriod: 0`); enabled via config
   - 4 new tests: expired file deletion, recent file preservation, checkpoint-before-delete, disabled-when-zero
-- ⬜ **Commit 6: Integration test and plan update**
+- ✅ **Commit 6: Integration test and plan update**
+  - Full lifecycle integration test (`log_compaction_integration_test.go`): write → WAL roll → checkpoint → segment → compaction → recovery
+  - `TestLogCompaction_FullLifecycle`: 300 durable messages across 3 queues, ACK 80%, checkpoint, verify unACKed readable, segment compaction, simulate restart
+  - `TestLogCompaction_RetentionWithCheckpoint`: time-based retention force-checkpoints unACKed messages to segments before deletion
+  - `TestLogCompaction_LargeOffsetLifecycle`: uint64 offsets > uint32 max through full WAL → segment pipeline
+  - `TestLogCompaction_TierFallback`: validates Ring Buffer → WAL → Segment three-tier read fallback
 
 **Phase 13 - Memory Allocation Optimizations: COMPLETE** ✅
 
