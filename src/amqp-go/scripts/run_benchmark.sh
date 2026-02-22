@@ -35,8 +35,9 @@ pkill -9 perftest || true
 rm -rf /tmp/amqp-storage-* || true
 sleep 1
 
-# Step 2: Build
-echo "[2/8] Building server and perftest..."
+# Step 2: Create results directory and build
+echo "[2/8] Creating results directory and building binaries..."
+mkdir -p "$PROFILE_DIR"
 cd "$PROJECT_DIR"
 go build -o amqp-server ./cmd/amqp-server
 if [ $? -ne 0 ]; then
@@ -49,9 +50,8 @@ if [ $? -ne 0 ]; then
     exit 1
 fi
 
-# Step 3: Create results directory
-echo "[3/8] Creating results directory..."
-mkdir -p "$PROFILE_DIR"
+# Step 3: (merged into step 2)
+echo "[3/8] Results directory: $PROFILE_DIR"
 
 # Step 4: Generate config file and start server
 echo "[4/8] Generating config and starting server..."

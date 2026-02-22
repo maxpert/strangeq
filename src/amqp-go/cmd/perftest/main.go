@@ -266,19 +266,29 @@ func runProducer(ctx context.Context, url, queueName, exchange string, size int,
 			deliveryMode = amqp.Persistent
 		}
 
-		var seqNo uint64 = 1
 		for {
 			select {
 			case <-ctx.Done():
 				return
 			default:
+				// Record publish time under lock before publishing so the
+				// confirm goroutine never misses an entry.
+				seqNo := ch.GetNextPublishSeqNo()
 				publishTime := time.Now()
+				pendingMu.Lock()
+				pending[seqNo] = publishTime
+				pendingMu.Unlock()
+
 				if err := ch.PublishWithContext(ctx, exchange, queueName, false, false, amqp.Publishing{
 					DeliveryMode: deliveryMode,
 					ContentType:  "application/octet-stream",
 					Body:         body,
 					Timestamp:    publishTime,
 				}); err != nil {
+					// Remove the entry we pre-recorded since the publish failed.
+					pendingMu.Lock()
+					delete(pending, seqNo)
+					pendingMu.Unlock()
 					if ctx.Err() != nil {
 						return
 					}
@@ -286,10 +296,6 @@ func runProducer(ctx context.Context, url, queueName, exchange string, size int,
 					time.Sleep(10 * time.Millisecond)
 					continue
 				}
-				pendingMu.Lock()
-				pending[seqNo] = publishTime
-				seqNo++
-				pendingMu.Unlock()
 				st.published.Add(1)
 			}
 		}
