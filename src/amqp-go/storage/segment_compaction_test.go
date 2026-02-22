@@ -1,0 +1,210 @@
+package storage
+
+import (
+	"testing"
+	"time"
+
+	"github.com/maxpert/amqp-go/protocol"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+// TestSegment_DeletedCountIncrement verifies that acknowledging messages
+// correctly increments the deletedCount on the segment containing them.
+func TestSegment_DeletedCountIncrement(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	sm, err := NewSegmentManager(tmpDir)
+	require.NoError(t, err)
+	defer sm.Close()
+
+	queueName := "test_queue"
+
+	// Write 100 messages to segments
+	for i := uint64(1); i <= 100; i++ {
+		msg := &protocol.Message{
+			Body:        []byte("test message"),
+			DeliveryTag: i,
+		}
+		err := sm.Write(queueName, msg, i)
+		require.NoError(t, err)
+	}
+
+	// ACK 60 messages
+	for i := uint64(1); i <= 60; i++ {
+		sm.Acknowledge(queueName, i)
+	}
+
+	// Get the queue segments and check deletedCount
+	val, ok := sm.queueSegments.Load(queueName)
+	require.True(t, ok)
+	qs := val.(*QueueSegments)
+
+	// Check current segment (messages should be there since we didn't seal)
+	qs.mutex.Lock()
+	currentSeg := qs.currentSegment
+	qs.mutex.Unlock()
+
+	require.NotNil(t, currentSeg)
+	assert.Equal(t, uint64(60), currentSeg.deletedCount.Load(),
+		"deletedCount should be 60 after ACKing 60 of 100 messages")
+	assert.Equal(t, uint64(100), currentSeg.messageCount.Load(),
+		"messageCount should remain 100")
+}
+
+// TestSegment_CompactionTriggers verifies that compaction triggers when
+// deletion ratio exceeds the threshold.
+func TestSegment_CompactionTriggers(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	cfg := DefaultSegmentConfig()
+	cfg.CompactionThreshold = 0.5
+	cfg.CompactionInterval = 100 * time.Millisecond // Fast compaction for testing
+
+	sm, err := NewSegmentManagerWithConfig(tmpDir, cfg)
+	require.NoError(t, err)
+	defer sm.Close()
+
+	queueName := "test_queue"
+
+	// Write 100 messages
+	for i := uint64(1); i <= 100; i++ {
+		msg := &protocol.Message{
+			Body:        []byte("test message for compaction"),
+			DeliveryTag: i,
+		}
+		err := sm.Write(queueName, msg, i)
+		require.NoError(t, err)
+	}
+
+	// Get queue segments
+	val, ok := sm.queueSegments.Load(queueName)
+	require.True(t, ok)
+	qs := val.(*QueueSegments)
+
+	// Seal the current segment so compaction can operate on it
+	qs.mutex.Lock()
+	qs.sealSegment()
+	qs.mutex.Unlock()
+	// openNextSegment takes the mutex internally
+	err = qs.openNextSegment()
+	require.NoError(t, err)
+
+	// ACK 51 messages (>50% threshold)
+	for i := uint64(1); i <= 51; i++ {
+		sm.Acknowledge(queueName, i)
+	}
+
+	// Wait for compaction loop to run
+	time.Sleep(500 * time.Millisecond)
+
+	// After compaction, the sealed segment should have fewer messages
+	qs.sealedMutex.RLock()
+	compacted := false
+	for _, seg := range qs.sealedSegments {
+		// If compaction happened, deletedCount should be 0 (reset after compaction)
+		// and messageCount should be 49 (100 - 51 ACKed)
+		if seg.deletedCount.Load() == 0 && seg.messageCount.Load() == 49 {
+			compacted = true
+		}
+	}
+	qs.sealedMutex.RUnlock()
+
+	assert.True(t, compacted, "compaction should have triggered and reduced segment to 49 messages")
+}
+
+// TestSegment_CompactionPreservesUnacked verifies that after compaction,
+// unACKed messages are still readable.
+func TestSegment_CompactionPreservesUnacked(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	cfg := DefaultSegmentConfig()
+	cfg.CompactionThreshold = 0.3 // Low threshold
+
+	sm, err := NewSegmentManagerWithConfig(tmpDir, cfg)
+	require.NoError(t, err)
+	defer sm.Close()
+
+	queueName := "test_queue"
+
+	// Write 10 messages with distinct bodies
+	for i := uint64(1); i <= 10; i++ {
+		msg := &protocol.Message{
+			Body:        []byte("unacked message body"),
+			DeliveryTag: i,
+		}
+		err := sm.Write(queueName, msg, i)
+		require.NoError(t, err)
+	}
+
+	// Get queue segments and seal
+	val, ok := sm.queueSegments.Load(queueName)
+	require.True(t, ok)
+	qs := val.(*QueueSegments)
+
+	qs.mutex.Lock()
+	qs.sealSegment()
+	qs.mutex.Unlock()
+	err = qs.openNextSegment()
+	require.NoError(t, err)
+
+	// ACK first 4 (40% > 30% threshold)
+	for i := uint64(1); i <= 4; i++ {
+		sm.Acknowledge(queueName, i)
+	}
+
+	// Manually trigger compaction
+	qs.tryCompaction()
+
+	// Verify unACKed messages (5-10) are still readable
+	for i := uint64(5); i <= 10; i++ {
+		msg, err := sm.Read(queueName, i)
+		require.NoError(t, err, "unACKed message at offset %d should be readable after compaction", i)
+		assert.Equal(t, []byte("unacked message body"), msg.Body)
+	}
+
+	// Verify ACKed messages (1-4) are NOT readable after compaction
+	for i := uint64(1); i <= 4; i++ {
+		_, err := sm.Read(queueName, i)
+		assert.Error(t, err, "ACKed message at offset %d should not be readable after compaction", i)
+	}
+}
+
+// TestSegment_DeletedCountNotIncrementedWithoutFix is a regression test
+// verifying that the fix correctly increments deletedCount. Before the fix,
+// deletedCount was always 0.
+func TestSegment_DeletedCountNotIncrementedWithoutFix(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	sm, err := NewSegmentManager(tmpDir)
+	require.NoError(t, err)
+	defer sm.Close()
+
+	queueName := "test_queue"
+
+	// Write 5 messages
+	for i := uint64(1); i <= 5; i++ {
+		msg := &protocol.Message{
+			Body:        []byte("test"),
+			DeliveryTag: i,
+		}
+		err := sm.Write(queueName, msg, i)
+		require.NoError(t, err)
+	}
+
+	// ACK 1 message
+	sm.Acknowledge(queueName, 1)
+
+	// Get the current segment
+	val, ok := sm.queueSegments.Load(queueName)
+	require.True(t, ok)
+	qs := val.(*QueueSegments)
+
+	qs.mutex.Lock()
+	seg := qs.currentSegment
+	qs.mutex.Unlock()
+
+	// Before the fix, this would be 0. After the fix, it should be 1.
+	assert.Equal(t, uint64(1), seg.deletedCount.Load(),
+		"deletedCount must be incremented when a message in the segment is ACKed")
+}

@@ -179,6 +179,44 @@ func (sm *SegmentManager) Acknowledge(queueName string, offset uint64) {
 	segments.bitmapMutex.Lock()
 	segments.ackBitmap.Add(offset)
 	segments.bitmapMutex.Unlock()
+
+	// Increment deletedCount on the segment containing this offset
+	segments.acknowledgeInSegment(offset)
+}
+
+// acknowledgeInSegment finds the segment containing the offset and increments its deletedCount
+func (qs *QueueSegments) acknowledgeInSegment(offset uint64) {
+	// Check current segment first
+	qs.mutex.Lock()
+	if qs.currentSegment != nil {
+		if qs.currentIndex != nil {
+			qs.currentIndex.mutex.RLock()
+			_, exists := qs.currentIndex.entries[offset]
+			qs.currentIndex.mutex.RUnlock()
+			if exists {
+				qs.currentSegment.deletedCount.Add(1)
+				qs.mutex.Unlock()
+				return
+			}
+		}
+	}
+	qs.mutex.Unlock()
+
+	// Check sealed segments
+	qs.sealedMutex.RLock()
+	defer qs.sealedMutex.RUnlock()
+
+	for _, seg := range qs.sealedSegments {
+		if offset >= seg.minOffset && offset <= seg.maxOffset {
+			seg.mutex.RLock()
+			_, exists := seg.index[offset]
+			seg.mutex.RUnlock()
+			if exists {
+				seg.deletedCount.Add(1)
+				return
+			}
+		}
+	}
 }
 
 // Close closes all segments
@@ -334,6 +372,24 @@ func (qs *QueueSegments) sealSegment() {
 
 	// Sync to disk
 	_ = qs.currentSegment.file.Sync()
+
+	// Copy index entries to the segment's own index for sealed-segment reads
+	if qs.currentIndex != nil {
+		qs.currentIndex.mutex.RLock()
+		qs.currentSegment.mutex.Lock()
+		for offset, position := range qs.currentIndex.entries {
+			qs.currentSegment.index[offset] = position
+		}
+		qs.currentSegment.mutex.Unlock()
+		qs.currentIndex.mutex.RUnlock()
+	}
+
+	// Reopen file as read-only for sealed segment reads
+	readFile, err := os.Open(qs.currentSegment.path)
+	if err == nil {
+		_ = qs.currentSegment.file.Close()
+		qs.currentSegment.file = readFile
+	}
 
 	// Move to sealed segments
 	qs.sealedMutex.Lock()
@@ -584,33 +640,36 @@ func serializeSegmentMessage(message *protocol.Message, offset uint64) []byte {
 }
 
 func readSegmentMessageAt(file *os.File, position int64) (*protocol.Message, error) {
-	// Read header
-	header := make([]byte, SegmentHeaderSize)
+	// Read header (CRC + length only, 8 bytes)
+	header := make([]byte, 8)
 	_, err := file.ReadAt(header, position)
 	if err != nil {
 		return nil, err
 	}
 
 	// Parse header
-	crc := binary.BigEndian.Uint32(header[0:4])
+	storedCRC := binary.BigEndian.Uint32(header[0:4])
 	dataLen := binary.BigEndian.Uint32(header[4:8])
-	offset := binary.BigEndian.Uint64(header[8:16])
 
-	// Read message data
-	data := make([]byte, dataLen)
-	_, err = file.ReadAt(data, position+8) // +8 to skip CRC and length
+	// Read data portion: [length_4][data_N] for CRC verification
+	// CRC was computed over buf[4:] = [length_4][offset_8][body_N]
+	crcData := make([]byte, 4+dataLen)
+	copy(crcData[0:4], header[4:8])               // length field
+	_, err = file.ReadAt(crcData[4:], position+8) // offset + body
 	if err != nil {
 		return nil, err
 	}
 
-	// Verify CRC
-	calculatedCRC := crc32.ChecksumIEEE(data)
-	if calculatedCRC != crc {
+	// Verify CRC over [length][offset][body] (matches serialization)
+	calculatedCRC := crc32.ChecksumIEEE(crcData)
+	if calculatedCRC != storedCRC {
 		return nil, fmt.Errorf("CRC mismatch")
 	}
 
-	// Parse message (simplified - skip offset field in data)
-	body := data[8:] // Skip offset field
+	// Parse data: [offset_8][body_N]
+	data := crcData[4:] // skip length field, now at [offset][body]
+	offset := binary.BigEndian.Uint64(data[0:8])
+	body := data[8:]
 
 	return &protocol.Message{
 		DeliveryTag: offset,

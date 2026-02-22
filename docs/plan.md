@@ -22,7 +22,14 @@ Create a Go package `github.com/maxpert/amqp-go` that implements an AMQP 0.9.1 s
   - Updated `server/builder.go` to call `NewDisruptorStorageWithEngineConfig()` with `EngineConfig`
   - All hardcoded constants (batch size, timeout, file size, channel buffer, cleanup/compaction/checkpoint intervals) now respect config
   - 5 new tests: custom batch size, custom compaction threshold, engine→WAL mapping, engine→segment mapping, default fallback
-- ⬜ **Commit 3: Fix segment deletedCount tracking**
+- ✅ **Commit 3: Fix segment deletedCount tracking**
+  - Added `acknowledgeInSegment()` method that finds the segment containing an offset and increments its `deletedCount`
+  - Called from `Acknowledge()` after updating the ACK bitmap
+  - Checks both current segment (via currentIndex) and sealed segments (via segment.index)
+  - Fixed `sealSegment()` to copy currentIndex entries to segment.index for sealed-segment reads
+  - Fixed `sealSegment()` to reopen file as read-only for sealed-segment ReadAt support
+  - Fixed pre-existing CRC verification bug in `readSegmentMessageAt()` — was verifying CRC over wrong data slice
+  - 4 new tests: deletedCount increment, compaction triggers, compaction preserves unacked, regression test
 - ⬜ **Commit 4: Implement WAL → Segment checkpointing**
 - ⬜ **Commit 5: Add time-based WAL retention**
 - ⬜ **Commit 6: Integration test and plan update**
