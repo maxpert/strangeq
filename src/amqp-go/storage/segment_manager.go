@@ -26,6 +26,24 @@ const (
 	SegmentHeaderSize = 16
 )
 
+// SegmentConfig holds configurable parameters for the segment manager
+type SegmentConfig struct {
+	SegmentSize         int64
+	CompactionThreshold float64
+	CompactionInterval  time.Duration
+	CheckpointInterval  time.Duration
+}
+
+// DefaultSegmentConfig returns a SegmentConfig with production defaults
+func DefaultSegmentConfig() SegmentConfig {
+	return SegmentConfig{
+		SegmentSize:         DefaultSegmentSize,
+		CompactionThreshold: DefaultCompactionThreshold,
+		CompactionInterval:  1 * time.Minute,
+		CheckpointInterval:  SegmentCheckpointInterval,
+	}
+}
+
 // SegmentMetrics interface for metrics collection
 type SegmentMetrics interface {
 	UpdateSegmentMetrics(queueName string, count, sizeBytes float64)
@@ -39,12 +57,14 @@ type SegmentManager struct {
 	dataDir       string
 	queueSegments sync.Map // queueName -> *QueueSegments
 	metrics       SegmentMetrics
+	cfg           SegmentConfig
 }
 
 // QueueSegments manages segments for a single queue
 type QueueSegments struct {
 	queueName string
 	dataDir   string
+	cfg       SegmentConfig
 
 	// Active segment being written to
 	currentSegment *SegmentFile
@@ -101,8 +121,13 @@ type SegmentIndex struct {
 	mutex      sync.RWMutex
 }
 
-// NewSegmentManager creates a new segment manager
+// NewSegmentManager creates a new segment manager with default config
 func NewSegmentManager(dataDir string) (*SegmentManager, error) {
+	return NewSegmentManagerWithConfig(dataDir, DefaultSegmentConfig())
+}
+
+// NewSegmentManagerWithConfig creates a new segment manager with custom config
+func NewSegmentManagerWithConfig(dataDir string, cfg SegmentConfig) (*SegmentManager, error) {
 	segDir := filepath.Join(dataDir, "segments")
 	if err := os.MkdirAll(segDir, 0755); err != nil {
 		return nil, fmt.Errorf("failed to create segments directory: %w", err)
@@ -110,6 +135,7 @@ func NewSegmentManager(dataDir string) (*SegmentManager, error) {
 
 	return &SegmentManager{
 		dataDir: segDir,
+		cfg:     cfg,
 	}, nil
 }
 
@@ -179,6 +205,7 @@ func (sm *SegmentManager) getOrCreateQueueSegments(queueName string) *QueueSegme
 	segments := &QueueSegments{
 		queueName:      queueName,
 		dataDir:        queueDir,
+		cfg:            sm.cfg,
 		sealedSegments: make(map[uint64]*SegmentFile),
 		ackBitmap:      roaring64.New(),
 		stopChan:       make(chan struct{}),
@@ -242,7 +269,7 @@ func (qs *QueueSegments) writeMessage(message *protocol.Message, offset uint64) 
 	}
 
 	// Check if we need to roll to new segment
-	if qs.currentSegment.fileSize.Load() >= DefaultSegmentSize {
+	if qs.currentSegment.fileSize.Load() >= qs.cfg.SegmentSize {
 		qs.sealSegment()
 		_ = qs.openNextSegment()
 	}
@@ -350,7 +377,7 @@ func (qs *QueueSegments) openNextSegment() error {
 func (qs *QueueSegments) checkpointLoop() {
 	defer qs.wg.Done()
 
-	ticker := time.NewTicker(SegmentCheckpointInterval)
+	ticker := time.NewTicker(qs.cfg.CheckpointInterval)
 	defer ticker.Stop()
 
 	for {
@@ -370,7 +397,7 @@ func (qs *QueueSegments) checkpointLoop() {
 func (qs *QueueSegments) compactionLoop() {
 	defer qs.wg.Done()
 
-	ticker := time.NewTicker(1 * time.Minute)
+	ticker := time.NewTicker(qs.cfg.CompactionInterval)
 	defer ticker.Stop()
 
 	for {
@@ -395,7 +422,7 @@ func (qs *QueueSegments) tryCompaction() {
 
 		if totalCount > 0 {
 			deletionRatio := float64(deletedCount) / float64(totalCount)
-			if deletionRatio > DefaultCompactionThreshold {
+			if deletionRatio > qs.cfg.CompactionThreshold {
 				segmentsToCompact = append(segmentsToCompact, segment)
 			}
 		}

@@ -1,11 +1,13 @@
 package storage
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
 	"time"
 
+	"github.com/maxpert/amqp-go/interfaces"
 	"github.com/maxpert/amqp-go/protocol"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -309,4 +311,109 @@ func TestWAL_RecoverFromWAL_LargeOffsets(t *testing.T) {
 	files, err := os.ReadDir(walDir)
 	require.NoError(t, err)
 	assert.Greater(t, len(files), 0, "WAL files should exist on disk")
+}
+
+// TestWALConfig_CustomBatchSize verifies that custom batch size from config
+// controls when the WAL flushes.
+func TestWALConfig_CustomBatchSize(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	cfg := DefaultWALConfig()
+	cfg.BatchSize = 5                  // Very small batch size for testing
+	cfg.BatchTimeout = 5 * time.Second // Long timeout so only size triggers flush
+
+	wm, err := NewWALManagerWithConfig(tmpDir, cfg)
+	require.NoError(t, err)
+	defer wm.Close()
+
+	// Verify config was applied
+	assert.Equal(t, 5, wm.sharedWAL.cfg.BatchSize)
+
+	// Write exactly 5 messages (should trigger a flush at batch boundary)
+	for i := 0; i < 5; i++ {
+		msg := &protocol.Message{
+			Exchange:     "test.exchange",
+			RoutingKey:   "test.key",
+			Body:         []byte(fmt.Sprintf("msg %d", i)),
+			DeliveryMode: 2,
+		}
+		err := wm.Write("test_queue", msg, uint64(i+1))
+		require.NoError(t, err)
+	}
+
+	// Messages should be flushed (batch size reached)
+	// Give a small moment for the write to complete
+	time.Sleep(50 * time.Millisecond)
+
+	// Verify all 5 messages are readable
+	for i := 0; i < 5; i++ {
+		msg, err := wm.Read("test_queue", uint64(i+1))
+		require.NoError(t, err, "should read message at offset %d", i+1)
+		assert.NotNil(t, msg)
+	}
+}
+
+// TestSegmentConfig_CustomCompactionThreshold verifies custom compaction threshold
+func TestSegmentConfig_CustomCompactionThreshold(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	cfg := DefaultSegmentConfig()
+	cfg.CompactionThreshold = 0.3 // Lower threshold for testing
+
+	sm, err := NewSegmentManagerWithConfig(tmpDir, cfg)
+	require.NoError(t, err)
+	defer sm.Close()
+
+	// Verify config was stored
+	assert.Equal(t, 0.3, sm.cfg.CompactionThreshold)
+}
+
+// TestWALConfigFromEngine verifies EngineConfig maps correctly to WALConfig
+func TestWALConfigFromEngine(t *testing.T) {
+	ec := interfaces.EngineConfig{
+		WALBatchSize:              500,
+		WALBatchTimeoutMS:         20,
+		WALFileSize:               1024 * 1024, // 1MB
+		WALChannelBuffer:          5000,
+		WALCleanupCheckIntervalMS: 10000, // 10s
+	}
+
+	cfg := WALConfigFromEngine(ec)
+
+	assert.Equal(t, 500, cfg.BatchSize)
+	assert.Equal(t, 20*time.Millisecond, cfg.BatchTimeout)
+	assert.Equal(t, int64(1024*1024), cfg.FileSize)
+	assert.Equal(t, 5000, cfg.ChannelBuffer)
+	assert.Equal(t, 10*time.Second, cfg.CleanupInterval)
+}
+
+// TestSegmentConfigFromEngine verifies EngineConfig maps correctly to SegmentConfig
+func TestSegmentConfigFromEngine(t *testing.T) {
+	ec := interfaces.EngineConfig{
+		SegmentSize:                 512 * 1024 * 1024, // 512MB
+		CompactionThreshold:         0.3,
+		CompactionIntervalMS:        60000,  // 1 minute
+		SegmentCheckpointIntervalMS: 120000, // 2 minutes
+	}
+
+	cfg := SegmentConfigFromEngine(ec)
+
+	assert.Equal(t, int64(512*1024*1024), cfg.SegmentSize)
+	assert.Equal(t, 0.3, cfg.CompactionThreshold)
+	assert.Equal(t, time.Minute, cfg.CompactionInterval)
+	assert.Equal(t, 2*time.Minute, cfg.CheckpointInterval)
+}
+
+// TestWALConfigFromEngine_Defaults verifies zero EngineConfig uses defaults
+func TestWALConfigFromEngine_Defaults(t *testing.T) {
+	ec := interfaces.EngineConfig{} // all zeros
+
+	cfg := WALConfigFromEngine(ec)
+	defaults := DefaultWALConfig()
+
+	assert.Equal(t, defaults.BatchSize, cfg.BatchSize)
+	assert.Equal(t, defaults.BatchTimeout, cfg.BatchTimeout)
+	assert.Equal(t, defaults.FileSize, cfg.FileSize)
+	assert.Equal(t, defaults.ChannelBuffer, cfg.ChannelBuffer)
+	assert.Equal(t, defaults.CleanupInterval, cfg.CleanupInterval)
 }

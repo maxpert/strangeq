@@ -14,7 +14,14 @@ Create a Go package `github.com/maxpert/amqp-go` that implements an AMQP 0.9.1 s
   - Added `currentFileOffsets` tracking in `QueueWAL` to capture offsets during `flushBatch()` and pass to `rollFile()`
   - Updated `readMessageSequential()` to use bitmap `Contains()` instead of range check
   - 5 new tests in `wal_compaction_test.go`: large offsets, sparse offsets, partial ACK, false positive regression, large offset recovery
-- ⬜ **Commit 2: Wire EngineConfig to storage layer constructors**
+- ✅ **Commit 2: Wire EngineConfig to storage layer constructors**
+  - Added `WALConfig` struct with `DefaultWALConfig()` and `NewWALManagerWithConfig()` constructor
+  - Added `SegmentConfig` struct with `DefaultSegmentConfig()` and `NewSegmentManagerWithConfig()` constructor
+  - Added `WALConfigFromEngine()` and `SegmentConfigFromEngine()` to map `EngineConfig` → storage configs
+  - Added `NewDisruptorStorageWithEngineConfig()` that passes config through to WAL/Segment constructors
+  - Updated `server/builder.go` to call `NewDisruptorStorageWithEngineConfig()` with `EngineConfig`
+  - All hardcoded constants (batch size, timeout, file size, channel buffer, cleanup/compaction/checkpoint intervals) now respect config
+  - 5 new tests: custom batch size, custom compaction threshold, engine→WAL mapping, engine→segment mapping, default fallback
 - ⬜ **Commit 3: Fix segment deletedCount tracking**
 - ⬜ **Commit 4: Implement WAL → Segment checkpointing**
 - ⬜ **Commit 5: Add time-based WAL retention**

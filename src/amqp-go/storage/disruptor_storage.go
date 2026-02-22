@@ -118,6 +118,50 @@ func NewDisruptorStorageWithDataDir(dataDir string) *DisruptorStorage {
 
 // NewDisruptorStorageWithCheckpointInterval creates storage with custom data directory and checkpoint interval
 func NewDisruptorStorageWithCheckpointInterval(dataDir string, checkpointInterval time.Duration) *DisruptorStorage {
+	return NewDisruptorStorageWithEngineConfig(dataDir, checkpointInterval, interfaces.EngineConfig{})
+}
+
+// WALConfigFromEngine creates a WALConfig from EngineConfig, falling back to defaults
+func WALConfigFromEngine(ec interfaces.EngineConfig) WALConfig {
+	cfg := DefaultWALConfig()
+	if ec.WALBatchSize > 0 {
+		cfg.BatchSize = ec.WALBatchSize
+	}
+	if ec.WALBatchTimeoutMS > 0 {
+		cfg.BatchTimeout = time.Duration(ec.WALBatchTimeoutMS) * time.Millisecond
+	}
+	if ec.WALFileSize > 0 {
+		cfg.FileSize = ec.WALFileSize
+	}
+	if ec.WALChannelBuffer > 0 {
+		cfg.ChannelBuffer = ec.WALChannelBuffer
+	}
+	if ec.WALCleanupCheckIntervalMS > 0 {
+		cfg.CleanupInterval = time.Duration(ec.WALCleanupCheckIntervalMS) * time.Millisecond
+	}
+	return cfg
+}
+
+// SegmentConfigFromEngine creates a SegmentConfig from EngineConfig, falling back to defaults
+func SegmentConfigFromEngine(ec interfaces.EngineConfig) SegmentConfig {
+	cfg := DefaultSegmentConfig()
+	if ec.SegmentSize > 0 {
+		cfg.SegmentSize = ec.SegmentSize
+	}
+	if ec.CompactionThreshold > 0 {
+		cfg.CompactionThreshold = ec.CompactionThreshold
+	}
+	if ec.CompactionIntervalMS > 0 {
+		cfg.CompactionInterval = time.Duration(ec.CompactionIntervalMS) * time.Millisecond
+	}
+	if ec.SegmentCheckpointIntervalMS > 0 {
+		cfg.CheckpointInterval = time.Duration(ec.SegmentCheckpointIntervalMS) * time.Millisecond
+	}
+	return cfg
+}
+
+// NewDisruptorStorageWithEngineConfig creates storage with full engine config support
+func NewDisruptorStorageWithEngineConfig(dataDir string, checkpointInterval time.Duration, engineCfg interfaces.EngineConfig) *DisruptorStorage {
 	// Create JSON metadata store
 	metadataStore, err := NewPersistentMetadataStore(dataDir)
 	if err != nil {
@@ -133,15 +177,19 @@ func NewDisruptorStorageWithCheckpointInterval(dataDir string, checkpointInterva
 		offsetStore = nil
 	}
 
+	// Map engine config to storage-specific configs
+	walCfg := WALConfigFromEngine(engineCfg)
+	segCfg := SegmentConfigFromEngine(engineCfg)
+
 	// Create WAL Manager (Phase 6A)
-	walManager, err := NewWALManager(dataDir)
+	walManager, err := NewWALManagerWithConfig(dataDir, walCfg)
 	if err != nil {
 		// In production, this should be a fatal error
 		walManager = nil
 	}
 
 	// Create Segment Manager (Phase 6B)
-	segmentManager, err := NewSegmentManager(dataDir)
+	segmentManager, err := NewSegmentManagerWithConfig(dataDir, segCfg)
 	if err != nil {
 		// In production, this should be a fatal error
 		segmentManager = nil

@@ -193,11 +193,12 @@ func (b *ServerBuilder) Build() (*Server, error) {
 	if b.storage != nil {
 		storageImpl = b.storage
 	} else {
-		// Create new disruptor storage with configurable checkpoint interval (Phase 4)
+		// Create new disruptor storage with configurable checkpoint interval and engine config
 		checkpointInterval := time.Duration(b.config.Storage.CheckpointIntervalMS) * time.Millisecond
-		storageImpl = storage.NewDisruptorStorageWithCheckpointInterval(
+		storageImpl = storage.NewDisruptorStorageWithEngineConfig(
 			b.config.Storage.Path,
 			checkpointInterval,
+			b.config.GetEngine(),
 		)
 		if checkpointInterval == 0 {
 			logger.Info("Using disruptor-based storage with offset checkpointing disabled")

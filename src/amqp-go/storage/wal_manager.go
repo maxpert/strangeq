@@ -27,6 +27,28 @@ const (
 	// Note: Header is variable-length (depends on queue name, exchange, and routing key lengths)
 )
 
+// WALConfig holds configurable parameters for the WAL manager
+type WALConfig struct {
+	BatchSize       int
+	BatchTimeout    time.Duration
+	FileSize        int64
+	ChannelBuffer   int
+	CleanupInterval time.Duration
+	RetentionPeriod time.Duration // for time-based retention (commit 5)
+}
+
+// DefaultWALConfig returns a WALConfig with production defaults
+func DefaultWALConfig() WALConfig {
+	return WALConfig{
+		BatchSize:       DefaultWALBatchSize,
+		BatchTimeout:    DefaultWALBatchTimeout,
+		FileSize:        DefaultWALFileSize,
+		ChannelBuffer:   10000,
+		CleanupInterval: 5 * time.Second,
+		RetentionPeriod: 0, // disabled by default
+	}
+}
+
 // WALMetrics interface for metrics collection
 type WALMetrics interface {
 	UpdateWALSize(bytes float64)
@@ -45,6 +67,7 @@ type WALManager struct {
 	sharedWAL *QueueWAL // Single WAL for all queues
 	mu        sync.Mutex
 	metrics   WALMetrics
+	cfg       WALConfig
 }
 
 // QueueWAL manages a SHARED Write-Ahead Log with lock-free write path
@@ -52,6 +75,7 @@ type WALManager struct {
 type QueueWAL struct {
 	name    string // "shared" for the single shared WAL
 	dataDir string
+	cfg     WALConfig
 
 	// Lock-free write path
 	writeChan chan *writeRequest // Buffered channel for lock-free writes
@@ -113,8 +137,13 @@ type walFileInfo struct {
 	offsets *roaring64.Bitmap // actual message offsets in this file
 }
 
-// NewWALManager creates a new WAL manager with shared WAL
+// NewWALManager creates a new WAL manager with shared WAL using default config
 func NewWALManager(dataDir string) (*WALManager, error) {
+	return NewWALManagerWithConfig(dataDir, DefaultWALConfig())
+}
+
+// NewWALManagerWithConfig creates a new WAL manager with custom config
+func NewWALManagerWithConfig(dataDir string, cfg WALConfig) (*WALManager, error) {
 	walDir := filepath.Join(dataDir, "wal")
 	if err := os.MkdirAll(walDir, 0755); err != nil {
 		return nil, fmt.Errorf("failed to create WAL directory: %w", err)
@@ -122,6 +151,7 @@ func NewWALManager(dataDir string) (*WALManager, error) {
 
 	wm := &WALManager{
 		dataDir: walDir,
+		cfg:     cfg,
 	}
 
 	// Create the single shared WAL for all queues
@@ -415,8 +445,9 @@ func (wm *WALManager) createSharedWAL() (*QueueWAL, error) {
 	wal := &QueueWAL{
 		name:               "shared",
 		dataDir:            sharedDir,
-		writeChan:          make(chan *writeRequest, 10000), // Large buffer for high throughput
-		ackChan:            make(chan *ackRequest, 10000),   // Now holds queue+offset
+		cfg:                wm.cfg,
+		writeChan:          make(chan *writeRequest, wm.cfg.ChannelBuffer),
+		ackChan:            make(chan *ackRequest, wm.cfg.ChannelBuffer),
 		ackBitmap:          roaring64.New(),
 		currentFileOffsets: roaring64.New(),
 		oldFiles:           make(map[uint64]*walFileInfo),
@@ -442,15 +473,15 @@ func (wm *WALManager) createSharedWAL() (*QueueWAL, error) {
 func (qw *QueueWAL) batchWriterLoop() {
 	defer qw.wg.Done()
 
-	batch := make([]*writeRequest, 0, DefaultWALBatchSize)
-	ticker := time.NewTicker(DefaultWALBatchTimeout)
+	batch := make([]*writeRequest, 0, qw.cfg.BatchSize)
+	ticker := time.NewTicker(qw.cfg.BatchTimeout)
 	defer ticker.Stop()
 
 	for {
 		select {
 		case req := <-qw.writeChan:
 			batch = append(batch, req)
-			if len(batch) >= DefaultWALBatchSize {
+			if len(batch) >= qw.cfg.BatchSize {
 				qw.flushBatch(batch)
 				batch = batch[:0]
 			}
@@ -566,7 +597,7 @@ func (qw *QueueWAL) flushBatch(batch []*writeRequest) {
 	newOffset := qw.fileOffset.Add(int64(n))
 
 	// Check if we need to roll to new file
-	if newOffset >= DefaultWALFileSize {
+	if newOffset >= qw.cfg.FileSize {
 		qw.rollFile()
 	}
 }
@@ -669,7 +700,7 @@ func (qw *QueueWAL) openNextFile() error {
 func (qw *QueueWAL) cleanupLoop() {
 	defer qw.wg.Done()
 
-	ticker := time.NewTicker(5 * time.Second)
+	ticker := time.NewTicker(qw.cfg.CleanupInterval)
 	defer ticker.Stop()
 
 	for {
