@@ -30,7 +30,12 @@ Create a Go package `github.com/maxpert/amqp-go` that implements an AMQP 0.9.1 s
   - Fixed `sealSegment()` to reopen file as read-only for sealed-segment ReadAt support
   - Fixed pre-existing CRC verification bug in `readSegmentMessageAt()` — was verifying CRC over wrong data slice
   - 4 new tests: deletedCount increment, compaction triggers, compaction preserves unacked, regression test
-- ⬜ **Commit 4: Implement WAL → Segment checkpointing**
+- ✅ **Commit 4: Implement WAL → Segment checkpointing**
+  - Implemented `performCheckpoint()`: scans old WAL files, filters out ACKed messages, writes unACKed to segments, deletes WAL file, cleans offset index
+  - Added `CheckpointBatch()` on SegmentManager for bulk message writes during checkpoint
+  - Only operates on old/rolled files — never touches the active WAL file
+  - Updated `checkpointLoop` to use configurable interval from SegmentConfig
+  - 5 new tests: moves to segments, deletes old files, skips ACKed, active file untouched, offset index cleanup
 - ⬜ **Commit 5: Add time-based WAL retention**
 - ⬜ **Commit 6: Integration test and plan update**
 

@@ -1074,7 +1074,12 @@ func (qw *QueueWAL) readMessageFromFile(queueName string, filePath string, offse
 func (qw *QueueWAL) checkpointLoop() {
 	defer qw.wg.Done()
 
-	ticker := time.NewTicker(5 * time.Minute)
+	// Use checkpoint interval from segment config if available, default to 5 minutes
+	interval := 5 * time.Minute
+	if qw.segmentMgr != nil {
+		interval = qw.segmentMgr.cfg.CheckpointInterval
+	}
+	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
 	for {
@@ -1090,17 +1095,76 @@ func (qw *QueueWAL) checkpointLoop() {
 	}
 }
 
-// performCheckpoint moves messages from old WAL files to segments
-// TODO(Phase 5): Reimplement checkpointing for shared WAL format
-// The old per-queue checkpointing code has been removed because it used
-// the old WAL format. Phase 5 will implement proper WAL compaction that:
-// 1. Scans shared WAL files using the new format (with queue names)
-// 2. Removes fully-ACKed messages
-// 3. Compacts remaining messages into new WAL files
+// performCheckpoint moves messages from old WAL files to segments.
+// Only operates on old/rolled files — never touches the current active file.
+// For each old file: scan messages, filter out ACKed ones, write unACKed
+// messages to segments, then delete the WAL file and clean up the offset index.
 func (qw *QueueWAL) performCheckpoint() {
-	// Disabled for now - will be reimplemented in Phase 5
-	// Current implementation only deletes fully-ACKed WAL files via tryDeleteOldFiles()
-	return
+	if qw.segmentMgr == nil {
+		return
+	}
+
+	// Snapshot old files to avoid holding the lock during I/O
+	qw.oldFilesMutex.RLock()
+	filesToCheckpoint := make(map[uint64]*walFileInfo, len(qw.oldFiles))
+	for num, info := range qw.oldFiles {
+		filesToCheckpoint[num] = info
+	}
+	qw.oldFilesMutex.RUnlock()
+
+	if len(filesToCheckpoint) == 0 {
+		return
+	}
+
+	for fileNum, info := range filesToCheckpoint {
+		// Scan the WAL file
+		messages, err := qw.scanWALFile(info.path)
+		if err != nil {
+			continue
+		}
+
+		// Group unACKed messages by queue
+		byQueue := make(map[string][]*RecoveryMessage)
+		qw.bitmapMutex.RLock()
+		for _, msg := range messages {
+			if !qw.ackBitmap.Contains(msg.Offset) {
+				byQueue[msg.QueueName] = append(byQueue[msg.QueueName], msg)
+			}
+		}
+		qw.bitmapMutex.RUnlock()
+
+		// Write unACKed messages to segments
+		checkpointOK := true
+		for queueName, queueMsgs := range byQueue {
+			if err := qw.segmentMgr.CheckpointBatch(queueName, queueMsgs); err != nil {
+				checkpointOK = false
+				break
+			}
+		}
+
+		if !checkpointOK {
+			continue
+		}
+
+		// Checkpoint succeeded — delete WAL file and clean up
+		_ = os.Remove(info.path)
+
+		// Remove from oldFiles map
+		qw.oldFilesMutex.Lock()
+		delete(qw.oldFiles, fileNum)
+		qw.oldFilesMutex.Unlock()
+
+		// Clean up offset index entries for this file's offsets
+		if info.offsets != nil {
+			qw.offsetIndexMutex.Lock()
+			it := info.offsets.Iterator()
+			for it.HasNext() {
+				offset := it.Next()
+				delete(qw.offsetIndex, offset)
+			}
+			qw.offsetIndexMutex.Unlock()
+		}
+	}
 }
 
 // close stops background goroutines and closes files

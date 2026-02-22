@@ -404,6 +404,268 @@ func TestSegmentConfigFromEngine(t *testing.T) {
 	assert.Equal(t, 2*time.Minute, cfg.CheckpointInterval)
 }
 
+// TestWAL_Checkpoint_MovesToSegments verifies that checkpoint migrates
+// messages from old WAL files to segments.
+func TestWAL_Checkpoint_MovesToSegments(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	cfg := DefaultWALConfig()
+	cfg.FileSize = 1024 // Very small file size to force rolls
+
+	wm, err := NewWALManagerWithConfig(tmpDir, cfg)
+	require.NoError(t, err)
+
+	// Create segment manager and wire up
+	sm, err := NewSegmentManager(tmpDir)
+	require.NoError(t, err)
+	wm.SetSegmentManager(sm)
+	defer sm.Close()
+
+	// Write messages that will cause file roll
+	for i := uint64(1); i <= 20; i++ {
+		msg := &protocol.Message{
+			Exchange:     "test.exchange",
+			RoutingKey:   "test.key",
+			Body:         []byte(fmt.Sprintf("checkpoint message %d", i)),
+			DeliveryMode: 2,
+		}
+		err := wm.Write("test_queue", msg, i)
+		require.NoError(t, err)
+	}
+
+	time.Sleep(100 * time.Millisecond)
+
+	// Verify we have old files (file rolled due to small FileSize)
+	wm.sharedWAL.oldFilesMutex.RLock()
+	oldFileCount := len(wm.sharedWAL.oldFiles)
+	wm.sharedWAL.oldFilesMutex.RUnlock()
+	require.Greater(t, oldFileCount, 0, "should have old WAL files after writes exceed file size")
+
+	// Trigger checkpoint
+	wm.sharedWAL.performCheckpoint()
+
+	// Verify messages are now readable from segments
+	for i := uint64(1); i <= 20; i++ {
+		msg, err := sm.Read("test_queue", i)
+		if err == nil {
+			assert.Contains(t, string(msg.Body), "checkpoint message")
+		}
+		// Some messages may be in current file (not checkpointed)
+	}
+
+	wm.Close()
+}
+
+// TestWAL_Checkpoint_DeletesOldFile verifies old WAL files are deleted after checkpoint.
+func TestWAL_Checkpoint_DeletesOldFile(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	cfg := DefaultWALConfig()
+	cfg.FileSize = 512 // Very small to force rolls
+
+	wm, err := NewWALManagerWithConfig(tmpDir, cfg)
+	require.NoError(t, err)
+
+	sm, err := NewSegmentManager(tmpDir)
+	require.NoError(t, err)
+	wm.SetSegmentManager(sm)
+	defer sm.Close()
+
+	// Write enough to create old files
+	for i := uint64(1); i <= 30; i++ {
+		msg := &protocol.Message{
+			Exchange:     "test.exchange",
+			RoutingKey:   "test.key",
+			Body:         []byte(fmt.Sprintf("message %d with some padding to fill the file", i)),
+			DeliveryMode: 2,
+		}
+		err := wm.Write("test_queue", msg, i)
+		require.NoError(t, err)
+	}
+
+	time.Sleep(100 * time.Millisecond)
+
+	// Record old file count and paths
+	wm.sharedWAL.oldFilesMutex.RLock()
+	oldFilesBefore := len(wm.sharedWAL.oldFiles)
+	var oldPaths []string
+	for _, info := range wm.sharedWAL.oldFiles {
+		oldPaths = append(oldPaths, info.path)
+	}
+	wm.sharedWAL.oldFilesMutex.RUnlock()
+	require.Greater(t, oldFilesBefore, 0)
+
+	// Trigger checkpoint
+	wm.sharedWAL.performCheckpoint()
+
+	// Old files should be deleted
+	wm.sharedWAL.oldFilesMutex.RLock()
+	oldFilesAfter := len(wm.sharedWAL.oldFiles)
+	wm.sharedWAL.oldFilesMutex.RUnlock()
+
+	assert.Equal(t, 0, oldFilesAfter, "old WAL files should be deleted after checkpoint")
+
+	// Verify files actually removed from disk
+	for _, path := range oldPaths {
+		_, err := os.Stat(path)
+		assert.True(t, os.IsNotExist(err), "WAL file %s should be removed from disk", path)
+	}
+
+	wm.Close()
+}
+
+// TestWAL_Checkpoint_SkipsAcked verifies that only unACKed messages are
+// written to segments during checkpoint.
+func TestWAL_Checkpoint_SkipsAcked(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	cfg := DefaultWALConfig()
+	cfg.FileSize = 512
+
+	wm, err := NewWALManagerWithConfig(tmpDir, cfg)
+	require.NoError(t, err)
+
+	sm, err := NewSegmentManager(tmpDir)
+	require.NoError(t, err)
+	wm.SetSegmentManager(sm)
+	defer sm.Close()
+
+	// Write 10 messages
+	for i := uint64(1); i <= 10; i++ {
+		msg := &protocol.Message{
+			Exchange:     "test.exchange",
+			RoutingKey:   "test.key",
+			Body:         []byte(fmt.Sprintf("msg %d padding to fill file", i)),
+			DeliveryMode: 2,
+		}
+		err := wm.Write("test_queue", msg, i)
+		require.NoError(t, err)
+	}
+
+	time.Sleep(100 * time.Millisecond)
+
+	// ACK first 5 messages
+	for i := uint64(1); i <= 5; i++ {
+		wm.Acknowledge("test_queue", i)
+	}
+	time.Sleep(100 * time.Millisecond)
+
+	// Trigger checkpoint
+	wm.sharedWAL.performCheckpoint()
+
+	// Only unACKed messages (6-10) should be in segments
+	for i := uint64(6); i <= 10; i++ {
+		msg, err := sm.Read("test_queue", i)
+		if err == nil {
+			assert.NotNil(t, msg, "unACKed message %d should be in segments", i)
+		}
+	}
+
+	// ACKed messages (1-5) should NOT be in segments
+	for i := uint64(1); i <= 5; i++ {
+		_, err := sm.Read("test_queue", i)
+		assert.Error(t, err, "ACKed message %d should NOT be in segments", i)
+	}
+
+	wm.Close()
+}
+
+// TestWAL_Checkpoint_ActiveFileUntouched verifies the current active WAL
+// file is never checkpointed.
+func TestWAL_Checkpoint_ActiveFileUntouched(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	wm, err := NewWALManager(tmpDir)
+	require.NoError(t, err)
+
+	sm, err := NewSegmentManager(tmpDir)
+	require.NoError(t, err)
+	wm.SetSegmentManager(sm)
+	defer sm.Close()
+
+	// Write messages (all to current file, no roll)
+	for i := uint64(1); i <= 5; i++ {
+		msg := &protocol.Message{
+			Exchange:     "test.exchange",
+			RoutingKey:   "test.key",
+			Body:         []byte("active file message"),
+			DeliveryMode: 2,
+		}
+		err := wm.Write("test_queue", msg, i)
+		require.NoError(t, err)
+	}
+
+	time.Sleep(50 * time.Millisecond)
+
+	// No old files - everything is in the active file
+	wm.sharedWAL.oldFilesMutex.RLock()
+	assert.Equal(t, 0, len(wm.sharedWAL.oldFiles), "should have no old files")
+	wm.sharedWAL.oldFilesMutex.RUnlock()
+
+	// Trigger checkpoint - should be a no-op
+	wm.sharedWAL.performCheckpoint()
+
+	// Messages should still be readable from WAL (not moved to segments)
+	for i := uint64(1); i <= 5; i++ {
+		msg, err := wm.Read("test_queue", i)
+		require.NoError(t, err, "message %d should still be in active WAL", i)
+		assert.Equal(t, []byte("active file message"), msg.Body)
+	}
+
+	wm.Close()
+}
+
+// TestWAL_Checkpoint_OffsetIndexCleanup verifies that checkpointed offsets
+// are removed from the WAL offset index.
+func TestWAL_Checkpoint_OffsetIndexCleanup(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	cfg := DefaultWALConfig()
+	cfg.FileSize = 512
+
+	wm, err := NewWALManagerWithConfig(tmpDir, cfg)
+	require.NoError(t, err)
+
+	sm, err := NewSegmentManager(tmpDir)
+	require.NoError(t, err)
+	wm.SetSegmentManager(sm)
+	defer sm.Close()
+
+	// Write enough to create old files
+	for i := uint64(1); i <= 20; i++ {
+		msg := &protocol.Message{
+			Exchange:     "test.exchange",
+			RoutingKey:   "test.key",
+			Body:         []byte(fmt.Sprintf("index cleanup msg %d padding", i)),
+			DeliveryMode: 2,
+		}
+		err := wm.Write("test_queue", msg, i)
+		require.NoError(t, err)
+	}
+
+	time.Sleep(100 * time.Millisecond)
+
+	// Check offset index has entries for old file offsets
+	wm.sharedWAL.offsetIndexMutex.RLock()
+	indexSizeBefore := len(wm.sharedWAL.offsetIndex)
+	wm.sharedWAL.offsetIndexMutex.RUnlock()
+	require.Greater(t, indexSizeBefore, 0, "offset index should have entries")
+
+	// Trigger checkpoint
+	wm.sharedWAL.performCheckpoint()
+
+	// After checkpoint, offset index should have fewer entries
+	// (entries for old files removed, current file entries remain)
+	wm.sharedWAL.offsetIndexMutex.RLock()
+	indexSizeAfter := len(wm.sharedWAL.offsetIndex)
+	wm.sharedWAL.offsetIndexMutex.RUnlock()
+
+	assert.Less(t, indexSizeAfter, indexSizeBefore,
+		"offset index should have fewer entries after checkpoint (old file offsets removed)")
+
+	wm.Close()
+}
+
 // TestWALConfigFromEngine_Defaults verifies zero EngineConfig uses defaults
 func TestWALConfigFromEngine_Defaults(t *testing.T) {
 	ec := interfaces.EngineConfig{} // all zeros

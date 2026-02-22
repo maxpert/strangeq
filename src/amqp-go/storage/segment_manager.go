@@ -219,6 +219,21 @@ func (qs *QueueSegments) acknowledgeInSegment(offset uint64) {
 	}
 }
 
+// CheckpointBatch writes a batch of recovery messages to segments for a given queue.
+// Used during WAL checkpoint to migrate messages from WAL to cold storage.
+func (sm *SegmentManager) CheckpointBatch(queueName string, messages []*RecoveryMessage) error {
+	if len(messages) == 0 {
+		return nil
+	}
+	segments := sm.getOrCreateQueueSegments(queueName)
+	for _, rm := range messages {
+		if err := segments.writeMessage(rm.Message, rm.Offset); err != nil {
+			return fmt.Errorf("checkpoint write failed for offset %d: %w", rm.Offset, err)
+		}
+	}
+	return nil
+}
+
 // Close closes all segments
 func (sm *SegmentManager) Close() error {
 	sm.queueSegments.Range(func(key, value interface{}) bool {
