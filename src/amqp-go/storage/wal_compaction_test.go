@@ -856,6 +856,43 @@ func TestWAL_Retention_DisabledWhenZero(t *testing.T) {
 	assert.Equal(t, oldCount, remaining, "files should not be deleted with retention disabled")
 }
 
+// TestWAL_SequentialScan_CorrectBody verifies that the sequential scan fallback
+// (used when an offset is not in the index) returns the correct body bytes.
+// Regression test for the readMessageFromFile missing bodyLen parse bug.
+func TestWAL_SequentialScan_CorrectBody(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	wm, err := NewWALManager(tmpDir)
+	require.NoError(t, err)
+	defer wm.Close()
+
+	expectedBody := []byte("exact body content — no extra bytes")
+
+	msg := &protocol.Message{
+		Exchange:     "test",
+		RoutingKey:   "key",
+		Body:         expectedBody,
+		DeliveryMode: 2,
+		DeliveryTag:  999,
+	}
+	err = wm.Write("test_queue", msg, 999)
+	require.NoError(t, err)
+
+	// Wait for flush so offset index is populated
+	time.Sleep(50 * time.Millisecond)
+
+	// Remove the offset from the index to force sequential scan path
+	wm.sharedWAL.offsetIndexMutex.Lock()
+	delete(wm.sharedWAL.offsetIndex, 999)
+	wm.sharedWAL.offsetIndexMutex.Unlock()
+
+	// Read via WAL — must fall through to sequential scan (readMessageFromFile)
+	readMsg, err := wm.Read("test_queue", 999)
+	require.NoError(t, err, "sequential scan should find the message")
+	assert.Equal(t, expectedBody, readMsg.Body,
+		"body from sequential scan must exactly match written body (no bodyLen prefix bytes)")
+}
+
 // TestWALConfigFromEngine_Defaults verifies zero EngineConfig uses defaults
 func TestWALConfigFromEngine_Defaults(t *testing.T) {
 	ec := interfaces.EngineConfig{} // all zeros

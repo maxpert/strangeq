@@ -321,10 +321,12 @@ func (qs *QueueSegments) writeMessage(message *protocol.Message, offset uint64) 
 		qs.currentSegment.maxOffset = offset
 	}
 
-	// Check if we need to roll to new segment
+	// Check if we need to roll to new segment.
+	// openNextSegmentLocked is called instead of openNextSegment because we
+	// already hold qs.mutex here — openNextSegment would deadlock.
 	if qs.currentSegment.fileSize.Load() >= qs.cfg.SegmentSize {
 		qs.sealSegment()
-		_ = qs.openNextSegment()
+		_ = qs.openNextSegmentLocked()
 	}
 
 	return nil
@@ -415,11 +417,17 @@ func (qs *QueueSegments) sealSegment() {
 	qs.writeIndexToDisk(qs.currentSegment.segmentNum, qs.currentIndex)
 }
 
-// openNextSegment creates and opens the next segment file
+// openNextSegment creates and opens the next segment file (acquires qs.mutex).
+// Use openNextSegmentLocked when the caller already holds qs.mutex.
 func (qs *QueueSegments) openNextSegment() error {
 	qs.mutex.Lock()
 	defer qs.mutex.Unlock()
+	return qs.openNextSegmentLocked()
+}
 
+// openNextSegmentLocked creates and opens the next segment file.
+// Precondition: caller must hold qs.mutex.
+func (qs *QueueSegments) openNextSegmentLocked() error {
 	segmentNum := uint64(time.Now().UnixNano())
 	filename := filepath.Join(qs.dataDir, fmt.Sprintf("%020d%s", segmentNum, SegmentFileExtension))
 
@@ -591,12 +599,18 @@ func (qs *QueueSegments) writeIndexToDisk(segmentNum uint64, index *SegmentIndex
 
 	// Write number of entries
 	numEntries := uint64(len(index.entries))
-	binary.Write(file, binary.BigEndian, numEntries)
+	if err := binary.Write(file, binary.BigEndian, numEntries); err != nil {
+		return fmt.Errorf("failed to write index entry count: %w", err)
+	}
 
 	// Write each entry: [8 bytes offset][8 bytes position]
 	for offset, position := range index.entries {
-		binary.Write(file, binary.BigEndian, offset)
-		binary.Write(file, binary.BigEndian, uint64(position))
+		if err := binary.Write(file, binary.BigEndian, offset); err != nil {
+			return fmt.Errorf("failed to write index offset: %w", err)
+		}
+		if err := binary.Write(file, binary.BigEndian, uint64(position)); err != nil {
+			return fmt.Errorf("failed to write index position: %w", err)
+		}
 	}
 
 	return file.Sync()

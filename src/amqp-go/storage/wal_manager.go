@@ -29,23 +29,25 @@ const (
 
 // WALConfig holds configurable parameters for the WAL manager
 type WALConfig struct {
-	BatchSize       int
-	BatchTimeout    time.Duration
-	FileSize        int64
-	ChannelBuffer   int
-	CleanupInterval time.Duration
-	RetentionPeriod time.Duration // for time-based retention (commit 5)
+	BatchSize          int
+	BatchTimeout       time.Duration
+	FileSize           int64
+	ChannelBuffer      int
+	CleanupInterval    time.Duration
+	RetentionPeriod    time.Duration // for time-based retention
+	CheckpointInterval time.Duration // how often WAL checkpoints old files to segments
 }
 
 // DefaultWALConfig returns a WALConfig with production defaults
 func DefaultWALConfig() WALConfig {
 	return WALConfig{
-		BatchSize:       DefaultWALBatchSize,
-		BatchTimeout:    DefaultWALBatchTimeout,
-		FileSize:        DefaultWALFileSize,
-		ChannelBuffer:   10000,
-		CleanupInterval: 5 * time.Second,
-		RetentionPeriod: 0, // disabled by default
+		BatchSize:          DefaultWALBatchSize,
+		BatchTimeout:       DefaultWALBatchTimeout,
+		FileSize:           DefaultWALFileSize,
+		ChannelBuffer:      10000,
+		CleanupInterval:    5 * time.Second,
+		RetentionPeriod:    0, // disabled by default
+		CheckpointInterval: 5 * time.Minute,
 	}
 }
 
@@ -1106,8 +1108,17 @@ func (qw *QueueWAL) readMessageFromFile(queueName string, filePath string, offse
 			deliveryMode := data[pos]
 			pos += 1
 
-			// Rest is body
-			body := data[pos:]
+			// Read body length then body (matches serializeMessage format)
+			if pos+4 > len(data) {
+				return nil, fmt.Errorf("data too short for body length")
+			}
+			bodyLen := binary.BigEndian.Uint32(data[pos : pos+4])
+			pos += 4
+
+			if pos+int(bodyLen) > len(data) {
+				return nil, fmt.Errorf("data too short for body")
+			}
+			body := data[pos : pos+int(bodyLen)]
 
 			return &protocol.Message{
 				Exchange:     exchange,
@@ -1125,12 +1136,9 @@ func (qw *QueueWAL) readMessageFromFile(queueName string, filePath string, offse
 func (qw *QueueWAL) checkpointLoop() {
 	defer qw.wg.Done()
 
-	// Use checkpoint interval from segment config if available, default to 5 minutes
-	interval := 5 * time.Minute
-	if segMgr := qw.getSegmentMgr(); segMgr != nil {
-		interval = segMgr.cfg.CheckpointInterval
-	}
-	ticker := time.NewTicker(interval)
+	// Use CheckpointInterval from WALConfig directly — avoids a race where
+	// segmentMgr is nil at goroutine start (it's set later via SetSegmentManager).
+	ticker := time.NewTicker(qw.cfg.CheckpointInterval)
 	defer ticker.Stop()
 
 	for {

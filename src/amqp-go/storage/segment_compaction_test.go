@@ -170,6 +170,45 @@ func TestSegment_CompactionPreservesUnacked(t *testing.T) {
 	}
 }
 
+// TestSegment_RolloverDuringWrite verifies that writing enough messages to
+// exceed SegmentSize triggers an automatic segment rollover without deadlock.
+// Regression test for the writeMessage→openNextSegment mutex deadlock.
+func TestSegment_RolloverDuringWrite(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	cfg := DefaultSegmentConfig()
+	cfg.SegmentSize = 32 // Tiny: forces rollover after 2 messages (each ~17 bytes)
+
+	sm, err := NewSegmentManagerWithConfig(tmpDir, cfg)
+	require.NoError(t, err)
+	defer sm.Close()
+
+	done := make(chan error, 1)
+	go func() {
+		for i := uint64(1); i <= 10; i++ {
+			msg := &protocol.Message{Body: []byte("x")}
+			if err := sm.Write("rollover_queue", msg, i); err != nil {
+				done <- err
+				return
+			}
+		}
+		done <- nil
+	}()
+
+	select {
+	case err := <-done:
+		require.NoError(t, err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("deadlock detected: writes timed out during segment rollover")
+	}
+
+	// All messages should be readable after rollover
+	for i := uint64(1); i <= 10; i++ {
+		_, err := sm.Read("rollover_queue", i)
+		assert.NoError(t, err, "message %d should be readable after rollover", i)
+	}
+}
+
 // TestSegment_DeletedCountNotIncrementedWithoutFix is a regression test
 // verifying that the fix correctly increments deletedCount. Before the fix,
 // deletedCount was always 0.

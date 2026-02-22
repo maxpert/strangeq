@@ -4,7 +4,14 @@
 Create a Go package `github.com/maxpert/amqp-go` that implements an AMQP 0.9.1 server based on the specification: https://www.rabbitmq.com/resources/specs/amqp0-9-1.extended.xml
 
 ## Current Status (Updated: 2026-02-22)
-**Phase 14 - Log Compaction: COMPLETE** ✅
+**Phase 14 - Log Compaction + Bug Fixes: COMPLETE** ✅
+
+### Phase 14 - Post-Review Bug Fixes (Code Review Pass):
+- ✅ **Fix: `readMessageFromFile` body deserialization** — Sequential scan path (WAL fallback when offset not in index) incorrectly returned body bytes including the 4-byte bodyLen prefix. Fixed by reading `bodyLen` field before slicing body, matching `serializeMessage` format. Test: `TestWAL_SequentialScan_CorrectBody`
+- ✅ **Fix: `openNextSegment` deadlock** — `writeMessage` held `qs.mutex` while calling `openNextSegment`, which also tried to acquire `qs.mutex` — a non-reentrant deadlock. Split into `openNextSegment()` (acquires mutex) and `openNextSegmentLocked()` (precondition: caller holds mutex). `writeMessage` now calls `openNextSegmentLocked()`. Test: `TestSegment_RolloverDuringWrite`
+- ✅ **Fix: `writeIndexToDisk` ignores write errors** — All `binary.Write` calls now check error return values and propagate failures, preventing silent index corruption on disk-full or I/O errors
+- ✅ **Fix: `checkpointLoop` interval race** — Goroutine started before `SetSegmentManager()` was called, causing it to read `segmentMgr == nil` and always use the 5-minute default. Added `CheckpointInterval` to `WALConfig` (mapped from `EngineConfig.SegmentCheckpointIntervalMS`); `checkpointLoop` now uses `qw.cfg.CheckpointInterval` directly, removing the dependency on segmentMgr at goroutine start
+- **58 tests pass**, 0 data races (verified with `-race`)
 
 ### Phase 14 - Log Compaction (Storage Reliability):
 - ✅ **Commit 1: Fix roaring64 bitmap and WAL offset tracking bug**
