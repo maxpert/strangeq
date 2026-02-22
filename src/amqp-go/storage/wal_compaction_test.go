@@ -666,6 +666,196 @@ func TestWAL_Checkpoint_OffsetIndexCleanup(t *testing.T) {
 	wm.Close()
 }
 
+// TestWAL_Retention_DeletesExpiredFile verifies that files older than
+// the retention period are deleted.
+func TestWAL_Retention_DeletesExpiredFile(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	cfg := DefaultWALConfig()
+	cfg.FileSize = 512                           // Small files
+	cfg.RetentionPeriod = 100 * time.Millisecond // Very short retention
+
+	wm, err := NewWALManagerWithConfig(tmpDir, cfg)
+	require.NoError(t, err)
+	defer wm.Close()
+
+	// Write enough to roll files
+	for i := uint64(1); i <= 20; i++ {
+		msg := &protocol.Message{
+			Exchange:     "test.exchange",
+			RoutingKey:   "test.key",
+			Body:         []byte(fmt.Sprintf("retention test msg %d with padding", i)),
+			DeliveryMode: 2,
+		}
+		err := wm.Write("test_queue", msg, i)
+		require.NoError(t, err)
+	}
+
+	time.Sleep(50 * time.Millisecond)
+
+	// Verify old files exist
+	wm.sharedWAL.oldFilesMutex.RLock()
+	require.Greater(t, len(wm.sharedWAL.oldFiles), 0)
+	wm.sharedWAL.oldFilesMutex.RUnlock()
+
+	// Wait for retention period to expire
+	time.Sleep(200 * time.Millisecond)
+
+	// Trigger cleanup — expired files should be deleted
+	wm.sharedWAL.tryDeleteOldFiles()
+
+	wm.sharedWAL.oldFilesMutex.RLock()
+	remaining := len(wm.sharedWAL.oldFiles)
+	wm.sharedWAL.oldFilesMutex.RUnlock()
+
+	assert.Equal(t, 0, remaining, "expired files should be deleted by retention")
+}
+
+// TestWAL_Retention_PreservesRecentFile verifies that recent files are NOT
+// deleted even if they have unACKed messages.
+func TestWAL_Retention_PreservesRecentFile(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	cfg := DefaultWALConfig()
+	cfg.FileSize = 512
+	cfg.RetentionPeriod = 10 * time.Second // Long retention
+
+	wm, err := NewWALManagerWithConfig(tmpDir, cfg)
+	require.NoError(t, err)
+	defer wm.Close()
+
+	// Write enough to roll files
+	for i := uint64(1); i <= 20; i++ {
+		msg := &protocol.Message{
+			Exchange:     "test.exchange",
+			RoutingKey:   "test.key",
+			Body:         []byte(fmt.Sprintf("recent file msg %d with padding", i)),
+			DeliveryMode: 2,
+		}
+		err := wm.Write("test_queue", msg, i)
+		require.NoError(t, err)
+	}
+
+	time.Sleep(50 * time.Millisecond)
+
+	wm.sharedWAL.oldFilesMutex.RLock()
+	oldCount := len(wm.sharedWAL.oldFiles)
+	wm.sharedWAL.oldFilesMutex.RUnlock()
+	require.Greater(t, oldCount, 0)
+
+	// Trigger cleanup — recent files should NOT be deleted
+	wm.sharedWAL.tryDeleteOldFiles()
+
+	wm.sharedWAL.oldFilesMutex.RLock()
+	remaining := len(wm.sharedWAL.oldFiles)
+	wm.sharedWAL.oldFilesMutex.RUnlock()
+
+	assert.Equal(t, oldCount, remaining, "recent files should NOT be deleted")
+}
+
+// TestWAL_Retention_CheckpointsBeforeDelete verifies that when a file expires
+// with unACKed messages, those messages are checkpointed to segments before deletion.
+func TestWAL_Retention_CheckpointsBeforeDelete(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	cfg := DefaultWALConfig()
+	cfg.FileSize = 512
+	cfg.RetentionPeriod = 100 * time.Millisecond
+
+	wm, err := NewWALManagerWithConfig(tmpDir, cfg)
+	require.NoError(t, err)
+
+	sm, err := NewSegmentManager(tmpDir)
+	require.NoError(t, err)
+	wm.SetSegmentManager(sm)
+	defer sm.Close()
+
+	// Write messages
+	for i := uint64(1); i <= 20; i++ {
+		msg := &protocol.Message{
+			Exchange:     "test.exchange",
+			RoutingKey:   "test.key",
+			Body:         []byte(fmt.Sprintf("force checkpoint msg %d pad", i)),
+			DeliveryMode: 2,
+		}
+		err := wm.Write("test_queue", msg, i)
+		require.NoError(t, err)
+	}
+
+	time.Sleep(50 * time.Millisecond)
+
+	// Do NOT ACK anything — all messages should be force-checkpointed
+
+	// Wait for retention to expire
+	time.Sleep(200 * time.Millisecond)
+
+	// Trigger cleanup
+	wm.sharedWAL.tryDeleteOldFiles()
+
+	// Old files should be deleted
+	wm.sharedWAL.oldFilesMutex.RLock()
+	remaining := len(wm.sharedWAL.oldFiles)
+	wm.sharedWAL.oldFilesMutex.RUnlock()
+	assert.Equal(t, 0, remaining, "expired files should be deleted")
+
+	// Messages should have been force-checkpointed to segments
+	checkpointedCount := 0
+	for i := uint64(1); i <= 20; i++ {
+		_, err := sm.Read("test_queue", i)
+		if err == nil {
+			checkpointedCount++
+		}
+	}
+	assert.Greater(t, checkpointedCount, 0,
+		"at least some messages should be force-checkpointed to segments before deletion")
+
+	wm.Close()
+}
+
+// TestWAL_Retention_DisabledWhenZero verifies that retention of 0 disables
+// time-based cleanup.
+func TestWAL_Retention_DisabledWhenZero(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	cfg := DefaultWALConfig()
+	cfg.FileSize = 512
+	cfg.RetentionPeriod = 0 // Disabled
+
+	wm, err := NewWALManagerWithConfig(tmpDir, cfg)
+	require.NoError(t, err)
+	defer wm.Close()
+
+	// Write enough to roll files
+	for i := uint64(1); i <= 20; i++ {
+		msg := &protocol.Message{
+			Exchange:     "test.exchange",
+			RoutingKey:   "test.key",
+			Body:         []byte(fmt.Sprintf("no retention msg %d with padding", i)),
+			DeliveryMode: 2,
+		}
+		err := wm.Write("test_queue", msg, i)
+		require.NoError(t, err)
+	}
+
+	time.Sleep(50 * time.Millisecond)
+
+	wm.sharedWAL.oldFilesMutex.RLock()
+	oldCount := len(wm.sharedWAL.oldFiles)
+	wm.sharedWAL.oldFilesMutex.RUnlock()
+	require.Greater(t, oldCount, 0)
+
+	// Wait a bit and trigger cleanup — without retention, only ACK-based cleanup
+	time.Sleep(100 * time.Millisecond)
+	wm.sharedWAL.tryDeleteOldFiles()
+
+	wm.sharedWAL.oldFilesMutex.RLock()
+	remaining := len(wm.sharedWAL.oldFiles)
+	wm.sharedWAL.oldFilesMutex.RUnlock()
+
+	// Files should still be there (nothing ACKed, no retention)
+	assert.Equal(t, oldCount, remaining, "files should not be deleted with retention disabled")
+}
+
 // TestWALConfigFromEngine_Defaults verifies zero EngineConfig uses defaults
 func TestWALConfigFromEngine_Defaults(t *testing.T) {
 	ec := interfaces.EngineConfig{} // all zeros

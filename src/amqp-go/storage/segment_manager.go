@@ -423,7 +423,7 @@ func (qs *QueueSegments) openNextSegment() error {
 	segmentNum := uint64(time.Now().UnixNano())
 	filename := filepath.Join(qs.dataDir, fmt.Sprintf("%020d%s", segmentNum, SegmentFileExtension))
 
-	file, err := os.OpenFile(filename, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+	file, err := os.OpenFile(filename, os.O_CREATE|os.O_RDWR|os.O_APPEND, 0644)
 	if err != nil {
 		return fmt.Errorf("failed to open segment file: %w", err)
 	}

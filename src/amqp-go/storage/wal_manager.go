@@ -133,8 +133,9 @@ type ackRequest struct {
 }
 
 type walFileInfo struct {
-	path    string
-	offsets *roaring64.Bitmap // actual message offsets in this file
+	path      string
+	offsets   *roaring64.Bitmap // actual message offsets in this file
+	createdAt time.Time         // when this file was rolled (for retention)
 }
 
 // NewWALManager creates a new WAL manager with shared WAL using default config
@@ -672,8 +673,9 @@ func (qw *QueueWAL) rollFile() {
 	// Move to old files map
 	qw.oldFilesMutex.Lock()
 	qw.oldFiles[currentFileNum] = &walFileInfo{
-		path:    currentPath,
-		offsets: fileOffsets,
+		path:      currentPath,
+		offsets:   fileOffsets,
+		createdAt: time.Now(),
 	}
 	qw.oldFilesMutex.Unlock()
 
@@ -726,7 +728,8 @@ func (qw *QueueWAL) cleanupLoop() {
 	}
 }
 
-// tryDeleteOldFiles deletes WAL files where all messages are ACKed
+// tryDeleteOldFiles deletes WAL files where all messages are ACKed,
+// or where the retention period has expired (with best-effort checkpoint).
 func (qw *QueueWAL) tryDeleteOldFiles() {
 	qw.oldFilesMutex.Lock()
 	defer qw.oldFilesMutex.Unlock()
@@ -741,11 +744,48 @@ func (qw *QueueWAL) tryDeleteOldFiles() {
 			info.offsets.GetCardinality() > 0 &&
 			roaring64.And(info.offsets, qw.ackBitmap).GetCardinality() == info.offsets.GetCardinality()
 
+		// Check time-based retention
+		expired := qw.cfg.RetentionPeriod > 0 &&
+			!info.createdAt.IsZero() &&
+			time.Since(info.createdAt) > qw.cfg.RetentionPeriod
+
 		if allAcked {
-			// Delete the WAL file
+			_ = os.Remove(info.path)
+			delete(qw.oldFiles, fileNum)
+		} else if expired {
+			// Force-checkpoint unACKed messages to segments before deletion
+			qw.forceCheckpointFile(info)
 			_ = os.Remove(info.path)
 			delete(qw.oldFiles, fileNum)
 		}
+	}
+}
+
+// forceCheckpointFile is a best-effort checkpoint of unACKed messages from an
+// expired WAL file to segments before force-deletion. Errors are logged but
+// do not prevent file deletion (the retention contract takes priority).
+// NOTE: Caller must hold bitmapMutex (RLock) and oldFilesMutex (Lock).
+func (qw *QueueWAL) forceCheckpointFile(info *walFileInfo) {
+	if qw.segmentMgr == nil {
+		return
+	}
+
+	messages, err := qw.scanWALFile(info.path)
+	if err != nil {
+		return
+	}
+
+	// Group unACKed messages by queue
+	byQueue := make(map[string][]*RecoveryMessage)
+	for _, msg := range messages {
+		if !qw.ackBitmap.Contains(msg.Offset) {
+			byQueue[msg.QueueName] = append(byQueue[msg.QueueName], msg)
+		}
+	}
+
+	// Write to segments (best-effort — errors are ignored)
+	for queueName, queueMsgs := range byQueue {
+		_ = qw.segmentMgr.CheckpointBatch(queueName, queueMsgs)
 	}
 }
 

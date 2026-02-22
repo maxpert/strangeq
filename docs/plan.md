@@ -36,7 +36,13 @@ Create a Go package `github.com/maxpert/amqp-go` that implements an AMQP 0.9.1 s
   - Only operates on old/rolled files — never touches the active WAL file
   - Updated `checkpointLoop` to use configurable interval from SegmentConfig
   - 5 new tests: moves to segments, deletes old files, skips ACKed, active file untouched, offset index cleanup
-- ⬜ **Commit 5: Add time-based WAL retention**
+- ✅ **Commit 5: Add time-based WAL retention**
+  - Added `createdAt time.Time` field to `walFileInfo` for tracking file age
+  - Added retention check in `tryDeleteOldFiles()`: files older than `RetentionPeriod` are force-deleted
+  - Added `forceCheckpointFile()` method: best-effort checkpoint of unACKed messages to segments before deletion
+  - Fixed segment `openNextSegment()` to use `O_RDWR` instead of `O_WRONLY` so checkpointed messages are readable from current segment
+  - Retention disabled by default (`RetentionPeriod: 0`); enabled via config
+  - 4 new tests: expired file deletion, recent file preservation, checkpoint-before-delete, disabled-when-zero
 - ⬜ **Commit 6: Integration test and plan update**
 
 **Phase 13 - Memory Allocation Optimizations: COMPLETE** ✅
