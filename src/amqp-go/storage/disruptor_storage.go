@@ -139,10 +139,11 @@ func WALConfigFromEngine(ec interfaces.EngineConfig) WALConfig {
 	if ec.WALCleanupCheckIntervalMS > 0 {
 		cfg.CleanupInterval = time.Duration(ec.WALCleanupCheckIntervalMS) * time.Millisecond
 	}
-	// Share the segment checkpoint interval so WAL and segments stay in sync
-	if ec.SegmentCheckpointIntervalMS > 0 {
-		cfg.CheckpointInterval = time.Duration(ec.SegmentCheckpointIntervalMS) * time.Millisecond
-	}
+	// Note: WALConfig.CheckpointInterval is intentionally not mapped from
+	// SegmentCheckpointIntervalMS. That field governs the segment-tier checkpoint
+	// loop; the WAL-to-segment migration loop uses its own default (5 min).
+	// Override WALConfig.CheckpointInterval directly if a custom WAL checkpoint
+	// cadence is needed.
 	return cfg
 }
 
