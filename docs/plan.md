@@ -6,6 +6,25 @@ Create a Go package `github.com/maxpert/amqp-go` that implements an AMQP 0.9.1 s
 ## Current Status (Updated: 2026-06-23)
 **Phase 15 - TLS + Authorization: IN PROGRESS** 🚧
 
+### Phase 15 - Commit B4: Per-Operation Authorization Checks (COMPLETE) ✅
+- ✅ **Authorize helper** (`server/authz.go`): checks `AuthorizationEnabled`, `conn.User`, `s.Authenticator`; fail-closed on nil
+- ✅ **sendChannelClose**: sends `channel.close` on correct channel ID (not channel 0); marks channel closed
+- ✅ **authzChannelError**: sends 403 (access-refused) + returns error to stop handler processing
+- ✅ **All 11 AMQP operations checked** per RabbitMQ permission table:
+  - exchange.declare → configure on exchange
+  - exchange.delete → configure on exchange
+  - exchange.unbind → write on destination + read on source
+  - queue.declare → configure on queue
+  - queue.delete → configure on queue
+  - queue.bind → write on queue + read on exchange
+  - queue.unbind → write on queue + read on exchange
+  - basic.publish → write on exchange
+  - basic.consume → read on queue
+  - basic.get → read on queue
+- ✅ **Reserved `amq.` name enforcement** (spec "reserved" rule): non-passive declare of `amq.*` → 403; passive allowed; server-generated `amq.gen.*` exempt
+- ✅ **22 tests pass** with `-race`: all operations (allowed + refused), reserved names (exchange + queue, non-passive refused + passive allowed), auth-disabled
+- ✅ **Code review fixes**: channel.close on correct channel (CRITICAL), queue.unbind + exchange.unbind authz added (MAJOR), nil Authenticator check (MINOR), passive queue reserved-name test (MINOR)
+
 ### Phase 15 - Commit B3: Vhost Access Check + Loopback Restriction (COMPLETE) ✅
 - ✅ **Vhost permission check at connection.open** (AMQP 0.9.1 spec "security" rule)
   - When `AuthorizationEnabled`: checks user's `VHostPermissions` for the requested vhost

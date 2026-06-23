@@ -3,6 +3,7 @@ package server
 import (
 	"fmt"
 
+	"github.com/maxpert/amqp-go/interfaces"
 	"github.com/maxpert/amqp-go/protocol"
 	"go.uber.org/zap"
 )
@@ -62,6 +63,17 @@ func (s *Server) handleQueueDeclare(conn *protocol.Connection, channelID uint16,
 		return err
 	}
 
+	// AMQP 0.9.1 spec "reserved" rule (on-failure: access-refused 403):
+	// Queue names starting with "amq." are reserved. The client MAY declare
+	// a queue starting with "amq." if the passive option is set, or the
+	// queue already exists. This check only applies to client-provided names,
+	// not server-generated names (amq.gen.*).
+	if !declareMethod.Passive && isReservedName(declareMethod.Queue) {
+		return s.authzChannelError(conn, channelID,
+			fmt.Errorf("queue name %q is reserved (spec: amq. prefix)", declareMethod.Queue),
+			50, 10)
+	}
+
 	// AMQP 0.9.1 spec "default-name" rule: if queue name is empty, the server
 	// MUST create a new queue with a unique generated name.
 	queueName := declareMethod.Queue
@@ -74,6 +86,16 @@ func (s *Server) handleQueueDeclare(conn *protocol.Connection, channelID uint16,
 		zap.Bool("durable", declareMethod.Durable),
 		zap.Bool("auto_delete", declareMethod.AutoDelete),
 		zap.Bool("exclusive", declareMethod.Exclusive))
+
+	// Authorization check: queue.declare requires configure permission on queue
+	if err := s.authorize(conn, channelID, interfaces.Operation{
+		Action:       interfaces.ActionConfigure,
+		ResourceType: interfaces.ResourceQueue,
+		Resource:     queueName,
+		VHost:        conn.Vhost,
+	}); err != nil {
+		return s.authzChannelError(conn, channelID, err, 50, 10)
+	}
 
 	// Call the broker to declare the queue
 	queue, err := s.Broker.DeclareQueue(
@@ -136,6 +158,24 @@ func (s *Server) handleQueueBind(conn *protocol.Connection, channelID uint16, pa
 		zap.String("exchange", bindMethod.Exchange),
 		zap.String("routing_key", bindMethod.RoutingKey))
 
+	// Authorization check: queue.bind requires write on queue AND read on exchange
+	if err := s.authorize(conn, channelID, interfaces.Operation{
+		Action:       interfaces.ActionWrite,
+		ResourceType: interfaces.ResourceQueue,
+		Resource:     queueName,
+		VHost:        conn.Vhost,
+	}); err != nil {
+		return s.authzChannelError(conn, channelID, err, 50, 20)
+	}
+	if err := s.authorize(conn, channelID, interfaces.Operation{
+		Action:       interfaces.ActionRead,
+		ResourceType: interfaces.ResourceExchange,
+		Resource:     bindMethod.Exchange,
+		VHost:        conn.Vhost,
+	}); err != nil {
+		return s.authzChannelError(conn, channelID, err, 50, 20)
+	}
+
 	// Call the broker to bind the queue
 	err = s.Broker.BindQueue(
 		queueName,
@@ -185,6 +225,24 @@ func (s *Server) handleQueueUnbind(conn *protocol.Connection, channelID uint16, 
 		zap.String("exchange", unbindMethod.Exchange),
 		zap.String("routing_key", unbindMethod.RoutingKey))
 
+	// Authorization check: queue.unbind requires write on queue AND read on exchange
+	if err := s.authorize(conn, channelID, interfaces.Operation{
+		Action:       interfaces.ActionWrite,
+		ResourceType: interfaces.ResourceQueue,
+		Resource:     queueName,
+		VHost:        conn.Vhost,
+	}); err != nil {
+		return s.authzChannelError(conn, channelID, err, 50, 50)
+	}
+	if err := s.authorize(conn, channelID, interfaces.Operation{
+		Action:       interfaces.ActionRead,
+		ResourceType: interfaces.ResourceExchange,
+		Resource:     unbindMethod.Exchange,
+		VHost:        conn.Vhost,
+	}); err != nil {
+		return s.authzChannelError(conn, channelID, err, 50, 50)
+	}
+
 	// Call the broker to unbind the queue
 	err = s.Broker.UnbindQueue(
 		queueName,
@@ -228,6 +286,16 @@ func (s *Server) handleQueueDelete(conn *protocol.Connection, channelID uint16, 
 		zap.String("queue", queueName),
 		zap.Bool("if_unused", deleteMethod.IfUnused),
 		zap.Bool("if_empty", deleteMethod.IfEmpty))
+
+	// Authorization check: queue.delete requires configure permission on queue
+	if err := s.authorize(conn, channelID, interfaces.Operation{
+		Action:       interfaces.ActionConfigure,
+		ResourceType: interfaces.ResourceQueue,
+		Resource:     queueName,
+		VHost:        conn.Vhost,
+	}); err != nil {
+		return s.authzChannelError(conn, channelID, err, 50, 40)
+	}
 
 	// Call the broker to delete the queue
 	err = s.Broker.DeleteQueue(queueName, deleteMethod.IfUnused, deleteMethod.IfEmpty)

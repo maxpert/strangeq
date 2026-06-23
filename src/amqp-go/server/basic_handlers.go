@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/maxpert/amqp-go/interfaces"
 	"github.com/maxpert/amqp-go/protocol"
 	"go.uber.org/zap"
 )
@@ -92,6 +93,16 @@ func (s *Server) handleBasicPublish(conn *protocol.Connection, channelID uint16,
 		zap.String("routing_key", publishMethod.RoutingKey),
 		zap.Bool("mandatory", publishMethod.Mandatory),
 		zap.Bool("immediate", publishMethod.Immediate))
+
+	// Authorization check: basic.publish requires write permission on exchange
+	if err := s.authorize(conn, channelID, interfaces.Operation{
+		Action:       interfaces.ActionWrite,
+		ResourceType: interfaces.ResourceExchange,
+		Resource:     publishMethod.Exchange,
+		VHost:        conn.Vhost,
+	}); err != nil {
+		return s.authzChannelError(conn, channelID, err, 60, 40)
+	}
 
 	// RabbitMQ-style memory alarm: Log warning when queue usage is high but DO NOT close connection
 	// With 10GB threshold and BrokerV2 architecture, we prioritize connection stability over strict memory limits
@@ -370,6 +381,16 @@ func (s *Server) handleBasicConsume(conn *protocol.Connection, channelID uint16,
 		zap.Bool("exclusive", consumeMethod.Exclusive),
 		zap.Uint16("prefetch_count", channel.PrefetchCount))
 
+	// Authorization check: basic.consume requires read permission on queue
+	if err := s.authorize(conn, channelID, interfaces.Operation{
+		Action:       interfaces.ActionRead,
+		ResourceType: interfaces.ResourceQueue,
+		Resource:     consumeMethod.Queue,
+		VHost:        conn.Vhost,
+	}); err != nil {
+		return s.authzChannelError(conn, channelID, err, 60, 20)
+	}
+
 	// Check if queue exists in the broker
 	// This is a simplified check - in a real implementation you'd verify queue exists
 	// For now, we'll proceed assuming the queue exists
@@ -513,6 +534,16 @@ func (s *Server) handleBasicGet(conn *protocol.Connection, channelID uint16, pay
 	s.Log.Debug("Basic get requested",
 		zap.String("queue", getMethod.Queue),
 		zap.Bool("no_ack", getMethod.NoAck))
+
+	// Authorization check: basic.get requires read permission on queue
+	if err := s.authorize(conn, channelID, interfaces.Operation{
+		Action:       interfaces.ActionRead,
+		ResourceType: interfaces.ResourceQueue,
+		Resource:     getMethod.Queue,
+		VHost:        conn.Vhost,
+	}); err != nil {
+		return s.authzChannelError(conn, channelID, err, 60, 70)
+	}
 
 	// For now, we'll respond with basic.get-empty since we don't have actual message retrieval implemented yet
 	// In a real implementation, we would try to get the next message from the queue

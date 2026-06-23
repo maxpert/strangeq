@@ -3,6 +3,7 @@ package server
 import (
 	"fmt"
 
+	"github.com/maxpert/amqp-go/interfaces"
 	"github.com/maxpert/amqp-go/protocol"
 	"go.uber.org/zap"
 )
@@ -47,6 +48,26 @@ func (s *Server) handleExchangeDeclare(conn *protocol.Connection, channelID uint
 		zap.Bool("auto_delete", declareMethod.AutoDelete),
 		zap.Bool("internal", declareMethod.Internal))
 
+	// AMQP 0.9.1 spec "reserved" rule (on-failure: access-refused 403):
+	// Exchange names starting with "amq." are reserved. The client MAY declare
+	// an exchange starting with "amq." if the passive option is set, or the
+	// exchange already exists.
+	if !declareMethod.Passive && isReservedName(declareMethod.Exchange) {
+		return s.authzChannelError(conn, channelID,
+			fmt.Errorf("exchange name %q is reserved (spec: amq. prefix)", declareMethod.Exchange),
+			40, 10)
+	}
+
+	// Authorization check: exchange.declare requires configure permission on exchange
+	if err := s.authorize(conn, channelID, interfaces.Operation{
+		Action:       interfaces.ActionConfigure,
+		ResourceType: interfaces.ResourceExchange,
+		Resource:     declareMethod.Exchange,
+		VHost:        conn.Vhost,
+	}); err != nil {
+		return s.authzChannelError(conn, channelID, err, 40, 10)
+	}
+
 	// Call the broker to declare the exchange
 	err = s.Broker.DeclareExchange(
 		declareMethod.Exchange,
@@ -90,6 +111,16 @@ func (s *Server) handleExchangeDelete(conn *protocol.Connection, channelID uint1
 		zap.String("exchange", deleteMethod.Exchange),
 		zap.Bool("if_unused", deleteMethod.IfUnused))
 
+	// Authorization check: exchange.delete requires configure permission on exchange
+	if err := s.authorize(conn, channelID, interfaces.Operation{
+		Action:       interfaces.ActionConfigure,
+		ResourceType: interfaces.ResourceExchange,
+		Resource:     deleteMethod.Exchange,
+		VHost:        conn.Vhost,
+	}); err != nil {
+		return s.authzChannelError(conn, channelID, err, 40, 20)
+	}
+
 	// Call the broker to delete the exchange
 	err = s.Broker.DeleteExchange(deleteMethod.Exchange, deleteMethod.IfUnused)
 	if err != nil {
@@ -125,6 +156,24 @@ func (s *Server) handleExchangeUnbind(conn *protocol.Connection, channelID uint1
 		zap.String("destination", unbindMethod.Destination),
 		zap.String("source", unbindMethod.Source),
 		zap.String("routing_key", unbindMethod.RoutingKey))
+
+	// Authorization check: exchange.unbind requires write on destination + read on source
+	if err := s.authorize(conn, channelID, interfaces.Operation{
+		Action:       interfaces.ActionWrite,
+		ResourceType: interfaces.ResourceExchange,
+		Resource:     unbindMethod.Destination,
+		VHost:        conn.Vhost,
+	}); err != nil {
+		return s.authzChannelError(conn, channelID, err, 40, 50)
+	}
+	if err := s.authorize(conn, channelID, interfaces.Operation{
+		Action:       interfaces.ActionRead,
+		ResourceType: interfaces.ResourceExchange,
+		Resource:     unbindMethod.Source,
+		VHost:        conn.Vhost,
+	}); err != nil {
+		return s.authzChannelError(conn, channelID, err, 40, 50)
+	}
 
 	// Call the broker to unbind the exchange
 	// In a real implementation, you'd remove the binding between source and destination exchanges
