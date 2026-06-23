@@ -6,6 +6,17 @@ Create a Go package `github.com/maxpert/amqp-go` that implements an AMQP 0.9.1 s
 ## Current Status (Updated: 2026-06-23)
 **Phase 15 - TLS + Authorization: IN PROGRESS** 🚧
 
+### Phase 15 - Commit B5: Authorization Integration Test (COMPLETE) ✅
+- ✅ **10 end-to-end integration tests** with real `amqp091-go` client against live server
+  - Admin can declare exchanges/queues (configure=.*)
+  - Producer cannot declare (configure=^$) but can publish (write=.*)
+  - Consumer cannot publish (write=^$) — channel.Close from server via NotifyClose
+  - Consumer can consume (read=.*)
+  - Restricted user can access own resources (^app1-.*), cannot access others (^app2-.*)
+  - Guest loopback allowed from localhost, refused from non-loopback
+  - Reserved exchange name (amq.custom) refused for non-passive declare
+- ✅ Tests use 5 users with different permission triples: admin, producer, consumer, restricted, guest
+
 ### Phase 15 - Commit B4: Per-Operation Authorization Checks (COMPLETE) ✅
 - ✅ **Authorize helper** (`server/authz.go`): checks `AuthorizationEnabled`, `conn.User`, `s.Authenticator`; fail-closed on nil
 - ✅ **sendChannelClose**: sends `channel.close` on correct channel ID (not channel 0); marks channel closed
