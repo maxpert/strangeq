@@ -38,6 +38,12 @@ func main() {
 		generateConfig  = flag.String("generate-config", "", "Generate default config file and exit (e.g., config.yaml)")
 		enableTelemetry = flag.Bool("enable-telemetry", false, "Enable telemetry endpoint (Prometheus + pprof profiling)")
 		telemetryPort   = flag.Int("telemetry-port", 9419, "Telemetry HTTP server port")
+
+		// TLS flags
+		tlsEnable = flag.Bool("tls", false, "Enable TLS (amqps)")
+		tlsCert   = flag.String("tls-cert", "", "Path to TLS certificate file (PEM)")
+		tlsKey    = flag.String("tls-key", "", "Path to TLS private key file (PEM)")
+		tlsCA     = flag.String("tls-ca", "", "Path to TLS CA file for mutual TLS client verification (PEM)")
 	)
 
 	flag.Parse()
@@ -89,6 +95,25 @@ func main() {
 		if !isDaemonChild() {
 			fmt.Println("Using default configuration (override with --config or AMQP_* env vars)")
 		}
+	}
+
+	// Apply TLS command-line flags (override config file values)
+	if *tlsEnable {
+		cfg.Security.TLSEnabled = true
+	}
+	if *tlsCert != "" {
+		cfg.Security.TLSCertFile = *tlsCert
+	}
+	if *tlsKey != "" {
+		cfg.Security.TLSKeyFile = *tlsKey
+	}
+	if *tlsCA != "" {
+		cfg.Security.TLSCAFile = *tlsCA
+	}
+
+	// Re-validate after CLI overrides
+	if err := cfg.Validate(); err != nil {
+		log.Fatalf("Invalid configuration: %v", err)
 	}
 
 	// Handle daemonization if requested (and not already a daemon)
@@ -161,7 +186,11 @@ func main() {
 			log.Printf("Starting AMQP server daemon on %s", cfg.Network.Address)
 			log.Printf("Storage path: %s (persistent)", cfg.Storage.Path)
 			if cfg.Security.TLSEnabled {
-				log.Println("TLS: Enabled")
+				if cfg.Security.TLSCAFile != "" {
+					log.Println("TLS: Enabled (mutual TLS, client cert required)")
+				} else {
+					log.Println("TLS: Enabled")
+				}
 			}
 			if cfg.Security.AuthenticationEnabled {
 				log.Printf("Authentication: Enabled (%s)", cfg.Security.AuthenticationBackend)
@@ -173,7 +202,11 @@ func main() {
 			fmt.Printf("Starting AMQP server on %s\n", cfg.Network.Address)
 			fmt.Printf("Storage path: %s (persistent)\n", cfg.Storage.Path)
 			if cfg.Security.TLSEnabled {
-				fmt.Println("TLS: Enabled")
+				if cfg.Security.TLSCAFile != "" {
+					fmt.Println("TLS: Enabled (mutual TLS, client cert required)")
+				} else {
+					fmt.Println("TLS: Enabled")
+				}
 			}
 			if cfg.Security.AuthenticationEnabled {
 				fmt.Printf("Authentication: Enabled (%s)\n", cfg.Security.AuthenticationBackend)
@@ -207,11 +240,8 @@ func setupSignalHandling(server *server.Server, pidFile string) {
 			os.Remove(pidFile)
 		}
 
-		// Stop server (if server has a Stop method)
-		server.Shutdown = true
-		if server.Listener != nil {
-			server.Listener.Close()
-		}
+		// Stop server gracefully (cancels metrics goroutine, closes listener)
+		server.Stop()
 
 		// Give some time for graceful shutdown
 		time.Sleep(2 * time.Second)

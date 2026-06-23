@@ -154,6 +154,16 @@ func (b *ServerBuilder) WithTLS(certFile, keyFile string) *ServerBuilder {
 	return b
 }
 
+// WithTLSMutualAuth enables mutual TLS by setting the CA file for client
+// certificate verification. Also sets TLSEnabled=true so that missing
+// cert/key files fail explicitly in Validate() rather than silently
+// downgrading to plaintext.
+func (b *ServerBuilder) WithTLSMutualAuth(caFile string) *ServerBuilder {
+	b.config.Security.TLSEnabled = true
+	b.config.Security.TLSCAFile = caFile
+	return b
+}
+
 // WithMaxConnections sets the maximum number of concurrent connections
 func (b *ServerBuilder) WithMaxConnections(max int) *ServerBuilder {
 	b.config.Network.MaxConnections = max

@@ -76,6 +76,51 @@ func TestConfigValidation(t *testing.T) {
 			wantErr: true,
 		},
 		{
+			name: "TLS enabled without key file",
+			modify: func(c *AMQPConfig) {
+				c.Security.TLSEnabled = true
+				c.Security.TLSCertFile = "/dev/null"
+				c.Security.TLSKeyFile = ""
+			},
+			wantErr: true,
+		},
+		{
+			name: "TLS enabled with non-existent cert",
+			modify: func(c *AMQPConfig) {
+				c.Security.TLSEnabled = true
+				c.Security.TLSCertFile = "/nonexistent/cert.pem"
+				c.Security.TLSKeyFile = "/dev/null"
+			},
+			wantErr: true,
+		},
+		{
+			name: "TLS enabled with non-existent key",
+			modify: func(c *AMQPConfig) {
+				c.Security.TLSEnabled = true
+				c.Security.TLSCertFile = "/dev/null"
+				c.Security.TLSKeyFile = "/nonexistent/key.pem"
+			},
+			wantErr: true,
+		},
+		{
+			name: "TLS enabled with non-existent CA file",
+			modify: func(c *AMQPConfig) {
+				c.Security.TLSEnabled = true
+				c.Security.TLSCertFile = "/dev/null"
+				c.Security.TLSKeyFile = "/dev/null"
+				c.Security.TLSCAFile = "/nonexistent/ca.pem"
+			},
+			wantErr: true,
+		},
+		{
+			name: "TLS disabled with non-existent CA file (CA not checked when TLS off)",
+			modify: func(c *AMQPConfig) {
+				c.Security.TLSEnabled = false
+				c.Security.TLSCAFile = "/nonexistent/ca.pem"
+			},
+			wantErr: false,
+		},
+		{
 			name: "invalid max channels",
 			modify: func(c *AMQPConfig) {
 				c.Server.MaxChannelsPerConnection = 0

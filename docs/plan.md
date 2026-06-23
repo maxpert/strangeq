@@ -6,6 +6,17 @@ Create a Go package `github.com/maxpert/amqp-go` that implements an AMQP 0.9.1 s
 ## Current Status (Updated: 2026-06-23)
 **Phase 15 - TLS + Authorization: IN PROGRESS** 🚧
 
+### Phase 15 - Commit A2: Builder Wiring and CLI Flags (COMPLETE) ✅
+- ✅ `server/builder.go`: `WithTLSMutualAuth(caFile)` builder method — self-enables TLS (sets `TLSEnabled=true`) so missing cert/key fails explicitly in `Validate()` instead of silently downgrading to plaintext
+- ✅ `config/config.go`: `Validate()` now checks CA file existence when `TLSEnabled && TLSCAFile != ""` (was: only checked cert/key)
+- ✅ `config/config_test.go`: 5 new TLS validation test cases — missing key, non-existent cert, non-existent key, non-existent CA, TLS-disabled with non-existent CA (not checked)
+- ✅ `cmd/amqp-server/main.go`: CLI flags `--tls`, `--tls-cert`, `--tls-key`, `--tls-ca` — override config file values, re-validate after applying
+- ✅ `cmd/amqp-server/main.go`: Signal handler uses `server.Stop()` instead of manual `Shutdown=true` + `Listener.Close()` (proper mutex + metrics cancellation)
+- ✅ `cmd/amqp-server/main.go`: Startup info shows "TLS: Enabled (mutual TLS, client cert required)" when CA file set
+- ✅ `server/builder_tls_test.go`: 7 builder/config tests — `WithTLS`, `WithTLSMutualAuth`, without TLS, validation failures, CA file validation
+- ✅ **Code review**: 1 round, 0 remaining issues from A2 changes (1 pre-existing MAJOR noted: graceful drain defeated by `Stop()` — separate fix)
+- ✅ Full test suite passes with `-race` across all packages
+
 ### Phase 15 - Commit A1: TLS Listener and Config Validation (COMPLETE) ✅
 - ✅ `server/tls.go`: `loadTLSConfig()` reads cert/key files, builds `*tls.Config` with MinVersion TLS 1.2, `PreferServerCipherSuites: true`
   - When `TLSCAFile` set → mutual TLS: `ClientAuth: tls.RequireAndVerifyClientCert` + client CA pool

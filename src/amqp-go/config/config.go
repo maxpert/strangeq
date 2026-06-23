@@ -172,6 +172,12 @@ func (c *AMQPConfig) Validate() error {
 		if _, err := os.Stat(c.Security.TLSKeyFile); os.IsNotExist(err) {
 			return fmt.Errorf("TLS key file does not exist: %s", c.Security.TLSKeyFile)
 		}
+
+		if c.Security.TLSCAFile != "" {
+			if _, err := os.Stat(c.Security.TLSCAFile); os.IsNotExist(err) {
+				return fmt.Errorf("TLS CA file does not exist: %s", c.Security.TLSCAFile)
+			}
+		}
 	}
 
 	// Validate server configuration
