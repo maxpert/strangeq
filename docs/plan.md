@@ -4,7 +4,7 @@
 Create a Go package `github.com/maxpert/amqp-go` that implements an AMQP 0.9.1 server based on the specification: https://www.rabbitmq.com/resources/specs/amqp0-9-1.extended.xml
 
 ## Current Status (Updated: 2026-06-23)
-**Phase 15 - TLS + Authorization: IN PROGRESS** 🚧
+**Phase 15 - TLS + Authorization: COMPLETE** ✅
 
 ### Phase 15 - Commit A3: TLS Integration Test and Documentation (COMPLETE) ✅
 - ✅ `tls_integration_test.go` (new): 5 end-to-end TLS integration tests with real `amqp091-go` client
@@ -602,7 +602,7 @@ Create a Go package `github.com/maxpert/amqp-go` that implements an AMQP 0.9.1 s
 - ✅ **Server Lifecycle Management**: State transitions, hooks, health monitoring, and graceful shutdown
 - ✅ **Backward Compatibility**: All existing functionality preserved with improved architecture
 
-**Next Phase:** Phase 11 - Production Hardening (TLS, Authorization, Performance Tuning)
+**Next Phase:** Phase 16 - Performance Tuning (profile disruptor.Reserve() blocking, tune EngineConfig defaults)
 
 ## Completed Release Preparation:
 - ✅ **GitHub Actions Workflows**: Multi-platform release builds for macOS (arm64, amd64), Linux (amd64, arm64, 386)
