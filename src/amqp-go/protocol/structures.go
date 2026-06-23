@@ -47,6 +47,7 @@ type Channel struct {
 	PrefetchCount  uint16               // Channel-level prefetch count
 	PrefetchSize   uint32               // Channel-level prefetch size (0 = unlimited)
 	GlobalPrefetch bool                 // Apply prefetch settings globally
+	CurrentQueue   string               // Last declared queue name (for empty-name resolution per AMQP spec)
 }
 
 // NewChannel creates a new AMQP channel
@@ -201,4 +202,19 @@ func generateID() string {
 	}
 
 	return fmt.Sprintf("%x", b)
+}
+
+// GenerateQueueName generates a unique server-assigned queue name.
+// Per AMQP 0.9.1 spec, when queue.declare is called with an empty name,
+// the server MUST create a unique generated name. RabbitMQ uses the
+// "amq.gen." prefix convention; we follow the same convention for
+// client compatibility.
+func GenerateQueueName() string {
+	b := make([]byte, 16)
+	_, err := rand.Read(b)
+	if err != nil {
+		mrand.Seed(time.Now().UnixNano())
+		return fmt.Sprintf("amq.gen.%d", mrand.Int63())
+	}
+	return "amq.gen." + fmt.Sprintf("%x", b)
 }

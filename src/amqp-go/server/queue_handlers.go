@@ -7,6 +7,28 @@ import (
 	"go.uber.org/zap"
 )
 
+// resolveQueueName resolves an empty queue name to the channel's "current
+// queue" (the last queue declared on the channel), per AMQP 0.9.1 spec
+// "queue-known" rule. Returns the resolved name, or an error if the name
+// is empty and no queue was previously declared on the channel (spec:
+// "this will result in a 502 (syntax error) channel exception").
+func resolveQueueName(conn *protocol.Connection, channelID uint16, queueName string) (string, error) {
+	if queueName != "" {
+		return queueName, nil
+	}
+	// Empty name: resolve to the channel's current queue
+	if val, exists := conn.Channels.Load(channelID); exists {
+		ch := val.(*protocol.Channel)
+		ch.Mutex.RLock()
+		current := ch.CurrentQueue
+		ch.Mutex.RUnlock()
+		if current != "" {
+			return current, nil
+		}
+	}
+	return "", fmt.Errorf("no queue name specified and no current queue on channel %d (spec: 502 syntax error)", channelID)
+}
+
 // processQueueMethod handles queue-related methods
 func (s *Server) processQueueMethod(conn *protocol.Connection, channelID uint16, methodID uint16, payload []byte) error {
 	switch methodID {
@@ -40,15 +62,22 @@ func (s *Server) handleQueueDeclare(conn *protocol.Connection, channelID uint16,
 		return err
 	}
 
+	// AMQP 0.9.1 spec "default-name" rule: if queue name is empty, the server
+	// MUST create a new queue with a unique generated name.
+	queueName := declareMethod.Queue
+	if queueName == "" {
+		queueName = protocol.GenerateQueueName()
+	}
+
 	s.Log.Debug("Queue declared",
-		zap.String("queue", declareMethod.Queue),
+		zap.String("queue", queueName),
 		zap.Bool("durable", declareMethod.Durable),
 		zap.Bool("auto_delete", declareMethod.AutoDelete),
 		zap.Bool("exclusive", declareMethod.Exclusive))
 
 	// Call the broker to declare the queue
 	queue, err := s.Broker.DeclareQueue(
-		declareMethod.Queue,
+		queueName,
 		declareMethod.Durable,
 		declareMethod.AutoDelete,
 		declareMethod.Exclusive,
@@ -58,8 +87,17 @@ func (s *Server) handleQueueDeclare(conn *protocol.Connection, channelID uint16,
 	if err != nil {
 		s.Log.Error("Failed to declare queue",
 			zap.Error(err),
-			zap.String("queue", declareMethod.Queue))
+			zap.String("queue", queueName))
 		return err
+	}
+
+	// AMQP 0.9.1 spec "queue-known" rule: track the last declared queue on
+	// the channel so subsequent methods with empty queue name can resolve it.
+	if val, exists := conn.Channels.Load(channelID); exists {
+		ch := val.(*protocol.Channel)
+		ch.Mutex.Lock()
+		ch.CurrentQueue = queue.Name
+		ch.Mutex.Unlock()
 	}
 
 	// Record queue declared metric
@@ -67,7 +105,8 @@ func (s *Server) handleQueueDeclare(conn *protocol.Connection, channelID uint16,
 		s.MetricsCollector.RecordQueueDeclared()
 	}
 
-	// Send queue.declare-ok response with queue info
+	// Send queue.declare-ok response with queue info (spec: must return the
+	// actual queue name, including server-generated names)
 	msgCount := uint32(queue.MessageCount.Load())
 	return s.sendQueueDeclareOK(conn, channelID, queue.Name, msgCount, 0)
 }
@@ -85,14 +124,21 @@ func (s *Server) handleQueueBind(conn *protocol.Connection, channelID uint16, pa
 		return err
 	}
 
+	// AMQP 0.9.1 spec "queue-known" rule: resolve empty queue name to the
+	// channel's current queue (last declared queue).
+	queueName, err := resolveQueueName(conn, channelID, bindMethod.Queue)
+	if err != nil {
+		return err
+	}
+
 	s.Log.Debug("Queue bound",
-		zap.String("queue", bindMethod.Queue),
+		zap.String("queue", queueName),
 		zap.String("exchange", bindMethod.Exchange),
 		zap.String("routing_key", bindMethod.RoutingKey))
 
 	// Call the broker to bind the queue
 	err = s.Broker.BindQueue(
-		bindMethod.Queue,
+		queueName,
 		bindMethod.Exchange,
 		bindMethod.RoutingKey,
 		bindMethod.Arguments,
@@ -101,7 +147,7 @@ func (s *Server) handleQueueBind(conn *protocol.Connection, channelID uint16, pa
 	if err != nil {
 		s.Log.Error("Failed to bind queue",
 			zap.Error(err),
-			zap.String("queue", bindMethod.Queue),
+			zap.String("queue", queueName),
 			zap.String("exchange", bindMethod.Exchange))
 		return err
 	}
@@ -127,14 +173,21 @@ func (s *Server) handleQueueUnbind(conn *protocol.Connection, channelID uint16, 
 		return err
 	}
 
+	// AMQP 0.9.1 spec "queue-known" rule: resolve empty queue name to the
+	// channel's current queue (last declared queue).
+	queueName, err := resolveQueueName(conn, channelID, unbindMethod.Queue)
+	if err != nil {
+		return err
+	}
+
 	s.Log.Debug("Queue unbound",
-		zap.String("queue", unbindMethod.Queue),
+		zap.String("queue", queueName),
 		zap.String("exchange", unbindMethod.Exchange),
 		zap.String("routing_key", unbindMethod.RoutingKey))
 
 	// Call the broker to unbind the queue
 	err = s.Broker.UnbindQueue(
-		unbindMethod.Queue,
+		queueName,
 		unbindMethod.Exchange,
 		unbindMethod.RoutingKey,
 	)
@@ -142,7 +195,7 @@ func (s *Server) handleQueueUnbind(conn *protocol.Connection, channelID uint16, 
 	if err != nil {
 		s.Log.Error("Failed to unbind queue",
 			zap.Error(err),
-			zap.String("queue", unbindMethod.Queue),
+			zap.String("queue", queueName),
 			zap.String("exchange", unbindMethod.Exchange))
 		return err
 	}
@@ -164,18 +217,35 @@ func (s *Server) handleQueueDelete(conn *protocol.Connection, channelID uint16, 
 		return err
 	}
 
+	// AMQP 0.9.1 spec "queue-known" rule: resolve empty queue name to the
+	// channel's current queue (last declared queue).
+	queueName, err := resolveQueueName(conn, channelID, deleteMethod.Queue)
+	if err != nil {
+		return err
+	}
+
 	s.Log.Debug("Queue deleted",
-		zap.String("queue", deleteMethod.Queue),
+		zap.String("queue", queueName),
 		zap.Bool("if_unused", deleteMethod.IfUnused),
 		zap.Bool("if_empty", deleteMethod.IfEmpty))
 
 	// Call the broker to delete the queue
-	err = s.Broker.DeleteQueue(deleteMethod.Queue, deleteMethod.IfUnused, deleteMethod.IfEmpty)
+	err = s.Broker.DeleteQueue(queueName, deleteMethod.IfUnused, deleteMethod.IfEmpty)
 	if err != nil {
 		s.Log.Error("Failed to delete queue",
 			zap.Error(err),
-			zap.String("queue", deleteMethod.Queue))
+			zap.String("queue", queueName))
 		return err
+	}
+
+	// Clear the current queue if it was the one deleted
+	if val, exists := conn.Channels.Load(channelID); exists {
+		ch := val.(*protocol.Channel)
+		ch.Mutex.Lock()
+		if ch.CurrentQueue == queueName {
+			ch.CurrentQueue = ""
+		}
+		ch.Mutex.Unlock()
 	}
 
 	// Record queue deleted metric

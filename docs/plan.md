@@ -10,21 +10,45 @@ Create a Go package `github.com/maxpert/amqp-go` that implements an AMQP 0.9.1 s
 - ✅ **Redesigned Permission/Operation types** in `interfaces/server.go` to RabbitMQ's configure/write/read regex triple model
   - `Permission` struct: `Configure`, `Write`, `Read` regex pattern fields (was: `Resource`/`Action`/`Pattern`)
   - `Permission.Matches(action, resourceName)` method for regex matching with safe failure
+  - `Permission` doc: unanchored patterns, `^$` empty-string edge case documented
+  - Compiled regex caching via `sync.Map` for hot-path performance (no per-message recompilation)
   - `Operation` struct: `Action` (OperationAction), `ResourceType` (ResourceType), `Resource`, `VHost`
   - `OperationAction` enum: `ActionConfigure`, `ActionWrite`, `ActionRead`
   - `ResourceType` enum: `ResourceExchange`, `ResourceQueue`, `ResourceVHost`
   - `VHostPermission` struct: ties a permission triple to a specific vhost
-  - `User` struct: `VHostPermissions []VHostPermission` replaces `Permissions []Permission`; added `Tags []string`
+  - `User` struct: `VHostPermissions []VHostPermission` replaces `Permissions []Permission`; added `Tags`, `LoopbackOnly`; `sync.RWMutex` for concurrent Authorize/RefreshUser safety
   - `NormalizeExchangeName()` + `DefaultExchangeName` constant: maps empty default exchange to "amq.default" for permission checks
 - ✅ **Implemented `FileAuthenticator.Authorize()`** in `auth/file_auth.go` (was stub `return nil`)
   - Finds user's VHostPermission for the operation's vhost; refuses if none exists
   - Normalizes default exchange name (empty → "amq.default") for permission checks
   - Matches resource name against the appropriate regex pattern (configure/write/read)
-  - Returns descriptive error on refusal
-- ✅ **Backward compatibility**: old `permissions` field (resource/action/pattern) auto-migrates to `vhost_permissions` with allow-all on "/" vhost
+  - Returns typed `*amqperrors.AuthError` (code 403) on refusal — `errors.IsAccessRefused()` works
+  - Holds `user.RLock()` during check to prevent concurrent RefreshUser data races
+- ✅ **Backward compatibility**: old `permissions` field faithfully migrated — each legacy Action mapped to corresponding permission field; missing actions default to `^$` (deny); warning logged
 - ✅ **Updated `auth/anonymous.go`**: ANONYMOUS mechanism now creates guest user with full VHostPermissions on "/" + `Tags: ["administrator"]`
 - ✅ **Updated `auth/auth_test.go`**: MockAuthenticator uses new VHostPermissions format
-- ✅ **35 auth tests pass** with `-race` (9 Permission.Matches tests, 2 NormalizeExchangeName tests, 24 Authorize tests covering all AMQP 0.9.1 operations per the RabbitMQ permission table)
+- ✅ **Slices cloned** in `GetUser`/`Authenticate` via `slices.Clone()` to avoid shared backing arrays
+- ✅ **44 auth tests pass** with `-race` (9 Permission.Matches, 2 NormalizeExchangeName, 33 Authorize tests covering all AMQP 0.9.1 operations, typed errors, concurrent RefreshUser, faithful legacy migration)
+
+### Phase 15 - Commit B1.1: Code Review Fixes + Spec Compliance (COMPLETE) ✅
+- ✅ **Code review (2 rounds, 0 remaining issues)**: Fixed 4 MAJOR + 6 MINOR issues from automated review
+  - M1: Typed `*AuthError` (403) instead of `fmt.Errorf`
+  - M2: Compiled regex cache (`sync.Map`) for hot-path performance
+  - M3: `sync.RWMutex` on `User` for concurrent Authorize/RefreshUser safety
+  - M4: Faithful legacy migration (not allow-all escalation)
+  - m1-m6: LoopbackOnly wired through, unanchored regex documented, slices cloned, tests fixed
+- ✅ **Spec compliance: Server-generated queue names** (AMQP 0.9.1 "default-name" rule)
+  - `protocol.GenerateQueueName()`: generates `amq.gen.<random>` names (RabbitMQ convention)
+  - `handleQueueDeclare`: generates name when empty, sets `Channel.CurrentQueue`
+  - `protocol.Channel.CurrentQueue` field: tracks last declared queue per channel
+- ✅ **Spec compliance: "Current queue" resolution** (AMQP 0.9.1 "queue-known" rule)
+  - `resolveQueueName()` helper: resolves empty queue name to `Channel.CurrentQueue`
+  - Applied to `handleQueueBind`, `handleQueueUnbind`, `handleQueueDelete`
+  - Returns error (spec: 502 syntax error) when no queue was previously declared on channel
+- ✅ **13 new tests** (7 protocol/queue_name_test.go + 6 server/queue_name_handler_test.go)
+  - GenerateQueueName: prefix, uniqueness, valid chars, length
+  - Channel.CurrentQueue: default, set after named declare, set after generated declare
+  - Handler: empty name generates server name, sets CurrentQueue, resolves for bind/delete, errors when no current queue
 - ✅ **Full test suite passes** (all packages, `-race`, 0 failures)
 
 **Phase 14 - Log Compaction + Bug Fixes: COMPLETE** ✅

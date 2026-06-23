@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"testing"
 
+	amqperrors "github.com/maxpert/amqp-go/errors"
 	"github.com/maxpert/amqp-go/interfaces"
 )
 
@@ -150,6 +151,17 @@ func newTestAuthenticator(t *testing.T, users []UserEntry) *FileAuthenticator {
 	return auth
 }
 
+// getUser is a test helper that fails the test if GetUser returns an error,
+// preventing nil-user masking bugs (review issue m4).
+func getUser(t *testing.T, auth *FileAuthenticator, username string) *interfaces.User {
+	t.Helper()
+	user, err := auth.GetUser(username)
+	if err != nil {
+		t.Fatalf("GetUser(%q) failed: %v", username, err)
+	}
+	return user
+}
+
 func TestAuthorizeExchangeDeclareAllowed(t *testing.T) {
 	auth := newTestAuthenticator(t, []UserEntry{
 		{
@@ -161,7 +173,7 @@ func TestAuthorizeExchangeDeclareAllowed(t *testing.T) {
 		},
 	})
 
-	user, _ := auth.GetUser("admin")
+	user := getUser(t, auth, "admin")
 	op := interfaces.Operation{Action: interfaces.ActionConfigure, ResourceType: interfaces.ResourceExchange, Resource: "my-exchange", VHost: "/"}
 
 	if err := auth.Authorize(user, op); err != nil {
@@ -180,7 +192,7 @@ func TestAuthorizeExchangeDeclareRefused(t *testing.T) {
 		},
 	})
 
-	user, _ := auth.GetUser("producer")
+	user := getUser(t, auth, "producer")
 	op := interfaces.Operation{Action: interfaces.ActionConfigure, ResourceType: interfaces.ResourceExchange, Resource: "my-exchange", VHost: "/"}
 
 	if err := auth.Authorize(user, op); err == nil {
@@ -199,7 +211,7 @@ func TestAuthorizeBasicPublishAllowed(t *testing.T) {
 		},
 	})
 
-	user, _ := auth.GetUser("producer")
+	user := getUser(t, auth, "producer")
 	op := interfaces.Operation{Action: interfaces.ActionWrite, ResourceType: interfaces.ResourceExchange, Resource: "my-exchange", VHost: "/"}
 
 	if err := auth.Authorize(user, op); err != nil {
@@ -218,7 +230,7 @@ func TestAuthorizeBasicPublishRefused(t *testing.T) {
 		},
 	})
 
-	user, _ := auth.GetUser("consumer")
+	user := getUser(t, auth, "consumer")
 	op := interfaces.Operation{Action: interfaces.ActionWrite, ResourceType: interfaces.ResourceExchange, Resource: "my-exchange", VHost: "/"}
 
 	if err := auth.Authorize(user, op); err == nil {
@@ -237,7 +249,7 @@ func TestAuthorizeBasicConsumeAllowed(t *testing.T) {
 		},
 	})
 
-	user, _ := auth.GetUser("consumer")
+	user := getUser(t, auth, "consumer")
 	op := interfaces.Operation{Action: interfaces.ActionRead, ResourceType: interfaces.ResourceQueue, Resource: "my-queue", VHost: "/"}
 
 	if err := auth.Authorize(user, op); err != nil {
@@ -256,7 +268,7 @@ func TestAuthorizeBasicConsumeRefused(t *testing.T) {
 		},
 	})
 
-	user, _ := auth.GetUser("producer")
+	user := getUser(t, auth, "producer")
 	op := interfaces.Operation{Action: interfaces.ActionRead, ResourceType: interfaces.ResourceQueue, Resource: "my-queue", VHost: "/"}
 
 	if err := auth.Authorize(user, op); err == nil {
@@ -275,7 +287,7 @@ func TestAuthorizeBasicGetAllowed(t *testing.T) {
 		},
 	})
 
-	user, _ := auth.GetUser("reader")
+	user := getUser(t, auth, "reader")
 	op := interfaces.Operation{Action: interfaces.ActionRead, ResourceType: interfaces.ResourceQueue, Resource: "my-queue", VHost: "/"}
 
 	if err := auth.Authorize(user, op); err != nil {
@@ -294,7 +306,7 @@ func TestAuthorizeBasicGetRefused(t *testing.T) {
 		},
 	})
 
-	user, _ := auth.GetUser("writer")
+	user := getUser(t, auth, "writer")
 	op := interfaces.Operation{Action: interfaces.ActionRead, ResourceType: interfaces.ResourceQueue, Resource: "my-queue", VHost: "/"}
 
 	if err := auth.Authorize(user, op); err == nil {
@@ -313,7 +325,7 @@ func TestAuthorizeQueueDeclareAllowed(t *testing.T) {
 		},
 	})
 
-	user, _ := auth.GetUser("admin")
+	user := getUser(t, auth, "admin")
 	op := interfaces.Operation{Action: interfaces.ActionConfigure, ResourceType: interfaces.ResourceQueue, Resource: "my-queue", VHost: "/"}
 
 	if err := auth.Authorize(user, op); err != nil {
@@ -332,7 +344,7 @@ func TestAuthorizeQueueDeclareRefused(t *testing.T) {
 		},
 	})
 
-	user, _ := auth.GetUser("consumer")
+	user := getUser(t, auth, "consumer")
 	op := interfaces.Operation{Action: interfaces.ActionConfigure, ResourceType: interfaces.ResourceQueue, Resource: "my-queue", VHost: "/"}
 
 	if err := auth.Authorize(user, op); err == nil {
@@ -351,7 +363,7 @@ func TestAuthorizeQueueDeleteAllowed(t *testing.T) {
 		},
 	})
 
-	user, _ := auth.GetUser("admin")
+	user := getUser(t, auth, "admin")
 	op := interfaces.Operation{Action: interfaces.ActionConfigure, ResourceType: interfaces.ResourceQueue, Resource: "my-queue", VHost: "/"}
 
 	if err := auth.Authorize(user, op); err != nil {
@@ -370,7 +382,7 @@ func TestAuthorizeQueueDeleteRefused(t *testing.T) {
 		},
 	})
 
-	user, _ := auth.GetUser("consumer")
+	user := getUser(t, auth, "consumer")
 	op := interfaces.Operation{Action: interfaces.ActionConfigure, ResourceType: interfaces.ResourceQueue, Resource: "my-queue", VHost: "/"}
 
 	if err := auth.Authorize(user, op); err == nil {
@@ -389,7 +401,7 @@ func TestAuthorizeQueueBindAllowed(t *testing.T) {
 		},
 	})
 
-	user, _ := auth.GetUser("appuser")
+	user := getUser(t, auth, "appuser")
 
 	// queue.bind requires write on queue AND read on exchange
 	writeOp := interfaces.Operation{Action: interfaces.ActionWrite, ResourceType: interfaces.ResourceQueue, Resource: "app-queue", VHost: "/"}
@@ -414,7 +426,7 @@ func TestAuthorizeQueueBindRefusedOnQueue(t *testing.T) {
 		},
 	})
 
-	user, _ := auth.GetUser("appuser")
+	user := getUser(t, auth, "appuser")
 
 	// Write on a queue that doesn't match the pattern
 	writeOp := interfaces.Operation{Action: interfaces.ActionWrite, ResourceType: interfaces.ResourceQueue, Resource: "other-queue", VHost: "/"}
@@ -435,7 +447,7 @@ func TestAuthorizeQueueBindRefusedOnExchange(t *testing.T) {
 		},
 	})
 
-	user, _ := auth.GetUser("appuser")
+	user := getUser(t, auth, "appuser")
 
 	// Read on an exchange that doesn't match the pattern
 	readOp := interfaces.Operation{Action: interfaces.ActionRead, ResourceType: interfaces.ResourceExchange, Resource: "other-exchange", VHost: "/"}
@@ -456,7 +468,7 @@ func TestAuthorizeNoVHostPermission(t *testing.T) {
 		},
 	})
 
-	user, _ := auth.GetUser("restricted")
+	user := getUser(t, auth, "restricted")
 
 	// User has permission for /prod but not for /dev
 	op := interfaces.Operation{Action: interfaces.ActionConfigure, ResourceType: interfaces.ResourceQueue, Resource: "my-queue", VHost: "/dev"}
@@ -477,7 +489,7 @@ func TestAuthorizeDefaultExchangeMapping(t *testing.T) {
 		},
 	})
 
-	user, _ := auth.GetUser("publisher")
+	user := getUser(t, auth, "publisher")
 
 	// Publishing to default exchange (empty name) should match "amq.default"
 	op := interfaces.Operation{Action: interfaces.ActionWrite, ResourceType: interfaces.ResourceExchange, Resource: "", VHost: "/"}
@@ -498,7 +510,7 @@ func TestAuthorizeRestrictedRegexPattern(t *testing.T) {
 		},
 	})
 
-	user, _ := auth.GetUser("user1")
+	user := getUser(t, auth, "user1")
 
 	// Allowed: user1's own resources
 	declareOp := interfaces.Operation{Action: interfaces.ActionConfigure, ResourceType: interfaces.ResourceQueue, Resource: "user1-queue", VHost: "/"}
@@ -535,7 +547,7 @@ func TestAuthorizeLegacyPermissionsMigration(t *testing.T) {
 		t.Fatalf("failed to create authenticator: %v", err)
 	}
 
-	user, _ := auth.GetUser("legacy-user")
+	user := getUser(t, auth, "legacy-user")
 
 	// Legacy permissions should be migrated to allow-all on "/"
 	op := interfaces.Operation{Action: interfaces.ActionConfigure, ResourceType: interfaces.ResourceExchange, Resource: "any-exchange", VHost: "/"}
@@ -555,7 +567,7 @@ func TestAuthorizeExchangeDeleteAllowed(t *testing.T) {
 		},
 	})
 
-	user, _ := auth.GetUser("admin")
+	user := getUser(t, auth, "admin")
 	op := interfaces.Operation{Action: interfaces.ActionConfigure, ResourceType: interfaces.ResourceExchange, Resource: "my-exchange", VHost: "/"}
 
 	if err := auth.Authorize(user, op); err != nil {
@@ -574,7 +586,7 @@ func TestAuthorizeExchangeDeleteRefused(t *testing.T) {
 		},
 	})
 
-	user, _ := auth.GetUser("consumer")
+	user := getUser(t, auth, "consumer")
 	op := interfaces.Operation{Action: interfaces.ActionConfigure, ResourceType: interfaces.ResourceExchange, Resource: "my-exchange", VHost: "/"}
 
 	if err := auth.Authorize(user, op); err == nil {
@@ -593,7 +605,7 @@ func TestAuthorizeQueuePurgeAllowed(t *testing.T) {
 		},
 	})
 
-	user, _ := auth.GetUser("admin")
+	user := getUser(t, auth, "admin")
 	op := interfaces.Operation{Action: interfaces.ActionRead, ResourceType: interfaces.ResourceQueue, Resource: "my-queue", VHost: "/"}
 
 	if err := auth.Authorize(user, op); err != nil {
@@ -613,7 +625,7 @@ func TestAuthorizeMultipleVHosts(t *testing.T) {
 		},
 	})
 
-	user, _ := auth.GetUser("multi")
+	user := getUser(t, auth, "multi")
 
 	// Allowed on /dev
 	opDev := interfaces.Operation{Action: interfaces.ActionConfigure, ResourceType: interfaces.ResourceQueue, Resource: "any-queue", VHost: "/dev"}
@@ -631,5 +643,215 @@ func TestAuthorizeMultipleVHosts(t *testing.T) {
 	opProdFail := interfaces.Operation{Action: interfaces.ActionConfigure, ResourceType: interfaces.ResourceQueue, Resource: "dev-queue", VHost: "/prod"}
 	if err := auth.Authorize(user, opProdFail); err == nil {
 		t.Error("multi should be REFUSED from declaring 'dev-queue' on /prod")
+	}
+}
+
+// ============================================================================
+// Missing coverage from review (m3): queue.unbind, queue.purge refused,
+// nil user, concurrent RefreshUser+Authorize, typed error verification.
+// ============================================================================
+
+func TestAuthorizeQueueUnbindAllowed(t *testing.T) {
+	auth := newTestAuthenticator(t, []UserEntry{
+		{
+			Username:     "appuser",
+			PasswordHash: "$2a$10$placeholder",
+			VHostPermissions: []interfaces.VHostPermission{
+				{VHost: "/", Permission: interfaces.Permission{Configure: "^app-.*", Write: "^app-.*", Read: ".*"}},
+			},
+		},
+	})
+
+	user := getUser(t, auth, "appuser")
+
+	// queue.unbind requires write on queue AND read on exchange (same as queue.bind)
+	writeOp := interfaces.Operation{Action: interfaces.ActionWrite, ResourceType: interfaces.ResourceQueue, Resource: "app-queue", VHost: "/"}
+	readOp := interfaces.Operation{Action: interfaces.ActionRead, ResourceType: interfaces.ResourceExchange, Resource: "amq.topic", VHost: "/"}
+
+	if err := auth.Authorize(user, writeOp); err != nil {
+		t.Errorf("appuser with write=^app-.* should be allowed to unbind queue 'app-queue': %v", err)
+	}
+	if err := auth.Authorize(user, readOp); err != nil {
+		t.Errorf("appuser with read=.* should be allowed to unbind from exchange 'amq.topic': %v", err)
+	}
+}
+
+func TestAuthorizeQueueUnbindRefusedOnQueue(t *testing.T) {
+	auth := newTestAuthenticator(t, []UserEntry{
+		{
+			Username:     "appuser",
+			PasswordHash: "$2a$10$placeholder",
+			VHostPermissions: []interfaces.VHostPermission{
+				{VHost: "/", Permission: interfaces.Permission{Configure: "^app-.*", Write: "^app-.*", Read: ".*"}},
+			},
+		},
+	})
+
+	user := getUser(t, auth, "appuser")
+
+	writeOp := interfaces.Operation{Action: interfaces.ActionWrite, ResourceType: interfaces.ResourceQueue, Resource: "other-queue", VHost: "/"}
+
+	if err := auth.Authorize(user, writeOp); err == nil {
+		t.Error("appuser with write=^app-.* should be REFUSED from unbinding queue 'other-queue'")
+	}
+}
+
+func TestAuthorizeQueuePurgeRefused(t *testing.T) {
+	auth := newTestAuthenticator(t, []UserEntry{
+		{
+			Username:     "writer",
+			PasswordHash: "$2a$10$placeholder",
+			VHostPermissions: []interfaces.VHostPermission{
+				{VHost: "/", Permission: interfaces.Permission{Configure: "^$", Write: ".*", Read: "^$"}},
+			},
+		},
+	})
+
+	user := getUser(t, auth, "writer")
+	op := interfaces.Operation{Action: interfaces.ActionRead, ResourceType: interfaces.ResourceQueue, Resource: "my-queue", VHost: "/"}
+
+	if err := auth.Authorize(user, op); err == nil {
+		t.Error("writer with read=^$ should be REFUSED from purging queue")
+	}
+}
+
+func TestAuthorizeNilUser(t *testing.T) {
+	auth := newTestAuthenticator(t, []UserEntry{
+		{
+			Username:     "admin",
+			PasswordHash: "$2a$10$placeholder",
+			VHostPermissions: []interfaces.VHostPermission{
+				{VHost: "/", Permission: interfaces.Permission{Configure: ".*", Write: ".*", Read: ".*"}},
+			},
+		},
+	})
+
+	op := interfaces.Operation{Action: interfaces.ActionConfigure, ResourceType: interfaces.ResourceExchange, Resource: "test", VHost: "/"}
+
+	if err := auth.Authorize(nil, op); err == nil {
+		t.Error("Authorize with nil user should return an error")
+	}
+}
+
+func TestAuthorizeReturnsTypedError(t *testing.T) {
+	auth := newTestAuthenticator(t, []UserEntry{
+		{
+			Username:     "consumer",
+			PasswordHash: "$2a$10$placeholder",
+			VHostPermissions: []interfaces.VHostPermission{
+				{VHost: "/", Permission: interfaces.Permission{Configure: "^$", Write: "^$", Read: ".*"}},
+			},
+		},
+	})
+
+	user := getUser(t, auth, "consumer")
+	op := interfaces.Operation{Action: interfaces.ActionWrite, ResourceType: interfaces.ResourceExchange, Resource: "my-exchange", VHost: "/"}
+
+	err := auth.Authorize(user, op)
+	if err == nil {
+		t.Fatal("expected error for refused operation")
+	}
+
+	if !amqperrors.IsAccessRefused(err) {
+		t.Errorf("expected access-refused (403) error, got: %v", err)
+	}
+}
+
+func TestAuthorizeNoVHostPermissionReturnsTypedError(t *testing.T) {
+	auth := newTestAuthenticator(t, []UserEntry{
+		{
+			Username:     "restricted",
+			PasswordHash: "$2a$10$placeholder",
+			VHostPermissions: []interfaces.VHostPermission{
+				{VHost: "/prod", Permission: interfaces.Permission{Configure: ".*", Write: ".*", Read: ".*"}},
+			},
+		},
+	})
+
+	user := getUser(t, auth, "restricted")
+	op := interfaces.Operation{Action: interfaces.ActionConfigure, ResourceType: interfaces.ResourceQueue, Resource: "my-queue", VHost: "/dev"}
+
+	err := auth.Authorize(user, op)
+	if err == nil {
+		t.Fatal("expected error for vhost without permission")
+	}
+
+	if !amqperrors.IsAccessRefused(err) {
+		t.Errorf("expected access-refused (403) error for missing vhost permission, got: %v", err)
+	}
+}
+
+func TestAuthorizeConcurrentRefreshUser(t *testing.T) {
+	auth := newTestAuthenticator(t, []UserEntry{
+		{
+			Username:     "testuser",
+			PasswordHash: "$2a$10$placeholder",
+			VHostPermissions: []interfaces.VHostPermission{
+				{VHost: "/", Permission: interfaces.Permission{Configure: ".*", Write: ".*", Read: ".*"}},
+			},
+		},
+	})
+
+	user := getUser(t, auth, "testuser")
+	op := interfaces.Operation{Action: interfaces.ActionWrite, ResourceType: interfaces.ResourceExchange, Resource: "test-exchange", VHost: "/"}
+
+	done := make(chan struct{})
+
+	// Concurrent goroutine: repeatedly refresh the user
+	go func() {
+		defer close(done)
+		for i := 0; i < 100; i++ {
+			_ = auth.RefreshUser(user)
+		}
+	}()
+
+	// Main goroutine: repeatedly authorize while refresh runs
+	for i := 0; i < 100; i++ {
+		if err := auth.Authorize(user, op); err != nil {
+			t.Errorf("Authorize failed during concurrent RefreshUser (iter %d): %v", i, err)
+		}
+	}
+
+	<-done
+}
+
+func TestAuthorizeLegacyPermissionsFaithfulMigration(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "auth.json")
+
+	// Legacy user with only "read" permission — should NOT get write or configure
+	writeAuthFile(t, path, []UserEntry{
+		{
+			Username:     "readonly",
+			PasswordHash: "$2a$10$placeholder",
+			LegacyPermissions: []legacyPermission{
+				{Resource: ".*", Action: "read", Pattern: ".*"},
+			},
+		},
+	})
+
+	auth, err := NewFileAuthenticator(path)
+	if err != nil {
+		t.Fatalf("failed to create authenticator: %v", err)
+	}
+
+	user := getUser(t, auth, "readonly")
+
+	// Read should be allowed
+	readOp := interfaces.Operation{Action: interfaces.ActionRead, ResourceType: interfaces.ResourceQueue, Resource: "my-queue", VHost: "/"}
+	if err := auth.Authorize(user, readOp); err != nil {
+		t.Errorf("legacy read-only user should be allowed to read: %v", err)
+	}
+
+	// Write should be refused (legacy only had read, not write)
+	writeOp := interfaces.Operation{Action: interfaces.ActionWrite, ResourceType: interfaces.ResourceExchange, Resource: "my-exchange", VHost: "/"}
+	if err := auth.Authorize(user, writeOp); err == nil {
+		t.Error("legacy read-only user should be REFUSED from writing (faithful migration, not allow-all)")
+	}
+
+	// Configure should be refused (legacy only had read, not configure)
+	configureOp := interfaces.Operation{Action: interfaces.ActionConfigure, ResourceType: interfaces.ResourceQueue, Resource: "my-queue", VHost: "/"}
+	if err := auth.Authorize(user, configureOp); err == nil {
+		t.Error("legacy read-only user should be REFUSED from configure (faithful migration, not allow-all)")
 	}
 }

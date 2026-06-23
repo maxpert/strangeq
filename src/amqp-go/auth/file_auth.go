@@ -3,9 +3,12 @@ package auth
 import (
 	"encoding/json"
 	"fmt"
+	"log"
 	"os"
+	"slices"
 	"sync"
 
+	amqperrors "github.com/maxpert/amqp-go/errors"
 	"github.com/maxpert/amqp-go/interfaces"
 	"golang.org/x/crypto/bcrypt"
 )
@@ -80,11 +83,28 @@ func (f *FileAuthenticator) load() error {
 	f.users = make(map[string]*UserEntry)
 	for i := range authFile.Users {
 		user := &authFile.Users[i]
-		// Migrate old permissions format to new vhost_permissions format
+		// Migrate old permissions format to new vhost_permissions format.
+		// Faithfully map each legacy Action to the corresponding permission field
+		// using its Pattern. Actions absent from the legacy list default to "^$"
+		// (deny all). Unknown actions are logged and treated as deny.
 		if len(user.VHostPermissions) == 0 && len(user.LegacyPermissions) > 0 {
-			user.VHostPermissions = []interfaces.VHostPermission{
-				{VHost: "/", Permission: interfaces.Permission{Configure: ".*", Write: ".*", Read: ".*"}},
+			migrated := interfaces.Permission{Configure: "^$", Write: "^$", Read: "^$"}
+			for _, lp := range user.LegacyPermissions {
+				switch lp.Action {
+				case "configure":
+					migrated.Configure = lp.Pattern
+				case "write":
+					migrated.Write = lp.Pattern
+				case "read":
+					migrated.Read = lp.Pattern
+				default:
+					log.Printf("[auth] WARNING: unknown legacy permission action %q for user %q, ignoring", lp.Action, user.Username)
+				}
 			}
+			user.VHostPermissions = []interfaces.VHostPermission{
+				{VHost: "/", Permission: migrated},
+			}
+			log.Printf("[auth] WARNING: migrated legacy permissions for user %q to vhost_permissions on / — please update auth file", user.Username)
 		}
 		f.users[user.Username] = user
 	}
@@ -159,12 +179,13 @@ func (f *FileAuthenticator) Authenticate(username, password string) (*interfaces
 		return nil, fmt.Errorf("invalid password")
 	}
 
-	// Create user object
+	// Create user object (clone slices to avoid sharing backing arrays with UserEntry)
 	user := &interfaces.User{
 		Username:         entry.Username,
-		VHostPermissions: entry.VHostPermissions,
-		Tags:             entry.Tags,
-		Groups:           entry.Groups,
+		VHostPermissions: slices.Clone(entry.VHostPermissions),
+		Tags:             slices.Clone(entry.Tags),
+		Groups:           slices.Clone(entry.Groups),
+		LoopbackOnly:     entry.LoopbackOnly,
 		Metadata:         entry.Metadata,
 	}
 
@@ -176,11 +197,17 @@ func (f *FileAuthenticator) Authenticate(username, password string) (*interfaces
 // (configure/write/read) of regex patterns. The resource name is matched
 // against the appropriate pattern based on the operation action.
 //
-// Returns nil if authorized, or a non-nil error (ErrAccessRefused) if not.
+// Returns nil if authorized, or an *amqperrors.AuthError with code 403
+// (access-refused) if not.
 func (f *FileAuthenticator) Authorize(user *interfaces.User, operation interfaces.Operation) error {
 	if user == nil {
-		return fmt.Errorf("cannot authorize nil user")
+		return amqperrors.NewAuthError(amqperrors.AccessRefused, "cannot authorize nil user", "", "", string(operation.Action))
 	}
+
+	// Hold a read lock on the user's mutable fields to prevent concurrent
+	// RefreshUser from mutating them mid-check.
+	user.RLock()
+	defer user.RUnlock()
 
 	// Find the user's VHostPermission for the operation's vhost.
 	// If the user has no permission entry for this vhost, refuse access.
@@ -192,7 +219,9 @@ func (f *FileAuthenticator) Authorize(user *interfaces.User, operation interface
 		}
 	}
 	if vhostPerm == nil {
-		return fmt.Errorf("access to vhost %s refused for user %s", operation.VHost, user.Username)
+		return amqperrors.NewAuthError(amqperrors.AccessRefused,
+			fmt.Sprintf("access to vhost %s refused for user %s", operation.VHost, user.Username),
+			user.Username, operation.VHost, string(operation.Action))
 	}
 
 	// Normalize the default exchange name (empty → "amq.default")
@@ -205,8 +234,11 @@ func (f *FileAuthenticator) Authorize(user *interfaces.User, operation interface
 	// Match the resource name against the appropriate regex pattern
 	// for the operation's action (configure/write/read).
 	if !vhostPerm.Permission.Matches(operation.Action, resourceName) {
-		return fmt.Errorf("access to %s %s refused for user %s in vhost %s",
-			operation.ResourceType, operation.Resource, user.Username, operation.VHost)
+		return amqperrors.NewAuthorizationFailed(
+			user.Username,
+			fmt.Sprintf("%s %s", operation.ResourceType, operation.Resource),
+			fmt.Sprintf("%s in vhost %s", operation.Action, operation.VHost),
+		)
 	}
 
 	return nil
@@ -224,9 +256,10 @@ func (f *FileAuthenticator) GetUser(username string) (*interfaces.User, error) {
 
 	user := &interfaces.User{
 		Username:         entry.Username,
-		VHostPermissions: entry.VHostPermissions,
-		Tags:             entry.Tags,
-		Groups:           entry.Groups,
+		VHostPermissions: slices.Clone(entry.VHostPermissions),
+		Tags:             slices.Clone(entry.Tags),
+		Groups:           slices.Clone(entry.Groups),
+		LoopbackOnly:     entry.LoopbackOnly,
 		Metadata:         entry.Metadata,
 	}
 
@@ -244,9 +277,14 @@ func (f *FileAuthenticator) RefreshUser(user *interfaces.User) error {
 		return err
 	}
 
+	// Hold a write lock while updating mutable fields to prevent concurrent
+	// Authorize from reading partially-updated data.
+	user.Lock()
+	defer user.Unlock()
 	user.VHostPermissions = updated.VHostPermissions
 	user.Tags = updated.Tags
 	user.Groups = updated.Groups
+	user.LoopbackOnly = updated.LoopbackOnly
 	user.Metadata = updated.Metadata
 
 	return nil

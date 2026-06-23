@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net"
 	"regexp"
+	"sync"
 	"time"
 )
 
@@ -62,14 +63,34 @@ type Authenticator interface {
 	RefreshUser(user *User) error
 }
 
-// User represents an authenticated user
+// User represents an authenticated user. A User is shared across channels
+// within a connection and may be refreshed by a background goroutine;
+// the mu mutex protects mutable fields (VHostPermissions, Tags, Groups,
+// Metadata) from concurrent access between Authorize (reader) and
+// RefreshUser (writer). Callers must use the pointer (*User), not a copy,
+// because sync.RWMutex is not safe to copy.
 type User struct {
 	Username         string
 	VHostPermissions []VHostPermission
 	Tags             []string
 	Groups           []string
+	LoopbackOnly     bool // if true, user may only connect from localhost (RabbitMQ guest restriction)
 	Metadata         map[string]interface{}
+
+	// mu protects mutable fields from concurrent Authorize/RefreshUser.
+	// It is unexported and not serialized (JSON/binary).
+	mu sync.RWMutex
 }
+
+// RLock acquires a read lock on the user's mutable fields.
+// Callers of Authorize should hold this lock while reading VHostPermissions.
+func (u *User) RLock()   { u.mu.RLock() }
+func (u *User) RUnlock() { u.mu.RUnlock() }
+
+// Lock acquires a write lock on the user's mutable fields.
+// Callers of RefreshUser should hold this lock while updating fields.
+func (u *User) Lock()   { u.mu.Lock() }
+func (u *User) Unlock() { u.mu.Unlock() }
 
 // VHostPermission ties a permission triple to a specific virtual host.
 // A user must have a VHostPermission entry for a vhost to access it at all.
@@ -80,16 +101,41 @@ type VHostPermission struct {
 
 // Permission represents a per-vhost permission triple (RabbitMQ model).
 // Each field is a regular expression matched against resource names.
-// The empty string pattern (^$) matches nothing and denies all operations.
+// Patterns are unanchored (Go regexp default); use ^...$ to restrict matches.
+// An empty pattern denies all operations for that action.
+// The regex "^$" matches only the empty string; it is RabbitMQ's convention
+// for "deny all" — callers must ensure resource names are non-empty before
+// checking (e.g. server-generated queue names must be assigned first).
 type Permission struct {
 	Configure string `json:"configure"` // regex for configure ops (declare/delete resources)
 	Write     string `json:"write"`     // regex for write ops (publish, bind queue to exchange)
 	Read      string `json:"read"`      // regex for read ops (consume, get, bind exchange)
 }
 
+// regexCache caches compiled regex patterns so that hot-path operations
+// (basic.publish, basic.consume) do not recompile the same pattern on
+// every message. This is critical for throughput at 150k+ msg/s.
+var regexCache sync.Map // map[string]*regexp.Regexp
+
+// getCachedRegex returns a compiled regex from the cache, compiling and
+// caching it on first use. Returns nil for invalid patterns.
+func getCachedRegex(pattern string) *regexp.Regexp {
+	if cached, ok := regexCache.Load(pattern); ok {
+		return cached.(*regexp.Regexp)
+	}
+	compiled, err := regexp.Compile(pattern)
+	if err != nil {
+		return nil
+	}
+	// StoreOrLoad to avoid racing with another goroutine that compiled
+	// the same pattern concurrently — either instance is equivalent.
+	actual, _ := regexCache.LoadOrStore(pattern, compiled)
+	return actual.(*regexp.Regexp)
+}
+
 // Matches checks if the given resource name matches this permission's
 // regex pattern for the specified action. Returns false on invalid regex
-// or empty pattern.
+// or empty pattern. Uses a compiled-regex cache for hot-path performance.
 func (p Permission) Matches(action OperationAction, resourceName string) bool {
 	var pattern string
 	switch action {
@@ -105,11 +151,11 @@ func (p Permission) Matches(action OperationAction, resourceName string) bool {
 	if pattern == "" {
 		return false
 	}
-	matched, err := regexp.MatchString(pattern, resourceName)
-	if err != nil {
+	re := getCachedRegex(pattern)
+	if re == nil {
 		return false
 	}
-	return matched
+	return re.MatchString(resourceName)
 }
 
 // OperationAction represents the type of authorization action.
