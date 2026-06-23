@@ -6,6 +6,20 @@ Create a Go package `github.com/maxpert/amqp-go` that implements an AMQP 0.9.1 s
 ## Current Status (Updated: 2026-06-23)
 **Phase 15 - TLS + Authorization: IN PROGRESS** 🚧
 
+### Phase 15 - Commit A3: TLS Integration Test and Documentation (COMPLETE) ✅
+- ✅ `tls_integration_test.go` (new): 5 end-to-end TLS integration tests with real `amqp091-go` client
+  - `TestTLSIntegration_PublishConsumeRoundtrip`: amqps:// connect, declare queue, publish, consume, verify body roundtrip
+  - `TestTLSIntegration_MultipleConnections`: two simultaneous TLS clients, cross-client pub/sub
+  - `TestTLSIntegration_MutualAuthWithCert`: mutual TLS with client cert → AMQP operations work
+  - `TestTLSIntegration_MutualAuthWithoutCertRejected`: mutual TLS without client cert → connection rejected
+  - `TestTLSIntegration_LargeMessageOverTLS`: 1MB message over TLS, byte-for-byte verification
+- ✅ `server/server.go`: `IsListening()` helper method for polling server readiness (checks `Listener != nil && !Shutdown`)
+- ✅ `docs/TLS.md` (new): comprehensive TLS documentation — quick start, cert generation (self-signed + production), configuration reference table, mutual TLS setup, TLS+auth simultaneous, performance considerations, port configuration
+- ✅ `config.sample.yaml`: updated TLS comments with link to docs/TLS.md
+- ✅ `README.md`: link to TLS Configuration guide
+- ✅ **Code review**: 1 round, 0 remaining issues (fixed: TLS.md moved to correct docs/ location, port 5671 in client examples, accurate mutual TLS error message, IsListening checks shutdown)
+- ✅ Full test suite passes with `-race` across all packages
+
 ### Phase 15 - Commit A2: Builder Wiring and CLI Flags (COMPLETE) ✅
 - ✅ `server/builder.go`: `WithTLSMutualAuth(caFile)` builder method — self-enables TLS (sets `TLSEnabled=true`) so missing cert/key fails explicitly in `Validate()` instead of silently downgrading to plaintext
 - ✅ `config/config.go`: `Validate()` now checks CA file existence when `TLSEnabled && TLSCAFile != ""` (was: only checked cert/key)

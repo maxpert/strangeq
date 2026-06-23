@@ -261,6 +261,7 @@ Key metrics:
 - [Configuration Guide](docs/CONFIGURATION.md) - Detailed configuration options
 - [Authentication Setup](docs/AUTHENTICATION.md) - Setting up user authentication
 - [Authorization Guide](docs/AUTHORIZATION.md) - Permission model and access control
+- [TLS Configuration](docs/TLS.md) - TLS encryption and mutual TLS setup
 - [Development Plan](docs/plan.md) - Project roadmap and implementation status
 - [Contributing Guidelines](CONTRIBUTING.md) - How to contribute
 - [Security Policy](SECURITY.md) - Security best practices

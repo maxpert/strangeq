@@ -104,6 +104,14 @@ func (s *Server) createListener() (net.Listener, error) {
 	return net.Listen("tcp", s.Addr)
 }
 
+// IsListening returns true if the server listener has been created and is ready
+// to accept connections.
+func (s *Server) IsListening() bool {
+	s.Mutex.RLock()
+	defer s.Mutex.RUnlock()
+	return s.Listener != nil && !s.Shutdown
+}
+
 // acceptLoop accepts connections in a loop until shutdown.
 func (s *Server) acceptLoop() error {
 	for {

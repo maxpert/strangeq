@@ -99,16 +99,17 @@ storage:
 # Security Configuration
 # ============================================================================
 security:
-  # Enable TLS/SSL encryption
+  # Enable TLS/SSL encryption (see docs/TLS.md for setup guide)
   tlsenabled: false
 
-  # Path to TLS certificate file (required if TLS enabled)
+  # Path to TLS certificate file (required if TLS enabled, PEM format)
   tlscertfile: ""
 
-  # Path to TLS private key file (required if TLS enabled)
+  # Path to TLS private key file (required if TLS enabled, PEM format)
   tlskeyfile: ""
 
-  # Path to TLS CA certificate file (optional, for client verification)
+  # Path to TLS CA certificate file (optional, enables mutual TLS when set)
+  # When set, server requires and verifies client certificates
   tlscafile: ""
 
   # Enable client authentication
