@@ -37,6 +37,7 @@ type Server struct {
 	MechanismRegistry  MechanismRegistry
 	MetricsCollector   MetricsCollector
 	StartTime          time.Time
+	metricsCancel      context.CancelFunc
 }
 
 // NewServer creates a new AMQP server with default storage
@@ -63,34 +64,62 @@ func NewServer(addr string) *Server {
 
 // Start starts the AMQP server
 func (s *Server) Start() error {
-	// Listen on the specified address
-	listener, err := net.Listen("tcp", s.Addr)
+	listener, err := s.createListener()
 	if err != nil {
-		return fmt.Errorf("failed to start server: %v", err)
+		return err
 	}
 
+	s.Mutex.Lock()
 	s.Listener = listener
-	s.Log.Info("AMQP server listening", zap.String("addr", s.Addr))
+	s.Mutex.Unlock()
+
+	if s.Config.Security.TLSEnabled {
+		s.Log.Info("AMQP server listening (TLS)", zap.String("addr", s.Addr))
+	} else {
+		s.Log.Info("AMQP server listening", zap.String("addr", s.Addr))
+	}
 
 	// Start system metrics collection in background
 	if s.MetricsCollector != nil {
-		ctx := context.Background()
+		ctx, cancel := context.WithCancel(context.Background())
+		s.Mutex.Lock()
+		s.metricsCancel = cancel
+		s.Mutex.Unlock()
 		go s.startSystemMetricsCollection(ctx)
 		s.Log.Info("Started system metrics collection")
 	}
 
-	// Accept connections
+	return s.acceptLoop()
+}
+
+// createListener creates the appropriate listener based on TLS configuration.
+func (s *Server) createListener() (net.Listener, error) {
+	if s.Config.Security.TLSEnabled {
+		tlsCfg, err := loadTLSConfig(s.Config.Security)
+		if err != nil {
+			return nil, fmt.Errorf("failed to load TLS config: %w", err)
+		}
+		return createTLSListener(s.Addr, tlsCfg)
+	}
+	return net.Listen("tcp", s.Addr)
+}
+
+// acceptLoop accepts connections in a loop until shutdown.
+func (s *Server) acceptLoop() error {
 	for {
 		conn, err := s.Listener.Accept()
 		if err != nil {
-			if s.Shutdown {
+			s.Mutex.RLock()
+			shutdown := s.Shutdown
+			s.Mutex.RUnlock()
+			if shutdown {
 				return nil
 			}
 			s.Log.Error("Error accepting connection", zap.Error(err))
+			time.Sleep(100 * time.Millisecond)
 			continue
 		}
 
-		// Handle the connection in a goroutine
 		go s.handleConnection(conn)
 	}
 }
@@ -494,28 +523,50 @@ func (s *Server) processChannelMethod(conn *protocol.Connection, frame *protocol
 	}
 }
 
-// processBasicMethod handles basic-class methods
+// Stop stops the server gracefully
 func (s *Server) Stop() error {
 	s.Mutex.Lock()
-	defer s.Mutex.Unlock()
-
 	s.Shutdown = true
-	if s.Listener != nil {
-		return s.Listener.Close()
+	ln := s.Listener
+	cancel := s.metricsCancel
+	s.Mutex.Unlock()
+
+	if cancel != nil {
+		cancel()
+	}
+
+	if ln != nil {
+		return ln.Close()
 	}
 	return nil
 }
 
 // StartWithQuitChannel starts the server and returns a quit channel that can be used to stop it
 func (s *Server) StartWithQuitChannel(quit <-chan struct{}) error {
-	// Listen on the specified address
-	listener, err := net.Listen("tcp", s.Addr)
+	listener, err := s.createListener()
 	if err != nil {
-		return fmt.Errorf("failed to start server: %v", err)
+		return fmt.Errorf("failed to start server: %w", err)
 	}
 
+	s.Mutex.Lock()
 	s.Listener = listener
-	s.Log.Info("AMQP server listening", zap.String("addr", s.Addr))
+	s.Mutex.Unlock()
+
+	if s.Config.Security.TLSEnabled {
+		s.Log.Info("AMQP server listening (TLS)", zap.String("addr", s.Addr))
+	} else {
+		s.Log.Info("AMQP server listening", zap.String("addr", s.Addr))
+	}
+
+	// Start system metrics collection in background
+	if s.MetricsCollector != nil {
+		ctx, cancel := context.WithCancel(context.Background())
+		s.Mutex.Lock()
+		s.metricsCancel = cancel
+		s.Mutex.Unlock()
+		go s.startSystemMetricsCollection(ctx)
+		s.Log.Info("Started system metrics collection")
+	}
 
 	// Accept connections
 	for {
@@ -524,7 +575,7 @@ func (s *Server) StartWithQuitChannel(quit <-chan struct{}) error {
 		errChan := make(chan error, 1)
 
 		go func() {
-			conn, err := s.Listener.Accept()
+			conn, err := listener.Accept()
 			connChan <- conn
 			errChan <- err
 		}()
@@ -533,10 +584,14 @@ func (s *Server) StartWithQuitChannel(quit <-chan struct{}) error {
 		case conn := <-connChan:
 			err := <-errChan
 			if err != nil {
-				if s.Shutdown {
+				s.Mutex.RLock()
+				shutdown := s.Shutdown
+				s.Mutex.RUnlock()
+				if shutdown {
 					return nil
 				}
 				s.Log.Error("Error accepting connection", zap.Error(err))
+				time.Sleep(100 * time.Millisecond)
 				continue
 			}
 
@@ -544,7 +599,14 @@ func (s *Server) StartWithQuitChannel(quit <-chan struct{}) error {
 			go s.handleConnection(conn)
 		case <-quit:
 			s.Log.Info("Server shutdown requested")
-			s.Listener.Close()
+			s.Mutex.Lock()
+			s.Shutdown = true
+			cancel := s.metricsCancel
+			s.Mutex.Unlock()
+			if cancel != nil {
+				cancel()
+			}
+			listener.Close()
 			return nil
 		}
 	}

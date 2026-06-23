@@ -132,9 +132,12 @@ func startAuthzTestServer(t *testing.T, port string) *server.Server {
 	// Wait for server to start
 	time.Sleep(500 * time.Millisecond)
 	t.Cleanup(func() {
+		srv.Mutex.Lock()
 		srv.Shutdown = true
-		if srv.Listener != nil {
-			srv.Listener.Close()
+		ln := srv.Listener
+		srv.Mutex.Unlock()
+		if ln != nil {
+			ln.Close()
 		}
 	})
 

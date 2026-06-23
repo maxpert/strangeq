@@ -6,6 +6,27 @@ Create a Go package `github.com/maxpert/amqp-go` that implements an AMQP 0.9.1 s
 ## Current Status (Updated: 2026-06-23)
 **Phase 15 - TLS + Authorization: IN PROGRESS** 🚧
 
+### Phase 15 - Commit A1: TLS Listener and Config Validation (COMPLETE) ✅
+- ✅ `server/tls.go`: `loadTLSConfig()` reads cert/key files, builds `*tls.Config` with MinVersion TLS 1.2, `PreferServerCipherSuites: true`
+  - When `TLSCAFile` set → mutual TLS: `ClientAuth: tls.RequireAndVerifyClientCert` + client CA pool
+  - When `TLSCAFile` empty → server-only TLS: `ClientAuth: tls.NoClientCert`
+  - Validates cert/key/CA file existence; returns errors for missing/empty paths
+- ✅ `server/tls.go`: `createTLSListener()` wraps `tls.Listen` for TLS-wrapped TCP
+- ✅ `server/server.go`: `Start()` refactored → `createListener()` routes to TLS or plain TCP based on `Security.TLSEnabled`; `acceptLoop()` extracted for reuse
+- ✅ `server/server.go`: `StartWithQuitChannel()` also uses `createListener()` (CRITICAL fix: was hardcoded `net.Listen("tcp")` — bypassed TLS)
+- ✅ `server/server.go`: `Stop()` fixed to cancel metrics goroutine via `metricsCancel` (MAJOR fix: was leaking goroutine via uncancellable `context.Background()`)
+- ✅ `server/server.go`: `acceptLoop()` and `StartWithQuitChannel()` read `s.Shutdown` under `s.Mutex` (MAJOR fix: data race)
+- ✅ `server/server.go`: `acceptLoop()` and `StartWithQuitChannel()` add 100ms backoff on Accept errors (MINOR fix: log flooding)
+- ✅ `server/server.go`: `StartWithQuitChannel()` sets `s.Shutdown = true` on quit, starts metrics, uses `%w` in errors (MINOR fixes)
+- ✅ **14 TLS tests pass** with `-race`:
+  - `TestLoadTLSConfig_*` (9 tests): valid cert/key, min version TLS 1.2, server-only no client cert, mutual TLS, missing cert/key/CA, empty paths
+  - `TestCreateTLSListener_*` (4 tests): valid config, TLS handshake with echo, mutual TLS client cert required (server rejects), mutual TLS with client cert
+  - `TestServerStart_WithTLS` + `TestServerStart_PlainTCPWhenTLSDisabled`: full `Start()` path with listener polling, verifies TLS vs TCP routing
+- ✅ **Code review**: 3 rounds, 0 remaining issues from TLS changes (1 pre-existing MAJOR noted for separate fix)
+- ✅ Test cert generation helper: ECDSA P-256 self-signed cert with `IsCA: true`, `ServerAuth`+`ClientAuth` EKU, `localhost` SAN + loopback IPs
+- ✅ `loadCAPool()` test helper: reads CA file with error checking (no ignored errors)
+- ✅ Full test suite passes with `-race` across all packages
+
 ### Phase 15 - Commit B6: Documentation (COMPLETE) ✅
 - ✅ `docs/AUTHORIZATION.md`: permission model, operation→permission mapping, auth file format, loopback restriction, backward compatibility, configuration, error handling
 - ✅ `config.sample.yaml`: authorizationenabled comment with link to docs
