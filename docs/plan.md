@@ -3,7 +3,30 @@
 ## Goal
 Create a Go package `github.com/maxpert/amqp-go` that implements an AMQP 0.9.1 server based on the specification: https://www.rabbitmq.com/resources/specs/amqp0-9-1.extended.xml
 
-## Current Status (Updated: 2026-02-22)
+## Current Status (Updated: 2026-06-23)
+**Phase 15 - TLS + Authorization: IN PROGRESS** 🚧
+
+### Phase 15 - Commit B1: Permission Model Redesign (COMPLETE) ✅
+- ✅ **Redesigned Permission/Operation types** in `interfaces/server.go` to RabbitMQ's configure/write/read regex triple model
+  - `Permission` struct: `Configure`, `Write`, `Read` regex pattern fields (was: `Resource`/`Action`/`Pattern`)
+  - `Permission.Matches(action, resourceName)` method for regex matching with safe failure
+  - `Operation` struct: `Action` (OperationAction), `ResourceType` (ResourceType), `Resource`, `VHost`
+  - `OperationAction` enum: `ActionConfigure`, `ActionWrite`, `ActionRead`
+  - `ResourceType` enum: `ResourceExchange`, `ResourceQueue`, `ResourceVHost`
+  - `VHostPermission` struct: ties a permission triple to a specific vhost
+  - `User` struct: `VHostPermissions []VHostPermission` replaces `Permissions []Permission`; added `Tags []string`
+  - `NormalizeExchangeName()` + `DefaultExchangeName` constant: maps empty default exchange to "amq.default" for permission checks
+- ✅ **Implemented `FileAuthenticator.Authorize()`** in `auth/file_auth.go` (was stub `return nil`)
+  - Finds user's VHostPermission for the operation's vhost; refuses if none exists
+  - Normalizes default exchange name (empty → "amq.default") for permission checks
+  - Matches resource name against the appropriate regex pattern (configure/write/read)
+  - Returns descriptive error on refusal
+- ✅ **Backward compatibility**: old `permissions` field (resource/action/pattern) auto-migrates to `vhost_permissions` with allow-all on "/" vhost
+- ✅ **Updated `auth/anonymous.go`**: ANONYMOUS mechanism now creates guest user with full VHostPermissions on "/" + `Tags: ["administrator"]`
+- ✅ **Updated `auth/auth_test.go`**: MockAuthenticator uses new VHostPermissions format
+- ✅ **35 auth tests pass** with `-race` (9 Permission.Matches tests, 2 NormalizeExchangeName tests, 24 Authorize tests covering all AMQP 0.9.1 operations per the RabbitMQ permission table)
+- ✅ **Full test suite passes** (all packages, `-race`, 0 failures)
+
 **Phase 14 - Log Compaction + Bug Fixes: COMPLETE** ✅
 
 ### Phase 14 - Post-Review Bug Fixes (Code Review Pass):

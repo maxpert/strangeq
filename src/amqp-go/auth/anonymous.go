@@ -17,11 +17,21 @@ func (a *AnonymousMechanism) Name() string {
 // This mechanism accepts any connection and creates a guest user
 // The response field is ignored as per SASL ANONYMOUS specification
 func (a *AnonymousMechanism) Authenticate(response []byte, authenticator interfaces.Authenticator) (*interfaces.User, error) {
-	// Create a guest user with minimal permissions
+	// Create a guest user with full permissions on default vhost
 	user := &interfaces.User{
-		Username:    "guest",
-		Permissions: []interfaces.Permission{},
-		Groups:      []string{"guest"},
+		Username: "guest",
+		VHostPermissions: []interfaces.VHostPermission{
+			{
+				VHost: "/",
+				Permission: interfaces.Permission{
+					Configure: ".*",
+					Write:     ".*",
+					Read:      ".*",
+				},
+			},
+		},
+		Tags:   []string{"administrator"},
+		Groups: []string{"guest"},
 		Metadata: map[string]interface{}{
 			"mechanism": "ANONYMOUS",
 		},

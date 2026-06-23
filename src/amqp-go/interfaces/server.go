@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"net"
+	"regexp"
 	"time"
 )
 
@@ -63,25 +64,94 @@ type Authenticator interface {
 
 // User represents an authenticated user
 type User struct {
-	Username    string
-	Permissions []Permission
-	Groups      []string
-	Metadata    map[string]interface{}
+	Username         string
+	VHostPermissions []VHostPermission
+	Tags             []string
+	Groups           []string
+	Metadata         map[string]interface{}
 }
 
-// Permission represents a user permission
+// VHostPermission ties a permission triple to a specific virtual host.
+// A user must have a VHostPermission entry for a vhost to access it at all.
+type VHostPermission struct {
+	VHost      string     `json:"vhost"`
+	Permission Permission `json:"permission"`
+}
+
+// Permission represents a per-vhost permission triple (RabbitMQ model).
+// Each field is a regular expression matched against resource names.
+// The empty string pattern (^$) matches nothing and denies all operations.
 type Permission struct {
-	Resource string // exchange, queue, etc.
-	Action   string // read, write, configure, etc.
-	Pattern  string // resource name pattern
+	Configure string `json:"configure"` // regex for configure ops (declare/delete resources)
+	Write     string `json:"write"`     // regex for write ops (publish, bind queue to exchange)
+	Read      string `json:"read"`      // regex for read ops (consume, get, bind exchange)
 }
 
-// Operation represents an operation requiring authorization
+// Matches checks if the given resource name matches this permission's
+// regex pattern for the specified action. Returns false on invalid regex
+// or empty pattern.
+func (p Permission) Matches(action OperationAction, resourceName string) bool {
+	var pattern string
+	switch action {
+	case ActionConfigure:
+		pattern = p.Configure
+	case ActionWrite:
+		pattern = p.Write
+	case ActionRead:
+		pattern = p.Read
+	default:
+		return false
+	}
+	if pattern == "" {
+		return false
+	}
+	matched, err := regexp.MatchString(pattern, resourceName)
+	if err != nil {
+		return false
+	}
+	return matched
+}
+
+// OperationAction represents the type of authorization action.
+// These map to RabbitMQ's configure/write/read permission model.
+type OperationAction string
+
+const (
+	ActionConfigure OperationAction = "configure"
+	ActionWrite     OperationAction = "write"
+	ActionRead      OperationAction = "read"
+)
+
+// ResourceType represents the type of AMQP resource being authorized.
+type ResourceType string
+
+const (
+	ResourceExchange ResourceType = "exchange"
+	ResourceQueue    ResourceType = "queue"
+	ResourceVHost    ResourceType = "vhost"
+)
+
+// Operation represents an authorization check request.
 type Operation struct {
-	Type     string                 // "exchange.declare", "queue.bind", "basic.publish", etc.
-	Resource string                 // resource name
-	Action   string                 // specific action
-	Context  map[string]interface{} // additional context
+	Action       OperationAction // configure, write, or read
+	ResourceType ResourceType    // exchange, queue, or vhost
+	Resource     string          // resource name (exchange/queue name, or vhost name)
+	VHost        string          // virtual host context for the operation
+}
+
+// DefaultExchangeName is the name used for permission checks on the AMQP
+// default exchange (empty name). RabbitMQ maps the blank default exchange
+// name to "amq.default" when performing permission checks.
+const DefaultExchangeName = "amq.default"
+
+// NormalizeExchangeName maps the empty default exchange name to the
+// canonical name used for permission checks. Non-empty names are returned
+// unchanged.
+func NormalizeExchangeName(name string) string {
+	if name == "" {
+		return DefaultExchangeName
+	}
+	return name
 }
 
 // Server defines the interface for AMQP server implementations

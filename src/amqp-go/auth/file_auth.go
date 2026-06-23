@@ -19,11 +19,23 @@ type FileAuthenticator struct {
 
 // UserEntry represents a user entry in the auth file
 type UserEntry struct {
-	Username     string                  `json:"username"`
-	PasswordHash string                  `json:"password_hash"` // bcrypt hash
-	Permissions  []interfaces.Permission `json:"permissions"`
-	Groups       []string                `json:"groups"`
-	Metadata     map[string]interface{}  `json:"metadata"`
+	Username         string                       `json:"username"`
+	PasswordHash     string                       `json:"password_hash"` // bcrypt hash
+	VHostPermissions []interfaces.VHostPermission `json:"vhost_permissions"`
+	Tags             []string                     `json:"tags"`
+	Groups           []string                     `json:"groups"`
+	LoopbackOnly     bool                         `json:"loopback_only"`
+	Metadata         map[string]interface{}       `json:"metadata"`
+	// LegacyPermissions is the old permission format (resource/action/pattern).
+	// Migrated to VHostPermissions on load for backward compatibility.
+	LegacyPermissions []legacyPermission `json:"permissions,omitempty"`
+}
+
+// legacyPermission is the old permission format for backward compatibility.
+type legacyPermission struct {
+	Resource string `json:"resource"`
+	Action   string `json:"action"`
+	Pattern  string `json:"pattern"`
 }
 
 // AuthFile represents the structure of the auth file
@@ -68,6 +80,12 @@ func (f *FileAuthenticator) load() error {
 	f.users = make(map[string]*UserEntry)
 	for i := range authFile.Users {
 		user := &authFile.Users[i]
+		// Migrate old permissions format to new vhost_permissions format
+		if len(user.VHostPermissions) == 0 && len(user.LegacyPermissions) > 0 {
+			user.VHostPermissions = []interfaces.VHostPermission{
+				{VHost: "/", Permission: interfaces.Permission{Configure: ".*", Write: ".*", Read: ".*"}},
+			}
+		}
 		f.users[user.Username] = user
 	}
 
@@ -87,24 +105,19 @@ func (f *FileAuthenticator) createDefaultFile() error {
 			{
 				Username:     "guest",
 				PasswordHash: string(hash),
-				Permissions: []interfaces.Permission{
+				VHostPermissions: []interfaces.VHostPermission{
 					{
-						Resource: ".*",
-						Action:   "read",
-						Pattern:  ".*",
-					},
-					{
-						Resource: ".*",
-						Action:   "write",
-						Pattern:  ".*",
-					},
-					{
-						Resource: ".*",
-						Action:   "configure",
-						Pattern:  ".*",
+						VHost: "/",
+						Permission: interfaces.Permission{
+							Configure: ".*",
+							Write:     ".*",
+							Read:      ".*",
+						},
 					},
 				},
-				Groups: []string{"guest"},
+				Tags:         []string{"administrator"},
+				Groups:       []string{"guest"},
+				LoopbackOnly: true,
 				Metadata: map[string]interface{}{
 					"created": "default",
 				},
@@ -148,19 +161,54 @@ func (f *FileAuthenticator) Authenticate(username, password string) (*interfaces
 
 	// Create user object
 	user := &interfaces.User{
-		Username:    entry.Username,
-		Permissions: entry.Permissions,
-		Groups:      entry.Groups,
-		Metadata:    entry.Metadata,
+		Username:         entry.Username,
+		VHostPermissions: entry.VHostPermissions,
+		Tags:             entry.Tags,
+		Groups:           entry.Groups,
+		Metadata:         entry.Metadata,
 	}
 
 	return user, nil
 }
 
-// Authorize checks if a user has permission for an operation
+// Authorize checks if a user has permission for an operation per the
+// RabbitMQ permission model. Each user has a per-vhost permission triple
+// (configure/write/read) of regex patterns. The resource name is matched
+// against the appropriate pattern based on the operation action.
+//
+// Returns nil if authorized, or a non-nil error (ErrAccessRefused) if not.
 func (f *FileAuthenticator) Authorize(user *interfaces.User, operation interfaces.Operation) error {
-	// TODO: Implement permission checking logic
-	// For now, allow all operations for authenticated users
+	if user == nil {
+		return fmt.Errorf("cannot authorize nil user")
+	}
+
+	// Find the user's VHostPermission for the operation's vhost.
+	// If the user has no permission entry for this vhost, refuse access.
+	var vhostPerm *interfaces.VHostPermission
+	for i := range user.VHostPermissions {
+		if user.VHostPermissions[i].VHost == operation.VHost {
+			vhostPerm = &user.VHostPermissions[i]
+			break
+		}
+	}
+	if vhostPerm == nil {
+		return fmt.Errorf("access to vhost %s refused for user %s", operation.VHost, user.Username)
+	}
+
+	// Normalize the default exchange name (empty → "amq.default")
+	// for permission checks, per RabbitMQ behavior.
+	resourceName := operation.Resource
+	if operation.ResourceType == interfaces.ResourceExchange {
+		resourceName = interfaces.NormalizeExchangeName(resourceName)
+	}
+
+	// Match the resource name against the appropriate regex pattern
+	// for the operation's action (configure/write/read).
+	if !vhostPerm.Permission.Matches(operation.Action, resourceName) {
+		return fmt.Errorf("access to %s %s refused for user %s in vhost %s",
+			operation.ResourceType, operation.Resource, user.Username, operation.VHost)
+	}
+
 	return nil
 }
 
@@ -175,10 +223,11 @@ func (f *FileAuthenticator) GetUser(username string) (*interfaces.User, error) {
 	}
 
 	user := &interfaces.User{
-		Username:    entry.Username,
-		Permissions: entry.Permissions,
-		Groups:      entry.Groups,
-		Metadata:    entry.Metadata,
+		Username:         entry.Username,
+		VHostPermissions: entry.VHostPermissions,
+		Tags:             entry.Tags,
+		Groups:           entry.Groups,
+		Metadata:         entry.Metadata,
 	}
 
 	return user, nil
@@ -195,7 +244,8 @@ func (f *FileAuthenticator) RefreshUser(user *interfaces.User) error {
 		return err
 	}
 
-	user.Permissions = updated.Permissions
+	user.VHostPermissions = updated.VHostPermissions
+	user.Tags = updated.Tags
 	user.Groups = updated.Groups
 	user.Metadata = updated.Metadata
 

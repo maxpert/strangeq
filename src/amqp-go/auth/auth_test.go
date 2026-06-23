@@ -227,10 +227,20 @@ func (m *MockAuthenticator) Authenticate(username, password string) (*interfaces
 		return nil, interfaces.ErrInvalidCredentials
 	}
 	return &interfaces.User{
-		Username:    username,
-		Permissions: []interfaces.Permission{},
-		Groups:      []string{},
-		Metadata:    map[string]interface{}{},
+		Username: username,
+		VHostPermissions: []interfaces.VHostPermission{
+			{
+				VHost: "/",
+				Permission: interfaces.Permission{
+					Configure: ".*",
+					Write:     ".*",
+					Read:      ".*",
+				},
+			},
+		},
+		Tags:     []string{},
+		Groups:   []string{},
+		Metadata: map[string]interface{}{},
 	}, nil
 }
 
@@ -244,10 +254,20 @@ func (m *MockAuthenticator) GetUser(username string) (*interfaces.User, error) {
 		return nil, interfaces.ErrUserNotFound
 	}
 	return &interfaces.User{
-		Username:    username,
-		Permissions: []interfaces.Permission{},
-		Groups:      []string{},
-		Metadata:    map[string]interface{}{},
+		Username: username,
+		VHostPermissions: []interfaces.VHostPermission{
+			{
+				VHost: "/",
+				Permission: interfaces.Permission{
+					Configure: ".*",
+					Write:     ".*",
+					Read:      ".*",
+				},
+			},
+		},
+		Tags:     []string{},
+		Groups:   []string{},
+		Metadata: map[string]interface{}{},
 	}, nil
 }
 
