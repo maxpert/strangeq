@@ -17,6 +17,7 @@ type Connection struct {
 	Channels        sync.Map                   // map[uint16]*Channel - concurrent-safe map
 	Vhost           string                     // Virtual host for this connection
 	Username        string                     // Authenticated username
+	User            interface{}                // Authenticated *interfaces.User (interface{} to avoid import cycle; set once during handshake, immutable thereafter)
 	PendingMessages map[uint16]*PendingMessage // Track messages being published on each channel
 	FrameQueue      chan *Frame                // Buffer frames between reader and processor goroutines
 	Mutex           sync.RWMutex               // Protects connection state

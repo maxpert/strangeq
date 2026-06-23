@@ -6,6 +6,23 @@ Create a Go package `github.com/maxpert/amqp-go` that implements an AMQP 0.9.1 s
 ## Current Status (Updated: 2026-06-23)
 **Phase 15 - TLS + Authorization: IN PROGRESS** 🚧
 
+### Phase 15 - Commit B3: Vhost Access Check + Loopback Restriction (COMPLETE) ✅
+- ✅ **Vhost permission check at connection.open** (AMQP 0.9.1 spec "security" rule)
+  - When `AuthorizationEnabled`: checks user's `VHostPermissions` for the requested vhost
+  - Fail-closed: refuses connection if `conn.User` is nil when authorization is enabled (MAJOR-2 fix)
+  - Returns 402 (invalid-path) on vhost access denied
+- ✅ **Loopback restriction** (RabbitMQ guest restriction)
+  - Users with `LoopbackOnly=true` can only connect from localhost
+  - `isLoopbackConn()` checks `RemoteAddr()` is TCP loopback; denies non-TCP conservatively
+  - Returns 403 (access-refused) on loopback violation
+  - Enforced both with and without authorization enabled
+- ✅ **`conn.User` field** added to `protocol.Connection` (as `interface{}` to avoid import cycle)
+  - Set during `handleConnectionStartOK` after successful authentication
+  - Documented as set-once, immutable after handshake
+- ✅ **Single `RLock` for both vhost + loopback checks** (MAJOR-1 fix: prevents data race with concurrent `RefreshUser`)
+- ✅ **Named error constants** (`amqperrors.InvalidPath`, `amqperrors.AccessRefused`) instead of magic numbers
+- ✅ **8 tests pass** with `-race`: allowed, refused, auth-disabled, nil-user fail-closed, empty-permissions, loopback allowed/refused, non-guest non-loopback
+
 ### Phase 15 - Commit B1: Permission Model Redesign (COMPLETE) ✅
 - ✅ **Redesigned Permission/Operation types** in `interfaces/server.go` to RabbitMQ's configure/write/read regex triple model
   - `Permission` struct: `Configure`, `Write`, `Read` regex pattern fields (was: `Resource`/`Action`/`Pattern`)

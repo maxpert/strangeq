@@ -2,7 +2,9 @@ package server
 
 import (
 	"fmt"
+	"net"
 
+	amqperrors "github.com/maxpert/amqp-go/errors"
 	"github.com/maxpert/amqp-go/interfaces"
 	"github.com/maxpert/amqp-go/protocol"
 	"go.uber.org/zap"
@@ -135,18 +137,86 @@ func (s *Server) processConnectionOpen(conn *protocol.Connection, frame *protoco
 		return err
 	}
 
-	// Validate the virtual host
-	// For now, allow "/" and empty string (which defaults to "/")
-	// In a real implementation, we'd have proper vhost management
-	if openMethod.VirtualHost != "/" && openMethod.VirtualHost != "" {
-		return fmt.Errorf("access to vhost %s not allowed", openMethod.VirtualHost)
+	// Normalize empty vhost to "/"
+	vhost := openMethod.VirtualHost
+	if vhost == "" {
+		vhost = "/"
+	}
+
+	// AMQP 0.9.1 spec, connection.open "security" rule (SHOULD):
+	//   "The server SHOULD verify that the client has permission to access
+	//    the specified virtual host."
+	// When authorization is enabled, fail-closed if there is no valid user.
+	if s.Config != nil && s.Config.Security.AuthorizationEnabled {
+		if conn.User == nil {
+			s.Log.Warn("Authorization enabled but no authenticated user",
+				zap.String("connection_id", conn.ID))
+			s.sendConnectionClose(conn, amqperrors.AccessRefused, "ACCESS_REFUSED",
+				"authorization enabled but no authenticated user")
+			return fmt.Errorf("authorization enabled but no authenticated user")
+		}
+		user, ok := conn.User.(*interfaces.User)
+		if !ok {
+			s.Log.Warn("Unsupported user type for authorization",
+				zap.String("connection_id", conn.ID))
+			s.sendConnectionClose(conn, amqperrors.AccessRefused, "ACCESS_REFUSED",
+				"unsupported user type for authorization")
+			return fmt.Errorf("unsupported user type for authorization")
+		}
+
+		// Hold RLock for both vhost permission and loopback checks to prevent
+		// concurrent RefreshUser from mutating fields mid-check.
+		user.RLock()
+		hasVHostPermission := false
+		for _, vhp := range user.VHostPermissions {
+			if vhp.VHost == vhost {
+				hasVHostPermission = true
+				break
+			}
+		}
+		loopbackOnly := user.LoopbackOnly
+		user.RUnlock()
+
+		if !hasVHostPermission {
+			s.Log.Warn("Vhost access refused",
+				zap.String("connection_id", conn.ID),
+				zap.String("username", user.Username),
+				zap.String("vhost", vhost))
+			s.sendConnectionClose(conn, amqperrors.InvalidPath, "INVALID_PATH",
+				fmt.Sprintf("access to vhost %s refused for user %s", vhost, user.Username))
+			return fmt.Errorf("access to vhost %s refused for user %s", vhost, user.Username)
+		}
+
+		// RabbitMQ loopback restriction: users with LoopbackOnly=true may only
+		// connect from localhost (loopback interface).
+		if loopbackOnly && !isLoopbackConn(conn.Conn) {
+			s.Log.Warn("Loopback restriction violated",
+				zap.String("connection_id", conn.ID),
+				zap.String("username", user.Username))
+			s.sendConnectionClose(conn, amqperrors.AccessRefused, "ACCESS_REFUSED",
+				fmt.Sprintf("user %s can only connect via localhost", user.Username))
+			return fmt.Errorf("user %s can only connect via localhost", user.Username)
+		}
+	} else if conn.User != nil {
+		// Authorization disabled, but still enforce loopback restriction
+		// for users that have it (e.g. guest via ANONYMOUS mechanism).
+		if user, ok := conn.User.(*interfaces.User); ok {
+			user.RLock()
+			loopbackOnly := user.LoopbackOnly
+			user.RUnlock()
+			if loopbackOnly && !isLoopbackConn(conn.Conn) {
+				s.Log.Warn("Loopback restriction violated",
+					zap.String("connection_id", conn.ID),
+					zap.String("username", user.Username))
+				s.sendConnectionClose(conn, amqperrors.AccessRefused, "ACCESS_REFUSED",
+					fmt.Sprintf("user %s can only connect via localhost", user.Username))
+				return fmt.Errorf("user %s can only connect via localhost", user.Username)
+			}
+		}
 	}
 
 	// Set the connection's vhost
-	conn.Vhost = openMethod.VirtualHost
-	if conn.Vhost == "" {
-		conn.Vhost = "/" // Default vhost
-	}
+	conn.Vhost = vhost
 
 	s.Log.Info("Connection opened",
 		zap.String("connection_id", conn.ID),
@@ -154,6 +224,19 @@ func (s *Server) processConnectionOpen(conn *protocol.Connection, frame *protoco
 
 	// Send connection.open-ok
 	return s.sendConnectionOpenOK(conn)
+}
+
+// isLoopbackConn checks if the remote address of a connection is a loopback address.
+// Returns false for non-TCP connections (conservative: deny by default).
+func isLoopbackConn(conn net.Conn) bool {
+	if conn == nil {
+		return false
+	}
+	addr, ok := conn.RemoteAddr().(*net.TCPAddr)
+	if !ok {
+		return false
+	}
+	return addr.IP.IsLoopback()
 }
 
 // handleConnectionStartOK handles the connection.start-ok method and performs authentication
@@ -206,6 +289,7 @@ func (s *Server) handleConnectionStartOK(conn *protocol.Connection, payload []by
 		// Extract username from authenticated user
 		if user, ok := userInterface.(*interfaces.User); ok {
 			conn.Username = user.Username
+			conn.User = user
 			s.Log.Info("User authenticated successfully",
 				zap.String("connection_id", conn.ID),
 				zap.String("username", user.Username),
