@@ -128,6 +128,8 @@ security:
     - PLAIN
 
   # Enable authorization (access control)
+  # When enabled, per-operation permission checks are enforced per the
+  # RabbitMQ configure/write/read model. See docs/AUTHORIZATION.md
   authorizationenabled: false
 
   # Default virtual host for connections

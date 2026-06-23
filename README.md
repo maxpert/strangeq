@@ -260,6 +260,7 @@ Key metrics:
 - [Client Examples](CLIENT_EXAMPLES.md) - Complete examples for Python, Node.js, and Go
 - [Configuration Guide](docs/CONFIGURATION.md) - Detailed configuration options
 - [Authentication Setup](docs/AUTHENTICATION.md) - Setting up user authentication
+- [Authorization Guide](docs/AUTHORIZATION.md) - Permission model and access control
 - [Development Plan](docs/plan.md) - Project roadmap and implementation status
 - [Contributing Guidelines](CONTRIBUTING.md) - How to contribute
 - [Security Policy](SECURITY.md) - Security best practices

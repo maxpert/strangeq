@@ -6,6 +6,11 @@ Create a Go package `github.com/maxpert/amqp-go` that implements an AMQP 0.9.1 s
 ## Current Status (Updated: 2026-06-23)
 **Phase 15 - TLS + Authorization: IN PROGRESS** 🚧
 
+### Phase 15 - Commit B6: Documentation (COMPLETE) ✅
+- ✅ `docs/AUTHORIZATION.md`: permission model, operation→permission mapping, auth file format, loopback restriction, backward compatibility, configuration, error handling
+- ✅ `config.sample.yaml`: authorizationenabled comment with link to docs
+- ✅ `README.md`: link to authorization guide
+
 ### Phase 15 - Commit B5: Authorization Integration Test (COMPLETE) ✅
 - ✅ **10 end-to-end integration tests** with real `amqp091-go` client against live server
   - Admin can declare exchanges/queues (configure=.*)
