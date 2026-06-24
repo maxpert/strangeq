@@ -32,6 +32,15 @@ type UnifiedBroker interface {
 	// Delivery lookup (NEW - for O(1) ACK routing)
 	GetConsumerForDelivery(deliveryTag uint64) (string, bool)
 
+	// Recovery support — enqueues a recovered message ID for consumer delivery
+	EnqueueRecoveredMessage(queueName string, deliveryTag uint64)
+
+	// Recovery support — advances global delivery tag past recovered tags
+	AdvanceDeliveryTag(tag uint64)
+
+	// Recovery support — rebuilds delivery index entry for a recovered pending ack
+	RebuildDeliveryIndex(deliveryTag uint64, consumerTag string)
+
 	// Management operations (optional for some implementations)
 	GetQueues() map[string]*protocol.Queue
 	GetExchanges() map[string]*protocol.Exchange

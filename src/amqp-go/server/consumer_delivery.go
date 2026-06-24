@@ -17,7 +17,8 @@ type consumerInfo struct {
 
 // consumerDeliveryLoop continuously reads from consumer channels and sends messages to clients
 // LOCK-FREE: Uses message passing and channel operations only, no mutexes
-func (s *Server) consumerDeliveryLoop(conn *protocol.Connection) {
+func (s *Server) consumerDeliveryLoop(conn *protocol.Connection, done chan struct{}) {
+	defer close(done)
 	s.Log.Debug("Starting consumer delivery loop", zap.String("connection_id", conn.ID))
 
 	// Create a map to track consumer info (cached channel/consumer references)

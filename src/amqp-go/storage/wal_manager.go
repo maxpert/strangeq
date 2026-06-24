@@ -222,20 +222,20 @@ func (wm *WALManager) Write(queueName string, message *protocol.Message, offset 
 	return <-doneChan
 }
 
-// Acknowledge marks a message as ACKed (lock-free)
+// Acknowledge marks a message as ACKed
 func (wm *WALManager) Acknowledge(queueName string, offset uint64) {
 	if wm.sharedWAL == nil {
 		return
 	}
 
-	// Send to ACK channel (non-blocking)
+	// Send to ACK channel (blocking with stopChan to prevent silent drops)
 	select {
 	case wm.sharedWAL.ackChan <- &ackRequest{
 		queueName: queueName,
 		offset:    offset,
 	}:
-	default:
-		// ACK channel full, skip (will be processed on next cleanup)
+	case <-wm.sharedWAL.stopChan:
+		// WAL is shutting down, discard ACK
 	}
 }
 

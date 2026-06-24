@@ -3,7 +3,24 @@
 ## Goal
 Create a Go package `github.com/maxpert/amqp-go` that implements an AMQP 0.9.1 server based on the specification: https://www.rabbitmq.com/resources/specs/amqp0-9-1.extended.xml
 
-## Current Status (Updated: 2026-06-23)
+## Current Status (Updated: 2026-06-24)
+**Phase 16 - Performance Tuning: IN PROGRESS** 🚧
+
+### Phase 16 - Commit 1: P0 Correctness Fixes (COMPLETE) ✅
+- ✅ **C1: Missing WriteMutex** — `sendBasicDeliver` now locks `conn.WriteMutex` before `conn.Conn.Write(allFrames)` to prevent frame corruption race with heartbeats
+- ✅ **C2: Double consumerDeliveryLoop** — Removed duplicate `go s.consumerDeliveryLoop()` at line 172; added `done chan struct{}` parameter + `defer close(done)` for proper lifecycle
+- ✅ **C3: deliveryIndex global key collision** — Replaced per-queue `nextMsgID` with global `atomic.Uint64` counter (`globalDeliveryTag`); added `AdvanceDeliveryTag()` called during recovery to prevent new tags from colliding with recovered ones
+- ✅ **C4: Segment format loses AMQP metadata** — Rewrote `serializeSegmentMessage`/`readSegmentMessageAt` to use full WAL format (queue+offset+exchange+routingKey+deliveryMode+body); consumers now receive complete messages from cold storage
+- ✅ **C5: Checkpoint data loss window** — `CheckpointBatch` now calls `sync()` (fsync) on segment file before returning, so WAL file can be safely deleted
+- ✅ **C6: deliveryIndex type assertion failure** — Moved `RebuildDeliveryIndex` to `UnifiedBroker` interface (was type-asserting `*broker.StorageBroker` but received `*StorageBrokerAdapter` — dead code)
+- ✅ **C7: queueConsumers non-atomic RMW** — Added per-queue `sync.Mutex` (`queueConsumersMu`) protecting slice mutations in Register/Unregister/DeleteQueue; added `sync.Once` (`stopOnce`) to prevent `stopCh` double-close panic
+- ✅ **C8: WAL ackChan silent drops** — Changed `Acknowledge()` from non-blocking send with `default` (drops ACKs → disk leak) to blocking send with `stopChan` select
+- ✅ **CRITICAL fix: Recovered messages never enqueued** — Added `EnqueueRecoveredMessage()` to enqueue recovered message IDs into `available` channel (non-blocking to prevent deadlock during recovery)
+- ✅ **CRITICAL fix: DeleteQueue semCancel** — Added `semCancel()` call before closing `stopCh` in `DeleteQueue` (was leaking goroutines blocked on semaphore acquire)
+- ✅ **6 new tests** (3 broker correctness, 3 storage correctness), all pass with `-race`
+- ✅ **Code review**: 3 rounds, 0 remaining issues
+- ✅ Full test suite passes with `-race` across all packages
+
 **Phase 15 - TLS + Authorization: COMPLETE** ✅
 
 ### Phase 15 - Commit A3: TLS Integration Test and Documentation (COMPLETE) ✅

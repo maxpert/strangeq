@@ -803,7 +803,10 @@ func (s *Server) sendBasicDeliver(conn *protocol.Connection, channelID uint16, c
 		zap.Int("num_body_fragments", len(bodyFrames)))
 
 	// Atomic write of all frames (method + header + N body fragments)
+	// Must hold WriteMutex to prevent interleaving with heartbeat frames
+	conn.WriteMutex.Lock()
 	_, err = conn.Conn.Write(allFrames)
+	conn.WriteMutex.Unlock()
 	if err != nil {
 		s.Log.Error("Error sending all frames atomically",
 			zap.Error(err),

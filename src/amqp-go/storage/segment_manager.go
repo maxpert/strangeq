@@ -231,6 +231,21 @@ func (sm *SegmentManager) CheckpointBatch(queueName string, messages []*Recovery
 			return fmt.Errorf("checkpoint write failed for offset %d: %w", rm.Offset, err)
 		}
 	}
+	// Fsync the segment file to ensure durability before the WAL file is deleted.
+	// Without this, a crash after WAL deletion but before segment fsync would lose messages.
+	if err := segments.sync(); err != nil {
+		return fmt.Errorf("checkpoint fsync failed for queue %s: %w", queueName, err)
+	}
+	return nil
+}
+
+// sync flushes the current segment file to disk
+func (qs *QueueSegments) sync() error {
+	qs.mutex.Lock()
+	defer qs.mutex.Unlock()
+	if qs.currentSegment != nil && qs.currentSegment.file != nil {
+		return qs.currentSegment.file.Sync()
+	}
 	return nil
 }
 
@@ -639,9 +654,12 @@ func (qs *QueueSegments) close() {
 
 // Helper functions
 
+// serializeSegmentMessage serializes a message with full AMQP metadata.
+// Format: [CRC][length][queue_len][queue][offset][exchange_len][exchange][routing_key_len][routing_key][delivery_mode][body_len][body]
+// This matches the WAL serialization format to preserve Exchange, RoutingKey, DeliveryMode.
 func serializeSegmentMessage(message *protocol.Message, offset uint64) []byte {
 	bodySize := len(message.Body)
-	totalSize := SegmentHeaderSize + bodySize + 256 // Extra for metadata
+	totalSize := 8 + 4 + len(message.Exchange) + 4 + len(message.RoutingKey) + 1 + 4 + bodySize + 256
 
 	buf := make([]byte, 0, totalSize)
 
@@ -649,19 +667,34 @@ func serializeSegmentMessage(message *protocol.Message, offset uint64) []byte {
 	buf = append(buf, 0, 0, 0, 0) // CRC32 placeholder
 	buf = append(buf, 0, 0, 0, 0) // Length placeholder
 
-	// Write offset
-	offsetBytes := make([]byte, 8)
-	binary.BigEndian.PutUint64(offsetBytes, offset)
-	buf = append(buf, offsetBytes...)
+	// Write queue name (empty for segment messages — queue is known by the segment's queue)
+	queueName := ""
+	buf = binary.BigEndian.AppendUint32(buf, uint32(len(queueName)))
+	buf = append(buf, []byte(queueName)...)
 
-	// Write message body
+	// Write offset
+	buf = binary.BigEndian.AppendUint64(buf, offset)
+
+	// Write exchange
+	buf = binary.BigEndian.AppendUint32(buf, uint32(len(message.Exchange)))
+	buf = append(buf, []byte(message.Exchange)...)
+
+	// Write routing key
+	buf = binary.BigEndian.AppendUint32(buf, uint32(len(message.RoutingKey)))
+	buf = append(buf, []byte(message.RoutingKey)...)
+
+	// Write delivery mode (1 byte)
+	buf = append(buf, message.DeliveryMode)
+
+	// Write body
+	buf = binary.BigEndian.AppendUint32(buf, uint32(bodySize))
 	buf = append(buf, message.Body...)
 
-	// Calculate length
+	// Calculate actual length (excluding CRC and length fields)
 	dataLen := len(buf) - 8
 	binary.BigEndian.PutUint32(buf[4:8], uint32(dataLen))
 
-	// Calculate CRC
+	// Calculate CRC over everything after CRC field
 	crc := crc32.ChecksumIEEE(buf[4:])
 	binary.BigEndian.PutUint32(buf[0:4], crc)
 
@@ -669,7 +702,7 @@ func serializeSegmentMessage(message *protocol.Message, offset uint64) []byte {
 }
 
 func readSegmentMessageAt(file *os.File, position int64) (*protocol.Message, error) {
-	// Read header (CRC + length only, 8 bytes)
+	// Read header (CRC + length, 8 bytes)
 	header := make([]byte, 8)
 	_, err := file.ReadAt(header, position)
 	if err != nil {
@@ -680,28 +713,89 @@ func readSegmentMessageAt(file *os.File, position int64) (*protocol.Message, err
 	storedCRC := binary.BigEndian.Uint32(header[0:4])
 	dataLen := binary.BigEndian.Uint32(header[4:8])
 
-	// Read data portion: [length_4][data_N] for CRC verification
-	// CRC was computed over buf[4:] = [length_4][offset_8][body_N]
+	// Read data portion: [length][queue_len][queue][offset][exchange_len][exchange][routing_key_len][routing_key][delivery_mode][body_len][body]
 	crcData := make([]byte, 4+dataLen)
-	copy(crcData[0:4], header[4:8])               // length field
-	_, err = file.ReadAt(crcData[4:], position+8) // offset + body
+	copy(crcData[0:4], header[4:8]) // length field
+	_, err = file.ReadAt(crcData[4:], position+8)
 	if err != nil {
 		return nil, err
 	}
 
-	// Verify CRC over [length][offset][body] (matches serialization)
+	// Verify CRC over [length][data...]
 	calculatedCRC := crc32.ChecksumIEEE(crcData)
 	if calculatedCRC != storedCRC {
 		return nil, fmt.Errorf("CRC mismatch")
 	}
 
-	// Parse data: [offset_8][body_N]
-	data := crcData[4:] // skip length field, now at [offset][body]
-	offset := binary.BigEndian.Uint64(data[0:8])
-	body := data[8:]
+	// Parse data: skip length field, then [queue_len][queue][offset][exchange_len][exchange][routing_key_len][routing_key][delivery_mode][body_len][body]
+	data := crcData[4:] // skip length field
+	pos := 0
+
+	// Read queue name (ignored — queue is known by the segment's queue)
+	if len(data) < pos+4 {
+		return nil, fmt.Errorf("invalid segment data: too short for queue length")
+	}
+	queueLen := binary.BigEndian.Uint32(data[pos : pos+4])
+	pos += 4
+	if len(data) < pos+int(queueLen) {
+		return nil, fmt.Errorf("invalid segment data: too short for queue name")
+	}
+	pos += int(queueLen) // skip queue name
+
+	// Read offset
+	if len(data) < pos+8 {
+		return nil, fmt.Errorf("invalid segment data: too short for offset")
+	}
+	offset := binary.BigEndian.Uint64(data[pos : pos+8])
+	pos += 8
+
+	// Read exchange
+	if len(data) < pos+4 {
+		return nil, fmt.Errorf("invalid segment data: too short for exchange length")
+	}
+	exchangeLen := binary.BigEndian.Uint32(data[pos : pos+4])
+	pos += 4
+	if len(data) < pos+int(exchangeLen) {
+		return nil, fmt.Errorf("invalid segment data: too short for exchange")
+	}
+	exchange := string(data[pos : pos+int(exchangeLen)])
+	pos += int(exchangeLen)
+
+	// Read routing key
+	if len(data) < pos+4 {
+		return nil, fmt.Errorf("invalid segment data: too short for routing key length")
+	}
+	routingKeyLen := binary.BigEndian.Uint32(data[pos : pos+4])
+	pos += 4
+	if len(data) < pos+int(routingKeyLen) {
+		return nil, fmt.Errorf("invalid segment data: too short for routing key")
+	}
+	routingKey := string(data[pos : pos+int(routingKeyLen)])
+	pos += int(routingKeyLen)
+
+	// Read delivery mode
+	if len(data) < pos+1 {
+		return nil, fmt.Errorf("invalid segment data: too short for delivery mode")
+	}
+	deliveryMode := data[pos]
+	pos += 1
+
+	// Read body
+	if len(data) < pos+4 {
+		return nil, fmt.Errorf("invalid segment data: too short for body length")
+	}
+	bodyLen := binary.BigEndian.Uint32(data[pos : pos+4])
+	pos += 4
+	if len(data) < pos+int(bodyLen) {
+		return nil, fmt.Errorf("invalid segment data: too short for body")
+	}
+	body := data[pos : pos+int(bodyLen)]
 
 	return &protocol.Message{
-		DeliveryTag: offset,
-		Body:        body,
+		DeliveryTag:  offset,
+		Body:         body,
+		Exchange:     exchange,
+		RoutingKey:   routingKey,
+		DeliveryMode: deliveryMode,
 	}, nil
 }

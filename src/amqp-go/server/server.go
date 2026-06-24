@@ -168,10 +168,9 @@ func (s *Server) handleConnection(conn net.Conn) {
 		s.MetricsCollector.RecordConnectionCreated()
 	}
 
-	// Start consumer delivery loop for this connection
-	go s.consumerDeliveryLoop(connection)
-
 	// Process frames for this connection
+	// Note: consumerDeliveryLoop is started later in processConnectionFrames
+	// after the handshake completes (line 312)
 	s.processConnectionFrames(connection)
 
 	// Clean up on connection close - iterate all channels and cancel consumers
@@ -309,7 +308,7 @@ func (s *Server) processConnectionFrames(conn *protocol.Connection) {
 
 	// Start consumer delivery loop
 	consumerDeliveryDone := make(chan struct{})
-	go s.consumerDeliveryLoop(conn)
+	go s.consumerDeliveryLoop(conn, consumerDeliveryDone)
 
 	// Wait for any goroutine to finish (connection close or error)
 	select {

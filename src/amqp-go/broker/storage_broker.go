@@ -19,9 +19,8 @@ var ErrConsumerChannelFull = errors.New("consumer channel full")
 // QueueState tracks the state of a queue using lock-free data structures
 // This enables O(1) message delivery and atomic operations
 type QueueState struct {
-	available chan uint64   // Lock-free queue of available message IDs
-	inflight  sync.Map      // msgID → consumerTag (in-flight messages)
-	nextMsgID atomic.Uint64 // Monotonic counter for message IDs
+	available chan uint64 // Lock-free queue of available message IDs
+	inflight  sync.Map    // msgID → consumerTag (in-flight messages)
 }
 
 // NewQueueState creates a new queue state with a configured buffered channel
@@ -41,18 +40,21 @@ type ConsumerState struct {
 	semCtx      context.Context     // Context for semaphore cancellation
 	semCancel   context.CancelFunc  // Cancel function for semaphore
 	stopCh      chan struct{}       // Stop signal for goroutine
+	stopOnce    sync.Once           // Ensures stopCh is closed exactly once
 }
 
 // StorageBroker manages exchanges, queues, and routing using persistent storage
 // All fields use lock-free data structures for maximum concurrency
 type StorageBroker struct {
-	storage         interfaces.Storage
-	engineConfig    interfaces.EngineConfig
-	queueStates     sync.Map // queueName -> *QueueState (lock-free)
-	activeQueues    sync.Map // queueName -> *protocol.Queue (lock-free)
-	activeConsumers sync.Map // consumerTag -> *ConsumerState (lock-free)
-	queueConsumers  sync.Map // queueName -> []*ConsumerState (lock-free)
-	deliveryIndex   sync.Map // deliveryTag → consumerTag (global delivery lookup for O(1) ACK routing)
+	storage           interfaces.Storage
+	engineConfig      interfaces.EngineConfig
+	queueStates       sync.Map      // queueName -> *QueueState (lock-free)
+	activeQueues      sync.Map      // queueName -> *protocol.Queue (lock-free)
+	activeConsumers   sync.Map      // consumerTag -> *ConsumerState (lock-free)
+	queueConsumers    sync.Map      // queueName -> []*ConsumerState (lock-free)
+	queueConsumersMu  sync.Map      // queueName -> *sync.Mutex (protects queueConsumers slice mutation)
+	deliveryIndex     sync.Map      // deliveryTag → consumerTag (global delivery lookup for O(1) ACK routing)
+	globalDeliveryTag atomic.Uint64 // Global counter for unique delivery tags across all queues
 }
 
 // NewStorageBroker creates a new storage-backed broker instance
@@ -125,6 +127,13 @@ func (b *StorageBroker) initializeDefaultExchanges() {
 	b.storage.StoreExchange(fanoutExchange)
 	b.storage.StoreExchange(topicExchange)
 	b.storage.StoreExchange(headersExchange)
+}
+
+// getQueueConsumersMutex returns the per-queue mutex for protecting queueConsumers slice mutations.
+// Uses sync.Map LoadOrStore to ensure exactly one mutex per queue.
+func (b *StorageBroker) getQueueConsumersMutex(queueName string) *sync.Mutex {
+	val, _ := b.queueConsumersMu.LoadOrStore(queueName, &sync.Mutex{})
+	return val.(*sync.Mutex)
 }
 
 // getOrCreateQueueState returns the queue state, creating it if needed (lock-free)
@@ -403,14 +412,21 @@ func (b *StorageBroker) DeleteQueue(name string, ifUnused, ifEmpty bool) error {
 		}
 	}
 
-	// Stop all consumers for this queue
+	// Stop all consumers for this queue (protected by per-queue mutex)
+	mu := b.getQueueConsumersMutex(name)
+	mu.Lock()
 	if val, ok := b.queueConsumers.Load(name); ok {
 		consumers := val.([]*ConsumerState)
 		for _, state := range consumers {
-			close(state.stopCh)
+			if state.semCancel != nil {
+				state.semCancel()
+			}
+			state.stopOnce.Do(func() { close(state.stopCh) })
 			b.activeConsumers.Delete(state.consumer.Tag)
 		}
 	}
+	b.queueConsumers.Delete(name)
+	mu.Unlock()
 
 	// Delete all messages in the queue
 	b.storage.PurgeQueue(name)
@@ -434,7 +450,6 @@ func (b *StorageBroker) DeleteQueue(name string, ifUnused, ifEmpty bool) error {
 
 	// Remove from active caches (lock-free)
 	b.activeQueues.Delete(name)
-	b.queueConsumers.Delete(name)
 	b.queueStates.Delete(name)
 
 	return b.storage.DeleteQueue(name)
@@ -523,7 +538,10 @@ func (b *StorageBroker) RegisterConsumer(queueName, consumerTag string, consumer
 	// Store in sync.Map (lock-free)
 	b.activeConsumers.Store(consumerTag, state)
 
-	// Add to queue consumers list (lock-free)
+	// Add to queue consumers list (protected by per-queue mutex to prevent lost updates)
+	mu := b.getQueueConsumersMutex(queueName)
+	mu.Lock()
+	defer mu.Unlock()
 	val, _ := b.queueConsumers.LoadOrStore(queueName, []*ConsumerState{})
 	consumers := val.([]*ConsumerState)
 	consumers = append(consumers, state)
@@ -555,13 +573,16 @@ func (b *StorageBroker) UnregisterConsumer(consumerTag string) error {
 		state.semCancel()
 	}
 
-	// Then stop polling goroutine
-	close(state.stopCh)
+	// Then stop polling goroutine (idempotent via sync.Once)
+	state.stopOnce.Do(func() { close(state.stopCh) })
 
 	// Remove from activeConsumers
 	b.activeConsumers.Delete(consumerTag)
 
-	// Remove from queueConsumers list (lock-free)
+	// Remove from queueConsumers list (protected by per-queue mutex)
+	mu := b.getQueueConsumersMutex(state.queueName)
+	mu.Lock()
+	defer mu.Unlock()
 	if val, ok := b.queueConsumers.Load(state.queueName); ok {
 		consumers := val.([]*ConsumerState)
 		// Filter out this consumer
@@ -609,8 +630,8 @@ func (b *StorageBroker) PublishMessage(exchangeName, routingKey string, message 
 		// Get or create queue state (lock-free)
 		queueState := b.getOrCreateQueueState(queueName)
 
-		// Assign message ID atomically
-		msgID := queueState.nextMsgID.Add(1)
+		// Assign globally unique delivery tag (prevents deliveryIndex collisions across queues)
+		msgID := b.globalDeliveryTag.Add(1)
 		message.DeliveryTag = msgID
 
 		// Store to persistent storage
@@ -994,7 +1015,7 @@ func (b *StorageBroker) NacknowledgeMessage(consumerTag string, deliveryTag uint
 }
 
 // GetConsumerForDelivery returns the consumer tag for a given delivery tag
-// This provides O(1) lookup for ACK routing, fixing the broken consumer lookup bug
+// This provides O(1) lookup for ACK routing using globally unique delivery tags.
 func (b *StorageBroker) GetConsumerForDelivery(deliveryTag uint64) (string, bool) {
 	val, ok := b.deliveryIndex.Load(deliveryTag)
 	if !ok {
@@ -1006,4 +1027,33 @@ func (b *StorageBroker) GetConsumerForDelivery(deliveryTag uint64) (string, bool
 // RebuildDeliveryIndex rebuilds a single delivery index entry (used during crash recovery)
 func (b *StorageBroker) RebuildDeliveryIndex(deliveryTag uint64, consumerTag string) {
 	b.deliveryIndex.Store(deliveryTag, consumerTag)
+}
+
+// AdvanceDeliveryTag advances the global delivery tag counter past the given value.
+// Called during recovery to ensure new delivery tags don't collide with recovered ones.
+func (b *StorageBroker) AdvanceDeliveryTag(tag uint64) {
+	for {
+		current := b.globalDeliveryTag.Load()
+		if tag <= current {
+			return
+		}
+		if b.globalDeliveryTag.CompareAndSwap(current, tag) {
+			return
+		}
+	}
+}
+
+// EnqueueRecoveredMessage enqueues a recovered message ID into the queue's available
+// channel so that consumer poll loops can discover and deliver it after a restart.
+// Uses non-blocking send to prevent deadlock during recovery (no consumers are
+// registered yet). If the channel is full, the message is already in the ring
+// buffer and will be delivered when a consumer connects and drains the channel.
+func (b *StorageBroker) EnqueueRecoveredMessage(queueName string, deliveryTag uint64) {
+	queueState := b.getOrCreateQueueState(queueName)
+	select {
+	case queueState.available <- deliveryTag:
+	default:
+		// Channel full — message is in ring buffer/WAL and will be
+		// delivered when consumers drain the channel.
+	}
 }

@@ -67,6 +67,18 @@ func (a *StorageBrokerAdapter) GetConsumerForDelivery(deliveryTag uint64) (strin
 	return a.broker.GetConsumerForDelivery(deliveryTag)
 }
 
+func (a *StorageBrokerAdapter) AdvanceDeliveryTag(tag uint64) {
+	a.broker.AdvanceDeliveryTag(tag)
+}
+
+func (a *StorageBrokerAdapter) EnqueueRecoveredMessage(queueName string, deliveryTag uint64) {
+	a.broker.EnqueueRecoveredMessage(queueName, deliveryTag)
+}
+
+func (a *StorageBrokerAdapter) RebuildDeliveryIndex(deliveryTag uint64, consumerTag string) {
+	a.broker.RebuildDeliveryIndex(deliveryTag, consumerTag)
+}
+
 func (a *StorageBrokerAdapter) GetQueues() map[string]*protocol.Queue {
 	return a.broker.GetQueues()
 }

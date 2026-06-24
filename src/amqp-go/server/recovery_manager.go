@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/maxpert/amqp-go/broker"
 	"github.com/maxpert/amqp-go/interfaces"
 	"github.com/maxpert/amqp-go/protocol"
 	"go.uber.org/zap"
@@ -233,8 +232,14 @@ func (r *RecoveryManager) recoverPersistentMessages(stats *protocol.RecoveryStat
 		return err
 	}
 
+	var maxDeliveryTag uint64
 	for queueName, messages := range recoverableMessages {
 		for _, message := range messages {
+			// Track highest delivery tag for globalDeliveryTag restoration
+			if message.DeliveryTag > maxDeliveryTag {
+				maxDeliveryTag = message.DeliveryTag
+			}
+
 			// Only recover messages with DeliveryMode=2 (persistent)
 			if message.DeliveryMode == 2 {
 				// Load message directly into ring buffer WITHOUT re-writing to WAL
@@ -249,12 +254,21 @@ func (r *RecoveryManager) recoverPersistentMessages(stats *protocol.RecoveryStat
 						fmt.Sprintf("Failed to load message in queue %s: %v", queueName, err))
 				} else {
 					stats.PersistentMessagesRecovered++
+					// Enqueue recovered message ID so consumer poll loops can deliver it
+					r.broker.EnqueueRecoveredMessage(queueName, message.DeliveryTag)
 					r.logger.Debug("Loaded recovered message into ring buffer",
 						zap.String("queue", queueName),
 						zap.Uint64("delivery_tag", message.DeliveryTag))
 				}
 			}
 		}
+	}
+
+	// Advance global delivery tag past all recovered tags to prevent collisions
+	if maxDeliveryTag > 0 {
+		r.broker.AdvanceDeliveryTag(maxDeliveryTag)
+		r.logger.Info("Advanced global delivery tag past recovered messages",
+			zap.Uint64("max_recovered_tag", maxDeliveryTag))
 	}
 
 	return nil
@@ -278,49 +292,30 @@ func (r *RecoveryManager) recoverPendingAcknowledgments(stats *protocol.Recovery
 
 	// CRITICAL FIX: Rebuild global delivery index during crash recovery
 	// This ensures ACKs can be routed correctly after server restart
-	if storageBroker, ok := r.broker.(*broker.StorageBroker); ok {
-		for _, pendingAck := range pendingAcks {
-			// Check if the acknowledgment is too old (potential zombie)
-			age := time.Since(pendingAck.DeliveredAt)
-			if age > expiredCutoff {
-				// Remove expired acknowledgment (don't rebuild index for it)
-				err := r.storage.DeletePendingAck(pendingAck.QueueName, pendingAck.DeliveryTag)
-				if err != nil {
-					r.logger.Warn("Failed to delete expired pending ack",
-						zap.String("queue", pendingAck.QueueName),
-						zap.Uint64("delivery_tag", pendingAck.DeliveryTag),
-						zap.Error(err))
-				}
-				continue
+	for _, pendingAck := range pendingAcks {
+		// Check if the acknowledgment is too old (potential zombie)
+		age := time.Since(pendingAck.DeliveredAt)
+		if age > expiredCutoff {
+			// Remove expired acknowledgment (don't rebuild index for it)
+			err := r.storage.DeletePendingAck(pendingAck.QueueName, pendingAck.DeliveryTag)
+			if err != nil {
+				r.logger.Warn("Failed to delete expired pending ack",
+					zap.String("queue", pendingAck.QueueName),
+					zap.Uint64("delivery_tag", pendingAck.DeliveryTag),
+					zap.Error(err))
 			}
-
-			// Rebuild global delivery index for this pending ack
-			storageBroker.RebuildDeliveryIndex(pendingAck.DeliveryTag, pendingAck.ConsumerTag)
-
-			stats.PendingAcksRecovered++
-			r.logger.Debug("Recovered pending acknowledgment",
-				zap.String("queue", pendingAck.QueueName),
-				zap.String("consumer", pendingAck.ConsumerTag),
-				zap.Uint64("delivery_tag", pendingAck.DeliveryTag),
-				zap.Duration("age", age))
+			continue
 		}
-	} else {
-		// If not using StorageBroker, just count the pending acks
-		for _, pendingAck := range pendingAcks {
-			age := time.Since(pendingAck.DeliveredAt)
-			if age > expiredCutoff {
-				err := r.storage.DeletePendingAck(pendingAck.QueueName, pendingAck.DeliveryTag)
-				if err != nil {
-					r.logger.Warn("Failed to delete expired pending ack",
-						zap.String("queue", pendingAck.QueueName),
-						zap.Uint64("delivery_tag", pendingAck.DeliveryTag),
-						zap.Error(err))
-				}
-				continue
-			}
 
-			stats.PendingAcksRecovered++
-		}
+		// Rebuild global delivery index for this pending ack
+		r.broker.RebuildDeliveryIndex(pendingAck.DeliveryTag, pendingAck.ConsumerTag)
+
+		stats.PendingAcksRecovered++
+		r.logger.Debug("Recovered pending acknowledgment",
+			zap.String("queue", pendingAck.QueueName),
+			zap.String("consumer", pendingAck.ConsumerTag),
+			zap.Uint64("delivery_tag", pendingAck.DeliveryTag),
+			zap.Duration("age", age))
 	}
 
 	return nil
