@@ -252,8 +252,7 @@ type EngineConfig struct {
 	// ========================================
 
 	// ExpiredMessageCheckIntervalMS is how often to scan for expired messages (milliseconds)
-	// Longer = less overhead, slower TTL enforcement
-	// Shorter = more overhead, stricter TTL enforcement
+	// Note: Not yet implemented — reserved for future TTL enforcement feature.
 	// Default: 60000 (60 seconds)
 	ExpiredMessageCheckIntervalMS int64 `json:"expired_message_check_interval_ms"`
 

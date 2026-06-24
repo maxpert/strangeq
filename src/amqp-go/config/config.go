@@ -82,15 +82,15 @@ func DefaultConfig() *AMQPConfig {
 
 			// Write-Ahead Log (WAL)
 			WALBatchSize:      1000,              // 1,000 messages per batch
-			WALBatchTimeoutMS: 10,                // 10 milliseconds max wait
+			WALBatchTimeoutMS: 5,                 // 5ms max wait (halves tail latency for lone durable messages)
 			WALFileSize:       512 * 1024 * 1024, // 512 MB per WAL file
 			WALChannelBuffer:  10000,             // 10K buffered requests
 
 			// Segment Storage (Cold Path)
-			SegmentSize:                 1024 * 1024 * 1024, // 1 GB per segment
-			SegmentCheckpointIntervalMS: 300000,             // 5 minutes
-			CompactionThreshold:         0.5,                // Compact at 50% deleted
-			CompactionIntervalMS:        1800000,            // 30 minutes
+			SegmentSize:                 256 * 1024 * 1024, // 256 MB per segment (4x faster compaction vs 1GB)
+			SegmentCheckpointIntervalMS: 300000,            // 5 minutes
+			CompactionThreshold:         0.5,               // Compact at 50% deleted
+			CompactionIntervalMS:        1800000,           // 30 minutes
 
 			// Consumer Delivery
 			ConsumerSelectTimeoutMS: 1,   // 1 millisecond (500µs rounded up)

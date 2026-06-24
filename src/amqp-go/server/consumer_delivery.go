@@ -25,10 +25,15 @@ func (s *Server) consumerDeliveryLoop(conn *protocol.Connection, done chan struc
 	// This map is only accessed by this goroutine - no locks needed
 	consumerInfos := make(map[string]*consumerInfo)
 
-	const (
-		selectTimeout = 500 * time.Microsecond // Wait timeout when no messages available
-		maxBatchSize  = 100                    // Maximum messages to batch per consumer
-	)
+	// Configurable timeout and batch size from EngineConfig (wired, not hardcoded)
+	selectTimeout := time.Duration(s.Config.Engine.ConsumerSelectTimeoutMS) * time.Millisecond
+	if selectTimeout <= 0 {
+		selectTimeout = 500 * time.Microsecond
+	}
+	maxBatchSize := s.Config.Engine.ConsumerMaxBatchSize
+	if maxBatchSize <= 0 {
+		maxBatchSize = 100
+	}
 
 	// TIMER REUSE: Create timer once and reuse to avoid 450MB allocations
 	// Using Reset() eliminates repeated timer/channel allocations in hot loop

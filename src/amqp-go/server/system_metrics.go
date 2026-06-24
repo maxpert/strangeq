@@ -15,7 +15,7 @@ func (s *Server) startSystemMetricsCollection(ctx context.Context) {
 		return
 	}
 
-	ticker := time.NewTicker(10 * time.Second)
+	ticker := time.NewTicker(60 * time.Second) // 60s — filepath.Walk over data dir is O(files)
 	defer ticker.Stop()
 
 	// Collect once immediately

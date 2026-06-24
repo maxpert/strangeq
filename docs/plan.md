@@ -4,7 +4,14 @@
 Create a Go package `github.com/maxpert/amqp-go` that implements an AMQP 0.9.1 server based on the specification: https://www.rabbitmq.com/resources/specs/amqp0-9-1.extended.xml
 
 ## Current Status (Updated: 2026-06-24)
-**Phase 16 - Performance Tuning: IN PROGRESS** 🚧
+**Phase 16 - Performance Tuning: COMPLETE** ✅
+
+### Phase 16 - Commit 5: Config Tuning + Cleanup (COMPLETE) ✅
+- ✅ **M6: Wire dead config fields** — `ConsumerSelectTimeoutMS` and `ConsumerMaxBatchSize` now wired from EngineConfig into `consumerDeliveryLoop` (were hardcoded constants, config changes had no effect). Falls back to defaults (500µs / 100) when config is zero. Marked `ExpiredMessageCheckIntervalMS` as "not yet implemented" in interface docs.
+- ✅ **M7: Reduce `WALBatchTimeoutMS` 10 → 5** — Halves worst-case tail latency for lone durable messages (10ms → 5ms). Under load, batches fill via `WALBatchSize` before timeout fires, so minimal throughput impact.
+- ✅ **M8: Reduce `SegmentSize` 1GB → 256MB** — 4x faster compaction (rewrites entire segment file). Smaller I/O spikes during compaction. Faster WAL replay on restart.
+- ✅ **M9: Fix system metrics interval 10s → 60s** — `filepath.Walk` over data directory is O(files). With 100+ WAL/segment files, 10s caused stat() storms. 60s is sufficient for monitoring granularity.
+- ✅ Full test suite passes with `-race` across all packages
 
 ### Phase 16 - Commit 4: Consumer Delivery + I/O Improvements (COMPLETE) ✅
 - ✅ **P7: Cache `reflect.SelectCase` slices** — `cases` and `consumerTags` declared outside the for loop in `consumerDeliveryLoop`, reused when consumer count hasn't changed. Eliminates 2 `make()` allocations per loop iteration (~100KB/sec garbage at 2000 iterations/sec with 100 consumers)
