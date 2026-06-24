@@ -128,9 +128,9 @@ func (s *Server) handleBasicPublish(conn *protocol.Connection, channelID uint16,
 	}
 	pendingMsg := &protocol.PendingMessage{
 		Method:   publishMethod,
-		Body:     make([]byte, 0),
+		Body:     nil, // Pre-allocated in processHeaderFrame when BodySize is known
 		Received: 0,
-		Channel:  channelRef, // Get the channel reference
+		Channel:  channelRef,
 	}
 
 	// Store the pending message for this channel
@@ -172,6 +172,12 @@ func (s *Server) processHeaderFrame(conn *protocol.Connection, frame *protocol.F
 
 	// Attach the header to the pending message
 	pendingMsg.Header = contentHeader
+
+	// Pre-allocate body slice to BodySize capacity to eliminate reallocations
+	// during body frame append (saves ~4.6GB allocations at high throughput)
+	if contentHeader.BodySize > 0 && cap(pendingMsg.Body) < int(contentHeader.BodySize) {
+		pendingMsg.Body = make([]byte, 0, contentHeader.BodySize)
+	}
 
 	s.Log.Debug("Content header received for pending message",
 		zap.String("exchange", pendingMsg.Method.Exchange),
@@ -774,11 +780,29 @@ func (s *Server) sendBasicDeliver(conn *protocol.Connection, channelID uint16, c
 		totalBodySize += 8 + len(frame.Payload)
 	}
 
-	// Allocate combined buffer for atomic write
+	// Allocate combined buffer for atomic write (pooled for typical sizes, direct for large)
 	totalSize := len(methodFrameData) + len(headerFrameData) + totalBodySize
-	allFrames := make([]byte, 0, totalSize)
-	allFrames = append(allFrames, methodFrameData...)
-	allFrames = append(allFrames, headerFrameData...)
+	var allFramesBuf *[]byte
+	const maxPoolSize = 131 * 1024 // 128KB — largest pool tier
+	if totalSize > maxPoolSize {
+		b := make([]byte, 0, totalSize)
+		allFramesBuf = &b
+	} else {
+		allFramesBuf = protocol.GetBufferForSize(totalSize)
+	}
+	// Ensure buffer is returned to pool on all exit paths
+	defer func() {
+		if allFramesBuf != nil {
+			// Only return to pool if allFrames hasn't grown beyond the pool buffer
+			if cap(*allFramesBuf) <= maxPoolSize {
+				protocol.PutBufferForSize(allFramesBuf)
+			}
+			allFramesBuf = nil
+		}
+	}()
+	*allFramesBuf = append((*allFramesBuf)[:0], methodFrameData...)
+	*allFramesBuf = append(*allFramesBuf, headerFrameData...)
+	allFrames := *allFramesBuf
 
 	// Serialize body frames with pooled buffers and append to combined buffer
 	for i, bodyFrame := range bodyFrames {
@@ -807,6 +831,8 @@ func (s *Server) sendBasicDeliver(conn *protocol.Connection, channelID uint16, c
 	conn.WriteMutex.Lock()
 	_, err = conn.Conn.Write(allFrames)
 	conn.WriteMutex.Unlock()
+
+	// allFramesBuf returned via defer above
 	if err != nil {
 		s.Log.Error("Error sending all frames atomically",
 			zap.Error(err),

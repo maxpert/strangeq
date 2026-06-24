@@ -624,36 +624,26 @@ func (qw *QueueWAL) serializeMessage(queueName string, message *protocol.Message
 	buf = append(buf, 0, 0, 0, 0) // CRC32 placeholder
 	buf = append(buf, 0, 0, 0, 0) // Length placeholder
 
-	// Write queue name (NEW for shared WAL!)
-	queueLen := make([]byte, 4)
-	binary.BigEndian.PutUint32(queueLen, uint32(len(queueName)))
-	buf = append(buf, queueLen...)
-	buf = append(buf, []byte(queueName)...)
+	// Write queue name
+	buf = binary.BigEndian.AppendUint32(buf, uint32(len(queueName)))
+	buf = append(buf, queueName...)
 
 	// Write offset
-	offsetBytes := make([]byte, 8)
-	binary.BigEndian.PutUint64(offsetBytes, offset)
-	buf = append(buf, offsetBytes...)
+	buf = binary.BigEndian.AppendUint64(buf, offset)
 
 	// Write exchange
-	exchangeLen := make([]byte, 4)
-	binary.BigEndian.PutUint32(exchangeLen, uint32(len(message.Exchange)))
-	buf = append(buf, exchangeLen...)
-	buf = append(buf, []byte(message.Exchange)...)
+	buf = binary.BigEndian.AppendUint32(buf, uint32(len(message.Exchange)))
+	buf = append(buf, message.Exchange...)
 
 	// Write routing key
-	routingKeyLen := make([]byte, 4)
-	binary.BigEndian.PutUint32(routingKeyLen, uint32(len(message.RoutingKey)))
-	buf = append(buf, routingKeyLen...)
-	buf = append(buf, []byte(message.RoutingKey)...)
+	buf = binary.BigEndian.AppendUint32(buf, uint32(len(message.RoutingKey)))
+	buf = append(buf, message.RoutingKey...)
 
 	// Write delivery mode (1 byte)
 	buf = append(buf, message.DeliveryMode)
 
 	// Write body
-	bodyLen := make([]byte, 4)
-	binary.BigEndian.PutUint32(bodyLen, uint32(len(message.Body)))
-	buf = append(buf, bodyLen...)
+	buf = binary.BigEndian.AppendUint32(buf, uint32(len(message.Body)))
 	buf = append(buf, message.Body...)
 
 	// Calculate actual length (excluding CRC and length fields)

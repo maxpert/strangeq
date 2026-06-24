@@ -41,29 +41,6 @@ func putBuffer(buf *bytes.Buffer) {
 	bufferPool.Put(buf)
 }
 
-// byteSlicePool is a pool of byte slices for reuse
-var byteSlicePool = sync.Pool{
-	New: func() interface{} {
-		b := make([]byte, 0, 1024)
-		return &b
-	},
-}
-
-// getByteSlice gets a byte slice from the pool
-func getByteSlice() *[]byte {
-	return byteSlicePool.Get().(*[]byte)
-}
-
-// putByteSlice returns a byte slice to the pool
-func putByteSlice(b *[]byte) {
-	// Don't pool slices that are too large
-	if cap(*b) > 64*1024 {
-		return
-	}
-	*b = (*b)[:0]
-	byteSlicePool.Put(b)
-}
-
 // frameHeaderPool is a pool for frame header bytes (7 bytes)
 var frameHeaderPool = sync.Pool{
 	New: func() interface{} {
@@ -80,24 +57,6 @@ func getFrameHeader() *[]byte {
 // putFrameHeader returns a header buffer to the pool
 func putFrameHeader(b *[]byte) {
 	frameHeaderPool.Put(b)
-}
-
-// smallBufferPool is a pool for small buffers (< 256 bytes)
-var smallBufferPool = sync.Pool{
-	New: func() interface{} {
-		b := make([]byte, 256)
-		return &b
-	},
-}
-
-// getSmallBuffer gets a small buffer from the pool
-func getSmallBuffer() *[]byte {
-	return smallBufferPool.Get().(*[]byte)
-}
-
-// putSmallBuffer returns a small buffer to the pool
-func putSmallBuffer(b *[]byte) {
-	smallBufferPool.Put(b)
 }
 
 // Tiered buffer pools for frame serialization to reduce allocations in hot paths.

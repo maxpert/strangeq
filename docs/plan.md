@@ -6,6 +6,14 @@ Create a Go package `github.com/maxpert/amqp-go` that implements an AMQP 0.9.1 s
 ## Current Status (Updated: 2026-06-24)
 **Phase 16 - Performance Tuning: IN PROGRESS** 🚧
 
+### Phase 16 - Commit 3: Memory Allocation Optimizations (COMPLETE) ✅
+- ✅ **P2: Pre-allocate `pendingMsg.Body` to `BodySize`** — Changed `make([]byte, 0)` → `nil` in `handleBasicPublish`; pre-allocate in `processHeaderFrame` when `BodySize` is known. Eliminates multiple reallocations during body frame append (~4.6GB savings)
+- ✅ **P10: Pool `allFrames` buffer in `sendBasicDeliver`** — Use `GetBufferForSize`/`PutBufferForSize` for combined frame buffer (was `make([]byte, 0, totalSize)` per delivery). Falls back to direct allocation for messages >128KB (larger than max pool tier). Uses defer for guaranteed pool return on all paths.
+- ✅ **M11: Eliminate WAL temp byte slices** — Replaced 5× `make([]byte, N)` + `append` with `binary.BigEndian.AppendUint32/64`; replaced `[]byte(string)` with direct `append(buf, string...)` (avoids intermediate allocation)
+- ✅ **M12: Remove dead pools** — Removed `byteSlicePool` and `smallBufferPool` from `buffer_pool.go` (defined but never called anywhere)
+- ✅ **Code review**: 1 round, 0 CRITICAL, 0 MAJOR (fixed pool undersize for large messages, pool leak on error path)
+- ✅ Full test suite passes with `-race` across all packages
+
 ### Phase 16 - Commit 2: Lock Contention + Config Wiring (COMPLETE) ✅
 - ✅ **P1: `ds.mutex` → `sync.Map`** — Replaced global `sync.RWMutex` with `sync.Map` for queue rings; `getQueueRing()` helper provides lock-free reads on publish/get/delete hot path; `getOrCreateQueueRing()` uses double-check locking (mutex only held during rare queue creation). Eliminates the #1 throughput limiter — all publishes across all queues no longer serialize on a single write lock.
 - ✅ **P6: `AvailableChannelBuffer` 10M → 100K** — 80MB → 800KB per queue (100x memory reduction); 1000 queues: 80GB → 800MB
