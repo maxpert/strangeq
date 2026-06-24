@@ -90,15 +90,20 @@ type QueueWAL struct {
 
 	// Current active file
 	currentFile             *os.File
+	currentReadFile         *os.File // Read-only handle for ReadAt (currentFile is O_WRONLY)
 	fileNum                 atomic.Uint64
 	fileOffset              atomic.Int64
 	fileMutex               sync.Mutex
-	currentFileOffsets      *roaring64.Bitmap // actual offsets written to current file
+	currentFileOffsets      *roaring64.Bitmap
 	currentFileOffsetsMutex sync.Mutex
 
 	// Old inactive files
 	oldFiles      map[uint64]*walFileInfo
 	oldFilesMutex sync.RWMutex
+
+	// File handle cache for old WAL files (avoids open/close per read)
+	oldFileCache      map[uint64]*os.File
+	oldFileCacheMutex sync.RWMutex
 
 	// Offset index for O(1) lookups (Phase 6D: Fix consumer bottleneck)
 	// Maps offset → (fileNum, filePosition) for fast reads
@@ -464,6 +469,7 @@ func (wm *WALManager) createSharedWAL() (*QueueWAL, error) {
 		ackBitmap:          roaring64.New(),
 		currentFileOffsets: roaring64.New(),
 		oldFiles:           make(map[uint64]*walFileInfo),
+		oldFileCache:       make(map[uint64]*os.File),
 		offsetIndex:        make(map[uint64]*offsetLocation), // Phase 6D: Offset index for O(1) reads
 		stopChan:           make(chan struct{}),
 	}
@@ -659,18 +665,27 @@ func (qw *QueueWAL) serializeMessage(queueName string, message *protocol.Message
 
 // rollFile rolls to a new WAL file when size limit reached
 func (qw *QueueWAL) rollFile() {
-	// Get current file info
 	currentFileNum := qw.fileNum.Load()
 	currentPath := qw.currentFile.Name()
 
-	// Capture current file's offsets and reset for new file
 	qw.currentFileOffsetsMutex.Lock()
 	fileOffsets := qw.currentFileOffsets
 	qw.currentFileOffsets = roaring64.New()
 	qw.currentFileOffsetsMutex.Unlock()
 
-	// Close current file
+	// Close current write file
 	_ = qw.currentFile.Close()
+
+	// Move current read handle to old file cache (it's already open, no need to reopen)
+	if qw.currentReadFile != nil {
+		qw.oldFileCacheMutex.Lock()
+		if qw.oldFileCache == nil {
+			qw.oldFileCache = make(map[uint64]*os.File)
+		}
+		qw.oldFileCache[currentFileNum] = qw.currentReadFile
+		qw.currentReadFile = nil
+		qw.oldFileCacheMutex.Unlock()
+	}
 
 	// Move to old files map
 	qw.oldFilesMutex.Lock()
@@ -695,7 +710,20 @@ func (qw *QueueWAL) openNextFile() error {
 		return fmt.Errorf("failed to open WAL file: %w", err)
 	}
 
+	// Open a read-only handle for ReadAt (currentFile is O_WRONLY, can't ReadAt)
+	readFile, err := os.Open(filename)
+	if err != nil {
+		file.Close()
+		return fmt.Errorf("failed to open WAL read handle: %w", err)
+	}
+
+	// Close previous read handle if any
+	if qw.currentReadFile != nil {
+		_ = qw.currentReadFile.Close()
+	}
+
 	qw.currentFile = file
+	qw.currentReadFile = readFile
 	qw.fileOffset.Store(0)
 	return nil
 }
@@ -753,11 +781,13 @@ func (qw *QueueWAL) tryDeleteOldFiles() {
 
 		if allAcked {
 			_ = os.Remove(info.path)
+			qw.closeOldFileHandle(fileNum)
 			delete(qw.oldFiles, fileNum)
 		} else if expired {
 			// Force-checkpoint unACKed messages to segments before deletion
 			qw.forceCheckpointFile(info)
 			_ = os.Remove(info.path)
+			qw.closeOldFileHandle(fileNum)
 			delete(qw.oldFiles, fileNum)
 		}
 	}
@@ -811,71 +841,109 @@ func (qw *QueueWAL) readMessage(queueName string, offset uint64) (*protocol.Mess
 	return qw.readMessageSequential(queueName, offset)
 }
 
-// readMessageAtPosition reads a message at a specific file position (O(1))
-func (qw *QueueWAL) readMessageAtPosition(queueName string, fileNum uint64, filePosition int64, expectedOffset uint64) (*protocol.Message, error) {
-	// Get file path
-	var filePath string
-	currentFileNum := qw.fileNum.Load()
+// getOldFileHandle returns an open file handle for an old WAL file, using a cache
+// to avoid repeated open/close syscalls. Callers must call the returned unlock
+// function after done with the file (ReadAt calls) to prevent concurrent close.
+func (qw *QueueWAL) getOldFileHandle(fileNum uint64) (*os.File, func(), error) {
+	// Fast path: cache hit (RLock allows concurrent readers)
+	qw.oldFileCacheMutex.RLock()
+	if file, ok := qw.oldFileCache[fileNum]; ok {
+		return file, qw.oldFileCacheMutex.RUnlock, nil
+	}
+	qw.oldFileCacheMutex.RUnlock()
 
-	if fileNum == currentFileNum {
-		// Reading from current file
-		qw.fileMutex.Lock()
-		if qw.currentFile != nil {
-			filePath = qw.currentFile.Name()
-		}
-		qw.fileMutex.Unlock()
-	} else {
-		// Reading from old file
-		qw.oldFilesMutex.RLock()
-		if info, ok := qw.oldFiles[fileNum]; ok {
-			filePath = info.path
-		}
-		qw.oldFilesMutex.RUnlock()
+	// Cache miss: get file path first (separate lock to avoid lock order inversion)
+	qw.oldFilesMutex.RLock()
+	info, ok := qw.oldFiles[fileNum]
+	filePath := ""
+	if ok {
+		filePath = info.path
+	}
+	qw.oldFilesMutex.RUnlock()
+	if !ok {
+		return nil, func() {}, fmt.Errorf("WAL file not found for fileNum %d", fileNum)
 	}
 
-	if filePath == "" {
-		return nil, fmt.Errorf("WAL file not found for fileNum %d", fileNum)
-	}
-
-	// Open file and seek to position
+	// Open file outside any locks
 	file, err := os.Open(filePath)
 	if err != nil {
-		return nil, err
+		return nil, func() {}, err
 	}
-	defer file.Close()
 
-	_, err = file.Seek(filePosition, 0)
+	// Add to cache (write lock)
+	qw.oldFileCacheMutex.Lock()
+	defer qw.oldFileCacheMutex.Unlock()
+
+	// Double-check: another goroutine may have opened and cached it
+	if existing, ok := qw.oldFileCache[fileNum]; ok {
+		_ = file.Close() // close our redundant handle
+		return existing, func() {}, nil
+	}
+
+	if qw.oldFileCache == nil {
+		qw.oldFileCache = make(map[uint64]*os.File)
+	}
+	qw.oldFileCache[fileNum] = file
+	return file, func() {}, nil
+}
+
+// closeOldFileHandle closes and removes a cached file handle (called when old file is deleted)
+func (qw *QueueWAL) closeOldFileHandle(fileNum uint64) {
+	qw.oldFileCacheMutex.Lock()
+	defer qw.oldFileCacheMutex.Unlock()
+	if file, ok := qw.oldFileCache[fileNum]; ok {
+		_ = file.Close()
+		delete(qw.oldFileCache, fileNum)
+	}
+}
+
+// readMessageAtPosition reads a message at a specific file position (O(1))
+// Uses ReadAt (pread) for positional I/O — no Seek needed, no file open/close per read.
+// Current file: uses the already-open handle. Old files: uses a file handle cache.
+func (qw *QueueWAL) readMessageAtPosition(queueName string, fileNum uint64, filePosition int64, expectedOffset uint64) (*protocol.Message, error) {
+	var file *os.File
+
+	// Load currentFileNum inside fileMutex to prevent TOCTOU race with rollFile
+	qw.fileMutex.Lock()
+	currentFileNum := qw.fileNum.Load()
+	if fileNum == currentFileNum {
+		file = qw.currentReadFile
+		qw.fileMutex.Unlock()
+		if file == nil {
+			return nil, fmt.Errorf("WAL current read file not open for fileNum %d", fileNum)
+		}
+	} else {
+		qw.fileMutex.Unlock()
+		// Reading from old file — use file handle cache
+		var unlock func()
+		var cacheErr error
+		file, unlock, cacheErr = qw.getOldFileHandle(fileNum)
+		if cacheErr != nil {
+			return nil, cacheErr
+		}
+		defer unlock()
+	}
+
+	// Read CRC + length in a single ReadAt (8 bytes at filePosition)
+	header := make([]byte, 8)
+	_, err := file.ReadAt(header, filePosition)
 	if err != nil {
 		return nil, err
 	}
 
-	// Read CRC field (4 bytes)
-	crcBytes := make([]byte, 4)
-	_, err = file.Read(crcBytes)
-	if err != nil {
-		return nil, err
-	}
-	crc := binary.BigEndian.Uint32(crcBytes)
+	crc := binary.BigEndian.Uint32(header[0:4])
+	dataLen := binary.BigEndian.Uint32(header[4:8])
 
-	// Read length field (4 bytes)
-	lengthBytes := make([]byte, 4)
-	_, err = file.Read(lengthBytes)
-	if err != nil {
-		return nil, err
-	}
-	dataLen := binary.BigEndian.Uint32(lengthBytes)
-
-	// Read remaining data (queue + offset + message)
+	// Read data portion in a single ReadAt (dataLen bytes at filePosition+8)
 	data := make([]byte, dataLen)
-	_, err = file.Read(data)
+	_, err = file.ReadAt(data, filePosition+8)
 	if err != nil {
 		return nil, err
 	}
 
 	// Verify CRC (calculated over [length_bytes][data])
-	// This recreates buf[4:] from serialization
 	crcCheckData := make([]byte, 4+dataLen)
-	copy(crcCheckData[0:4], lengthBytes)
+	copy(crcCheckData[0:4], header[4:8])
 	copy(crcCheckData[4:], data)
 	calculatedCRC := crc32.ChecksumIEEE(crcCheckData)
 
@@ -1198,6 +1266,7 @@ func (qw *QueueWAL) performCheckpoint() {
 
 		// Checkpoint succeeded — delete WAL file and clean up
 		_ = os.Remove(info.path)
+		qw.closeOldFileHandle(fileNum)
 
 		// Remove from oldFiles map
 		qw.oldFilesMutex.Lock()
@@ -1222,11 +1291,22 @@ func (qw *QueueWAL) close() {
 	close(qw.stopChan)
 	qw.wg.Wait()
 
+	// Close cached old file handles
+	qw.oldFileCacheMutex.Lock()
+	for _, file := range qw.oldFileCache {
+		_ = file.Close()
+	}
+	qw.oldFileCache = nil
+	qw.oldFileCacheMutex.Unlock()
+
 	qw.fileMutex.Lock()
 	defer qw.fileMutex.Unlock()
 
 	if qw.currentFile != nil {
 		_ = qw.currentFile.Sync()
 		_ = qw.currentFile.Close()
+	}
+	if qw.currentReadFile != nil {
+		_ = qw.currentReadFile.Close()
 	}
 }

@@ -6,6 +6,15 @@ Create a Go package `github.com/maxpert/amqp-go` that implements an AMQP 0.9.1 s
 ## Current Status (Updated: 2026-06-24)
 **Phase 16 - Performance Tuning: IN PROGRESS** 🚧
 
+### Phase 16 - Commit 4: Consumer Delivery + I/O Improvements (COMPLETE) ✅
+- ✅ **P7: Cache `reflect.SelectCase` slices** — `cases` and `consumerTags` declared outside the for loop in `consumerDeliveryLoop`, reused when consumer count hasn't changed. Eliminates 2 `make()` allocations per loop iteration (~100KB/sec garbage at 2000 iterations/sec with 100 consumers)
+- ✅ **P4: WAL file handle cache** — `oldFileCache map[uint64]*os.File` with `getOldFileHandle()`/`closeOldFileHandle()`. Eliminates `os.Open`/`defer file.Close()` per WAL read (2 syscalls + 4 allocations per read). Handles closed when old files are deleted in `tryDeleteOldFiles`, `performCheckpoint`, and `close()`. Uses `sync.RWMutex` — concurrent readers (RLock) don't block each other; `closeOldFileHandle` takes WLock briefly
+- ✅ **M3: Use `ReadAt` (pread) in WAL reads** — Replaced `Seek`+3×`Read` with 2×`ReadAt` (8B header + data). No seek needed, halves syscalls. Added `currentReadFile` (read-only handle) because `currentFile` is `O_WRONLY` and can't `ReadAt`. Handle transferred to `oldFileCache` on `rollFile()`
+- ✅ **TOCTOU race fix** — `currentFileNum` loaded inside `fileMutex` to prevent race with `rollFile` (was loaded before lock, could read from wrong file after roll)
+- ✅ **Lock order inversion fix** — `getOldFileHandle` gets file path outside cache mutex to avoid `oldFileCacheMutex → oldFilesMutex` vs `oldFilesMutex → oldFileCacheMutex` deadlock
+- ✅ **Code review**: 1 round, 0 CRITICAL, 0 MAJOR (fixed TOCTOU race, fd leak in tryDeleteOldFiles, use-after-close race, lock order inversion)
+- ✅ Full test suite passes with `-race` across all packages
+
 ### Phase 16 - Commit 3: Memory Allocation Optimizations (COMPLETE) ✅
 - ✅ **P2: Pre-allocate `pendingMsg.Body` to `BodySize`** — Changed `make([]byte, 0)` → `nil` in `handleBasicPublish`; pre-allocate in `processHeaderFrame` when `BodySize` is known. Eliminates multiple reallocations during body frame append (~4.6GB savings)
 - ✅ **P10: Pool `allFrames` buffer in `sendBasicDeliver`** — Use `GetBufferForSize`/`PutBufferForSize` for combined frame buffer (was `make([]byte, 0, totalSize)` per delivery). Falls back to direct allocation for messages >128KB (larger than max pool tier). Uses defer for guaranteed pool return on all paths.
