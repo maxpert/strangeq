@@ -163,3 +163,82 @@ func TestQueueConsumersConcurrentUnregister(t *testing.T) {
 		}
 	}
 }
+
+// TestGlobalDeliveryTagMonotonic verifies that the global delivery tag counter
+// produces strictly increasing, globally unique IDs (C3 fix).
+func TestGlobalDeliveryTagMonotonic(t *testing.T) {
+	broker, cleanup := createTestBroker(t)
+	defer cleanup()
+
+	broker.DeclareQueue("queue-a", false, false, false, nil)
+	broker.DeclareQueue("queue-b", false, false, false, nil)
+
+	// Publish to both queues alternately
+	prev := uint64(0)
+	for i := 0; i < 100; i++ {
+		qn := "queue-a"
+		if i%2 == 1 {
+			qn = "queue-b"
+		}
+		msg := &protocol.Message{Body: []byte("x"), Exchange: "", RoutingKey: qn}
+		if err := broker.PublishMessage("", qn, msg); err != nil {
+			t.Fatalf("Publish %d to %s failed: %v", i, qn, err)
+		}
+		if msg.DeliveryTag <= prev {
+			t.Errorf("delivery tag %d not increasing (prev=%d) at iteration %d", msg.DeliveryTag, prev, i)
+		}
+		prev = msg.DeliveryTag
+	}
+}
+
+// TestAdvanceDeliveryTag verifies that AdvanceDeliveryTag correctly moves
+// the global counter past a recovered tag, preventing collisions (C3 fix).
+func TestAdvanceDeliveryTag(t *testing.T) {
+	broker, cleanup := createTestBroker(t)
+	defer cleanup()
+
+	// Simulate recovery: advance past tag 1000
+	broker.AdvanceDeliveryTag(1000)
+
+	broker.DeclareQueue("queue-a", false, false, false, nil)
+	msg := &protocol.Message{Body: []byte("x"), Exchange: "", RoutingKey: "queue-a"}
+	if err := broker.PublishMessage("", "queue-a", msg); err != nil {
+		t.Fatalf("Publish failed: %v", err)
+	}
+
+	// New tag must be > 1000 (not start from 1, which would collide with recovered messages)
+	if msg.DeliveryTag <= 1000 {
+		t.Errorf("new delivery tag %d should be > 1000 after AdvanceDeliveryTag(1000)", msg.DeliveryTag)
+	}
+}
+
+// TestStopChIdempotentClose verifies that close(stopCh) via sync.Once
+// doesn't panic when called twice (C7 fix — stopOnce prevents double-close).
+func TestStopChIdempotentClose(t *testing.T) {
+	broker, cleanup := createTestBroker(t)
+	defer cleanup()
+
+	broker.DeclareQueue("test-queue", false, false, false, nil)
+	consumer := &protocol.Consumer{
+		Tag:      "test-consumer",
+		Queue:    "test-queue",
+		Messages: make(chan *protocol.Delivery, 1),
+	}
+	if err := broker.RegisterConsumer("test-queue", "test-consumer", consumer); err != nil {
+		t.Fatalf("RegisterConsumer failed: %v", err)
+	}
+
+	// Get the consumer state
+	val, ok := broker.activeConsumers.Load("test-consumer")
+	if !ok {
+		t.Fatal("consumer not found")
+	}
+	state := val.(*ConsumerState)
+
+	// Close stopCh twice — should not panic
+	state.stopOnce.Do(func() { close(state.stopCh) })
+	state.stopOnce.Do(func() { close(state.stopCh) }) // would panic without sync.Once
+
+	// Cleanup
+	broker.UnregisterConsumer("test-consumer")
+}

@@ -21,9 +21,44 @@ func TestDefaultConfig(t *testing.T) {
 	assert.Equal(t, false, config.Security.TLSEnabled)
 	assert.Equal(t, "amqp-go-server", config.Server.Name)
 
+	// Phase 16: Verify memory-reduction config defaults
+	// AvailableChannelBuffer was 10M (80MB per queue) → now 100K (800KB per queue)
+	// This is a 100x reduction enabling realistic multi-queue deployments
+	assert.Equal(t, 100000, config.Engine.AvailableChannelBuffer,
+		"AvailableChannelBuffer should be 100K (800KB per queue), was 10M (80MB)")
+
+	// WALBatchTimeoutMS was 10ms → now 5ms (halves tail latency for lone durable messages)
+	assert.Equal(t, int64(5), config.Engine.WALBatchTimeoutMS,
+		"WALBatchTimeoutMS should be 5ms, was 10ms")
+
+	// SegmentSize was 1GB → now 256MB (4x faster compaction)
+	assert.Equal(t, int64(256*1024*1024), config.Engine.SegmentSize,
+		"SegmentSize should be 256MB, was 1GB")
+
 	// Test validation passes
 	err := config.Validate()
 	assert.NoError(t, err)
+}
+
+// TestDefaultConfigMemoryBudget verifies the per-queue memory footprint
+// of the default config. This is a proof-point for the Phase 16 optimization
+// that reduced AvailableChannelBuffer from 10M to 100K.
+func TestDefaultConfigMemoryBudget(t *testing.T) {
+	cfg := DefaultConfig()
+
+	// AvailableChannelBuffer is a chan uint64 — each entry is 8 bytes
+	// Per-queue memory = buffer_size * 8 bytes
+	bytesPerEntry := int64(8)
+	perQueueBytes := int64(cfg.Engine.AvailableChannelBuffer) * bytesPerEntry
+
+	// 100K entries * 8 bytes = 800KB per queue — well under 1MB
+	assert.Less(t, perQueueBytes, int64(1024*1024),
+		"per-queue available channel memory should be < 1MB, got %d bytes", perQueueBytes)
+
+	// Verify 1000 queues would fit in < 1GB total (was 80GB with old 10M default)
+	totalFor1000Queues := perQueueBytes * 1000
+	assert.Less(t, totalFor1000Queues, int64(1024*1024*1024),
+		"1000 queues should fit in < 1GB, got %d bytes", totalFor1000Queues)
 }
 
 func TestConfigValidation(t *testing.T) {
