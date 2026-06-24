@@ -387,9 +387,7 @@ func TestLogCompaction_TierFallback(t *testing.T) {
 	assert.Equal(t, []byte("tier-fallback-message"), readMsg.Body)
 
 	// Clear ring buffer to force WAL fallback
-	ds.mutex.RLock()
-	ring := ds.queues[queue]
-	ds.mutex.RUnlock()
+	ring := ds.getQueueRing(queue)
 	index := uint64(42) & RingBufferMask
 	ring.ringBuffer[index] = nil
 

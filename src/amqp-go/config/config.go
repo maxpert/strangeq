@@ -74,7 +74,7 @@ func DefaultConfig() *AMQPConfig {
 		},
 		Engine: interfaces.EngineConfig{
 			// Queue State Management
-			AvailableChannelBuffer: 10000000, // 10M = 80 MB per queue (Phase 6E)
+			AvailableChannelBuffer: 100000, // 100K = 800 KB per queue (was 10M = 80 MB)
 
 			// Ring Buffer (Hot Path)
 			RingBufferSize:        65536, // 64K messages = ~6.5 MB per queue

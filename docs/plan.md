@@ -6,6 +6,14 @@ Create a Go package `github.com/maxpert/amqp-go` that implements an AMQP 0.9.1 s
 ## Current Status (Updated: 2026-06-24)
 **Phase 16 - Performance Tuning: IN PROGRESS** 🚧
 
+### Phase 16 - Commit 2: Lock Contention + Config Wiring (COMPLETE) ✅
+- ✅ **P1: `ds.mutex` → `sync.Map`** — Replaced global `sync.RWMutex` with `sync.Map` for queue rings; `getQueueRing()` helper provides lock-free reads on publish/get/delete hot path; `getOrCreateQueueRing()` uses double-check locking (mutex only held during rare queue creation). Eliminates the #1 throughput limiter — all publishes across all queues no longer serialize on a single write lock.
+- ✅ **P6: `AvailableChannelBuffer` 10M → 100K** — 80MB → 800KB per queue (100x memory reduction); 1000 queues: 80GB → 800MB
+- ✅ **P8: Durable message spill bypass fixed** — Durable messages now also skip ring buffer when above spill threshold (they're already in WAL); prevents ring buffer overflow and consumer fallthrough to slow WAL read path
+- ✅ Removed dead `deliveryTagCounters` map (delivery tags now come from broker's global counter)
+- ✅ **Code review**: 1 round, 0 CRITICAL, 0 MAJOR, 3 MINOR (comment fix)
+- ✅ Full test suite passes with `-race` across all packages
+
 ### Phase 16 - Commit 1: P0 Correctness Fixes (COMPLETE) ✅
 - ✅ **C1: Missing WriteMutex** — `sendBasicDeliver` now locks `conn.WriteMutex` before `conn.Conn.Write(allFrames)` to prevent frame corruption race with heartbeats
 - ✅ **C2: Double consumerDeliveryLoop** — Removed duplicate `go s.consumerDeliveryLoop()` at line 172; added `done chan struct{}` parameter + `defer close(done)` for proper lifecycle

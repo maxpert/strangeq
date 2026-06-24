@@ -29,13 +29,10 @@ type StorageMetrics interface {
 }
 
 // DisruptorStorage implements an in-memory message queue using LMAX Disruptor pattern
-// Phase 1: Pure in-memory, zero-GC, lock-free ring buffer
-// Phase 2-5: Various optimizations
-// Phase 6: RabbitMQ-style three-tier storage (Ring → WAL → Segments)
 type DisruptorStorage struct {
-	// Per-queue disruptor rings
-	queues map[string]*QueueRing
-	mutex  sync.RWMutex
+	// Per-queue disruptor rings (sync.Map for lock-free reads after creation)
+	queues   sync.Map // queueName -> *QueueRing (lock-free reads)
+	queuesMu sync.Mutex // Only used for double-check locking during queue creation
 
 	// Metadata storage (Phase 3: JSON files)
 	metadataStore *PersistentMetadataStore
@@ -48,9 +45,6 @@ type DisruptorStorage struct {
 
 	// Segment Manager (Phase 6B: Long-term cold storage with compaction)
 	segments *SegmentManager
-
-	// Atomic counters for delivery tags
-	deliveryTagCounters map[string]*atomic.Uint64 // queueName -> counter
 
 	// Transaction storage (simple in-memory for now)
 	transactions map[string]*interfaces.Transaction
@@ -206,14 +200,12 @@ func NewDisruptorStorageWithEngineConfig(dataDir string, checkpointInterval time
 	}
 
 	return &DisruptorStorage{
-		queues:              make(map[string]*QueueRing),
-		metadataStore:       metadataStore,
-		offsetStore:         offsetStore,
-		wal:                 walManager,
-		segments:            segmentManager,
-		deliveryTagCounters: make(map[string]*atomic.Uint64),
-		transactions:        make(map[string]*interfaces.Transaction),
-		dataDir:             dataDir,
+		metadataStore: metadataStore,
+		offsetStore:   offsetStore,
+		wal:           walManager,
+		segments:      segmentManager,
+		transactions:  make(map[string]*interfaces.Transaction),
+		dataDir:       dataDir,
 	}
 }
 
@@ -228,41 +220,44 @@ func (ds *DisruptorStorage) SetMetrics(metrics StorageMetrics) {
 	}
 }
 
-// getOrCreateQueueRing returns existing queue ring or creates a new one
-func (ds *DisruptorStorage) getOrCreateQueueRing(queueName string) *QueueRing {
-	ds.mutex.Lock()
-	defer ds.mutex.Unlock()
+// getQueueRing returns the queue ring for the given queue, or nil if not found.
+// Lock-free read via sync.Map.Load — no mutex contention on the hot path.
+func (ds *DisruptorStorage) getQueueRing(queueName string) *QueueRing {
+	if val, ok := ds.queues.Load(queueName); ok {
+		return val.(*QueueRing)
+	}
+	return nil
+}
 
-	if ring, exists := ds.queues[queueName]; exists {
-		return ring
+// getOrCreateQueueRing returns existing queue ring or creates a new one.
+// Uses sync.Map for lock-free reads on the hot path (publish/get/delete).
+// The mutex is only held during initial queue creation (rare).
+func (ds *DisruptorStorage) getOrCreateQueueRing(queueName string) *QueueRing {
+	if ring, ok := ds.queues.Load(queueName); ok {
+		return ring.(*QueueRing)
 	}
 
-	// Create new queue ring
+	ds.queuesMu.Lock()
+	defer ds.queuesMu.Unlock()
+
+	// Double-check after acquiring lock
+	if ring, ok := ds.queues.Load(queueName); ok {
+		return ring.(*QueueRing)
+	}
+
 	ring := &QueueRing{
 		name:              queueName,
 		consumerPositions: make(map[string]*atomic.Uint64),
 		unacked:           make(map[string]map[uint64]struct{}),
 	}
-
-	// Initialize consumer
 	ring.consumer = &QueueConsumer{ring: ring}
-
-	// Create disruptor with SPSC (single producer, single consumer) pattern
 	ring.disruptor = disruptor.New(
 		disruptor.WithCapacity(DefaultRingBufferSize),
 		disruptor.WithConsumerGroup(ring.consumer),
 	)
-
-	// CRITICAL FIX (Phase 5): Start the reader goroutine!
-	// This is what actually frees ring buffer slots when Consume() returns
-	// Without this, the consumer cursor never advances and Reserve() blocks forever
 	go ring.disruptor.Read()
 
-	// Initialize delivery tag counter
-	counter := &atomic.Uint64{}
-	ds.deliveryTagCounters[queueName] = counter
-
-	ds.queues[queueName] = ring
+	ds.queues.Store(queueName, ring)
 	return ring
 }
 
@@ -323,15 +318,16 @@ func (ds *DisruptorStorage) StoreMessage(queueName string, message *protocol.Mes
 	// This handles transient messages when ring is full
 	messageCount := ring.messageCount.Load()
 	if ds.wal != nil && messageCount > SpillThreshold {
-		// Ring buffer is > 80% full
+		// Ring buffer is > 80% full — spill to WAL instead of overwriting unconsumed slots.
+		// Durable messages are already written to WAL above, so just skip ring buffer.
+		// Transient messages need to be written to WAL for overflow storage.
 		if message.DeliveryMode != 2 {
-			// For transient messages, write to WAL as overflow
 			if err := ds.wal.Write(queueName, message, message.DeliveryTag); err != nil {
 				// Log error but continue - transient messages can be lost
 			}
 		}
-		// Don't store in ring buffer - it's full
-		// Message will be recovered from WAL on next consume
+		// Both durable and transient skip ring buffer when above threshold.
+		// Messages will be read from WAL on-demand when consumers need them.
 		return nil
 	}
 
@@ -361,11 +357,9 @@ func (ds *DisruptorStorage) StoreMessage(queueName string, message *protocol.Mes
 // GetMessage retrieves a message by delivery tag (pull-based delivery)
 // Phase 6B: Falls back to WAL, then Segments
 func (ds *DisruptorStorage) GetMessage(queueName string, deliveryTag uint64) (*protocol.Message, error) {
-	ds.mutex.RLock()
-	ring, exists := ds.queues[queueName]
-	ds.mutex.RUnlock()
+	ring := ds.getQueueRing(queueName)
 
-	if !exists {
+	if ring == nil {
 		return nil, interfaces.ErrQueueNotFound
 	}
 
@@ -399,11 +393,9 @@ func (ds *DisruptorStorage) GetMessage(queueName string, deliveryTag uint64) (*p
 // DeleteMessage removes a message after ACK
 // Phase 6B: Notifies both WAL and Segments (for compaction)
 func (ds *DisruptorStorage) DeleteMessage(queueName string, deliveryTag uint64) error {
-	ds.mutex.RLock()
-	ring, exists := ds.queues[queueName]
-	ds.mutex.RUnlock()
+	ring := ds.getQueueRing(queueName)
 
-	if !exists {
+	if ring == nil {
 		return interfaces.ErrQueueNotFound
 	}
 
@@ -432,11 +424,9 @@ func (ds *DisruptorStorage) DeleteMessage(queueName string, deliveryTag uint64) 
 
 // GetQueueMessages retrieves all messages in a queue (for testing/debugging)
 func (ds *DisruptorStorage) GetQueueMessages(queueName string) ([]*protocol.Message, error) {
-	ds.mutex.RLock()
-	ring, exists := ds.queues[queueName]
-	ds.mutex.RUnlock()
+	ring := ds.getQueueRing(queueName)
 
-	if !exists {
+	if ring == nil {
 		return nil, interfaces.ErrQueueNotFound
 	}
 
@@ -461,11 +451,9 @@ func (ds *DisruptorStorage) GetQueueMessageCount(queueName string) (int, error) 
 
 // PurgeQueue removes all messages from a queue
 func (ds *DisruptorStorage) PurgeQueue(queueName string) (int, error) {
-	ds.mutex.RLock()
-	ring, exists := ds.queues[queueName]
-	ds.mutex.RUnlock()
+	ring := ds.getQueueRing(queueName)
 
-	if !exists {
+	if ring == nil {
 		return 0, interfaces.ErrQueueNotFound
 	}
 
@@ -482,11 +470,9 @@ func (ds *DisruptorStorage) PurgeQueue(queueName string) (int, error) {
 
 // GetMessageRange retrieves messages in a delivery tag range
 func (ds *DisruptorStorage) GetMessageRange(queueName string, startTag, endTag uint64) ([]*protocol.Message, error) {
-	ds.mutex.RLock()
-	ring, exists := ds.queues[queueName]
-	ds.mutex.RUnlock()
+	ring := ds.getQueueRing(queueName)
 
-	if !exists {
+	if ring == nil {
 		return nil, interfaces.ErrQueueNotFound
 	}
 
@@ -503,11 +489,9 @@ func (ds *DisruptorStorage) GetMessageRange(queueName string, startTag, endTag u
 
 // DeleteMessageRange deletes messages in a range (for GC)
 func (ds *DisruptorStorage) DeleteMessageRange(queueName string, startTag, endTag uint64) error {
-	ds.mutex.RLock()
-	ring, exists := ds.queues[queueName]
-	ds.mutex.RUnlock()
+	ring := ds.getQueueRing(queueName)
 
-	if !exists {
+	if ring == nil {
 		return interfaces.ErrQueueNotFound
 	}
 
@@ -542,11 +526,9 @@ func (ds *DisruptorStorage) IncrementQueueHead(queueName string) (uint64, error)
 
 // GetConsumerPosition returns the consumer's current position
 func (ds *DisruptorStorage) GetConsumerPosition(queueName, consumerTag string) (uint64, error) {
-	ds.mutex.RLock()
-	ring, exists := ds.queues[queueName]
-	ds.mutex.RUnlock()
+	ring := ds.getQueueRing(queueName)
 
-	if !exists {
+	if ring == nil {
 		return 0, interfaces.ErrQueueNotFound
 	}
 
@@ -581,11 +563,9 @@ func (ds *DisruptorStorage) SetConsumerPosition(queueName, consumerTag string, p
 
 // AddUnacked marks a message as unacknowledged
 func (ds *DisruptorStorage) AddUnacked(queueName, consumerTag string, deliveryTag uint64) error {
-	ds.mutex.RLock()
-	ring, exists := ds.queues[queueName]
-	ds.mutex.RUnlock()
+	ring := ds.getQueueRing(queueName)
 
-	if !exists {
+	if ring == nil {
 		return interfaces.ErrQueueNotFound
 	}
 
@@ -603,11 +583,9 @@ func (ds *DisruptorStorage) AddUnacked(queueName, consumerTag string, deliveryTa
 // RemoveUnacked removes an acknowledged message
 // Phase 4: Also updates consumer offset (zero disk writes)
 func (ds *DisruptorStorage) RemoveUnacked(queueName, consumerTag string, deliveryTag uint64) error {
-	ds.mutex.RLock()
-	ring, exists := ds.queues[queueName]
-	ds.mutex.RUnlock()
+	ring := ds.getQueueRing(queueName)
 
-	if !exists {
+	if ring == nil {
 		return interfaces.ErrQueueNotFound
 	}
 
@@ -628,11 +606,9 @@ func (ds *DisruptorStorage) RemoveUnacked(queueName, consumerTag string, deliver
 
 // GetUnackedCount returns the number of unacked messages for a consumer
 func (ds *DisruptorStorage) GetUnackedCount(queueName, consumerTag string) (int, error) {
-	ds.mutex.RLock()
-	ring, exists := ds.queues[queueName]
-	ds.mutex.RUnlock()
+	ring := ds.getQueueRing(queueName)
 
-	if !exists {
+	if ring == nil {
 		return 0, interfaces.ErrQueueNotFound
 	}
 
@@ -648,11 +624,9 @@ func (ds *DisruptorStorage) GetUnackedCount(queueName, consumerTag string) (int,
 
 // GetUnackedTags returns all unacked delivery tags for a consumer
 func (ds *DisruptorStorage) GetUnackedTags(queueName, consumerTag string) ([]uint64, error) {
-	ds.mutex.RLock()
-	ring, exists := ds.queues[queueName]
-	ds.mutex.RUnlock()
+	ring := ds.getQueueRing(queueName)
 
-	if !exists {
+	if ring == nil {
 		return nil, interfaces.ErrQueueNotFound
 	}
 
@@ -672,11 +646,9 @@ func (ds *DisruptorStorage) GetUnackedTags(queueName, consumerTag string) ([]uin
 
 // GetLowestUnackedAcrossConsumers returns the lowest unacked tag across all consumers
 func (ds *DisruptorStorage) GetLowestUnackedAcrossConsumers(queueName string) (uint64, error) {
-	ds.mutex.RLock()
-	ring, exists := ds.queues[queueName]
-	ds.mutex.RUnlock()
+	ring := ds.getQueueRing(queueName)
 
-	if !exists {
+	if ring == nil {
 		return 0, interfaces.ErrQueueNotFound
 	}
 
@@ -760,15 +732,10 @@ func (ds *DisruptorStorage) GetQueue(name string) (*protocol.Queue, error) {
 
 // DeleteQueue deletes a queue
 func (ds *DisruptorStorage) DeleteQueue(name string) error {
-	ds.mutex.Lock()
-	defer ds.mutex.Unlock()
-
-	if ring, exists := ds.queues[name]; exists {
-		// Close the disruptor
+	if val, ok := ds.queues.LoadAndDelete(name); ok {
+		ring := val.(*QueueRing)
 		_ = ring.disruptor.Close()
 		ring.closed.Store(true)
-
-		delete(ds.queues, name)
 	}
 
 	// Delete queue metadata from JSON file
@@ -890,7 +857,7 @@ func (ds *DisruptorStorage) GetTransaction(txID string) (*interfaces.Transaction
 	ds.txMutex.RLock()
 	defer ds.txMutex.RUnlock()
 
-	if tx, exists := ds.transactions[txID]; exists {
+	if tx, ok := ds.transactions[txID]; ok {
 		return tx, nil
 	}
 
@@ -901,8 +868,8 @@ func (ds *DisruptorStorage) AddAction(txID string, action *interfaces.Transactio
 	ds.txMutex.Lock()
 	defer ds.txMutex.Unlock()
 
-	tx, exists := ds.transactions[txID]
-	if !exists {
+	tx, ok := ds.transactions[txID]
+	if !ok {
 		return interfaces.ErrTransactionNotFound
 	}
 
@@ -918,8 +885,8 @@ func (ds *DisruptorStorage) CommitTransaction(txID string) error {
 	ds.txMutex.Lock()
 	defer ds.txMutex.Unlock()
 
-	tx, exists := ds.transactions[txID]
-	if !exists {
+	tx, ok := ds.transactions[txID]
+	if !ok {
 		return interfaces.ErrTransactionNotFound
 	}
 
@@ -936,8 +903,8 @@ func (ds *DisruptorStorage) RollbackTransaction(txID string) error {
 	ds.txMutex.Lock()
 	defer ds.txMutex.Unlock()
 
-	tx, exists := ds.transactions[txID]
-	if !exists {
+	tx, ok := ds.transactions[txID]
+	if !ok {
 		return interfaces.ErrTransactionNotFound
 	}
 
@@ -1144,27 +1111,24 @@ func (ds *DisruptorStorage) RecoverAllQueues() error {
 	return nil
 }
 
-// ExecuteAtomic runs operations atomically (Phase 1: simple mutex lock)
+// ExecuteAtomic runs operations atomically
 func (ds *DisruptorStorage) ExecuteAtomic(operations func(txnStorage interfaces.Storage) error) error {
-	ds.mutex.Lock()
-	defer ds.mutex.Unlock()
+	ds.txMutex.Lock()
+	defer ds.txMutex.Unlock()
 
-	// In Phase 1, we just execute operations under the global lock
-	// Phase 2+ will implement proper MVCC or transaction log
 	return operations(ds)
 }
 
 // Close cleans up all resources
 func (ds *DisruptorStorage) Close() error {
-	ds.mutex.Lock()
-	defer ds.mutex.Unlock()
-
-	for _, ring := range ds.queues {
+	ds.queues.Range(func(_, value interface{}) bool {
+		ring := value.(*QueueRing)
 		if !ring.closed.Load() {
 			_ = ring.disruptor.Close()
 			ring.closed.Store(true)
 		}
-	}
+		return true
+	})
 
 	// Close metadata store (Phase 3)
 	if ds.metadataStore != nil {
