@@ -264,7 +264,7 @@ Benchmarks on Apple M4 Max (16 cores):
 - **Configurable ring buffer** — Size and spill threshold wired from EngineConfig (was hardcoded)
 - **WAL file handle cache** — Eliminates open/close syscalls per WAL read; pread for positional I/O
 
-See [docs/BENCHMARKS.md](docs/BENCHMARKS.md) and [PERFORMANCE_PLAN.md](PERFORMANCE_PLAN.md) for detailed performance analysis.
+See [docs/BENCHMARKS.md](docs/BENCHMARKS.md) for detailed performance analysis.
 
 ## Production Deployment
 
@@ -314,8 +314,6 @@ Key metrics:
 - [Authentication Setup](docs/AUTHENTICATION.md) - Setting up user authentication
 - [Authorization Guide](docs/AUTHORIZATION.md) - Permission model and access control
 - [TLS Configuration](docs/TLS.md) - TLS encryption and mutual TLS setup
-- [Development Plan](docs/plan.md) - Project roadmap and implementation status
-- [Performance Plan](PERFORMANCE_PLAN.md) - Phase 16 optimization details and benchmarks
 - [Contributing Guidelines](CONTRIBUTING.md) - How to contribute
 - [Security Policy](SECURITY.md) - Security best practices
 
