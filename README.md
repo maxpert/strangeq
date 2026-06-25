@@ -11,12 +11,17 @@ A high-performance AMQP 0.9.1 message broker implementation written in Go. Compa
 - ✅ Full AMQP 0.9.1 protocol implementation
 - ✅ Compatible with RabbitMQ clients (Go, Python, Node.js, etc.)
 - ✅ Multiple exchange types (direct, fanout, topic, headers)
-- ✅ Persistent and non-persistent messages
-- ✅ Multiple storage backends (memory, Badger)
+- ✅ Three-tier storage architecture (Ring Buffer → WAL → Segments)
+- ✅ Persistent and non-persistent messages with crash recovery
+- ✅ TLS/SSL encryption with mutual TLS support
 - ✅ SASL authentication (PLAIN, ANONYMOUS)
-- ✅ Transaction support
-- ✅ High performance (3M+ ops/sec in-memory)
+- ✅ Authorization with RabbitMQ-style configure/write/read permissions per vhost
+- ✅ Transaction support (Tx.Select, Tx.Commit, Tx.Rollback)
+- ✅ High performance (3M+ ops/sec in-memory, optimized durable path)
 - ✅ Prometheus metrics integration
+- ✅ Configurable engine tuning (ring buffer size, WAL batch size, spill thresholds)
+- ✅ Lock-free hot paths (sync.Map, atomic counters, channel-based fan-in)
+- ✅ Linux fdatasync for 10-20% faster WAL fsync
 
 ## Installation
 
@@ -58,6 +63,15 @@ amqp-server
 
 # With persistent storage (production)
 amqp-server --storage badger --storage-path ./data
+
+# With TLS encryption
+amqp-server --tls --tls-cert cert.pem --tls-key key.pem
+
+# With mutual TLS (client cert verification)
+amqp-server --tls --tls-cert cert.pem --tls-key key.pem --tls-ca ca.pem
+
+# With authentication and authorization
+amqp-server --auth --auth-file auth.json --config config.json
 
 # With configuration file
 amqp-server --config config.json
@@ -165,6 +179,10 @@ Options:
   --auth-file FILE         Authentication file path
   --log-level LEVEL        Log level: debug|info|warn|error (default: info)
   --log-file FILE          Log file path (default: stdout)
+  --tls                    Enable TLS encryption
+  --tls-cert FILE          TLS certificate file path
+  --tls-key FILE           TLS private key file path
+  --tls-ca FILE            TLS CA certificate file path (enables mutual TLS)
 ```
 
 ### Configuration File
@@ -175,25 +193,45 @@ Create `config.json`:
 {
   "network": {
     "address": ":5672",
-    "max_connections": 1000
+    "max_connections": 1000,
+    "heartbeat_interval_ms": 60000,
+    "tcp_keepalive": true
   },
   "storage": {
-    "backend": "badger",
     "path": "./data",
-    "persistent": true
+    "checkpoint_interval_ms": 5000
   },
   "security": {
-    "authentication_enabled": true,
-    "authentication_config": {
-      "user_file": "users.json"
-    }
+    "tls_enabled": false,
+    "authentication_enabled": false,
+    "authorization_enabled": false,
+    "default_vhost": "/",
+    "auth_mechanisms": ["PLAIN"]
   },
   "server": {
     "log_level": "info",
-    "max_frame_size": 131072
+    "max_frame_size": 131072,
+    "max_channels_per_connection": 2047,
+    "memory_limit_percent": 60
+  },
+  "engine": {
+    "ring_buffer_size": 65536,
+    "spill_threshold_percent": 80,
+    "wal_batch_size": 1000,
+    "wal_batch_timeout_ms": 5,
+    "segment_size": 268435456,
+    "consumer_select_timeout_ms": 1,
+    "consumer_max_batch_size": 100
   }
 }
 ```
+
+Key engine tuning parameters:
+- `ring_buffer_size` — In-memory ring buffer per queue (must be power of 2, default 64K)
+- `spill_threshold_percent` — Ring fill % before spilling to WAL (default 80)
+- `wal_batch_size` / `wal_batch_timeout_ms` — WAL batching for durable writes (1000 msgs / 5ms)
+- `segment_size` — Cold storage segment file size (default 256MB)
+- `consumer_select_timeout_ms` — Consumer delivery poll interval (default 1ms)
 
 Run with config:
 
@@ -208,11 +246,25 @@ Benchmarks on Apple M4 Max (16 cores):
 | Operation | Throughput | Latency |
 |-----------|-----------|---------|
 | Message Publishing (memory) | 2.9M ops/sec | 344 ns/op |
+| Multi-queue concurrent publish | 942K ops/sec | 1,062 ns/op |
 | Exchange Declaration | 3.2M ops/sec | 309 ns/op |
 | Queue Declaration | 2.8M ops/sec | 357 ns/op |
 | Message Publishing (persistent) | 15K ops/sec | 66 μs/op |
+| WAL read (indexed, with cache) | 89K ops/sec | 11,233 ns/op |
+| E2E large message (64KB) | 62K ops/sec | 16,195 ns/op |
 
-See [docs/BENCHMARKS.md](docs/BENCHMARKS.md) for detailed performance analysis.
+### Phase 16 Performance Optimizations
+
+- **Lock-free queue rings** — `sync.Map` for queue lookup, no mutex on hot path
+- **Fan-in consumer delivery** — Replaced `reflect.Select` with per-consumer forwarding goroutines → O(1) channel select
+- **Batch WAL writes** — Single fsync per batch (fdatasync on Linux for 10-20% speedup)
+- **Batch segment checkpoint** — Single mutex + single `file.Write()` per batch
+- **Batch segment ACKs** — Channel-batched bitmap updates reduce lock contention
+- **Pooled allocations** — `sync.Pool` for WAL done channels, frame buffers; `AppendUint*` for zero-temp serialization
+- **Configurable ring buffer** — Size and spill threshold wired from EngineConfig (was hardcoded)
+- **WAL file handle cache** — Eliminates open/close syscalls per WAL read; pread for positional I/O
+
+See [docs/BENCHMARKS.md](docs/BENCHMARKS.md) and [PERFORMANCE_PLAN.md](PERFORMANCE_PLAN.md) for detailed performance analysis.
 
 ## Production Deployment
 
@@ -263,6 +315,7 @@ Key metrics:
 - [Authorization Guide](docs/AUTHORIZATION.md) - Permission model and access control
 - [TLS Configuration](docs/TLS.md) - TLS encryption and mutual TLS setup
 - [Development Plan](docs/plan.md) - Project roadmap and implementation status
+- [Performance Plan](PERFORMANCE_PLAN.md) - Phase 16 optimization details and benchmarks
 - [Contributing Guidelines](CONTRIBUTING.md) - How to contribute
 - [Security Policy](SECURITY.md) - Security best practices
 
@@ -278,6 +331,9 @@ StrangeQ implements AMQP 0.9.1 specification with support for:
 - Message consumption (Basic.Get, Basic.Consume)
 - Message acknowledgment (Basic.Ack, Basic.Nack, Basic.Reject)
 - Transactions (Tx.Select, Tx.Commit, Tx.Rollback)
+- TLS/SSL encryption with mutual TLS authentication
+- SASL authentication (PLAIN, ANONYMOUS)
+- Authorization with per-vhost configure/write/read permissions
 
 ## Compatibility
 
