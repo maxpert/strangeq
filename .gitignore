@@ -70,9 +70,4 @@ Thumbs.db
 .claude/
 
 # Planning docs (kept local, not tracked in git)
-IMPLEMENTATION_PLAN.md
-PERFORMANCE_PLAN.md
 docs/plan.md
-docs/LOCK_FREE_OPTIMIZATION_PLAN.md
-docs/PROTOCOL_COVERAGE_PLAN.md
-src/amqp-go/docs/protocol-performance.md
