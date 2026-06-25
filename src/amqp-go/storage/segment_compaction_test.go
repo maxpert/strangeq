@@ -40,6 +40,14 @@ func TestSegment_DeletedCountIncrement(t *testing.T) {
 	require.True(t, ok)
 	qs := val.(*QueueSegments)
 
+	// Batch ACK is asynchronous — wait for all 60 ACKs to be applied
+	require.Eventually(t, func() bool {
+		qs.bitmapMutex.RLock()
+		count := int(qs.ackBitmap.GetCardinality())
+		qs.bitmapMutex.RUnlock()
+		return count >= 60
+	}, 1*time.Second, 5*time.Millisecond, "batch ACKs should be applied")
+
 	// Check current segment (messages should be there since we didn't seal)
 	qs.mutex.Lock()
 	currentSeg := qs.currentSegment
@@ -84,8 +92,9 @@ func TestSegment_CompactionTriggers(t *testing.T) {
 
 	// Seal the current segment so compaction can operate on it
 	qs.mutex.Lock()
-	qs.sealSegment()
+	err = qs.sealSegment()
 	qs.mutex.Unlock()
+	require.NoError(t, err)
 	// openNextSegment takes the mutex internally
 	err = qs.openNextSegment()
 	require.NoError(t, err)
@@ -94,6 +103,14 @@ func TestSegment_CompactionTriggers(t *testing.T) {
 	for i := uint64(1); i <= 51; i++ {
 		sm.Acknowledge(queueName, i)
 	}
+
+	// Batch ACK is asynchronous — wait for ACKs to be applied before compaction
+	require.Eventually(t, func() bool {
+		qs.bitmapMutex.RLock()
+		count := int(qs.ackBitmap.GetCardinality())
+		qs.bitmapMutex.RUnlock()
+		return count >= 51
+	}, 1*time.Second, 5*time.Millisecond, "batch ACKs should be applied before compaction")
 
 	// Wait for compaction loop to run
 	time.Sleep(500 * time.Millisecond)
@@ -143,8 +160,9 @@ func TestSegment_CompactionPreservesUnacked(t *testing.T) {
 	qs := val.(*QueueSegments)
 
 	qs.mutex.Lock()
-	qs.sealSegment()
+	err = qs.sealSegment()
 	qs.mutex.Unlock()
+	require.NoError(t, err)
 	err = qs.openNextSegment()
 	require.NoError(t, err)
 
@@ -152,6 +170,14 @@ func TestSegment_CompactionPreservesUnacked(t *testing.T) {
 	for i := uint64(1); i <= 4; i++ {
 		sm.Acknowledge(queueName, i)
 	}
+
+	// Batch ACK is asynchronous — wait for all 4 ACKs to be applied to the bitmap
+	require.Eventually(t, func() bool {
+		qs.bitmapMutex.RLock()
+		count := int(qs.ackBitmap.GetCardinality())
+		qs.bitmapMutex.RUnlock()
+		return count >= 4
+	}, 1*time.Second, 5*time.Millisecond, "batch ACKs should be applied before compaction")
 
 	// Manually trigger compaction
 	qs.tryCompaction()
@@ -239,11 +265,13 @@ func TestSegment_DeletedCountNotIncrementedWithoutFix(t *testing.T) {
 	require.True(t, ok)
 	qs := val.(*QueueSegments)
 
-	qs.mutex.Lock()
-	seg := qs.currentSegment
-	qs.mutex.Unlock()
-
-	// Before the fix, this would be 0. After the fix, it should be 1.
-	assert.Equal(t, uint64(1), seg.deletedCount.Load(),
+	// Batch ACK is asynchronous (processed by batchAckLoop every ~10ms).
+	// Poll for the expected deletedCount value with a timeout.
+	require.Eventually(t, func() bool {
+		qs.mutex.Lock()
+		seg := qs.currentSegment
+		qs.mutex.Unlock()
+		return seg != nil && seg.deletedCount.Load() == 1
+	}, 1*time.Second, 5*time.Millisecond,
 		"deletedCount must be incremented when a message in the segment is ACKed")
 }

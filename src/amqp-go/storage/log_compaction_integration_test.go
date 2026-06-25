@@ -147,8 +147,9 @@ func TestLogCompaction_FullLifecycle(t *testing.T) {
 	if ok {
 		qs := val.(*QueueSegments)
 		qs.mutex.Lock()
-		qs.sealSegment()
+		err = qs.sealSegment()
 		qs.mutex.Unlock()
+		require.NoError(t, err)
 		err = qs.openNextSegment()
 		require.NoError(t, err)
 
@@ -388,7 +389,7 @@ func TestLogCompaction_TierFallback(t *testing.T) {
 
 	// Clear ring buffer to force WAL fallback
 	ring := ds.getQueueRing(queue)
-	index := uint64(42) & RingBufferMask
+	index := uint64(42) & uint64(ring.ringMask)
 	ring.ringBuffer[index] = nil
 
 	// Tier 2: Read from WAL (ring buffer cleared)

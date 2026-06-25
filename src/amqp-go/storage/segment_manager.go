@@ -79,6 +79,10 @@ type QueueSegments struct {
 	ackBitmap   *roaring64.Bitmap
 	bitmapMutex sync.RWMutex
 
+	// Batch ACK channel (M2: reduces bitmapMutex contention from per-ACK to per-batch)
+	ackChan      chan uint64
+	ackBatchSize int
+
 	// Compaction state
 	lastCompaction time.Time
 	compactionMux  sync.Mutex
@@ -168,7 +172,10 @@ func (sm *SegmentManager) Read(queueName string, offset uint64) (*protocol.Messa
 	return segments.readMessage(offset)
 }
 
-// Acknowledge marks a message as ACKed for future compaction
+// Acknowledge marks a message as ACKed for future compaction.
+// M2: Sends the offset to a batch ACK channel instead of locking bitmapMutex
+// per call. The batchAckLoop goroutine collects ACKs and applies them in
+// batches, reducing lock contention from O(N) to O(N/batchSize).
 func (sm *SegmentManager) Acknowledge(queueName string, offset uint64) {
 	val, ok := sm.queueSegments.Load(queueName)
 	if !ok {
@@ -176,12 +183,74 @@ func (sm *SegmentManager) Acknowledge(queueName string, offset uint64) {
 	}
 	segments := val.(*QueueSegments)
 
-	segments.bitmapMutex.Lock()
-	segments.ackBitmap.Add(offset)
-	segments.bitmapMutex.Unlock()
+	// Non-blocking send to batch ACK channel (drop if full to prevent backpressure)
+	select {
+	case segments.ackChan <- offset:
+	default:
+		// Channel full — apply directly as fallback
+		segments.applyAck(offset)
+	}
+}
 
-	// Increment deletedCount on the segment containing this offset
-	segments.acknowledgeInSegment(offset)
+// applyAck applies a single ACK to the bitmap and segment counters.
+func (qs *QueueSegments) applyAck(offset uint64) {
+	qs.bitmapMutex.Lock()
+	qs.ackBitmap.Add(offset)
+	qs.bitmapMutex.Unlock()
+	qs.acknowledgeInSegment(offset)
+}
+
+// batchAckLoop collects ACKs from the channel and applies them in batches,
+// reducing bitmapMutex lock contention from per-ACK to per-batch.
+func (qs *QueueSegments) batchAckLoop() {
+	defer qs.wg.Done()
+
+	batch := make([]uint64, 0, qs.ackBatchSize)
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+
+	flush := func() {
+		if len(batch) == 0 {
+			return
+		}
+		// Single lock acquisition for the entire batch
+		qs.bitmapMutex.Lock()
+		for _, offset := range batch {
+			qs.ackBitmap.Add(offset)
+		}
+		qs.bitmapMutex.Unlock()
+
+		// Update segment-level deleted counts (no bitmap lock needed)
+		for _, offset := range batch {
+			qs.acknowledgeInSegment(offset)
+		}
+		batch = batch[:0]
+	}
+
+	for {
+		select {
+		case offset := <-qs.ackChan:
+			batch = append(batch, offset)
+			if len(batch) >= qs.ackBatchSize {
+				flush()
+			}
+
+		case <-ticker.C:
+			flush()
+
+		case <-qs.stopChan:
+			// Drain remaining ACKs before exit
+			for {
+				select {
+				case offset := <-qs.ackChan:
+					batch = append(batch, offset)
+				default:
+					flush()
+					return
+				}
+			}
+		}
+	}
 }
 
 // acknowledgeInSegment finds the segment containing the offset and increments its deletedCount
@@ -220,22 +289,86 @@ func (qs *QueueSegments) acknowledgeInSegment(offset uint64) {
 }
 
 // CheckpointBatch writes a batch of recovery messages to segments for a given queue.
+// M5: All messages are written in a single file.Write() call with a single
+// mutex acquisition, reducing lock contention and write syscalls from O(N) to O(1).
 // Used during WAL checkpoint to migrate messages from WAL to cold storage.
 func (sm *SegmentManager) CheckpointBatch(queueName string, messages []*RecoveryMessage) error {
 	if len(messages) == 0 {
 		return nil
 	}
 	segments := sm.getOrCreateQueueSegments(queueName)
-	for _, rm := range messages {
-		if err := segments.writeMessage(rm.Message, rm.Offset); err != nil {
-			return fmt.Errorf("checkpoint write failed for offset %d: %w", rm.Offset, err)
-		}
+	if err := segments.writeMessageBatch(messages); err != nil {
+		return fmt.Errorf("checkpoint batch write failed for queue %s: %w", queueName, err)
 	}
-	// Fsync the segment file to ensure durability before the WAL file is deleted.
+	// Fdatasync the segment file to ensure durability before the WAL file is deleted.
 	// Without this, a crash after WAL deletion but before segment fsync would lose messages.
 	if err := segments.sync(); err != nil {
 		return fmt.Errorf("checkpoint fsync failed for queue %s: %w", queueName, err)
 	}
+	return nil
+}
+
+// writeMessageBatch writes multiple messages to the current segment in a single
+// file write, with a single mutex acquisition. This is O(1) in lock acquisitions
+// and write syscalls vs O(N) for individual writeMessage calls.
+func (qs *QueueSegments) writeMessageBatch(messages []*RecoveryMessage) error {
+	qs.mutex.Lock()
+	defer qs.mutex.Unlock()
+
+	if qs.currentSegment == nil {
+		return fmt.Errorf("no active segment")
+	}
+
+	// Serialize all messages and build a single write buffer + index updates
+	type indexUpdate struct {
+		offset   uint64
+		position int64
+	}
+	updates := make([]indexUpdate, 0, len(messages))
+	var buf []byte
+
+	for _, rm := range messages {
+		position := qs.currentSegment.fileSize.Load() + int64(len(buf))
+		msgBytes := serializeSegmentMessage(rm.Message, rm.Offset)
+		buf = append(buf, msgBytes...)
+		updates = append(updates, indexUpdate{offset: rm.Offset, position: position})
+	}
+
+	// Single write syscall for all messages
+	n, err := qs.currentSegment.file.Write(buf)
+	if err != nil {
+		return fmt.Errorf("failed to write batch to segment: %w", err)
+	}
+
+	// Update index entries in a single lock acquisition
+	qs.currentIndex.mutex.Lock()
+	for _, u := range updates {
+		qs.currentIndex.entries[u.offset] = u.position
+	}
+	qs.currentIndex.mutex.Unlock()
+
+	// Update segment metadata
+	qs.currentSegment.fileSize.Add(int64(n))
+	qs.currentSegment.messageCount.Add(uint64(len(messages)))
+	for _, rm := range messages {
+		if rm.Offset < qs.currentSegment.minOffset || qs.currentSegment.minOffset == 0 {
+			qs.currentSegment.minOffset = rm.Offset
+		}
+		if rm.Offset > qs.currentSegment.maxOffset {
+			qs.currentSegment.maxOffset = rm.Offset
+		}
+	}
+
+	// Check if we need to roll to new segment
+	if qs.currentSegment.fileSize.Load() >= qs.cfg.SegmentSize {
+		if err := qs.sealSegment(); err != nil {
+			return fmt.Errorf("failed to seal segment during batch write: %w", err)
+		}
+		if err := qs.openNextSegmentLocked(); err != nil {
+			return fmt.Errorf("failed to open new segment during batch write: %w", err)
+		}
+	}
+
 	return nil
 }
 
@@ -244,7 +377,7 @@ func (qs *QueueSegments) sync() error {
 	qs.mutex.Lock()
 	defer qs.mutex.Unlock()
 	if qs.currentSegment != nil && qs.currentSegment.file != nil {
-		return qs.currentSegment.file.Sync()
+		return fdatasyncFile(qs.currentSegment.file)
 	}
 	return nil
 }
@@ -270,12 +403,18 @@ func (sm *SegmentManager) getOrCreateQueueSegments(queueName string) *QueueSegme
 	queueDir := filepath.Join(sm.dataDir, queueName)
 	_ = os.MkdirAll(queueDir, 0755)
 
+	// Batch ACK settings
+	const ackChannelBuffer = 1000
+	const ackBatchSize = 100
+
 	segments := &QueueSegments{
 		queueName:      queueName,
 		dataDir:        queueDir,
 		cfg:            sm.cfg,
 		sealedSegments: make(map[uint64]*SegmentFile),
 		ackBitmap:      roaring64.New(),
+		ackChan:        make(chan uint64, ackChannelBuffer),
+		ackBatchSize:   ackBatchSize,
 		stopChan:       make(chan struct{}),
 		metrics:        sm.metrics,
 	}
@@ -286,9 +425,10 @@ func (sm *SegmentManager) getOrCreateQueueSegments(queueName string) *QueueSegme
 	}
 
 	// Start background goroutines
-	segments.wg.Add(2)
+	segments.wg.Add(3)
 	go segments.checkpointLoop()
 	go segments.compactionLoop()
+	go segments.batchAckLoop()
 
 	// Store and return
 	actual, loaded := sm.queueSegments.LoadOrStore(queueName, segments)
@@ -340,8 +480,12 @@ func (qs *QueueSegments) writeMessage(message *protocol.Message, offset uint64) 
 	// openNextSegmentLocked is called instead of openNextSegment because we
 	// already hold qs.mutex here — openNextSegment would deadlock.
 	if qs.currentSegment.fileSize.Load() >= qs.cfg.SegmentSize {
-		qs.sealSegment()
-		_ = qs.openNextSegmentLocked()
+		if err := qs.sealSegment(); err != nil {
+			return fmt.Errorf("failed to seal segment: %w", err)
+		}
+		if err := qs.openNextSegmentLocked(); err != nil {
+			return fmt.Errorf("failed to open new segment: %w", err)
+		}
 	}
 
 	return nil
@@ -396,14 +540,17 @@ func (qs *QueueSegments) readMessage(offset uint64) (*protocol.Message, error) {
 	return nil, fmt.Errorf("message not in segments")
 }
 
-// sealSegment moves current segment to sealed segments
-func (qs *QueueSegments) sealSegment() {
+// sealSegment moves current segment to sealed segments.
+// Returns an error if the segment file cannot be synced to disk.
+func (qs *QueueSegments) sealSegment() error {
 	if qs.currentSegment == nil {
-		return
+		return nil
 	}
 
-	// Sync to disk
-	_ = qs.currentSegment.file.Sync()
+	// Sync to disk — must succeed for durability before sealing
+	if err := qs.currentSegment.file.Sync(); err != nil {
+		return fmt.Errorf("failed to sync segment before sealing: %w", err)
+	}
 
 	// Copy index entries to the segment's own index for sealed-segment reads
 	if qs.currentIndex != nil {
@@ -430,6 +577,8 @@ func (qs *QueueSegments) sealSegment() {
 
 	// Write index to disk
 	qs.writeIndexToDisk(qs.currentSegment.segmentNum, qs.currentIndex)
+
+	return nil
 }
 
 // openNextSegment creates and opens the next segment file (acquires qs.mutex).

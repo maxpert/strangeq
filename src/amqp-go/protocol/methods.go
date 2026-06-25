@@ -2119,16 +2119,15 @@ type BasicDeliverMethod struct {
 
 // Serialize encodes the BasicDeliverMethod into a byte slice
 func (m *BasicDeliverMethod) Serialize() ([]byte, error) {
-	var result []byte
+	// Pre-allocate with enough capacity for all fields to avoid regrowth.
+	// consumerTag(1+255) + deliveryTag(8) + redelivered(1) + exchange(1+255) + routingKey(1+255) = 777 max
+	result := make([]byte, 0, 777)
 
 	// Consumer tag (short string)
-	consumerTagBytes := encodeShortString(m.ConsumerTag)
-	result = append(result, consumerTagBytes...)
+	result = append(result, encodeShortString(m.ConsumerTag)...)
 
-	// Delivery tag (long long integer - 64-bit)
-	deliveryTagBytes := make([]byte, 8)
-	binary.BigEndian.PutUint64(deliveryTagBytes, m.DeliveryTag)
-	result = append(result, deliveryTagBytes...)
+	// Delivery tag (64-bit, appended in-place — no temp allocation)
+	result = binary.BigEndian.AppendUint64(result, m.DeliveryTag)
 
 	// Redelivered (bit field - single byte with bit 0 set if redelivered)
 	// AMQP 0.9.1 spec: redelivered is a single bit field, not a 16-bit flags field
@@ -2141,12 +2140,10 @@ func (m *BasicDeliverMethod) Serialize() ([]byte, error) {
 	result = append(result, redeliveredByte)
 
 	// Exchange (short string)
-	exchangeBytes := encodeShortString(m.Exchange)
-	result = append(result, exchangeBytes...)
+	result = append(result, encodeShortString(m.Exchange)...)
 
 	// Routing key (short string)
-	routingKeyBytes := encodeShortString(m.RoutingKey)
-	result = append(result, routingKeyBytes...)
+	result = append(result, encodeShortString(m.RoutingKey)...)
 
 	return result, nil
 }

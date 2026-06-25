@@ -203,6 +203,38 @@ func (wm *WALManager) SetMetrics(metrics WALMetrics) {
 	}
 }
 
+// doneChannelPool pools buffered error channels (cap 1) used by Write() for
+// synchronous batch durability. Each durable message previously allocated a
+// new channel via make(chan error, 1); the pool eliminates that allocation on
+// the hot path after warmup.
+var doneChannelPool = sync.Pool{
+	New: func() interface{} {
+		return make(chan error, 1)
+	},
+}
+
+// getDoneChannelPool returns the package-level done channel pool (for testing).
+func getDoneChannelPool() *sync.Pool {
+	return &doneChannelPool
+}
+
+// getDoneChannel gets a buffered error channel (cap 1) from the pool.
+func getDoneChannel(pool *sync.Pool) chan error {
+	return pool.Get().(chan error)
+}
+
+// putDoneChannel returns a channel to the pool. Defensively drains any stale
+// value to prevent deadlock if a future code path returns the channel without
+// reading the result (a pending value in a cap-1 channel would cause the next
+// flushBatch send to block forever).
+func putDoneChannel(pool *sync.Pool, ch chan error) {
+	select {
+	case <-ch: // drain any stale value
+	default:
+	}
+	pool.Put(ch)
+}
+
 // Write writes a message to the shared WAL (synchronous batch write)
 // Blocks until the batch containing this message is fsynced to disk.
 // This ensures proper AMQP durability semantics (Option 2: Batch Synchronous).
@@ -211,8 +243,9 @@ func (wm *WALManager) Write(queueName string, message *protocol.Message, offset 
 		return fmt.Errorf("shared WAL not initialized")
 	}
 
-	// Create response channel for this write
-	doneChan := make(chan error, 1)
+	// Get a response channel from the pool (avoids make(chan error, 1) per write)
+	doneChan := getDoneChannel(&doneChannelPool)
+	defer putDoneChannel(&doneChannelPool, doneChan)
 
 	// Blocking send to channel - callers will wait if channel is full (true backpressure)
 	wm.sharedWAL.writeChan <- &writeRequest{
@@ -568,10 +601,11 @@ func (qw *QueueWAL) flushBatch(batch []*writeRequest) {
 		}
 	}
 
-	// Fsync for durability (one sync per batch!)
-	// This is the critical durability guarantee - messages are only durable after this completes
+	// Fdatasync for durability (one sync per batch!)
+	// Uses fdatasync on Linux (skips metadata sync for ~2-5x speedup vs fsync).
+	// This is the critical durability guarantee - messages are only durable after this completes.
 	fsyncStart := time.Now()
-	fsyncErr := qw.currentFile.Sync()
+	fsyncErr := fdatasyncFile(qw.currentFile)
 	fsyncDuration := time.Since(fsyncStart).Seconds()
 
 	// Record fsync metrics

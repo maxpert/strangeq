@@ -233,101 +233,107 @@ func ReadContentHeader(frame *Frame) (*ContentHeader, error) {
 
 // Serialize encodes the ContentHeader into a byte slice
 func (h *ContentHeader) Serialize() ([]byte, error) {
-	var result []byte
-
-	// Class ID (uint16)
-	classIDBytes := make([]byte, 2)
-	binary.BigEndian.PutUint16(classIDBytes, h.ClassID)
-	result = append(result, classIDBytes...)
-
-	// Weight (uint16)
-	weightBytes := make([]byte, 2)
-	binary.BigEndian.PutUint16(weightBytes, h.Weight)
-	result = append(result, weightBytes...)
-
-	// Body size (uint64)
-	bodySizeBytes := make([]byte, 8)
-	binary.BigEndian.PutUint64(bodySizeBytes, h.BodySize)
-	result = append(result, bodySizeBytes...)
-
-	// Property flags (uint16)
-	propertyFlagsBytes := make([]byte, 2)
-	binary.BigEndian.PutUint16(propertyFlagsBytes, h.PropertyFlags)
-	result = append(result, propertyFlagsBytes...)
-
-	// Serialize properties based on property flags
-	if h.PropertyFlags&FlagContentType != 0 {
-		contentTypeBytes := encodeShortString(h.ContentType)
-		result = append(result, contentTypeBytes...)
+	// Compute exact capacity to guarantee zero slice regrowth.
+	// Fixed header: classID(2) + weight(2) + bodySize(8) + propertyFlags(2) = 14 bytes.
+	// Each short-string property: 1 (length byte) + len(string), capped at 255.
+	// Timestamp: 8 bytes. DeliveryMode/Priority: 1 byte each.
+	// Headers field-table: encoded length (computed below).
+	size := 14
+	for _, s := range []string{
+		h.ContentType, h.ContentEncoding, h.CorrelationID,
+		h.ReplyTo, h.Expiration, h.MessageID,
+		h.Type, h.UserID, h.AppID, h.ClusterID,
+	} {
+		if len(s) > 255 {
+			size += 256
+		} else {
+			size += 1 + len(s)
+		}
+	}
+	if h.PropertyFlags&FlagDeliveryMode != 0 {
+		size += 1
+	}
+	if h.PropertyFlags&FlagPriority != 0 {
+		size += 1
+	}
+	if h.PropertyFlags&FlagTimestamp != 0 {
+		size += 8
 	}
 
-	if h.PropertyFlags&FlagContentEncoding != 0 {
-		contentEncodingBytes := encodeShortString(h.ContentEncoding)
-		result = append(result, contentEncodingBytes...)
-	}
-
+	// Pre-encode headers field-table to measure its exact size.
+	var headersBytes []byte
 	if h.PropertyFlags&FlagHeaders != 0 {
-		headersBytes, err := encodeFieldTable(h.Headers)
+		var err error
+		headersBytes, err = encodeFieldTable(h.Headers)
 		if err != nil {
 			return nil, fmt.Errorf("error encoding headers: %v", err)
 		}
+		size += len(headersBytes)
+	}
+
+	result := make([]byte, 0, size)
+
+	// Fixed header
+	result = binary.BigEndian.AppendUint16(result, h.ClassID)
+	result = binary.BigEndian.AppendUint16(result, h.Weight)
+	result = binary.BigEndian.AppendUint64(result, h.BodySize)
+	result = binary.BigEndian.AppendUint16(result, h.PropertyFlags)
+
+	// Serialize properties based on property flags
+	if h.PropertyFlags&FlagContentType != 0 {
+		result = append(result, encodeShortString(h.ContentType)...)
+	}
+
+	if h.PropertyFlags&FlagContentEncoding != 0 {
+		result = append(result, encodeShortString(h.ContentEncoding)...)
+	}
+
+	if h.PropertyFlags&FlagHeaders != 0 {
 		result = append(result, headersBytes...)
 	}
 
 	if h.PropertyFlags&FlagDeliveryMode != 0 {
-		deliveryModeBytes := []byte{h.DeliveryMode}
-		result = append(result, deliveryModeBytes...)
+		result = append(result, h.DeliveryMode)
 	}
 
 	if h.PropertyFlags&FlagPriority != 0 {
-		priorityBytes := []byte{h.Priority}
-		result = append(result, priorityBytes...)
+		result = append(result, h.Priority)
 	}
 
 	if h.PropertyFlags&FlagCorrelationID != 0 {
-		correlationIDBytes := encodeShortString(h.CorrelationID)
-		result = append(result, correlationIDBytes...)
+		result = append(result, encodeShortString(h.CorrelationID)...)
 	}
 
 	if h.PropertyFlags&FlagReplyTo != 0 {
-		replyToBytes := encodeShortString(h.ReplyTo)
-		result = append(result, replyToBytes...)
+		result = append(result, encodeShortString(h.ReplyTo)...)
 	}
 
 	if h.PropertyFlags&FlagExpiration != 0 {
-		expirationBytes := encodeShortString(h.Expiration)
-		result = append(result, expirationBytes...)
+		result = append(result, encodeShortString(h.Expiration)...)
 	}
 
 	if h.PropertyFlags&FlagMessageID != 0 {
-		messageIDBytes := encodeShortString(h.MessageID)
-		result = append(result, messageIDBytes...)
+		result = append(result, encodeShortString(h.MessageID)...)
 	}
 
 	if h.PropertyFlags&FlagTimestamp != 0 {
-		timestampBytes := make([]byte, 8)
-		binary.BigEndian.PutUint64(timestampBytes, h.Timestamp)
-		result = append(result, timestampBytes...)
+		result = binary.BigEndian.AppendUint64(result, h.Timestamp)
 	}
 
 	if h.PropertyFlags&FlagType != 0 {
-		typeBytes := encodeShortString(h.Type)
-		result = append(result, typeBytes...)
+		result = append(result, encodeShortString(h.Type)...)
 	}
 
 	if h.PropertyFlags&FlagUserID != 0 {
-		userIDBytes := encodeShortString(h.UserID)
-		result = append(result, userIDBytes...)
+		result = append(result, encodeShortString(h.UserID)...)
 	}
 
 	if h.PropertyFlags&FlagAppID != 0 {
-		appIDBytes := encodeShortString(h.AppID)
-		result = append(result, appIDBytes...)
+		result = append(result, encodeShortString(h.AppID)...)
 	}
 
 	if h.PropertyFlags&FlagClusterID != 0 {
-		clusterIDBytes := encodeShortString(h.ClusterID)
-		result = append(result, clusterIDBytes...)
+		result = append(result, encodeShortString(h.ClusterID)...)
 	}
 
 	return result, nil

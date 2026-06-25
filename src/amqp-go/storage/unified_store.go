@@ -9,17 +9,21 @@ import (
 // UnifiedStore provides a clean abstraction over the three-tier storage architecture
 // It hides the complexity of Ring Buffer → WAL → Segments from callers
 type UnifiedStore struct {
-	ring     *[DefaultRingBufferSize]*protocol.Message
-	wal      *WALManager
-	segments *SegmentManager
+	ring           []*protocol.Message
+	ringMask       int
+	spillThreshold uint64
+	wal            *WALManager
+	segments       *SegmentManager
 }
 
 // NewUnifiedStore creates a new unified storage abstraction
-func NewUnifiedStore(ring *[DefaultRingBufferSize]*protocol.Message, wal *WALManager, segments *SegmentManager) *UnifiedStore {
+func NewUnifiedStore(ring []*protocol.Message, ringMask int, spillThreshold uint64, wal *WALManager, segments *SegmentManager) *UnifiedStore {
 	return &UnifiedStore{
-		ring:     ring,
-		wal:      wal,
-		segments: segments,
+		ring:           ring,
+		ringMask:       ringMask,
+		spillThreshold: spillThreshold,
+		wal:            wal,
+		segments:       segments,
 	}
 }
 
@@ -28,7 +32,7 @@ func NewUnifiedStore(ring *[DefaultRingBufferSize]*protocol.Message, wal *WALMan
 func (us *UnifiedStore) Get(queueName string, offset uint64) (*protocol.Message, error) {
 	// Tier 1: Try ring buffer (hot, O(1))
 	if us.ring != nil {
-		index := offset & RingBufferMask
+		index := offset & uint64(us.ringMask)
 		msg := us.ring[index]
 		if msg != nil && msg.DeliveryTag == offset {
 			return msg, nil
@@ -57,8 +61,8 @@ func (us *UnifiedStore) Get(queueName string, offset uint64) (*protocol.Message,
 // Put stores a message in the appropriate tier
 // Hot messages go to ring buffer, spilled messages go to WAL
 func (us *UnifiedStore) Put(queueName string, message *protocol.Message, ringCount uint64) error {
-	// Check if ring buffer has space (< 80% full)
-	if ringCount < SpillThreshold {
+	// Check if ring buffer has space (< spill threshold)
+	if ringCount < us.spillThreshold {
 		// Store in ring buffer
 		// Caller handles ring buffer writes
 		return nil

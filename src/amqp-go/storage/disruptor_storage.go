@@ -12,12 +12,12 @@ import (
 )
 
 const (
-	// Ring buffer size - must be power of 2 for fast modulo via bitwise AND
-	DefaultRingBufferSize = 1024 * 256 // 256K messages (4x larger for high throughput)
-	RingBufferMask        = DefaultRingBufferSize - 1
+	// DefaultRingBufferSize is the fallback ring buffer size when EngineConfig
+	// doesn't specify one. Must be a power of 2 for fast modulo via bitwise AND.
+	DefaultRingBufferSize = 1024 * 256 // 256K messages
 
-	// Spilling threshold - start writing to log when ring is 80% full
-	SpillThreshold = uint64(209715) // 80% of 256K = 209,715
+	// DefaultSpillThresholdPercent is the fallback spill threshold percentage.
+	DefaultSpillThresholdPercent = 80
 )
 
 // StorageMetrics interface for metrics collection
@@ -31,8 +31,13 @@ type StorageMetrics interface {
 // DisruptorStorage implements an in-memory message queue using LMAX Disruptor pattern
 type DisruptorStorage struct {
 	// Per-queue disruptor rings (sync.Map for lock-free reads after creation)
-	queues   sync.Map // queueName -> *QueueRing (lock-free reads)
+	queues   sync.Map   // queueName -> *QueueRing (lock-free reads)
 	queuesMu sync.Mutex // Only used for double-check locking during queue creation
+
+	// Ring buffer configuration (wired from EngineConfig)
+	ringBufferSize int
+	ringBufferMask int
+	spillThreshold uint64
 
 	// Metadata storage (Phase 3: JSON files)
 	metadataStore *PersistentMetadataStore
@@ -61,8 +66,9 @@ type DisruptorStorage struct {
 type QueueRing struct {
 	name string
 
-	// Pre-allocated ring buffer for messages
-	ringBuffer [DefaultRingBufferSize]*protocol.Message
+	// Pre-allocated ring buffer for messages (slice, size from EngineConfig)
+	ringBuffer []*protocol.Message
+	ringMask   int
 
 	// Disruptor (embeds Writer and Reader)
 	disruptor disruptor.Disruptor
@@ -161,6 +167,23 @@ func SegmentConfigFromEngine(ec interfaces.EngineConfig) SegmentConfig {
 
 // NewDisruptorStorageWithEngineConfig creates storage with full engine config support
 func NewDisruptorStorageWithEngineConfig(dataDir string, checkpointInterval time.Duration, engineCfg interfaces.EngineConfig) *DisruptorStorage {
+	// Resolve ring buffer config from EngineConfig, falling back to defaults
+	ringBufferSize := engineCfg.RingBufferSize
+	if ringBufferSize <= 0 {
+		ringBufferSize = DefaultRingBufferSize
+	}
+	spillPercent := engineCfg.SpillThresholdPercent
+	if spillPercent <= 0 {
+		spillPercent = DefaultSpillThresholdPercent
+	}
+
+	// Validate ring buffer size is a power of 2 (required for bitwise-AND masking).
+	// The config layer enforces this, but this is a public constructor that can be
+	// called directly — enforce the invariant here for defense-in-depth.
+	if ringBufferSize <= 0 || (ringBufferSize&(ringBufferSize-1)) != 0 {
+		panic(fmt.Sprintf("ring buffer size must be a positive power of 2, got %d", ringBufferSize))
+	}
+
 	// Create JSON metadata store
 	metadataStore, err := NewPersistentMetadataStore(dataDir)
 	if err != nil {
@@ -200,12 +223,15 @@ func NewDisruptorStorageWithEngineConfig(dataDir string, checkpointInterval time
 	}
 
 	return &DisruptorStorage{
-		metadataStore: metadataStore,
-		offsetStore:   offsetStore,
-		wal:           walManager,
-		segments:      segmentManager,
-		transactions:  make(map[string]*interfaces.Transaction),
-		dataDir:       dataDir,
+		ringBufferSize: ringBufferSize,
+		ringBufferMask: ringBufferSize - 1,
+		spillThreshold: uint64(ringBufferSize) * uint64(spillPercent) / 100,
+		metadataStore:  metadataStore,
+		offsetStore:    offsetStore,
+		wal:            walManager,
+		segments:       segmentManager,
+		transactions:   make(map[string]*interfaces.Transaction),
+		dataDir:        dataDir,
 	}
 }
 
@@ -247,12 +273,14 @@ func (ds *DisruptorStorage) getOrCreateQueueRing(queueName string) *QueueRing {
 
 	ring := &QueueRing{
 		name:              queueName,
+		ringBuffer:        make([]*protocol.Message, ds.ringBufferSize),
+		ringMask:          ds.ringBufferMask,
 		consumerPositions: make(map[string]*atomic.Uint64),
 		unacked:           make(map[string]map[uint64]struct{}),
 	}
 	ring.consumer = &QueueConsumer{ring: ring}
 	ring.disruptor = disruptor.New(
-		disruptor.WithCapacity(DefaultRingBufferSize),
+		disruptor.WithCapacity(int64(ds.ringBufferSize)),
 		disruptor.WithConsumerGroup(ring.consumer),
 	)
 	go ring.disruptor.Read()
@@ -269,7 +297,7 @@ func (ds *DisruptorStorage) LoadMessageFromRecovery(queueName string, message *p
 
 	// Check if ring buffer is full
 	messageCount := ring.messageCount.Load()
-	if messageCount >= DefaultRingBufferSize {
+	if messageCount >= uint64(ds.ringBufferSize) {
 		// Ring buffer is full - skip this message
 		// It will be read from WAL on-demand when consumers need it
 		return nil
@@ -279,7 +307,7 @@ func (ds *DisruptorStorage) LoadMessageFromRecovery(queueName string, message *p
 	sequence := ring.disruptor.Reserve(1)
 
 	// Store message in ring buffer (zero-copy)
-	index := message.DeliveryTag & RingBufferMask
+	index := message.DeliveryTag & uint64(ring.ringMask)
 	ring.ringBuffer[index] = message
 
 	// Increment message count
@@ -314,10 +342,12 @@ func (ds *DisruptorStorage) StoreMessage(queueName string, message *protocol.Mes
 		// Continue to also store in ring buffer for fast access
 	}
 
-	// Check if we should spill to WAL (ring buffer overflow)
+	// Check if we should spill to WAL (ring buffer overflow).
+	// Spill condition is strict-greater (messageCount > spillThreshold), so the
+	// ring effectively holds spillThreshold+1 messages before spilling begins.
 	// This handles transient messages when ring is full
 	messageCount := ring.messageCount.Load()
-	if ds.wal != nil && messageCount > SpillThreshold {
+	if ds.wal != nil && messageCount > ds.spillThreshold {
 		// Ring buffer is > 80% full — spill to WAL instead of overwriting unconsumed slots.
 		// Durable messages are already written to WAL above, so just skip ring buffer.
 		// Transient messages need to be written to WAL for overflow storage.
@@ -336,7 +366,7 @@ func (ds *DisruptorStorage) StoreMessage(queueName string, message *protocol.Mes
 
 	// Store message in ring buffer (zero-copy)
 	// Use delivery tag as index for O(1) lookup
-	index := message.DeliveryTag & RingBufferMask
+	index := message.DeliveryTag & uint64(ring.ringMask)
 	ring.ringBuffer[index] = message
 
 	// Increment message count
@@ -364,7 +394,7 @@ func (ds *DisruptorStorage) GetMessage(queueName string, deliveryTag uint64) (*p
 	}
 
 	// Try ring buffer first (hot path)
-	index := deliveryTag & RingBufferMask
+	index := deliveryTag & uint64(ring.ringMask)
 	message := ring.ringBuffer[index]
 
 	if message != nil && message.DeliveryTag == deliveryTag {
@@ -400,7 +430,7 @@ func (ds *DisruptorStorage) DeleteMessage(queueName string, deliveryTag uint64) 
 	}
 
 	// Clear ring buffer slot (will be overwritten on next publish)
-	index := deliveryTag & RingBufferMask
+	index := deliveryTag & uint64(ring.ringMask)
 	if ring.ringBuffer[index] != nil {
 		ring.ringBuffer[index] = nil
 		// Decrement message count
@@ -430,8 +460,8 @@ func (ds *DisruptorStorage) GetQueueMessages(queueName string) ([]*protocol.Mess
 		return nil, interfaces.ErrQueueNotFound
 	}
 
-	messages := make([]*protocol.Message, 0, DefaultRingBufferSize)
-	for i := 0; i < DefaultRingBufferSize; i++ {
+	messages := make([]*protocol.Message, 0, len(ring.ringBuffer))
+	for i := 0; i < len(ring.ringBuffer); i++ {
 		if msg := ring.ringBuffer[i]; msg != nil {
 			messages = append(messages, msg)
 		}
@@ -458,7 +488,7 @@ func (ds *DisruptorStorage) PurgeQueue(queueName string) (int, error) {
 	}
 
 	count := 0
-	for i := 0; i < DefaultRingBufferSize; i++ {
+	for i := 0; i < len(ring.ringBuffer); i++ {
 		if ring.ringBuffer[i] != nil {
 			count++
 			ring.ringBuffer[i] = nil
@@ -478,7 +508,7 @@ func (ds *DisruptorStorage) GetMessageRange(queueName string, startTag, endTag u
 
 	messages := make([]*protocol.Message, 0, endTag-startTag+1)
 	for tag := startTag; tag <= endTag; tag++ {
-		index := tag & RingBufferMask
+		index := tag & uint64(ring.ringMask)
 		if msg := ring.ringBuffer[index]; msg != nil && msg.DeliveryTag == tag {
 			messages = append(messages, msg)
 		}
@@ -496,7 +526,7 @@ func (ds *DisruptorStorage) DeleteMessageRange(queueName string, startTag, endTa
 	}
 
 	for tag := startTag; tag <= endTag; tag++ {
-		index := tag & RingBufferMask
+		index := tag & uint64(ring.ringMask)
 		if msg := ring.ringBuffer[index]; msg != nil && msg.DeliveryTag == tag {
 			ring.ringBuffer[index] = nil
 		}

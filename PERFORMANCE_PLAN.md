@@ -38,29 +38,29 @@ Compiled from 6 parallel investigation agents covering: disruptor hot path, memo
 |---|-------|-----------|-------------|
 | P1 | `ds.mutex` write lock on every publish | `disruptor_storage.go:233` | **Largest single throughput win** — replace with `sync.Map` |
 | P2 | Pre-allocate `pendingMsg.Body` to `BodySize` | `basic_handlers.go:132` | **~4.6GB allocation savings** |
-| P3 | Wire ring buffer config (currently hardcoded) | `disruptor_storage.go:16-20` | Config `RingBufferSize`/`SpillThresholdPercent` ignored |
+| P3 | Wire ring buffer config (currently hardcoded) | `disruptor_storage.go:16-20` | ✅ DONE — Config `RingBufferSize`/`SpillThresholdPercent` wired from EngineConfig |
 | P4 | Cache WAL file handles for reads | `wal_manager.go:851` | Eliminate 2 syscalls + 4 allocs per WAL read |
-| P5 | Pool `ContentHeader.Serialize()` | `content.go:235` | ~1.5-2GB savings, ~15 fewer allocs/msg |
+| P5 | Pool `ContentHeader.Serialize()` | `content.go:235` | ✅ DONE — AppendUint16/64 + exact pre-alloc, 1 alloc (was 2-3) |
 | P6 | Reduce `AvailableChannelBuffer` 10M → 100K | `config.go:77` | 80MB → 800KB per queue (100x memory reduction) |
 | P7 | Cache `reflect.SelectCase` slices | `consumer_delivery.go:86` | Eliminate 2 allocs per loop iteration |
 | P8 | Fix durable message spill bypass | `disruptor_storage.go:325` | Durable messages always enter ring buffer even above threshold |
-| P9 | Pool WAL `done` channels | `wal_manager.go:211` | Eliminate `make(chan error, 1)` per durable message |
+| P9 | Pool WAL `done` channels | `wal_manager.go:211` | ✅ DONE — sync.Pool for chan error, defensive drain |
 | P10 | Pool `allFrames` combined buffer | `basic_handlers.go:779` | 1 fewer large alloc per delivered message |
 
 ### P2: Medium-Impact Improvements
 
 | # | Issue | File:Line | Est. Impact |
 |---|-------|-----------|-------------|
-| M1 | Replace `reflect.Select` with fan-in channel | `consumer_delivery.go` | 3-5x faster delivery loop, eliminates re-scan |
-| M2 | Batch segment ACK marking | `segment_manager.go:179` | Remove 2 write locks per ACK |
+| M1 | Replace `reflect.Select` with fan-in channel | `consumer_delivery.go` | ✅ DONE — O(1) select, per-consumer forwarders, consumer removal detection |
+| M2 | Batch segment ACK marking | `segment_manager.go:179` | ✅ DONE — ackChan + batchAckLoop, single bitmapMutex per batch |
 | M3 | Use `pread` (ReadAt) in WAL reads | `wal_manager.go:863` | Halve syscalls per WAL read |
-| M4 | Use `fdatasync` instead of `Sync` | `wal_manager.go:568` | ~10-20% fsync speedup on Linux |
-| M5 | Batch segment writes during checkpoint | `segment_manager.go:290` | Single mutex + single write per batch |
+| M4 | Use `fdatasync` instead of `Sync` | `wal_manager.go:568` | ✅ DONE — syscall.Fdatasync on Linux, Sync fallback on other platforms |
+| M5 | Batch segment writes during checkpoint | `segment_manager.go:290` | ✅ DONE — Single mutex + single write per batch, sealSegment returns error |
 | M6 | Fix dead config fields (6 fields) | multiple | Wire or remove: `ConsumerSelectTimeoutMS`, `ConsumerMaxBatchSize`, `ExpiredMessageCheckIntervalMS`, `OffsetCleanup*`, `Fsync` |
 | M7 | Reduce `WALBatchTimeoutMS` 10 → 5 | `config.go:85` | Halve tail latency for lone durable messages |
 | M8 | Reduce `SegmentSize` 1GB → 256MB | `config.go:90` | 4x faster compaction, smaller I/O spikes |
 | M9 | Fix system metrics filesystem walk | `system_metrics.go:18` | Change 10s → 60s, or incremental tracking |
-| M10 | Pool `BasicDeliverMethod.Serialize()` | `methods.go:2121` | ~0.8-1GB savings |
+| M10 | Pool `BasicDeliverMethod.Serialize()` | `methods.go:2121` | ✅ DONE — AppendUint64 + pre-alloc, 1 alloc (was 2) |
 | M11 | Eliminate WAL temp byte slices | `wal_manager.go:628` | Write directly into buf via `binary.BigEndian` |
 | M12 | Remove dead pools | `buffer_pool.go:45,86` | Cleanup: `byteSlicePool`, `smallBufferPool` |
 
