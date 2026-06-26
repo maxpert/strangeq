@@ -212,10 +212,7 @@ func (qs *QueueState) AckAdvance(tag uint64) {
 	} else if tag == qs.minAckCursor.Load() {
 		qs.minAckCursor.CompareAndSwap(tag, tag+1)
 	}
-	select {
-	case qs.wake <- struct{}{}:
-	default:
-	}
+	qs.NotifyNewMessage()
 }
 
 func (qs *QueueState) Recover(minTag, maxTag uint64) {
@@ -252,6 +249,10 @@ func (qs *QueueState) AtHighWaterMark() bool {
 		return false
 	}
 	return qs.Depth() >= wm
+}
+
+func (qs *QueueState) SetMinAckCursor(val uint64) {
+	qs.minAckCursor.Store(val)
 }
 
 func (qs *QueueState) Close() {

@@ -149,7 +149,7 @@ func (b *StorageBroker) getOrCreateQueueState(queueName string) *QueueState {
 func (b *StorageBroker) computeDepthHighWM() uint64 {
 	ringSize := b.engineConfig.RingBufferSize
 	if ringSize <= 0 {
-		ringSize = 65536
+		ringSize = 1024 * 256
 	}
 	spillPct := b.engineConfig.SpillThresholdPercent
 	if spillPct <= 0 {
@@ -245,7 +245,8 @@ func (b *StorageBroker) deliverMessage(queueState *QueueState, state *ConsumerSt
 	// Semaphore permit is held until ACK arrives
 	select {
 	case state.consumer.Messages <- delivery:
-		// Success! Write pending ack after successful delivery
+		// Success! Register with AckCursor for wraparound tracking
+		b.storage.DeliverToConsumer(state.queueName, state.consumer.Tag, msgID)
 		b.storage.StorePendingAck(pendingAck)
 		// Semaphore permit remains held until ACK/NACK/Reject
 
@@ -556,6 +557,9 @@ func (b *StorageBroker) RegisterConsumer(queueName, consumerTag string, consumer
 	// Store in sync.Map (lock-free)
 	b.activeConsumers.Store(consumerTag, state)
 
+	// Register consumer with AckCursor for wraparound safety tracking
+	b.storage.RegisterConsumerCursor(queueName, consumerTag)
+
 	// Add to queue consumers list (protected by per-queue mutex to prevent lost updates)
 	mu := b.getQueueConsumersMutex(queueName)
 	mu.Lock()
@@ -604,6 +608,9 @@ func (b *StorageBroker) UnregisterConsumer(consumerTag string) error {
 
 	// Remove from activeConsumers
 	b.activeConsumers.Delete(consumerTag)
+
+	// Unregister from AckCursor so minAckCursor recomputes without this consumer
+	b.storage.UnregisterConsumerCursor(state.queueName, consumerTag)
 
 	// Remove from queueConsumers list (protected by per-queue mutex)
 	mu := b.getQueueConsumersMutex(state.queueName)
@@ -668,8 +675,15 @@ func (b *StorageBroker) PublishMessage(exchangeName, routingKey string, message 
 		msgID := b.globalDeliveryTag.Add(1)
 		message.DeliveryTag = msgID
 
+		// Clone message per queue so each queue owns its own *Message with its
+		// own DeliveryTag. Without this, fanout to N queues stores the same
+		// pointer and the last iteration's DeliveryTag overwrites all earlier
+		// ones — GetMessage's tag guard fails for N-1 queues (R6 bug).
+		msgCopy := *message
+		msgCopy.DeliveryTag = msgID
+
 		// Store to persistent storage
-		err := b.storage.StoreMessage(queueName, message)
+		err := b.storage.StoreMessage(queueName, &msgCopy)
 		if err != nil {
 			return fmt.Errorf("failed to store message to queue '%s': %w", queueName, err)
 		}
@@ -920,9 +934,24 @@ func (b *StorageBroker) AcknowledgeMessage(consumerTag string, deliveryTag uint6
 		}
 	} else {
 		// Acknowledge single message
+		// Guard against duplicate ACK: if not in delivery index, already acked
+		if _, exists := b.deliveryIndex.Load(deliveryTag); !exists {
+			if state.prefetchSem != nil {
+				state.prefetchSem.Release(1)
+			}
+			return nil
+		}
 		// Delete message and pending ack from storage
 		b.storage.DeleteMessage(state.queueName, deliveryTag)
 		b.storage.DeletePendingAck(state.queueName, deliveryTag)
+
+		// Notify AckCursor that this consumer acked this tag
+		b.storage.AckFromConsumer(state.queueName, state.consumer.Tag, deliveryTag)
+
+		// Sync the true minAckCursor from storage's AckCursor (which tracks
+		// per-consumer lowest unacked with O(1) lookup) into QueueState for
+		// accurate backpressure depth calculation.
+		queueState.SetMinAckCursor(b.storage.GetMinAckCursor(state.queueName))
 
 		// Remove from inflight ownership and delivery index, and advance the
 		// depth frontier (may jump minAckCursor to head if queue drained).
@@ -956,27 +985,18 @@ func (b *StorageBroker) RejectMessage(consumerTag string, deliveryTag uint64, re
 	queueState.DeleteInflight(deliveryTag)
 	b.deliveryIndex.Delete(deliveryTag)
 
-	// Handle acknowledgment tracking for rejected message
-	pendingAck, err := b.storage.GetPendingAck(state.queueName, deliveryTag)
-	if err == nil && pendingAck != nil {
-		if requeue {
-			// Remove from pending acks and requeue for redelivery.
-			// Requeue preserves the original delivery tag (AMQP redelivery
-			// semantics) and pushes it to the requeue ring so it is
-			// delivered before any fresh tail tag.
-			b.storage.DeletePendingAck(state.queueName, deliveryTag)
-			queueState.Requeue(deliveryTag)
-		} else {
-			// Remove from both pending acks and storage (message discarded).
-			// Treated as resolved: release the in-flight depth slot.
-			b.storage.DeletePendingAck(state.queueName, deliveryTag)
-			b.storage.DeleteMessage(state.queueName, deliveryTag)
-			queueState.AckAdvance(deliveryTag)
-		}
+	// Notify AckCursor (NACK removes from unacked set regardless of requeue)
+	b.storage.NackFromConsumer(state.queueName, state.consumer.Tag, deliveryTag)
+
+	// Reject always requeues or discards — no PendingAck dependency needed.
+	// The message was stored in deliverMessage; here we either requeue it
+	// for redelivery or delete it.
+	if requeue {
+		b.storage.DeletePendingAck(state.queueName, deliveryTag)
+		queueState.Requeue(deliveryTag)
 	} else {
-		// No pending ack record (e.g. already removed): still release the
-		// in-flight depth slot claimed in deliverMessage so depth accounting
-		// stays balanced.
+		b.storage.DeletePendingAck(state.queueName, deliveryTag)
+		b.storage.DeleteMessage(state.queueName, deliveryTag)
 		queueState.AckAdvance(deliveryTag)
 	}
 
@@ -1039,21 +1059,15 @@ func (b *StorageBroker) NacknowledgeMessage(consumerTag string, deliveryTag uint
 		queueState.DeleteInflight(deliveryTag)
 		b.deliveryIndex.Delete(deliveryTag)
 
-		pendingAck, err := b.storage.GetPendingAck(state.queueName, deliveryTag)
-		if err == nil && pendingAck != nil {
-			if requeue {
-				// Remove from pending acks and requeue for redelivery.
-				b.storage.DeletePendingAck(state.queueName, deliveryTag)
-				queueState.Requeue(deliveryTag)
-			} else {
-				// Remove from both pending acks and storage (message discarded).
-				b.storage.DeletePendingAck(state.queueName, deliveryTag)
-				b.storage.DeleteMessage(state.queueName, deliveryTag)
-				queueState.AckAdvance(deliveryTag)
-			}
+		// Notify AckCursor (NACK removes from unacked set)
+		b.storage.NackFromConsumer(state.queueName, state.consumer.Tag, deliveryTag)
+
+		if requeue {
+			b.storage.DeletePendingAck(state.queueName, deliveryTag)
+			queueState.Requeue(deliveryTag)
 		} else {
-			// No pending ack record: still release the in-flight depth slot
-			// claimed in deliverMessage so depth accounting stays balanced.
+			b.storage.DeletePendingAck(state.queueName, deliveryTag)
+			b.storage.DeleteMessage(state.queueName, deliveryTag)
 			queueState.AckAdvance(deliveryTag)
 		}
 

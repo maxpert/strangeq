@@ -37,6 +37,9 @@ type DisruptorStorage struct {
 	transactions map[string]*interfaces.Transaction
 	txMutex      sync.RWMutex
 
+	pendingAcks  sync.Map
+	consumerAcks sync.Map
+
 	metrics StorageMetrics
 	dataDir string
 }
@@ -236,7 +239,7 @@ func (ds *DisruptorStorage) StoreMessage(queueName string, message *protocol.Mes
 		return fmt.Errorf("failed to store message in ring: %w", err)
 	}
 	if spilled {
-		if message.DeliveryMode != 2 {
+		if message.DeliveryMode != 2 && ds.wal != nil {
 			if err := ds.wal.Write(queueName, message, message.DeliveryTag); err != nil {
 				return fmt.Errorf("failed to spill transient message to WAL: %w", err)
 			}
@@ -303,15 +306,6 @@ func (ds *DisruptorStorage) DeleteMessage(queueName string, deliveryTag uint64) 
 	}
 
 	return nil
-}
-
-func (ds *DisruptorStorage) AdvanceMinAckCursor(queueName string, consumerTag string) {
-	ring := ds.getQueueRing(queueName)
-	if ring == nil {
-		return
-	}
-	ring.ack.OnAck(0, consumerTag)
-	_ = consumerTag
 }
 
 func (ds *DisruptorStorage) RegisterConsumerCursor(queueName string, consumerTag string) {
@@ -739,22 +733,65 @@ func (ds *DisruptorStorage) ListActiveTransactions() ([]*interfaces.Transaction,
 }
 
 func (ds *DisruptorStorage) StorePendingAck(pendingAck *protocol.PendingAck) error {
+	if pendingAck == nil {
+		return nil
+	}
+	ds.pendingAcks.Store(pendingAck.DeliveryTag, pendingAck)
+
+	var consumerList []*protocol.PendingAck
+	if val, ok := ds.consumerAcks.Load(pendingAck.ConsumerTag); ok {
+		consumerList = val.([]*protocol.PendingAck)
+	}
+	consumerList = append(consumerList, pendingAck)
+	ds.consumerAcks.Store(pendingAck.ConsumerTag, consumerList)
+
 	return nil
 }
 
 func (ds *DisruptorStorage) GetPendingAck(queueName string, deliveryTag uint64) (*protocol.PendingAck, error) {
+	if val, ok := ds.pendingAcks.Load(deliveryTag); ok {
+		return val.(*protocol.PendingAck), nil
+	}
 	return nil, interfaces.ErrPendingAckNotFound
 }
 
 func (ds *DisruptorStorage) DeletePendingAck(queueName string, deliveryTag uint64) error {
+	if val, ok := ds.pendingAcks.LoadAndDelete(deliveryTag); ok {
+		pa := val.(*protocol.PendingAck)
+		if consumerVal, cok := ds.consumerAcks.Load(pa.ConsumerTag); cok {
+			list := consumerVal.([]*protocol.PendingAck)
+			newList := make([]*protocol.PendingAck, 0, len(list))
+			for _, item := range list {
+				if item.DeliveryTag != deliveryTag {
+					newList = append(newList, item)
+				}
+			}
+			if len(newList) == 0 {
+				ds.consumerAcks.Delete(pa.ConsumerTag)
+			} else {
+				ds.consumerAcks.Store(pa.ConsumerTag, newList)
+			}
+		}
+	}
 	return nil
 }
 
 func (ds *DisruptorStorage) GetQueuePendingAcks(queueName string) ([]*protocol.PendingAck, error) {
-	return []*protocol.PendingAck{}, nil
+	var result []*protocol.PendingAck
+	ds.pendingAcks.Range(func(_, val interface{}) bool {
+		pa := val.(*protocol.PendingAck)
+		if pa.QueueName == queueName {
+			result = append(result, pa)
+		}
+		return true
+	})
+	return result, nil
 }
 
 func (ds *DisruptorStorage) GetConsumerPendingAcks(consumerTag string) ([]*protocol.PendingAck, error) {
+	if val, ok := ds.consumerAcks.Load(consumerTag); ok {
+		return val.([]*protocol.PendingAck), nil
+	}
 	return []*protocol.PendingAck{}, nil
 }
 
@@ -763,7 +800,12 @@ func (ds *DisruptorStorage) CleanupExpiredAcks(maxAge time.Duration) error {
 }
 
 func (ds *DisruptorStorage) GetAllPendingAcks() ([]*protocol.PendingAck, error) {
-	return []*protocol.PendingAck{}, nil
+	var result []*protocol.PendingAck
+	ds.pendingAcks.Range(func(_, val interface{}) bool {
+		result = append(result, val.(*protocol.PendingAck))
+		return true
+	})
+	return result, nil
 }
 
 func (ds *DisruptorStorage) StoreDurableEntityMetadata(metadata *protocol.DurableEntityMetadata) error {
