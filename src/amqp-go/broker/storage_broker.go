@@ -30,6 +30,7 @@ type ConsumerState struct {
 	semCancel   context.CancelFunc  // Cancel function for semaphore
 	stopCh      chan struct{}       // Stop signal for goroutine
 	stopOnce    sync.Once           // Ensures stopCh is closed exactly once
+	done        chan struct{}       // Closed when consumerPollLoop has fully exited
 }
 
 // StorageBroker manages exchanges, queues, and routing using persistent storage
@@ -163,6 +164,7 @@ func (b *StorageBroker) computeDepthHighWM() uint64 {
 // Stage 2: Claim a delivery tag from the queue's tail cursor (parks if none)
 // Stage 3: Deliver message with blocking send (provides TCP backpressure)
 func (b *StorageBroker) consumerPollLoop(state *ConsumerState, queueState *QueueState) {
+	defer close(state.done)
 	for {
 		// STAGE 1: Acquire capacity permit (blocks if at prefetch limit)
 		// This eliminates CPU spinning when consumer is at capacity
@@ -552,6 +554,7 @@ func (b *StorageBroker) RegisterConsumer(queueName, consumerTag string, consumer
 		semCtx:      semCtx,
 		semCancel:   semCancel,
 		stopCh:      make(chan struct{}),
+		done:        make(chan struct{}),
 	}
 
 	// Store in sync.Map (lock-free)
@@ -581,7 +584,13 @@ func (b *StorageBroker) RegisterConsumer(queueName, consumerTag string, consumer
 	return nil
 }
 
-// UnregisterConsumer removes a consumer
+// UnregisterConsumer removes a consumer and requeues all its in-flight
+// messages (delivered but not yet ACKed) so they can be redelivered to other
+// consumers. Without this cleanup, messages buffered in consumer.Messages or
+// already pulled by the server's forwarder goroutine would be permanently
+// orphaned: the deliveryIndex would still map their tags, the QueueState
+// inflight counter would still count them, and pendingAck records would
+// persist in storage — but no one would ever ACK or requeue them.
 func (b *StorageBroker) UnregisterConsumer(consumerTag string) error {
 	// Load consumer state (lock-free)
 	val, ok := b.activeConsumers.Load(consumerTag)
@@ -590,35 +599,96 @@ func (b *StorageBroker) UnregisterConsumer(consumerTag string) error {
 	}
 	state := val.(*ConsumerState)
 
-	// Cancel semaphore context first to unblock any waiting goroutines
+	// 1. Cancel semaphore context — unblocks the poll loop if it is parked
+	//    in prefetchSem.Acquire(semCtx, 1).
 	if state.semCancel != nil {
 		state.semCancel()
 	}
 
-	// Then stop polling goroutine (idempotent via sync.Once)
+	// 2. Stop the poll loop (idempotent via sync.Once). After this, the poll
+	//    loop's Claim() returns false (stopCh path) and deliverMessage's
+	//    select takes the stopCh branch (requeuing the in-flight message).
+	//    NOTE: Go's select chooses randomly when both the send case and the
+	//    stopCh case are ready, so deliverMessage MAY still send one last
+	//    message to consumer.Messages before the loop exits. We handle this
+	//    by draining the channel after the loop has fully exited (step 6).
 	state.stopOnce.Do(func() { close(state.stopCh) })
 
-	// Wake any consumers parked on this queue's condvar so the unregistered
-	// consumer's Claim() returns promptly (sync.Cond can't select on stopCh;
-	// WakeAll bounds the park latency to zero). Other consumers re-check and
-	// re-park harmlessly.
-	if qval, qok := b.queueStates.Load(state.queueName); qok {
-		qval.(*QueueState).WakeAll()
-	}
+	// 3. Wake all parked consumers on this queue so the unregistered
+	//    consumer's Claim() returns promptly. Other consumers re-check and
+	//    re-park harmlessly.
+	queueState := b.getOrCreateQueueState(state.queueName)
+	queueState.WakeAll()
 
-	// Remove from activeConsumers
+	// 4. Wait for the poll loop goroutine to fully exit. This is CRITICAL:
+	//    it guarantees no new messages can enter consumer.Messages after
+	//    this point. Without this wait, we would race with deliverMessage's
+	//    blocking send — a message could be sent to the channel AFTER our
+	//    drain loop finishes, orphaning it.
+	<-state.done
+
+	// 5. Remove from activeConsumers BEFORE draining. This prevents new
+	//    ACK/NACK/Reject calls from racing with the cleanup. In-flight ACK
+	//    calls that already loaded the state are handled safely by the
+	//    deliveryIndex.LoadAndDelete guard in requeueInflightDelivery (and
+	//    in the ACK/NACK/Reject handlers, which were changed to use
+	//    LoadAndDelete for the same reason). Only one side wins the
+	//    LoadAndDelete; the other sees !loaded and skips — no double
+	//    decrement of the inflight counter, no double requeue.
 	b.activeConsumers.Delete(consumerTag)
 
-	// Unregister from AckCursor so minAckCursor recomputes without this consumer
+	// 6. Drain consumer.Messages — these are deliveries that were buffered
+	//    in the channel but not yet pulled by the server's forwarder
+	//    goroutine. Each delivery is requeued for redelivery to other
+	//    consumers. The requeue preserves the original delivery tag, so the
+	//    redelivered message carries the same tag (AMQP redelivery
+	//    semantics). No semaphore permit is released: the cancelled
+	//    consumer's semaphore is dead, and the requeued message will be
+	//    claimed by another consumer which acquires its own permit.
+	for {
+		select {
+		case delivery, ok := <-state.consumer.Messages:
+			if !ok {
+				// Channel closed (defensive — Messages is never closed
+				// in current code, but guard against future changes).
+				goto drainComplete
+			}
+			b.requeueInflightDelivery(queueState, state.queueName, delivery.DeliveryTag)
+		default:
+			goto drainComplete
+		}
+	}
+drainComplete:
+
+	// 7. Scan inflightOwners for remaining in-flight messages owned by this
+	//    consumer. These are deliveries that already LEFT consumer.Messages
+	//    (pulled by the server's forwarder goroutine, sitting in the fanIn
+	//    channel buffer, or already sent to the client over TCP) but were
+	//    never ACKed. Without this scan, they would be permanently
+	//    orphaned. Messages that were already requeued by deliverMessage's
+	//    stopCh/semCtx path or by the drain above are no longer in
+	//    inflightOwners (DeleteInflight was called), so there is no
+	//    double-requeue.
+	//
+	//    The scan is O(total inflight for this queue) — acceptable because
+	//    consumer cancellation is a rare event.
+	queueState.RangeInflightForConsumer(consumerTag, func(deliveryTag uint64) {
+		b.requeueInflightDelivery(queueState, state.queueName, deliveryTag)
+	})
+
+	// 8. Unregister from AckCursor — safe now: all in-flight messages have
+	//    been requeued, so minAckCursor recomputation won't skip them. If
+	//    this were done before the requeue, minAckCursor would jump forward
+	//    past the consumer's unacked tags, making the queue appear emptier
+	//    than it actually is and potentially failing to apply backpressure.
 	b.storage.UnregisterConsumerCursor(state.queueName, consumerTag)
 
-	// Remove from queueConsumers list (protected by per-queue mutex)
+	// 9. Remove from queueConsumers list (protected by per-queue mutex)
 	mu := b.getQueueConsumersMutex(state.queueName)
 	mu.Lock()
 	defer mu.Unlock()
 	if val, ok := b.queueConsumers.Load(state.queueName); ok {
 		consumers := val.([]*ConsumerState)
-		// Filter out this consumer
 		newConsumers := make([]*ConsumerState, 0, len(consumers)-1)
 		for _, c := range consumers {
 			if c.consumer.Tag != consumerTag {
@@ -632,13 +702,28 @@ func (b *StorageBroker) UnregisterConsumer(consumerTag string) error {
 		}
 	}
 
-	// Delete from storage
+	// 10. Delete from storage
 	err := b.storage.DeleteConsumer(state.queueName, consumerTag)
 	if err != nil && !errors.Is(err, interfaces.ErrConsumerNotFound) {
 		return err
 	}
 
 	return nil
+}
+
+// requeueInflightDelivery atomically claims a delivery tag via
+// deliveryIndex.LoadAndDelete and, if claimed, requeues the message for
+// redelivery to other consumers. This is race-free: if an ACK/NACK/Reject
+// handler already claimed the tag via its own LoadAndDelete, this is a
+// no-op — preventing double-decrement of the inflight counter and
+// double-requeue of the message.
+func (b *StorageBroker) requeueInflightDelivery(qs *QueueState, queueName string, deliveryTag uint64) {
+	if _, loaded := b.deliveryIndex.LoadAndDelete(deliveryTag); !loaded {
+		return
+	}
+	qs.DeleteInflight(deliveryTag)
+	qs.Requeue(deliveryTag)
+	b.storage.DeletePendingAck(queueName, deliveryTag)
 }
 
 // PublishMessage publishes a message to an exchange
@@ -914,11 +999,17 @@ func (b *StorageBroker) AcknowledgeMessage(consumerTag string, deliveryTag uint6
 		if err == nil {
 			for _, pendingAck := range pendingAcks {
 				if pendingAck.DeliveryTag <= deliveryTag {
+					// Atomic guard: claim the tag. If already processed
+					// (by cleanup in UnregisterConsumer or a duplicate
+					// multiple-ACK), skip to avoid double-decrementing
+					// the inflight counter.
+					if _, loaded := b.deliveryIndex.LoadAndDelete(pendingAck.DeliveryTag); !loaded {
+						continue
+					}
 					b.storage.DeleteMessage(pendingAck.QueueName, pendingAck.DeliveryTag)
 					b.storage.DeletePendingAck(pendingAck.QueueName, pendingAck.DeliveryTag)
 					b.storage.AckFromConsumer(pendingAck.QueueName, consumerTag, pendingAck.DeliveryTag)
 					queueState.DeleteInflight(pendingAck.DeliveryTag)
-					b.deliveryIndex.Delete(pendingAck.DeliveryTag)
 					queueState.AckAdvance(pendingAck.DeliveryTag)
 					ackedCount++
 				}
@@ -930,8 +1021,11 @@ func (b *StorageBroker) AcknowledgeMessage(consumerTag string, deliveryTag uint6
 		}
 	} else {
 		// Acknowledge single message
-		// Guard against duplicate ACK: if not in delivery index, already acked
-		if _, exists := b.deliveryIndex.Load(deliveryTag); !exists {
+		// Atomic guard against duplicate ACK or concurrent cleanup in
+		// UnregisterConsumer: LoadAndDelete ensures only one caller
+		// processes this tag, preventing double-decrement of the inflight
+		// counter.
+		if _, loaded := b.deliveryIndex.LoadAndDelete(deliveryTag); !loaded {
 			return nil
 		}
 		// Delete message and pending ack from storage
@@ -946,10 +1040,9 @@ func (b *StorageBroker) AcknowledgeMessage(consumerTag string, deliveryTag uint6
 		// accurate backpressure depth calculation.
 		queueState.SetMinAckCursor(b.storage.GetMinAckCursor(state.queueName))
 
-		// Remove from inflight ownership and delivery index, and advance the
-		// depth frontier (may jump minAckCursor to head if queue drained).
+		// Remove from inflight ownership and advance the depth frontier
+		// (may jump minAckCursor to head if queue drained).
 		queueState.DeleteInflight(deliveryTag)
-		b.deliveryIndex.Delete(deliveryTag)
 		queueState.AckAdvance(deliveryTag)
 
 		// Release semaphore permit (frees capacity for next message)
@@ -974,14 +1067,15 @@ func (b *StorageBroker) RejectMessage(consumerTag string, deliveryTag uint64, re
 	// Get queue state
 	queueState := b.getOrCreateQueueState(state.queueName)
 
-	// Guard against duplicate reject
-	if _, exists := b.deliveryIndex.Load(deliveryTag); !exists {
+	// Atomic guard against duplicate reject or concurrent cleanup in
+	// UnregisterConsumer: LoadAndDelete ensures only one caller processes
+	// this tag, preventing double-decrement of the inflight counter.
+	if _, loaded := b.deliveryIndex.LoadAndDelete(deliveryTag); !loaded {
 		return nil
 	}
 
-	// Remove from inflight ownership and delivery index
+	// Remove from inflight ownership
 	queueState.DeleteInflight(deliveryTag)
-	b.deliveryIndex.Delete(deliveryTag)
 
 	// Notify AckCursor (NACK removes from unacked set regardless of requeue)
 	b.storage.NackFromConsumer(state.queueName, state.consumer.Tag, deliveryTag)
@@ -1024,8 +1118,14 @@ func (b *StorageBroker) NacknowledgeMessage(consumerTag string, deliveryTag uint
 		if err == nil {
 			for _, pendingAck := range pendingAcks {
 				if pendingAck.DeliveryTag <= deliveryTag {
+					// Atomic guard: claim the tag. If already processed
+					// (by cleanup in UnregisterConsumer or a duplicate
+					// multiple-NACK), skip to avoid double-decrementing
+					// the inflight counter.
+					if _, loaded := b.deliveryIndex.LoadAndDelete(pendingAck.DeliveryTag); !loaded {
+						continue
+					}
 					queueState.DeleteInflight(pendingAck.DeliveryTag)
-					b.deliveryIndex.Delete(pendingAck.DeliveryTag)
 					b.storage.NackFromConsumer(pendingAck.QueueName, consumerTag, pendingAck.DeliveryTag)
 
 					if requeue {
@@ -1046,13 +1146,15 @@ func (b *StorageBroker) NacknowledgeMessage(consumerTag string, deliveryTag uint
 		}
 	} else {
 		// Nacknowledge single message
-		// Guard against duplicate nack
-		if _, exists := b.deliveryIndex.Load(deliveryTag); !exists {
+		// Atomic guard against duplicate nack or concurrent cleanup in
+		// UnregisterConsumer: LoadAndDelete ensures only one caller
+		// processes this tag, preventing double-decrement of the inflight
+		// counter.
+		if _, loaded := b.deliveryIndex.LoadAndDelete(deliveryTag); !loaded {
 			return nil
 		}
-		// Remove from inflight ownership and delivery index
+		// Remove from inflight ownership
 		queueState.DeleteInflight(deliveryTag)
-		b.deliveryIndex.Delete(deliveryTag)
 
 		// Notify AckCursor (NACK removes from unacked set)
 		b.storage.NackFromConsumer(state.queueName, state.consumer.Tag, deliveryTag)

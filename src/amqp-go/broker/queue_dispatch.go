@@ -297,6 +297,28 @@ func (qs *QueueState) DeleteInflight(msgID uint64) {
 	qs.inflightOwners.Delete(msgID)
 }
 
+// RangeInflightForConsumer iterates over all in-flight delivery tags owned
+// by the given consumer tag. Used during consumer cancellation to find
+// messages that have already left consumer.Messages (pulled by the server's
+// forwarder goroutine or sent to the client) but have not yet been ACKed.
+//
+// Tags are collected in a first pass and fn is called in a second pass.
+// This is critical because sync.Map.Range does not guarantee visiting all
+// keys when entries are deleted concurrently during iteration — including
+// by fn itself. Collecting first ensures no tags are skipped.
+func (qs *QueueState) RangeInflightForConsumer(consumerTag string, fn func(deliveryTag uint64)) {
+	var tags []uint64
+	qs.inflightOwners.Range(func(key, value interface{}) bool {
+		if value.(string) == consumerTag {
+			tags = append(tags, key.(uint64))
+		}
+		return true
+	})
+	for _, tag := range tags {
+		fn(tag)
+	}
+}
+
 func (qs *QueueState) Head() uint64         { return qs.head.Load() }
 func (qs *QueueState) Tail() uint64         { return qs.tail.Load() }
 func (qs *QueueState) InflightCount() int64 { return qs.inflight.Load() }

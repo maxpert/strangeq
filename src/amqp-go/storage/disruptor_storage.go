@@ -39,6 +39,30 @@ type DisruptorStorage struct {
 
 	pendingAcks sync.Map
 
+	// consumerPendingAcks is a secondary index over pendingAcks keyed by
+	// consumerTag -> *sync.Map{ deliveryTag -> *PendingAck }.
+	//
+	// Invariant: the index is always a SUPERSET of pendingAcks for any given
+	// consumer, so GetConsumerPendingAcks can transiently return an extra
+	// (already-acked) entry but can never drop a tag that is still pending.
+	// The invariant is maintained by write ordering:
+	//   - StorePendingAck writes the index BEFORE the primary map.
+	//   - DeletePendingAck deletes from the primary map BEFORE the index.
+	// The primary only gains a tag after the index already has it, and the
+	// index only loses a tag after the primary already lost it.
+	//
+	// This holds under the broker's per-delivery-tag contract: for a given tag,
+	// at most one Store races one Delete (the channel-send-then-ack window),
+	// and any re-Store of a tag (re-delivery after requeue) happens strictly
+	// after the prior Delete returns -- Requeue is called after DeletePendingAck
+	// in every reject/nack path, and StorePendingAck only runs in the dispatch
+	// loop once the requeued tag is claimed. The extra entries are benign: the
+	// multiple-ack read-then-delete loop calls DeletePendingAck, which is a
+	// no-op on a missing primary entry and reaps the orphan from the index.
+	// GetConsumerPendingAcks is thus O(M) in the consumer's own pending acks
+	// instead of O(N) over the global set.
+	consumerPendingAcks sync.Map
+
 	metrics StorageMetrics
 	dataDir string
 }
@@ -739,6 +763,10 @@ func (ds *DisruptorStorage) StorePendingAck(pendingAck *protocol.PendingAck) err
 	if pendingAck == nil {
 		return nil
 	}
+	// Index first, then primary: preserves index-superset invariant even if a
+	// concurrent DeletePendingAck runs between these two steps (see struct doc).
+	inner, _ := ds.consumerPendingAcks.LoadOrStore(pendingAck.ConsumerTag, &sync.Map{})
+	inner.(*sync.Map).Store(pendingAck.DeliveryTag, pendingAck)
 	ds.pendingAcks.Store(pendingAck.DeliveryTag, pendingAck)
 	return nil
 }
@@ -751,7 +779,19 @@ func (ds *DisruptorStorage) GetPendingAck(queueName string, deliveryTag uint64) 
 }
 
 func (ds *DisruptorStorage) DeletePendingAck(queueName string, deliveryTag uint64) error {
-	ds.pendingAcks.Delete(deliveryTag)
+	// Primary first, then index: LoadAndDelete atomically retrieves the
+	// PendingAck (to learn its consumer tag) and removes it from the primary
+	// map. Only then do we delete from that consumer's index. If the primary
+	// entry is already gone (e.g. ack raced the store), this is a no-op and the
+	// index is left untouched -- preserving the index-superset invariant.
+	val, ok := ds.pendingAcks.LoadAndDelete(deliveryTag)
+	if !ok {
+		return nil
+	}
+	pa := val.(*protocol.PendingAck)
+	if inner, ok := ds.consumerPendingAcks.Load(pa.ConsumerTag); ok {
+		inner.(*sync.Map).Delete(deliveryTag)
+	}
 	return nil
 }
 
@@ -769,13 +809,12 @@ func (ds *DisruptorStorage) GetQueuePendingAcks(queueName string) ([]*protocol.P
 
 func (ds *DisruptorStorage) GetConsumerPendingAcks(consumerTag string) ([]*protocol.PendingAck, error) {
 	var result []*protocol.PendingAck
-	ds.pendingAcks.Range(func(_, val interface{}) bool {
-		pa := val.(*protocol.PendingAck)
-		if pa.ConsumerTag == consumerTag {
-			result = append(result, pa)
-		}
-		return true
-	})
+	if inner, ok := ds.consumerPendingAcks.Load(consumerTag); ok {
+		inner.(*sync.Map).Range(func(_, val interface{}) bool {
+			result = append(result, val.(*protocol.PendingAck))
+			return true
+		})
+	}
 	return result, nil
 }
 
