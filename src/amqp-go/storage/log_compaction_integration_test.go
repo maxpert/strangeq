@@ -389,8 +389,7 @@ func TestLogCompaction_TierFallback(t *testing.T) {
 
 	// Clear ring buffer to force WAL fallback
 	ring := ds.getQueueRing(queue)
-	index := uint64(42) & uint64(ring.ringMask)
-	ring.ringBuffer[index] = nil
+	ring.ring.Delete(42)
 
 	// Tier 2: Read from WAL (ring buffer cleared)
 	readMsg, err = ds.GetMessage(queue, 42)

@@ -263,7 +263,7 @@ func TestDisruptorStorage_WALFallback(t *testing.T) {
 
 	// Clear ring buffer to simulate message eviction
 	ring := storage.getQueueRing("test_queue")
-	ring.ringBuffer[1&uint64(ring.ringMask)] = nil
+	ring.ring.Delete(1)
 
 	// Try to retrieve message - should fall back to WAL
 	retrievedMsg, err := storage.GetMessage("test_queue", 1)

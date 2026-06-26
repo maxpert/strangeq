@@ -8,19 +8,13 @@ import (
 
 	"github.com/maxpert/amqp-go/interfaces"
 	"github.com/maxpert/amqp-go/protocol"
-	disruptor "github.com/smartystreets-prototypes/go-disruptor"
 )
 
 const (
-	// DefaultRingBufferSize is the fallback ring buffer size when EngineConfig
-	// doesn't specify one. Must be a power of 2 for fast modulo via bitwise AND.
-	DefaultRingBufferSize = 1024 * 256 // 256K messages
-
-	// DefaultSpillThresholdPercent is the fallback spill threshold percentage.
+	DefaultRingBufferSize        = 1024 * 256
 	DefaultSpillThresholdPercent = 80
 )
 
-// StorageMetrics interface for metrics collection
 type StorageMetrics interface {
 	UpdateDiskMetrics(freeBytes, usedBytes float64)
 	UpdateRingBufferUtilization(queueName string, utilization float64)
@@ -28,100 +22,48 @@ type StorageMetrics interface {
 	SegmentMetrics
 }
 
-// DisruptorStorage implements an in-memory message queue using LMAX Disruptor pattern
 type DisruptorStorage struct {
-	// Per-queue disruptor rings (sync.Map for lock-free reads after creation)
-	queues   sync.Map   // queueName -> *QueueRing (lock-free reads)
-	queuesMu sync.Mutex // Only used for double-check locking during queue creation
+	queues   sync.Map
+	queuesMu sync.Mutex
 
-	// Ring buffer configuration (wired from EngineConfig)
 	ringBufferSize int
-	ringBufferMask int
 	spillThreshold uint64
 
-	// Metadata storage (Phase 3: JSON files)
 	metadataStore *PersistentMetadataStore
+	offsetStore   *OffsetCheckpointStore
+	wal           *WALManager
+	segments      *SegmentManager
 
-	// Offset checkpoint store (Phase 4: Zero-write ACKs)
-	offsetStore *OffsetCheckpointStore
-
-	// WAL Manager (Phase 6A: Lock-free, channel-batched writes)
-	wal *WALManager
-
-	// Segment Manager (Phase 6B: Long-term cold storage with compaction)
-	segments *SegmentManager
-
-	// Transaction storage (simple in-memory for now)
 	transactions map[string]*interfaces.Transaction
 	txMutex      sync.RWMutex
 
-	// Metrics collector
 	metrics StorageMetrics
-
-	// Data directory
 	dataDir string
 }
 
-// QueueRing represents a single queue's disruptor ring buffer
 type QueueRing struct {
 	name string
+	ring *AtomicRing
+	ack  *AckCursor
 
-	// Pre-allocated ring buffer for messages (slice, size from EngineConfig)
-	ringBuffer []*protocol.Message
-	ringMask   int
-
-	// Disruptor (embeds Writer and Reader)
-	disruptor disruptor.Disruptor
-
-	// Consumer for processing messages
-	consumer *QueueConsumer
-
-	// Queue head (next delivery tag to assign)
-	head atomic.Uint64
-
-	// Consumer position tracking (consumerTag -> position)
 	consumerPositions map[string]*atomic.Uint64
 	consumerMutex     sync.RWMutex
 
-	// Unacked tracking (consumerTag -> set of unacked tags)
-	unacked      map[string]map[uint64]struct{}
-	unackedMutex sync.RWMutex
-
-	// Queue state
 	closed atomic.Bool
-
-	// Ring buffer message count (for spilling logic)
-	messageCount atomic.Uint64
 }
 
-// QueueConsumer implements the disruptor.Consumer interface
-type QueueConsumer struct {
-	ring *QueueRing
-}
-
-// Consume processes a batch of messages (disruptor callback)
-func (qc *QueueConsumer) Consume(lower, upper int64) {
-	// Messages are already in the ring buffer
-	// This callback is just for coordination - actual consumption happens via GetMessage
-	// In Phase 1, we're using pull-based delivery, so this is a no-op
-}
-
-// NewDisruptorStorage creates a new in-memory disruptor-based storage
 func NewDisruptorStorage() *DisruptorStorage {
 	return NewDisruptorStorageWithDataDir("./data")
 }
 
-// NewDisruptorStorageWithDataDir creates storage with custom data directory
 func NewDisruptorStorageWithDataDir(dataDir string) *DisruptorStorage {
 	return NewDisruptorStorageWithCheckpointInterval(dataDir, DefaultCheckpointInterval)
 }
 
-// NewDisruptorStorageWithCheckpointInterval creates storage with custom data directory and checkpoint interval
 func NewDisruptorStorageWithCheckpointInterval(dataDir string, checkpointInterval time.Duration) *DisruptorStorage {
 	return NewDisruptorStorageWithEngineConfig(dataDir, checkpointInterval, interfaces.EngineConfig{})
 }
 
-// WALConfigFromEngine creates a WALConfig from EngineConfig, falling back to defaults
 func WALConfigFromEngine(ec interfaces.EngineConfig) WALConfig {
 	cfg := DefaultWALConfig()
 	if ec.WALBatchSize > 0 {
@@ -139,15 +81,9 @@ func WALConfigFromEngine(ec interfaces.EngineConfig) WALConfig {
 	if ec.WALCleanupCheckIntervalMS > 0 {
 		cfg.CleanupInterval = time.Duration(ec.WALCleanupCheckIntervalMS) * time.Millisecond
 	}
-	// Note: WALConfig.CheckpointInterval is intentionally not mapped from
-	// SegmentCheckpointIntervalMS. That field governs the segment-tier checkpoint
-	// loop; the WAL-to-segment migration loop uses its own default (5 min).
-	// Override WALConfig.CheckpointInterval directly if a custom WAL checkpoint
-	// cadence is needed.
 	return cfg
 }
 
-// SegmentConfigFromEngine creates a SegmentConfig from EngineConfig, falling back to defaults
 func SegmentConfigFromEngine(ec interfaces.EngineConfig) SegmentConfig {
 	cfg := DefaultSegmentConfig()
 	if ec.SegmentSize > 0 {
@@ -165,9 +101,7 @@ func SegmentConfigFromEngine(ec interfaces.EngineConfig) SegmentConfig {
 	return cfg
 }
 
-// NewDisruptorStorageWithEngineConfig creates storage with full engine config support
 func NewDisruptorStorageWithEngineConfig(dataDir string, checkpointInterval time.Duration, engineCfg interfaces.EngineConfig) *DisruptorStorage {
-	// Resolve ring buffer config from EngineConfig, falling back to defaults
 	ringBufferSize := engineCfg.RingBufferSize
 	if ringBufferSize <= 0 {
 		ringBufferSize = DefaultRingBufferSize
@@ -177,54 +111,39 @@ func NewDisruptorStorageWithEngineConfig(dataDir string, checkpointInterval time
 		spillPercent = DefaultSpillThresholdPercent
 	}
 
-	// Validate ring buffer size is a power of 2 (required for bitwise-AND masking).
-	// The config layer enforces this, but this is a public constructor that can be
-	// called directly — enforce the invariant here for defense-in-depth.
 	if ringBufferSize <= 0 || (ringBufferSize&(ringBufferSize-1)) != 0 {
 		panic(fmt.Sprintf("ring buffer size must be a positive power of 2, got %d", ringBufferSize))
 	}
 
-	// Create JSON metadata store
 	metadataStore, err := NewPersistentMetadataStore(dataDir)
 	if err != nil {
-		// Fall back to nil - will cause errors but won't crash
-		// In production, we'd want better error handling
 		metadataStore = nil
 	}
 
-	// Create offset checkpoint store (Phase 4) with configurable interval
 	offsetStore, err := NewOffsetCheckpointStoreWithInterval(dataDir, checkpointInterval)
 	if err != nil {
-		// Fall back to nil
 		offsetStore = nil
 	}
 
-	// Map engine config to storage-specific configs
 	walCfg := WALConfigFromEngine(engineCfg)
 	segCfg := SegmentConfigFromEngine(engineCfg)
 
-	// Create WAL Manager (Phase 6A)
 	walManager, err := NewWALManagerWithConfig(dataDir, walCfg)
 	if err != nil {
-		// In production, this should be a fatal error
 		walManager = nil
 	}
 
-	// Create Segment Manager (Phase 6B)
 	segmentManager, err := NewSegmentManagerWithConfig(dataDir, segCfg)
 	if err != nil {
-		// In production, this should be a fatal error
 		segmentManager = nil
 	}
 
-	// Wire up WAL and Segment managers for checkpointing
 	if walManager != nil && segmentManager != nil {
 		walManager.SetSegmentManager(segmentManager)
 	}
 
 	return &DisruptorStorage{
 		ringBufferSize: ringBufferSize,
-		ringBufferMask: ringBufferSize - 1,
 		spillThreshold: uint64(ringBufferSize) * uint64(spillPercent) / 100,
 		metadataStore:  metadataStore,
 		offsetStore:    offsetStore,
@@ -235,7 +154,6 @@ func NewDisruptorStorageWithEngineConfig(dataDir string, checkpointInterval time
 	}
 }
 
-// SetMetrics sets the metrics collector for storage and propagates to WAL and segments
 func (ds *DisruptorStorage) SetMetrics(metrics StorageMetrics) {
 	ds.metrics = metrics
 	if ds.wal != nil {
@@ -246,8 +164,6 @@ func (ds *DisruptorStorage) SetMetrics(metrics StorageMetrics) {
 	}
 }
 
-// getQueueRing returns the queue ring for the given queue, or nil if not found.
-// Lock-free read via sync.Map.Load — no mutex contention on the hot path.
 func (ds *DisruptorStorage) getQueueRing(queueName string) *QueueRing {
 	if val, ok := ds.queues.Load(queueName); ok {
 		return val.(*QueueRing)
@@ -255,9 +171,6 @@ func (ds *DisruptorStorage) getQueueRing(queueName string) *QueueRing {
 	return nil
 }
 
-// getOrCreateQueueRing returns existing queue ring or creates a new one.
-// Uses sync.Map for lock-free reads on the hot path (publish/get/delete).
-// The mutex is only held during initial queue creation (rare).
 func (ds *DisruptorStorage) getOrCreateQueueRing(queueName string) *QueueRing {
 	if ring, ok := ds.queues.Load(queueName); ok {
 		return ring.(*QueueRing)
@@ -266,185 +179,125 @@ func (ds *DisruptorStorage) getOrCreateQueueRing(queueName string) *QueueRing {
 	ds.queuesMu.Lock()
 	defer ds.queuesMu.Unlock()
 
-	// Double-check after acquiring lock
 	if ring, ok := ds.queues.Load(queueName); ok {
 		return ring.(*QueueRing)
 	}
 
 	ring := &QueueRing{
 		name:              queueName,
-		ringBuffer:        make([]*protocol.Message, ds.ringBufferSize),
-		ringMask:          ds.ringBufferMask,
+		ring:              NewAtomicRing(ds.ringBufferSize),
+		ack:               NewAckCursor(),
 		consumerPositions: make(map[string]*atomic.Uint64),
-		unacked:           make(map[string]map[uint64]struct{}),
 	}
-	ring.consumer = &QueueConsumer{ring: ring}
-	ring.disruptor = disruptor.New(
-		disruptor.WithCapacity(int64(ds.ringBufferSize)),
-		disruptor.WithConsumerGroup(ring.consumer),
-	)
-	go ring.disruptor.Read()
 
 	ds.queues.Store(queueName, ring)
 	return ring
 }
 
-// LoadMessageFromRecovery loads a message directly into ring buffer during recovery
-// DOES NOT write to WAL (message is already in WAL, we're loading FROM WAL)
-// This prevents double-writing during recovery which causes massive slowdown
 func (ds *DisruptorStorage) LoadMessageFromRecovery(queueName string, message *protocol.Message) error {
 	ring := ds.getOrCreateQueueRing(queueName)
 
-	// Check if ring buffer is full
-	messageCount := ring.messageCount.Load()
-	if messageCount >= uint64(ds.ringBufferSize) {
-		// Ring buffer is full - skip this message
-		// It will be read from WAL on-demand when consumers need it
+	if ring.ring.Count() >= ds.spillThreshold {
 		return nil
 	}
 
-	// Reserve slot in ring buffer
-	sequence := ring.disruptor.Reserve(1)
-
-	// Store message in ring buffer (zero-copy)
-	index := message.DeliveryTag & uint64(ring.ringMask)
-	ring.ringBuffer[index] = message
-
-	// Increment message count
-	ring.messageCount.Add(1)
-
-	// Commit to make visible to consumers
-	ring.disruptor.Commit(sequence, sequence)
-
-	// Update head to track highest delivery tag seen
-	if message.DeliveryTag > ring.head.Load() {
-		ring.head.Store(message.DeliveryTag)
+	_, spilled, err := ring.ring.Store(message.DeliveryTag, message)
+	if err != nil {
+		return err
+	}
+	if spilled {
+		return nil
 	}
 
+	ring.ack.OnPublish(message.DeliveryTag)
 	return nil
 }
 
-// StoreMessage stores a message in the ring buffer (zero-copy publish)
-// NOTE: Delivery tag must already be assigned by the broker before calling this
-// Phase 6A: Spills to WAL when ring is > 80% full (lock-free channel write)
 func (ds *DisruptorStorage) StoreMessage(queueName string, message *protocol.Message) error {
 	ring := ds.getOrCreateQueueRing(queueName)
 
-	// Phase 2: Write durable messages to WAL FIRST (before ring buffer)
-	// DeliveryMode == 2 means persistent/durable message
 	if ds.wal != nil && message.DeliveryMode == 2 {
-		// Write to WAL for durability (lock-free!)
 		if err := ds.wal.Write(queueName, message, message.DeliveryTag); err != nil {
-			// WAL write failed - this is critical for durable messages
 			return fmt.Errorf("failed to write durable message to WAL: %w", err)
 		}
-		// WAL write succeeded - message is now durable
-		// Continue to also store in ring buffer for fast access
 	}
 
-	// Check if we should spill to WAL (ring buffer overflow).
-	// Spill condition is strict-greater (messageCount > spillThreshold), so the
-	// ring effectively holds spillThreshold+1 messages before spilling begins.
-	// This handles transient messages when ring is full
-	messageCount := ring.messageCount.Load()
-	if ds.wal != nil && messageCount > ds.spillThreshold {
-		// Ring buffer is > 80% full — spill to WAL instead of overwriting unconsumed slots.
-		// Durable messages are already written to WAL above, so just skip ring buffer.
-		// Transient messages need to be written to WAL for overflow storage.
+	if ds.wal != nil && ring.ring.Count() > ds.spillThreshold {
 		if message.DeliveryMode != 2 {
 			if err := ds.wal.Write(queueName, message, message.DeliveryTag); err != nil {
-				// Log error but continue - transient messages can be lost
+				return fmt.Errorf("failed to spill transient message to WAL: %w", err)
 			}
 		}
-		// Both durable and transient skip ring buffer when above threshold.
-		// Messages will be read from WAL on-demand when consumers need them.
 		return nil
 	}
 
-	// Reserve slot in ring buffer
-	sequence := ring.disruptor.Reserve(1)
-
-	// Store message in ring buffer (zero-copy)
-	// Use delivery tag as index for O(1) lookup
-	index := message.DeliveryTag & uint64(ring.ringMask)
-	ring.ringBuffer[index] = message
-
-	// Increment message count
-	ring.messageCount.Add(1)
-
-	// Commit to make visible to consumers
-	ring.disruptor.Commit(sequence, sequence)
-
-	// Update head to track highest delivery tag seen
-	// This is only needed for recovery scenarios
-	if message.DeliveryTag > ring.head.Load() {
-		ring.head.Store(message.DeliveryTag)
+	_, spilled, err := ring.ring.Store(message.DeliveryTag, message)
+	if err != nil {
+		return fmt.Errorf("failed to store message in ring: %w", err)
+	}
+	if spilled {
+		if message.DeliveryMode != 2 {
+			if err := ds.wal.Write(queueName, message, message.DeliveryTag); err != nil {
+				return fmt.Errorf("failed to spill transient message to WAL: %w", err)
+			}
+		}
+		return nil
 	}
 
+	ring.ack.OnPublish(message.DeliveryTag)
 	return nil
 }
 
-// GetMessage retrieves a message by delivery tag (pull-based delivery)
-// Phase 6B: Falls back to WAL, then Segments
 func (ds *DisruptorStorage) GetMessage(queueName string, deliveryTag uint64) (*protocol.Message, error) {
 	ring := ds.getQueueRing(queueName)
-
 	if ring == nil {
 		return nil, interfaces.ErrQueueNotFound
 	}
 
-	// Try ring buffer first (hot path)
-	index := deliveryTag & uint64(ring.ringMask)
-	message := ring.ringBuffer[index]
-
-	if message != nil && message.DeliveryTag == deliveryTag {
-		return message, nil
+	if msg, ok := ring.ring.LoadByTag(deliveryTag); ok {
+		return msg, nil
 	}
 
-	// Not in ring buffer - try the WAL (Phase 6A)
 	if ds.wal != nil {
-		message, err := ds.wal.Read(queueName, deliveryTag)
-		if err == nil {
-			return message, nil
+		if msg, err := ds.wal.Read(queueName, deliveryTag); err == nil {
+			return msg, nil
 		}
 	}
 
-	// Not in WAL - try segments (Phase 6B)
 	if ds.segments != nil {
-		message, err := ds.segments.Read(queueName, deliveryTag)
-		if err == nil {
-			return message, nil
+		if msg, err := ds.segments.Read(queueName, deliveryTag); err == nil {
+			return msg, nil
 		}
 	}
 
 	return nil, interfaces.ErrMessageNotFound
 }
 
-// DeleteMessage removes a message after ACK
-// Phase 6B: Notifies both WAL and Segments (for compaction)
+func (ds *DisruptorStorage) LoadMessageBySeq(queueName string, seq uint64) (*protocol.Message, error) {
+	ring := ds.getQueueRing(queueName)
+	if ring == nil {
+		return nil, interfaces.ErrQueueNotFound
+	}
+
+	if msg, ok := ring.ring.LoadBySeq(seq); ok {
+		return msg, nil
+	}
+
+	return nil, interfaces.ErrMessageNotFound
+}
+
 func (ds *DisruptorStorage) DeleteMessage(queueName string, deliveryTag uint64) error {
 	ring := ds.getQueueRing(queueName)
-
 	if ring == nil {
 		return interfaces.ErrQueueNotFound
 	}
 
-	// Clear ring buffer slot (will be overwritten on next publish)
-	index := deliveryTag & uint64(ring.ringMask)
-	if ring.ringBuffer[index] != nil {
-		ring.ringBuffer[index] = nil
-		// Decrement message count
-		if ring.messageCount.Load() > 0 {
-			ring.messageCount.Add(^uint64(0)) // Subtract 1 using two's complement
-		}
-	}
+	ring.ring.Delete(deliveryTag)
 
-	// Notify WAL of ACK (Phase 6A: lock-free!)
 	if ds.wal != nil {
 		ds.wal.Acknowledge(queueName, deliveryTag)
 	}
 
-	// Notify Segments of ACK for compaction (Phase 6B)
 	if ds.segments != nil {
 		ds.segments.Acknowledge(queueName, deliveryTag)
 	}
@@ -452,112 +305,129 @@ func (ds *DisruptorStorage) DeleteMessage(queueName string, deliveryTag uint64) 
 	return nil
 }
 
-// GetQueueMessages retrieves all messages in a queue (for testing/debugging)
+func (ds *DisruptorStorage) AdvanceMinAckCursor(queueName string, consumerTag string) {
+	ring := ds.getQueueRing(queueName)
+	if ring == nil {
+		return
+	}
+	ring.ack.OnAck(0, consumerTag)
+	_ = consumerTag
+}
+
+func (ds *DisruptorStorage) RegisterConsumerCursor(queueName string, consumerTag string) {
+	ring := ds.getOrCreateQueueRing(queueName)
+	ring.ack.OnConsumerRegister(consumerTag)
+}
+
+func (ds *DisruptorStorage) UnregisterConsumerCursor(queueName string, consumerTag string) {
+	ring := ds.getQueueRing(queueName)
+	if ring == nil {
+		return
+	}
+	ring.ack.OnConsumerUnregister(consumerTag)
+}
+
+func (ds *DisruptorStorage) DeliverToConsumer(queueName string, consumerTag string, deliveryTag uint64) {
+	ring := ds.getQueueRing(queueName)
+	if ring == nil {
+		return
+	}
+	ring.ack.OnDeliver(deliveryTag, consumerTag)
+}
+
+func (ds *DisruptorStorage) AckFromConsumer(queueName string, consumerTag string, deliveryTag uint64) {
+	ring := ds.getQueueRing(queueName)
+	if ring == nil {
+		return
+	}
+	ring.ack.OnAck(deliveryTag, consumerTag)
+}
+
+func (ds *DisruptorStorage) NackFromConsumer(queueName string, consumerTag string, deliveryTag uint64) {
+	ring := ds.getQueueRing(queueName)
+	if ring == nil {
+		return
+	}
+	ring.ack.OnNack(deliveryTag, consumerTag)
+}
+
+func (ds *DisruptorStorage) GetMinAckCursor(queueName string) uint64 {
+	ring := ds.getQueueRing(queueName)
+	if ring == nil {
+		return 0
+	}
+	return ring.ack.MinAckCursor()
+}
+
+func (ds *DisruptorStorage) IsSafeToOverwrite(queueName string, oldTag, newTag uint64) bool {
+	ring := ds.getQueueRing(queueName)
+	if ring == nil {
+		return true
+	}
+	return ring.ack.IsSafeToOverwrite(oldTag, newTag, ds.ringBufferSize)
+}
+
 func (ds *DisruptorStorage) GetQueueMessages(queueName string) ([]*protocol.Message, error) {
 	ring := ds.getQueueRing(queueName)
-
 	if ring == nil {
 		return nil, interfaces.ErrQueueNotFound
 	}
-
-	messages := make([]*protocol.Message, 0, len(ring.ringBuffer))
-	for i := 0; i < len(ring.ringBuffer); i++ {
-		if msg := ring.ringBuffer[i]; msg != nil {
-			messages = append(messages, msg)
-		}
-	}
-
-	return messages, nil
+	return ring.ring.GetAll(), nil
 }
 
-// GetQueueMessageCount returns the number of messages in a queue
 func (ds *DisruptorStorage) GetQueueMessageCount(queueName string) (int, error) {
-	messages, err := ds.GetQueueMessages(queueName)
-	if err != nil {
-		return 0, err
-	}
-	return len(messages), nil
-}
-
-// PurgeQueue removes all messages from a queue
-func (ds *DisruptorStorage) PurgeQueue(queueName string) (int, error) {
 	ring := ds.getQueueRing(queueName)
-
 	if ring == nil {
 		return 0, interfaces.ErrQueueNotFound
 	}
-
-	count := 0
-	for i := 0; i < len(ring.ringBuffer); i++ {
-		if ring.ringBuffer[i] != nil {
-			count++
-			ring.ringBuffer[i] = nil
-		}
-	}
-
-	return count, nil
+	return int(ring.ring.Count()), nil
 }
 
-// GetMessageRange retrieves messages in a delivery tag range
+func (ds *DisruptorStorage) PurgeQueue(queueName string) (int, error) {
+	ring := ds.getQueueRing(queueName)
+	if ring == nil {
+		return 0, interfaces.ErrQueueNotFound
+	}
+	return ring.ring.Purge(), nil
+}
+
 func (ds *DisruptorStorage) GetMessageRange(queueName string, startTag, endTag uint64) ([]*protocol.Message, error) {
 	ring := ds.getQueueRing(queueName)
-
 	if ring == nil {
 		return nil, interfaces.ErrQueueNotFound
 	}
-
-	messages := make([]*protocol.Message, 0, endTag-startTag+1)
-	for tag := startTag; tag <= endTag; tag++ {
-		index := tag & uint64(ring.ringMask)
-		if msg := ring.ringBuffer[index]; msg != nil && msg.DeliveryTag == tag {
-			messages = append(messages, msg)
-		}
-	}
-
-	return messages, nil
+	return ring.ring.GetRange(startTag, endTag), nil
 }
 
-// DeleteMessageRange deletes messages in a range (for GC)
 func (ds *DisruptorStorage) DeleteMessageRange(queueName string, startTag, endTag uint64) error {
 	ring := ds.getQueueRing(queueName)
-
 	if ring == nil {
 		return interfaces.ErrQueueNotFound
 	}
-
-	for tag := startTag; tag <= endTag; tag++ {
-		index := tag & uint64(ring.ringMask)
-		if msg := ring.ringBuffer[index]; msg != nil && msg.DeliveryTag == tag {
-			ring.ringBuffer[index] = nil
-		}
-	}
-
+	ring.ring.DeleteRange(startTag, endTag)
 	return nil
 }
 
-// GetQueueHead returns the current head position (next delivery tag)
 func (ds *DisruptorStorage) GetQueueHead(queueName string) (uint64, error) {
 	ring := ds.getOrCreateQueueRing(queueName)
-	return ring.head.Load(), nil
+	return ring.ack.Head(), nil
 }
 
-// SetQueueHead sets the head position
 func (ds *DisruptorStorage) SetQueueHead(queueName string, head uint64) error {
 	ring := ds.getOrCreateQueueRing(queueName)
-	ring.head.Store(head)
+	ring.ack.OnPublish(head)
 	return nil
 }
 
-// IncrementQueueHead increments and returns the new head
 func (ds *DisruptorStorage) IncrementQueueHead(queueName string) (uint64, error) {
 	ring := ds.getOrCreateQueueRing(queueName)
-	return ring.head.Add(1), nil
+	head := ring.ack.Head() + 1
+	ring.ack.OnPublish(head)
+	return head, nil
 }
 
-// GetConsumerPosition returns the consumer's current position
 func (ds *DisruptorStorage) GetConsumerPosition(queueName, consumerTag string) (uint64, error) {
 	ring := ds.getQueueRing(queueName)
-
 	if ring == nil {
 		return 0, interfaces.ErrQueueNotFound
 	}
@@ -568,12 +438,9 @@ func (ds *DisruptorStorage) GetConsumerPosition(queueName, consumerTag string) (
 	if pos, exists := ring.consumerPositions[consumerTag]; exists {
 		return pos.Load(), nil
 	}
-
-	// First time - start at 0
 	return 0, nil
 }
 
-// SetConsumerPosition updates the consumer's position
 func (ds *DisruptorStorage) SetConsumerPosition(queueName, consumerTag string, position uint64) error {
 	ring := ds.getOrCreateQueueRing(queueName)
 
@@ -587,123 +454,56 @@ func (ds *DisruptorStorage) SetConsumerPosition(queueName, consumerTag string, p
 		pos.Store(position)
 		ring.consumerPositions[consumerTag] = pos
 	}
-
 	return nil
 }
 
-// AddUnacked marks a message as unacknowledged
 func (ds *DisruptorStorage) AddUnacked(queueName, consumerTag string, deliveryTag uint64) error {
 	ring := ds.getQueueRing(queueName)
-
 	if ring == nil {
 		return interfaces.ErrQueueNotFound
 	}
-
-	ring.unackedMutex.Lock()
-	defer ring.unackedMutex.Unlock()
-
-	if ring.unacked[consumerTag] == nil {
-		ring.unacked[consumerTag] = make(map[uint64]struct{})
-	}
-	ring.unacked[consumerTag][deliveryTag] = struct{}{}
-
+	ring.ack.OnDeliver(deliveryTag, consumerTag)
 	return nil
 }
 
-// RemoveUnacked removes an acknowledged message
-// Phase 4: Also updates consumer offset (zero disk writes)
 func (ds *DisruptorStorage) RemoveUnacked(queueName, consumerTag string, deliveryTag uint64) error {
 	ring := ds.getQueueRing(queueName)
-
 	if ring == nil {
 		return interfaces.ErrQueueNotFound
 	}
+	ring.ack.OnAck(deliveryTag, consumerTag)
 
-	ring.unackedMutex.Lock()
-	defer ring.unackedMutex.Unlock()
-
-	if unackedSet, exists := ring.unacked[consumerTag]; exists {
-		delete(unackedSet, deliveryTag)
-	}
-
-	// Phase 4: Update consumer offset in memory (no disk write!)
 	if ds.offsetStore != nil {
 		ds.offsetStore.UpdateOffset(queueName, consumerTag, deliveryTag)
 	}
-
 	return nil
 }
 
-// GetUnackedCount returns the number of unacked messages for a consumer
 func (ds *DisruptorStorage) GetUnackedCount(queueName, consumerTag string) (int, error) {
 	ring := ds.getQueueRing(queueName)
-
 	if ring == nil {
 		return 0, interfaces.ErrQueueNotFound
 	}
-
-	ring.unackedMutex.RLock()
-	defer ring.unackedMutex.RUnlock()
-
-	if unackedSet, exists := ring.unacked[consumerTag]; exists {
-		return len(unackedSet), nil
-	}
-
-	return 0, nil
+	return ring.ack.GetUnackedCount(consumerTag), nil
 }
 
-// GetUnackedTags returns all unacked delivery tags for a consumer
 func (ds *DisruptorStorage) GetUnackedTags(queueName, consumerTag string) ([]uint64, error) {
 	ring := ds.getQueueRing(queueName)
-
 	if ring == nil {
 		return nil, interfaces.ErrQueueNotFound
 	}
 
-	ring.unackedMutex.RLock()
-	defer ring.unackedMutex.RUnlock()
-
-	if unackedSet, exists := ring.unacked[consumerTag]; exists {
-		tags := make([]uint64, 0, len(unackedSet))
-		for tag := range unackedSet {
-			tags = append(tags, tag)
-		}
-		return tags, nil
-	}
-
-	return []uint64{}, nil
+	return ring.ack.GetUnackedTags(consumerTag), nil
 }
 
-// GetLowestUnackedAcrossConsumers returns the lowest unacked tag across all consumers
 func (ds *DisruptorStorage) GetLowestUnackedAcrossConsumers(queueName string) (uint64, error) {
 	ring := ds.getQueueRing(queueName)
-
 	if ring == nil {
 		return 0, interfaces.ErrQueueNotFound
 	}
-
-	ring.unackedMutex.RLock()
-	defer ring.unackedMutex.RUnlock()
-
-	var lowest uint64 = ^uint64(0) // Max uint64
-	for _, unackedSet := range ring.unacked {
-		for tag := range unackedSet {
-			if tag < lowest {
-				lowest = tag
-			}
-		}
-	}
-
-	if lowest == ^uint64(0) {
-		return 0, nil
-	}
-
-	return lowest, nil
+	return ring.ack.MinAckCursor(), nil
 }
 
-// Metadata operations (Phase 3: JSON files)
-
-// StoreExchange stores an exchange
 func (ds *DisruptorStorage) StoreExchange(exchange *protocol.Exchange) error {
 	if ds.metadataStore == nil {
 		return fmt.Errorf("metadata store not initialized")
@@ -711,7 +511,6 @@ func (ds *DisruptorStorage) StoreExchange(exchange *protocol.Exchange) error {
 	return ds.metadataStore.StoreExchange(exchange)
 }
 
-// GetExchange retrieves an exchange
 func (ds *DisruptorStorage) GetExchange(name string) (*protocol.Exchange, error) {
 	if ds.metadataStore == nil {
 		return nil, fmt.Errorf("metadata store not initialized")
@@ -719,7 +518,6 @@ func (ds *DisruptorStorage) GetExchange(name string) (*protocol.Exchange, error)
 	return ds.metadataStore.GetExchange(name)
 }
 
-// DeleteExchange deletes an exchange
 func (ds *DisruptorStorage) DeleteExchange(name string) error {
 	if ds.metadataStore == nil {
 		return fmt.Errorf("metadata store not initialized")
@@ -727,7 +525,6 @@ func (ds *DisruptorStorage) DeleteExchange(name string) error {
 	return ds.metadataStore.DeleteExchange(name)
 }
 
-// ListExchanges returns all exchanges
 func (ds *DisruptorStorage) ListExchanges() ([]*protocol.Exchange, error) {
 	if ds.metadataStore == nil {
 		return nil, fmt.Errorf("metadata store not initialized")
@@ -735,24 +532,17 @@ func (ds *DisruptorStorage) ListExchanges() ([]*protocol.Exchange, error) {
 	return ds.metadataStore.ListExchanges()
 }
 
-// StoreQueue stores a queue
 func (ds *DisruptorStorage) StoreQueue(queue *protocol.Queue) error {
 	if ds.metadataStore == nil {
 		return fmt.Errorf("metadata store not initialized")
 	}
-
-	// Store to JSON file
 	if err := ds.metadataStore.StoreQueue(queue); err != nil {
 		return err
 	}
-
-	// Create the queue ring
 	_ = ds.getOrCreateQueueRing(queue.Name)
-
 	return nil
 }
 
-// GetQueue retrieves a queue
 func (ds *DisruptorStorage) GetQueue(name string) (*protocol.Queue, error) {
 	if ds.metadataStore == nil {
 		return nil, fmt.Errorf("metadata store not initialized")
@@ -760,23 +550,19 @@ func (ds *DisruptorStorage) GetQueue(name string) (*protocol.Queue, error) {
 	return ds.metadataStore.GetQueue(name)
 }
 
-// DeleteQueue deletes a queue
 func (ds *DisruptorStorage) DeleteQueue(name string) error {
 	if val, ok := ds.queues.LoadAndDelete(name); ok {
 		ring := val.(*QueueRing)
-		_ = ring.disruptor.Close()
+		ring.ring.Close()
 		ring.closed.Store(true)
 	}
 
-	// Delete queue metadata from JSON file
 	if ds.metadataStore != nil {
 		return ds.metadataStore.DeleteQueue(name)
 	}
-
 	return nil
 }
 
-// ListQueues returns all queues
 func (ds *DisruptorStorage) ListQueues() ([]*protocol.Queue, error) {
 	if ds.metadataStore == nil {
 		return nil, fmt.Errorf("metadata store not initialized")
@@ -784,7 +570,6 @@ func (ds *DisruptorStorage) ListQueues() ([]*protocol.Queue, error) {
 	return ds.metadataStore.ListQueues()
 }
 
-// StoreBinding stores a binding
 func (ds *DisruptorStorage) StoreBinding(queueName, exchangeName, routingKey string, arguments map[string]interface{}) error {
 	if ds.metadataStore == nil {
 		return fmt.Errorf("metadata store not initialized")
@@ -792,7 +577,6 @@ func (ds *DisruptorStorage) StoreBinding(queueName, exchangeName, routingKey str
 	return ds.metadataStore.StoreBinding(queueName, exchangeName, routingKey, arguments)
 }
 
-// GetBinding retrieves a specific binding
 func (ds *DisruptorStorage) GetBinding(queueName, exchangeName, routingKey string) (*interfaces.QueueBinding, error) {
 	if ds.metadataStore == nil {
 		return nil, fmt.Errorf("metadata store not initialized")
@@ -800,7 +584,6 @@ func (ds *DisruptorStorage) GetBinding(queueName, exchangeName, routingKey strin
 	return ds.metadataStore.GetBinding(queueName, exchangeName, routingKey)
 }
 
-// DeleteBinding deletes a binding
 func (ds *DisruptorStorage) DeleteBinding(queueName, exchangeName, routingKey string) error {
 	if ds.metadataStore == nil {
 		return fmt.Errorf("metadata store not initialized")
@@ -808,7 +591,6 @@ func (ds *DisruptorStorage) DeleteBinding(queueName, exchangeName, routingKey st
 	return ds.metadataStore.DeleteBinding(queueName, exchangeName, routingKey)
 }
 
-// GetQueueBindings returns all bindings for a queue
 func (ds *DisruptorStorage) GetQueueBindings(queueName string) ([]*interfaces.QueueBinding, error) {
 	if ds.metadataStore == nil {
 		return nil, fmt.Errorf("metadata store not initialized")
@@ -816,7 +598,6 @@ func (ds *DisruptorStorage) GetQueueBindings(queueName string) ([]*interfaces.Qu
 	return ds.metadataStore.GetQueueBindings(queueName)
 }
 
-// GetExchangeBindings returns all bindings for an exchange
 func (ds *DisruptorStorage) GetExchangeBindings(exchangeName string) ([]*interfaces.QueueBinding, error) {
 	if ds.metadataStore == nil {
 		return nil, fmt.Errorf("metadata store not initialized")
@@ -824,7 +605,6 @@ func (ds *DisruptorStorage) GetExchangeBindings(exchangeName string) ([]*interfa
 	return ds.metadataStore.GetExchangeBindings(exchangeName)
 }
 
-// StoreConsumer stores a consumer
 func (ds *DisruptorStorage) StoreConsumer(queueName, consumerTag string, consumer *protocol.Consumer) error {
 	if ds.metadataStore == nil {
 		return fmt.Errorf("metadata store not initialized")
@@ -832,7 +612,6 @@ func (ds *DisruptorStorage) StoreConsumer(queueName, consumerTag string, consume
 	return ds.metadataStore.StoreConsumer(queueName, consumerTag, consumer)
 }
 
-// GetConsumer retrieves a consumer
 func (ds *DisruptorStorage) GetConsumer(queueName, consumerTag string) (*protocol.Consumer, error) {
 	if ds.metadataStore == nil {
 		return nil, fmt.Errorf("metadata store not initialized")
@@ -840,29 +619,22 @@ func (ds *DisruptorStorage) GetConsumer(queueName, consumerTag string) (*protoco
 	return ds.metadataStore.GetConsumer(queueName, consumerTag)
 }
 
-// DeleteConsumer deletes a consumer
 func (ds *DisruptorStorage) DeleteConsumer(queueName, consumerTag string) error {
 	if ds.metadataStore == nil {
 		return fmt.Errorf("metadata store not initialized")
 	}
-
-	// Phase 4: Remove consumer offset tracking
 	if ds.offsetStore != nil {
 		_ = ds.offsetStore.RemoveConsumer(queueName, consumerTag)
 	}
-
 	return ds.metadataStore.DeleteConsumer(queueName, consumerTag)
 }
 
-// GetQueueConsumers returns all consumers for a queue
 func (ds *DisruptorStorage) GetQueueConsumers(queueName string) ([]*protocol.Consumer, error) {
 	if ds.metadataStore == nil {
 		return nil, fmt.Errorf("metadata store not initialized")
 	}
 	return ds.metadataStore.GetQueueConsumers(queueName)
 }
-
-// Transaction operations (simple in-memory implementation)
 
 func (ds *DisruptorStorage) BeginTransaction(txID string) (*interfaces.Transaction, error) {
 	ds.txMutex.Lock()
@@ -890,7 +662,6 @@ func (ds *DisruptorStorage) GetTransaction(txID string) (*interfaces.Transaction
 	if tx, ok := ds.transactions[txID]; ok {
 		return tx, nil
 	}
-
 	return nil, interfaces.ErrTransactionNotFound
 }
 
@@ -950,7 +721,6 @@ func (ds *DisruptorStorage) RollbackTransaction(txID string) error {
 func (ds *DisruptorStorage) DeleteTransaction(txID string) error {
 	ds.txMutex.Lock()
 	defer ds.txMutex.Unlock()
-
 	delete(ds.transactions, txID)
 	return nil
 }
@@ -965,15 +735,10 @@ func (ds *DisruptorStorage) ListActiveTransactions() ([]*interfaces.Transaction,
 			active = append(active, tx)
 		}
 	}
-
 	return active, nil
 }
 
-// Acknowledgment store (Phase 1: No-op, Phase 4 will implement offset-based ACKs)
-
 func (ds *DisruptorStorage) StorePendingAck(pendingAck *protocol.PendingAck) error {
-	// Phase 1: No-op - we're not storing pending acks to disk
-	// Phase 4 will implement offset-based ACKs with periodic checkpointing
 	return nil
 }
 
@@ -982,7 +747,6 @@ func (ds *DisruptorStorage) GetPendingAck(queueName string, deliveryTag uint64) 
 }
 
 func (ds *DisruptorStorage) DeletePendingAck(queueName string, deliveryTag uint64) error {
-	// Phase 1: No-op
 	return nil
 }
 
@@ -995,7 +759,6 @@ func (ds *DisruptorStorage) GetConsumerPendingAcks(consumerTag string) ([]*proto
 }
 
 func (ds *DisruptorStorage) CleanupExpiredAcks(maxAge time.Duration) error {
-	// Phase 1: No-op
 	return nil
 }
 
@@ -1003,16 +766,11 @@ func (ds *DisruptorStorage) GetAllPendingAcks() ([]*protocol.PendingAck, error) 
 	return []*protocol.PendingAck{}, nil
 }
 
-// Durability store (Phase 1: In-memory only, Phase 2 will add append-log)
-
 func (ds *DisruptorStorage) StoreDurableEntityMetadata(metadata *protocol.DurableEntityMetadata) error {
-	// Phase 1: No-op - in-memory only
-	// Phase 3 will implement JSON metadata files
 	return nil
 }
 
 func (ds *DisruptorStorage) GetDurableEntityMetadata() (*protocol.DurableEntityMetadata, error) {
-	// Phase 3: Return durable queues and exchanges from metadata store
 	if ds.metadataStore == nil {
 		return nil, fmt.Errorf("metadata store not initialized")
 	}
@@ -1024,7 +782,6 @@ func (ds *DisruptorStorage) GetDurableEntityMetadata() (*protocol.DurableEntityM
 		LastUpdated: time.Now(),
 	}
 
-	// Collect exchanges from metadata store
 	exchanges, err := ds.metadataStore.ListExchanges()
 	if err != nil {
 		return nil, fmt.Errorf("failed to list exchanges: %w", err)
@@ -1035,7 +792,6 @@ func (ds *DisruptorStorage) GetDurableEntityMetadata() (*protocol.DurableEntityM
 		}
 	}
 
-	// Collect queues from metadata store
 	queues, err := ds.metadataStore.ListQueues()
 	if err != nil {
 		return nil, fmt.Errorf("failed to list queues: %w", err)
@@ -1045,9 +801,6 @@ func (ds *DisruptorStorage) GetDurableEntityMetadata() (*protocol.DurableEntityM
 			metadata.Queues = append(metadata.Queues, queue)
 		}
 	}
-
-	// Note: Bindings recovery not yet implemented
-	// This would require scanning all exchanges and their bindings
 
 	return metadata, nil
 }
@@ -1061,18 +814,15 @@ func (ds *DisruptorStorage) RepairCorruption(autoRepair bool) (*protocol.Recover
 }
 
 func (ds *DisruptorStorage) GetRecoverableMessages() (map[string][]*protocol.Message, error) {
-	// Phase 3: Call WAL recovery to get all unacknowledged messages
 	if ds.wal == nil {
 		return make(map[string][]*protocol.Message), nil
 	}
 
-	// Recover messages from WAL
 	recoveredMessages, err := ds.wal.RecoverFromWAL()
 	if err != nil {
 		return nil, fmt.Errorf("WAL recovery failed: %w", err)
 	}
 
-	// Group messages by queue name
 	messagesByQueue := make(map[string][]*protocol.Message)
 	for _, recoveryMsg := range recoveredMessages {
 		messagesByQueue[recoveryMsg.QueueName] = append(
@@ -1088,95 +838,57 @@ func (ds *DisruptorStorage) MarkRecoveryComplete(stats *protocol.RecoveryStats) 
 	return nil
 }
 
-// RecoverFromLog scans the WAL and segments to recover messages into ring buffer
-// This is called during startup to reload persisted messages
 func (ds *DisruptorStorage) RecoverFromLog(queueName string) error {
-	ring := ds.getOrCreateQueueRing(queueName)
-
-	// Step 1: Recover from segments (cold storage)
-	if ds.segments != nil {
-		// Segments store messages long-term, scan and load into ring
-		// This is a simplified recovery - production would use indexes
-	}
-
-	// Step 2: Recover from WAL (recent messages)
-	if ds.wal != nil {
-		// WAL contains recent messages not yet checkpointed
-		// This is handled by WAL's checkpoint loop on startup
-	}
-
-	// Step 3: Load consumer offsets
-	if ds.offsetStore != nil {
-		// Consumer offsets are already loaded by OffsetCheckpointStore
-		// No additional work needed here
-	}
-
-	// Update ring head to highest delivery tag seen
-	// This ensures new messages get unique tags
-	_ = ring
-
+	_ = ds.getOrCreateQueueRing(queueName)
 	return nil
 }
 
-// RecoverAllQueues recovers all queues from persistent storage
 func (ds *DisruptorStorage) RecoverAllQueues() error {
 	if ds.metadataStore == nil {
 		return nil
 	}
 
-	// Get all queues from metadata
 	queues, err := ds.metadataStore.ListQueues()
 	if err != nil {
 		return fmt.Errorf("failed to list queues: %w", err)
 	}
 
-	// Recover each queue
 	for _, queue := range queues {
 		if err := ds.RecoverFromLog(queue.Name); err != nil {
-			// Log error but continue with other queues
 			continue
 		}
 	}
-
 	return nil
 }
 
-// ExecuteAtomic runs operations atomically
 func (ds *DisruptorStorage) ExecuteAtomic(operations func(txnStorage interfaces.Storage) error) error {
 	ds.txMutex.Lock()
 	defer ds.txMutex.Unlock()
-
 	return operations(ds)
 }
 
-// Close cleans up all resources
 func (ds *DisruptorStorage) Close() error {
 	ds.queues.Range(func(_, value interface{}) bool {
 		ring := value.(*QueueRing)
 		if !ring.closed.Load() {
-			_ = ring.disruptor.Close()
+			ring.ring.Close()
 			ring.closed.Store(true)
 		}
 		return true
 	})
 
-	// Close metadata store (Phase 3)
 	if ds.metadataStore != nil {
 		_ = ds.metadataStore.Close()
 	}
 
-	// Close offset checkpoint store (Phase 4)
-	// This will perform a final checkpoint before exit
 	if ds.offsetStore != nil {
 		_ = ds.offsetStore.Close()
 	}
 
-	// Close WAL manager (Phase 6A)
 	if ds.wal != nil {
 		_ = ds.wal.Close()
 	}
 
-	// Close Segment manager (Phase 6B)
 	if ds.segments != nil {
 		_ = ds.segments.Close()
 	}
@@ -1184,5 +896,4 @@ func (ds *DisruptorStorage) Close() error {
 	return nil
 }
 
-// Compile-time interface check
 var _ interfaces.Storage = (*DisruptorStorage)(nil)

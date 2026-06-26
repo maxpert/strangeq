@@ -32,8 +32,11 @@ type UnifiedBroker interface {
 	// Delivery lookup (NEW - for O(1) ACK routing)
 	GetConsumerForDelivery(deliveryTag uint64) (string, bool)
 
-	// Recovery support — enqueues a recovered message ID for consumer delivery
-	EnqueueRecoveredMessage(queueName string, deliveryTag uint64)
+	// Recovery support — initializes a queue's dispatch cursor from the
+	// recovered message tag range [minTag, maxTag], making recovered
+	// messages immediately claimable by consumers. Replaces the old
+	// per-message EnqueueRecoveredMessage.
+	RecoverQueue(queueName string, minTag, maxTag uint64)
 
 	// Recovery support — advances global delivery tag past recovered tags
 	AdvanceDeliveryTag(tag uint64)

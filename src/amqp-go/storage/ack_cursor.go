@@ -114,6 +114,30 @@ func (ac *AckCursor) ConsumerCount() int {
 	return len(ac.consumers)
 }
 
+func (ac *AckCursor) GetUnackedTags(consumerTag string) []uint64 {
+	ac.mu.Lock()
+	defer ac.mu.Unlock()
+	c, ok := ac.consumers[consumerTag]
+	if !ok {
+		return nil
+	}
+	tags := make([]uint64, 0, len(c.unacked))
+	for tag := range c.unacked {
+		tags = append(tags, tag)
+	}
+	return tags
+}
+
+func (ac *AckCursor) GetUnackedCount(consumerTag string) int {
+	ac.mu.Lock()
+	defer ac.mu.Unlock()
+	c, ok := ac.consumers[consumerTag]
+	if !ok {
+		return 0
+	}
+	return len(c.unacked)
+}
+
 func (ac *AckCursor) recomputeMinLocked() {
 	lowest := noLowest
 	for _, c := range ac.consumers {

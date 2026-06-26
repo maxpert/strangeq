@@ -71,8 +71,8 @@ func (a *StorageBrokerAdapter) AdvanceDeliveryTag(tag uint64) {
 	a.broker.AdvanceDeliveryTag(tag)
 }
 
-func (a *StorageBrokerAdapter) EnqueueRecoveredMessage(queueName string, deliveryTag uint64) {
-	a.broker.EnqueueRecoveredMessage(queueName, deliveryTag)
+func (a *StorageBrokerAdapter) RecoverQueue(queueName string, minTag, maxTag uint64) {
+	a.broker.RecoverQueue(queueName, minTag, maxTag)
 }
 
 func (a *StorageBrokerAdapter) RebuildDeliveryIndex(deliveryTag uint64, consumerTag string) {

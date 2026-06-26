@@ -234,6 +234,13 @@ func (r *RecoveryManager) recoverPersistentMessages(stats *protocol.RecoveryStat
 
 	var maxDeliveryTag uint64
 	for queueName, messages := range recoverableMessages {
+		// Compute the recovered tag range for this queue so the dispatch
+		// cursor can be initialized once (tail=min, head=max+1) instead of
+		// per-message enqueueing. The cursor range [minTag, maxTag] is
+		// claimable immediately; gaps (tags acked before restart) are
+		// skipped at delivery time via the GetMessage-not-found path.
+		var minTag, maxTag uint64
+		hasRecovered := false
 		for _, message := range messages {
 			// Track highest delivery tag for globalDeliveryTag restoration
 			if message.DeliveryTag > maxDeliveryTag {
@@ -254,13 +261,23 @@ func (r *RecoveryManager) recoverPersistentMessages(stats *protocol.RecoveryStat
 						fmt.Sprintf("Failed to load message in queue %s: %v", queueName, err))
 				} else {
 					stats.PersistentMessagesRecovered++
-					// Enqueue recovered message ID so consumer poll loops can deliver it
-					r.broker.EnqueueRecoveredMessage(queueName, message.DeliveryTag)
+					if !hasRecovered || message.DeliveryTag < minTag {
+						minTag = message.DeliveryTag
+					}
+					if message.DeliveryTag > maxTag {
+						maxTag = message.DeliveryTag
+					}
+					hasRecovered = true
 					r.logger.Debug("Loaded recovered message into ring buffer",
 						zap.String("queue", queueName),
 						zap.Uint64("delivery_tag", message.DeliveryTag))
 				}
 			}
+		}
+		// Initialize the queue's dispatch cursor from the recovered range
+		// so consumers can claim [minTag, maxTag] as soon as they register.
+		if hasRecovered {
+			r.broker.RecoverQueue(queueName, minTag, maxTag)
 		}
 	}
 

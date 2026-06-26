@@ -16,21 +16,10 @@ import (
 // ErrConsumerChannelFull is returned when a consumer channel is full and cannot accept more messages
 var ErrConsumerChannelFull = errors.New("consumer channel full")
 
-// QueueState tracks the state of a queue using lock-free data structures
-// This enables O(1) message delivery and atomic operations
-type QueueState struct {
-	available chan uint64 // Lock-free queue of available message IDs
-	inflight  sync.Map    // msgID → consumerTag (in-flight messages)
-}
-
-// NewQueueState creates a new queue state with a configured buffered channel
-// Phase 6E: Reduced from 100M to 10M based on benchmark analysis
-// Phase 6G: Made configurable via EngineConfig.AvailableChannelBuffer
-func NewQueueState(bufferSize int) *QueueState {
-	return &QueueState{
-		available: make(chan uint64, bufferSize),
-	}
-}
+// QueueState and its constructor NewQueueState now live in queue_dispatch.go,
+// replacing the old `available chan uint64` with a lock-free tail cursor +
+// condvar park/wake + bounded requeue ring. See queue_dispatch.go for the
+// full design.
 
 // ConsumerState tracks the state of an active consumer for pull-based delivery
 type ConsumerState struct {
@@ -143,15 +132,35 @@ func (b *StorageBroker) getOrCreateQueueState(queueName string) *QueueState {
 		return val.(*QueueState)
 	}
 
-	// Create new queue state with configured buffer size
-	newState := NewQueueState(b.engineConfig.AvailableChannelBuffer)
+	// Create new queue state with a backpressure high-water mark derived from
+	// the ring-buffer spill threshold. The depth gate (head - minAckCursor)
+	// coordinates broker-level publisher backpressure with storage-level
+	// spilling: once unacked depth reaches the spill threshold, publishers
+	// block in WaitForCapacity until consumers ack and drain.
+	newState := NewQueueState(b.computeDepthHighWM())
 	actual, _ := b.queueStates.LoadOrStore(queueName, newState)
 	return actual.(*QueueState)
 }
 
+// computeDepthHighWM derives the per-queue backpressure high-water mark from
+// the engine config: ring buffer size × spill threshold %. This is the depth
+// (head - minAckCursor) at which publishers block or spill. Falls back to
+// sensible defaults when config fields are unset.
+func (b *StorageBroker) computeDepthHighWM() uint64 {
+	ringSize := b.engineConfig.RingBufferSize
+	if ringSize <= 0 {
+		ringSize = 65536
+	}
+	spillPct := b.engineConfig.SpillThresholdPercent
+	if spillPct <= 0 {
+		spillPct = 80
+	}
+	return uint64(ringSize) * uint64(spillPct) / 100
+}
+
 // consumerPollLoop implements three-stage pipeline with semaphore-based flow control
 // Stage 1: Acquire semaphore permit (blocks if at prefetch limit)
-// Stage 2: Pull message ID from available channel (only after capacity confirmed)
+// Stage 2: Claim a delivery tag from the queue's tail cursor (parks if none)
 // Stage 3: Deliver message with blocking send (provides TCP backpressure)
 func (b *StorageBroker) consumerPollLoop(state *ConsumerState, queueState *QueueState) {
 	for {
@@ -164,40 +173,43 @@ func (b *StorageBroker) consumerPollLoop(state *ConsumerState, queueState *Queue
 			}
 		}
 
-		// STAGE 2: Pull message ID from available channel
-		// Only reached after semaphore acquired, ensuring we have capacity
-		var msgID uint64
-		select {
-		case <-state.stopCh:
+		// STAGE 2: Claim a delivery tag from the tail cursor.
+		// Parks (condvar) when tail >= head and the requeue ring is empty.
+		// Woken by Publish/Requeue/Recover. Returns false when stop fires.
+		tag, ok := queueState.Claim(state.stopCh)
+		if !ok {
 			// Consumer stopped, release unused permit and exit
 			if state.prefetchSem != nil {
 				state.prefetchSem.Release(1)
 			}
 			return
-		case msgID = <-queueState.available:
-			// Got message ID, proceed to delivery
 		}
 
 		// STAGE 3: Deliver message (blocking send provides backpressure)
-		b.deliverMessage(queueState, state, msgID)
+		b.deliverMessage(queueState, state, tag)
 	}
 }
 
 // deliverMessage delivers a message to a consumer with blocking send
 // This provides natural TCP backpressure when consumer is slow
 // Messages are never put back in normal operation, preserving FIFO order
-// Put-backs only occur on shutdown/cancellation (rare events)
+// Put-backs only occur on shutdown/cancellation (rare events) via Requeue
 func (b *StorageBroker) deliverMessage(queueState *QueueState, state *ConsumerState, msgID uint64) {
-	// Mark as in-flight
-	queueState.inflight.Store(msgID, state.consumer.Tag)
+	// Mark as in-flight: ownership map + depth counter.
+	queueState.StoreInflight(msgID, state.consumer.Tag)
+	queueState.ClaimInflight(msgID)
 	b.deliveryIndex.Store(msgID, state.consumer.Tag)
 
 	// Get message from storage
 	message, err := b.storage.GetMessage(state.queueName, msgID)
 	if err != nil {
-		// Message not found - clean up and release permit
-		queueState.inflight.Delete(msgID)
+		// Message not found (gap in recovered range, or spilled/corrupted).
+		// Treat as resolved: release in-flight accounting and permit, then
+		// continue to the next claim. The tag is gone and must not count
+		// toward queue depth.
+		queueState.DeleteInflight(msgID)
 		b.deliveryIndex.Delete(msgID)
+		queueState.AckAdvance(msgID)
 		if state.prefetchSem != nil {
 			state.prefetchSem.Release(1)
 		}
@@ -238,19 +250,21 @@ func (b *StorageBroker) deliverMessage(queueState *QueueState, state *ConsumerSt
 		// Semaphore permit remains held until ACK/NACK/Reject
 
 	case <-state.stopCh:
-		// Consumer stopped - put message back (acceptable on shutdown)
-		queueState.available <- msgID
-		queueState.inflight.Delete(msgID)
+		// Consumer stopped - put message back via Requeue so another
+		// consumer redelivers it. Requeue releases the in-flight slot
+		// (depth counter) and pushes the tag to the requeue ring.
+		queueState.DeleteInflight(msgID)
 		b.deliveryIndex.Delete(msgID)
+		queueState.Requeue(msgID)
 		if state.prefetchSem != nil {
 			state.prefetchSem.Release(1)
 		}
 
 	case <-state.semCtx.Done():
-		// Context cancelled - put message back
-		queueState.available <- msgID
-		queueState.inflight.Delete(msgID)
+		// Context cancelled - put message back via Requeue.
+		queueState.DeleteInflight(msgID)
 		b.deliveryIndex.Delete(msgID)
+		queueState.Requeue(msgID)
 		if state.prefetchSem != nil {
 			state.prefetchSem.Release(1)
 		}
@@ -450,7 +464,11 @@ func (b *StorageBroker) DeleteQueue(name string, ifUnused, ifEmpty bool) error {
 
 	// Remove from active caches (lock-free)
 	b.activeQueues.Delete(name)
-	b.queueStates.Delete(name)
+	// Close the dispatch cursor: wakes parked consumers and blocked
+	// publishers so they exit promptly, then drop our reference.
+	if qval, qok := b.queueStates.LoadAndDelete(name); qok {
+		qval.(*QueueState).Close()
+	}
 
 	return b.storage.DeleteQueue(name)
 }
@@ -576,6 +594,14 @@ func (b *StorageBroker) UnregisterConsumer(consumerTag string) error {
 	// Then stop polling goroutine (idempotent via sync.Once)
 	state.stopOnce.Do(func() { close(state.stopCh) })
 
+	// Wake any consumers parked on this queue's condvar so the unregistered
+	// consumer's Claim() returns promptly (sync.Cond can't select on stopCh;
+	// WakeAll bounds the park latency to zero). Other consumers re-check and
+	// re-park harmlessly.
+	if qval, qok := b.queueStates.Load(state.queueName); qok {
+		qval.(*QueueState).WakeAll()
+	}
+
 	// Remove from activeConsumers
 	b.activeConsumers.Delete(consumerTag)
 
@@ -630,6 +656,14 @@ func (b *StorageBroker) PublishMessage(exchangeName, routingKey string, message 
 		// Get or create queue state (lock-free)
 		queueState := b.getOrCreateQueueState(queueName)
 
+		// Backpressure gate: block while the queue depth (head - minAckCursor)
+		// is at or above the high-water mark. Replaces the old blocking send
+		// to a buffered channel. Woken by AckAdvance when consumers drain.
+		// Aborts if the queue is deleted (StopCh closed).
+		if !queueState.WaitForCapacity(queueState.StopCh()) {
+			return fmt.Errorf("queue '%s' closed during backpressure wait", queueName)
+		}
+
 		// Assign globally unique delivery tag (prevents deliveryIndex collisions across queues)
 		msgID := b.globalDeliveryTag.Add(1)
 		message.DeliveryTag = msgID
@@ -640,8 +674,9 @@ func (b *StorageBroker) PublishMessage(exchangeName, routingKey string, message 
 			return fmt.Errorf("failed to store message to queue '%s': %w", queueName, err)
 		}
 
-		// Enqueue ID in available channel
-		queueState.available <- msgID
+		// Advance the per-queue head cursor and wake parked consumers.
+		// Replaces the old `available <- msgID` channel send.
+		queueState.Publish(msgID)
 
 		// Done - polling loops will discover it (NO consumer iteration needed)
 	}
@@ -870,9 +905,11 @@ func (b *StorageBroker) AcknowledgeMessage(consumerTag string, deliveryTag uint6
 					b.storage.DeleteMessage(pendingAck.QueueName, pendingAck.DeliveryTag)
 					b.storage.DeletePendingAck(pendingAck.QueueName, pendingAck.DeliveryTag)
 
-					// Remove from inflight and delivery index
-					queueState.inflight.Delete(pendingAck.DeliveryTag)
+					// Remove from inflight ownership and delivery index, and
+					// advance the depth frontier for each acked tag.
+					queueState.DeleteInflight(pendingAck.DeliveryTag)
 					b.deliveryIndex.Delete(pendingAck.DeliveryTag)
+					queueState.AckAdvance(pendingAck.DeliveryTag)
 					ackedCount++
 				}
 			}
@@ -887,9 +924,11 @@ func (b *StorageBroker) AcknowledgeMessage(consumerTag string, deliveryTag uint6
 		b.storage.DeleteMessage(state.queueName, deliveryTag)
 		b.storage.DeletePendingAck(state.queueName, deliveryTag)
 
-		// Remove from inflight and delivery index
-		queueState.inflight.Delete(deliveryTag)
+		// Remove from inflight ownership and delivery index, and advance the
+		// depth frontier (may jump minAckCursor to head if queue drained).
+		queueState.DeleteInflight(deliveryTag)
 		b.deliveryIndex.Delete(deliveryTag)
+		queueState.AckAdvance(deliveryTag)
 
 		// Release semaphore permit (frees capacity for next message)
 		if state.prefetchSem != nil {
@@ -913,24 +952,32 @@ func (b *StorageBroker) RejectMessage(consumerTag string, deliveryTag uint64, re
 	// Get queue state
 	queueState := b.getOrCreateQueueState(state.queueName)
 
-	// Remove from inflight and delivery index
-	queueState.inflight.Delete(deliveryTag)
+	// Remove from inflight ownership and delivery index
+	queueState.DeleteInflight(deliveryTag)
 	b.deliveryIndex.Delete(deliveryTag)
 
 	// Handle acknowledgment tracking for rejected message
 	pendingAck, err := b.storage.GetPendingAck(state.queueName, deliveryTag)
 	if err == nil && pendingAck != nil {
 		if requeue {
-			// Remove from pending acks and requeue
+			// Remove from pending acks and requeue for redelivery.
+			// Requeue preserves the original delivery tag (AMQP redelivery
+			// semantics) and pushes it to the requeue ring so it is
+			// delivered before any fresh tail tag.
 			b.storage.DeletePendingAck(state.queueName, deliveryTag)
-
-			// Put back in available queue
-			queueState.available <- deliveryTag
+			queueState.Requeue(deliveryTag)
 		} else {
-			// Remove from both pending acks and storage (message discarded)
+			// Remove from both pending acks and storage (message discarded).
+			// Treated as resolved: release the in-flight depth slot.
 			b.storage.DeletePendingAck(state.queueName, deliveryTag)
 			b.storage.DeleteMessage(state.queueName, deliveryTag)
+			queueState.AckAdvance(deliveryTag)
 		}
+	} else {
+		// No pending ack record (e.g. already removed): still release the
+		// in-flight depth slot claimed in deliverMessage so depth accounting
+		// stays balanced.
+		queueState.AckAdvance(deliveryTag)
 	}
 
 	// Release semaphore permit (frees capacity for next message)
@@ -960,21 +1007,23 @@ func (b *StorageBroker) NacknowledgeMessage(consumerTag string, deliveryTag uint
 		if err == nil {
 			for _, pendingAck := range pendingAcks {
 				if pendingAck.DeliveryTag <= deliveryTag {
-					// Remove from inflight and delivery index
-					queueState.inflight.Delete(pendingAck.DeliveryTag)
+					// Remove from inflight ownership and delivery index
+					queueState.DeleteInflight(pendingAck.DeliveryTag)
 					b.deliveryIndex.Delete(pendingAck.DeliveryTag)
 
 					// Handle requeue vs discard
 					if requeue {
-						// Remove from pending acks and requeue
+						// Remove from pending acks and requeue for redelivery.
+						// Requeue preserves the original delivery tag and
+						// releases the in-flight depth slot.
 						b.storage.DeletePendingAck(pendingAck.QueueName, pendingAck.DeliveryTag)
-
-						// Put back in available queue
-						queueState.available <- pendingAck.DeliveryTag
+						queueState.Requeue(pendingAck.DeliveryTag)
 					} else {
-						// Remove from both pending acks and storage (message discarded)
+						// Remove from both pending acks and storage (message discarded).
+						// Treated as resolved: release the in-flight depth slot.
 						b.storage.DeletePendingAck(pendingAck.QueueName, pendingAck.DeliveryTag)
 						b.storage.DeleteMessage(pendingAck.QueueName, pendingAck.DeliveryTag)
+						queueState.AckAdvance(pendingAck.DeliveryTag)
 					}
 					nackedCount++
 				}
@@ -986,23 +1035,26 @@ func (b *StorageBroker) NacknowledgeMessage(consumerTag string, deliveryTag uint
 		}
 	} else {
 		// Nacknowledge single message
-		// Remove from inflight and delivery index
-		queueState.inflight.Delete(deliveryTag)
+		// Remove from inflight ownership and delivery index
+		queueState.DeleteInflight(deliveryTag)
 		b.deliveryIndex.Delete(deliveryTag)
 
 		pendingAck, err := b.storage.GetPendingAck(state.queueName, deliveryTag)
 		if err == nil && pendingAck != nil {
 			if requeue {
-				// Remove from pending acks and requeue
+				// Remove from pending acks and requeue for redelivery.
 				b.storage.DeletePendingAck(state.queueName, deliveryTag)
-
-				// Put back in available queue
-				queueState.available <- deliveryTag
+				queueState.Requeue(deliveryTag)
 			} else {
-				// Remove from both pending acks and storage (message discarded)
+				// Remove from both pending acks and storage (message discarded).
 				b.storage.DeletePendingAck(state.queueName, deliveryTag)
 				b.storage.DeleteMessage(state.queueName, deliveryTag)
+				queueState.AckAdvance(deliveryTag)
 			}
+		} else {
+			// No pending ack record: still release the in-flight depth slot
+			// claimed in deliverMessage so depth accounting stays balanced.
+			queueState.AckAdvance(deliveryTag)
 		}
 
 		// Release semaphore permit (frees capacity for next message)
@@ -1043,17 +1095,24 @@ func (b *StorageBroker) AdvanceDeliveryTag(tag uint64) {
 	}
 }
 
-// EnqueueRecoveredMessage enqueues a recovered message ID into the queue's available
-// channel so that consumer poll loops can discover and deliver it after a restart.
-// Uses non-blocking send to prevent deadlock during recovery (no consumers are
-// registered yet). If the channel is full, the message is already in the ring
-// buffer and will be delivered when a consumer connects and drains the channel.
-func (b *StorageBroker) EnqueueRecoveredMessage(queueName string, deliveryTag uint64) {
+// RecoverQueue initializes a queue's dispatch cursor from the recovered
+// message tag range, making [minTag, maxTag] immediately claimable by
+// consumers without per-message enqueueing.
+//
+//   - minTag: lowest delivery tag among recovered messages for this queue.
+//     tail starts here so consumers claim recovered messages first.
+//   - maxTag: highest delivery tag among recovered messages for this queue.
+//     head starts at maxTag+1 so the range is claimable without parking.
+//
+// Called by the recovery manager after loading recovered messages into the
+// ring/WAL (via LoadMessageFromRecovery), BEFORE any consumer is registered
+// or any new Publish. Gaps inside [minTag, maxTag] (tags acked before
+// restart) are skipped at delivery time via the GetMessage-not-found path
+// in deliverMessage.
+//
+// If the queue has no recovered messages, callers should pass (0, 0) — tail
+// and head stay at 0 and consumers park until the first Publish.
+func (b *StorageBroker) RecoverQueue(queueName string, minTag, maxTag uint64) {
 	queueState := b.getOrCreateQueueState(queueName)
-	select {
-	case queueState.available <- deliveryTag:
-	default:
-		// Channel full — message is in ring buffer/WAL and will be
-		// delivered when consumers drain the channel.
-	}
+	queueState.Recover(minTag, maxTag)
 }
