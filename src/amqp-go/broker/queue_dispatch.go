@@ -252,7 +252,15 @@ func (qs *QueueState) AtHighWaterMark() bool {
 }
 
 func (qs *QueueState) SetMinAckCursor(val uint64) {
-	qs.minAckCursor.Store(val)
+	for {
+		cur := qs.minAckCursor.Load()
+		if val <= cur {
+			return
+		}
+		if qs.minAckCursor.CompareAndSwap(cur, val) {
+			return
+		}
+	}
 }
 
 func (qs *QueueState) Close() {

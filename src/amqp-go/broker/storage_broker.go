@@ -909,18 +909,14 @@ func (b *StorageBroker) AcknowledgeMessage(consumerTag string, deliveryTag uint6
 	queueState := b.getOrCreateQueueState(state.queueName)
 
 	if multiple {
-		// Acknowledge all messages up to and including deliveryTag
 		ackedCount := 0
 		pendingAcks, err := b.storage.GetConsumerPendingAcks(consumerTag)
 		if err == nil {
 			for _, pendingAck := range pendingAcks {
 				if pendingAck.DeliveryTag <= deliveryTag {
-					// Delete message and pending ack from storage
 					b.storage.DeleteMessage(pendingAck.QueueName, pendingAck.DeliveryTag)
 					b.storage.DeletePendingAck(pendingAck.QueueName, pendingAck.DeliveryTag)
-
-					// Remove from inflight ownership and delivery index, and
-					// advance the depth frontier for each acked tag.
+					b.storage.AckFromConsumer(pendingAck.QueueName, consumerTag, pendingAck.DeliveryTag)
 					queueState.DeleteInflight(pendingAck.DeliveryTag)
 					b.deliveryIndex.Delete(pendingAck.DeliveryTag)
 					queueState.AckAdvance(pendingAck.DeliveryTag)
@@ -928,7 +924,7 @@ func (b *StorageBroker) AcknowledgeMessage(consumerTag string, deliveryTag uint6
 				}
 			}
 		}
-		// Release semaphore permits for all ACKed messages
+		queueState.SetMinAckCursor(b.storage.GetMinAckCursor(state.queueName))
 		if state.prefetchSem != nil && ackedCount > 0 {
 			state.prefetchSem.Release(int64(ackedCount))
 		}
@@ -936,9 +932,6 @@ func (b *StorageBroker) AcknowledgeMessage(consumerTag string, deliveryTag uint6
 		// Acknowledge single message
 		// Guard against duplicate ACK: if not in delivery index, already acked
 		if _, exists := b.deliveryIndex.Load(deliveryTag); !exists {
-			if state.prefetchSem != nil {
-				state.prefetchSem.Release(1)
-			}
 			return nil
 		}
 		// Delete message and pending ack from storage
@@ -981,6 +974,11 @@ func (b *StorageBroker) RejectMessage(consumerTag string, deliveryTag uint64, re
 	// Get queue state
 	queueState := b.getOrCreateQueueState(state.queueName)
 
+	// Guard against duplicate reject
+	if _, exists := b.deliveryIndex.Load(deliveryTag); !exists {
+		return nil
+	}
+
 	// Remove from inflight ownership and delivery index
 	queueState.DeleteInflight(deliveryTag)
 	b.deliveryIndex.Delete(deliveryTag)
@@ -1021,26 +1019,19 @@ func (b *StorageBroker) NacknowledgeMessage(consumerTag string, deliveryTag uint
 	queueState := b.getOrCreateQueueState(state.queueName)
 
 	if multiple {
-		// Nacknowledge all messages up to and including deliveryTag
 		nackedCount := 0
 		pendingAcks, err := b.storage.GetConsumerPendingAcks(consumerTag)
 		if err == nil {
 			for _, pendingAck := range pendingAcks {
 				if pendingAck.DeliveryTag <= deliveryTag {
-					// Remove from inflight ownership and delivery index
 					queueState.DeleteInflight(pendingAck.DeliveryTag)
 					b.deliveryIndex.Delete(pendingAck.DeliveryTag)
+					b.storage.NackFromConsumer(pendingAck.QueueName, consumerTag, pendingAck.DeliveryTag)
 
-					// Handle requeue vs discard
 					if requeue {
-						// Remove from pending acks and requeue for redelivery.
-						// Requeue preserves the original delivery tag and
-						// releases the in-flight depth slot.
 						b.storage.DeletePendingAck(pendingAck.QueueName, pendingAck.DeliveryTag)
 						queueState.Requeue(pendingAck.DeliveryTag)
 					} else {
-						// Remove from both pending acks and storage (message discarded).
-						// Treated as resolved: release the in-flight depth slot.
 						b.storage.DeletePendingAck(pendingAck.QueueName, pendingAck.DeliveryTag)
 						b.storage.DeleteMessage(pendingAck.QueueName, pendingAck.DeliveryTag)
 						queueState.AckAdvance(pendingAck.DeliveryTag)
@@ -1049,12 +1040,16 @@ func (b *StorageBroker) NacknowledgeMessage(consumerTag string, deliveryTag uint
 				}
 			}
 		}
-		// Release semaphore permits for all NACKed messages
+		queueState.SetMinAckCursor(b.storage.GetMinAckCursor(state.queueName))
 		if state.prefetchSem != nil && nackedCount > 0 {
 			state.prefetchSem.Release(int64(nackedCount))
 		}
 	} else {
 		// Nacknowledge single message
+		// Guard against duplicate nack
+		if _, exists := b.deliveryIndex.Load(deliveryTag); !exists {
+			return nil
+		}
 		// Remove from inflight ownership and delivery index
 		queueState.DeleteInflight(deliveryTag)
 		b.deliveryIndex.Delete(deliveryTag)
