@@ -68,13 +68,9 @@ type DisruptorStorage struct {
 }
 
 type QueueRing struct {
-	name string
-	ring *AtomicRing
-	ack  *AckCursor
-
-	consumerPositions map[string]*atomic.Uint64
-	consumerMutex     sync.RWMutex
-
+	name   string
+	ring   *AtomicRing
+	ack    *AckCursor
 	closed atomic.Bool
 }
 
@@ -210,10 +206,9 @@ func (ds *DisruptorStorage) getOrCreateQueueRing(queueName string) *QueueRing {
 	}
 
 	ring := &QueueRing{
-		name:              queueName,
-		ring:              NewAtomicRing(ds.ringBufferSize),
-		ack:               NewAckCursor(),
-		consumerPositions: make(map[string]*atomic.Uint64),
+		name: queueName,
+		ring: NewAtomicRing(ds.ringBufferSize),
+		ack:  NewAckCursor(),
 	}
 
 	ds.queues.Store(queueName, ring)
@@ -303,19 +298,6 @@ func (ds *DisruptorStorage) GetMessage(queueName string, deliveryTag uint64) (*p
 	return nil, interfaces.ErrMessageNotFound
 }
 
-func (ds *DisruptorStorage) LoadMessageBySeq(queueName string, seq uint64) (*protocol.Message, error) {
-	ring := ds.getQueueRing(queueName)
-	if ring == nil {
-		return nil, interfaces.ErrQueueNotFound
-	}
-
-	if msg, ok := ring.ring.LoadBySeq(seq); ok {
-		return msg, nil
-	}
-
-	return nil, interfaces.ErrMessageNotFound
-}
-
 func (ds *DisruptorStorage) DeleteMessage(queueName string, deliveryTag uint64) error {
 	ring := ds.getQueueRing(queueName)
 	if ring == nil {
@@ -380,14 +362,6 @@ func (ds *DisruptorStorage) GetMinAckCursor(queueName string) uint64 {
 	return ring.ack.MinAckCursor()
 }
 
-func (ds *DisruptorStorage) IsSafeToOverwrite(queueName string, oldTag, newTag uint64) bool {
-	ring := ds.getQueueRing(queueName)
-	if ring == nil {
-		return true
-	}
-	return ring.ack.IsSafeToOverwrite(oldTag, newTag, ds.ringBufferSize)
-}
-
 func (ds *DisruptorStorage) GetQueueMessages(queueName string) ([]*protocol.Message, error) {
 	ring := ds.getQueueRing(queueName)
 	if ring == nil {
@@ -426,55 +400,6 @@ func (ds *DisruptorStorage) DeleteMessageRange(queueName string, startTag, endTa
 		return interfaces.ErrQueueNotFound
 	}
 	ring.ring.DeleteRange(startTag, endTag)
-	return nil
-}
-
-func (ds *DisruptorStorage) GetQueueHead(queueName string) (uint64, error) {
-	ring := ds.getOrCreateQueueRing(queueName)
-	return ring.ack.Head(), nil
-}
-
-func (ds *DisruptorStorage) SetQueueHead(queueName string, head uint64) error {
-	ring := ds.getOrCreateQueueRing(queueName)
-	ring.ack.OnPublish(head)
-	return nil
-}
-
-func (ds *DisruptorStorage) IncrementQueueHead(queueName string) (uint64, error) {
-	ring := ds.getOrCreateQueueRing(queueName)
-	head := ring.ack.Head() + 1
-	ring.ack.OnPublish(head)
-	return head, nil
-}
-
-func (ds *DisruptorStorage) GetConsumerPosition(queueName, consumerTag string) (uint64, error) {
-	ring := ds.getQueueRing(queueName)
-	if ring == nil {
-		return 0, interfaces.ErrQueueNotFound
-	}
-
-	ring.consumerMutex.RLock()
-	defer ring.consumerMutex.RUnlock()
-
-	if pos, exists := ring.consumerPositions[consumerTag]; exists {
-		return pos.Load(), nil
-	}
-	return 0, nil
-}
-
-func (ds *DisruptorStorage) SetConsumerPosition(queueName, consumerTag string, position uint64) error {
-	ring := ds.getOrCreateQueueRing(queueName)
-
-	ring.consumerMutex.Lock()
-	defer ring.consumerMutex.Unlock()
-
-	if pos, exists := ring.consumerPositions[consumerTag]; exists {
-		pos.Store(position)
-	} else {
-		pos := &atomic.Uint64{}
-		pos.Store(position)
-		ring.consumerPositions[consumerTag] = pos
-	}
 	return nil
 }
 
@@ -900,29 +825,6 @@ func (ds *DisruptorStorage) GetRecoverableMessages() (map[string][]*protocol.Mes
 }
 
 func (ds *DisruptorStorage) MarkRecoveryComplete(stats *protocol.RecoveryStats) error {
-	return nil
-}
-
-func (ds *DisruptorStorage) RecoverFromLog(queueName string) error {
-	_ = ds.getOrCreateQueueRing(queueName)
-	return nil
-}
-
-func (ds *DisruptorStorage) RecoverAllQueues() error {
-	if ds.metadataStore == nil {
-		return nil
-	}
-
-	queues, err := ds.metadataStore.ListQueues()
-	if err != nil {
-		return fmt.Errorf("failed to list queues: %w", err)
-	}
-
-	for _, queue := range queues {
-		if err := ds.RecoverFromLog(queue.Name); err != nil {
-			continue
-		}
-	}
 	return nil
 }
 

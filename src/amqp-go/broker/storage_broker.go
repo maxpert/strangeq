@@ -218,9 +218,6 @@ func (b *StorageBroker) deliverMessage(queueState *QueueState, state *ConsumerSt
 		return
 	}
 
-	// Set delivery tag
-	message.DeliveryTag = msgID
-
 	// Create pending ack record
 	pendingAck := &protocol.PendingAck{
 		QueueName:       state.queueName,

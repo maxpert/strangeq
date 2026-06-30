@@ -53,9 +53,6 @@ type MessageStore interface {
 	// DeleteMessageRange deletes messages below a specific delivery tag (for GC)
 	DeleteMessageRange(queueName string, startTag, endTag uint64) error
 
-	// LoadMessageBySeq loads a message by its per-queue sequence number (for tail-cursor dispatch)
-	LoadMessageBySeq(queueName string, seq uint64) (*protocol.Message, error)
-
 	// Consumer cursor registration for ACK tracking
 	RegisterConsumerCursor(queueName string, consumerTag string)
 	UnregisterConsumerCursor(queueName string, consumerTag string)
@@ -63,15 +60,6 @@ type MessageStore interface {
 	AckFromConsumer(queueName string, consumerTag string, deliveryTag uint64)
 	NackFromConsumer(queueName string, consumerTag string, deliveryTag uint64)
 	GetMinAckCursor(queueName string) uint64
-
-	// Queue head counter operations (atomic delivery tag assignment)
-	GetQueueHead(queueName string) (uint64, error)
-	SetQueueHead(queueName string, head uint64) error
-	IncrementQueueHead(queueName string) (uint64, error)
-
-	// Consumer position tracking (for pull-based delivery)
-	GetConsumerPosition(queueName, consumerTag string) (uint64, error)
-	SetConsumerPosition(queueName, consumerTag string, position uint64) error
 
 	// Unacked message tracking (for prefetch limit enforcement)
 	AddUnacked(queueName, consumerTag string, deliveryTag uint64) error
