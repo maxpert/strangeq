@@ -16,7 +16,6 @@ func createTestBroker(t *testing.T) (*StorageBroker, func()) {
 	store := storage.NewDisruptorStorageWithDataDir(tmpDir)
 
 	engineConfig := interfaces.EngineConfig{
-		AvailableChannelBuffer:  10000,
 		RingBufferSize:          65536,
 		SpillThresholdPercent:   80,
 		WALBatchSize:            1000,
