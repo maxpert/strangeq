@@ -8,20 +8,18 @@ A high-performance AMQP 0.9.1 message broker implementation written in Go. Compa
 
 ## Features
 
-- ✅ Full AMQP 0.9.1 protocol implementation
-- ✅ Compatible with RabbitMQ clients (Go, Python, Node.js, etc.)
-- ✅ Multiple exchange types (direct, fanout, topic, headers)
-- ✅ Three-tier storage architecture (Ring Buffer → WAL → Segments)
-- ✅ Persistent and non-persistent messages with crash recovery
-- ✅ TLS/SSL encryption with mutual TLS support
-- ✅ SASL authentication (PLAIN, ANONYMOUS)
-- ✅ Authorization with RabbitMQ-style configure/write/read permissions per vhost
-- ✅ Transaction support (Tx.Select, Tx.Commit, Tx.Rollback)
-- ✅ High performance (3M+ ops/sec in-memory, optimized durable path)
-- ✅ Prometheus metrics integration
-- ✅ Configurable engine tuning (ring buffer size, WAL batch size, spill thresholds)
-- ✅ Lock-free hot paths (sync.Map, atomic counters, channel-based fan-in)
-- ✅ Linux fdatasync for 10-20% faster WAL fsync
+- AMQP 0.9.1 protocol compatible with RabbitMQ clients (Go, Python, Node.js, etc.)
+- Exchange types: direct, fanout, topic (partial), headers (partial)
+- Three-tier storage architecture (Ring Buffer -> WAL -> Segments)
+- Persistent and non-persistent messages with crash recovery
+- TLS/SSL encryption with mutual TLS support
+- SASL authentication (PLAIN, ANONYMOUS)
+- Authorization with RabbitMQ-style configure/write/read permissions per vhost
+- Transaction protocol handshake (Tx.Select, Tx.Commit, Tx.Rollback)
+- 1.14-1.32x faster than RabbitMQ 4.3 on same hardware (same Go client, 3 ack modes)
+- Prometheus metrics and pprof profiling
+- Lock-free per-queue AtomicRing with per-slot CAS
+- Batch TCP writes and ACK offloading (no fsync head-of-line blocking)
 
 ## Installation
 
@@ -58,23 +56,49 @@ go install github.com/maxpert/amqp-go/cmd/amqp-server@latest
 ### Start Server
 
 ```bash
-# In-memory mode (development)
+# Defaults (in-memory, port 5672)
 amqp-server
 
-# With persistent storage (production)
-amqp-server --storage badger --storage-path ./data
+# Generate example config
+amqp-server --generate-config config.yaml
 
-# With TLS encryption
+# Run with config file
+amqp-server --config config.yaml
+
+# With TLS
 amqp-server --tls --tls-cert cert.pem --tls-key key.pem
 
 # With mutual TLS (client cert verification)
 amqp-server --tls --tls-cert cert.pem --tls-key key.pem --tls-ca ca.pem
 
-# With authentication and authorization
-amqp-server --auth --auth-file auth.json --config config.json
+# With telemetry (Prometheus + pprof)
+amqp-server --config config.yaml --enable-telemetry --telemetry-port 9419
+```
 
-# With configuration file
-amqp-server --config config.json
+### Environment Variables
+
+Override any configuration setting using `AMQP_<section>_<key>` format:
+
+```bash
+AMQP_NETWORK_PORT=15672 amqp-server --config config.yaml
+AMQP_STORAGE_PATH=/var/lib/amqp amqp-server
+AMQP_SERVER_LOGLEVEL=debug amqp-server
+```
+
+### Command Line Options
+
+```
+amqp-server [options]
+
+  --config string          Configuration file path (YAML/JSON)
+  --generate-config string Generate default config file and exit
+  --version                Show version and exit
+  --enable-telemetry       Enable Prometheus + pprof endpoint
+  --telemetry-port int     Telemetry port (default: 9419)
+  --tls                    Enable TLS (amqps)
+  --tls-cert string        TLS certificate file (PEM)
+  --tls-key string         TLS private key file (PEM)
+  --tls-ca string          TLS CA file for mutual TLS client verification (PEM)
 ```
 
 ### Connect from Python
@@ -87,10 +111,8 @@ connection = pika.BlockingConnection(
 )
 channel = connection.channel()
 
-# Declare queue
 channel.queue_declare(queue='hello')
 
-# Publish message
 channel.basic_publish(
     exchange='',
     routing_key='hello',
@@ -165,106 +187,212 @@ See [CLIENT_EXAMPLES.md](CLIENT_EXAMPLES.md) for complete examples including con
 
 ## Configuration
 
-### Command Line Options
+See `src/amqp-go/config.sample.yaml` for full configuration with documented defaults.
 
-```bash
-amqp-server [options]
+### Minimal Configuration
 
-Options:
-  --port PORT              Server port (default: 5672)
-  --storage BACKEND        Storage backend: memory|badger (default: memory)
-  --storage-path PATH      Storage directory (default: ./data)
-  --config FILE            Configuration file path
-  --auth                   Enable authentication
-  --auth-file FILE         Authentication file path
-  --log-level LEVEL        Log level: debug|info|warn|error (default: info)
-  --log-file FILE          Log file path (default: stdout)
-  --tls                    Enable TLS encryption
-  --tls-cert FILE          TLS certificate file path
-  --tls-key FILE           TLS private key file path
-  --tls-ca FILE            TLS CA certificate file path (enables mutual TLS)
+```yaml
+network:
+  address: :5672
+  port: 5672
+
+storage:
+  path: ./data
+
+server:
+  loglevel: info
 ```
 
-### Configuration File
+### Production Configuration
 
-Create `config.json`:
+```yaml
+network:
+  address: :5672
+  maxconnections: 10000
+  tcpkeepalive: true
 
-```json
-{
-  "network": {
-    "address": ":5672",
-    "max_connections": 1000,
-    "heartbeat_interval_ms": 60000,
-    "tcp_keepalive": true
-  },
-  "storage": {
-    "path": "./data",
-    "checkpoint_interval_ms": 5000
-  },
-  "security": {
-    "tls_enabled": false,
-    "authentication_enabled": false,
-    "authorization_enabled": false,
-    "default_vhost": "/",
-    "auth_mechanisms": ["PLAIN"]
-  },
-  "server": {
-    "log_level": "info",
-    "max_frame_size": 131072,
-    "max_channels_per_connection": 2047,
-    "memory_limit_percent": 60
-  },
-  "engine": {
-    "ring_buffer_size": 65536,
-    "spill_threshold_percent": 80,
-    "wal_batch_size": 1000,
-    "wal_batch_timeout_ms": 5,
-    "segment_size": 268435456,
-    "consumer_select_timeout_ms": 1,
-    "consumer_max_batch_size": 100
-  }
-}
+storage:
+  path: /var/lib/amqp
+
+security:
+  tlsenabled: true
+  tlscertfile: /etc/amqp/cert.pem
+  tlskeyfile: /etc/amqp/key.pem
+  authenticationenabled: true
+  authenticationfilepath: /etc/amqp/auth.json
+
+server:
+  loglevel: info
+  logfile: /var/log/amqp-server.log
+  pidfile: /var/run/amqp-server.pid
+  daemonize: true
+  memorylimitpercent: 60
+
+engine:
+  ringbuffersize: 262144
+  walbatchsize: 1000
+  walbatchtimeout: 10ms
 ```
 
 Key engine tuning parameters:
-- `ring_buffer_size` — In-memory ring buffer per queue (must be power of 2, default 64K)
-- `spill_threshold_percent` — Ring fill % before spilling to WAL (default 80)
-- `wal_batch_size` / `wal_batch_timeout_ms` — WAL batching for durable writes (1000 msgs / 5ms)
-- `segment_size` — Cold storage segment file size (default 256MB)
-- `consumer_select_timeout_ms` — Consumer delivery poll interval (default 1ms)
-
-Run with config:
-
-```bash
-amqp-server --config config.json
-```
+- `ringbuffersize` -- In-memory ring buffer per queue (must be power of 2, default 64K)
+- `spillthresholdpercent` -- Ring fill % before spilling to WAL (default 80)
+- `walbatchsize` / `walbatchtimeoutms` -- WAL batching for durable writes (1000 msgs / 10ms)
+- `segmentsize` -- Cold storage segment file size (default 1 GB)
+- `consumermaxbatchsize` -- Max messages to deliver per consumer per poll (default 100)
 
 ## Performance
 
-Benchmarks on Apple M4 Max (16 cores):
+### Head-to-Head vs RabbitMQ 4.3
 
-| Operation | Throughput | Latency |
-|-----------|-----------|---------|
-| Message Publishing (memory) | 2.9M ops/sec | 344 ns/op |
-| Multi-queue concurrent publish | 942K ops/sec | 1,062 ns/op |
-| Exchange Declaration | 3.2M ops/sec | 309 ns/op |
-| Queue Declaration | 2.8M ops/sec | 357 ns/op |
-| Message Publishing (persistent) | 15K ops/sec | 66 μs/op |
-| WAL read (indexed, with cache) | 89K ops/sec | 11,233 ns/op |
-| E2E large message (64KB) | 62K ops/sec | 16,195 ns/op |
+Same machine (Apple M4 Max, 16-core ARM64), same Go client ([amqp091-go](https://github.com/rabbitmq/amqp091-go)), 12-byte messages (RabbitMQ PerfTest default), durable queue, transient messages, 1 publisher + 1 consumer, 50K iterations x 5 runs each. RabbitMQ ran in a Docker container (`rabbitmq:4.3-management`, ARM64) on the same host. StrangeQ ran natively.
 
-### Phase 16 Performance Optimizations
+| Benchmark | Broker | Run 1 (ns/op) | Run 2 (ns/op) | Run 3 (ns/op) | Run 4 (ns/op) | Run 5 (ns/op) | Median (ns/op) | msg/s | Ratio |
+|-----------|--------|---------------|---------------|---------------|---------------|---------------|----------------|-------|-------|
+| Auto-ack | StrangeQ | 2,894 | 3,413 | 4,071 | 3,180 | 3,166 | 3,180 | 314K | 1.14x |
+| Auto-ack | RabbitMQ | 3,918 | 3,635 | 3,559 | 3,638 | 3,712 | 3,638 | 275K | |
+| Manual ack | StrangeQ | 3,047 | 3,196 | 3,052 | 3,325 | 3,437 | 3,196 | 313K | 1.32x |
+| Manual ack | RabbitMQ | 4,520 | 6,842 | 4,226 | 4,032 | 4,104 | 4,226 | 237K | |
+| Multi-ack 1000 | StrangeQ | 4,038 | 3,578 | 3,174 | 2,820 | 2,674 | 3,174 | 315K | 1.26x |
+| Multi-ack 1000 | RabbitMQ | 3,943 | 3,976 | 3,999 | 4,058 | 9,583 | 3,999 | 250K | |
 
-- **Lock-free queue rings** — `sync.Map` for queue lookup, no mutex on hot path
-- **Fan-in consumer delivery** — Replaced `reflect.Select` with per-consumer forwarding goroutines → O(1) channel select
-- **Batch WAL writes** — Single fsync per batch (fdatasync on Linux for 10-20% speedup)
-- **Batch segment checkpoint** — Single mutex + single `file.Write()` per batch
-- **Batch segment ACKs** — Channel-batched bitmap updates reduce lock contention
-- **Pooled allocations** — `sync.Pool` for WAL done channels, frame buffers; `AppendUint*` for zero-temp serialization
-- **Configurable ring buffer** — Size and spill threshold wired from EngineConfig (was hardcoded)
-- **WAL file handle cache** — Eliminates open/close syscalls per WAL read; pread for positional I/O
+### Running the Benchmarks
 
-See [docs/BENCHMARKS.md](docs/BENCHMARKS.md) for detailed performance analysis.
+```bash
+cd src/amqp-go
+
+# Benchmark StrangeQ (embedded server starts automatically)
+go test . -run='^$' -bench="BenchmarkVersus" -benchmem -benchtime=50000x -count=5
+
+# Benchmark RabbitMQ (must be running on localhost:5672)
+docker run -d -p 5672:5672 --name rabbitmq-bench rabbitmq:4.3-management
+AMQP_TARGET=rabbitmq go test . -run='^$' -bench="BenchmarkVersus" -benchmem -benchtime=50000x -count=5
+
+# E2E benchmarks (publish-only, roundtrip, multi-queue, multi-connection)
+go test . -run='^$' -bench="BenchmarkE2E" -benchmem -benchtime=3s -count=3
+```
+
+## Feature Comparison vs RabbitMQ
+
+### AMQP Protocol Methods
+
+| Method | StrangeQ | RabbitMQ |
+|--------|----------|----------|
+| `connection.start` / `start-ok` | Yes | Yes |
+| `connection.tune` / `tune-ok` | Yes | Yes |
+| `connection.open` / `open-ok` | Yes | Yes |
+| `connection.close` / `close-ok` | Yes | Yes |
+| `connection.secure` / `secure-ok` | No | Yes |
+| `channel.open` / `open-ok` | Yes | Yes |
+| `channel.close` / `close-ok` | Yes | Yes |
+| `channel.flow` / `flow-ok` | No | Yes |
+| `exchange.declare` / `declare-ok` | Yes | Yes |
+| `exchange.delete` / `delete-ok` | Yes | Yes |
+| `exchange.bind` / `bind-ok` | No | Yes |
+| `exchange.unbind` / `unbind-ok` | No | Yes |
+| `queue.declare` / `declare-ok` | Yes | Yes |
+| `queue.delete` / `delete-ok` | Yes | Yes |
+| `queue.bind` / `bind-ok` | Yes | Yes |
+| `queue.unbind` / `unbind-ok` | Yes | Yes |
+| `queue.purge` / `purge-ok` | No | Yes |
+| `basic.qos` / `qos-ok` | Yes (per-channel; global QoS not enforced) | Yes |
+| `basic.consume` / `consume-ok` | Yes | Yes |
+| `basic.cancel` / `cancel-ok` | Yes | Yes |
+| `basic.publish` | Yes | Yes |
+| `basic.ack` | Yes | Yes |
+| `basic.nack` | Yes | Yes |
+| `basic.reject` | Yes | Yes |
+| `basic.get` / `get-ok` / `get-empty` | Partial (always returns `get-empty`) | Yes |
+| `basic.deliver` | Yes | Yes |
+| `basic.return` | No | Yes |
+| `basic.recover` / `recover-ok` | No | Yes |
+| `tx.select` / `commit` / `rollback` | Partial (protocol handshake works; publishes not buffered for atomicity) | Yes |
+| `confirm.select` / `select-ok` | No | Yes |
+
+### Exchange Types
+
+| Type | StrangeQ | RabbitMQ |
+|------|----------|----------|
+| `direct` | Yes | Yes |
+| `fanout` | Yes | Yes |
+| `topic` | Partial (`*` wildcard not implemented; exact match and `#` work) | Yes |
+| `headers` | Partial (only `x-match: all`; `x-match: any` not implemented) | Yes |
+| `match` | No | Yes (plugin) |
+
+### Security
+
+| Feature | StrangeQ | RabbitMQ |
+|---------|----------|----------|
+| TLS | Yes | Yes |
+| Mutual TLS (mTLS) | Yes | Yes |
+| SASL PLAIN | Yes | Yes |
+| SASL ANONYMOUS | Yes | Yes |
+| SASL EXTERNAL | No | Yes |
+| File-based authentication | Yes (bcrypt) | Yes |
+| Per-vhost authorization | Yes (RabbitMQ-style regex) | Yes |
+| Loopback restriction | Yes | Yes |
+
+### Persistence & Reliability
+
+| Feature | StrangeQ | RabbitMQ |
+|---------|----------|----------|
+| Durable queues | Yes | Yes |
+| Durable exchanges | Yes | Yes |
+| Persistent messages (delivery mode 2) | Yes | Yes |
+| WAL (write-ahead log) | Yes | Yes |
+| Crash recovery | Yes | Yes |
+| Bindings persistence | Yes | Yes |
+
+### Special Features
+
+| Feature | StrangeQ | RabbitMQ |
+|---------|----------|----------|
+| Dead-letter exchange (DLX) | No | Yes |
+| Message TTL | No | Yes |
+| Queue TTL (`x-expires`) | No | Yes |
+| Priority queues (`x-max-priority`) | No | Yes |
+| Lazy queues (`x-queue-mode`) | No | Yes |
+| Exclusive queues | Partial (flag stored; not enforced on connection close) | Yes |
+| Auto-delete queues | Partial (flag stored; last-consumer-leave not enforced) | Yes |
+| Passive declare | Partial (bypasses reserved-name check; no NOT_FOUND for missing entities) | Yes |
+| Publisher confirms | No | Yes |
+| Mandatory / `basic.return` | No | Yes |
+
+### Management & Observability
+
+| Feature | StrangeQ | RabbitMQ |
+|---------|----------|----------|
+| Prometheus metrics | Yes | Yes (via plugin) |
+| pprof profiling | Yes | No (Erlang) |
+| Management UI | No | Yes (plugin) |
+| CLI management | No | Yes (rabbitmqctl) |
+
+## Architecture
+
+### Storage Engine
+
+- **Ring Buffer**: `[]atomic.Pointer[Message]` with per-slot CAS -- zero allocations on hot path
+- **WAL Spill**: When ring buffer fills, messages spill to write-ahead log (batched fsync)
+- **Segment Storage**: 1 GB segments for cold message storage
+- **Per-Queue Isolation**: Each queue has its own ring buffer, WAL cursor, and consumer dispatch -- zero cross-queue contention
+
+### Connection Handling
+
+- **Reader/Processor Separation**: TCP reader and frame processor in separate goroutines
+- **ACK Offloading**: Per-connection `ackProcessor` goroutine handles all ACK/NACK/reject frames -- eliminates fsync head-of-line blocking on the frame processor
+- **Batched TCP Writes**: All deliveries in a batch are serialized into a single buffer and sent with one `Write()` call -- reduces syscalls and lock acquisitions
+- **Consumer Dirty Flag**: Delivery loop only re-scans consumers when the consumer set changes -- avoids per-iteration map scan
+- **Flow Control**: RabbitMQ-style memory pressure handling
+
+### Crash Recovery
+
+1. Validate storage integrity
+2. Recover durable exchanges and queues
+3. Rebuild bindings
+4. Load persistent messages directly into ring buffer
+5. Restore pending acknowledgments
+
+Recovery is incremental and happens in milliseconds for typical workloads.
 
 ## Production Deployment
 
@@ -295,54 +423,114 @@ This is used for protocol testing and interoperability verification only.
 
 ## Monitoring
 
-StrangeQ exposes Prometheus metrics on port 9419:
+Enable telemetry to expose Prometheus metrics and pprof profiling:
+
+```bash
+amqp-server --config config.yaml --enable-telemetry --telemetry-port 9419
+```
+
+### Prometheus Metrics
 
 ```bash
 curl http://localhost:9419/metrics
 ```
 
-Key metrics:
-- `amqp_connections_total` - Total active connections
-- `amqp_messages_published_total` - Total messages published
-- `amqp_messages_delivered_total` - Total messages delivered
-- `amqp_messages_acknowledged_total` - Total message acknowledgments
+Available metrics:
+- Message throughput (published, consumed, confirmed)
+- Connection and channel counts
+- Queue depths and message rates
+- Memory usage and GC statistics
+- WAL and ring buffer utilization
+
+### Profiling
+
+```bash
+# CPU profile (30 seconds)
+curl -o cpu.prof http://localhost:9419/debug/pprof/profile?seconds=30
+go tool pprof -http=:8080 cpu.prof
+
+# Memory profile
+curl -o mem.prof http://localhost:9419/debug/pprof/heap
+go tool pprof -http=:8080 mem.prof
+
+# Goroutine profile
+curl -o goroutine.prof http://localhost:9419/debug/pprof/goroutine
+go tool pprof -http=:8080 goroutine.prof
+
+# Mutex contention
+curl -o mutex.prof http://localhost:9419/debug/pprof/mutex
+go tool pprof -http=:8080 mutex.prof
+```
+
+## Development
+
+### Running Tests
+
+```bash
+cd src/amqp-go
+
+# Run all tests
+go test ./...
+
+# Run with race detector
+go test -race ./...
+
+# Run with coverage
+go test -cover ./...
+
+# Run benchmarks
+go test -bench=. -benchmem -benchtime=5s ./storage
+```
+
+### Building
+
+```bash
+cd src/amqp-go
+
+# Build server
+go build -o amqp-server ./cmd/amqp-server
+
+# Build with optimizations
+go build -ldflags="-s -w" -o amqp-server ./cmd/amqp-server
+
+# Cross-compile for Linux
+GOOS=linux GOARCH=amd64 go build -o amqp-server-linux ./cmd/amqp-server
+```
+
+### Code Structure
+
+```
+src/amqp-go/
+├── cmd/amqp-server/     # Server entry point
+├── config/              # Configuration management
+├── protocol/            # AMQP protocol implementation
+├── server/              # Server and connection handling
+├── storage/             # Storage engine (AtomicRing, WAL, segments)
+├── interfaces/          # Interface definitions
+├── broker/              # Message routing and delivery
+├── auth/                # Authentication & authorization
+├── metrics/             # Prometheus metrics
+└── benchmark/           # Performance testing tools
+```
+
+## Compatibility
+
+Compatible with any AMQP 0.9.1 client library:
+
+- **Go**: [github.com/rabbitmq/amqp091-go](https://github.com/rabbitmq/amqp091-go)
+- **Python**: [pika](https://pika.readthedocs.io/), `aio-pika`
+- **Node.js**: [amqplib](https://www.npmjs.com/package/amqplib)
+- **Java**: [RabbitMQ Java Client](https://www.rabbitmq.com/java-client.html), Spring AMQP
+- **Ruby**: `bunny`
+- **C#**: [RabbitMQ .NET Client](https://www.rabbitmq.com/dotnet.html)
 
 ## Documentation
 
 - [Client Examples](CLIENT_EXAMPLES.md) - Complete examples for Python, Node.js, and Go
-- [Configuration Guide](docs/CONFIGURATION.md) - Detailed configuration options
-- [Authentication Setup](docs/AUTHENTICATION.md) - Setting up user authentication
 - [Authorization Guide](docs/AUTHORIZATION.md) - Permission model and access control
 - [TLS Configuration](docs/TLS.md) - TLS encryption and mutual TLS setup
 - [Contributing Guidelines](CONTRIBUTING.md) - How to contribute
 - [Security Policy](SECURITY.md) - Security best practices
-
-## Protocol Support
-
-StrangeQ implements AMQP 0.9.1 specification with support for:
-
-- Connection management (negotiation, heartbeat, flow control)
-- Channel operations (multiple channels per connection)
-- Exchange types (direct, fanout, topic, headers)
-- Queue operations (declare, bind, purge, delete)
-- Message publishing (persistent and non-persistent)
-- Message consumption (Basic.Get, Basic.Consume)
-- Message acknowledgment (Basic.Ack, Basic.Nack, Basic.Reject)
-- Transactions (Tx.Select, Tx.Commit, Tx.Rollback)
-- TLS/SSL encryption with mutual TLS authentication
-- SASL authentication (PLAIN, ANONYMOUS)
-- Authorization with per-vhost configure/write/read permissions
-
-## Compatibility
-
-StrangeQ is compatible with all standard AMQP 0.9.1 clients:
-
-- **Python**: `pika`, `aio-pika`
-- **Node.js**: `amqplib`
-- **Go**: `amqp091-go`, `streadway/amqp`
-- **Java**: Spring AMQP, RabbitMQ Java Client
-- **Ruby**: `bunny`
-- **.NET**: RabbitMQ .NET Client
 
 ## Contributing
 
