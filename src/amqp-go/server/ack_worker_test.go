@@ -252,7 +252,8 @@ func TestA2_AckFrameRoutedToAckQueue(t *testing.T) {
 
 	ackFrame := encodeAckFrame(t, 1, 42, false)
 
-	if err := srv.processFrame(conn, ackFrame); err != nil {
+	_, err := srv.processFrame(conn, ackFrame)
+	if err != nil {
 		t.Fatalf("processFrame returned error: %v", err)
 	}
 
@@ -279,7 +280,8 @@ func TestA2_NackFrameRoutedToAckQueue(t *testing.T) {
 
 	nackFrame := encodeNackFrame(t, 1, 42, false, true)
 
-	if err := srv.processFrame(conn, nackFrame); err != nil {
+	_, err := srv.processFrame(conn, nackFrame)
+	if err != nil {
 		t.Fatalf("processFrame returned error: %v", err)
 	}
 
@@ -303,7 +305,8 @@ func TestA2_RejectFrameRoutedToAckQueue(t *testing.T) {
 
 	rejectFrame := encodeRejectFrame(t, 1, 42, true)
 
-	if err := srv.processFrame(conn, rejectFrame); err != nil {
+	_, err := srv.processFrame(conn, rejectFrame)
+	if err != nil {
 		t.Fatalf("processFrame returned error: %v", err)
 	}
 
@@ -330,7 +333,7 @@ func TestA2_NonAckFrameNotRoutedToAckQueue(t *testing.T) {
 
 	done := make(chan struct{})
 	go func() {
-		srv.processFrame(conn, publishFrame)
+		_, _ = srv.processFrame(conn, publishFrame)
 		close(done)
 	}()
 

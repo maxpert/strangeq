@@ -383,26 +383,25 @@ func (s *Server) processFrames(conn *protocol.Connection, done chan struct{}) {
 		select {
 		case frame, ok := <-conn.FrameQueue:
 			if !ok {
-				// Reader closed the queue
 				s.Log.Info("Frame queue closed", zap.String("connection_id", conn.ID))
 				return
 			}
 
-			// Handle heartbeats immediately (lightweight, no processing needed)
 			if frame.Type == protocol.FrameHeartbeat {
+				protocol.PutFrame(frame)
 				continue
 			}
 
-			// Process frame (can block on WAL fsync)
-			if err := s.processFrame(conn, frame); err != nil {
+			pooled, err := s.processFrame(conn, frame)
+			if pooled {
+				protocol.PutFrame(frame)
+			}
+			if err != nil {
 				s.Log.Error("Error processing frame",
 					zap.String("connection_id", conn.ID),
 					zap.Uint16("channel", frame.Channel),
 					zap.Error(err))
-
-				// Mark connection as closed on error
 				conn.Closed.Store(true)
-
 				return
 			}
 
@@ -412,37 +411,33 @@ func (s *Server) processFrames(conn *protocol.Connection, done chan struct{}) {
 	}
 }
 
-// processFrame processes a single frame directly (no mailbox queuing)
-func (s *Server) processFrame(conn *protocol.Connection, frame *protocol.Frame) error {
-	// Process the frame based on its type
-	// Processed synchronously to maintain frame ordering (AMQP requirement)
+// processFrame processes a single frame directly (no mailbox queuing).
+// Returns (pooled, error): pooled=true means the frame was consumed and the
+// caller may return it to the frame pool; pooled=false means the frame was
+// handed off to another goroutine (e.g., AckQueue) and must NOT be pooled.
+func (s *Server) processFrame(conn *protocol.Connection, frame *protocol.Frame) (bool, error) {
 	switch frame.Type {
 	case protocol.FrameMethod:
 		if isAckFrame(frame) {
 			select {
 			case conn.AckQueue <- frame:
+				return false, nil
 			default:
-				return s.processMethodFrame(conn, frame)
+				return true, s.processMethodFrame(conn, frame)
 			}
-			return nil
 		}
-		return s.processMethodFrame(conn, frame)
+		return true, s.processMethodFrame(conn, frame)
 	case protocol.FrameHeader:
-		return s.processHeaderFrame(conn, frame)
+		return true, s.processHeaderFrame(conn, frame)
 	case protocol.FrameBody:
-		// Process body frames synchronously
-		// Note: This may block on broker operations, but that's acceptable
-		// as it provides natural TCP back-pressure
-		return s.processBodyFrame(conn, frame)
+		return true, s.processBodyFrame(conn, frame)
 	case protocol.FrameHeartbeat:
-		// Heartbeats already handled in readFrames
-		s.Log.Debug("Heartbeat frame received", zap.String("connection_id", conn.ID))
-		return nil
+		return true, nil
 	default:
 		s.Log.Warn("Unknown frame type",
 			zap.Int("type", int(frame.Type)),
 			zap.String("connection_id", conn.ID))
-		return nil
+		return true, nil
 	}
 }
 
@@ -484,7 +479,9 @@ func (s *Server) processAckFrame(conn *protocol.Connection, frame *protocol.Fram
 func (s *Server) ackProcessor(conn *protocol.Connection, done chan struct{}) {
 	defer close(done)
 	for frame := range conn.AckQueue {
-		if err := s.processAckFrame(conn, frame); err != nil {
+		err := s.processAckFrame(conn, frame)
+		protocol.PutFrame(frame)
+		if err != nil {
 			s.Log.Error("Error processing ACK frame",
 				zap.String("connection_id", conn.ID),
 				zap.Uint16("channel", frame.Channel),

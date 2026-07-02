@@ -79,9 +79,10 @@ func (s *Server) handleBasicQos(conn *protocol.Connection, channelID uint16, pay
 // handleBasicPublish handles the basic.publish method
 func (s *Server) handleBasicPublish(conn *protocol.Connection, channelID uint16, payload []byte) error {
 	// Deserialize the basic.publish method
-	publishMethod := &protocol.BasicPublishMethod{}
+	publishMethod := protocol.GetBasicPublishMethod()
 	err := publishMethod.Deserialize(payload)
 	if err != nil {
+		protocol.PutBasicPublishMethod(publishMethod)
 		s.Log.Error("Failed to deserialize basic.publish",
 			zap.Error(err),
 			zap.String("connection_id", conn.ID),
@@ -127,12 +128,9 @@ func (s *Server) handleBasicPublish(conn *protocol.Connection, channelID uint16,
 	if value, ok := conn.Channels.Load(channelID); ok {
 		channelRef = value.(*protocol.Channel)
 	}
-	pendingMsg := &protocol.PendingMessage{
-		Method:   publishMethod,
-		Body:     nil, // Pre-allocated in processHeaderFrame when BodySize is known
-		Received: 0,
-		Channel:  channelRef,
-	}
+	pendingMsg := protocol.GetPendingMessage()
+	pendingMsg.Method = publishMethod
+	pendingMsg.Channel = channelRef
 
 	// Store the pending message for this channel
 	conn.PendingMessages[channelID] = pendingMsg
@@ -189,11 +187,13 @@ func (s *Server) processHeaderFrame(conn *protocol.Connection, frame *protocol.F
 			ce.Write(zap.String("exchange", pendingMsg.Method.Exchange), zap.String("routing_key", pendingMsg.Method.RoutingKey))
 		}
 
-		// Remove the pending message from the map before processing
 		delete(conn.PendingMessages, frame.Channel)
 
-		// Process the complete message immediately
-		if err := s.processCompleteMessage(conn, frame.Channel, pendingMsg); err != nil {
+		err := s.processCompleteMessage(conn, frame.Channel, pendingMsg)
+		protocol.PutBasicPublishMethod(pendingMsg.Method)
+		protocol.PutContentHeader(pendingMsg.Header)
+		protocol.PutPendingMessage(pendingMsg)
+		if err != nil {
 			s.Log.Error("Failed to process complete empty message",
 				zap.Error(err),
 				zap.String("connection_id", conn.ID),
@@ -255,10 +255,11 @@ func (s *Server) processBodyFrame(conn *protocol.Connection, frame *protocol.Fra
 		// Remove the pending message from the map before processing
 		delete(conn.PendingMessages, frame.Channel)
 
-		// Process the complete message synchronously.
-		// With reader/processor separation, the frame reader remains responsive
-		// even if this blocks, because we process frames from FrameQueue
-		if err := s.processCompleteMessage(conn, frame.Channel, pendingMsg); err != nil {
+		err := s.processCompleteMessage(conn, frame.Channel, pendingMsg)
+		protocol.PutBasicPublishMethod(pendingMsg.Method)
+		protocol.PutContentHeader(pendingMsg.Header)
+		protocol.PutPendingMessage(pendingMsg)
+		if err != nil {
 			s.Log.Error("Failed to process complete message",
 				zap.Error(err),
 				zap.String("connection_id", conn.ID),

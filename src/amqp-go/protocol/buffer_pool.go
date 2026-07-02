@@ -159,3 +159,90 @@ func PutBufferForSize(b *[]byte) {
 		// else: let GC handle oversized buffers
 	}
 }
+
+// Object pools for hot-path structs. These are safe for concurrent use.
+// Each Get resets all fields; each Put clears all references before returning.
+
+var framePool = sync.Pool{
+	New: func() any { return &Frame{} },
+}
+
+func GetFrame() *Frame {
+	f := framePool.Get().(*Frame)
+	f.Type = 0
+	f.Channel = 0
+	f.Size = 0
+	f.Payload = nil
+	return f
+}
+
+func PutFrame(f *Frame) {
+	f.Type = 0
+	f.Channel = 0
+	f.Size = 0
+	f.Payload = nil
+	framePool.Put(f)
+}
+
+var basicPublishMethodPool = sync.Pool{
+	New: func() any { return &BasicPublishMethod{} },
+}
+
+func GetBasicPublishMethod() *BasicPublishMethod {
+	m := basicPublishMethodPool.Get().(*BasicPublishMethod)
+	m.Reserved1 = 0
+	m.Exchange = ""
+	m.RoutingKey = ""
+	m.Mandatory = false
+	m.Immediate = false
+	return m
+}
+
+func PutBasicPublishMethod(m *BasicPublishMethod) {
+	m.Reserved1 = 0
+	m.Exchange = ""
+	m.RoutingKey = ""
+	m.Mandatory = false
+	m.Immediate = false
+	basicPublishMethodPool.Put(m)
+}
+
+var pendingMessagePool = sync.Pool{
+	New: func() any { return &PendingMessage{} },
+}
+
+func GetPendingMessage() *PendingMessage {
+	m := pendingMessagePool.Get().(*PendingMessage)
+	m.Method = nil
+	m.Header = nil
+	m.Body = nil
+	m.BodySize = 0
+	m.Received = 0
+	m.Channel = nil
+	return m
+}
+
+func PutPendingMessage(m *PendingMessage) {
+	m.Method = nil
+	m.Header = nil
+	m.Body = nil
+	m.BodySize = 0
+	m.Received = 0
+	m.Channel = nil
+	pendingMessagePool.Put(m)
+}
+
+var contentHeaderPool = sync.Pool{
+	New: func() any { return &ContentHeader{} },
+}
+
+func GetContentHeader() *ContentHeader {
+	h := contentHeaderPool.Get().(*ContentHeader)
+	*h = ContentHeader{}
+	return h
+}
+
+func PutContentHeader(h *ContentHeader) {
+	*h = ContentHeader{}
+	contentHeaderPool.Put(h)
+}

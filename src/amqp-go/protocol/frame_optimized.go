@@ -26,12 +26,10 @@ import (
 // This reduces allocations by using a pooled header buffer.
 // Returns 3 allocations vs 4 for the standard ReadFrame.
 func ReadFrameOptimized(reader io.Reader) (*Frame, error) {
-	// Get header buffer from pool
 	headerPtr := getFrameHeader()
 	header := *headerPtr
 	defer putFrameHeader(headerPtr)
 
-	// Read the frame header (first 7 bytes: type, channel, size)
 	_, err := io.ReadFull(reader, header)
 	if err != nil {
 		return nil, err
@@ -41,24 +39,22 @@ func ReadFrameOptimized(reader io.Reader) (*Frame, error) {
 	channel := binary.BigEndian.Uint16(header[1:3])
 	size := binary.BigEndian.Uint32(header[3:7])
 
-	// Read the payload + end-byte
-	payload := make([]byte, size+1) // +1 for end-byte
+	payload := make([]byte, size+1)
 	_, err = io.ReadFull(reader, payload)
 	if err != nil {
 		return nil, err
 	}
 
-	// Verify end-byte
 	if payload[size] != FrameEnd {
 		return nil, fmt.Errorf("invalid frame end-byte: expected 0x%02X, got 0x%02X", FrameEnd, payload[size])
 	}
 
-	return &Frame{
-		Type:    frameType,
-		Channel: channel,
-		Size:    size,
-		Payload: payload[:size],
-	}, nil
+	frame := GetFrame()
+	frame.Type = frameType
+	frame.Channel = channel
+	frame.Size = size
+	frame.Payload = payload[:size]
+	return frame, nil
 }
 
 // MarshalBinaryOptimized encodes a frame with pre-allocation.

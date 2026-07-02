@@ -57,11 +57,10 @@ func ReadContentHeader(frame *Frame) (*ContentHeader, error) {
 
 	offset := 0
 
-	header := &ContentHeader{
-		ClassID:  binary.BigEndian.Uint16(frame.Payload[offset : offset+2]),
-		Weight:   binary.BigEndian.Uint16(frame.Payload[offset+2 : offset+4]),
-		BodySize: binary.BigEndian.Uint64(frame.Payload[offset+4 : offset+12]),
-	}
+	header := GetContentHeader()
+	header.ClassID = binary.BigEndian.Uint16(frame.Payload[offset : offset+2])
+	header.Weight = binary.BigEndian.Uint16(frame.Payload[offset+2 : offset+4])
+	header.BodySize = binary.BigEndian.Uint64(frame.Payload[offset+4 : offset+12])
 
 	offset += 12
 
