@@ -324,14 +324,22 @@ func (ds *DisruptorStorage) DeleteMessage(queueName string, deliveryTag uint64) 
 		return interfaces.ErrQueueNotFound
 	}
 
+	// Check if message is in the ring and whether it's durable.
+	// Durable messages (DeliveryMode=2) are always written to WAL on publish,
+	// so they need WAL ack regardless. Transient messages only need WAL ack
+	// if they were spilled (not in ring).
+	msg, foundInRing := ring.ring.LoadByTag(deliveryTag)
+	isDurable := foundInRing && msg.DeliveryMode == 2
+
 	ring.ring.Delete(deliveryTag)
 
-	if ds.wal != nil {
-		ds.wal.Acknowledge(queueName, deliveryTag)
-	}
-
-	if ds.segments != nil {
-		ds.segments.Acknowledge(queueName, deliveryTag)
+	if !foundInRing || isDurable {
+		if ds.wal != nil {
+			ds.wal.Acknowledge(queueName, deliveryTag)
+		}
+		if ds.segments != nil {
+			ds.segments.Acknowledge(queueName, deliveryTag)
+		}
 	}
 
 	return nil

@@ -8,21 +8,19 @@ import (
 const noLowest = ^uint64(0)
 
 type consumerAckState struct {
-	unacked       map[uint64]struct{}
+	unacked       sync.Map // tag -> struct{}
 	lowestUnacked atomic.Uint64
 }
 
 type AckCursor struct {
 	minAckCursor atomic.Uint64
 	head         atomic.Uint64
-	mu           sync.Mutex
-	consumers    map[string]*consumerAckState
+	consumers    sync.Map // consumerTag -> *consumerAckState
+	dirty        atomic.Bool
 }
 
 func NewAckCursor() *AckCursor {
-	ac := &AckCursor{
-		consumers: make(map[string]*consumerAckState),
-	}
+	ac := &AckCursor{}
 	ac.minAckCursor.Store(0)
 	ac.head.Store(0)
 	return ac
@@ -35,38 +33,34 @@ func (ac *AckCursor) OnPublish(tag uint64) {
 }
 
 func (ac *AckCursor) OnDeliver(tag uint64, consumerTag string) {
-	ac.mu.Lock()
-	c := ac.consumers[consumerTag]
-	if c == nil {
-		c = &consumerAckState{unacked: make(map[uint64]struct{})}
-		c.lowestUnacked.Store(noLowest)
-		ac.consumers[consumerTag] = c
+	v, _ := ac.consumers.LoadOrStore(consumerTag, newConsumerAckState())
+	c := v.(*consumerAckState)
+	c.unacked.Store(tag, struct{}{})
+	for {
+		cur := c.lowestUnacked.Load()
+		if cur != noLowest && tag >= cur {
+			break
+		}
+		if c.lowestUnacked.CompareAndSwap(cur, tag) {
+			break
+		}
 	}
-	c.unacked[tag] = struct{}{}
-	if tag < c.lowestUnacked.Load() {
-		c.lowestUnacked.Store(tag)
-	}
-	ac.recomputeMinLocked()
-	ac.mu.Unlock()
+	ac.dirty.Store(true)
 }
 
 func (ac *AckCursor) OnAck(tag uint64, consumerTag string) bool {
-	ac.mu.Lock()
-	c := ac.consumers[consumerTag]
-	if c == nil {
-		ac.mu.Unlock()
+	v, ok := ac.consumers.Load(consumerTag)
+	if !ok {
 		return false
 	}
-	if _, ok := c.unacked[tag]; !ok {
-		ac.mu.Unlock()
+	c := v.(*consumerAckState)
+	if _, ok := c.unacked.LoadAndDelete(tag); !ok {
 		return false
 	}
-	delete(c.unacked, tag)
 	if c.lowestUnacked.Load() == tag {
-		c.lowestUnacked.Store(lowestOf(c.unacked))
+		c.lowestUnacked.Store(scanLowest(&c.unacked))
 	}
-	ac.recomputeMinLocked()
-	ac.mu.Unlock()
+	ac.dirty.Store(true)
 	return true
 }
 
@@ -75,24 +69,25 @@ func (ac *AckCursor) OnNack(tag uint64, consumerTag string) bool {
 }
 
 func (ac *AckCursor) OnConsumerRegister(consumerTag string) {
-	ac.mu.Lock()
-	if ac.consumers[consumerTag] == nil {
-		c := &consumerAckState{unacked: make(map[uint64]struct{})}
-		c.lowestUnacked.Store(noLowest)
-		ac.consumers[consumerTag] = c
-	}
-	ac.recomputeMinLocked()
-	ac.mu.Unlock()
+	ac.consumers.LoadOrStore(consumerTag, newConsumerAckState())
+	ac.dirty.Store(true)
+}
+
+func newConsumerAckState() *consumerAckState {
+	c := &consumerAckState{}
+	c.lowestUnacked.Store(noLowest)
+	return c
 }
 
 func (ac *AckCursor) OnConsumerUnregister(consumerTag string) {
-	ac.mu.Lock()
-	delete(ac.consumers, consumerTag)
-	ac.recomputeMinLocked()
-	ac.mu.Unlock()
+	ac.consumers.Delete(consumerTag)
+	ac.dirty.Store(true)
 }
 
 func (ac *AckCursor) MinAckCursor() uint64 {
+	if ac.dirty.CompareAndSwap(true, false) {
+		ac.recomputeMin()
+	}
 	return ac.minAckCursor.Load()
 }
 
@@ -109,46 +104,51 @@ func (ac *AckCursor) Head() uint64 {
 }
 
 func (ac *AckCursor) ConsumerCount() int {
-	ac.mu.Lock()
-	defer ac.mu.Unlock()
-	return len(ac.consumers)
+	count := 0
+	ac.consumers.Range(func(_, _ any) bool {
+		count++
+		return true
+	})
+	return count
 }
 
 func (ac *AckCursor) GetUnackedTags(consumerTag string) []uint64 {
-	ac.mu.Lock()
-	defer ac.mu.Unlock()
-	c, ok := ac.consumers[consumerTag]
+	v, ok := ac.consumers.Load(consumerTag)
 	if !ok {
 		return nil
 	}
-	tags := make([]uint64, 0, len(c.unacked))
-	for tag := range c.unacked {
-		tags = append(tags, tag)
-	}
+	c := v.(*consumerAckState)
+	var tags []uint64
+	c.unacked.Range(func(k, _ any) bool {
+		tags = append(tags, k.(uint64))
+		return true
+	})
 	return tags
 }
 
 func (ac *AckCursor) GetUnackedCount(consumerTag string) int {
-	ac.mu.Lock()
-	defer ac.mu.Unlock()
-	c, ok := ac.consumers[consumerTag]
+	v, ok := ac.consumers.Load(consumerTag)
 	if !ok {
 		return 0
 	}
-	return len(c.unacked)
+	c := v.(*consumerAckState)
+	count := 0
+	c.unacked.Range(func(_, _ any) bool {
+		count++
+		return true
+	})
+	return count
 }
 
-func (ac *AckCursor) recomputeMinLocked() {
+func (ac *AckCursor) recomputeMin() {
 	lowest := noLowest
-	for _, c := range ac.consumers {
-		l := c.lowestUnacked.Load()
-		if l == noLowest {
-			continue
-		}
+	ac.consumers.Range(func(_, v any) bool {
+		l := v.(*consumerAckState).lowestUnacked.Load()
 		if l < lowest {
 			lowest = l
 		}
-	}
+		return true
+	})
 	if lowest == noLowest {
 		ac.minAckCursor.Store(ac.head.Load())
 	} else {
@@ -156,12 +156,14 @@ func (ac *AckCursor) recomputeMinLocked() {
 	}
 }
 
-func lowestOf(m map[uint64]struct{}) uint64 {
+func scanLowest(m *sync.Map) uint64 {
 	min := noLowest
-	for t := range m {
+	m.Range(func(k, _ any) bool {
+		t := k.(uint64)
 		if t < min {
 			min = t
 		}
-	}
+		return true
+	})
 	return min
 }
