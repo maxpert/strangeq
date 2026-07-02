@@ -262,6 +262,245 @@ func BenchmarkE2E_MultiConnectionPublish(b *testing.B) {
 	})
 }
 
+// ============================================================================
+// RabbitMQ PerfTest-matching benchmarks
+//
+// These benchmarks match the parameters used by RabbitMQ's official PerfTest
+// tool (https://perftest.rabbitmq.com/) for fair head-to-head comparison.
+//
+// Matching parameters:
+//   - Message size: 12 bytes (PerfTest default)
+//   - 1 publisher, 1 consumer on a single queue
+//   - Non-durable queue, transient messages (no replication)
+//   - No publisher confirms
+//
+// Ack modes (PerfTest test 1 and test 11):
+//   - Auto-ack:       perf-test.jar -x 1 -y 1 -a   (test 1, "-a" flag)
+//   - Manual ack:     perf-test.jar -x 1 -y 1       (no -a flag, default prefetch)
+//   - Multi-ack 1000: perf-test.jar -x 1 -y 1 --multi-ack-every 1000  (test 11)
+//
+// Run: go test . -run='^$' -bench="BenchmarkRabbitMQMatch" -benchmem -benchtime=5s -count=3
+// ============================================================================
+
+// BenchmarkRabbitMQMatch_AutoAck matches PerfTest test 1:
+// 12-byte messages, 1 publisher + 1 consumer, auto-ack, no confirms.
+func BenchmarkRabbitMQMatch_AutoAck(b *testing.B) {
+	uri, cleanup := startBenchServer(b)
+	defer cleanup()
+
+	conn, err := amqp.Dial(uri)
+	if err != nil {
+		b.Fatalf("Dial failed: %v", err)
+	}
+	defer conn.Close()
+
+	ch, err := conn.Channel()
+	if err != nil {
+		b.Fatalf("Channel failed: %v", err)
+	}
+	defer ch.Close()
+
+	q, err := ch.QueueDeclare("match_autoack", false, false, false, false, nil)
+	if err != nil {
+		b.Fatalf("QueueDeclare failed: %v", err)
+	}
+
+	msgs, err := ch.Consume(q.Name, "", true, false, false, false, nil)
+	if err != nil {
+		b.Fatalf("Consume failed: %v", err)
+	}
+
+	body := make([]byte, 12) // 12 bytes — PerfTest default
+
+	done := make(chan struct{})
+	go func() {
+		for range msgs {
+		}
+		close(done)
+	}()
+
+	b.ResetTimer()
+	b.ReportAllocs()
+
+	for i := 0; i < b.N; i++ {
+		err := ch.Publish("", q.Name, false, false, amqp.Publishing{
+			Body: body,
+		})
+		if err != nil {
+			b.Fatalf("Publish failed at %d: %v", i, err)
+		}
+	}
+
+	b.StopTimer()
+	time.Sleep(500 * time.Millisecond)
+	conn.Close()
+	<-done
+}
+
+// BenchmarkRabbitMQMatch_ManualAck matches PerfTest with manual ack:
+// 12-byte messages, 1 publisher + 1 consumer, manual ack with default prefetch.
+func BenchmarkRabbitMQMatch_ManualAck(b *testing.B) {
+	uri, cleanup := startBenchServer(b)
+	defer cleanup()
+
+	conn, err := amqp.Dial(uri)
+	if err != nil {
+		b.Fatalf("Dial failed: %v", err)
+	}
+	defer conn.Close()
+
+	ch, err := conn.Channel()
+	if err != nil {
+		b.Fatalf("Channel failed: %v", err)
+	}
+	defer ch.Close()
+
+	q, err := ch.QueueDeclare("match_manualack", false, false, false, false, nil)
+	if err != nil {
+		b.Fatalf("QueueDeclare failed: %v", err)
+	}
+
+	msgs, err := ch.Consume(q.Name, "", false, false, false, false, nil)
+	if err != nil {
+		b.Fatalf("Consume failed: %v", err)
+	}
+
+	body := make([]byte, 12)
+
+	done := make(chan struct{})
+	go func() {
+		for d := range msgs {
+			d.Ack(false)
+		}
+		close(done)
+	}()
+
+	b.ResetTimer()
+	b.ReportAllocs()
+
+	for i := 0; i < b.N; i++ {
+		err := ch.Publish("", q.Name, false, false, amqp.Publishing{
+			Body: body,
+		})
+		if err != nil {
+			b.Fatalf("Publish failed at %d: %v", i, err)
+		}
+	}
+
+	b.StopTimer()
+	time.Sleep(500 * time.Millisecond)
+	conn.Close()
+	<-done
+}
+
+// BenchmarkRabbitMQMatch_MultiAck1000 matches PerfTest test 11:
+// 12-byte messages, 1 publisher + 1 consumer, multi-ack every 1000 messages.
+func BenchmarkRabbitMQMatch_MultiAck1000(b *testing.B) {
+	uri, cleanup := startBenchServer(b)
+	defer cleanup()
+
+	conn, err := amqp.Dial(uri)
+	if err != nil {
+		b.Fatalf("Dial failed: %v", err)
+	}
+	defer conn.Close()
+
+	ch, err := conn.Channel()
+	if err != nil {
+		b.Fatalf("Channel failed: %v", err)
+	}
+	defer ch.Close()
+
+	q, err := ch.QueueDeclare("match_multiack", false, false, false, false, nil)
+	if err != nil {
+		b.Fatalf("QueueDeclare failed: %v", err)
+	}
+
+	msgs, err := ch.Consume(q.Name, "", false, false, false, false, nil)
+	if err != nil {
+		b.Fatalf("Consume failed: %v", err)
+	}
+
+	body := make([]byte, 12)
+
+	done := make(chan struct{})
+	go func() {
+		var count int
+		for d := range msgs {
+			count++
+			if count%1000 == 0 {
+				d.Ack(true) // multiple=true: ack all messages up to this one
+			}
+		}
+		close(done)
+	}()
+
+	b.ResetTimer()
+	b.ReportAllocs()
+
+	for i := 0; i < b.N; i++ {
+		err := ch.Publish("", q.Name, false, false, amqp.Publishing{
+			Body: body,
+		})
+		if err != nil {
+			b.Fatalf("Publish failed at %d: %v", i, err)
+		}
+	}
+
+	b.StopTimer()
+	time.Sleep(500 * time.Millisecond)
+	conn.Close()
+	<-done
+}
+
+// BenchmarkRabbitMQMatch_PublishOnly measures publish-only throughput
+// (no consumer) matching PerfTest with -y 0.
+func BenchmarkRabbitMQMatch_PublishOnly(b *testing.B) {
+	uri, cleanup := startBenchServer(b)
+	defer cleanup()
+
+	conn, err := amqp.Dial(uri)
+	if err != nil {
+		b.Fatalf("Dial failed: %v", err)
+	}
+	defer conn.Close()
+
+	ch, err := conn.Channel()
+	if err != nil {
+		b.Fatalf("Channel failed: %v", err)
+	}
+	defer ch.Close()
+
+	_, err = ch.QueueDeclare("match_pubonly", false, false, false, false, nil)
+	if err != nil {
+		b.Fatalf("QueueDeclare failed: %v", err)
+	}
+
+	body := make([]byte, 12)
+
+	// Drain queue in background to prevent backpressure from blocking publisher
+	msgs, err := ch.Consume("match_pubonly", "", true, false, false, false, nil)
+	if err != nil {
+		b.Fatalf("Consume failed: %v", err)
+	}
+	go func() {
+		for range msgs {
+		}
+	}()
+
+	b.ResetTimer()
+	b.ReportAllocs()
+
+	for i := 0; i < b.N; i++ {
+		err := ch.Publish("", "match_pubonly", false, false, amqp.Publishing{
+			Body: body,
+		})
+		if err != nil {
+			b.Fatalf("Publish failed at %d: %v", i, err)
+		}
+	}
+}
+
 // BenchmarkE2E_LargeMessage measures throughput with large messages (64KB)
 // — tests body pre-allocation optimization and frame fragmentation.
 func BenchmarkE2E_LargeMessage(b *testing.B) {
