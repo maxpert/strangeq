@@ -741,31 +741,30 @@ func (b *StorageBroker) PublishMessage(exchangeName, routingKey string, message 
 	}
 
 	// Enqueue to all target queues (lock-free, no consumer iteration)
-	for _, queueName := range targetQueues {
-		// Get or create queue state (lock-free)
+	for i, queueName := range targetQueues {
 		queueState := b.getOrCreateQueueState(queueName)
 
-		// Backpressure gate: block while the queue depth (head - minAckCursor)
-		// is at or above the high-water mark. Replaces the old blocking send
-		// to a buffered channel. Woken by AckAdvance when consumers drain.
-		// Aborts if the queue is deleted (StopCh closed).
 		if !queueState.WaitForCapacity(queueState.StopCh()) {
 			return fmt.Errorf("queue '%s' closed during backpressure wait", queueName)
 		}
 
-		// Assign globally unique delivery tag (prevents deliveryIndex collisions across queues)
 		msgID := b.globalDeliveryTag.Add(1)
-		message.DeliveryTag = msgID
 
-		// Clone message per queue so each queue owns its own *Message with its
-		// own DeliveryTag. Without this, fanout to N queues stores the same
-		// pointer and the last iteration's DeliveryTag overwrites all earlier
-		// ones — GetMessage's tag guard fails for N-1 queues (R6 bug).
-		msgCopy := *message
-		msgCopy.DeliveryTag = msgID
+		var storeMsg *protocol.Message
+		if i == 0 {
+			// First (and often only) queue: store the original directly.
+			// message is freshly allocated in processCompleteMessage — no aliasing.
+			message.DeliveryTag = msgID
+			storeMsg = message
+		} else {
+			// Fanout: each subsequent queue needs its own *Message with its own DeliveryTag.
+			msgCopy := *message
+			msgCopy.DeliveryTag = msgID
+			storeMsg = &msgCopy
+		}
 
 		// Store to persistent storage
-		err := b.storage.StoreMessage(queueName, &msgCopy)
+		err := b.storage.StoreMessage(queueName, storeMsg)
 		if err != nil {
 			return fmt.Errorf("failed to store message to queue '%s': %w", queueName, err)
 		}

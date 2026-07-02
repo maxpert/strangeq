@@ -151,9 +151,9 @@ func TestAtomicRing_DeleteTagGuard(t *testing.T) {
 	_, _, err = r.Store(5, msgAt(5))
 	require.NoError(t, err)
 
-	staleSeq := new(uint64)
-	*staleSeq = 0
-	r.tagToSeq.Store(1, staleSeq)
+	r.tagMu.Lock()
+	r.tagToSeq[1] = 0
+	r.tagMu.Unlock()
 
 	require.False(t, r.Delete(1))
 

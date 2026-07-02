@@ -16,7 +16,8 @@ type AtomicRing struct {
 	mask         uint64
 	publishSeq   atomic.Uint64
 	messageCount atomic.Uint64
-	tagToSeq     sync.Map
+	tagToSeq     map[uint64]uint64
+	tagMu        sync.RWMutex
 	closed       atomic.Bool
 }
 
@@ -28,8 +29,9 @@ func NewAtomicRing(size int) *AtomicRing {
 		panic("AtomicRing: size must be a power of two")
 	}
 	r := &AtomicRing{
-		size: size,
-		mask: uint64(size - 1),
+		size:     size,
+		mask:     uint64(size - 1),
+		tagToSeq: make(map[uint64]uint64, size),
 	}
 	r.slots = make([]atomic.Pointer[protocol.Message], size)
 	return r
@@ -43,15 +45,9 @@ func (r *AtomicRing) Store(deliveryTag uint64, msg *protocol.Message) (seq uint6
 		return 0, false, fmt.Errorf("ring is closed")
 	}
 	seq = r.publishSeq.Add(1) - 1
-	if v, ok := r.tagToSeq.Load(deliveryTag); ok {
-		atomic.StoreUint64(v.(*uint64), seq)
-	} else {
-		p := new(uint64)
-		atomic.StoreUint64(p, seq)
-		if actual, loaded := r.tagToSeq.LoadOrStore(deliveryTag, p); loaded {
-			atomic.StoreUint64(actual.(*uint64), seq)
-		}
-	}
+	r.tagMu.Lock()
+	r.tagToSeq[deliveryTag] = seq
+	r.tagMu.Unlock()
 	msg.DeliveryTag = deliveryTag
 	if r.slots[seq&r.mask].CompareAndSwap(nil, msg) {
 		r.messageCount.Add(1)
@@ -61,11 +57,12 @@ func (r *AtomicRing) Store(deliveryTag uint64, msg *protocol.Message) (seq uint6
 }
 
 func (r *AtomicRing) LoadByTag(deliveryTag uint64) (*protocol.Message, bool) {
-	v, ok := r.tagToSeq.Load(deliveryTag)
+	r.tagMu.RLock()
+	seq, ok := r.tagToSeq[deliveryTag]
+	r.tagMu.RUnlock()
 	if !ok {
 		return nil, false
 	}
-	seq := atomic.LoadUint64(v.(*uint64))
 	msg := r.slots[seq&r.mask].Load()
 	if msg != nil && msg.DeliveryTag == deliveryTag {
 		return msg, true
@@ -76,8 +73,10 @@ func (r *AtomicRing) LoadByTag(deliveryTag uint64) (*protocol.Message, bool) {
 func (r *AtomicRing) LoadBySeq(seq uint64) (*protocol.Message, bool) {
 	msg := r.slots[seq&r.mask].Load()
 	if msg != nil {
-		v, ok := r.tagToSeq.Load(msg.DeliveryTag)
-		if ok && atomic.LoadUint64(v.(*uint64)) == seq {
+		r.tagMu.RLock()
+		s, ok := r.tagToSeq[msg.DeliveryTag]
+		r.tagMu.RUnlock()
+		if ok && s == seq {
 			return msg, true
 		}
 	}
@@ -85,11 +84,12 @@ func (r *AtomicRing) LoadBySeq(seq uint64) (*protocol.Message, bool) {
 }
 
 func (r *AtomicRing) Delete(deliveryTag uint64) bool {
-	v, ok := r.tagToSeq.Load(deliveryTag)
+	r.tagMu.RLock()
+	seq, ok := r.tagToSeq[deliveryTag]
+	r.tagMu.RUnlock()
 	if !ok {
 		return false
 	}
-	seq := atomic.LoadUint64(v.(*uint64))
 	slot := &r.slots[seq&r.mask]
 	msg := slot.Load()
 	if msg == nil || msg.DeliveryTag != deliveryTag {
@@ -97,7 +97,9 @@ func (r *AtomicRing) Delete(deliveryTag uint64) bool {
 	}
 	if slot.CompareAndSwap(msg, nil) {
 		r.messageCount.Add(^uint64(0))
-		r.tagToSeq.Delete(deliveryTag)
+		r.tagMu.Lock()
+		delete(r.tagToSeq, deliveryTag)
+		r.tagMu.Unlock()
 		return true
 	}
 	return false
@@ -122,10 +124,9 @@ func (r *AtomicRing) Purge() int {
 			break
 		}
 	}
-	r.tagToSeq.Range(func(k, v any) bool {
-		r.tagToSeq.Delete(k)
-		return true
-	})
+	r.tagMu.Lock()
+	r.tagToSeq = make(map[uint64]uint64, r.size)
+	r.tagMu.Unlock()
 	return removed
 }
 
@@ -173,7 +174,9 @@ func (r *AtomicRing) DeleteRange(startTag, endTag uint64) int {
 		}
 		if r.slots[i].CompareAndSwap(msg, nil) {
 			r.messageCount.Add(^uint64(0))
-			r.tagToSeq.Delete(msg.DeliveryTag)
+			r.tagMu.Lock()
+			delete(r.tagToSeq, msg.DeliveryTag)
+			r.tagMu.Unlock()
 			removed++
 		}
 	}
