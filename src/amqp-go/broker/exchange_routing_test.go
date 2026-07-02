@@ -11,7 +11,7 @@ import (
 )
 
 // createTestBroker creates a test broker with in-memory storage
-func createTestBroker(t *testing.T) (*StorageBroker, func()) {
+func createTestBroker(t testing.TB) (*StorageBroker, func()) {
 	tmpDir := t.TempDir()
 	store := storage.NewDisruptorStorageWithDataDir(tmpDir)
 

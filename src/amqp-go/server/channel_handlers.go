@@ -44,6 +44,7 @@ func (s *Server) processChannelSpecificMethod(conn *protocol.Connection, channel
 			channel.Consumers = make(map[string]*protocol.Consumer) // Clear all consumers
 			channel.Closed = true
 			channel.Mutex.Unlock()
+			conn.ConsumersDirty.Store(true)
 
 			// Unregister consumers from broker (stops poll goroutines)
 			for _, consumerTag := range consumerTags {

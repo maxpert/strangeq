@@ -302,12 +302,17 @@ func (s *Server) processConnectionFrames(conn *protocol.Connection) {
 	processorDone := make(chan struct{})
 	go s.processFrames(conn, processorDone)
 
+	// Start ACK processor goroutine (handles basic.ack/nack/reject off the frame processor)
+	ackProcessorDone := make(chan struct{})
+	go s.ackProcessor(conn, ackProcessorDone)
+
 	// Start heartbeat sender goroutine (sends heartbeat frames to client periodically)
 	heartbeatSenderDone := make(chan struct{})
 	go s.sendHeartbeats(conn, heartbeatSenderDone)
 
 	// Start consumer delivery loop
 	consumerDeliveryDone := make(chan struct{})
+	conn.ConsumersDirty.Store(true)
 	go s.consumerDeliveryLoop(conn, consumerDeliveryDone)
 
 	// Wait for any goroutine to finish (connection close or error)
@@ -320,7 +325,19 @@ func (s *Server) processConnectionFrames(conn *protocol.Connection) {
 		s.Log.Info("Heartbeat sender completed", zap.String("connection_id", conn.ID))
 	case <-consumerDeliveryDone:
 		s.Log.Info("Consumer delivery completed", zap.String("connection_id", conn.ID))
+	case <-ackProcessorDone:
+		s.Log.Info("ACK processor completed", zap.String("connection_id", conn.ID))
+		return
 	}
+
+	// Close the connection to unblock reader and processor
+	conn.Conn.Close()
+
+	// Wait for frame processor to exit (it is the only sender to ackQueue)
+	<-processorDone
+	// Close ackQueue so ackProcessor drains remaining frames and exits
+	close(conn.AckQueue)
+	<-ackProcessorDone
 }
 
 // readFrames reads frames from TCP connection and enqueues them for processing
@@ -401,6 +418,14 @@ func (s *Server) processFrame(conn *protocol.Connection, frame *protocol.Frame) 
 	// Processed synchronously to maintain frame ordering (AMQP requirement)
 	switch frame.Type {
 	case protocol.FrameMethod:
+		if isAckFrame(frame) {
+			select {
+			case conn.AckQueue <- frame:
+			default:
+				return s.processMethodFrame(conn, frame)
+			}
+			return nil
+		}
 		return s.processMethodFrame(conn, frame)
 	case protocol.FrameHeader:
 		return s.processHeaderFrame(conn, frame)
@@ -418,6 +443,55 @@ func (s *Server) processFrame(conn *protocol.Connection, frame *protocol.Frame) 
 			zap.Int("type", int(frame.Type)),
 			zap.String("connection_id", conn.ID))
 		return nil
+	}
+}
+
+func isAckFrame(frame *protocol.Frame) bool {
+	if frame.Type != protocol.FrameMethod || len(frame.Payload) < 4 {
+		return false
+	}
+	classID := (uint16(frame.Payload[0]) << 8) | uint16(frame.Payload[1])
+	if classID != 60 {
+		return false
+	}
+	methodID := (uint16(frame.Payload[2]) << 8) | uint16(frame.Payload[3])
+	switch methodID {
+	case protocol.BasicAck, protocol.BasicReject, protocol.BasicNack:
+		return true
+	default:
+		return false
+	}
+}
+
+func (s *Server) processAckFrame(conn *protocol.Connection, frame *protocol.Frame) error {
+	if len(frame.Payload) < 4 {
+		return fmt.Errorf("ack frame payload too short")
+	}
+	methodID := (uint16(frame.Payload[2]) << 8) | uint16(frame.Payload[3])
+	payload := frame.Payload[4:]
+	switch methodID {
+	case protocol.BasicAck:
+		return s.handleBasicAck(conn, frame.Channel, payload)
+	case protocol.BasicReject:
+		return s.handleBasicReject(conn, frame.Channel, payload)
+	case protocol.BasicNack:
+		return s.handleBasicNack(conn, frame.Channel, payload)
+	default:
+		return fmt.Errorf("unexpected method %d in ack processor", methodID)
+	}
+}
+
+func (s *Server) ackProcessor(conn *protocol.Connection, done chan struct{}) {
+	defer close(done)
+	for frame := range conn.AckQueue {
+		if err := s.processAckFrame(conn, frame); err != nil {
+			s.Log.Error("Error processing ACK frame",
+				zap.String("connection_id", conn.ID),
+				zap.Uint16("channel", frame.Channel),
+				zap.Error(err))
+			conn.Closed.Store(true)
+			return
+		}
 	}
 }
 

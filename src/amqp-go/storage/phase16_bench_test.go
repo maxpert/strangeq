@@ -34,26 +34,26 @@ func BenchmarkMultiQueueConcurrentPublish(b *testing.B) {
 		ds.getOrCreateQueueRing(queues[i])
 	}
 
-	msg := &protocol.Message{
-		Exchange:     "",
-		RoutingKey:   "bench.key",
-		Body:         make([]byte, 256),
-		DeliveryMode: 1, // Transient
-	}
+	var tag atomic.Uint64
 
 	b.ResetTimer()
 	b.ReportAllocs()
 
 	b.RunParallel(func(pb *testing.PB) {
-		i := uint64(0)
 		for pb.Next() {
-			i++
-			queueName := queues[i%10]
-			msg.DeliveryTag = i
+			t := tag.Add(1)
+			queueName := queues[t%10]
+			msg := &protocol.Message{
+				Exchange:     "",
+				RoutingKey:   "bench.key",
+				Body:         make([]byte, 256),
+				DeliveryMode: 1,
+				DeliveryTag:  t,
+			}
 			if err := ds.StoreMessage(queueName, msg); err != nil {
 				b.Fatal(err)
 			}
-			_ = ds.DeleteMessage(queueName, i)
+			_ = ds.DeleteMessage(queueName, t)
 		}
 	})
 }
@@ -68,25 +68,25 @@ func BenchmarkSingleQueueConcurrentPublish(b *testing.B) {
 	queueName := "single_queue"
 	ds.getOrCreateQueueRing(queueName)
 
-	msg := &protocol.Message{
-		Exchange:     "",
-		RoutingKey:   queueName,
-		Body:         make([]byte, 256),
-		DeliveryMode: 1, // Transient
-	}
+	var tag atomic.Uint64
 
 	b.ResetTimer()
 	b.ReportAllocs()
 
 	b.RunParallel(func(pb *testing.PB) {
-		i := uint64(0)
 		for pb.Next() {
-			i++
-			msg.DeliveryTag = i
+			t := tag.Add(1)
+			msg := &protocol.Message{
+				Exchange:     "",
+				RoutingKey:   queueName,
+				Body:         make([]byte, 256),
+				DeliveryMode: 1,
+				DeliveryTag:  t,
+			}
 			if err := ds.StoreMessage(queueName, msg); err != nil {
 				b.Fatal(err)
 			}
-			_ = ds.DeleteMessage(queueName, i)
+			_ = ds.DeleteMessage(queueName, t)
 		}
 	})
 }

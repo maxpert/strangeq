@@ -430,6 +430,7 @@ func (s *Server) handleBasicConsume(conn *protocol.Connection, channelID uint16,
 	channel.Mutex.Lock()
 	channel.Consumers[consumer.Tag] = consumer
 	channel.Mutex.Unlock()
+	conn.ConsumersDirty.Store(true)
 
 	// Register the consumer with the broker
 	err = s.Broker.RegisterConsumer(consumeMethod.Queue, consumer.Tag, consumer)
@@ -496,6 +497,7 @@ func (s *Server) handleBasicCancel(conn *protocol.Connection, channelID uint16, 
 	close(consumer.Cancel)
 	delete(channel.Consumers, cancelMethod.ConsumerTag)
 	channel.Mutex.Unlock()
+	conn.ConsumersDirty.Store(true)
 
 	// Unregister the consumer with the broker
 	err = s.Broker.UnregisterConsumer(cancelMethod.ConsumerTag)
@@ -565,25 +567,11 @@ func (s *Server) handleBasicGet(conn *protocol.Connection, channelID uint16, pay
 	return nil
 }
 
-// sendBasicDeliver sends a basic.deliver method frame to a consumer
-func (s *Server) sendBasicDeliver(conn *protocol.Connection, channelID uint16, consumerTag string, deliveryTag uint64, redelivered bool, exchange, routingKey string, message *protocol.Message) error {
-	// Track delivery latency
-	startTime := time.Now()
-	defer func() {
-		if s.MetricsCollector != nil {
-			duration := time.Since(startTime).Seconds()
-			s.MetricsCollector.RecordDeliveryLatency(duration)
-		}
-	}()
-
-	s.Log.Debug("ENTERING sendBasicDeliver function",
-		zap.String("consumer_tag", consumerTag),
-		zap.Uint16("channel_id", channelID),
-		zap.Uint64("delivery_tag", deliveryTag),
-		zap.String("exchange", exchange),
-		zap.String("routing_key", routingKey),
-		zap.Int("message_body_size", len(message.Body)))
-
+// serializeDelivery serializes a single basic.deliver (method frame + header frame
+// + body fragments) into a complete byte slice ready for writing to the wire.
+// The returned slice is backed by a pooled buffer; the caller MUST call
+// protocol.PutBufferForSize on it after use.
+func (s *Server) serializeDelivery(channelID uint16, consumerTag string, deliveryTag uint64, redelivered bool, exchange, routingKey string, message *protocol.Message) ([]byte, error) {
 	deliverMethod := &protocol.BasicDeliverMethod{
 		ConsumerTag: consumerTag,
 		DeliveryTag: deliveryTag,
@@ -594,34 +582,16 @@ func (s *Server) sendBasicDeliver(conn *protocol.Connection, channelID uint16, c
 
 	methodData, err := deliverMethod.Serialize()
 	if err != nil {
-		s.Log.Error("Error serializing basic.deliver", zap.Error(err))
-		return fmt.Errorf("error serializing basic.deliver: %v", err)
+		return nil, fmt.Errorf("error serializing basic.deliver: %v", err)
 	}
 
-	frame := protocol.EncodeMethodFrameForChannel(channelID, 60, 60, methodData) // 60.60 = basic.deliver
-
-	s.Log.Debug("About to send basic.deliver method frame",
-		zap.String("consumer_tag", consumerTag),
-		zap.Uint16("channel_id", channelID))
-
-	// NOTE: We'll prepare all frames first, then send them atomically
-
-	// Continue with content header and body frames
-	s.Log.Debug("Continuing with content header and body frames",
-		zap.String("consumer_tag", consumerTag),
-		zap.Uint16("channel_id", channelID))
-
-	// Send content header frame
-	// Create a content header frame with the message properties
-	s.Log.Debug("Creating content header structure",
-		zap.String("consumer_tag", consumerTag),
-		zap.String("content_type", message.ContentType))
+	methodFrame := protocol.EncodeMethodFrameForChannel(channelID, 60, 60, methodData)
 
 	contentHeader := &protocol.ContentHeader{
-		ClassID:         60, // basic class
+		ClassID:         60,
 		Weight:          0,
 		BodySize:        uint64(len(message.Body)),
-		PropertyFlags:   0,
+		PropertyFlags:   buildPropertyFlags(message),
 		Headers:         message.Headers,
 		ContentType:     message.ContentType,
 		ContentEncoding: message.ContentEncoding,
@@ -638,87 +608,11 @@ func (s *Server) sendBasicDeliver(conn *protocol.Connection, channelID uint16, c
 		ClusterID:       message.ClusterID,
 	}
 
-	// Set property flags based on which properties are set
-	propertyFlags := uint16(0)
-	if len(message.Headers) > 0 {
-		propertyFlags |= protocol.FlagHeaders // headers
-	}
-	if message.ContentType != "" {
-		propertyFlags |= protocol.FlagContentType // content-type
-	}
-	if message.ContentEncoding != "" {
-		propertyFlags |= protocol.FlagContentEncoding // content-encoding
-	}
-	if message.DeliveryMode != 0 {
-		propertyFlags |= protocol.FlagDeliveryMode // delivery-mode
-	}
-	if message.Priority != 0 {
-		propertyFlags |= protocol.FlagPriority // priority
-	}
-	if message.CorrelationID != "" {
-		propertyFlags |= protocol.FlagCorrelationID // correlation-id
-	}
-	if message.ReplyTo != "" {
-		propertyFlags |= protocol.FlagReplyTo // reply-to
-	}
-	if message.Expiration != "" {
-		propertyFlags |= protocol.FlagExpiration // expiration
-	}
-	if message.MessageID != "" {
-		propertyFlags |= protocol.FlagMessageID // message-id
-	}
-	if message.Timestamp != 0 {
-		propertyFlags |= protocol.FlagTimestamp // timestamp
-	}
-	if message.Type != "" {
-		propertyFlags |= protocol.FlagType // type
-	}
-	if message.UserID != "" {
-		propertyFlags |= protocol.FlagUserID // user-id
-	}
-	if message.AppID != "" {
-		propertyFlags |= protocol.FlagAppID // app-id
-	}
-	if message.ClusterID != "" {
-		propertyFlags |= protocol.FlagClusterID // cluster-id
-	}
-
-	contentHeader.PropertyFlags = propertyFlags
-
-	s.Log.Debug("Property flags set",
-		zap.String("consumer_tag", consumerTag),
-		zap.Uint16("property_flags", propertyFlags))
-
-	// Use ContentHeader.Serialize() to get properly formatted header payload
-	s.Log.Debug("About to serialize content header",
-		zap.String("consumer_tag", consumerTag))
-
 	headerPayload, err := contentHeader.Serialize()
 	if err != nil {
-		s.Log.Error("Error serializing content header", zap.Error(err))
-		return fmt.Errorf("error serializing content header: %v", err)
+		return nil, fmt.Errorf("error serializing content header: %v", err)
 	}
 
-	s.Log.Debug("Content header serialized successfully",
-		zap.String("consumer_tag", consumerTag),
-		zap.Int("payload_length", len(headerPayload)))
-
-	s.Log.Debug("Content header serialization complete",
-		zap.String("consumer_tag", consumerTag),
-		zap.Uint16("class_id", contentHeader.ClassID),
-		zap.Uint64("body_size", contentHeader.BodySize),
-		zap.Uint16("property_flags", contentHeader.PropertyFlags),
-		zap.String("content_type", contentHeader.ContentType),
-		zap.Int("header_payload_length", len(headerPayload)))
-
-	s.Log.Debug("Creating content header frame",
-		zap.String("consumer_tag", consumerTag),
-		zap.Uint16("channel_id", channelID),
-		zap.Uint64("body_size", uint64(len(message.Body))),
-		zap.Uint16("property_flags", propertyFlags),
-		zap.Int("header_payload_size", len(headerPayload)))
-
-	// Create header frame directly with serialized payload
 	headerFrame := &protocol.Frame{
 		Type:    protocol.FrameHeader,
 		Channel: channelID,
@@ -726,131 +620,88 @@ func (s *Server) sendBasicDeliver(conn *protocol.Connection, channelID uint16, c
 		Payload: headerPayload,
 	}
 
-	s.Log.Debug("Header frame created",
-		zap.String("consumer_tag", consumerTag))
+	maxFrameSize := uint32(s.Config.Server.MaxFrameSize)
+	bodyFrames := protocol.FragmentBodyIntoFrames(channelID, message.Body, maxFrameSize)
 
-	s.Log.Debug("Sending content header frame",
-		zap.String("consumer_tag", consumerTag),
-		zap.Uint16("channel_id", channelID),
-		zap.Uint64("body_size", contentHeader.BodySize))
+	totalBodySize := 0
+	for _, bf := range bodyFrames {
+		totalBodySize += 8 + len(bf.Payload)
+	}
 
-	// Prepare all frames for atomic transmission
-	s.Log.Debug("Preparing all frames for atomic transmission",
-		zap.String("consumer_tag", consumerTag),
-		zap.Uint16("channel_id", channelID))
-
-	// POOLED SERIALIZATION: Use pooled buffers to eliminate allocations
-	// This achieves 25.28GB allocation savings in high-throughput scenarios
-
-	// Serialize method frame with pooled buffer
-	methodFrameData, err := frame.MarshalBinaryPooled()
+	methodFrameData, err := methodFrame.MarshalBinaryPooled()
 	if err != nil {
-		s.Log.Error("Error serializing method frame", zap.Error(err))
-		return fmt.Errorf("error serializing method frame: %v", err)
+		return nil, fmt.Errorf("error serializing method frame: %v", err)
 	}
 	defer protocol.PutBufferForSize(&methodFrameData)
 
-	// Serialize header frame with pooled buffer
 	headerFrameData, err := headerFrame.MarshalBinaryPooled()
 	if err != nil {
-		s.Log.Error("Error serializing header frame", zap.Error(err))
-		return fmt.Errorf("error serializing header frame: %v", err)
+		return nil, fmt.Errorf("error serializing header frame: %v", err)
 	}
 	defer protocol.PutBufferForSize(&headerFrameData)
 
-	// Fragment body into AMQP-compliant frames (respecting maxFrameSize)
-	// This fixes the protocol violation for messages > 128KB
-	maxFrameSize := uint32(s.Config.Server.MaxFrameSize)
-	s.Log.Debug("Fragmenting body into frames",
-		zap.String("consumer_tag", consumerTag),
-		zap.Uint16("channel_id", channelID),
-		zap.Int("body_size", len(message.Body)),
-		zap.Uint32("max_frame_size", maxFrameSize))
-
-	bodyFrames := protocol.FragmentBodyIntoFrames(channelID, message.Body, maxFrameSize)
-
-	s.Log.Debug("Body fragmented",
-		zap.String("consumer_tag", consumerTag),
-		zap.Int("num_fragments", len(bodyFrames)))
-
-	// Pre-calculate total size for combined buffer
-	totalBodySize := 0
-	for _, frame := range bodyFrames {
-		// Each frame: 1 (type) + 2 (channel) + 4 (size) + payload + 1 (end)
-		totalBodySize += 8 + len(frame.Payload)
-	}
-
-	// Allocate combined buffer for atomic write (pooled for typical sizes, direct for large)
 	totalSize := len(methodFrameData) + len(headerFrameData) + totalBodySize
-	var allFramesBuf *[]byte
-	const maxPoolSize = 131 * 1024 // 128KB — largest pool tier
+
+	const maxPoolSize = 131 * 1024
+	var buf *[]byte
 	if totalSize > maxPoolSize {
 		b := make([]byte, 0, totalSize)
-		allFramesBuf = &b
+		buf = &b
 	} else {
-		allFramesBuf = protocol.GetBufferForSize(totalSize)
+		buf = protocol.GetBufferForSize(totalSize)
 	}
-	// Ensure buffer is returned to pool on all exit paths
-	defer func() {
-		if allFramesBuf != nil {
-			// Only return to pool if allFrames hasn't grown beyond the pool buffer
-			if cap(*allFramesBuf) <= maxPoolSize {
-				protocol.PutBufferForSize(allFramesBuf)
-			}
-			allFramesBuf = nil
-		}
-	}()
-	*allFramesBuf = append((*allFramesBuf)[:0], methodFrameData...)
-	*allFramesBuf = append(*allFramesBuf, headerFrameData...)
-	allFrames := *allFramesBuf
 
-	// Serialize body frames with pooled buffers and append to combined buffer
+	*buf = append((*buf)[:0], methodFrameData...)
+	*buf = append(*buf, headerFrameData...)
+
 	for i, bodyFrame := range bodyFrames {
 		bodyFrameData, err := bodyFrame.MarshalBinaryPooled()
 		if err != nil {
-			s.Log.Error("Error serializing body frame",
-				zap.Error(err),
-				zap.Int("fragment", i))
-			return fmt.Errorf("error serializing body frame %d: %v", i, err)
+			if cap(*buf) <= maxPoolSize {
+				protocol.PutBufferForSize(buf)
+			}
+			return nil, fmt.Errorf("error serializing body frame %d: %v", i, err)
 		}
-		allFrames = append(allFrames, bodyFrameData...)
-		protocol.PutBufferForSize(&bodyFrameData) // Return buffer to pool immediately
+		*buf = append(*buf, bodyFrameData...)
+		protocol.PutBufferForSize(&bodyFrameData)
 	}
 
-	s.Log.Debug("Writing all frames atomically",
-		zap.String("consumer_tag", consumerTag),
-		zap.Uint16("channel_id", channelID),
-		zap.Int("total_bytes", len(allFrames)),
-		zap.Int("method_frame_size", len(methodFrameData)),
-		zap.Int("header_frame_size", len(headerFrameData)),
-		zap.Int("body_frames_size", totalBodySize),
-		zap.Int("num_body_fragments", len(bodyFrames)))
+	return *buf, nil
+}
 
-	// Atomic write of all frames (method + header + N body fragments)
-	// Must hold WriteMutex to prevent interleaving with heartbeat frames
-	conn.WriteMutex.Lock()
-	_, err = conn.Conn.Write(allFrames)
-	conn.WriteMutex.Unlock()
+// sendBasicDeliver sends a basic.deliver method frame to a consumer.
+// Used for single-delivery paths (basic.get-ok, non-batched deliveries).
+func (s *Server) sendBasicDeliver(conn *protocol.Connection, channelID uint16, consumerTag string, deliveryTag uint64, redelivered bool, exchange, routingKey string, message *protocol.Message) error {
+	startTime := time.Now()
+	defer func() {
+		if s.MetricsCollector != nil {
+			duration := time.Since(startTime).Seconds()
+			s.MetricsCollector.RecordDeliveryLatency(duration)
+		}
+	}()
 
-	// allFramesBuf returned via defer above
+	data, err := s.serializeDelivery(channelID, consumerTag, deliveryTag, redelivered, exchange, routingKey, message)
 	if err != nil {
-		s.Log.Error("Error sending all frames atomically",
+		s.Log.Error("Failed to serialize delivery",
 			zap.Error(err),
 			zap.String("consumer_tag", consumerTag),
 			zap.Uint16("channel_id", channelID))
-		return fmt.Errorf("error sending frames atomically: %v", err)
+		return err
+	}
+	defer protocol.PutBufferForSize(&data)
+
+	conn.WriteMutex.Lock()
+	_, err = conn.Conn.Write(data)
+	conn.WriteMutex.Unlock()
+
+	if err != nil {
+		s.Log.Error("Error sending delivery frames",
+			zap.Error(err),
+			zap.String("consumer_tag", consumerTag),
+			zap.Uint16("channel_id", channelID))
+		return fmt.Errorf("error sending frames: %v", err)
 	}
 
-	s.Log.Debug("Sent all frames atomically",
-		zap.String("consumer_tag", consumerTag),
-		zap.Uint16("channel_id", channelID),
-		zap.Int("body_size", len(message.Body)))
-
-	s.Log.Debug("basic.deliver complete - all frames sent atomically",
-		zap.String("consumer_tag", consumerTag),
-		zap.Uint16("channel_id", channelID))
-
-	// Record message delivered metric (count and bytes)
 	if s.MetricsCollector != nil {
 		s.MetricsCollector.RecordMessageDelivered(len(message.Body))
 	}

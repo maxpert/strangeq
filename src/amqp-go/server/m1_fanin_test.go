@@ -64,6 +64,7 @@ func TestM1_FanInMultipleConsumers(t *testing.T) {
 
 	// Start the delivery loop
 	done := make(chan struct{})
+	conn.ConsumersDirty.Store(true)
 	go srv.consumerDeliveryLoop(conn, done)
 
 	// Give the loop time to discover consumers
@@ -155,6 +156,7 @@ func TestM1_FanInNoGoroutineLeak(t *testing.T) {
 
 	// Start the delivery loop
 	done := make(chan struct{})
+	conn.ConsumersDirty.Store(true)
 	go srv.consumerDeliveryLoop(conn, done)
 
 	// Give the loop time to discover consumers and start forwarders
@@ -228,6 +230,7 @@ func TestM1_FanInConsumerRemoval(t *testing.T) {
 	beforeGoroutines := runtime.NumGoroutine()
 
 	done := make(chan struct{})
+	conn.ConsumersDirty.Store(true)
 	go srv.consumerDeliveryLoop(conn, done)
 
 	// Give the loop time to discover the consumer and start a forwarder
@@ -237,6 +240,7 @@ func TestM1_FanInConsumerRemoval(t *testing.T) {
 	ch.Mutex.Lock()
 	delete(ch.Consumers, "consumer-x")
 	ch.Mutex.Unlock()
+	conn.ConsumersDirty.Store(true)
 
 	// Give the loop time to detect removal and stop the forwarder
 	time.Sleep(100 * time.Millisecond)
@@ -250,6 +254,7 @@ func TestM1_FanInConsumerRemoval(t *testing.T) {
 		Cancel:   make(chan struct{}),
 	}
 	ch.Mutex.Unlock()
+	conn.ConsumersDirty.Store(true)
 
 	// Give the loop time to discover the new consumer
 	time.Sleep(100 * time.Millisecond)

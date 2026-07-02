@@ -188,6 +188,67 @@ func TestConsumerPendingAcksIndex_SupersetInvariant(t *testing.T) {
 	}
 }
 
+// TestConsumerPendingAcksIndex_ReStoreRace is the focused regression test for
+// the pending-ack index lost-tag bug. It exercises the exact interleaving that
+// a non-atomic two-map index cannot tolerate: a re-Store (re-delivery after
+// requeue) racing a Delete (ack) on a tag that is ALREADY present in both maps.
+//
+// Without per-tag atomicity between StorePendingAck and DeletePendingAck the
+// following schedule loses the tag from the index while it survives in the
+// primary:
+//
+//  1. re-Store: index.Store(t)              // index has t
+//  2. Delete:   primary.LoadAndDelete(t) ok // primary loses t (old entry)
+//  3. Delete:   index.Delete(t)             // index loses t
+//  4. re-Store: primary.Store(t)            // primary has t, index does NOT
+//
+// Step 3 deletes the re-Store's index entry (same key), while step 4 lands the
+// re-Store's primary entry after the Delete already removed the old one. The
+// tag is now pending in the primary but invisible to GetConsumerPendingAcks.
+//
+// Every tag is pre-stored (a delivered, unacked message), then a re-Store in a
+// fresh goroutine races a synchronous Delete for that tag -- the broker's
+// ack-during-re-delivery window. assertIndexEqualsPrimary must hold at
+// quiescence. Run with -race.
+func TestConsumerPendingAcksIndex_ReStoreRace(t *testing.T) {
+	const consumers = 16
+	const raceTags = 100
+
+	ds := NewDisruptorStorage()
+	var wg sync.WaitGroup
+	ctag := func(c int) string { return fmt.Sprintf("R%d", c) }
+	dtag := func(c int, tag uint64) uint64 { return uint64(c)*100000 + tag }
+
+	// Pre-store every tag so it exists in both maps: a delivered, unacked msg.
+	for c := 0; c < consumers; c++ {
+		for tag := uint64(1); tag <= raceTags; tag++ {
+			require.NoError(t, ds.StorePendingAck(newTestPendingAck(ctag(c), dtag(c, tag))))
+		}
+	}
+
+	// Re-Store (re-delivery) in a fresh goroutine races Delete (ack) run
+	// synchronously in the loop -- one Store races one Delete per tag, on a
+	// tag that is already pending. This is the schedule above.
+	for c := 0; c < consumers; c++ {
+		c := c
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for tag := uint64(1); tag <= raceTags; tag++ {
+				t := dtag(c, tag)
+				wg.Add(1)
+				go func() {
+					defer wg.Done()
+					_ = ds.StorePendingAck(newTestPendingAck(ctag(c), t))
+				}()
+				_ = ds.DeletePendingAck("", t)
+			}
+		}()
+	}
+	wg.Wait()
+	assertIndexEqualsPrimary(t, ds)
+}
+
 // TestConsumerPendingAcksIndex_AdversarialNoRaces hammers the index with
 // repeated same-tag Store/Delete cycles that EXCEED the broker's per-tag
 // contract. The strong index==primary invariant is not claimed under this

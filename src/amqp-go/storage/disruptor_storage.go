@@ -13,6 +13,11 @@ import (
 const (
 	DefaultRingBufferSize        = 1024 * 256
 	DefaultSpillThresholdPercent = 80
+
+	// pendingAckShardCount is the number of striped locks used to make
+	// StorePendingAck and DeletePendingAck mutually exclusive for a given
+	// delivery tag. It is a power of two so deliveryTag&mask selects a shard.
+	pendingAckShardCount = 256
 )
 
 type StorageMetrics interface {
@@ -42,26 +47,41 @@ type DisruptorStorage struct {
 	// consumerPendingAcks is a secondary index over pendingAcks keyed by
 	// consumerTag -> *sync.Map{ deliveryTag -> *PendingAck }.
 	//
-	// Invariant: the index is always a SUPERSET of pendingAcks for any given
-	// consumer, so GetConsumerPendingAcks can transiently return an extra
-	// (already-acked) entry but can never drop a tag that is still pending.
-	// The invariant is maintained by write ordering:
-	//   - StorePendingAck writes the index BEFORE the primary map.
-	//   - DeletePendingAck deletes from the primary map BEFORE the index.
-	// The primary only gains a tag after the index already has it, and the
-	// index only loses a tag after the primary already lost it.
+	// Safety invariant: at all times the index is a SUPERSET of pendingAcks for
+	// every consumer, so GetConsumerPendingAcks can transiently observe an
+	// extra (already-acked) entry but can never drop a tag that is still
+	// pending. This keeps GetConsumerPendingAcks lock-free and O(M) in the
+	// consumer's own pending set instead of O(N) over the global map.
 	//
-	// This holds under the broker's per-delivery-tag contract: for a given tag,
-	// at most one Store races one Delete (the channel-send-then-ack window),
-	// and any re-Store of a tag (re-delivery after requeue) happens strictly
-	// after the prior Delete returns -- Requeue is called after DeletePendingAck
-	// in every reject/nack path, and StorePendingAck only runs in the dispatch
-	// loop once the requeued tag is claimed. The extra entries are benign: the
-	// multiple-ack read-then-delete loop calls DeletePendingAck, which is a
-	// no-op on a missing primary entry and reaps the orphan from the index.
-	// GetConsumerPendingAcks is thus O(M) in the consumer's own pending acks
-	// instead of O(N) over the global set.
+	// The invariant is enforced by making StorePendingAck and DeletePendingAck
+	// mutually exclusive FOR A GIVEN DELIVERY TAG. Each tag selects one shard of
+	// pendingAckShards (a striped lock set); both methods hold that shard's
+	// mutex across their entire two-map update, so the update is atomic with
+	// respect to any other Store/Delete of the SAME tag:
+	//   - StorePendingAck writes the index BEFORE the primary (under the shard
+	//     lock), so the primary only gains a tag after the index already has it.
+	//   - DeletePendingAck deletes from the primary BEFORE the index (under the
+	//     shard lock), so the index only loses a tag after the primary lost it.
+	//
+	// Same-tag atomicity rules out the lost-tag interleaving that a non-atomic
+	// two-map index suffers under re-delivery: a re-Store's index write can no
+	// longer be undone by a concurrent Delete's index delete while the
+	// re-Store's primary write lands after that Delete's primary delete. This
+	// holds even when a re-Store of a previously-stored tag (re-delivery after
+	// requeue) races the ack's Delete -- the two are serialized on the tag's
+	// shard, leaving the tag present in both maps or absent from both.
+	//
+	// Distinct tags may map to different shards and run concurrently, even when
+	// they share a consumer's inner *sync.Map; sync.Map handles concurrent
+	// distinct-key access and the per-tag invariant is independent. Reads
+	// (GetConsumerPendingAcks) only Range the inner sync.Map, which is safe
+	// concurrent with those writers and observes the superset at every instant.
 	consumerPendingAcks sync.Map
+
+	// pendingAckShards striped-locks the per-delivery-tag pending-ack updates
+	// (see consumerPendingAcks). Sharded by deliveryTag to bound contention
+	// while still serializing all operations on the same tag.
+	pendingAckShards [pendingAckShardCount]sync.Mutex
 
 	metrics StorageMetrics
 	dataDir string
@@ -688,8 +708,12 @@ func (ds *DisruptorStorage) StorePendingAck(pendingAck *protocol.PendingAck) err
 	if pendingAck == nil {
 		return nil
 	}
-	// Index first, then primary: preserves index-superset invariant even if a
-	// concurrent DeletePendingAck runs between these two steps (see struct doc).
+	// Hold the tag's shard across both map updates so the two-phase write is
+	// atomic w.r.t. any DeletePendingAck of the same tag. Index first, then
+	// primary: under the lock this preserves the index-superset invariant.
+	lock := ds.pendingAckLock(pendingAck.DeliveryTag)
+	lock.Lock()
+	defer lock.Unlock()
 	inner, _ := ds.consumerPendingAcks.LoadOrStore(pendingAck.ConsumerTag, &sync.Map{})
 	inner.(*sync.Map).Store(pendingAck.DeliveryTag, pendingAck)
 	ds.pendingAcks.Store(pendingAck.DeliveryTag, pendingAck)
@@ -704,11 +728,17 @@ func (ds *DisruptorStorage) GetPendingAck(queueName string, deliveryTag uint64) 
 }
 
 func (ds *DisruptorStorage) DeletePendingAck(queueName string, deliveryTag uint64) error {
-	// Primary first, then index: LoadAndDelete atomically retrieves the
-	// PendingAck (to learn its consumer tag) and removes it from the primary
-	// map. Only then do we delete from that consumer's index. If the primary
-	// entry is already gone (e.g. ack raced the store), this is a no-op and the
-	// index is left untouched -- preserving the index-superset invariant.
+	// Hold the tag's shard across both map updates so the two-phase delete is
+	// atomic w.r.t. any StorePendingAck of the same tag. Primary first, then
+	// index: LoadAndDelete atomically retrieves the PendingAck (to learn its
+	// consumer tag) and removes it from the primary; only then do we delete
+	// from that consumer's index, keeping the index a superset at all times.
+	// If the primary entry is already gone, this is a no-op and the index is
+	// left untouched (a stale extra entry is benign and reaped on a later
+	// delete of a re-stored tag, which is serialized on the same shard).
+	lock := ds.pendingAckLock(deliveryTag)
+	lock.Lock()
+	defer lock.Unlock()
 	val, ok := ds.pendingAcks.LoadAndDelete(deliveryTag)
 	if !ok {
 		return nil
@@ -718,6 +748,12 @@ func (ds *DisruptorStorage) DeletePendingAck(queueName string, deliveryTag uint6
 		inner.(*sync.Map).Delete(deliveryTag)
 	}
 	return nil
+}
+
+// pendingAckLock returns the striped mutex that serializes all pending-ack
+// index updates for a given delivery tag (see consumerPendingAcks doc).
+func (ds *DisruptorStorage) pendingAckLock(deliveryTag uint64) *sync.Mutex {
+	return &ds.pendingAckShards[deliveryTag&(pendingAckShardCount-1)]
 }
 
 func (ds *DisruptorStorage) GetQueuePendingAcks(queueName string) ([]*protocol.PendingAck, error) {
