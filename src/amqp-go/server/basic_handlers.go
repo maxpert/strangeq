@@ -7,6 +7,7 @@ import (
 	"github.com/maxpert/amqp-go/interfaces"
 	"github.com/maxpert/amqp-go/protocol"
 	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
 )
 
 func (s *Server) processBasicMethod(conn *protocol.Connection, channelID uint16, methodID uint16, payload []byte) error {
@@ -88,11 +89,13 @@ func (s *Server) handleBasicPublish(conn *protocol.Connection, channelID uint16,
 		return err
 	}
 
-	s.Log.Debug("Basic publish received",
-		zap.String("exchange", publishMethod.Exchange),
-		zap.String("routing_key", publishMethod.RoutingKey),
-		zap.Bool("mandatory", publishMethod.Mandatory),
-		zap.Bool("immediate", publishMethod.Immediate))
+	if ce := s.Log.Check(zapcore.DebugLevel, "Basic publish received"); ce != nil {
+		ce.Write(
+			zap.String("exchange", publishMethod.Exchange),
+			zap.String("routing_key", publishMethod.RoutingKey),
+			zap.Bool("mandatory", publishMethod.Mandatory),
+			zap.Bool("immediate", publishMethod.Immediate))
+	}
 
 	// Authorization check: basic.publish requires write permission on exchange
 	if err := s.authorize(conn, channelID, interfaces.Operation{
@@ -134,9 +137,9 @@ func (s *Server) handleBasicPublish(conn *protocol.Connection, channelID uint16,
 	// Store the pending message for this channel
 	conn.PendingMessages[channelID] = pendingMsg
 
-	s.Log.Debug("Started tracking pending message",
-		zap.Uint16("channel_id", channelID),
-		zap.String("connection_id", conn.ID))
+	if ce := s.Log.Check(zapcore.DebugLevel, "Started tracking pending message"); ce != nil {
+		ce.Write(zap.Uint16("channel_id", channelID), zap.String("connection_id", conn.ID))
+	}
 
 	return nil
 }
@@ -172,17 +175,19 @@ func (s *Server) processHeaderFrame(conn *protocol.Connection, frame *protocol.F
 		pendingMsg.Body = make([]byte, 0, contentHeader.BodySize)
 	}
 
-	s.Log.Debug("Content header received for pending message",
-		zap.String("exchange", pendingMsg.Method.Exchange),
-		zap.String("routing_key", pendingMsg.Method.RoutingKey),
-		zap.Uint64("body_size", contentHeader.BodySize))
+	if ce := s.Log.Check(zapcore.DebugLevel, "Content header received for pending message"); ce != nil {
+		ce.Write(
+			zap.String("exchange", pendingMsg.Method.Exchange),
+			zap.String("routing_key", pendingMsg.Method.RoutingKey),
+			zap.Uint64("body_size", contentHeader.BodySize))
+	}
 
 	// For empty messages (body_size = 0), no body frame will be sent
 	// We should process the complete message immediately
 	if contentHeader.BodySize == 0 {
-		s.Log.Debug("Empty message detected - processing immediately",
-			zap.String("exchange", pendingMsg.Method.Exchange),
-			zap.String("routing_key", pendingMsg.Method.RoutingKey))
+		if ce := s.Log.Check(zapcore.DebugLevel, "Empty message detected - processing immediately"); ce != nil {
+			ce.Write(zap.String("exchange", pendingMsg.Method.Exchange), zap.String("routing_key", pendingMsg.Method.RoutingKey))
+		}
 
 		// Remove the pending message from the map before processing
 		delete(conn.PendingMessages, frame.Channel)
@@ -223,10 +228,11 @@ func (s *Server) processBodyFrame(conn *protocol.Connection, frame *protocol.Fra
 	pendingMsg.Body = append(pendingMsg.Body, frame.Payload...)
 	pendingMsg.Received += uint64(len(frame.Payload))
 
-	s.Log.Debug("Body frame received for pending message",
-		zap.Uint16("channel", frame.Channel),
-		zap.Uint64("received", pendingMsg.Received),
-		zap.Uint64("expected", pendingMsg.Header.BodySize))
+	if ce := s.Log.Check(zapcore.DebugLevel, "Body frame received for pending message"); ce != nil {
+		ce.Write(zap.Uint16("channel", frame.Channel),
+			zap.Uint64("received", pendingMsg.Received),
+			zap.Uint64("expected", pendingMsg.Header.BodySize))
+	}
 
 	// Check if we've received the complete message
 	if pendingMsg.Received >= pendingMsg.Header.BodySize {
@@ -268,25 +274,17 @@ func (s *Server) processBodyFrame(conn *protocol.Connection, frame *protocol.Fra
 
 // processCompleteMessage processes a message that has been fully received (method + header + body)
 func (s *Server) processCompleteMessage(conn *protocol.Connection, channelID uint16, pendingMsg *protocol.PendingMessage) error {
-	// Track publish latency
-	startTime := time.Now()
-	defer func() {
-		if s.MetricsCollector != nil {
-			duration := time.Since(startTime).Seconds()
-			s.MetricsCollector.RecordPublishLatency(duration)
-		}
-	}()
+	if ce := s.Log.Check(zapcore.DebugLevel, "Processing complete message"); ce != nil {
+		ce.Write(zap.String("exchange", pendingMsg.Method.Exchange),
+			zap.String("routing_key", pendingMsg.Method.RoutingKey),
+			zap.Uint64("body_size", uint64(len(pendingMsg.Body))))
+	}
 
-	s.Log.Debug("Processing complete message",
-		zap.String("exchange", pendingMsg.Method.Exchange),
-		zap.String("routing_key", pendingMsg.Method.RoutingKey),
-		zap.Uint64("body_size", uint64(len(pendingMsg.Body))))
-
-	// Convert the pending message to a protocol.Message
-	s.Log.Debug("Creating message from pending message",
-		zap.String("content_type", pendingMsg.Header.ContentType),
-		zap.Int("body_size", len(pendingMsg.Body)),
-		zap.Uint16("property_flags", pendingMsg.Header.PropertyFlags))
+	if ce := s.Log.Check(zapcore.DebugLevel, "Creating message from pending message"); ce != nil {
+		ce.Write(zap.String("content_type", pendingMsg.Header.ContentType),
+			zap.Int("body_size", len(pendingMsg.Body)),
+			zap.Uint16("property_flags", pendingMsg.Header.PropertyFlags))
+	}
 
 	message := &protocol.Message{
 		Body:            pendingMsg.Body,
@@ -308,15 +306,15 @@ func (s *Server) processCompleteMessage(conn *protocol.Connection, channelID uin
 		ClusterID:       pendingMsg.Header.ClusterID,
 	}
 
-	// Route the message using the broker
-	// Track publish latency
-	publishStart := time.Now()
-	err := s.Broker.PublishMessage(message.Exchange, message.RoutingKey, message)
-	publishDuration := time.Since(publishStart).Seconds()
-
-	// Record publish latency metric
+	var publishStart time.Time
 	if s.MetricsCollector != nil {
-		s.MetricsCollector.RecordPublishLatency(publishDuration)
+		publishStart = time.Now()
+	}
+
+	err := s.Broker.PublishMessage(message.Exchange, message.RoutingKey, message)
+
+	if s.MetricsCollector != nil {
+		s.MetricsCollector.RecordPublishLatency(time.Since(publishStart).Seconds())
 	}
 
 	if err != nil {
@@ -327,14 +325,13 @@ func (s *Server) processCompleteMessage(conn *protocol.Connection, channelID uin
 		return err
 	}
 
-	// Record message published metric (count and bytes)
 	if s.MetricsCollector != nil {
 		s.MetricsCollector.RecordMessagePublished(len(message.Body))
 	}
 
-	s.Log.Debug("Message successfully routed",
-		zap.String("exchange", message.Exchange),
-		zap.String("routing_key", message.RoutingKey))
+	if ce := s.Log.Check(zapcore.DebugLevel, "Message successfully routed"); ce != nil {
+		ce.Write(zap.String("exchange", message.Exchange), zap.String("routing_key", message.RoutingKey))
+	}
 
 	return nil
 }

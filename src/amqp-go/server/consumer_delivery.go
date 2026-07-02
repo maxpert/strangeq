@@ -120,6 +120,9 @@ func (s *Server) consumerDeliveryLoop(conn *protocol.Connection, done chan struc
 	}
 	defer stopAllForwarders()
 
+	batch := make([]*protocol.Delivery, 0, maxBatchSize)
+	extras := make([]*protocol.Delivery, 0, maxBatchSize)
+
 	for {
 		if conn.Closed.Load() {
 			s.Log.Debug("Connection closed, stopping consumer delivery loop", zap.String("connection_id", conn.ID))
@@ -161,8 +164,9 @@ func (s *Server) consumerDeliveryLoop(conn *protocol.Connection, done chan struc
 			}
 
 			// Try to collect more messages from the fan-in channel (non-blocking)
-			batch := []*protocol.Delivery{delivery}
-			extras := make([]*protocol.Delivery, 0, maxBatchSize-1)
+			batch = batch[:0]
+			batch = append(batch, delivery)
+			extras = extras[:0]
 
 		draining:
 			for len(batch)+len(extras) < maxBatchSize {
@@ -207,13 +211,17 @@ func (s *Server) consumerDeliveryLoop(conn *protocol.Connection, done chan struc
 						zap.String("consumer_tag", extra.ConsumerTag),
 						zap.Int("remaining_extras", len(extras)-i))
 					conn.Closed.Store(true)
-					// Requeue only the failed extra and remaining unprocessed extras.
-					// Already-sent extras (0..i-1) were written to TCP successfully.
-					// Under at-least-once semantics, requeuing them would cause
-					// duplicate delivery for data the client may have already received.
 					s.requeueFailedDeliveries(nil, extras[i:])
 					return
 				}
+			}
+
+			// Clear references to avoid retaining Delivery pointers
+			for i := range batch {
+				batch[i] = nil
+			}
+			for i := range extras {
+				extras[i] = nil
 			}
 		}
 	}

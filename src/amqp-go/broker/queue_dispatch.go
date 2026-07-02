@@ -45,6 +45,8 @@ func (qs *QueueState) WaitForCapacity(stop <-chan struct{}) bool {
 	if !qs.AtHighWaterMark() {
 		return true
 	}
+	timer := time.NewTimer(10 * time.Millisecond)
+	defer timer.Stop()
 	for qs.AtHighWaterMark() {
 		if qs.closed.Load() {
 			return false
@@ -54,11 +56,18 @@ func (qs *QueueState) WaitForCapacity(stop <-chan struct{}) bool {
 			return false
 		default:
 		}
+		if !timer.Stop() {
+			select {
+			case <-timer.C:
+			default:
+			}
+		}
+		timer.Reset(10 * time.Millisecond)
 		select {
 		case <-qs.wake:
 		case <-stop:
 			return false
-		case <-time.After(10 * time.Millisecond):
+		case <-timer.C:
 		}
 	}
 	return !qs.closed.Load()
@@ -109,7 +118,7 @@ func (qs *QueueState) WakeAll() {
 	}
 }
 
-func (qs *QueueState) Claim(stop <-chan struct{}) (uint64, bool) {
+func (qs *QueueState) Claim(stop <-chan struct{}, timer *time.Timer) (uint64, bool) {
 	if t, ok := qs.tryPopRequeue(); ok {
 		return t, true
 	}
@@ -125,13 +134,13 @@ func (qs *QueueState) Claim(stop <-chan struct{}) (uint64, bool) {
 		if t2, ok := qs.tryPopRequeue(); ok {
 			return t2, true
 		}
-		if !qs.park(stop) {
+		if !qs.park(stop, timer) {
 			return 0, false
 		}
 	}
 }
 
-func (qs *QueueState) park(stop <-chan struct{}) bool {
+func (qs *QueueState) park(stop <-chan struct{}, timer *time.Timer) bool {
 	select {
 	case <-stop:
 		return false
@@ -145,6 +154,13 @@ func (qs *QueueState) park(stop <-chan struct{}) bool {
 		qs.parkedCount.Add(-1)
 		return true
 	}
+	if !timer.Stop() {
+		select {
+		case <-timer.C:
+		default:
+		}
+	}
+	timer.Reset(qs.parkTimeout)
 	select {
 	case <-qs.wake:
 		qs.parkedCount.Add(-1)
@@ -152,7 +168,7 @@ func (qs *QueueState) park(stop <-chan struct{}) bool {
 	case <-stop:
 		qs.parkedCount.Add(-1)
 		return false
-	case <-time.After(qs.parkTimeout):
+	case <-timer.C:
 		qs.parkedCount.Add(-1)
 		return true
 	}

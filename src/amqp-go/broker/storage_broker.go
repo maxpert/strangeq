@@ -165,20 +165,16 @@ func (b *StorageBroker) computeDepthHighWM() uint64 {
 // Stage 3: Deliver message with blocking send (provides TCP backpressure)
 func (b *StorageBroker) consumerPollLoop(state *ConsumerState, queueState *QueueState) {
 	defer close(state.done)
+	parkTimer := time.NewTimer(queueState.parkTimeout)
+	defer parkTimer.Stop()
 	for {
-		// STAGE 1: Acquire capacity permit (blocks if at prefetch limit)
-		// This eliminates CPU spinning when consumer is at capacity
 		if state.prefetchSem != nil {
 			if err := state.prefetchSem.Acquire(state.semCtx, 1); err != nil {
-				// Context cancelled (consumer unregistered)
 				return
 			}
 		}
 
-		// STAGE 2: Claim a delivery tag from the tail cursor.
-		// Parks (condvar) when tail >= head and the requeue ring is empty.
-		// Woken by Publish/Requeue/Recover. Returns false when stop fires.
-		tag, ok := queueState.Claim(state.stopCh)
+		tag, ok := queueState.Claim(state.stopCh, parkTimer)
 		if !ok {
 			// Consumer stopped, release unused permit and exit
 			if state.prefetchSem != nil {
@@ -220,11 +216,15 @@ func (b *StorageBroker) deliverMessage(queueState *QueueState, state *ConsumerSt
 
 	// Create pending ack record
 	pendingAck := &protocol.PendingAck{
-		QueueName:       state.queueName,
-		DeliveryTag:     msgID,
-		ConsumerTag:     state.consumer.Tag,
-		MessageID:       fmt.Sprintf("%s:%d", state.queueName, msgID),
-		DeliveredAt:     time.Now(),
+		QueueName:   state.queueName,
+		DeliveryTag: msgID,
+		ConsumerTag: state.consumer.Tag,
+		// DeliveredAt and MessageID intentionally omitted:
+		// - MessageID is never read in production (only in tests)
+		// - DeliveredAt is only read in crash recovery (recovery_manager.go),
+		//   and pending acks are in-memory only (not persisted), so
+		//   GetAllPendingAcks returns empty after restart. The IsZero()
+		//   guard in recovery skips the age check for zero-valued timestamps.
 		RedeliveryCount: 0,
 		Redelivered:     false,
 	}
@@ -783,22 +783,17 @@ func (b *StorageBroker) PublishMessage(exchangeName, routingKey string, message 
 // findTargetQueues determines which queues should receive the message
 // CRITICAL FIX: Check in-memory cache FIRST before falling back to storage
 func (b *StorageBroker) findTargetQueues(exchange *protocol.Exchange, routingKey string, message *protocol.Message) ([]string, error) {
-	var targetQueues []string
-
 	// For default exchange, route directly to queue with same name as routing key
 	if exchange.Name == "" {
-		// FIX: Check in-memory cache FIRST (lock-free)
 		if _, ok := b.activeQueues.Load(routingKey); ok {
-			targetQueues = append(targetQueues, routingKey)
-			return targetQueues, nil
+			return []string{routingKey}, nil
 		}
 
-		// Fallback to storage if not in cache
 		_, err := b.storage.GetQueue(routingKey)
 		if err == nil {
-			targetQueues = append(targetQueues, routingKey)
+			return []string{routingKey}, nil
 		}
-		return targetQueues, nil
+		return nil, nil
 	}
 
 	// Get all bindings for this exchange
@@ -806,6 +801,8 @@ func (b *StorageBroker) findTargetQueues(exchange *protocol.Exchange, routingKey
 	if err != nil {
 		return nil, fmt.Errorf("failed to get exchange bindings: %w", err)
 	}
+
+	targetQueues := make([]string, 0, len(bindings))
 
 	// Route based on exchange type
 	switch exchange.Kind {

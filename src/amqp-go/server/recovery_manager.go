@@ -310,29 +310,27 @@ func (r *RecoveryManager) recoverPendingAcknowledgments(stats *protocol.Recovery
 	// CRITICAL FIX: Rebuild global delivery index during crash recovery
 	// This ensures ACKs can be routed correctly after server restart
 	for _, pendingAck := range pendingAcks {
-		// Check if the acknowledgment is too old (potential zombie)
-		age := time.Since(pendingAck.DeliveredAt)
-		if age > expiredCutoff {
-			// Remove expired acknowledgment (don't rebuild index for it)
-			err := r.storage.DeletePendingAck(pendingAck.QueueName, pendingAck.DeliveryTag)
-			if err != nil {
-				r.logger.Warn("Failed to delete expired pending ack",
-					zap.String("queue", pendingAck.QueueName),
-					zap.Uint64("delivery_tag", pendingAck.DeliveryTag),
-					zap.Error(err))
+		if !pendingAck.DeliveredAt.IsZero() {
+			age := time.Since(pendingAck.DeliveredAt)
+			if age > expiredCutoff {
+				err := r.storage.DeletePendingAck(pendingAck.QueueName, pendingAck.DeliveryTag)
+				if err != nil {
+					r.logger.Warn("Failed to delete expired pending ack",
+						zap.String("queue", pendingAck.QueueName),
+						zap.Uint64("delivery_tag", pendingAck.DeliveryTag),
+						zap.Error(err))
+				}
+				continue
 			}
-			continue
 		}
 
-		// Rebuild global delivery index for this pending ack
 		r.broker.RebuildDeliveryIndex(pendingAck.DeliveryTag, pendingAck.ConsumerTag)
 
 		stats.PendingAcksRecovered++
 		r.logger.Debug("Recovered pending acknowledgment",
 			zap.String("queue", pendingAck.QueueName),
 			zap.String("consumer", pendingAck.ConsumerTag),
-			zap.Uint64("delivery_tag", pendingAck.DeliveryTag),
-			zap.Duration("age", age))
+			zap.Uint64("delivery_tag", pendingAck.DeliveryTag))
 	}
 
 	return nil
