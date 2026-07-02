@@ -980,10 +980,9 @@ func (b *StorageBroker) updateDurableMetadata() error {
 
 // AcknowledgeMessage handles message acknowledgment (lock-free hot path)
 func (b *StorageBroker) AcknowledgeMessage(consumerTag string, deliveryTag uint64, multiple bool) error {
-	// Load consumer state (lock-free)
 	val, ok := b.activeConsumers.Load(consumerTag)
 	if !ok {
-		return errors.New("consumer not found")
+		return nil
 	}
 	state := val.(*ConsumerState)
 
@@ -1054,10 +1053,9 @@ func (b *StorageBroker) AcknowledgeMessage(consumerTag string, deliveryTag uint6
 
 // RejectMessage handles message rejection (lock-free hot path)
 func (b *StorageBroker) RejectMessage(consumerTag string, deliveryTag uint64, requeue bool) error {
-	// Load consumer state (lock-free)
 	val, ok := b.activeConsumers.Load(consumerTag)
 	if !ok {
-		return errors.New("consumer not found")
+		return nil
 	}
 	state := val.(*ConsumerState)
 
@@ -1099,10 +1097,9 @@ func (b *StorageBroker) RejectMessage(consumerTag string, deliveryTag uint64, re
 
 // NacknowledgeMessage handles negative acknowledgment (lock-free hot path)
 func (b *StorageBroker) NacknowledgeMessage(consumerTag string, deliveryTag uint64, multiple, requeue bool) error {
-	// Load consumer state (lock-free)
 	val, ok := b.activeConsumers.Load(consumerTag)
 	if !ok {
-		return errors.New("consumer not found")
+		return nil
 	}
 	state := val.(*ConsumerState)
 

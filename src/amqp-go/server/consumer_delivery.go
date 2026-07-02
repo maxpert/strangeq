@@ -188,12 +188,14 @@ func (s *Server) consumerDeliveryLoop(conn *protocol.Connection, done chan struc
 					zap.Error(err),
 					zap.String("consumer_tag", delivery.ConsumerTag),
 					zap.Int("batch_size", len(batch)),
-					zap.Int("dropped_extras", len(extras)))
+					zap.Int("extras", len(extras)))
+				conn.Closed.Store(true)
+				s.requeueFailedDeliveries(batch, extras)
 				return
 			}
 
 			// Process any extras from other consumers
-			for _, extra := range extras {
+			for i, extra := range extras {
 				extraInfo, exists := consumerInfos[extra.ConsumerTag]
 				if !exists {
 					continue
@@ -203,10 +205,46 @@ func (s *Server) consumerDeliveryLoop(conn *protocol.Connection, done chan struc
 					s.Log.Error("Failed to send batched deliveries",
 						zap.Error(err),
 						zap.String("consumer_tag", extra.ConsumerTag),
-						zap.Int("remaining_extras", len(extras)-1))
+						zap.Int("remaining_extras", len(extras)-i))
+					conn.Closed.Store(true)
+					// Requeue only the failed extra and remaining unprocessed extras.
+					// Already-sent extras (0..i-1) were written to TCP successfully.
+					// Under at-least-once semantics, requeuing them would cause
+					// duplicate delivery for data the client may have already received.
+					s.requeueFailedDeliveries(nil, extras[i:])
 					return
 				}
 			}
 		}
+	}
+}
+
+// requeueFailedDeliveries requeues batch and extra deliveries after a TCP
+// write error. Each delivery is requeued via RejectMessage(consumerTag,
+// deliveryTag, true). The deliveryIndex.LoadAndDelete guard in RejectMessage
+// ensures no double-requeue with the connection teardown's UnregisterConsumer
+// cleanup (step 7), which also uses LoadAndDelete on the same index.
+func (s *Server) requeueFailedDeliveries(batch []*protocol.Delivery, extras []*protocol.Delivery) {
+	for _, d := range batch {
+		s.requeueSingleDelivery(d)
+	}
+	for _, d := range extras {
+		s.requeueSingleDelivery(d)
+	}
+}
+
+func (s *Server) requeueSingleDelivery(d *protocol.Delivery) {
+	if d == nil {
+		return
+	}
+	consumerTag, ok := s.Broker.GetConsumerForDelivery(d.DeliveryTag)
+	if !ok {
+		return
+	}
+	if err := s.Broker.RejectMessage(consumerTag, d.DeliveryTag, true); err != nil {
+		s.Log.Warn("Failed to requeue delivery on write error",
+			zap.Uint64("delivery_tag", d.DeliveryTag),
+			zap.String("consumer_tag", consumerTag),
+			zap.Error(err))
 	}
 }

@@ -106,9 +106,7 @@ func (s *Server) handleBasicPublish(conn *protocol.Connection, channelID uint16,
 
 	// RabbitMQ-style memory alarm: Log warning when queue usage is high but DO NOT close connection
 	// With 10GB threshold and BrokerV2 architecture, we prioritize connection stability over strict memory limits
-	conn.Mutex.RLock()
-	blocked := conn.Blocked
-	conn.Mutex.RUnlock()
+	blocked := conn.Blocked.Load()
 
 	if blocked {
 		// Log warning but continue processing to maintain connection stability
@@ -134,9 +132,7 @@ func (s *Server) handleBasicPublish(conn *protocol.Connection, channelID uint16,
 	}
 
 	// Store the pending message for this channel
-	conn.Mutex.Lock()
 	conn.PendingMessages[channelID] = pendingMsg
-	conn.Mutex.Unlock()
 
 	s.Log.Debug("Started tracking pending message",
 		zap.Uint16("channel_id", channelID),
@@ -147,9 +143,6 @@ func (s *Server) handleBasicPublish(conn *protocol.Connection, channelID uint16,
 
 // processHeaderFrame processes content header frames
 func (s *Server) processHeaderFrame(conn *protocol.Connection, frame *protocol.Frame) error {
-	conn.Mutex.Lock()
-	defer conn.Mutex.Unlock()
-
 	// Check if there's a pending message for this channel that needs a header
 	pendingMsg, exists := conn.PendingMessages[frame.Channel]
 	if !exists {
@@ -191,6 +184,9 @@ func (s *Server) processHeaderFrame(conn *protocol.Connection, frame *protocol.F
 			zap.String("exchange", pendingMsg.Method.Exchange),
 			zap.String("routing_key", pendingMsg.Method.RoutingKey))
 
+		// Remove the pending message from the map before processing
+		delete(conn.PendingMessages, frame.Channel)
+
 		// Process the complete message immediately
 		if err := s.processCompleteMessage(conn, frame.Channel, pendingMsg); err != nil {
 			s.Log.Error("Failed to process complete empty message",
@@ -199,9 +195,6 @@ func (s *Server) processHeaderFrame(conn *protocol.Connection, frame *protocol.F
 				zap.Uint16("channel", frame.Channel))
 			return err
 		}
-
-		// Remove the pending message from the map since it's now complete
-		delete(conn.PendingMessages, frame.Channel)
 	}
 
 	return nil
@@ -209,12 +202,9 @@ func (s *Server) processHeaderFrame(conn *protocol.Connection, frame *protocol.F
 
 // processBodyFrame processes content body frames
 func (s *Server) processBodyFrame(conn *protocol.Connection, frame *protocol.Frame) error {
-	conn.Mutex.Lock()
-
 	// Check if there's a pending message for this channel that needs body content
 	pendingMsg, exists := conn.PendingMessages[frame.Channel]
 	if !exists {
-		conn.Mutex.Unlock()
 		s.Log.Warn("Body frame received for channel with no pending message",
 			zap.Uint16("channel", frame.Channel),
 			zap.String("connection_id", conn.ID))
@@ -223,7 +213,6 @@ func (s *Server) processBodyFrame(conn *protocol.Connection, frame *protocol.Fra
 
 	// Check if we have a header for this message
 	if pendingMsg.Header == nil {
-		conn.Mutex.Unlock()
 		s.Log.Warn("Body frame received before header frame",
 			zap.Uint16("channel", frame.Channel),
 			zap.String("connection_id", conn.ID))
@@ -257,33 +246,23 @@ func (s *Server) processBodyFrame(conn *protocol.Connection, frame *protocol.Fra
 			pendingMsg.Body = pendingMsg.Body[:pendingMsg.Received]
 		}
 
-		// Remove the pending message from the map BEFORE processing
-		// to avoid holding the connection lock during potentially blocking operations
+		// Remove the pending message from the map before processing
 		delete(conn.PendingMessages, frame.Channel)
 
-		// Make a copy of the message for processing
-		msgCopy := *pendingMsg
-		channelCopy := frame.Channel
-
-		// Release connection lock before potentially blocking broker operations
-		conn.Mutex.Unlock()
-
-		// Process the complete message synchronously
+		// Process the complete message synchronously.
 		// With reader/processor separation, the frame reader remains responsive
 		// even if this blocks, because we process frames from FrameQueue
-		if err := s.processCompleteMessage(conn, channelCopy, &msgCopy); err != nil {
+		if err := s.processCompleteMessage(conn, frame.Channel, pendingMsg); err != nil {
 			s.Log.Error("Failed to process complete message",
 				zap.Error(err),
 				zap.String("connection_id", conn.ID),
-				zap.Uint16("channel", channelCopy))
+				zap.Uint16("channel", frame.Channel))
 			return err
 		}
 
 		return nil
 	}
 
-	// Message not complete yet, unlock and wait for more body frames
-	conn.Mutex.Unlock()
 	return nil
 }
 
@@ -733,10 +712,10 @@ func (s *Server) handleBasicAck(conn *protocol.Connection, channelID uint16, pay
 	// This fixes the broken random consumer lookup that caused 95% of ACKs to route incorrectly
 	consumerTag, ok := s.Broker.GetConsumerForDelivery(ackMethod.DeliveryTag)
 	if !ok {
-		s.Log.Warn("Could not find consumer for acknowledgment",
+		s.Log.Debug("Delivery tag already processed (consumer cancelled?)",
 			zap.Uint64("delivery_tag", ackMethod.DeliveryTag),
 			zap.Uint16("channel_id", channelID))
-		return fmt.Errorf("delivery tag %d not found", ackMethod.DeliveryTag)
+		return nil
 	}
 
 	// Tell the broker to acknowledge the message
@@ -780,10 +759,10 @@ func (s *Server) handleBasicReject(conn *protocol.Connection, channelID uint16, 
 	// CRITICAL FIX: Use global delivery index for O(1) consumer lookup
 	consumerTag, ok := s.Broker.GetConsumerForDelivery(rejectMethod.DeliveryTag)
 	if !ok {
-		s.Log.Warn("Could not find consumer for rejection",
+		s.Log.Debug("Delivery tag already processed (consumer cancelled?)",
 			zap.Uint64("delivery_tag", rejectMethod.DeliveryTag),
 			zap.Uint16("channel_id", channelID))
-		return fmt.Errorf("delivery tag %d not found", rejectMethod.DeliveryTag)
+		return nil
 	}
 
 	// Tell the broker to reject the message
@@ -828,10 +807,10 @@ func (s *Server) handleBasicNack(conn *protocol.Connection, channelID uint16, pa
 	// CRITICAL FIX: Use global delivery index for O(1) consumer lookup
 	consumerTag, ok := s.Broker.GetConsumerForDelivery(nackMethod.DeliveryTag)
 	if !ok {
-		s.Log.Warn("Could not find consumer for nack",
+		s.Log.Debug("Delivery tag already processed (consumer cancelled?)",
 			zap.Uint64("delivery_tag", nackMethod.DeliveryTag),
 			zap.Uint16("channel_id", channelID))
-		return fmt.Errorf("delivery tag %d not found", nackMethod.DeliveryTag)
+		return nil
 	}
 
 	// Tell the broker to nack the message

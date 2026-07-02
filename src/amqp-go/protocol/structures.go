@@ -18,14 +18,14 @@ type Connection struct {
 	Vhost           string                     // Virtual host for this connection
 	Username        string                     // Authenticated username
 	User            interface{}                // Authenticated *interfaces.User (interface{} to avoid import cycle; set once during handshake, immutable thereafter)
-	PendingMessages map[uint16]*PendingMessage // Track messages being published on each channel
-	FrameQueue      chan *Frame                // Buffer frames between reader and processor goroutines
-	AckQueue        chan *Frame                // Buffer ACK/NACK/Reject frames for the ack worker goroutine
-	Mutex           sync.RWMutex               // Protects connection state
-	WriteMutex      sync.Mutex                 // Protects socket writes (heartbeat sender + frame processor both write)
-	Closed          atomic.Bool                // Atomic flag for connection closure
-	ConsumersDirty  atomic.Bool                // Set when consumers are added/removed; delivery loop re-scans only when true
-	Blocked         bool                       // Back-pressure flag: true when queue usage > 90%, false when < 80%
+	PendingMessages map[uint16]*PendingMessage // Track messages being published on each channel.
+	// SINGLE-WRITER: accessed only by the processFrames goroutine. No mutex needed.
+	FrameQueue     chan *Frame // Buffer frames between reader and processor goroutines
+	AckQueue       chan *Frame // Buffer ACK/NACK/Reject frames for the ack worker goroutine
+	WriteMutex     sync.Mutex  // Protects socket writes (heartbeat sender + frame processor both write)
+	Closed         atomic.Bool // Atomic flag for connection closure
+	ConsumersDirty atomic.Bool // Set when consumers are added/removed; delivery loop re-scans only when true
+	Blocked        atomic.Bool // Back-pressure flag: true when queue usage > 90%, false when < 80%
 }
 
 // NewConnection creates a new AMQP connection
