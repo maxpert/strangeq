@@ -26,20 +26,20 @@ type PublishCall struct {
 }
 
 type AckCall struct {
-	QueueName   string
+	ConsumerTag string
 	DeliveryTag uint64
 	Multiple    bool
 }
 
 type NackCall struct {
-	QueueName   string
+	ConsumerTag string
 	DeliveryTag uint64
 	Multiple    bool
 	Requeue     bool
 }
 
 type RejectCall struct {
-	QueueName   string
+	ConsumerTag string
 	DeliveryTag uint64
 	Requeue     bool
 }
@@ -56,24 +56,24 @@ func (m *MockExecutor) ExecutePublish(exchange, routingKey string, message *prot
 	return nil
 }
 
-func (m *MockExecutor) ExecuteAck(queueName string, deliveryTag uint64, multiple bool) error {
+func (m *MockExecutor) ExecuteAck(consumerTag string, deliveryTag uint64, multiple bool) error {
 	if m.fail && m.failOn == "ack" {
 		return assert.AnError
 	}
 	m.acks = append(m.acks, AckCall{
-		QueueName:   queueName,
+		ConsumerTag: consumerTag,
 		DeliveryTag: deliveryTag,
 		Multiple:    multiple,
 	})
 	return nil
 }
 
-func (m *MockExecutor) ExecuteNack(queueName string, deliveryTag uint64, multiple, requeue bool) error {
+func (m *MockExecutor) ExecuteNack(consumerTag string, deliveryTag uint64, multiple, requeue bool) error {
 	if m.fail && m.failOn == "nack" {
 		return assert.AnError
 	}
 	m.nacks = append(m.nacks, NackCall{
-		QueueName:   queueName,
+		ConsumerTag: consumerTag,
 		DeliveryTag: deliveryTag,
 		Multiple:    multiple,
 		Requeue:     requeue,
@@ -81,12 +81,12 @@ func (m *MockExecutor) ExecuteNack(queueName string, deliveryTag uint64, multipl
 	return nil
 }
 
-func (m *MockExecutor) ExecuteReject(queueName string, deliveryTag uint64, requeue bool) error {
+func (m *MockExecutor) ExecuteReject(consumerTag string, deliveryTag uint64, requeue bool) error {
 	if m.fail && m.failOn == "reject" {
 		return assert.AnError
 	}
 	m.rejects = append(m.rejects, RejectCall{
-		QueueName:   queueName,
+		ConsumerTag: consumerTag,
 		DeliveryTag: deliveryTag,
 		Requeue:     requeue,
 	})
@@ -220,7 +220,7 @@ func TestTransactionManagerCommit(t *testing.T) {
 	assert.Equal(t, "test.key", executor.publishes[0].RoutingKey)
 
 	assert.Len(t, executor.acks, 1)
-	assert.Equal(t, "test.queue", executor.acks[0].QueueName)
+	assert.Equal(t, "test.queue", executor.acks[0].ConsumerTag)
 	assert.Equal(t, uint64(123), executor.acks[0].DeliveryTag)
 
 	// Transaction should be back to active state (still in transactional mode)
@@ -437,20 +437,20 @@ func TestTransactionOperationHelpers(t *testing.T) {
 
 	ackOp := NewAckOperation("queue", 123, true)
 	assert.Equal(t, interfaces.OpAck, ackOp.Type)
-	assert.Equal(t, "queue", ackOp.QueueName)
+	assert.Equal(t, "queue", ackOp.ConsumerTag)
 	assert.Equal(t, uint64(123), ackOp.DeliveryTag)
 	assert.True(t, ackOp.Multiple)
 
 	nackOp := NewNackOperation("queue", 124, true, false)
 	assert.Equal(t, interfaces.OpNack, nackOp.Type)
-	assert.Equal(t, "queue", nackOp.QueueName)
+	assert.Equal(t, "queue", nackOp.ConsumerTag)
 	assert.Equal(t, uint64(124), nackOp.DeliveryTag)
 	assert.True(t, nackOp.Multiple)
 	assert.False(t, nackOp.Requeue)
 
 	rejectOp := NewRejectOperation("queue", 125, true)
 	assert.Equal(t, interfaces.OpReject, rejectOp.Type)
-	assert.Equal(t, "queue", rejectOp.QueueName)
+	assert.Equal(t, "queue", rejectOp.ConsumerTag)
 	assert.Equal(t, uint64(125), rejectOp.DeliveryTag)
 	assert.True(t, rejectOp.Requeue)
 }

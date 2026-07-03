@@ -39,6 +39,14 @@ func (a *StorageBrokerAdapter) UnbindQueue(queueName, exchangeName, routingKey s
 	return a.broker.UnbindQueue(queueName, exchangeName, routingKey)
 }
 
+func (a *StorageBrokerAdapter) BindExchange(destination, source, routingKey string, arguments map[string]interface{}) error {
+	return a.broker.BindExchange(destination, source, routingKey, arguments)
+}
+
+func (a *StorageBrokerAdapter) UnbindExchange(destination, source, routingKey string) error {
+	return a.broker.UnbindExchange(destination, source, routingKey)
+}
+
 func (a *StorageBrokerAdapter) PublishMessage(exchangeName, routingKey string, message *protocol.Message) error {
 	return a.broker.PublishMessage(exchangeName, routingKey, message)
 }

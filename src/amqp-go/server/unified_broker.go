@@ -16,6 +16,8 @@ type UnifiedBroker interface {
 	// Binding operations
 	BindQueue(queueName, exchangeName, routingKey string, arguments map[string]interface{}) error
 	UnbindQueue(queueName, exchangeName, routingKey string) error
+	BindExchange(destination, source, routingKey string, arguments map[string]interface{}) error
+	UnbindExchange(destination, source, routingKey string) error
 
 	// Message operations
 	PublishMessage(exchangeName, routingKey string, message *protocol.Message) error

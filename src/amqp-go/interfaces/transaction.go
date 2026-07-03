@@ -20,7 +20,7 @@ type TransactionOperation struct {
 	Exchange    string
 	RoutingKey  string
 	Message     *protocol.Message
-	QueueName   string
+	ConsumerTag string
 	DeliveryTag uint64
 	Multiple    bool
 	Requeue     bool
@@ -73,13 +73,13 @@ type TransactionExecutor interface {
 	ExecutePublish(exchange, routingKey string, message *protocol.Message) error
 
 	// ExecuteAck executes a message acknowledgment operation
-	ExecuteAck(queueName string, deliveryTag uint64, multiple bool) error
+	ExecuteAck(consumerTag string, deliveryTag uint64, multiple bool) error
 
 	// ExecuteNack executes a negative acknowledgment operation
-	ExecuteNack(queueName string, deliveryTag uint64, multiple, requeue bool) error
+	ExecuteNack(consumerTag string, deliveryTag uint64, multiple, requeue bool) error
 
 	// ExecuteReject executes a message rejection operation
-	ExecuteReject(queueName string, deliveryTag uint64, requeue bool) error
+	ExecuteReject(consumerTag string, deliveryTag uint64, requeue bool) error
 }
 
 // TransactionManager coordinates transaction operations with the broker

@@ -61,9 +61,14 @@ func (s *Server) sendExchangeDeleteOK(conn *protocol.Connection, channelID uint1
 	return s.sendMethodResponse(conn, channelID, 40, 21, &protocol.ExchangeDeleteOKMethod{})
 }
 
+// sendExchangeBindOK sends the exchange.bind-ok method frame
+func (s *Server) sendExchangeBindOK(conn *protocol.Connection, channelID uint16) error {
+	return s.sendMethodResponse(conn, channelID, 40, 31, &protocol.ExchangeBindOKMethod{})
+}
+
 // sendExchangeUnbindOK sends the exchange.unbind-ok method frame
 func (s *Server) sendExchangeUnbindOK(conn *protocol.Connection, channelID uint16) error {
-	return s.sendMethodResponse(conn, channelID, 40, 51, &protocol.ExchangeUnbindOKMethod{})
+	return s.sendMethodResponse(conn, channelID, 40, 41, &protocol.ExchangeUnbindOKMethod{})
 }
 
 // sendQueueDeclareOK sends the queue.declare-ok method frame

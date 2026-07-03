@@ -14,13 +14,14 @@ import (
 )
 
 const (
-	MetadataDir       = "metadata"
-	ExchangesDir      = "exchanges"
-	QueuesDir         = "queues"
-	BindingsDir       = "bindings"
-	ConsumersDir      = "consumers"
-	FileExtension     = ".cbor"
-	TempFileExtension = ".tmp"
+	MetadataDir         = "metadata"
+	ExchangesDir        = "exchanges"
+	QueuesDir           = "queues"
+	BindingsDir         = "bindings"
+	ExchangeBindingsDir = "exchange_bindings"
+	ConsumersDir        = "consumers"
+	FileExtension       = ".cbor"
+	TempFileExtension   = ".tmp"
 )
 
 // PersistentMetadataStore implements persistent metadata storage using CBOR binary format
@@ -41,6 +42,10 @@ type PersistentMetadataStore struct {
 	queueBindingsCache    sync.Map // queueName -> []*interfaces.QueueBinding
 	exchangeBindingsCache sync.Map // exchangeName -> []*interfaces.QueueBinding
 
+	// Exchange-to-exchange binding cache
+	exchBindingCache      sync.Map // "source:dest:key" -> *interfaces.ExchangeBinding
+	exchBindingsFromCache sync.Map // source -> []*interfaces.ExchangeBinding
+
 	cacheEnabled bool
 }
 
@@ -53,6 +58,7 @@ func NewPersistentMetadataStore(dataDir string) (*PersistentMetadataStore, error
 		filepath.Join(baseDir, ExchangesDir),
 		filepath.Join(baseDir, QueuesDir),
 		filepath.Join(baseDir, BindingsDir),
+		filepath.Join(baseDir, ExchangeBindingsDir),
 		filepath.Join(baseDir, ConsumersDir),
 	}
 
@@ -127,6 +133,19 @@ func (pm *PersistentMetadataStore) loadCacheFromDisk() {
 		}
 		for exchangeName, bindings := range exchangeBindings {
 			pm.exchangeBindingsCache.Store(exchangeName, bindings)
+		}
+
+		// Load all exchange-to-exchange bindings into cache
+		if exchBindings, err := pm.loadExchangeBindingsFromDisk(); err == nil {
+			fromIndex := make(map[string][]*interfaces.ExchangeBinding)
+			for _, eb := range exchBindings {
+				cacheKey := makeExchangeBindingCacheKey(eb.Source, eb.Destination, eb.RoutingKey)
+				pm.exchBindingCache.Store(cacheKey, eb)
+				fromIndex[eb.Source] = append(fromIndex[eb.Source], eb)
+			}
+			for source, bindings := range fromIndex {
+				pm.exchBindingsFromCache.Store(source, bindings)
+			}
 		}
 	}
 }
@@ -631,6 +650,146 @@ func (pm *PersistentMetadataStore) GetExchangeBindings(exchangeName string) ([]*
 	// Update cache with result (Phase 6H)
 	if pm.cacheEnabled {
 		pm.exchangeBindingsCache.Store(exchangeName, result)
+	}
+
+	return result, nil
+}
+
+// makeExchangeBindingCacheKey creates a unique cache key for an exchange-to-exchange binding
+func makeExchangeBindingCacheKey(source, destination, routingKey string) string {
+	return fmt.Sprintf("%s:%s:%s", source, destination, routingKey)
+}
+
+// makeExchangeBindingFilename creates a unique filename for an exchange-to-exchange binding
+func makeExchangeBindingFilename(source, destination, routingKey string) string {
+	safe := func(s string) string {
+		s = strings.ReplaceAll(s, "/", "_")
+		s = strings.ReplaceAll(s, "\\", "_")
+		s = strings.ReplaceAll(s, ":", "_")
+		s = strings.ReplaceAll(s, "*", "_")
+		s = strings.ReplaceAll(s, "?", "_")
+		s = strings.ReplaceAll(s, "<", "_")
+		s = strings.ReplaceAll(s, ">", "_")
+		s = strings.ReplaceAll(s, "|", "_")
+		return s
+	}
+
+	return fmt.Sprintf("%s_%s_%s%s",
+		safe(source),
+		safe(destination),
+		safe(routingKey),
+		FileExtension)
+}
+
+// loadExchangeBindingsFromDisk loads all exchange-to-exchange bindings from disk
+func (pm *PersistentMetadataStore) loadExchangeBindingsFromDisk() ([]*interfaces.ExchangeBinding, error) {
+	dir := filepath.Join(pm.baseDir, ExchangeBindingsDir)
+	files, err := os.ReadDir(dir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return []*interfaces.ExchangeBinding{}, nil
+		}
+		return nil, fmt.Errorf("failed to read exchange bindings directory: %w", err)
+	}
+
+	bindings := make([]*interfaces.ExchangeBinding, 0, len(files))
+	for _, file := range files {
+		if file.IsDir() || !strings.HasSuffix(file.Name(), FileExtension) {
+			continue
+		}
+
+		path := filepath.Join(dir, file.Name())
+		data, err := os.ReadFile(path)
+		if err != nil {
+			continue
+		}
+
+		var binding interfaces.ExchangeBinding
+		if err := cbor.Unmarshal(data, &binding); err != nil {
+			continue
+		}
+
+		bindings = append(bindings, &binding)
+	}
+
+	return bindings, nil
+}
+
+// StoreExchangeBinding persists an exchange-to-exchange binding to disk and updates cache
+func (pm *PersistentMetadataStore) StoreExchangeBinding(source, destination, routingKey string, arguments map[string]interface{}) error {
+	pm.mutex.Lock()
+	defer pm.mutex.Unlock()
+
+	binding := &interfaces.ExchangeBinding{
+		Source:      source,
+		Destination: destination,
+		RoutingKey:  routingKey,
+		Arguments:   arguments,
+	}
+
+	data, err := cbor.Marshal(binding)
+	if err != nil {
+		return fmt.Errorf("failed to marshal exchange binding: %w", err)
+	}
+
+	filename := makeExchangeBindingFilename(source, destination, routingKey)
+	path := filepath.Join(pm.baseDir, ExchangeBindingsDir, filename)
+	if err := pm.atomicWrite(path, data); err != nil {
+		return err
+	}
+
+	if pm.cacheEnabled {
+		cacheKey := makeExchangeBindingCacheKey(source, destination, routingKey)
+		pm.exchBindingCache.Store(cacheKey, binding)
+		pm.exchBindingsFromCache.Delete(source)
+	}
+
+	return nil
+}
+
+// DeleteExchangeBinding removes an exchange-to-exchange binding from disk and cache
+func (pm *PersistentMetadataStore) DeleteExchangeBinding(source, destination, routingKey string) error {
+	pm.mutex.Lock()
+	defer pm.mutex.Unlock()
+
+	filename := makeExchangeBindingFilename(source, destination, routingKey)
+	path := filepath.Join(pm.baseDir, ExchangeBindingsDir, filename)
+
+	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("failed to delete exchange binding file: %w", err)
+	}
+
+	if pm.cacheEnabled {
+		cacheKey := makeExchangeBindingCacheKey(source, destination, routingKey)
+		pm.exchBindingCache.Delete(cacheKey)
+		pm.exchBindingsFromCache.Delete(source)
+	}
+
+	return nil
+}
+
+// GetExchangeBindingsFrom returns all exchange-to-exchange bindings from the given source exchange
+func (pm *PersistentMetadataStore) GetExchangeBindingsFrom(source string) ([]*interfaces.ExchangeBinding, error) {
+	if pm.cacheEnabled {
+		if cached, ok := pm.exchBindingsFromCache.Load(source); ok {
+			return cached.([]*interfaces.ExchangeBinding), nil
+		}
+	}
+
+	allBindings, err := pm.loadExchangeBindingsFromDisk()
+	if err != nil {
+		return nil, err
+	}
+
+	result := make([]*interfaces.ExchangeBinding, 0)
+	for _, binding := range allBindings {
+		if binding.Source == source {
+			result = append(result, binding)
+		}
+	}
+
+	if pm.cacheEnabled {
+		pm.exchBindingsFromCache.Store(source, result)
 	}
 
 	return result, nil

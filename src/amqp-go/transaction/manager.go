@@ -260,19 +260,19 @@ func (tm *DefaultTransactionManager) executeSequentially(operations []*interface
 			}
 
 		case interfaces.OpAck:
-			err := tm.executor.ExecuteAck(op.QueueName, op.DeliveryTag, op.Multiple)
+			err := tm.executor.ExecuteAck(op.ConsumerTag, op.DeliveryTag, op.Multiple)
 			if err != nil {
 				return fmt.Errorf("failed to execute ack: %w", err)
 			}
 
 		case interfaces.OpNack:
-			err := tm.executor.ExecuteNack(op.QueueName, op.DeliveryTag, op.Multiple, op.Requeue)
+			err := tm.executor.ExecuteNack(op.ConsumerTag, op.DeliveryTag, op.Multiple, op.Requeue)
 			if err != nil {
 				return fmt.Errorf("failed to execute nack: %w", err)
 			}
 
 		case interfaces.OpReject:
-			err := tm.executor.ExecuteReject(op.QueueName, op.DeliveryTag, op.Requeue)
+			err := tm.executor.ExecuteReject(op.ConsumerTag, op.DeliveryTag, op.Requeue)
 			if err != nil {
 				return fmt.Errorf("failed to execute reject: %w", err)
 			}
@@ -336,29 +336,29 @@ func NewPublishOperation(exchange, routingKey string, message *protocol.Message)
 	}
 }
 
-func NewAckOperation(queueName string, deliveryTag uint64, multiple bool) *interfaces.TransactionOperation {
+func NewAckOperation(consumerTag string, deliveryTag uint64, multiple bool) *interfaces.TransactionOperation {
 	return &interfaces.TransactionOperation{
 		Type:        interfaces.OpAck,
-		QueueName:   queueName,
+		ConsumerTag: consumerTag,
 		DeliveryTag: deliveryTag,
 		Multiple:    multiple,
 	}
 }
 
-func NewNackOperation(queueName string, deliveryTag uint64, multiple, requeue bool) *interfaces.TransactionOperation {
+func NewNackOperation(consumerTag string, deliveryTag uint64, multiple, requeue bool) *interfaces.TransactionOperation {
 	return &interfaces.TransactionOperation{
 		Type:        interfaces.OpNack,
-		QueueName:   queueName,
+		ConsumerTag: consumerTag,
 		DeliveryTag: deliveryTag,
 		Multiple:    multiple,
 		Requeue:     requeue,
 	}
 }
 
-func NewRejectOperation(queueName string, deliveryTag uint64, requeue bool) *interfaces.TransactionOperation {
+func NewRejectOperation(consumerTag string, deliveryTag uint64, requeue bool) *interfaces.TransactionOperation {
 	return &interfaces.TransactionOperation{
 		Type:        interfaces.OpReject,
-		QueueName:   queueName,
+		ConsumerTag: consumerTag,
 		DeliveryTag: deliveryTag,
 		Requeue:     requeue,
 	}

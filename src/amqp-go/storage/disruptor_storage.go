@@ -579,6 +579,27 @@ func (ds *DisruptorStorage) GetExchangeBindings(exchangeName string) ([]*interfa
 	return ds.metadataStore.GetExchangeBindings(exchangeName)
 }
 
+func (ds *DisruptorStorage) StoreExchangeBinding(source, destination, routingKey string, arguments map[string]interface{}) error {
+	if ds.metadataStore == nil {
+		return fmt.Errorf("metadata store not initialized")
+	}
+	return ds.metadataStore.StoreExchangeBinding(source, destination, routingKey, arguments)
+}
+
+func (ds *DisruptorStorage) DeleteExchangeBinding(source, destination, routingKey string) error {
+	if ds.metadataStore == nil {
+		return fmt.Errorf("metadata store not initialized")
+	}
+	return ds.metadataStore.DeleteExchangeBinding(source, destination, routingKey)
+}
+
+func (ds *DisruptorStorage) GetExchangeBindingsFrom(source string) ([]*interfaces.ExchangeBinding, error) {
+	if ds.metadataStore == nil {
+		return nil, fmt.Errorf("metadata store not initialized")
+	}
+	return ds.metadataStore.GetExchangeBindingsFrom(source)
+}
+
 func (ds *DisruptorStorage) StoreConsumer(queueName, consumerTag string, consumer *protocol.Consumer) error {
 	if ds.metadataStore == nil {
 		return fmt.Errorf("metadata store not initialized")

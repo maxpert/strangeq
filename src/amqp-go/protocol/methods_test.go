@@ -292,6 +292,74 @@ func TestExchangeMethodsSerialization(t *testing.T) {
 		method := &ExchangeDeleteOKMethod{}
 		testMethodSerialization(t, "ExchangeDeleteOK", 40, 21, method.Serialize)
 	})
+
+	t.Run("ExchangeBind", func(t *testing.T) {
+		method := &ExchangeBindMethod{
+			Reserved1:   0,
+			Destination: "dest-exchange",
+			Source:      "src-exchange",
+			RoutingKey:  "routing.key",
+			NoWait:      false,
+			Arguments:   map[string]interface{}{},
+		}
+		testMethodSerialization(t, "ExchangeBind", 40, 30, method.Serialize)
+	})
+
+	t.Run("ExchangeBindOK", func(t *testing.T) {
+		method := &ExchangeBindOKMethod{}
+		testMethodSerialization(t, "ExchangeBindOK", 40, 31, method.Serialize)
+	})
+
+	t.Run("ExchangeUnbind", func(t *testing.T) {
+		method := &ExchangeUnbindMethod{
+			Reserved1:   0,
+			Destination: "dest-exchange",
+			Source:      "src-exchange",
+			RoutingKey:  "routing.key",
+			NoWait:      false,
+			Arguments:   map[string]interface{}{},
+		}
+		testMethodSerialization(t, "ExchangeUnbind", 40, 40, method.Serialize)
+	})
+
+	t.Run("ExchangeUnbindOK", func(t *testing.T) {
+		method := &ExchangeUnbindOKMethod{}
+		testMethodSerialization(t, "ExchangeUnbindOK", 40, 41, method.Serialize)
+	})
+}
+
+func TestExchangeBindMethodSerializeDeserialize(t *testing.T) {
+	original := &ExchangeBindMethod{
+		Reserved1:   0,
+		Destination: "dest-exchange",
+		Source:      "src-exchange",
+		RoutingKey:  "routing.key",
+		NoWait:      true,
+		Arguments:   map[string]interface{}{"x-key": "value"},
+	}
+
+	data, err := original.Serialize()
+	if err != nil {
+		t.Fatalf("Serialize failed: %v", err)
+	}
+
+	decoded := &ExchangeBindMethod{}
+	if err := decoded.Deserialize(data); err != nil {
+		t.Fatalf("Deserialize failed: %v", err)
+	}
+
+	if decoded.Destination != original.Destination {
+		t.Errorf("Destination mismatch: got %q, want %q", decoded.Destination, original.Destination)
+	}
+	if decoded.Source != original.Source {
+		t.Errorf("Source mismatch: got %q, want %q", decoded.Source, original.Source)
+	}
+	if decoded.RoutingKey != original.RoutingKey {
+		t.Errorf("RoutingKey mismatch: got %q, want %q", decoded.RoutingKey, original.RoutingKey)
+	}
+	if decoded.NoWait != original.NoWait {
+		t.Errorf("NoWait mismatch: got %v, want %v", decoded.NoWait, original.NoWait)
+	}
 }
 
 // Test all Queue class methods

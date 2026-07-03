@@ -105,6 +105,12 @@ func (b *ackTestBroker) DeleteQueue(name string, ifUnused, ifEmpty bool) error {
 func (b *ackTestBroker) BindQueue(queueName, exchangeName, routingKey string, arguments map[string]interface{}) error {
 	return nil
 }
+func (b *ackTestBroker) BindExchange(destination, source, routingKey string, arguments map[string]interface{}) error {
+	return nil
+}
+func (b *ackTestBroker) UnbindExchange(destination, source, routingKey string) error {
+	return nil
+}
 func (b *ackTestBroker) UnbindQueue(queueName, exchangeName, routingKey string) error { return nil }
 
 func (b *ackTestBroker) PublishMessage(exchangeName, routingKey string, message *protocol.Message) error {

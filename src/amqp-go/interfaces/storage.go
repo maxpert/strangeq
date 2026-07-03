@@ -90,6 +90,11 @@ type MetadataStore interface {
 	GetQueueBindings(queueName string) ([]*QueueBinding, error)
 	GetExchangeBindings(exchangeName string) ([]*QueueBinding, error)
 
+	// Exchange-to-exchange binding operations
+	StoreExchangeBinding(source, destination, routingKey string, arguments map[string]interface{}) error
+	DeleteExchangeBinding(source, destination, routingKey string) error
+	GetExchangeBindingsFrom(source string) ([]*ExchangeBinding, error)
+
 	// Consumer operations
 	StoreConsumer(queueName, consumerTag string, consumer *protocol.Consumer) error
 	GetConsumer(queueName, consumerTag string) (*protocol.Consumer, error)
@@ -127,6 +132,14 @@ type QueueBinding struct {
 	ExchangeName string                 `json:"exchange_name"`
 	RoutingKey   string                 `json:"routing_key"`
 	Arguments    map[string]interface{} `json:"arguments"`
+}
+
+// ExchangeBinding represents an exchange-to-exchange binding
+type ExchangeBinding struct {
+	Source      string                 `json:"source"`
+	Destination string                 `json:"destination"`
+	RoutingKey  string                 `json:"routing_key"`
+	Arguments   map[string]interface{} `json:"arguments"`
 }
 
 // Transaction represents an AMQP transaction

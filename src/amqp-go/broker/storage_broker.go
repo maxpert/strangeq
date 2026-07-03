@@ -520,6 +520,73 @@ func (b *StorageBroker) UnbindQueue(queueName, exchangeName, routingKey string) 
 	return b.storage.DeleteBinding(queueName, exchangeName, routingKey)
 }
 
+// BindExchange binds a destination exchange to a source exchange with a routing key.
+// Messages published to the source exchange with a matching routing key are routed
+// to the destination exchange, which then routes to its bound queues (or further
+// exchanges). Exchange-to-exchange bindings can form chains but MUST NOT form cycles.
+func (b *StorageBroker) BindExchange(destination, source, routingKey string, arguments map[string]interface{}) error {
+	_, err := b.storage.GetExchange(source)
+	if err != nil {
+		if errors.Is(err, interfaces.ErrExchangeNotFound) {
+			return fmt.Errorf("source exchange '%s' not found", source)
+		}
+		return err
+	}
+
+	_, err = b.storage.GetExchange(destination)
+	if err != nil {
+		if errors.Is(err, interfaces.ErrExchangeNotFound) {
+			return fmt.Errorf("destination exchange '%s' not found", destination)
+		}
+		return err
+	}
+
+	if source == destination {
+		return fmt.Errorf("exchange binding cycle detected: %s -> %s", destination, source)
+	}
+
+	if b.wouldCreateCycle(destination, source) {
+		return fmt.Errorf("exchange binding cycle detected: binding %s -> %s would create a cycle", destination, source)
+	}
+
+	return b.storage.StoreExchangeBinding(source, destination, routingKey, arguments)
+}
+
+// UnbindExchange removes an exchange-to-exchange binding.
+func (b *StorageBroker) UnbindExchange(destination, source, routingKey string) error {
+	return b.storage.DeleteExchangeBinding(source, destination, routingKey)
+}
+
+// wouldCreateCycle checks if binding destination→source would create a cycle.
+// It performs a DFS from source following exchange-to-exchange binding edges
+// (source→destination) to see if destination is already reachable from source.
+// If so, adding destination→source would close the cycle.
+func (b *StorageBroker) wouldCreateCycle(destination, source string) bool {
+	visited := make(map[string]bool)
+	return b.reachableFrom(destination, source, visited)
+}
+
+func (b *StorageBroker) reachableFrom(current, target string, visited map[string]bool) bool {
+	if current == target {
+		return true
+	}
+	if visited[current] {
+		return false
+	}
+	visited[current] = true
+
+	bindings, err := b.storage.GetExchangeBindingsFrom(current)
+	if err != nil {
+		return false
+	}
+	for _, eb := range bindings {
+		if b.reachableFrom(eb.Destination, target, visited) {
+			return true
+		}
+	}
+	return false
+}
+
 // RegisterConsumer registers a new consumer for a queue
 func (b *StorageBroker) RegisterConsumer(queueName, consumerTag string, consumer *protocol.Consumer) error {
 	// Check if queue exists (lock-free)
@@ -793,60 +860,114 @@ func (b *StorageBroker) PublishMessage(exchangeName, routingKey string, message 
 	return nil
 }
 
-// findTargetQueues determines which queues should receive the message
-// CRITICAL FIX: Check in-memory cache FIRST before falling back to storage
+// findTargetQueues determines which queues should receive the message.
+// It follows both queue bindings and exchange-to-exchange bindings recursively,
+// using a visited set for cycle protection and a seen set for queue deduplication.
 func (b *StorageBroker) findTargetQueues(exchange *protocol.Exchange, routingKey string, message *protocol.Message) ([]string, error) {
-	// For default exchange, route directly to queue with same name as routing key
-	if exchange.Name == "" {
-		if _, ok := b.activeQueues.Load(routingKey); ok {
-			return []string{routingKey}, nil
-		}
+	seen := make(map[string]struct{})
+	visited := make(map[string]struct{})
+	var queues []string
+	if err := b.collectTargetQueues(exchange, routingKey, message, seen, visited, &queues); err != nil {
+		return nil, err
+	}
+	return queues, nil
+}
 
+func (b *StorageBroker) collectTargetQueues(exchange *protocol.Exchange, routingKey string, message *protocol.Message, seen map[string]struct{}, visited map[string]struct{}, queues *[]string) error {
+	if _, ok := visited[exchange.Name]; ok {
+		return nil
+	}
+	visited[exchange.Name] = struct{}{}
+
+	if exchange.Name == "" {
+		if _, ok := seen[routingKey]; ok {
+			return nil
+		}
+		if _, ok := b.activeQueues.Load(routingKey); ok {
+			*queues = append(*queues, routingKey)
+			seen[routingKey] = struct{}{}
+			return nil
+		}
 		_, err := b.storage.GetQueue(routingKey)
 		if err == nil {
-			return []string{routingKey}, nil
+			*queues = append(*queues, routingKey)
+			seen[routingKey] = struct{}{}
 		}
-		return nil, nil
+		return nil
 	}
 
-	// Get all bindings for this exchange
 	bindings, err := b.storage.GetExchangeBindings(exchange.Name)
 	if err != nil {
-		return nil, fmt.Errorf("failed to get exchange bindings: %w", err)
+		return fmt.Errorf("failed to get exchange bindings: %w", err)
 	}
 
-	targetQueues := make([]string, 0, len(bindings))
-
-	// Route based on exchange type
 	switch exchange.Kind {
 	case "direct":
 		for _, binding := range bindings {
 			if binding.RoutingKey == routingKey {
-				targetQueues = append(targetQueues, binding.QueueName)
+				if _, ok := seen[binding.QueueName]; !ok {
+					*queues = append(*queues, binding.QueueName)
+					seen[binding.QueueName] = struct{}{}
+				}
 			}
 		}
-
 	case "fanout":
 		for _, binding := range bindings {
-			targetQueues = append(targetQueues, binding.QueueName)
+			if _, ok := seen[binding.QueueName]; !ok {
+				*queues = append(*queues, binding.QueueName)
+				seen[binding.QueueName] = struct{}{}
+			}
 		}
-
 	case "topic":
 		for _, binding := range bindings {
 			if b.matchTopicPattern(binding.RoutingKey, routingKey) {
-				targetQueues = append(targetQueues, binding.QueueName)
+				if _, ok := seen[binding.QueueName]; !ok {
+					*queues = append(*queues, binding.QueueName)
+					seen[binding.QueueName] = struct{}{}
+				}
 			}
 		}
-
 	case "headers":
 		for _, binding := range bindings {
 			if b.matchHeaders(binding.Arguments, message.Headers) {
-				targetQueues = append(targetQueues, binding.QueueName)
+				if _, ok := seen[binding.QueueName]; !ok {
+					*queues = append(*queues, binding.QueueName)
+					seen[binding.QueueName] = struct{}{}
+				}
 			}
 		}
 	}
 
-	return targetQueues, nil
+	exchBindings, err := b.storage.GetExchangeBindingsFrom(exchange.Name)
+	if err != nil {
+		return fmt.Errorf("failed to get exchange-to-exchange bindings: %w", err)
+	}
+
+	for _, eb := range exchBindings {
+		match := false
+		switch exchange.Kind {
+		case "direct":
+			match = eb.RoutingKey == routingKey
+		case "fanout":
+			match = true
+		case "topic":
+			match = b.matchTopicPattern(eb.RoutingKey, routingKey)
+		case "headers":
+			match = b.matchHeaders(eb.Arguments, message.Headers)
+		}
+		if !match {
+			continue
+		}
+		destExchange, err := b.storage.GetExchange(eb.Destination)
+		if err != nil {
+			continue
+		}
+		if err := b.collectTargetQueues(destExchange, routingKey, message, seen, visited, queues); err != nil {
+			return err
+		}
+	}
+
+	return nil
 }
 
 // Helper methods for routing

@@ -9,6 +9,7 @@ import (
 	"github.com/maxpert/amqp-go/broker"
 	"github.com/maxpert/amqp-go/interfaces"
 	"github.com/maxpert/amqp-go/protocol"
+	"github.com/maxpert/amqp-go/transaction"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
 )
@@ -311,6 +312,12 @@ func (s *Server) processCompleteMessage(conn *protocol.Connection, channelID uin
 		AppID:           pendingMsg.Header.AppID,
 		ClusterID:       pendingMsg.Header.ClusterID,
 		Mandatory:       pendingMsg.Method.Mandatory,
+	}
+
+	// Buffer into transaction if channel is in transactional mode
+	if s.TransactionManager != nil && s.TransactionManager.IsTransactional(channelID) {
+		op := transaction.NewPublishOperation(message.Exchange, message.RoutingKey, message)
+		return s.TransactionManager.AddOperation(channelID, op)
 	}
 
 	var publishStart time.Time
@@ -801,6 +808,12 @@ func (s *Server) handleBasicAck(conn *protocol.Connection, channelID uint16, pay
 		return nil
 	}
 
+	// Buffer into transaction if channel is in transactional mode
+	if s.TransactionManager != nil && s.TransactionManager.IsTransactional(channelID) {
+		op := transaction.NewAckOperation(consumerTag, deliveryTag, multiple)
+		return s.TransactionManager.AddOperation(channelID, op)
+	}
+
 	if consumerTag == "" {
 		return s.Broker.AcknowledgeGetDelivery(deliveryTag)
 	}
@@ -836,6 +849,12 @@ func (s *Server) handleBasicReject(conn *protocol.Connection, channelID uint16, 
 			zap.Uint64("delivery_tag", deliveryTag),
 			zap.Uint16("channel_id", channelID))
 		return nil
+	}
+
+	// Buffer into transaction if channel is in transactional mode
+	if s.TransactionManager != nil && s.TransactionManager.IsTransactional(channelID) {
+		op := transaction.NewRejectOperation(consumerTag, deliveryTag, requeue)
+		return s.TransactionManager.AddOperation(channelID, op)
 	}
 
 	if consumerTag == "" {
@@ -875,6 +894,12 @@ func (s *Server) handleBasicNack(conn *protocol.Connection, channelID uint16, pa
 			zap.Uint64("delivery_tag", deliveryTag),
 			zap.Uint16("channel_id", channelID))
 		return nil
+	}
+
+	// Buffer into transaction if channel is in transactional mode
+	if s.TransactionManager != nil && s.TransactionManager.IsTransactional(channelID) {
+		op := transaction.NewNackOperation(consumerTag, deliveryTag, multiple, requeue)
+		return s.TransactionManager.AddOperation(channelID, op)
 	}
 
 	if consumerTag == "" {

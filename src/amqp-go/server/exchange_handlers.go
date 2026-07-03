@@ -15,6 +15,8 @@ func (s *Server) processExchangeMethod(conn *protocol.Connection, channelID uint
 		return s.handleExchangeDeclare(conn, channelID, payload)
 	case protocol.ExchangeDelete: // Method ID 20 for exchange class
 		return s.handleExchangeDelete(conn, channelID, payload)
+	case protocol.ExchangeBind: // Method ID 30 for exchange class
+		return s.handleExchangeBind(conn, channelID, payload)
 	case protocol.ExchangeUnbind: // Method ID 40 for exchange class
 		return s.handleExchangeUnbind(conn, channelID, payload)
 	default:
@@ -139,9 +141,54 @@ func (s *Server) handleExchangeDelete(conn *protocol.Connection, channelID uint1
 	return s.sendExchangeDeleteOK(conn, channelID)
 }
 
+// handleExchangeBind handles the exchange.bind method
+func (s *Server) handleExchangeBind(conn *protocol.Connection, channelID uint16, payload []byte) error {
+	bindMethod := &protocol.ExchangeBindMethod{}
+	err := bindMethod.Deserialize(payload)
+	if err != nil {
+		s.Log.Error("Failed to deserialize exchange.bind",
+			zap.Error(err),
+			zap.String("connection_id", conn.ID),
+			zap.Uint16("channel_id", channelID))
+		return err
+	}
+
+	s.Log.Debug("Exchange bound",
+		zap.String("destination", bindMethod.Destination),
+		zap.String("source", bindMethod.Source),
+		zap.String("routing_key", bindMethod.RoutingKey))
+
+	if err := s.authorize(conn, channelID, interfaces.Operation{
+		Action:       interfaces.ActionWrite,
+		ResourceType: interfaces.ResourceExchange,
+		Resource:     bindMethod.Destination,
+		VHost:        conn.Vhost,
+	}); err != nil {
+		return s.authzChannelError(conn, channelID, err, 40, 30)
+	}
+	if err := s.authorize(conn, channelID, interfaces.Operation{
+		Action:       interfaces.ActionRead,
+		ResourceType: interfaces.ResourceExchange,
+		Resource:     bindMethod.Source,
+		VHost:        conn.Vhost,
+	}); err != nil {
+		return s.authzChannelError(conn, channelID, err, 40, 30)
+	}
+
+	err = s.Broker.BindExchange(bindMethod.Destination, bindMethod.Source, bindMethod.RoutingKey, bindMethod.Arguments)
+	if err != nil {
+		s.Log.Error("Failed to bind exchange",
+			zap.Error(err),
+			zap.String("destination", bindMethod.Destination),
+			zap.String("source", bindMethod.Source))
+		return err
+	}
+
+	return s.sendExchangeBindOK(conn, channelID)
+}
+
 // handleExchangeUnbind handles the exchange.unbind method
 func (s *Server) handleExchangeUnbind(conn *protocol.Connection, channelID uint16, payload []byte) error {
-	// Deserialize the exchange.unbind method
 	unbindMethod := &protocol.ExchangeUnbindMethod{}
 	err := unbindMethod.Deserialize(payload)
 	if err != nil {
@@ -157,14 +204,13 @@ func (s *Server) handleExchangeUnbind(conn *protocol.Connection, channelID uint1
 		zap.String("source", unbindMethod.Source),
 		zap.String("routing_key", unbindMethod.RoutingKey))
 
-	// Authorization check: exchange.unbind requires write on destination + read on source
 	if err := s.authorize(conn, channelID, interfaces.Operation{
 		Action:       interfaces.ActionWrite,
 		ResourceType: interfaces.ResourceExchange,
 		Resource:     unbindMethod.Destination,
 		VHost:        conn.Vhost,
 	}); err != nil {
-		return s.authzChannelError(conn, channelID, err, 40, 50)
+		return s.authzChannelError(conn, channelID, err, 40, 40)
 	}
 	if err := s.authorize(conn, channelID, interfaces.Operation{
 		Action:       interfaces.ActionRead,
@@ -172,13 +218,17 @@ func (s *Server) handleExchangeUnbind(conn *protocol.Connection, channelID uint1
 		Resource:     unbindMethod.Source,
 		VHost:        conn.Vhost,
 	}); err != nil {
-		return s.authzChannelError(conn, channelID, err, 40, 50)
+		return s.authzChannelError(conn, channelID, err, 40, 40)
 	}
 
-	// Call the broker to unbind the exchange
-	// In a real implementation, you'd remove the binding between source and destination exchanges
-	// For now, we'll just log the operation
+	err = s.Broker.UnbindExchange(unbindMethod.Destination, unbindMethod.Source, unbindMethod.RoutingKey)
+	if err != nil {
+		s.Log.Error("Failed to unbind exchange",
+			zap.Error(err),
+			zap.String("destination", unbindMethod.Destination),
+			zap.String("source", unbindMethod.Source))
+		return err
+	}
 
-	// Send exchange.unbind-ok response
 	return s.sendExchangeUnbindOK(conn, channelID)
 }
