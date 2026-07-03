@@ -29,8 +29,22 @@ type UnifiedBroker interface {
 	RejectMessage(consumerTag string, deliveryTag uint64, requeue bool) error
 	NacknowledgeMessage(consumerTag string, deliveryTag uint64, multiple, requeue bool) error
 
+	// Recovery — requeue all unacked messages for a consumer (basic.recover)
+	RequeueAllForConsumer(consumerTag string) error
+
 	// Delivery lookup (NEW - for O(1) ACK routing)
 	GetConsumerForDelivery(deliveryTag uint64) (string, bool)
+
+	// Synchronous message retrieval (basic.get)
+	GetMessageForGet(queueName string, noAck bool) (*protocol.Message, uint64, uint32, error)
+
+	// Queue purge (queue.purge)
+	PurgeQueue(name string) (int, error)
+
+	// Acknowledgment for basic.get deliveries (empty consumer tag)
+	AcknowledgeGetDelivery(deliveryTag uint64) error
+	RejectGetDelivery(deliveryTag uint64, requeue bool) error
+	NackGetDelivery(deliveryTag uint64, requeue bool) error
 
 	// Recovery support — initializes a queue's dispatch cursor from the
 	// recovered message tag range [minTag, maxTag], making recovered

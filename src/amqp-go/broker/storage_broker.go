@@ -18,6 +18,10 @@ import (
 // ErrConsumerChannelFull is returned when a consumer channel is full and cannot accept more messages
 var ErrConsumerChannelFull = errors.New("consumer channel full")
 
+// ErrNoRoute is returned when a message published with mandatory=true
+// cannot be routed to any queue.
+var ErrNoRoute = errors.New("no route to destination queue")
+
 // QueueState and its constructor NewQueueState now live in queue_dispatch.go,
 // replacing the old `available chan uint64` with a lock-free tail cursor +
 // condvar park/wake + bounded requeue ring. See queue_dispatch.go for the
@@ -46,6 +50,7 @@ type StorageBroker struct {
 	queueConsumers    sync.Map      // queueName -> []*ConsumerState (lock-free)
 	queueConsumersMu  sync.Map      // queueName -> *sync.Mutex (protects queueConsumers slice mutation)
 	deliveryIndex     sync.Map      // deliveryTag → consumerTag (global delivery lookup for O(1) ACK routing)
+	getDeliveryQueues sync.Map      // deliveryTag → queueName (for basic.get ack/reject/nack routing)
 	globalDeliveryTag atomic.Uint64 // Global counter for unique delivery tags across all queues
 }
 
@@ -742,6 +747,13 @@ func (b *StorageBroker) PublishMessage(exchangeName, routingKey string, message 
 		return err
 	}
 
+	if len(targetQueues) == 0 {
+		if message.Mandatory {
+			return ErrNoRoute
+		}
+		return nil
+	}
+
 	// Enqueue to all target queues (lock-free, no consumer iteration)
 	for i, queueName := range targetQueues {
 		queueState := b.getOrCreateQueueState(queueName)
@@ -1279,4 +1291,184 @@ func (b *StorageBroker) AdvanceDeliveryTag(tag uint64) {
 func (b *StorageBroker) RecoverQueue(queueName string, minTag, maxTag uint64) {
 	queueState := b.getOrCreateQueueState(queueName)
 	queueState.Recover(minTag, maxTag)
+}
+
+// GetMessageForGet attempts to synchronously retrieve the next message from a
+// queue for a basic.get operation. If no message is available, returns
+// (nil, 0, 0, nil). When noAck is false, the delivery is tracked for
+// ack/nack/reject using an empty consumer tag ("") in the deliveryIndex.
+// Returns the message, its delivery tag, the remaining message count, and any
+// error.
+func (b *StorageBroker) GetMessageForGet(queueName string, noAck bool) (*protocol.Message, uint64, uint32, error) {
+	queueState := b.getOrCreateQueueState(queueName)
+
+	// Non-blocking claim loop: try requeue ring first, then walk the
+	// tail→head cursor. basic.get is synchronous and must return immediately
+	// if no message is available. Gap tags (from recovered/acked messages)
+	// are skipped via the GetMessage-not-found path, mirroring deliverMessage.
+	var tag uint64
+	var message *protocol.Message
+
+	if t, ok := queueState.tryPopRequeue(); ok {
+		tag = t
+		message, _ = b.storage.GetMessage(queueName, tag)
+	}
+
+	if message == nil {
+		for {
+			t := queueState.tail.Load()
+			h := queueState.head.Load()
+			if t >= h {
+				break
+			}
+			if !queueState.tail.CompareAndSwap(t, t+1) {
+				continue
+			}
+			tag = t
+			msg, err := b.storage.GetMessage(queueName, tag)
+			if err != nil {
+				queueState.AckAdvance(tag)
+				continue
+			}
+			message = msg
+			break
+		}
+	}
+
+	if message == nil {
+		return nil, 0, 0, nil
+	}
+
+	countBefore, _ := b.storage.GetQueueMessageCount(queueName)
+	remaining := uint32(countBefore)
+	if remaining > 0 {
+		remaining--
+	}
+
+	if !noAck {
+		queueState.StoreInflight(tag, "")
+		queueState.ClaimInflight(tag)
+		b.deliveryIndex.Store(tag, "")
+		b.getDeliveryQueues.Store(tag, queueName)
+		b.storage.StorePendingAck(&protocol.PendingAck{
+			QueueName:   queueName,
+			DeliveryTag: tag,
+			ConsumerTag: "",
+		})
+	}
+
+	return message, tag, remaining, nil
+}
+
+// PurgeQueue removes all waiting messages from a queue while keeping the
+// queue itself and its bindings intact. Returns the number of messages purged.
+func (b *StorageBroker) PurgeQueue(name string) (int, error) {
+	count, err := b.storage.PurgeQueue(name)
+	if err != nil {
+		return 0, err
+	}
+
+	if val, ok := b.queueStates.Load(name); ok {
+		qs := val.(*QueueState)
+		qs.tail.Store(qs.head.Load())
+		qs.requeueMu.Lock()
+		qs.requeueTags = nil
+		qs.requeueCount.Store(0)
+		qs.requeueMu.Unlock()
+		qs.WakeAll()
+	}
+
+	return count, nil
+}
+
+// AcknowledgeGetDelivery handles acknowledgment of a basic.get delivery
+// (identified by an empty consumer tag in the deliveryIndex).
+func (b *StorageBroker) AcknowledgeGetDelivery(deliveryTag uint64) error {
+	if _, loaded := b.deliveryIndex.LoadAndDelete(deliveryTag); !loaded {
+		return nil
+	}
+
+	val, ok := b.getDeliveryQueues.LoadAndDelete(deliveryTag)
+	if !ok {
+		return nil
+	}
+	queueName := val.(string)
+
+	queueState := b.getOrCreateQueueState(queueName)
+	b.storage.DeleteMessage(queueName, deliveryTag)
+	b.storage.DeletePendingAck(queueName, deliveryTag)
+	queueState.DeleteInflight(deliveryTag)
+	queueState.AckAdvance(deliveryTag)
+	queueState.SetMinAckCursor(b.storage.GetMinAckCursor(queueName))
+
+	return nil
+}
+
+// RejectGetDelivery handles rejection of a basic.get delivery.
+func (b *StorageBroker) RejectGetDelivery(deliveryTag uint64, requeue bool) error {
+	if _, loaded := b.deliveryIndex.LoadAndDelete(deliveryTag); !loaded {
+		return nil
+	}
+
+	val, ok := b.getDeliveryQueues.LoadAndDelete(deliveryTag)
+	if !ok {
+		return nil
+	}
+	queueName := val.(string)
+
+	queueState := b.getOrCreateQueueState(queueName)
+	queueState.DeleteInflight(deliveryTag)
+	b.storage.DeletePendingAck(queueName, deliveryTag)
+
+	if requeue {
+		queueState.Requeue(deliveryTag)
+	} else {
+		b.storage.DeleteMessage(queueName, deliveryTag)
+		queueState.AckAdvance(deliveryTag)
+	}
+
+	return nil
+}
+
+// NackGetDelivery handles negative acknowledgment of a basic.get delivery.
+func (b *StorageBroker) NackGetDelivery(deliveryTag uint64, requeue bool) error {
+	return b.RejectGetDelivery(deliveryTag, requeue)
+}
+
+// RequeueAllForConsumer requeues all unacknowledged (in-flight) messages
+// for the given consumer. This is used by basic.recover to redeliver
+// unacked messages. The requeued messages become available for delivery
+// to any consumer on the same queue (including the original consumer).
+func (b *StorageBroker) RequeueAllForConsumer(consumerTag string) error {
+	val, ok := b.activeConsumers.Load(consumerTag)
+	if !ok {
+		return nil
+	}
+	state := val.(*ConsumerState)
+
+	queueState := b.getOrCreateQueueState(state.queueName)
+
+	pendingAcks, err := b.storage.GetConsumerPendingAcks(consumerTag)
+	if err != nil {
+		return err
+	}
+
+	requeuedCount := 0
+	for _, pendingAck := range pendingAcks {
+		if _, loaded := b.deliveryIndex.LoadAndDelete(pendingAck.DeliveryTag); !loaded {
+			continue
+		}
+		queueState.DeleteInflight(pendingAck.DeliveryTag)
+		b.storage.DeletePendingAck(pendingAck.QueueName, pendingAck.DeliveryTag)
+		queueState.Requeue(pendingAck.DeliveryTag)
+		requeuedCount++
+	}
+
+	queueState.SetMinAckCursor(b.storage.GetMinAckCursor(state.queueName))
+
+	if state.prefetchSem != nil && requeuedCount > 0 {
+		state.prefetchSem.Release(int64(requeuedCount))
+	}
+
+	return nil
 }

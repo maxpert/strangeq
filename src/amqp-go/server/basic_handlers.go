@@ -2,9 +2,11 @@ package server
 
 import (
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"time"
 
+	"github.com/maxpert/amqp-go/broker"
 	"github.com/maxpert/amqp-go/interfaces"
 	"github.com/maxpert/amqp-go/protocol"
 	"go.uber.org/zap"
@@ -29,6 +31,8 @@ func (s *Server) processBasicMethod(conn *protocol.Connection, channelID uint16,
 		return s.handleBasicReject(conn, channelID, payload)
 	case protocol.BasicNack: // Method ID 120 for basic class
 		return s.handleBasicNack(conn, channelID, payload)
+	case protocol.BasicRecover: // Method ID 110 for basic class
+		return s.handleBasicRecover(conn, channelID, payload)
 	default:
 		s.Log.Warn("Unknown basic method ID",
 			zap.Uint16("method_id", methodID),
@@ -306,6 +310,7 @@ func (s *Server) processCompleteMessage(conn *protocol.Connection, channelID uin
 		UserID:          pendingMsg.Header.UserID,
 		AppID:           pendingMsg.Header.AppID,
 		ClusterID:       pendingMsg.Header.ClusterID,
+		Mandatory:       pendingMsg.Method.Mandatory,
 	}
 
 	var publishStart time.Time
@@ -320,6 +325,12 @@ func (s *Server) processCompleteMessage(conn *protocol.Connection, channelID uin
 	}
 
 	if err != nil {
+		if errors.Is(err, broker.ErrNoRoute) {
+			if s.MetricsCollector != nil {
+				s.MetricsCollector.RecordMessageUnroutable()
+			}
+			return s.sendBasicReturn(conn, channelID, 312, "NO_ROUTE", message.Exchange, message.RoutingKey, message)
+		}
 		s.Log.Error("Failed to route message",
 			zap.Error(err),
 			zap.String("exchange", message.Exchange),
@@ -506,7 +517,6 @@ func (s *Server) handleBasicCancel(conn *protocol.Connection, channelID uint16, 
 
 // handleBasicGet handles the basic.get method
 func (s *Server) handleBasicGet(conn *protocol.Connection, channelID uint16, payload []byte) error {
-	// Deserialize the basic.get method
 	getMethod := &protocol.BasicGetMethod{}
 	err := getMethod.Deserialize(payload)
 	if err != nil {
@@ -517,11 +527,12 @@ func (s *Server) handleBasicGet(conn *protocol.Connection, channelID uint16, pay
 		return err
 	}
 
-	s.Log.Debug("Basic get requested",
-		zap.String("queue", getMethod.Queue),
-		zap.Bool("no_ack", getMethod.NoAck))
+	if ce := s.Log.Check(zapcore.DebugLevel, "Basic get requested"); ce != nil {
+		ce.Write(
+			zap.String("queue", getMethod.Queue),
+			zap.Bool("no_ack", getMethod.NoAck))
+	}
 
-	// Authorization check: basic.get requires read permission on queue
 	if err := s.authorize(conn, channelID, interfaces.Operation{
 		Action:       interfaces.ActionRead,
 		ResourceType: interfaces.ResourceQueue,
@@ -531,15 +542,55 @@ func (s *Server) handleBasicGet(conn *protocol.Connection, channelID uint16, pay
 		return s.authzChannelError(conn, channelID, err, 60, 70)
 	}
 
-	// For now, we'll respond with basic.get-empty since we don't have actual message retrieval implemented yet
-	// In a real implementation, we would try to get the next message from the queue
-	err = s.sendBasicGetEmpty(conn, channelID)
+	message, deliveryTag, messageCount, err := s.Broker.GetMessageForGet(getMethod.Queue, getMethod.NoAck)
 	if err != nil {
-		s.Log.Error("Failed to send basic.get-empty",
+		s.Log.Error("Failed to get message for basic.get",
 			zap.Error(err),
+			zap.String("queue", getMethod.Queue),
 			zap.String("connection_id", conn.ID),
 			zap.Uint16("channel_id", channelID))
 		return err
+	}
+
+	if message == nil {
+		return s.sendBasicGetEmpty(conn, channelID)
+	}
+
+	const maxPoolSize = 131 * 1024
+	estimatedSize := deliveryOverheadEstimate + len(message.Body)
+	var buf *[]byte
+	if estimatedSize > maxPoolSize {
+		b := make([]byte, 0, estimatedSize)
+		buf = &b
+	} else {
+		buf = protocol.GetBufferForSize(estimatedSize)
+	}
+	defer func() {
+		if cap(*buf) <= maxPoolSize {
+			protocol.PutBufferForSize(buf)
+		}
+	}()
+
+	if err := s.serializeGetDeliveryInto(buf, channelID, deliveryTag, false, message.Exchange, message.RoutingKey, messageCount, message); err != nil {
+		s.Log.Error("Failed to serialize basic.get-ok delivery",
+			zap.Error(err),
+			zap.Uint16("channel_id", channelID))
+		return err
+	}
+
+	conn.WriteMutex.Lock()
+	_, err = conn.Conn.Write(*buf)
+	conn.WriteMutex.Unlock()
+
+	if err != nil {
+		s.Log.Error("Error sending basic.get-ok frames",
+			zap.Error(err),
+			zap.Uint16("channel_id", channelID))
+		return fmt.Errorf("error sending basic.get-ok frames: %v", err)
+	}
+
+	if s.MetricsCollector != nil {
+		s.MetricsCollector.RecordMessageDelivered(len(message.Body))
 	}
 
 	return nil
@@ -564,6 +615,72 @@ func (s *Server) serializeDeliveryInto(buf *[]byte, channelID uint16, consumerTa
 	}
 	payload = protocol.AppendShortString(payload, exchange)
 	payload = protocol.AppendShortString(payload, routingKey)
+	*buf = protocol.AppendFrame(*buf, protocol.FrameMethod, channelID, payload)
+
+	// --- Header frame (content header) ---
+	propertyFlags := buildPropertyFlags(message)
+	var hdrPayload []byte
+	hdrPayload, err := (&protocol.ContentHeader{
+		ClassID:         60,
+		Weight:          0,
+		BodySize:        uint64(len(message.Body)),
+		PropertyFlags:   propertyFlags,
+		Headers:         message.Headers,
+		ContentType:     message.ContentType,
+		ContentEncoding: message.ContentEncoding,
+		DeliveryMode:    message.DeliveryMode,
+		Priority:        message.Priority,
+		CorrelationID:   message.CorrelationID,
+		ReplyTo:         message.ReplyTo,
+		Expiration:      message.Expiration,
+		MessageID:       message.MessageID,
+		Timestamp:       message.Timestamp,
+		Type:            message.Type,
+		UserID:          message.UserID,
+		AppID:           message.AppID,
+		ClusterID:       message.ClusterID,
+	}).SerializeInto(hdrPayload)
+	if err != nil {
+		return fmt.Errorf("error serializing content header: %v", err)
+	}
+	*buf = protocol.AppendFrame(*buf, protocol.FrameHeader, channelID, hdrPayload)
+
+	// --- Body frames ---
+	maxFrameSize := uint32(s.Config.Server.MaxFrameSize)
+	maxBodyPerFrame := int(maxFrameSize) - 8
+	if maxBodyPerFrame <= 0 {
+		maxBodyPerFrame = 4096
+	}
+	for offset := 0; offset < len(message.Body); offset += maxBodyPerFrame {
+		end := offset + maxBodyPerFrame
+		if end > len(message.Body) {
+			end = len(message.Body)
+		}
+		*buf = protocol.AppendFrame(*buf, protocol.FrameBody, channelID, message.Body[offset:end])
+	}
+
+	return nil
+}
+
+// serializeGetDeliveryInto serializes a basic.get-ok (method frame + header
+// frame + body frames) directly into the provided buffer, avoiding all
+// intermediate allocations. This is the synchronous-response counterpart to
+// serializeDeliveryInto, using basic.get-ok (60.71) instead of basic.deliver
+// (60.60) and including the message-count field.
+func (s *Server) serializeGetDeliveryInto(buf *[]byte, channelID uint16, deliveryTag uint64, redelivered bool, exchange, routingKey string, messageCount uint32, message *protocol.Message) error {
+	// --- Method frame (basic.get-ok) ---
+	var payload []byte
+	payload = binary.BigEndian.AppendUint16(payload, 60) // class ID
+	payload = binary.BigEndian.AppendUint16(payload, 71) // method ID (basic.get-ok)
+	payload = binary.BigEndian.AppendUint64(payload, deliveryTag)
+	if redelivered {
+		payload = append(payload, 1)
+	} else {
+		payload = append(payload, 0)
+	}
+	payload = protocol.AppendShortString(payload, exchange)
+	payload = protocol.AppendShortString(payload, routingKey)
+	payload = binary.BigEndian.AppendUint32(payload, messageCount)
 	*buf = protocol.AppendFrame(*buf, protocol.FrameMethod, channelID, payload)
 
 	// --- Header frame (content header) ---
@@ -664,9 +781,6 @@ func (s *Server) sendBasicDeliver(conn *protocol.Connection, channelID uint16, c
 	return nil
 }
 
-// sendBasicGetEmpty sends the basic.get-empty method frame
-
-// handleBasicAck handles the basic.ack method
 // handleBasicAck handles the basic.ack method
 func (s *Server) handleBasicAck(conn *protocol.Connection, channelID uint16, payload []byte) error {
 	if len(payload) < 8 {
@@ -685,6 +799,10 @@ func (s *Server) handleBasicAck(conn *protocol.Connection, channelID uint16, pay
 			zap.Uint64("delivery_tag", deliveryTag),
 			zap.Uint16("channel_id", channelID))
 		return nil
+	}
+
+	if consumerTag == "" {
+		return s.Broker.AcknowledgeGetDelivery(deliveryTag)
 	}
 
 	err := s.Broker.AcknowledgeMessage(consumerTag, deliveryTag, multiple)
@@ -718,6 +836,10 @@ func (s *Server) handleBasicReject(conn *protocol.Connection, channelID uint16, 
 			zap.Uint64("delivery_tag", deliveryTag),
 			zap.Uint16("channel_id", channelID))
 		return nil
+	}
+
+	if consumerTag == "" {
+		return s.Broker.RejectGetDelivery(deliveryTag, requeue)
 	}
 
 	err := s.Broker.RejectMessage(consumerTag, deliveryTag, requeue)
@@ -755,6 +877,10 @@ func (s *Server) handleBasicNack(conn *protocol.Connection, channelID uint16, pa
 		return nil
 	}
 
+	if consumerTag == "" {
+		return s.Broker.NackGetDelivery(deliveryTag, requeue)
+	}
+
 	err := s.Broker.NacknowledgeMessage(consumerTag, deliveryTag, multiple, requeue)
 	if err != nil {
 		s.Log.Error("Failed to nack message in broker",
@@ -767,6 +893,40 @@ func (s *Server) handleBasicNack(conn *protocol.Connection, channelID uint16, pa
 	}
 
 	return nil
+}
+
+func (s *Server) handleBasicRecover(conn *protocol.Connection, channelID uint16, payload []byte) error {
+	recoverMethod := &protocol.BasicRecoverMethod{}
+	if err := recoverMethod.Deserialize(payload); err != nil {
+		s.Log.Error("Failed to deserialize basic.recover",
+			zap.Error(err),
+			zap.String("connection_id", conn.ID),
+			zap.Uint16("channel_id", channelID))
+		return err
+	}
+
+	value, exists := conn.Channels.Load(channelID)
+	if !exists {
+		return fmt.Errorf("channel %d does not exist", channelID)
+	}
+	channel := value.(*protocol.Channel)
+
+	channel.Mutex.RLock()
+	consumerTags := make([]string, 0, len(channel.Consumers))
+	for tag := range channel.Consumers {
+		consumerTags = append(consumerTags, tag)
+	}
+	channel.Mutex.RUnlock()
+
+	for _, tag := range consumerTags {
+		if err := s.Broker.RequeueAllForConsumer(tag); err != nil {
+			s.Log.Error("Failed to requeue messages for consumer",
+				zap.Error(err),
+				zap.String("consumer_tag", tag))
+		}
+	}
+
+	return s.sendBasicRecoverOK(conn, channelID)
 }
 
 // Stop gracefully stops the server

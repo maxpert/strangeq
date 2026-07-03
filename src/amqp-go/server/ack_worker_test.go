@@ -155,6 +155,10 @@ func (b *ackTestBroker) NacknowledgeMessage(consumerTag string, deliveryTag uint
 	return nil
 }
 
+func (b *ackTestBroker) RequeueAllForConsumer(consumerTag string) error {
+	return nil
+}
+
 func (b *ackTestBroker) GetConsumerForDelivery(deliveryTag uint64) (string, bool) {
 	b.mu.Lock()
 	tag, ok := b.deliveryTags[deliveryTag]
@@ -165,9 +169,18 @@ func (b *ackTestBroker) GetConsumerForDelivery(deliveryTag uint64) (string, bool
 func (b *ackTestBroker) RecoverQueue(queueName string, minTag, maxTag uint64)        {}
 func (b *ackTestBroker) AdvanceDeliveryTag(tag uint64)                               {}
 func (b *ackTestBroker) RebuildDeliveryIndex(deliveryTag uint64, consumerTag string) {}
-func (b *ackTestBroker) GetQueues() map[string]*protocol.Queue                       { return nil }
-func (b *ackTestBroker) GetExchanges() map[string]*protocol.Exchange                 { return nil }
-func (b *ackTestBroker) GetConsumers() map[string]*protocol.Consumer                 { return nil }
+func (b *ackTestBroker) GetMessageForGet(queueName string, noAck bool) (*protocol.Message, uint64, uint32, error) {
+	return nil, 0, 0, nil
+}
+func (b *ackTestBroker) PurgeQueue(name string) (int, error)             { return 0, nil }
+func (b *ackTestBroker) AcknowledgeGetDelivery(deliveryTag uint64) error { return nil }
+func (b *ackTestBroker) RejectGetDelivery(deliveryTag uint64, requeue bool) error {
+	return nil
+}
+func (b *ackTestBroker) NackGetDelivery(deliveryTag uint64, requeue bool) error { return nil }
+func (b *ackTestBroker) GetQueues() map[string]*protocol.Queue                  { return nil }
+func (b *ackTestBroker) GetExchanges() map[string]*protocol.Exchange            { return nil }
+func (b *ackTestBroker) GetConsumers() map[string]*protocol.Consumer            { return nil }
 
 func newAckTestServer(broker *ackTestBroker) *Server {
 	return &Server{

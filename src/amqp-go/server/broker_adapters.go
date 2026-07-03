@@ -63,8 +63,32 @@ func (a *StorageBrokerAdapter) NacknowledgeMessage(consumerTag string, deliveryT
 	return a.broker.NacknowledgeMessage(consumerTag, deliveryTag, multiple, requeue)
 }
 
+func (a *StorageBrokerAdapter) RequeueAllForConsumer(consumerTag string) error {
+	return a.broker.RequeueAllForConsumer(consumerTag)
+}
+
 func (a *StorageBrokerAdapter) GetConsumerForDelivery(deliveryTag uint64) (string, bool) {
 	return a.broker.GetConsumerForDelivery(deliveryTag)
+}
+
+func (a *StorageBrokerAdapter) GetMessageForGet(queueName string, noAck bool) (*protocol.Message, uint64, uint32, error) {
+	return a.broker.GetMessageForGet(queueName, noAck)
+}
+
+func (a *StorageBrokerAdapter) PurgeQueue(name string) (int, error) {
+	return a.broker.PurgeQueue(name)
+}
+
+func (a *StorageBrokerAdapter) AcknowledgeGetDelivery(deliveryTag uint64) error {
+	return a.broker.AcknowledgeGetDelivery(deliveryTag)
+}
+
+func (a *StorageBrokerAdapter) RejectGetDelivery(deliveryTag uint64, requeue bool) error {
+	return a.broker.RejectGetDelivery(deliveryTag, requeue)
+}
+
+func (a *StorageBrokerAdapter) NackGetDelivery(deliveryTag uint64, requeue bool) error {
+	return a.broker.NackGetDelivery(deliveryTag, requeue)
 }
 
 func (a *StorageBrokerAdapter) AdvanceDeliveryTag(tag uint64) {

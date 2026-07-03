@@ -39,6 +39,8 @@ func (s *Server) processQueueMethod(conn *protocol.Connection, channelID uint16,
 		return s.handleQueueBind(conn, channelID, payload)
 	case protocol.QueueUnbind: // Method ID 50 for queue class
 		return s.handleQueueUnbind(conn, channelID, payload)
+	case protocol.QueuePurge: // Method ID 30 for queue class
+		return s.handleQueuePurge(conn, channelID, payload)
 	case protocol.QueueDelete: // Method ID 40 for queue class
 		return s.handleQueueDelete(conn, channelID, payload)
 	default:
@@ -260,6 +262,50 @@ func (s *Server) handleQueueUnbind(conn *protocol.Connection, channelID uint16, 
 
 	// Send queue.unbind-ok response
 	return s.sendQueueUnbindOK(conn, channelID)
+}
+
+// handleQueuePurge handles the queue.purge method
+func (s *Server) handleQueuePurge(conn *protocol.Connection, channelID uint16, payload []byte) error {
+	purgeMethod := &protocol.QueuePurgeMethod{}
+	err := purgeMethod.Deserialize(payload)
+	if err != nil {
+		s.Log.Error("Failed to deserialize queue.purge",
+			zap.Error(err),
+			zap.String("connection_id", conn.ID),
+			zap.Uint16("channel_id", channelID))
+		return err
+	}
+
+	queueName, err := resolveQueueName(conn, channelID, purgeMethod.Queue)
+	if err != nil {
+		return err
+	}
+
+	s.Log.Debug("Queue purge requested",
+		zap.String("queue", queueName))
+
+	if err := s.authorize(conn, channelID, interfaces.Operation{
+		Action:       interfaces.ActionWrite,
+		ResourceType: interfaces.ResourceQueue,
+		Resource:     queueName,
+		VHost:        conn.Vhost,
+	}); err != nil {
+		return s.authzChannelError(conn, channelID, err, 50, 30)
+	}
+
+	count, err := s.Broker.PurgeQueue(queueName)
+	if err != nil {
+		s.Log.Error("Failed to purge queue",
+			zap.Error(err),
+			zap.String("queue", queueName))
+		return err
+	}
+
+	if !purgeMethod.NoWait {
+		return s.sendQueuePurgeOK(conn, channelID, uint32(count))
+	}
+
+	return nil
 }
 
 // handleQueueDelete handles the queue.delete method

@@ -163,6 +163,7 @@ type Message struct {
 	UserID          string
 	AppID           string
 	ClusterID       string
+	Mandatory       bool
 }
 
 // Delivery represents a message delivery to a consumer

@@ -350,8 +350,7 @@ func (w *brokerWrapper) DeleteQueue(name string, ifUnused, ifEmpty bool) error {
 }
 
 func (w *brokerWrapper) PurgeQueue(name string) (int, error) {
-	// Not directly supported in UnifiedBroker interface - would need extension
-	return 0, fmt.Errorf("purge queue not supported in unified broker")
+	return w.unifiedBroker.PurgeQueue(name)
 }
 
 func (w *brokerWrapper) BindQueue(queueName, exchangeName, routingKey string, arguments map[string]interface{}) error {

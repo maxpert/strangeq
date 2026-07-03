@@ -1419,6 +1419,90 @@ func (m *QueueDeleteOKMethod) Serialize() ([]byte, error) {
 	return result, nil
 }
 
+// QueuePurgeMethod represents the queue.purge method
+type QueuePurgeMethod struct {
+	Reserved1 uint16
+	Queue     string
+	NoWait    bool
+}
+
+// Serialize encodes the QueuePurgeMethod into a byte slice
+func (m *QueuePurgeMethod) Serialize() ([]byte, error) {
+	var result []byte
+
+	// Reserved1 (uint16)
+	reservedBytes := make([]byte, 2)
+	binary.BigEndian.PutUint16(reservedBytes, m.Reserved1)
+	result = append(result, reservedBytes...)
+
+	// Queue (short string)
+	queueBytes := encodeShortString(m.Queue)
+	result = append(result, queueBytes...)
+
+	// Flags (uint16) — bit 0: no-wait
+	flags := uint16(0)
+	if m.NoWait {
+		flags |= (1 << 0)
+	}
+	flagBytes := make([]byte, 2)
+	binary.BigEndian.PutUint16(flagBytes, flags)
+	result = append(result, flagBytes...)
+
+	return result, nil
+}
+
+// Deserialize decodes the QueuePurgeMethod from a byte slice
+func (m *QueuePurgeMethod) Deserialize(data []byte) error {
+	if len(data) < 3 { // Need at least reserved(2) + queue length byte(1)
+		return fmt.Errorf("queue.purge method data too short")
+	}
+
+	offset := 0
+
+	// Reserved1 (uint16)
+	m.Reserved1 = binary.BigEndian.Uint16(data[offset : offset+2])
+	offset += 2
+
+	// Queue (short string)
+	queue, newOffset, err := decodeShortString(data, offset)
+	if err != nil {
+		return fmt.Errorf("failed to decode queue name: %v", err)
+	}
+	m.Queue = queue
+	offset = newOffset
+
+	// Flags (uint16)
+	if offset+2 > len(data) {
+		m.NoWait = false
+		return nil
+	}
+	flags := binary.BigEndian.Uint16(data[offset : offset+2])
+	m.NoWait = (flags & (1 << 0)) != 0
+
+	return nil
+}
+
+// QueuePurgeOKMethod represents the queue.purge-ok method
+type QueuePurgeOKMethod struct {
+	MessageCount uint32
+}
+
+// Serialize encodes the QueuePurgeOKMethod into a byte slice
+func (m *QueuePurgeOKMethod) Serialize() ([]byte, error) {
+	result := make([]byte, 4)
+	binary.BigEndian.PutUint32(result, m.MessageCount)
+	return result, nil
+}
+
+// Deserialize decodes the QueuePurgeOKMethod from a byte slice
+func (m *QueuePurgeOKMethod) Deserialize(data []byte) error {
+	if len(data) < 4 {
+		return fmt.Errorf("queue.purge-ok method data too short")
+	}
+	m.MessageCount = binary.BigEndian.Uint32(data[:4])
+	return nil
+}
+
 // BasicQosMethod represents the basic.qos method
 type BasicQosMethod struct {
 	PrefetchSize  uint32
@@ -1934,6 +2018,47 @@ func (m *BasicGetOKMethod) Serialize() ([]byte, error) {
 	return result, nil
 }
 
+// Deserialize decodes the BasicGetOKMethod from a byte slice
+func (m *BasicGetOKMethod) Deserialize(data []byte) error {
+	if len(data) < 9 { // delivery_tag(8) + redelivered(1)
+		return fmt.Errorf("basic.get-ok method data too short")
+	}
+
+	offset := 0
+
+	// Delivery tag (uint64)
+	m.DeliveryTag = binary.BigEndian.Uint64(data[offset : offset+8])
+	offset += 8
+
+	// Redelivered (bit packed in a single byte)
+	m.Redelivered = data[offset] != 0
+	offset++
+
+	// Exchange (short string)
+	exchange, newOffset, err := decodeShortString(data, offset)
+	if err != nil {
+		return fmt.Errorf("failed to decode exchange: %v", err)
+	}
+	m.Exchange = exchange
+	offset = newOffset
+
+	// Routing key (short string)
+	routingKey, newOffset, err := decodeShortString(data, offset)
+	if err != nil {
+		return fmt.Errorf("failed to decode routing key: %v", err)
+	}
+	m.RoutingKey = routingKey
+	offset = newOffset
+
+	// Message count (uint32)
+	if offset+4 > len(data) {
+		return fmt.Errorf("message count field missing")
+	}
+	m.MessageCount = binary.BigEndian.Uint32(data[offset : offset+4])
+
+	return nil
+}
+
 // BasicGetEmptyMethod represents the basic.get-empty method
 type BasicGetEmptyMethod struct {
 	Reserved1 string // Should be "amq.empty" or similar
@@ -2250,6 +2375,101 @@ func (m *BasicDeliverMethod) Deserialize(data []byte) error {
 	offset = newOffset
 
 	return nil
+}
+
+// BasicReturnMethod represents the basic.return method (class 60, method 50)
+type BasicReturnMethod struct {
+	ReplyCode  uint16
+	ReplyText  string
+	Exchange   string
+	RoutingKey string
+}
+
+// Serialize encodes the BasicReturnMethod into a byte slice
+func (m *BasicReturnMethod) Serialize() ([]byte, error) {
+	result := make([]byte, 0, 2+256+256+256)
+
+	result = binary.BigEndian.AppendUint16(result, m.ReplyCode)
+	result = append(result, encodeShortString(m.ReplyText)...)
+	result = append(result, encodeShortString(m.Exchange)...)
+	result = append(result, encodeShortString(m.RoutingKey)...)
+
+	return result, nil
+}
+
+// Deserialize decodes the BasicReturnMethod from a byte slice
+func (m *BasicReturnMethod) Deserialize(data []byte) error {
+	if len(data) < 2 {
+		return fmt.Errorf("basic.return method data too short")
+	}
+
+	offset := 0
+
+	m.ReplyCode = binary.BigEndian.Uint16(data[offset : offset+2])
+	offset += 2
+
+	if offset >= len(data) {
+		return fmt.Errorf("reply-text field missing")
+	}
+	replyText, newOffset, err := decodeShortString(data, offset)
+	if err != nil {
+		return fmt.Errorf("failed to decode reply-text: %v", err)
+	}
+	m.ReplyText = replyText
+	offset = newOffset
+
+	if offset >= len(data) {
+		return fmt.Errorf("exchange field missing")
+	}
+	exchange, newOffset, err := decodeShortString(data, offset)
+	if err != nil {
+		return fmt.Errorf("failed to decode exchange: %v", err)
+	}
+	m.Exchange = exchange
+	offset = newOffset
+
+	if offset >= len(data) {
+		return fmt.Errorf("routing-key field missing")
+	}
+	routingKey, newOffset, err := decodeShortString(data, offset)
+	if err != nil {
+		return fmt.Errorf("failed to decode routing-key: %v", err)
+	}
+	m.RoutingKey = routingKey
+
+	return nil
+}
+
+// BasicRecoverMethod represents the basic.recover method (class 60, method 110)
+type BasicRecoverMethod struct {
+	Requeue bool
+}
+
+// Serialize encodes the BasicRecoverMethod into a byte slice
+func (m *BasicRecoverMethod) Serialize() ([]byte, error) {
+	if m.Requeue {
+		return []byte{1}, nil
+	}
+	return []byte{0}, nil
+}
+
+// Deserialize decodes the BasicRecoverMethod from a byte slice
+func (m *BasicRecoverMethod) Deserialize(data []byte) error {
+	if len(data) < 1 {
+		m.Requeue = false
+		return nil
+	}
+	m.Requeue = data[0] != 0
+	return nil
+}
+
+// BasicRecoverOKMethod represents the basic.recover-ok method (class 60, method 111)
+type BasicRecoverOKMethod struct {
+}
+
+// Serialize encodes the BasicRecoverOKMethod into a byte slice
+func (m *BasicRecoverOKMethod) Serialize() ([]byte, error) {
+	return []byte{}, nil
 }
 
 // ExchangeUnbindMethod represents the exchange.unbind method

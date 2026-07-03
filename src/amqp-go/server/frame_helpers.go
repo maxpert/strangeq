@@ -1,6 +1,7 @@
 package server
 
 import (
+	"encoding/binary"
 	"fmt"
 
 	"github.com/maxpert/amqp-go/protocol"
@@ -123,6 +124,27 @@ func (s *Server) sendBasicGetEmpty(conn *protocol.Connection, channelID uint16) 
 	return s.sendMethodResponse(conn, channelID, 60, 72, method)
 }
 
+// sendBasicGetOK sends the basic.get-ok method frame (content header and body
+// frames must follow on the same channel).
+func (s *Server) sendBasicGetOK(conn *protocol.Connection, channelID uint16, deliveryTag uint64, redelivered bool, exchange, routingKey string, messageCount uint32) error {
+	method := &protocol.BasicGetOKMethod{
+		DeliveryTag:  deliveryTag,
+		Redelivered:  redelivered,
+		Exchange:     exchange,
+		RoutingKey:   routingKey,
+		MessageCount: messageCount,
+	}
+	return s.sendMethodResponse(conn, channelID, 60, 71, method)
+}
+
+// sendQueuePurgeOK sends the queue.purge-ok method frame
+func (s *Server) sendQueuePurgeOK(conn *protocol.Connection, channelID uint16, messageCount uint32) error {
+	method := &protocol.QueuePurgeOKMethod{
+		MessageCount: messageCount,
+	}
+	return s.sendMethodResponse(conn, channelID, 50, 31, method)
+}
+
 // buildPropertyFlags builds the property flags bitmap from a message
 // Extracted from sendBasicDeliver to make it testable
 func buildPropertyFlags(msg *protocol.Message) uint16 {
@@ -172,4 +194,80 @@ func buildPropertyFlags(msg *protocol.Message) uint16 {
 	}
 
 	return flags
+}
+
+func (s *Server) sendBasicReturn(conn *protocol.Connection, channelID uint16, replyCode uint16, replyText, exchange, routingKey string, message *protocol.Message) error {
+	method := &protocol.BasicReturnMethod{
+		ReplyCode:  replyCode,
+		ReplyText:  replyText,
+		Exchange:   exchange,
+		RoutingKey: routingKey,
+	}
+	methodData, err := method.Serialize()
+	if err != nil {
+		return fmt.Errorf("failed to serialize basic.return: %w", err)
+	}
+
+	estimatedSize := deliveryOverheadEstimate + len(message.Body)
+	buf := make([]byte, 0, estimatedSize)
+
+	var methodPayload []byte
+	methodPayload = binary.BigEndian.AppendUint16(methodPayload, 60)
+	methodPayload = binary.BigEndian.AppendUint16(methodPayload, 50)
+	methodPayload = append(methodPayload, methodData...)
+	buf = protocol.AppendFrame(buf, protocol.FrameMethod, channelID, methodPayload)
+
+	propertyFlags := buildPropertyFlags(message)
+	var hdrPayload []byte
+	hdrPayload, err = (&protocol.ContentHeader{
+		ClassID:         60,
+		Weight:          0,
+		BodySize:        uint64(len(message.Body)),
+		PropertyFlags:   propertyFlags,
+		Headers:         message.Headers,
+		ContentType:     message.ContentType,
+		ContentEncoding: message.ContentEncoding,
+		DeliveryMode:    message.DeliveryMode,
+		Priority:        message.Priority,
+		CorrelationID:   message.CorrelationID,
+		ReplyTo:         message.ReplyTo,
+		Expiration:      message.Expiration,
+		MessageID:       message.MessageID,
+		Timestamp:       message.Timestamp,
+		Type:            message.Type,
+		UserID:          message.UserID,
+		AppID:           message.AppID,
+		ClusterID:       message.ClusterID,
+	}).SerializeInto(hdrPayload)
+	if err != nil {
+		return fmt.Errorf("error serializing content header: %v", err)
+	}
+	buf = protocol.AppendFrame(buf, protocol.FrameHeader, channelID, hdrPayload)
+
+	maxFrameSize := uint32(s.Config.Server.MaxFrameSize)
+	maxBodyPerFrame := int(maxFrameSize) - 8
+	if maxBodyPerFrame <= 0 {
+		maxBodyPerFrame = 4096
+	}
+	for offset := 0; offset < len(message.Body); offset += maxBodyPerFrame {
+		end := offset + maxBodyPerFrame
+		if end > len(message.Body) {
+			end = len(message.Body)
+		}
+		buf = protocol.AppendFrame(buf, protocol.FrameBody, channelID, message.Body[offset:end])
+	}
+
+	conn.WriteMutex.Lock()
+	_, err = conn.Conn.Write(buf)
+	conn.WriteMutex.Unlock()
+
+	if err != nil {
+		return fmt.Errorf("error sending basic.return frames: %v", err)
+	}
+
+	return nil
+}
+
+func (s *Server) sendBasicRecoverOK(conn *protocol.Connection, channelID uint16) error {
+	return s.sendMethodResponse(conn, channelID, 60, 111, &protocol.BasicRecoverOKMethod{})
 }
