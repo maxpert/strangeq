@@ -6,6 +6,18 @@ A high-performance AMQP 0.9.1 message broker implementation written in Go. Compa
 [![Go Report Card](https://goreportcard.com/badge/github.com/maxpert/strangeq)](https://goreportcard.com/report/github.com/maxpert/strangeq)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
+## Why StrangeQ?
+
+RabbitMQ is the gold standard for AMQP 0.9.1, but it runs on the Erlang VM — a separate runtime with its own scheduling, memory model, and operational overhead. StrangeQ exists for teams that want:
+
+- **Embeddable**: Run it as a library inside your Go application. No separate process, no Erlang runtime, no Docker image required for tests. The benchmark suite itself starts an embedded server in-process.
+- **Go-native observability**: Native `net/http/pprof` endpoints for CPU, memory, goroutine, and mutex profiling. Use `go tool pprof` directly — no Erlang tooling required.
+- **Single binary deployment**: One static binary with no runtime dependencies. Cross-compile for any Go-supported platform with a single command.
+- **AMQP 0.9.1 wire compatibility**: Drop-in replacement for RabbitMQ from any AMQP 0.9.1 client (Go, Python, Node.js, Java, Ruby, C#).
+- **Transparent internals**: The entire broker is readable Go source code — no opaque Erlang BEAM abstractions. Debug, profile, and extend with standard Go tooling.
+
+StrangeQ is not a drop-in replacement for RabbitMQ in production. It lacks management UI, clustering, DLX, TTL, priority queues, publisher confirms, and other RabbitMQ features. It is a lightweight, embeddable, high-performance broker for Go applications and development environments.
+
 ## Features
 
 - AMQP 0.9.1 protocol compatible with RabbitMQ clients (Go, Python, Node.js, etc.)
@@ -16,7 +28,7 @@ A high-performance AMQP 0.9.1 message broker implementation written in Go. Compa
 - SASL authentication (PLAIN, ANONYMOUS)
 - Authorization with RabbitMQ-style configure/write/read permissions per vhost
 - Transaction protocol handshake (Tx.Select, Tx.Commit, Tx.Rollback)
-- 56% less memory per operation and 31% fewer allocations than pre-optimization baseline; 1.07-1.36x faster throughput than RabbitMQ 4.3 on same hardware
+- 1.07-1.36x faster throughput than RabbitMQ 4.3 on same hardware (see benchmarks below)
 - Prometheus metrics and pprof profiling
 - Lock-free per-queue AtomicRing with per-slot CAS
 - Batch TCP writes and ACK offloading (no fsync head-of-line blocking)
@@ -245,18 +257,18 @@ Key engine tuning parameters:
 
 ### Head-to-Head vs RabbitMQ 4.3
 
-Same machine (Apple M4 Max, 16-core ARM64), same Go client ([amqp091-go](https://github.com/rabbitmq/amqp091-go)), 12-byte messages (RabbitMQ PerfTest default), durable queue, transient messages, 1 publisher + 1 consumer, 50K iterations x 20 runs (StrangeQ) / 5 runs (RabbitMQ). RabbitMQ ran in a Docker container (`rabbitmq:4.3-management`, ARM64) on the same host. StrangeQ ran natively.
+Same machine, same Go client ([amqp091-go](https://github.com/rabbitmq/amqp091-go)), 12-byte messages, durable queue, transient messages, 1 publisher + 1 consumer. RabbitMQ ran in a Docker container (`rabbitmq:4.3-management`, ARM64) on the same host. StrangeQ ran natively.
 
-| Benchmark | Broker | Median (ns/op) | Min (ns/op) | Max (ns/op) | msg/s | B/op | allocs/op | Ratio |
-|-----------|--------|----------------|-------------|-------------|-------|------|-----------|-------|
-| Auto-ack | StrangeQ | 3,463 | 2,774 | 4,250 | 289K | 1,371 | 32 | 1.14x |
-| Auto-ack | RabbitMQ | 3,931 | 3,801 | 4,059 | 254K | | | |
-| Manual ack | StrangeQ | 3,412 | 3,145 | 3,645 | 293K | 1,451 | 34 | 1.36x |
-| Manual ack | RabbitMQ | 4,641 | 4,516 | 4,776 | 215K | | | |
-| Multi-ack 1000 | StrangeQ | 3,831 | 2,933 | 4,177 | 261K | 1,418 | 33 | 1.07x |
-| Multi-ack 1000 | RabbitMQ | 4,099 | 3,940 | 4,251 | 244K | | | |
+| Benchmark | Broker | Median (ns/op) | msg/s | B/op | allocs/op | Ratio |
+|-----------|--------|----------------|-------|------|-----------|-------|
+| Auto-ack | StrangeQ | 3,463 | 289K | 1,371 | 32 | 1.14x |
+| Auto-ack | RabbitMQ | 3,931 | 254K | | | |
+| Manual ack | StrangeQ | 3,412 | 293K | 1,451 | 34 | 1.36x |
+| Manual ack | RabbitMQ | 4,641 | 215K | | | |
+| Multi-ack 1000 | StrangeQ | 3,831 | 261K | 1,418 | 33 | 1.07x |
+| Multi-ack 1000 | RabbitMQ | 4,099 | 244K | | | |
 
-> **Note on variance**: ns/op on TCP loopback benchmarks has high variance on macOS (bimodal distribution: ~2,800 fast path / ~4,000 slow path, depending on goroutine scheduling). The deterministic metrics are `B/op` (bytes allocated per operation) and `allocs/op` (heap allocations per operation), which are stable across runs. StrangeQ achieves **56% less memory** and **31% fewer allocations** per operation compared to the pre-optimization baseline. RabbitMQ `B/op` and `allocs/op` are not shown because StrangeQ's include both client and embedded server (same process), while RabbitMQ's would include only the Go client — the two are not directly comparable.
+RabbitMQ `B/op` and `allocs/op` are not shown because StrangeQ's include both client and embedded server (same process), while RabbitMQ's would include only the Go client — the two are not directly comparable.
 
 ### Running the Benchmarks
 
