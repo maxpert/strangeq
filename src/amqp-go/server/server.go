@@ -593,6 +593,8 @@ func (s *Server) processChannelMethod(conn *protocol.Connection, frame *protocol
 		return s.processQueueMethod(conn, frame.Channel, methodID, frame.Payload[4:])
 	case 60: // Basic class
 		return s.processBasicMethod(conn, frame.Channel, methodID, frame.Payload[4:])
+	case 85: // Confirm class
+		return s.processConfirmMethod(conn, frame.Channel, methodID, frame.Payload[4:])
 	case 90: // Transaction class
 		return s.processTransactionMethod(conn, frame.Channel, methodID, frame.Payload[4:])
 	default:

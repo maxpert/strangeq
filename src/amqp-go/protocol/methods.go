@@ -87,6 +87,17 @@ const (
 	TxRollbackOK = 31 // 90.31 - class ID 90, method ID 31
 )
 
+// Class ID for confirm class
+const (
+	ConfirmClass = 85
+)
+
+// Method IDs for confirm class
+const (
+	ConfirmSelect   = 10 // 85.10 - class ID 85, method ID 10
+	ConfirmSelectOK = 11 // 85.11 - class ID 85, method ID 11
+)
+
 // ConnectionStartMethod represents the connection.start method
 type ConnectionStartMethod struct {
 	VersionMajor     byte
@@ -2818,6 +2829,39 @@ func EncodeBodyFrameForChannel(channelID uint16, bodyData []byte) *Frame {
 		Size:    uint32(len(bodyData)),
 		Payload: bodyData,
 	}
+}
+
+// ConfirmSelectMethod represents the confirm.select method (class 85, method 10)
+type ConfirmSelectMethod struct {
+	NoWait bool
+}
+
+// Serialize encodes the ConfirmSelectMethod into a byte slice
+func (m *ConfirmSelectMethod) Serialize() ([]byte, error) {
+	var bits byte
+	if m.NoWait {
+		bits |= 1 << 0
+	}
+	return []byte{bits}, nil
+}
+
+// Deserialize decodes the ConfirmSelectMethod from a byte slice
+func (m *ConfirmSelectMethod) Deserialize(data []byte) error {
+	if len(data) < 1 {
+		m.NoWait = false
+		return nil
+	}
+	m.NoWait = data[0]&(1<<0) != 0
+	return nil
+}
+
+// ConfirmSelectOKMethod represents the confirm.select-ok method (class 85, method 11)
+type ConfirmSelectOKMethod struct {
+}
+
+// Serialize encodes the ConfirmSelectOKMethod into a byte slice
+func (m *ConfirmSelectOKMethod) Serialize() ([]byte, error) {
+	return []byte{}, nil
 }
 
 // FragmentBodyIntoFrames fragments a message body into multiple body frames

@@ -3,6 +3,8 @@ package server
 import (
 	"fmt"
 
+	amqperrors "github.com/maxpert/amqp-go/errors"
+	"github.com/maxpert/amqp-go/interfaces"
 	"github.com/maxpert/amqp-go/protocol"
 	"go.uber.org/zap"
 )
@@ -35,6 +37,19 @@ func (s *Server) handleTxSelect(conn *protocol.Connection, channelID uint16, pay
 			zap.String("connection_id", conn.ID),
 			zap.Uint16("channel_id", channelID))
 		return err
+	}
+
+	// Check if channel is in confirm mode — can't be in both
+	if val, ok := conn.Channels.Load(channelID); ok {
+		ch := val.(*protocol.Channel)
+		if ch.ConfirmMode.Load() {
+			s.Log.Warn("Cannot enable transaction mode on confirm channel",
+				zap.Uint16("channel_id", channelID),
+				zap.String("connection_id", conn.ID))
+			s.sendChannelClose(conn, channelID, amqperrors.PreconditionFailed,
+				"channel cannot be in both confirm and transaction mode", 90, 10)
+			return fmt.Errorf("channel %d is in confirm mode, cannot enable transaction mode", channelID)
+		}
 	}
 
 	s.Log.Info("Transaction select requested",
@@ -76,6 +91,18 @@ func (s *Server) handleTxCommit(conn *protocol.Connection, channelID uint16, pay
 		zap.String("connection_id", conn.ID),
 		zap.Uint16("channel_id", channelID))
 
+	// If channel is in confirm mode, capture pending operations before commit
+	// so we can send basic.ack for each publish after commit succeeds.
+	var ops []*interfaces.TransactionOperation
+	inConfirmMode := false
+	if val, ok := conn.Channels.Load(channelID); ok {
+		ch := val.(*protocol.Channel)
+		inConfirmMode = ch.ConfirmMode.Load()
+	}
+	if inConfirmMode && s.TransactionManager != nil {
+		ops, _ = s.TransactionManager.GetPendingOperations(channelID)
+	}
+
 	// Commit pending operations
 	if s.TransactionManager != nil {
 		err = s.TransactionManager.Commit(channelID)
@@ -87,6 +114,21 @@ func (s *Server) handleTxCommit(conn *protocol.Connection, channelID uint16, pay
 		}
 	} else {
 		return fmt.Errorf("transactions not supported")
+	}
+
+	// Send confirms for published messages after successful commit
+	if inConfirmMode {
+		for _, op := range ops {
+			if op.Type == interfaces.OpPublish {
+				if ackErr := s.sendBasicAck(conn, channelID, op.DeliveryTag, false); ackErr != nil {
+					s.Log.Error("Failed to send confirm after commit",
+						zap.Error(ackErr),
+						zap.Uint16("channel_id", channelID),
+						zap.Uint64("delivery_tag", op.DeliveryTag))
+					return ackErr
+				}
+			}
+		}
 	}
 
 	// Send tx.commit-ok response

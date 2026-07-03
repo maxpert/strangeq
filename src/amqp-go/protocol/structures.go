@@ -44,18 +44,20 @@ func NewConnection(conn net.Conn) *Connection {
 
 // Channel represents an AMQP channel
 type Channel struct {
-	ID             uint16
-	Connection     *Connection
-	Closed         bool
-	Mutex          sync.RWMutex
-	Consumers      map[string]*Consumer // Consumer tag -> Consumer
-	DeliveryTag    uint64               // Used for delivery tags in acknowledgements
-	PrefetchCount  uint16               // Channel-level prefetch count
-	PrefetchSize   uint32               // Channel-level prefetch size (0 = unlimited)
-	GlobalPrefetch bool                 // Apply prefetch settings globally
-	CurrentQueue   string               // Last declared queue name (for empty-name resolution per AMQP spec)
-	FlowActive     atomic.Bool          // channel.flow state: true = content frames may be sent
-	FlowWake       chan struct{}        // signaled to wake parked forwarders when flow resumes/closes
+	ID              uint16
+	Connection      *Connection
+	Closed          bool
+	Mutex           sync.RWMutex
+	Consumers       map[string]*Consumer // Consumer tag -> Consumer
+	DeliveryTag     uint64               // Used for delivery tags in acknowledgements
+	PrefetchCount   uint16               // Channel-level prefetch count
+	PrefetchSize    uint32               // Channel-level prefetch size (0 = unlimited)
+	GlobalPrefetch  bool                 // Apply prefetch settings globally
+	CurrentQueue    string               // Last declared queue name (for empty-name resolution per AMQP spec)
+	FlowActive      atomic.Bool          // channel.flow state: true = content frames may be sent
+	FlowWake        chan struct{}        // signaled to wake parked forwarders when flow resumes/closes
+	ConfirmMode     atomic.Bool          // confirm.select state: true = server sends basic.ack for each publish
+	ConfirmSequence atomic.Uint64        // channel-scoped delivery tag sequence for publisher confirms
 }
 
 // NewChannel creates a new AMQP channel

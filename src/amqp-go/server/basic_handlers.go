@@ -314,9 +314,22 @@ func (s *Server) processCompleteMessage(conn *protocol.Connection, channelID uin
 		Mandatory:       pendingMsg.Method.Mandatory,
 	}
 
+	// Assign confirm delivery tag if channel is in confirm mode (before
+	// transactional check so the tag is sequential across all publishes).
+	var confirmTag uint64
+	if val, ok := conn.Channels.Load(channelID); ok {
+		ch := val.(*protocol.Channel)
+		if ch.ConfirmMode.Load() {
+			confirmTag = ch.ConfirmSequence.Add(1)
+		}
+	}
+
 	// Buffer into transaction if channel is in transactional mode
 	if s.TransactionManager != nil && s.TransactionManager.IsTransactional(channelID) {
 		op := transaction.NewPublishOperation(message.Exchange, message.RoutingKey, message)
+		if confirmTag > 0 {
+			op.DeliveryTag = confirmTag
+		}
 		return s.TransactionManager.AddOperation(channelID, op)
 	}
 
@@ -336,7 +349,13 @@ func (s *Server) processCompleteMessage(conn *protocol.Connection, channelID uin
 			if s.MetricsCollector != nil {
 				s.MetricsCollector.RecordMessageUnroutable()
 			}
-			return s.sendBasicReturn(conn, channelID, 312, "NO_ROUTE", message.Exchange, message.RoutingKey, message)
+			if retErr := s.sendBasicReturn(conn, channelID, 312, "NO_ROUTE", message.Exchange, message.RoutingKey, message); retErr != nil {
+				return retErr
+			}
+			if confirmTag > 0 {
+				return s.sendBasicAck(conn, channelID, confirmTag, false)
+			}
+			return nil
 		}
 		s.Log.Error("Failed to route message",
 			zap.Error(err),
@@ -351,6 +370,10 @@ func (s *Server) processCompleteMessage(conn *protocol.Connection, channelID uin
 
 	if ce := s.Log.Check(zapcore.DebugLevel, "Message successfully routed"); ce != nil {
 		ce.Write(zap.String("exchange", message.Exchange), zap.String("routing_key", message.RoutingKey))
+	}
+
+	if confirmTag > 0 {
+		return s.sendBasicAck(conn, channelID, confirmTag, false)
 	}
 
 	return nil

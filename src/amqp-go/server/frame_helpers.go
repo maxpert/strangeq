@@ -276,3 +276,19 @@ func (s *Server) sendBasicReturn(conn *protocol.Connection, channelID uint16, re
 func (s *Server) sendBasicRecoverOK(conn *protocol.Connection, channelID uint16) error {
 	return s.sendMethodResponse(conn, channelID, 60, 111, &protocol.BasicRecoverOKMethod{})
 }
+
+// sendConfirmSelectOK sends the confirm.select-ok method frame
+func (s *Server) sendConfirmSelectOK(conn *protocol.Connection, channelID uint16) error {
+	return s.sendMethodResponse(conn, channelID, 85, 11, &protocol.ConfirmSelectOKMethod{})
+}
+
+// sendBasicAck sends a basic.ack method frame to the client. Used for publisher
+// confirms: the server acknowledges that a message with the given delivery tag
+// has been processed.
+func (s *Server) sendBasicAck(conn *protocol.Connection, channelID uint16, deliveryTag uint64, multiple bool) error {
+	method := &protocol.BasicAckMethod{
+		DeliveryTag: deliveryTag,
+		Multiple:    multiple,
+	}
+	return s.sendMethodResponse(conn, channelID, 60, 80, method)
+}
