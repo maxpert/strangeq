@@ -1,6 +1,6 @@
-# StrangeQ - AMQP 0.9.1 Message Broker
+# StrangeQ — AMQP 0.9.1 Message Broker
 
-A high-performance AMQP 0.9.1 message broker implementation written in Go. Compatible with RabbitMQ clients and tools.
+A high-performance AMQP 0.9.1 message broker written in Go. Compatible with RabbitMQ clients and tools.
 
 [![Build Status](https://github.com/maxpert/strangeq/workflows/Build%20and%20Test/badge.svg)](https://github.com/maxpert/strangeq/actions)
 [![Go Report Card](https://goreportcard.com/badge/github.com/maxpert/strangeq)](https://goreportcard.com/report/github.com/maxpert/strangeq)
@@ -10,28 +10,33 @@ A high-performance AMQP 0.9.1 message broker implementation written in Go. Compa
 
 RabbitMQ is the gold standard for AMQP 0.9.1, but it runs on the Erlang VM — a separate runtime with its own scheduling, memory model, and operational overhead. StrangeQ exists for teams that want:
 
-- **Embeddable**: Run it as a library inside your Go application. No separate process, no Erlang runtime, no Docker image required for tests. The benchmark suite itself starts an embedded server in-process.
+- **Embeddable**: Run it as a library inside your Go application. No separate process, no Erlang runtime, no Docker image required for tests.
 - **Go-native observability**: Native `net/http/pprof` endpoints for CPU, memory, goroutine, and mutex profiling. Use `go tool pprof` directly — no Erlang tooling required.
 - **Single binary deployment**: One static binary with no runtime dependencies. Cross-compile for any Go-supported platform with a single command.
 - **AMQP 0.9.1 wire compatibility**: Drop-in replacement for RabbitMQ from any AMQP 0.9.1 client (Go, Python, Node.js, Java, Ruby, C#).
-- **Transparent internals**: The entire broker is readable Go source code — no opaque Erlang BEAM abstractions. Debug, profile, and extend with standard Go tooling.
-
-StrangeQ is not a drop-in replacement for RabbitMQ in production. It lacks management UI, clustering, DLX, TTL, priority queues, publisher confirms, and other RabbitMQ features. It is a lightweight, embeddable, high-performance broker for Go applications and development environments.
+- **Transparent internals**: The entire broker is readable Go source code. Debug, profile, and extend with standard Go tooling.
 
 ## Features
 
-- AMQP 0.9.1 protocol compatible with RabbitMQ clients (Go, Python, Node.js, etc.)
-- Exchange types: direct, fanout, topic (partial), headers (partial)
-- Three-tier storage architecture (Ring Buffer -> WAL -> Segments)
+- AMQP 0.9.1 protocol compatible with RabbitMQ clients (Go, Python, Node.js, Java, Ruby, C#)
+- Exchange types: direct, fanout, topic (with `*` and `#` wildcards), headers (with `x-match: all` and `any`)
+- Exchange-to-exchange bindings with cycle detection
+- Three-tier storage architecture (ring buffer → WAL → segments)
 - Persistent and non-persistent messages with crash recovery
 - TLS/SSL encryption with mutual TLS support
 - SASL authentication (PLAIN, ANONYMOUS)
 - Authorization with RabbitMQ-style configure/write/read permissions per vhost
-- Transaction protocol handshake (Tx.Select, Tx.Commit, Tx.Rollback)
-- 1.07-1.36x faster throughput than RabbitMQ 4.3 on same hardware (see benchmarks below)
+- Publisher confirms (`confirm.select`)
+- Transactions (`tx.select` / `tx.commit` / `tx.rollback`) with publish and ack buffering
+- `basic.get` with synchronous message retrieval and ack tracking
+- `basic.return` for unroutable mandatory messages
+- `basic.recover` for redelivering unacknowledged messages
+- `queue.purge` for removing all messages from a queue
+- `channel.flow` / `channel.flow-ok` for start/stop of content frames
+- 1.07–1.36x faster throughput than RabbitMQ 4.3 on same hardware (see benchmarks below)
 - Prometheus metrics and pprof profiling
-- Lock-free per-queue AtomicRing with per-slot CAS
-- Batch TCP writes and ACK offloading (no fsync head-of-line blocking)
+- Lock-free per-queue ring buffer with per-slot CAS
+- Batch TCP writes and ACK offloading
 
 ## Installation
 
@@ -247,17 +252,17 @@ engine:
 ```
 
 Key engine tuning parameters:
-- `ringbuffersize` -- In-memory ring buffer per queue (must be power of 2, default 64K)
-- `spillthresholdpercent` -- Ring fill % before spilling to WAL (default 80)
-- `walbatchsize` / `walbatchtimeoutms` -- WAL batching for durable writes (1000 msgs / 10ms)
-- `segmentsize` -- Cold storage segment file size (default 1 GB)
-- `consumermaxbatchsize` -- Max messages to deliver per consumer per poll (default 100)
+- `ringbuffersize` — In-memory ring buffer per queue (must be power of 2, default 64K)
+- `spillthresholdpercent` — Ring fill % before spilling to WAL (default 80)
+- `walbatchsize` / `walbatchtimeoutms` — WAL batching for durable writes (1000 msgs / 10ms)
+- `segmentsize` — Cold storage segment file size (default 1 GB)
+- `consumermaxbatchsize` — Max messages to deliver per consumer per poll (default 100)
 
 ## Performance
 
 ### Head-to-Head vs RabbitMQ 4.3
 
-Same machine, same Go client ([amqp091-go](https://github.com/rabbitmq/amqp091-go)), 12-byte messages, durable queue, transient messages, 1 publisher + 1 consumer. RabbitMQ ran in a Docker container (`rabbitmq:4.3-management`, ARM64) on the same host. StrangeQ ran natively.
+Same machine, same Go client ([amqp091-go](https://github.com/rabbitmq/amqp091-go)), 12-byte messages, durable queue, transient messages, 1 publisher + 1 consumer.
 
 | Benchmark | Broker | Median (ns/op) | msg/s | B/op | allocs/op | Ratio |
 |-----------|--------|----------------|-------|------|-----------|-------|
@@ -267,8 +272,6 @@ Same machine, same Go client ([amqp091-go](https://github.com/rabbitmq/amqp091-g
 | Manual ack | RabbitMQ | 4,641 | 215K | | | |
 | Multi-ack 1000 | StrangeQ | 3,831 | 261K | 1,418 | 33 | 1.07x |
 | Multi-ack 1000 | RabbitMQ | 4,099 | 244K | | | |
-
-RabbitMQ `B/op` and `allocs/op` are not shown because StrangeQ's include both client and embedded server (same process), while RabbitMQ's would include only the Go client — the two are not directly comparable.
 
 ### Running the Benchmarks
 
@@ -281,9 +284,6 @@ go test . -run='^$' -bench="BenchmarkVersus" -benchmem -benchtime=50000x -count=
 # Benchmark RabbitMQ (must be running on localhost:5672)
 docker run -d -p 5672:5672 --name rabbitmq-bench rabbitmq:4.3-management
 AMQP_TARGET=rabbitmq go test . -run='^$' -bench="BenchmarkVersus" -benchmem -benchtime=50000x -count=5
-
-# E2E benchmarks (publish-only, roundtrip, multi-queue, multi-connection)
-go test . -run='^$' -bench="BenchmarkE2E" -benchmem -benchtime=3s -count=3
 ```
 
 ## Feature Comparison vs RabbitMQ
@@ -299,16 +299,16 @@ go test . -run='^$' -bench="BenchmarkE2E" -benchmem -benchtime=3s -count=3
 | `connection.secure` / `secure-ok` | No | Yes |
 | `channel.open` / `open-ok` | Yes | Yes |
 | `channel.close` / `close-ok` | Yes | Yes |
-| `channel.flow` / `flow-ok` | No | Yes |
+| `channel.flow` / `flow-ok` | Yes | Yes |
 | `exchange.declare` / `declare-ok` | Yes | Yes |
 | `exchange.delete` / `delete-ok` | Yes | Yes |
-| `exchange.bind` / `bind-ok` | No | Yes |
-| `exchange.unbind` / `unbind-ok` | No | Yes |
+| `exchange.bind` / `bind-ok` | Yes | Yes |
+| `exchange.unbind` / `unbind-ok` | Yes | Yes |
 | `queue.declare` / `declare-ok` | Yes | Yes |
 | `queue.delete` / `delete-ok` | Yes | Yes |
 | `queue.bind` / `bind-ok` | Yes | Yes |
 | `queue.unbind` / `unbind-ok` | Yes | Yes |
-| `queue.purge` / `purge-ok` | No | Yes |
+| `queue.purge` / `purge-ok` | Yes | Yes |
 | `basic.qos` / `qos-ok` | Yes (per-channel; global QoS not enforced) | Yes |
 | `basic.consume` / `consume-ok` | Yes | Yes |
 | `basic.cancel` / `cancel-ok` | Yes | Yes |
@@ -316,12 +316,12 @@ go test . -run='^$' -bench="BenchmarkE2E" -benchmem -benchtime=3s -count=3
 | `basic.ack` | Yes | Yes |
 | `basic.nack` | Yes | Yes |
 | `basic.reject` | Yes | Yes |
-| `basic.get` / `get-ok` / `get-empty` | Partial (always returns `get-empty`) | Yes |
+| `basic.get` / `get-ok` / `get-empty` | Yes | Yes |
 | `basic.deliver` | Yes | Yes |
-| `basic.return` | No | Yes |
-| `basic.recover` / `recover-ok` | No | Yes |
-| `tx.select` / `commit` / `rollback` | Partial (protocol handshake works; publishes not buffered for atomicity) | Yes |
-| `confirm.select` / `select-ok` | No | Yes |
+| `basic.return` | Yes | Yes |
+| `basic.recover` / `recover-ok` | Yes | Yes |
+| `tx.select` / `commit` / `rollback` | Yes | Yes |
+| `confirm.select` / `select-ok` | Yes | Yes |
 
 ### Exchange Types
 
@@ -329,9 +329,8 @@ go test . -run='^$' -bench="BenchmarkE2E" -benchmem -benchtime=3s -count=3
 |------|----------|----------|
 | `direct` | Yes | Yes |
 | `fanout` | Yes | Yes |
-| `topic` | Partial (`*` wildcard not implemented; exact match and `#` work) | Yes |
-| `headers` | Partial (only `x-match: all`; `x-match: any` not implemented) | Yes |
-| `match` | No | Yes (plugin) |
+| `topic` | Yes (`*` single-word, `#` zero-or-more words) | Yes |
+| `headers` | Yes (`x-match: all` and `any`) | Yes |
 
 ### Security
 
@@ -357,62 +356,52 @@ go test . -run='^$' -bench="BenchmarkE2E" -benchmem -benchtime=3s -count=3
 | Crash recovery | Yes | Yes |
 | Bindings persistence | Yes | Yes |
 
-### Special Features
+### Not Yet Supported
 
-| Feature | StrangeQ | RabbitMQ |
-|---------|----------|----------|
-| Dead-letter exchange (DLX) | No | Yes |
-| Message TTL | No | Yes |
-| Queue TTL (`x-expires`) | No | Yes |
-| Priority queues (`x-max-priority`) | No | Yes |
-| Lazy queues (`x-queue-mode`) | No | Yes |
-| Exclusive queues | Partial (flag stored; not enforced on connection close) | Yes |
-| Auto-delete queues | Partial (flag stored; last-consumer-leave not enforced) | Yes |
-| Passive declare | Partial (bypasses reserved-name check; no NOT_FOUND for missing entities) | Yes |
-| Publisher confirms | No | Yes |
-| Mandatory / `basic.return` | No | Yes |
+The following RabbitMQ features are not implemented:
 
-### Management & Observability
-
-| Feature | StrangeQ | RabbitMQ |
-|---------|----------|----------|
-| Prometheus metrics | Yes | Yes (via plugin) |
-| pprof profiling | Yes | No (Erlang) |
-| Management UI | No | Yes (plugin) |
-| CLI management | No | Yes (rabbitmqctl) |
+- Clustering and high availability
+- Dead-letter exchange (DLX)
+- Message TTL and queue TTL (`x-expires`)
+- Priority queues (`x-max-priority`)
+- Lazy queues (`x-queue-mode`)
+- Max length / max length bytes (`x-max-length`, `x-max-length-bytes`)
+- Consumer priorities (`x-priority`)
+- `connection.secure` / `secure-ok` (multi-step challenge-response auth)
+- SASL EXTERNAL
+- Exclusive queue enforcement on connection close
+- Auto-delete queue enforcement on last consumer leave
+- Global prefetch (`basic.qos` with `global=true`)
+- Prefetch size enforcement (`basic.qos` with `prefetch_size > 0`)
+- Management UI and CLI management tools
 
 ## Architecture
 
 ### Storage Engine
 
-- **Ring Buffer**: `[]atomic.Pointer[Message]` with per-slot CAS -- zero allocations on hot path
-- **Tag-to-Seq Map**: `map[uint64]uint64` with `sync.RWMutex` -- no per-tag `*uint64` boxing (replaces `sync.Map`)
-- **WAL Spill**: When ring buffer fills, messages spill to write-ahead log (batched fsync)
-- **WAL Skip**: In-memory transient messages skip WAL/segment ack on delete -- eliminates 1 alloc + 2 channel sends per ack
-- **Segment Storage**: 1 GB segments for cold message storage
-- **Per-Queue Isolation**: Each queue has its own ring buffer, WAL cursor, and consumer dispatch -- zero cross-queue contention
+- **Ring Buffer**: Per-queue lock-free ring with per-slot CAS — zero allocations on the hot path
+- **WAL Spill**: When the ring buffer fills, messages spill to a write-ahead log with batched fsync
+- **Segment Storage**: Cold message storage in segment files
+- **Per-Queue Isolation**: Each queue has its own ring buffer, WAL cursor, and consumer dispatch — no cross-queue contention
 
 ### Connection Handling
 
-- **Reader/Processor Separation**: TCP reader and frame processor in separate goroutines
-- **ACK Offloading**: Per-connection `ackProcessor` goroutine handles all ACK/NACK/reject frames -- eliminates fsync head-of-line blocking on the frame processor
-- **Blocking AckQueue**: ACK frames are sent to AckQueue with `conn.Done` fallback -- preserves ordering, prevents frame-processor stalls
-- **Batched TCP Writes**: All deliveries in a batch are serialized into a single buffer and sent with one `Write()` call -- reduces syscalls and lock acquisitions
-- **Direct-Write Serialization**: Frame bytes written directly into batch buffer via `AppendFrame` / `AppendShortString` -- eliminates intermediate `*Frame`, `*BasicDeliverMethod`, `*ContentHeader` allocations
-- **Object Pooling**: `*Frame`, `*BasicPublishMethod`, `*PendingMessage`, `*ContentHeader` pooled via `sync.Pool` -- 6 fewer heap allocs per publish
-- **Consumer Dirty Flag**: Delivery loop only re-scans consumers when the consumer set changes -- avoids per-iteration map scan
-- **Lock-Free AckCursor**: Per-consumer `sync.Map` + atomic CAS for `minAckCursor` -- no mutex contention between delivery and ack goroutines
-- **Flow Control**: RabbitMQ-style memory pressure handling
+- **Reader/Processor Separation**: TCP reader and frame processor run in separate goroutines
+- **ACK Offloading**: A dedicated goroutine handles ACK/NACK/reject frames — eliminates head-of-line blocking on the frame processor
+- **Batched TCP Writes**: Deliveries in a batch are serialized into a single buffer and sent with one write — reduces syscalls and lock acquisitions
+- **Direct-Write Serialization**: Frame bytes are written directly into the batch buffer — eliminates intermediate object allocations
+- **Object Pooling**: Frames, publish methods, pending messages, and content headers are pooled via `sync.Pool`
+- **Flow Control**: `channel.flow` gates delivery forwarding with a single atomic load — zero overhead when flow is active
 
 ### Crash Recovery
 
 1. Validate storage integrity
 2. Recover durable exchanges and queues
 3. Rebuild bindings
-4. Load persistent messages directly into ring buffer
+4. Load persistent messages into ring buffers
 5. Restore pending acknowledgments
 
-Recovery is incremental and happens in milliseconds for typical workloads.
+Recovery is incremental and completes in milliseconds for typical workloads.
 
 ## Production Deployment
 
@@ -430,16 +419,14 @@ sudo systemctl start amqp-server
 sudo systemctl status amqp-server
 ```
 
-### Using Docker (for testing with RabbitMQ)
+### Using Docker
 
-The repository includes a docker-compose file for testing compatibility with RabbitMQ:
+The repository includes a docker-compose file for protocol interoperability testing with RabbitMQ:
 
 ```bash
 cd src/amqp-go/protocol
 docker-compose up
 ```
-
-This is used for protocol testing and interoperability verification only.
 
 ## Monitoring
 
@@ -455,12 +442,7 @@ amqp-server --config config.yaml --enable-telemetry --telemetry-port 9419
 curl http://localhost:9419/metrics
 ```
 
-Available metrics:
-- Message throughput (published, consumed, confirmed)
-- Connection and channel counts
-- Queue depths and message rates
-- Memory usage and GC statistics
-- WAL and ring buffer utilization
+Available metrics include message throughput, connection and channel counts, queue depths, memory usage, and storage utilization.
 
 ### Profiling
 
@@ -525,12 +507,12 @@ src/amqp-go/
 ├── config/              # Configuration management
 ├── protocol/            # AMQP protocol implementation
 ├── server/              # Server and connection handling
-├── storage/             # Storage engine (AtomicRing, WAL, segments)
+├── storage/             # Storage engine (ring buffer, WAL, segments)
 ├── interfaces/          # Interface definitions
 ├── broker/              # Message routing and delivery
 ├── auth/                # Authentication & authorization
 ├── metrics/             # Prometheus metrics
-└── benchmark/           # Performance testing tools
+└── transaction/         # Transaction manager
 ```
 
 ## Compatibility
@@ -546,11 +528,11 @@ Compatible with any AMQP 0.9.1 client library:
 
 ## Documentation
 
-- [Client Examples](CLIENT_EXAMPLES.md) - Complete examples for Python, Node.js, and Go
-- [Authorization Guide](docs/AUTHORIZATION.md) - Permission model and access control
-- [TLS Configuration](docs/TLS.md) - TLS encryption and mutual TLS setup
-- [Contributing Guidelines](CONTRIBUTING.md) - How to contribute
-- [Security Policy](SECURITY.md) - Security best practices
+- [Client Examples](CLIENT_EXAMPLES.md) — Complete examples for Python, Node.js, and Go
+- [Authorization Guide](docs/AUTHORIZATION.md) — Permission model and access control
+- [TLS Configuration](docs/TLS.md) — TLS encryption and mutual TLS setup
+- [Contributing Guidelines](CONTRIBUTING.md) — How to contribute
+- [Security Policy](SECURITY.md) — Security best practices
 
 ## Contributing
 
@@ -558,7 +540,7 @@ We welcome contributions! Please see [CONTRIBUTING.md](CONTRIBUTING.md) for guid
 
 ## License
 
-MIT License - see [LICENSE](LICENSE) for details.
+MIT License — see [LICENSE](LICENSE) for details.
 
 ## Support
 
