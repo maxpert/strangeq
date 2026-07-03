@@ -54,11 +54,13 @@ type Channel struct {
 	PrefetchSize   uint32               // Channel-level prefetch size (0 = unlimited)
 	GlobalPrefetch bool                 // Apply prefetch settings globally
 	CurrentQueue   string               // Last declared queue name (for empty-name resolution per AMQP spec)
+	FlowActive     atomic.Bool          // channel.flow state: true = content frames may be sent
+	FlowWake       chan struct{}        // signaled to wake parked forwarders when flow resumes/closes
 }
 
 // NewChannel creates a new AMQP channel
 func NewChannel(id uint16, conn *Connection) *Channel {
-	return &Channel{
+	ch := &Channel{
 		ID:             id,
 		Connection:     conn,
 		Consumers:      make(map[string]*Consumer),
@@ -66,7 +68,10 @@ func NewChannel(id uint16, conn *Connection) *Channel {
 		PrefetchCount:  0,     // No limit by default
 		PrefetchSize:   0,     // No limit by default
 		GlobalPrefetch: false, // Per-consumer by default
+		FlowWake:       make(chan struct{}, 1),
 	}
+	ch.FlowActive.Store(true) // Flow is active by default per AMQP spec
+	return ch
 }
 
 // Exchange represents an AMQP exchange

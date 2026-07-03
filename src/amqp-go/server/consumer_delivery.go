@@ -17,12 +17,23 @@ type consumerInfo struct {
 // channel. Exits when the Messages channel is closed or stop is signaled.
 // Sends *protocol.Delivery directly (no wrapper) to avoid per-message
 // heap allocations — Delivery.ConsumerTag is used for routing.
-func forwardConsumerMessages(msgChan chan *protocol.Delivery, fanIn chan<- *protocol.Delivery, stop <-chan struct{}) {
+//
+// Flow control: before forwarding, a single atomic load of channel.FlowActive
+// gates the send. When flow is inactive the goroutine parks on FlowWake until
+// flow resumes or stop closes (zero overhead in the common active case).
+func forwardConsumerMessages(channel *protocol.Channel, msgChan chan *protocol.Delivery, fanIn chan<- *protocol.Delivery, stop <-chan struct{}) {
 	for {
 		select {
 		case delivery, ok := <-msgChan:
 			if !ok {
 				return
+			}
+			for !channel.FlowActive.Load() {
+				select {
+				case <-channel.FlowWake:
+				case <-stop:
+					return
+				}
 			}
 			select {
 			case fanIn <- delivery:
@@ -59,7 +70,7 @@ func (s *Server) discoverConsumers(
 				consumerInfos[consumer.Tag] = &consumerInfo{channel: channel}
 				stop := make(chan struct{})
 				forwarders[consumer.Tag] = stop
-				go forwardConsumerMessages(consumer.Messages, fanIn, stop)
+				go forwardConsumerMessages(channel, consumer.Messages, fanIn, stop)
 				s.Log.Debug("Started forwarder for consumer",
 					zap.String("consumer_tag", consumer.Tag),
 					zap.String("queue", consumer.Queue))

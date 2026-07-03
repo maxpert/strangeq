@@ -44,6 +44,12 @@ func (s *Server) sendChannelCloseOK(conn *protocol.Connection, channelID uint16)
 	return s.sendMethodResponse(conn, channelID, 20, 41, &protocol.ChannelCloseOKMethod{})
 }
 
+// sendChannelFlowOK sends the channel.flow-ok method frame, echoing the
+// current active state per AMQP 0.9.1 spec.
+func (s *Server) sendChannelFlowOK(conn *protocol.Connection, channelID uint16, active bool) error {
+	return s.sendMethodResponse(conn, channelID, 20, 21, &protocol.ChannelFlowOKMethod{Active: active})
+}
+
 // sendExchangeDeclareOK sends the exchange.declare-ok method frame
 func (s *Server) sendExchangeDeclareOK(conn *protocol.Connection, channelID uint16) error {
 	return s.sendMethodResponse(conn, channelID, 40, 11, &protocol.ExchangeDeclareOKMethod{})

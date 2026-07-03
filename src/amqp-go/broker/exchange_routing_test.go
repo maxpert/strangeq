@@ -251,9 +251,7 @@ func TestTopicExchangeRouting(t *testing.T) {
 		assert.Len(t, targetQueues, 1, "Should route to only queue2")
 	})
 
-	t.Run("Star wildcard not implemented", func(t *testing.T) {
-		// This test documents the current limitation
-		// Pattern "*.orange.*" should match "quick.orange.rabbit" but currently doesn't
+	t.Run("Star wildcard matches single word", func(t *testing.T) {
 		err = broker.storage.StoreBinding("topic.queue4", "test.topic", "*.orange.*", nil)
 		require.NoError(t, err)
 
@@ -264,8 +262,9 @@ func TestTopicExchangeRouting(t *testing.T) {
 
 		targetQueues, err := broker.findTargetQueues(exchange, "quick.orange.rabbit", message)
 		require.NoError(t, err)
-		// Currently, star wildcard is NOT implemented, so this won't match
-		assert.NotContains(t, targetQueues, "topic.queue4", "Star wildcard NOT IMPLEMENTED - this should fail")
+		assert.Contains(t, targetQueues, "topic.queue4", "queue4 should match *.orange.* pattern")
+		assert.Contains(t, targetQueues, "topic.queue2", "queue2 with # wildcard should also match")
+		assert.Len(t, targetQueues, 2, "Should route to queue2 (#) and queue4 (*.orange.*)")
 	})
 }
 
@@ -394,12 +393,9 @@ func TestHeadersExchangeRouting(t *testing.T) {
 		assert.Len(t, targetQueues, 0, "Should route to zero queues for empty headers")
 	})
 
-	t.Run("x-match any mode not implemented", func(t *testing.T) {
-		// This test documents the current limitation
-		// Currently, the implementation always uses "all" mode
-		// There's no way to test "any" mode since it's not implemented
+	t.Run("x-match any mode matches on single header", func(t *testing.T) {
 		bindingAnyArgs := map[string]interface{}{
-			"x-match": "any", // This is ignored by current implementation
+			"x-match": "any",
 			"header1": "value1",
 			"header2": "value2",
 		}
@@ -410,15 +406,14 @@ func TestHeadersExchangeRouting(t *testing.T) {
 			Body: []byte("headers message"),
 			Headers: map[string]interface{}{
 				"header1": "value1",
-				// Missing header2
 			},
 		}
 
 		targetQueues, err := broker.findTargetQueues(exchange, "", message)
 		require.NoError(t, err)
-		// Current implementation uses "all" mode, so queue4 won't match
-		// With "any" mode, it should match because header1 matches
-		assert.NotContains(t, targetQueues, "headers.queue4", "x-match: any NOT IMPLEMENTED - uses all mode")
+		assert.Contains(t, targetQueues, "headers.queue4", "queue4 should match with x-match: any since header1 matches")
+		assert.Contains(t, targetQueues, "headers.queue1", "queue1 should match header1=value1")
+		assert.Len(t, targetQueues, 2, "Should route to queue1 and queue4")
 	})
 }
 
@@ -466,4 +461,170 @@ func TestDefaultExchangeRouting(t *testing.T) {
 		require.NoError(t, err)
 		assert.Len(t, targetQueues, 0, "Should route to zero queues for non-existent queue name")
 	})
+}
+
+// TestMatchTopicPattern tests the topic exchange pattern matcher directly,
+// covering * (exactly one word) and # (zero or more words) wildcards per
+// AMQP 0.9.1.
+func TestMatchTopicPattern(t *testing.T) {
+	broker, cleanup := createTestBroker(t)
+	defer cleanup()
+
+	tests := []struct {
+		name       string
+		pattern    string
+		routingKey string
+		want       bool
+	}{
+		{"exact match", "a.b.c", "a.b.c", true},
+		{"exact mismatch key shorter", "a.b.c", "a.b", false},
+		{"exact mismatch key longer", "a.b", "a.b.c", false},
+		{"empty pattern empty key", "", "", true},
+		{"empty pattern nonempty key", "", "a", false},
+		{"nonempty pattern empty key", "a", "", false},
+
+		{"hash matches everything", "#", "any.routing.key.value", true},
+		{"hash matches empty", "#", "", true},
+		{"hash matches single word", "#", "foo", true},
+		{"a.hash matches a", "a.#", "a", true},
+		{"a.hash matches a.b", "a.#", "a.b", true},
+		{"a.hash matches a.b.c.d", "a.#", "a.b.c.d", true},
+		{"a.hash not match b", "a.#", "b", false},
+		{"a.hash not match ab", "a.#", "ab", false},
+		{"hash.b matches b", "#.b", "b", true},
+		{"hash.b matches a.b", "#.b", "a.b", true},
+		{"hash.b matches a.x.b", "#.b", "a.x.b", true},
+		{"hash.b not match a.x.c", "#.b", "a.x.c", false},
+		{"a.hash.b matches a.b", "a.#.b", "a.b", true},
+		{"a.hash.b matches a.x.b", "a.#.b", "a.x.b", true},
+		{"a.hash.b matches a.x.y.b", "a.#.b", "a.x.y.b", true},
+		{"a.hash.b not match a.x.b.c", "a.#.b", "a.x.b.c", false},
+		{"a.hash.b not match b", "a.#.b", "b", false},
+
+		{"star matches single word", "*", "foo", true},
+		{"star not match empty", "*", "", false},
+		{"star not match two words", "*", "a.b", false},
+		{"a.star matches a.foo", "a.*", "a.foo", true},
+		{"a.star not match a.foo.bar", "a.*", "a.foo.bar", false},
+		{"a.star not match a", "a.*", "a", false},
+		{"star.b matches foo.b", "*.b", "foo.b", true},
+		{"star.b not match foo.bar.b", "*.b", "foo.bar.b", false},
+		{"star.b not match b", "*.b", "b", false},
+		{"a.star.b matches a.foo.b", "a.*.b", "a.foo.b", true},
+		{"a.star.b not match a.foo.bar.b", "a.*.b", "a.foo.bar.b", false},
+		{"a.star.b not match a.b", "a.*.b", "a.b", false},
+
+		{"star.orange.star matches quick.orange.rabbit", "*.orange.*", "quick.orange.rabbit", true},
+		{"star.orange.star matches lazy.orange.rabbit", "*.orange.*", "lazy.orange.rabbit", true},
+		{"star.orange.star not match quick.brown.rabbit", "*.orange.*", "quick.brown.rabbit", false},
+		{"lazy.hash matches lazy.orange.rabbit", "lazy.#", "lazy.orange.rabbit", true},
+		{"lazy.hash not match quick.orange.rabbit", "lazy.#", "quick.orange.rabbit", false},
+		{"star.star.rabbit matches quick.orange.rabbit", "*.*.rabbit", "quick.orange.rabbit", true},
+		{"star.star.rabbit not match quick.orange.fox", "*.*.rabbit", "quick.orange.fox", false},
+		{"hash.rabbit matches quick.orange.rabbit", "#.rabbit", "quick.orange.rabbit", true},
+
+		{"a.star.hash matches a.b.c.d", "a.*.#", "a.b.c.d", true},
+		{"a.star.hash matches a.b", "a.*.#", "a.b", true},
+		{"a.star.hash not match a", "a.*.#", "a", false},
+		{"hash.hash matches a.b", "#.#", "a.b", true},
+		{"hash.hash matches empty", "#.#", "", true},
+		{"hash.hash matches single", "#.#", "a", true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := broker.matchTopicPattern(tt.pattern, tt.routingKey)
+			assert.Equal(t, tt.want, got, "matchTopicPattern(%q, %q)", tt.pattern, tt.routingKey)
+		})
+	}
+}
+
+// TestMatchHeaders tests the headers exchange matcher directly, covering
+// x-match: all (default) and x-match: any modes per AMQP 0.9.1.
+func TestMatchHeaders(t *testing.T) {
+	broker, cleanup := createTestBroker(t)
+	defer cleanup()
+
+	tests := []struct {
+		name           string
+		bindingArgs    map[string]interface{}
+		messageHeaders map[string]interface{}
+		want           bool
+	}{
+		{"all: single header match", map[string]interface{}{"h1": "v1"}, map[string]interface{}{"h1": "v1"}, true},
+		{"all: single header mismatch", map[string]interface{}{"h1": "v1"}, map[string]interface{}{"h1": "v2"}, false},
+		{"all: missing header", map[string]interface{}{"h1": "v1"}, map[string]interface{}{"h2": "v2"}, false},
+		{"all: nil message headers", map[string]interface{}{"h1": "v1"}, nil, false},
+		{"all: two headers both match", map[string]interface{}{"h1": "v1", "h2": "v2"}, map[string]interface{}{"h1": "v1", "h2": "v2"}, true},
+		{"all: two headers one missing", map[string]interface{}{"h1": "v1", "h2": "v2"}, map[string]interface{}{"h1": "v1"}, false},
+		{"all: extra message header ok", map[string]interface{}{"h1": "v1"}, map[string]interface{}{"h1": "v1", "h2": "v2"}, true},
+		{"all: explicit x-match all match", map[string]interface{}{"x-match": "all", "h1": "v1"}, map[string]interface{}{"h1": "v1"}, true},
+		{"all: explicit x-match all mismatch", map[string]interface{}{"x-match": "all", "h1": "v1"}, map[string]interface{}{"h1": "v2"}, false},
+
+		{"any: one of two matches", map[string]interface{}{"x-match": "any", "h1": "v1", "h2": "v2"}, map[string]interface{}{"h1": "v1"}, true},
+		{"any: second matches", map[string]interface{}{"x-match": "any", "h1": "v1", "h2": "v2"}, map[string]interface{}{"h2": "v2"}, true},
+		{"any: both match", map[string]interface{}{"x-match": "any", "h1": "v1", "h2": "v2"}, map[string]interface{}{"h1": "v1", "h2": "v2"}, true},
+		{"any: none match", map[string]interface{}{"x-match": "any", "h1": "v1", "h2": "v2"}, map[string]interface{}{"h3": "v3"}, false},
+		{"any: nil message headers", map[string]interface{}{"x-match": "any", "h1": "v1"}, nil, false},
+		{"any: single header match", map[string]interface{}{"x-match": "any", "h1": "v1"}, map[string]interface{}{"h1": "v1"}, true},
+
+		{"xmatch only all matches nonempty", map[string]interface{}{"x-match": "all"}, map[string]interface{}{"h1": "v1"}, true},
+		{"xmatch only any matches nonempty", map[string]interface{}{"x-match": "any"}, map[string]interface{}{"h1": "v1"}, true},
+		{"xmatch only all matches nil headers", map[string]interface{}{"x-match": "all"}, nil, true},
+		{"xmatch only any matches nil headers", map[string]interface{}{"x-match": "any"}, nil, true},
+		{"xmatch only matches empty headers", map[string]interface{}{"x-match": "all"}, map[string]interface{}{}, true},
+
+		{"nil binding no match", nil, map[string]interface{}{"h1": "v1"}, false},
+		{"empty binding no match", map[string]interface{}{}, map[string]interface{}{"h1": "v1"}, false},
+
+		{"int32 equal", map[string]interface{}{"n": int32(5)}, map[string]interface{}{"n": int32(5)}, true},
+		{"int64 equal", map[string]interface{}{"n": int64(5)}, map[string]interface{}{"n": int64(5)}, true},
+		{"int32 vs int64 not equal", map[string]interface{}{"n": int32(5)}, map[string]interface{}{"n": int64(5)}, false},
+		{"string vs int not equal", map[string]interface{}{"n": "5"}, map[string]interface{}{"n": 5}, false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := broker.matchHeaders(tt.bindingArgs, tt.messageHeaders)
+			assert.Equal(t, tt.want, got)
+		})
+	}
+}
+
+func BenchmarkMatchTopicPattern(b *testing.B) {
+	broker, cleanup := createTestBroker(b)
+	defer cleanup()
+
+	patterns := []struct {
+		pattern string
+		key     string
+	}{
+		{"a.b.c", "a.b.c"},
+		{"#", "a.b.c.d.e"},
+		{"*.orange.*", "quick.orange.rabbit"},
+		{"a.#.b", "a.x.y.z.b"},
+		{"*.*.rabbit", "quick.orange.rabbit"},
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		for _, p := range patterns {
+			broker.matchTopicPattern(p.pattern, p.key)
+		}
+	}
+}
+
+func BenchmarkMatchHeaders(b *testing.B) {
+	broker, cleanup := createTestBroker(b)
+	defer cleanup()
+
+	bindingAll := map[string]interface{}{"h1": "v1", "h2": "v2"}
+	bindingAny := map[string]interface{}{"x-match": "any", "h1": "v1", "h2": "v2"}
+	msg := map[string]interface{}{"h1": "v1", "h2": "v2", "h3": "v3"}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		broker.matchHeaders(bindingAll, msg)
+		broker.matchHeaders(bindingAny, msg)
+	}
 }

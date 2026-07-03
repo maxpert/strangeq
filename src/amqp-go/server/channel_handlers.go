@@ -27,6 +27,56 @@ func (s *Server) processChannelSpecificMethod(conn *protocol.Connection, channel
 		// Send channel.open-ok
 		return s.sendChannelOpenOK(conn, channelID)
 
+	case protocol.ChannelFlow: // Method ID 20 — client requests start/stop of content frames
+		flowMethod := &protocol.ChannelFlowMethod{}
+		if err := flowMethod.Deserialize(payload); err != nil {
+			s.Log.Error("Failed to deserialize channel.flow",
+				zap.Error(err),
+				zap.Uint16("channel_id", channelID),
+				zap.String("connection_id", conn.ID))
+			return err
+		}
+
+		value, exists := conn.Channels.Load(channelID)
+		if !exists {
+			return fmt.Errorf("channel %d does not exist", channelID)
+		}
+		channel := value.(*protocol.Channel)
+
+		channel.FlowActive.Store(flowMethod.Active)
+		s.Log.Debug("Channel flow state updated",
+			zap.Uint16("channel_id", channelID),
+			zap.Bool("active", flowMethod.Active))
+
+		if flowMethod.Active {
+			select {
+			case channel.FlowWake <- struct{}{}:
+			default:
+			}
+		}
+
+		return s.sendChannelFlowOK(conn, channelID, channel.FlowActive.Load())
+
+	case protocol.ChannelFlowOK: // Method ID 21 — client acknowledges server-initiated flow
+		flowOKMethod := &protocol.ChannelFlowOKMethod{}
+		if err := flowOKMethod.Deserialize(payload); err != nil {
+			s.Log.Error("Failed to deserialize channel.flow-ok",
+				zap.Error(err),
+				zap.Uint16("channel_id", channelID),
+				zap.String("connection_id", conn.ID))
+			return err
+		}
+
+		if value, exists := conn.Channels.Load(channelID); exists {
+			channel := value.(*protocol.Channel)
+			channel.FlowActive.Store(flowOKMethod.Active)
+			s.Log.Debug("Channel flow-ok received",
+				zap.Uint16("channel_id", channelID),
+				zap.Bool("active", flowOKMethod.Active))
+		}
+
+		return nil
+
 	case protocol.ChannelClose: // Method ID 40 for channel class
 		s.Log.Debug("Channel close requested",
 			zap.Uint16("channel_id", channelID),
@@ -35,6 +85,11 @@ func (s *Server) processChannelSpecificMethod(conn *protocol.Connection, channel
 		// Clean up channel resources
 		if value, exists := conn.Channels.Load(channelID); exists {
 			channel := value.(*protocol.Channel)
+			// Wake any forwarder parked on flow control so it can observe stop
+			select {
+			case channel.FlowWake <- struct{}{}:
+			default:
+			}
 			// Cancel all consumers on this channel
 			channel.Mutex.Lock()
 			consumerTags := make([]string, 0, len(channel.Consumers))

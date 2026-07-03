@@ -517,6 +517,15 @@ func (m *ChannelFlowMethod) Serialize() ([]byte, error) {
 	return result, nil
 }
 
+// Deserialize decodes the ChannelFlowMethod from a byte slice
+func (m *ChannelFlowMethod) Deserialize(data []byte) error {
+	if len(data) < 1 {
+		return fmt.Errorf("channel.flow method data too short")
+	}
+	m.Active = data[0] != 0
+	return nil
+}
+
 // ChannelFlowOKMethod represents the channel.flow-ok method
 type ChannelFlowOKMethod struct {
 	Active bool
@@ -534,6 +543,15 @@ func (m *ChannelFlowOKMethod) Serialize() ([]byte, error) {
 	}
 
 	return result, nil
+}
+
+// Deserialize decodes the ChannelFlowOKMethod from a byte slice
+func (m *ChannelFlowOKMethod) Deserialize(data []byte) error {
+	if len(data) < 1 {
+		return fmt.Errorf("channel.flow-ok method data too short")
+	}
+	m.Active = data[0] != 0
+	return nil
 }
 
 // ChannelCloseMethod represents the channel.close method

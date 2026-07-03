@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"reflect"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -838,30 +840,91 @@ func (b *StorageBroker) findTargetQueues(exchange *protocol.Exchange, routingKey
 // Helper methods for routing
 
 func (b *StorageBroker) matchTopicPattern(pattern, routingKey string) bool {
-	// Simplified topic matching - in a full implementation, this would handle wildcards
-	// * matches one word
-	// # matches zero or more words
-	return pattern == routingKey || pattern == "#"
-}
+	if pattern == routingKey || pattern == "#" {
+		return true
+	}
 
-func (b *StorageBroker) matchHeaders(bindingArgs map[string]interface{}, messageHeaders map[string]interface{}) bool {
-	if bindingArgs == nil || messageHeaders == nil {
+	pi := strings.IndexByte(pattern, '.')
+	var pWord, pRest string
+	if pi >= 0 {
+		pWord, pRest = pattern[:pi], pattern[pi+1:]
+	} else {
+		pWord = pattern
+	}
+
+	if pWord == "#" {
+		if b.matchTopicPattern(pRest, routingKey) {
+			return true
+		}
+		if routingKey != "" {
+			ki := strings.IndexByte(routingKey, '.')
+			var kRest string
+			if ki >= 0 {
+				kRest = routingKey[ki+1:]
+			}
+			return b.matchTopicPattern(pattern, kRest)
+		}
 		return false
 	}
 
-	// Simplified headers matching - in a full implementation, this would handle x-match
+	if routingKey == "" {
+		return false
+	}
+
+	ki := strings.IndexByte(routingKey, '.')
+	var kWord, kRest string
+	if ki >= 0 {
+		kWord, kRest = routingKey[:ki], routingKey[ki+1:]
+	} else {
+		kWord = routingKey
+	}
+
+	if pWord == "*" || pWord == kWord {
+		return b.matchTopicPattern(pRest, kRest)
+	}
+	return false
+}
+
+func (b *StorageBroker) matchHeaders(bindingArgs map[string]interface{}, messageHeaders map[string]interface{}) bool {
+	if len(bindingArgs) == 0 {
+		return false
+	}
+
+	anyMatch := false
+	headerCount := 0
 	for key, value := range bindingArgs {
 		if key == "x-match" {
-			continue // Skip matching mode
+			if s, ok := value.(string); ok && s == "any" {
+				anyMatch = true
+			}
+			continue
 		}
+		headerCount++
+	}
 
+	if headerCount == 0 {
+		return true
+	}
+
+	if messageHeaders == nil {
+		return false
+	}
+
+	for key, value := range bindingArgs {
+		if key == "x-match" {
+			continue
+		}
 		msgValue, exists := messageHeaders[key]
-		if !exists || msgValue != value {
+		matched := exists && reflect.DeepEqual(msgValue, value)
+		if anyMatch {
+			if matched {
+				return true
+			}
+		} else if !matched {
 			return false
 		}
 	}
-
-	return true
+	return !anyMatch
 }
 
 // Compatibility methods for existing broker interface
