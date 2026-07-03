@@ -204,6 +204,9 @@ func (s *Server) handleConnection(conn net.Conn) {
 		return true // continue iteration
 	})
 
+	// Requeue any orphaned basic.get deliveries (no_ack=false, unacked)
+	s.Broker.RequeueAllGetDeliveries()
+
 	s.Mutex.Lock()
 	delete(s.Connections, connection.ID)
 	s.Mutex.Unlock()

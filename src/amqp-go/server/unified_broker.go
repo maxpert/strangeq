@@ -48,6 +48,9 @@ type UnifiedBroker interface {
 	RejectGetDelivery(deliveryTag uint64, requeue bool) error
 	NackGetDelivery(deliveryTag uint64, requeue bool) error
 
+	// Requeue all in-flight basic.get deliveries on connection close
+	RequeueAllGetDeliveries()
+
 	// Recovery support — initializes a queue's dispatch cursor from the
 	// recovered message tag range [minTag, maxTag], making recovered
 	// messages immediately claimable by consumers. Replaces the old

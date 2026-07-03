@@ -184,6 +184,7 @@ func (b *ackTestBroker) RejectGetDelivery(deliveryTag uint64, requeue bool) erro
 	return nil
 }
 func (b *ackTestBroker) NackGetDelivery(deliveryTag uint64, requeue bool) error { return nil }
+func (b *ackTestBroker) RequeueAllGetDeliveries()                               {}
 func (b *ackTestBroker) GetQueues() map[string]*protocol.Queue                  { return nil }
 func (b *ackTestBroker) GetExchanges() map[string]*protocol.Exchange            { return nil }
 func (b *ackTestBroker) GetConsumers() map[string]*protocol.Consumer            { return nil }

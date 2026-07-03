@@ -258,20 +258,32 @@ func (s *Server) sendBasicReturn(conn *protocol.Connection, channelID uint16, re
 	}
 
 	estimatedSize := deliveryOverheadEstimate + len(message.Body)
-	buf := make([]byte, 0, estimatedSize)
+	const maxPoolSize = 131 * 1024
+	var buf *[]byte
+	if estimatedSize > maxPoolSize {
+		b := make([]byte, 0, estimatedSize)
+		buf = &b
+	} else {
+		buf = protocol.GetBufferForSize(estimatedSize)
+	}
+	defer func() {
+		if cap(*buf) <= maxPoolSize {
+			protocol.PutBufferForSize(buf)
+		}
+	}()
 
 	var methodPayload []byte
 	methodPayload = binary.BigEndian.AppendUint16(methodPayload, 60)
 	methodPayload = binary.BigEndian.AppendUint16(methodPayload, 50)
 	methodPayload = append(methodPayload, methodData...)
-	buf = protocol.AppendFrame(buf, protocol.FrameMethod, channelID, methodPayload)
+	*buf = protocol.AppendFrame(*buf, protocol.FrameMethod, channelID, methodPayload)
 
-	if err := s.appendHeaderAndBodyFrames(&buf, channelID, message); err != nil {
+	if err := s.appendHeaderAndBodyFrames(buf, channelID, message); err != nil {
 		return err
 	}
 
 	conn.WriteMutex.Lock()
-	_, err = conn.Conn.Write(buf)
+	_, err = conn.Conn.Write(*buf)
 	conn.WriteMutex.Unlock()
 
 	if err != nil {

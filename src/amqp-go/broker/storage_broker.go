@@ -525,6 +525,13 @@ func (b *StorageBroker) UnbindQueue(queueName, exchangeName, routingKey string) 
 // to the destination exchange, which then routes to its bound queues (or further
 // exchanges). Exchange-to-exchange bindings can form chains but MUST NOT form cycles.
 func (b *StorageBroker) BindExchange(destination, source, routingKey string, arguments map[string]interface{}) error {
+	if source == "" {
+		return fmt.Errorf("cannot bind from default exchange")
+	}
+	if destination == "" {
+		return fmt.Errorf("cannot bind to default exchange")
+	}
+
 	_, err := b.storage.GetExchange(source)
 	if err != nil {
 		if errors.Is(err, interfaces.ErrExchangeNotFound) {
@@ -533,12 +540,16 @@ func (b *StorageBroker) BindExchange(destination, source, routingKey string, arg
 		return err
 	}
 
-	_, err = b.storage.GetExchange(destination)
+	destExchange, err := b.storage.GetExchange(destination)
 	if err != nil {
 		if errors.Is(err, interfaces.ErrExchangeNotFound) {
 			return fmt.Errorf("destination exchange '%s' not found", destination)
 		}
 		return err
+	}
+
+	if destExchange.Internal {
+		return fmt.Errorf("cannot bind to internal exchange '%s'", destination)
 	}
 
 	if source == destination {
@@ -1421,6 +1432,14 @@ func (b *StorageBroker) RecoverQueue(queueName string, minTag, maxTag uint64) {
 // Returns the message, its delivery tag, the remaining message count, and any
 // error.
 func (b *StorageBroker) GetMessageForGet(queueName string, noAck bool) (*protocol.Message, uint64, uint32, error) {
+	_, err := b.storage.GetQueue(queueName)
+	if err != nil {
+		if errors.Is(err, interfaces.ErrQueueNotFound) {
+			return nil, 0, 0, fmt.Errorf("queue '%s' not found", queueName)
+		}
+		return nil, 0, 0, err
+	}
+
 	queueState := b.getOrCreateQueueState(queueName)
 
 	// Non-blocking claim loop: try requeue ring first, then walk the
@@ -1592,4 +1611,27 @@ func (b *StorageBroker) RequeueAllForConsumer(consumerTag string) error {
 	}
 
 	return nil
+}
+
+// RequeueAllGetDeliveries requeues all in-flight basic.get deliveries
+// (identified by empty consumer tag). Called during connection close
+// to prevent messages from being permanently orphaned when a client
+// disconnects without acking basic.get deliveries.
+func (b *StorageBroker) RequeueAllGetDeliveries() {
+	b.getDeliveryQueues.Range(func(key, value interface{}) bool {
+		deliveryTag := key.(uint64)
+		queueName := value.(string)
+
+		if _, loaded := b.deliveryIndex.LoadAndDelete(deliveryTag); !loaded {
+			return true
+		}
+		b.getDeliveryQueues.Delete(deliveryTag)
+
+		queueState := b.getOrCreateQueueState(queueName)
+		queueState.DeleteInflight(deliveryTag)
+		b.storage.DeletePendingAck(queueName, deliveryTag)
+		queueState.Requeue(deliveryTag)
+
+		return true
+	})
 }

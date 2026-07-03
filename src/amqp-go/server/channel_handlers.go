@@ -119,6 +119,11 @@ func (s *Server) processChannelSpecificMethod(conn *protocol.Connection, channel
 			// Remove channel from connection
 			conn.Channels.Delete(channelID)
 
+			// Clean up transaction state for this channel
+			if s.TransactionManager != nil {
+				s.TransactionManager.Close(channelID)
+			}
+
 			// Record channel closed metric
 			if s.MetricsCollector != nil {
 				s.MetricsCollector.RecordChannelClosed()

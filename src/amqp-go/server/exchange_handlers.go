@@ -184,6 +184,9 @@ func (s *Server) handleExchangeBind(conn *protocol.Connection, channelID uint16,
 		return err
 	}
 
+	if bindMethod.NoWait {
+		return nil
+	}
 	return s.sendExchangeBindOK(conn, channelID)
 }
 
@@ -230,5 +233,8 @@ func (s *Server) handleExchangeUnbind(conn *protocol.Connection, channelID uint1
 		return err
 	}
 
+	if unbindMethod.NoWait {
+		return nil
+	}
 	return s.sendExchangeUnbindOK(conn, channelID)
 }

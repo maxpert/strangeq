@@ -563,20 +563,25 @@ func (s *Server) handleBasicGet(conn *protocol.Connection, channelID uint16, pay
 			zap.Bool("no_ack", getMethod.NoAck))
 	}
 
+	queueName, err := resolveQueueName(conn, channelID, getMethod.Queue)
+	if err != nil {
+		return err
+	}
+
 	if err := s.authorize(conn, channelID, interfaces.Operation{
 		Action:       interfaces.ActionRead,
 		ResourceType: interfaces.ResourceQueue,
-		Resource:     getMethod.Queue,
+		Resource:     queueName,
 		VHost:        conn.Vhost,
 	}); err != nil {
 		return s.authzChannelError(conn, channelID, err, 60, 70)
 	}
 
-	message, deliveryTag, messageCount, err := s.Broker.GetMessageForGet(getMethod.Queue, getMethod.NoAck)
+	message, deliveryTag, messageCount, err := s.Broker.GetMessageForGet(queueName, getMethod.NoAck)
 	if err != nil {
 		s.Log.Error("Failed to get message for basic.get",
 			zap.Error(err),
-			zap.String("queue", getMethod.Queue),
+			zap.String("queue", queueName),
 			zap.String("connection_id", conn.ID),
 			zap.Uint16("channel_id", channelID))
 		return err
@@ -868,6 +873,11 @@ func (s *Server) handleBasicRecover(conn *protocol.Connection, channelID uint16,
 			zap.Uint16("channel_id", channelID))
 		return err
 	}
+
+	// requeue field is deserialized for wire-format correctness but not
+	// acted on — RabbitMQ also ignores requeue=false and always requeues
+	// to the shared queue. Redelivery to the same consumer is not supported.
+	_ = recoverMethod.Requeue
 
 	value, exists := conn.Channels.Load(channelID)
 	if !exists {

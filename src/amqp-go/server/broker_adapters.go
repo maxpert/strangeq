@@ -99,6 +99,10 @@ func (a *StorageBrokerAdapter) NackGetDelivery(deliveryTag uint64, requeue bool)
 	return a.broker.NackGetDelivery(deliveryTag, requeue)
 }
 
+func (a *StorageBrokerAdapter) RequeueAllGetDeliveries() {
+	a.broker.RequeueAllGetDeliveries()
+}
+
 func (a *StorageBrokerAdapter) AdvanceDeliveryTag(tag uint64) {
 	a.broker.AdvanceDeliveryTag(tag)
 }
