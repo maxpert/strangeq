@@ -280,7 +280,8 @@ func TestSerializeDelivery_ProducesValidFrames(t *testing.T) {
 		DeliveryMode: 2,
 	}
 
-	data, err := srv.serializeDelivery(1, "ct", 42, false, "ex", "rk", msg)
+	var data []byte
+	err := srv.serializeDeliveryInto(&data, 1, "ct", 42, false, "ex", "rk", msg)
 	require.NoError(t, err)
 	assert.NotEmpty(t, data)
 
@@ -301,7 +302,8 @@ func TestSerializeDelivery_EmptyBody(t *testing.T) {
 		RoutingKey: "rk",
 	}
 
-	data, err := srv.serializeDelivery(1, "ct", 1, false, "ex", "rk", msg)
+	var data []byte
+	err := srv.serializeDeliveryInto(&data, 1, "ct", 1, false, "ex", "rk", msg)
 	require.NoError(t, err)
 
 	frames := parseFrames(t, data)

@@ -1,6 +1,7 @@
 package server
 
 import (
+	"encoding/binary"
 	"fmt"
 	"time"
 
@@ -544,31 +545,35 @@ func (s *Server) handleBasicGet(conn *protocol.Connection, channelID uint16, pay
 	return nil
 }
 
-// serializeDelivery serializes a single basic.deliver (method frame + header frame
-// + body fragments) into a complete byte slice ready for writing to the wire.
-// The returned slice is backed by a pooled buffer; the caller MUST call
-// protocol.PutBufferForSize on it after use.
-func (s *Server) serializeDelivery(channelID uint16, consumerTag string, deliveryTag uint64, redelivered bool, exchange, routingKey string, message *protocol.Message) ([]byte, error) {
-	deliverMethod := &protocol.BasicDeliverMethod{
-		ConsumerTag: consumerTag,
-		DeliveryTag: deliveryTag,
-		Redelivered: redelivered,
-		Exchange:    exchange,
-		RoutingKey:  routingKey,
+// serializeDeliveryInto serializes a basic.deliver (method frame + header
+// frame + body frames) directly into the provided buffer, avoiding all
+// intermediate *Frame, *BasicDeliverMethod, and *ContentHeader allocations.
+// This is the zero-alloc delivery serializer for hot paths.
+func (s *Server) serializeDeliveryInto(buf *[]byte, channelID uint16, consumerTag string, deliveryTag uint64, redelivered bool, exchange, routingKey string, message *protocol.Message) error {
+	// --- Method frame (basic.deliver) ---
+	// class(2) + method(2) + consumerTag(1+N) + deliveryTag(8) + redelivered(1) + exchange(1+N) + routingKey(1+N)
+	var payload []byte
+	payload = binary.BigEndian.AppendUint16(payload, 60) // class ID
+	payload = binary.BigEndian.AppendUint16(payload, 60) // method ID
+	payload = protocol.AppendShortString(payload, consumerTag)
+	payload = binary.BigEndian.AppendUint64(payload, deliveryTag)
+	if redelivered {
+		payload = append(payload, 1)
+	} else {
+		payload = append(payload, 0)
 	}
+	payload = protocol.AppendShortString(payload, exchange)
+	payload = protocol.AppendShortString(payload, routingKey)
+	*buf = protocol.AppendFrame(*buf, protocol.FrameMethod, channelID, payload)
 
-	methodData, err := deliverMethod.Serialize()
-	if err != nil {
-		return nil, fmt.Errorf("error serializing basic.deliver: %v", err)
-	}
-
-	methodFrame := protocol.EncodeMethodFrameForChannel(channelID, 60, 60, methodData)
-
-	contentHeader := &protocol.ContentHeader{
+	// --- Header frame (content header) ---
+	propertyFlags := buildPropertyFlags(message)
+	var hdrPayload []byte
+	hdrPayload, err := (&protocol.ContentHeader{
 		ClassID:         60,
 		Weight:          0,
 		BodySize:        uint64(len(message.Body)),
-		PropertyFlags:   buildPropertyFlags(message),
+		PropertyFlags:   propertyFlags,
 		Headers:         message.Headers,
 		ContentType:     message.ContentType,
 		ContentEncoding: message.ContentEncoding,
@@ -583,67 +588,27 @@ func (s *Server) serializeDelivery(channelID uint16, consumerTag string, deliver
 		UserID:          message.UserID,
 		AppID:           message.AppID,
 		ClusterID:       message.ClusterID,
-	}
-
-	headerPayload, err := contentHeader.Serialize()
+	}).SerializeInto(hdrPayload)
 	if err != nil {
-		return nil, fmt.Errorf("error serializing content header: %v", err)
+		return fmt.Errorf("error serializing content header: %v", err)
 	}
+	*buf = protocol.AppendFrame(*buf, protocol.FrameHeader, channelID, hdrPayload)
 
-	headerFrame := &protocol.Frame{
-		Type:    protocol.FrameHeader,
-		Channel: channelID,
-		Size:    uint32(len(headerPayload)),
-		Payload: headerPayload,
-	}
-
+	// --- Body frames ---
 	maxFrameSize := uint32(s.Config.Server.MaxFrameSize)
-	bodyFrames := protocol.FragmentBodyIntoFrames(channelID, message.Body, maxFrameSize)
-
-	totalBodySize := 0
-	for _, bf := range bodyFrames {
-		totalBodySize += 8 + len(bf.Payload)
+	maxBodyPerFrame := int(maxFrameSize) - 8
+	if maxBodyPerFrame <= 0 {
+		maxBodyPerFrame = 4096
 	}
-
-	methodFrameData, err := methodFrame.MarshalBinaryPooled()
-	if err != nil {
-		return nil, fmt.Errorf("error serializing method frame: %v", err)
-	}
-	defer protocol.PutBufferForSize(&methodFrameData)
-
-	headerFrameData, err := headerFrame.MarshalBinaryPooled()
-	if err != nil {
-		return nil, fmt.Errorf("error serializing header frame: %v", err)
-	}
-	defer protocol.PutBufferForSize(&headerFrameData)
-
-	totalSize := len(methodFrameData) + len(headerFrameData) + totalBodySize
-
-	const maxPoolSize = 131 * 1024
-	var buf *[]byte
-	if totalSize > maxPoolSize {
-		b := make([]byte, 0, totalSize)
-		buf = &b
-	} else {
-		buf = protocol.GetBufferForSize(totalSize)
-	}
-
-	*buf = append((*buf)[:0], methodFrameData...)
-	*buf = append(*buf, headerFrameData...)
-
-	for i, bodyFrame := range bodyFrames {
-		bodyFrameData, err := bodyFrame.MarshalBinaryPooled()
-		if err != nil {
-			if cap(*buf) <= maxPoolSize {
-				protocol.PutBufferForSize(buf)
-			}
-			return nil, fmt.Errorf("error serializing body frame %d: %v", i, err)
+	for offset := 0; offset < len(message.Body); offset += maxBodyPerFrame {
+		end := offset + maxBodyPerFrame
+		if end > len(message.Body) {
+			end = len(message.Body)
 		}
-		*buf = append(*buf, bodyFrameData...)
-		protocol.PutBufferForSize(&bodyFrameData)
+		*buf = protocol.AppendFrame(*buf, protocol.FrameBody, channelID, message.Body[offset:end])
 	}
 
-	return *buf, nil
+	return nil
 }
 
 // sendBasicDeliver sends a basic.deliver method frame to a consumer.
@@ -657,18 +622,31 @@ func (s *Server) sendBasicDeliver(conn *protocol.Connection, channelID uint16, c
 		}
 	}()
 
-	data, err := s.serializeDelivery(channelID, consumerTag, deliveryTag, redelivered, exchange, routingKey, message)
-	if err != nil {
+	const maxPoolSize = 131 * 1024
+	estimatedSize := deliveryOverheadEstimate + len(message.Body)
+	var buf *[]byte
+	if estimatedSize > maxPoolSize {
+		b := make([]byte, 0, estimatedSize)
+		buf = &b
+	} else {
+		buf = protocol.GetBufferForSize(estimatedSize)
+	}
+	defer func() {
+		if cap(*buf) <= maxPoolSize {
+			protocol.PutBufferForSize(buf)
+		}
+	}()
+
+	if err := s.serializeDeliveryInto(buf, channelID, consumerTag, deliveryTag, redelivered, exchange, routingKey, message); err != nil {
 		s.Log.Error("Failed to serialize delivery",
 			zap.Error(err),
 			zap.String("consumer_tag", consumerTag),
 			zap.Uint16("channel_id", channelID))
 		return err
 	}
-	defer protocol.PutBufferForSize(&data)
 
 	conn.WriteMutex.Lock()
-	_, err = conn.Conn.Write(data)
+	_, err := conn.Conn.Write(*buf)
 	conn.WriteMutex.Unlock()
 
 	if err != nil {

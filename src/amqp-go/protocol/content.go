@@ -337,3 +337,61 @@ func (h *ContentHeader) Serialize() ([]byte, error) {
 
 	return result, nil
 }
+
+// SerializeInto appends the content header payload directly into buf,
+// avoiding all intermediate encodeShortString allocations.
+func (h *ContentHeader) SerializeInto(buf []byte) ([]byte, error) {
+	// Fixed header
+	buf = binary.BigEndian.AppendUint16(buf, h.ClassID)
+	buf = binary.BigEndian.AppendUint16(buf, h.Weight)
+	buf = binary.BigEndian.AppendUint64(buf, h.BodySize)
+	buf = binary.BigEndian.AppendUint16(buf, h.PropertyFlags)
+
+	if h.PropertyFlags&FlagHeaders != 0 {
+		headersBytes, err := encodeFieldTable(h.Headers)
+		if err != nil {
+			return nil, fmt.Errorf("error encoding headers: %v", err)
+		}
+		buf = append(buf, headersBytes...)
+	}
+	if h.PropertyFlags&FlagContentType != 0 {
+		buf = AppendShortString(buf, h.ContentType)
+	}
+	if h.PropertyFlags&FlagContentEncoding != 0 {
+		buf = AppendShortString(buf, h.ContentEncoding)
+	}
+	if h.PropertyFlags&FlagDeliveryMode != 0 {
+		buf = append(buf, h.DeliveryMode)
+	}
+	if h.PropertyFlags&FlagPriority != 0 {
+		buf = append(buf, h.Priority)
+	}
+	if h.PropertyFlags&FlagCorrelationID != 0 {
+		buf = AppendShortString(buf, h.CorrelationID)
+	}
+	if h.PropertyFlags&FlagReplyTo != 0 {
+		buf = AppendShortString(buf, h.ReplyTo)
+	}
+	if h.PropertyFlags&FlagExpiration != 0 {
+		buf = AppendShortString(buf, h.Expiration)
+	}
+	if h.PropertyFlags&FlagMessageID != 0 {
+		buf = AppendShortString(buf, h.MessageID)
+	}
+	if h.PropertyFlags&FlagTimestamp != 0 {
+		buf = binary.BigEndian.AppendUint64(buf, h.Timestamp)
+	}
+	if h.PropertyFlags&FlagType != 0 {
+		buf = AppendShortString(buf, h.Type)
+	}
+	if h.PropertyFlags&FlagUserID != 0 {
+		buf = AppendShortString(buf, h.UserID)
+	}
+	if h.PropertyFlags&FlagAppID != 0 {
+		buf = AppendShortString(buf, h.AppID)
+	}
+	if h.PropertyFlags&FlagClusterID != 0 {
+		buf = AppendShortString(buf, h.ClusterID)
+	}
+	return buf, nil
+}

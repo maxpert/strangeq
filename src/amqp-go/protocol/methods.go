@@ -602,6 +602,18 @@ func EncodeShortString(s string) []byte {
 	return result
 }
 
+// AppendShortString appends a short string (length-prefixed with a single
+// byte) directly into buf, avoiding the temporary []byte allocation that
+// EncodeShortString creates. This is the zero-alloc version for hot paths.
+func AppendShortString(buf []byte, s string) []byte {
+	if len(s) > 255 {
+		s = s[:255]
+	}
+	buf = append(buf, byte(len(s)))
+	buf = append(buf, s...)
+	return buf
+}
+
 func encodeLongString(s string) []byte {
 	// Long strings are prefixed with a uint32 length
 	result := make([]byte, 4+len(s))
@@ -2148,7 +2160,21 @@ func (m *BasicDeliverMethod) Serialize() ([]byte, error) {
 	return result, nil
 }
 
-// Deserialize decodes the BasicDeliverMethod from a byte slice
+// SerializeInto appends the basic.deliver method payload directly into buf,
+// avoiding all intermediate allocations. This is the zero-alloc version
+// of Serialize() for hot paths.
+func (m *BasicDeliverMethod) SerializeInto(buf []byte) []byte {
+	buf = AppendShortString(buf, m.ConsumerTag)
+	buf = binary.BigEndian.AppendUint64(buf, m.DeliveryTag)
+	if m.Redelivered {
+		buf = append(buf, byte(1))
+	} else {
+		buf = append(buf, byte(0))
+	}
+	buf = AppendShortString(buf, m.Exchange)
+	buf = AppendShortString(buf, m.RoutingKey)
+	return buf
+}
 func (m *BasicDeliverMethod) Deserialize(data []byte) error {
 	if len(data) < 1 { // Need at least consumer tag length byte
 		return fmt.Errorf("basic.deliver method data too short")

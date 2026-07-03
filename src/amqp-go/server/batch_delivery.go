@@ -43,7 +43,8 @@ func (s *Server) sendBatchedDeliveries(conn *protocol.Connection, channelID uint
 	}()
 
 	for _, delivery := range deliveries {
-		data, err := s.serializeDelivery(
+		err := s.serializeDeliveryInto(
+			batchBuf,
 			channelID,
 			consumerTag,
 			delivery.DeliveryTag,
@@ -59,8 +60,6 @@ func (s *Server) sendBatchedDeliveries(conn *protocol.Connection, channelID uint
 				zap.Uint64("delivery_tag", delivery.DeliveryTag))
 			return err
 		}
-		*batchBuf = append(*batchBuf, data...)
-		protocol.PutBufferForSize(&data)
 	}
 
 	s.Log.Debug("Writing batched deliveries atomically",
@@ -92,39 +91,4 @@ func (s *Server) sendBatchedDeliveries(conn *protocol.Connection, channelID uint
 		zap.Int("batch_size", len(deliveries)))
 
 	return nil
-}
-
-// collectBatch collects available messages from a consumer channel without blocking
-// It uses len(chan) to check availability and drains up to maxBatch messages
-func collectBatch(msgChan chan *protocol.Delivery, maxBatch int) []*protocol.Delivery {
-	if maxBatch <= 0 {
-		return nil
-	}
-
-	// Check how many messages are immediately available
-	available := len(msgChan)
-	if available == 0 {
-		return nil
-	}
-
-	// Cap at maxBatch
-	if available > maxBatch {
-		available = maxBatch
-	}
-
-	// Pre-allocate batch slice to avoid resizing
-	batch := make([]*protocol.Delivery, 0, available)
-
-	// Drain available messages (non-blocking)
-	for i := 0; i < available; i++ {
-		select {
-		case msg := <-msgChan:
-			batch = append(batch, msg)
-		default:
-			// Channel was drained by another goroutine, stop collecting
-			break
-		}
-	}
-
-	return batch
 }
