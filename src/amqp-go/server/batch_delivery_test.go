@@ -311,3 +311,62 @@ func TestSerializeDelivery_EmptyBody(t *testing.T) {
 	assert.Equal(t, byte(protocol.FrameMethod), frames[0].Type)
 	assert.Equal(t, byte(protocol.FrameHeader), frames[1].Type)
 }
+
+// TestSerializeDelivery_RoundTripProperties verifies that content header
+// properties serialized via serializeDeliveryInto can be correctly parsed
+// back by ReadContentHeader. This catches property ordering bugs in
+// SerializeInto (C1: Headers was written before ContentType/ContentEncoding).
+func TestSerializeDelivery_RoundTripProperties(t *testing.T) {
+	srv := makeTestServer()
+
+	msg := &protocol.Message{
+		Body:            []byte("test body"),
+		Exchange:        "ex",
+		RoutingKey:      "rk",
+		ContentType:     "text/plain",
+		ContentEncoding: "utf-8",
+		DeliveryMode:    2,
+		Priority:        5,
+		CorrelationID:   "corr-123",
+		ReplyTo:         "reply-queue",
+		MessageID:       "msg-456",
+		Type:            "test-type",
+		AppID:           "test-app",
+		Headers: map[string]interface{}{
+			"foo": "bar",
+			"num": int32(42),
+		},
+	}
+
+	var data []byte
+	err := srv.serializeDeliveryInto(&data, 1, "ct", 42, false, "ex", "rk", msg)
+	require.NoError(t, err)
+
+	frames := parseFrames(t, data)
+	require.Equal(t, 3, len(frames), "expected method + header + body frames")
+
+	// Parse the header frame back
+	headerFrame := &protocol.Frame{
+		Type:    frames[1].Type,
+		Channel: frames[1].Channel,
+		Size:    frames[1].Size,
+		Payload: frames[1].Payload,
+	}
+	parsedHeader, err := protocol.ReadContentHeader(headerFrame)
+	require.NoError(t, err, "ReadContentHeader must successfully parse SerializeInto output")
+
+	// Verify all properties round-tripped correctly
+	assert.Equal(t, uint16(60), parsedHeader.ClassID)
+	assert.Equal(t, uint64(len(msg.Body)), parsedHeader.BodySize)
+	assert.Equal(t, msg.ContentType, parsedHeader.ContentType)
+	assert.Equal(t, msg.ContentEncoding, parsedHeader.ContentEncoding)
+	assert.Equal(t, msg.DeliveryMode, parsedHeader.DeliveryMode)
+	assert.Equal(t, msg.Priority, parsedHeader.Priority)
+	assert.Equal(t, msg.CorrelationID, parsedHeader.CorrelationID)
+	assert.Equal(t, msg.ReplyTo, parsedHeader.ReplyTo)
+	assert.Equal(t, msg.MessageID, parsedHeader.MessageID)
+	assert.Equal(t, msg.Type, parsedHeader.Type)
+	assert.Equal(t, msg.AppID, parsedHeader.AppID)
+	assert.NotNil(t, parsedHeader.Headers)
+	assert.Equal(t, "bar", parsedHeader.Headers["foo"])
+}

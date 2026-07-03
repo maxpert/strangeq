@@ -347,18 +347,18 @@ func (h *ContentHeader) SerializeInto(buf []byte) ([]byte, error) {
 	buf = binary.BigEndian.AppendUint64(buf, h.BodySize)
 	buf = binary.BigEndian.AppendUint16(buf, h.PropertyFlags)
 
+	if h.PropertyFlags&FlagContentType != 0 {
+		buf = AppendShortString(buf, h.ContentType)
+	}
+	if h.PropertyFlags&FlagContentEncoding != 0 {
+		buf = AppendShortString(buf, h.ContentEncoding)
+	}
 	if h.PropertyFlags&FlagHeaders != 0 {
 		headersBytes, err := encodeFieldTable(h.Headers)
 		if err != nil {
 			return nil, fmt.Errorf("error encoding headers: %v", err)
 		}
 		buf = append(buf, headersBytes...)
-	}
-	if h.PropertyFlags&FlagContentType != 0 {
-		buf = AppendShortString(buf, h.ContentType)
-	}
-	if h.PropertyFlags&FlagContentEncoding != 0 {
-		buf = AppendShortString(buf, h.ContentEncoding)
 	}
 	if h.PropertyFlags&FlagDeliveryMode != 0 {
 		buf = append(buf, h.DeliveryMode)

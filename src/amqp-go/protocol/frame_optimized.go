@@ -69,17 +69,7 @@ func AppendFrame(buf []byte, frameType byte, channel uint16, payload []byte) []b
 	return buf
 }
 
-// AppendFrameFromParts appends a complete AMQP frame where the payload is
-// already written into payloadBuf at the given payloadOffset. It writes
-// the frame header before the payload and the end marker after.
-// This is useful when the payload was serialized directly into a buffer.
-func AppendFrameHeader(buf []byte, frameType byte, channel uint16, payloadSize int) []byte {
-	buf = append(buf, frameType)
-	buf = binary.BigEndian.AppendUint16(buf, channel)
-	buf = binary.BigEndian.AppendUint32(buf, uint32(payloadSize))
-	return buf
-}
-
+// MarshalBinaryOptimized encodes a frame with pre-allocation.
 // Calculates the exact frame size upfront and allocates once, avoiding slice growth.
 // This is more efficient than the standard MarshalBinary for repeated operations.
 func (f *Frame) MarshalBinaryOptimized() ([]byte, error) {

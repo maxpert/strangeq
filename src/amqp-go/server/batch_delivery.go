@@ -39,7 +39,6 @@ func (s *Server) sendBatchedDeliveries(conn *protocol.Connection, channelID uint
 		if cap(*batchBuf) <= maxPoolSize {
 			protocol.PutBufferForSize(batchBuf)
 		}
-		batchBuf = nil
 	}()
 
 	for _, delivery := range deliveries {

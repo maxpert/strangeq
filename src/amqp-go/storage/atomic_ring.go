@@ -45,11 +45,11 @@ func (r *AtomicRing) Store(deliveryTag uint64, msg *protocol.Message) (seq uint6
 		return 0, false, fmt.Errorf("ring is closed")
 	}
 	seq = r.publishSeq.Add(1) - 1
-	r.tagMu.Lock()
-	r.tagToSeq[deliveryTag] = seq
-	r.tagMu.Unlock()
 	msg.DeliveryTag = deliveryTag
 	if r.slots[seq&r.mask].CompareAndSwap(nil, msg) {
+		r.tagMu.Lock()
+		r.tagToSeq[deliveryTag] = seq
+		r.tagMu.Unlock()
 		r.messageCount.Add(1)
 		return seq, false, nil
 	}
