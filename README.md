@@ -16,7 +16,7 @@ A high-performance AMQP 0.9.1 message broker implementation written in Go. Compa
 - SASL authentication (PLAIN, ANONYMOUS)
 - Authorization with RabbitMQ-style configure/write/read permissions per vhost
 - Transaction protocol handshake (Tx.Select, Tx.Commit, Tx.Rollback)
-- 1.14-1.32x faster than RabbitMQ 4.3 on same hardware (same Go client, 3 ack modes)
+- 57% less memory per operation and 30% fewer allocations than pre-optimization baseline; 1.12-1.29x faster throughput than RabbitMQ 4.3 on same hardware
 - Prometheus metrics and pprof profiling
 - Lock-free per-queue AtomicRing with per-slot CAS
 - Batch TCP writes and ACK offloading (no fsync head-of-line blocking)
@@ -245,16 +245,18 @@ Key engine tuning parameters:
 
 ### Head-to-Head vs RabbitMQ 4.3
 
-Same machine (Apple M4 Max, 16-core ARM64), same Go client ([amqp091-go](https://github.com/rabbitmq/amqp091-go)), 12-byte messages (RabbitMQ PerfTest default), durable queue, transient messages, 1 publisher + 1 consumer, 50K iterations x 5 runs each. RabbitMQ ran in a Docker container (`rabbitmq:4.3-management`, ARM64) on the same host. StrangeQ ran natively.
+Same machine (Apple M4 Max, 16-core ARM64), same Go client ([amqp091-go](https://github.com/rabbitmq/amqp091-go)), 12-byte messages (RabbitMQ PerfTest default), durable queue, transient messages, 1 publisher + 1 consumer, 50K iterations x 20 runs each (StrangeQ). RabbitMQ ran in a Docker container (`rabbitmq:4.3-management`, ARM64) on the same host. StrangeQ ran natively.
 
-| Benchmark | Broker | Run 1 (ns/op) | Run 2 (ns/op) | Run 3 (ns/op) | Run 4 (ns/op) | Run 5 (ns/op) | Median (ns/op) | msg/s | Ratio |
-|-----------|--------|---------------|---------------|---------------|---------------|---------------|----------------|-------|-------|
-| Auto-ack | StrangeQ | 2,894 | 3,413 | 4,071 | 3,180 | 3,166 | 3,180 | 314K | 1.14x |
-| Auto-ack | RabbitMQ | 3,918 | 3,635 | 3,559 | 3,638 | 3,712 | 3,638 | 275K | |
-| Manual ack | StrangeQ | 3,047 | 3,196 | 3,052 | 3,325 | 3,437 | 3,196 | 313K | 1.32x |
-| Manual ack | RabbitMQ | 4,520 | 6,842 | 4,226 | 4,032 | 4,104 | 4,226 | 237K | |
-| Multi-ack 1000 | StrangeQ | 4,038 | 3,578 | 3,174 | 2,820 | 2,674 | 3,174 | 315K | 1.26x |
-| Multi-ack 1000 | RabbitMQ | 3,943 | 3,976 | 3,999 | 4,058 | 9,583 | 3,999 | 250K | |
+| Benchmark | Broker | Median (ns/op) | Min (ns/op) | Max (ns/op) | msg/s | B/op | allocs/op | Ratio |
+|-----------|--------|----------------|-------------|-------------|-------|------|-----------|-------|
+| Auto-ack | StrangeQ | 3,255 | 2,706 | 4,022 | 307K | 1,270 | 32 | 1.12x |
+| Auto-ack | RabbitMQ | 3,638 | 3,559 | 3,918 | 275K | | | |
+| Manual ack | StrangeQ | 3,356 | 3,097 | 3,514 | 298K | 1,350 | 33 | 1.26x |
+| Manual ack | RabbitMQ | 4,226 | 4,032 | 6,842 | 237K | | | |
+| Multi-ack 1000 | StrangeQ | 3,110 | 2,661 | 4,046 | 322K | 1,278 | 32 | 1.29x |
+| Multi-ack 1000 | RabbitMQ | 3,999 | 3,943 | 9,583 | 250K | | | |
+
+> **Note on variance**: ns/op on TCP loopback benchmarks has high variance on macOS (bimodal distribution: ~2,700 fast path / ~3,900 slow path, depending on goroutine scheduling). The deterministic metrics are `B/op` (bytes allocated per operation) and `allocs/op` (heap allocations per operation), which are stable across runs. StrangeQ achieves **57% less memory** and **30% fewer allocations** per operation compared to the pre-optimization baseline. RabbitMQ `B/op` and `allocs/op` are not available (Erlang runtime does not expose Go-style allocation metrics).
 
 ### Running the Benchmarks
 
@@ -262,7 +264,7 @@ Same machine (Apple M4 Max, 16-core ARM64), same Go client ([amqp091-go](https:/
 cd src/amqp-go
 
 # Benchmark StrangeQ (embedded server starts automatically)
-go test . -run='^$' -bench="BenchmarkVersus" -benchmem -benchtime=50000x -count=5
+go test . -run='^$' -bench="BenchmarkVersus" -benchmem -benchtime=50000x -count=20
 
 # Benchmark RabbitMQ (must be running on localhost:5672)
 docker run -d -p 5672:5672 --name rabbitmq-bench rabbitmq:4.3-management
@@ -372,7 +374,9 @@ go test . -run='^$' -bench="BenchmarkE2E" -benchmem -benchtime=3s -count=3
 ### Storage Engine
 
 - **Ring Buffer**: `[]atomic.Pointer[Message]` with per-slot CAS -- zero allocations on hot path
+- **Tag-to-Seq Map**: `map[uint64]uint64` with `sync.RWMutex` -- no per-tag `*uint64` boxing (replaces `sync.Map`)
 - **WAL Spill**: When ring buffer fills, messages spill to write-ahead log (batched fsync)
+- **WAL Skip**: In-memory transient messages skip WAL/segment ack on delete -- eliminates 1 alloc + 2 channel sends per ack
 - **Segment Storage**: 1 GB segments for cold message storage
 - **Per-Queue Isolation**: Each queue has its own ring buffer, WAL cursor, and consumer dispatch -- zero cross-queue contention
 
@@ -380,8 +384,12 @@ go test . -run='^$' -bench="BenchmarkE2E" -benchmem -benchtime=3s -count=3
 
 - **Reader/Processor Separation**: TCP reader and frame processor in separate goroutines
 - **ACK Offloading**: Per-connection `ackProcessor` goroutine handles all ACK/NACK/reject frames -- eliminates fsync head-of-line blocking on the frame processor
+- **Blocking AckQueue**: ACK frames are sent to AckQueue with `conn.Done` fallback -- preserves ordering, prevents frame-processor stalls
 - **Batched TCP Writes**: All deliveries in a batch are serialized into a single buffer and sent with one `Write()` call -- reduces syscalls and lock acquisitions
+- **Direct-Write Serialization**: Frame bytes written directly into batch buffer via `AppendFrame` / `AppendShortString` -- eliminates intermediate `*Frame`, `*BasicDeliverMethod`, `*ContentHeader` allocations
+- **Object Pooling**: `*Frame`, `*BasicPublishMethod`, `*PendingMessage`, `*ContentHeader` pooled via `sync.Pool` -- 6 fewer heap allocs per publish
 - **Consumer Dirty Flag**: Delivery loop only re-scans consumers when the consumer set changes -- avoids per-iteration map scan
+- **Lock-Free AckCursor**: Per-consumer `sync.Map` + atomic CAS for `minAckCursor` -- no mutex contention between delivery and ack goroutines
 - **Flow Control**: RabbitMQ-style memory pressure handling
 
 ### Crash Recovery
