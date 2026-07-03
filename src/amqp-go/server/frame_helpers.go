@@ -201,30 +201,10 @@ func buildPropertyFlags(msg *protocol.Message) uint16 {
 	return flags
 }
 
-func (s *Server) sendBasicReturn(conn *protocol.Connection, channelID uint16, replyCode uint16, replyText, exchange, routingKey string, message *protocol.Message) error {
-	method := &protocol.BasicReturnMethod{
-		ReplyCode:  replyCode,
-		ReplyText:  replyText,
-		Exchange:   exchange,
-		RoutingKey: routingKey,
-	}
-	methodData, err := method.Serialize()
-	if err != nil {
-		return fmt.Errorf("failed to serialize basic.return: %w", err)
-	}
-
-	estimatedSize := deliveryOverheadEstimate + len(message.Body)
-	buf := make([]byte, 0, estimatedSize)
-
-	var methodPayload []byte
-	methodPayload = binary.BigEndian.AppendUint16(methodPayload, 60)
-	methodPayload = binary.BigEndian.AppendUint16(methodPayload, 50)
-	methodPayload = append(methodPayload, methodData...)
-	buf = protocol.AppendFrame(buf, protocol.FrameMethod, channelID, methodPayload)
-
+func (s *Server) appendHeaderAndBodyFrames(buf *[]byte, channelID uint16, message *protocol.Message) error {
 	propertyFlags := buildPropertyFlags(message)
 	var hdrPayload []byte
-	hdrPayload, err = (&protocol.ContentHeader{
+	hdrPayload, err := (&protocol.ContentHeader{
 		ClassID:         60,
 		Weight:          0,
 		BodySize:        uint64(len(message.Body)),
@@ -247,7 +227,7 @@ func (s *Server) sendBasicReturn(conn *protocol.Connection, channelID uint16, re
 	if err != nil {
 		return fmt.Errorf("error serializing content header: %v", err)
 	}
-	buf = protocol.AppendFrame(buf, protocol.FrameHeader, channelID, hdrPayload)
+	*buf = protocol.AppendFrame(*buf, protocol.FrameHeader, channelID, hdrPayload)
 
 	maxFrameSize := uint32(s.Config.Server.MaxFrameSize)
 	maxBodyPerFrame := int(maxFrameSize) - 8
@@ -259,7 +239,35 @@ func (s *Server) sendBasicReturn(conn *protocol.Connection, channelID uint16, re
 		if end > len(message.Body) {
 			end = len(message.Body)
 		}
-		buf = protocol.AppendFrame(buf, protocol.FrameBody, channelID, message.Body[offset:end])
+		*buf = protocol.AppendFrame(*buf, protocol.FrameBody, channelID, message.Body[offset:end])
+	}
+
+	return nil
+}
+
+func (s *Server) sendBasicReturn(conn *protocol.Connection, channelID uint16, replyCode uint16, replyText, exchange, routingKey string, message *protocol.Message) error {
+	method := &protocol.BasicReturnMethod{
+		ReplyCode:  replyCode,
+		ReplyText:  replyText,
+		Exchange:   exchange,
+		RoutingKey: routingKey,
+	}
+	methodData, err := method.Serialize()
+	if err != nil {
+		return fmt.Errorf("failed to serialize basic.return: %w", err)
+	}
+
+	estimatedSize := deliveryOverheadEstimate + len(message.Body)
+	buf := make([]byte, 0, estimatedSize)
+
+	var methodPayload []byte
+	methodPayload = binary.BigEndian.AppendUint16(methodPayload, 60)
+	methodPayload = binary.BigEndian.AppendUint16(methodPayload, 50)
+	methodPayload = append(methodPayload, methodData...)
+	buf = protocol.AppendFrame(buf, protocol.FrameMethod, channelID, methodPayload)
+
+	if err := s.appendHeaderAndBodyFrames(&buf, channelID, message); err != nil {
+		return err
 	}
 
 	conn.WriteMutex.Lock()

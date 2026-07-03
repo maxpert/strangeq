@@ -1,10 +1,12 @@
 package transaction
 
 import (
+	"errors"
 	"fmt"
 	"sync"
 	"sync/atomic"
 
+	"github.com/maxpert/amqp-go/broker"
 	"github.com/maxpert/amqp-go/interfaces"
 	"github.com/maxpert/amqp-go/protocol"
 )
@@ -255,7 +257,7 @@ func (tm *DefaultTransactionManager) executeSequentially(operations []*interface
 		switch op.Type {
 		case interfaces.OpPublish:
 			err := tm.executor.ExecutePublish(op.Exchange, op.RoutingKey, op.Message)
-			if err != nil {
+			if err != nil && !errors.Is(err, broker.ErrNoRoute) {
 				return fmt.Errorf("failed to execute publish: %w", err)
 			}
 

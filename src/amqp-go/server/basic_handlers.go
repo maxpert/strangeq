@@ -647,49 +647,7 @@ func (s *Server) serializeDeliveryInto(buf *[]byte, channelID uint16, consumerTa
 	payload = protocol.AppendShortString(payload, routingKey)
 	*buf = protocol.AppendFrame(*buf, protocol.FrameMethod, channelID, payload)
 
-	// --- Header frame (content header) ---
-	propertyFlags := buildPropertyFlags(message)
-	var hdrPayload []byte
-	hdrPayload, err := (&protocol.ContentHeader{
-		ClassID:         60,
-		Weight:          0,
-		BodySize:        uint64(len(message.Body)),
-		PropertyFlags:   propertyFlags,
-		Headers:         message.Headers,
-		ContentType:     message.ContentType,
-		ContentEncoding: message.ContentEncoding,
-		DeliveryMode:    message.DeliveryMode,
-		Priority:        message.Priority,
-		CorrelationID:   message.CorrelationID,
-		ReplyTo:         message.ReplyTo,
-		Expiration:      message.Expiration,
-		MessageID:       message.MessageID,
-		Timestamp:       message.Timestamp,
-		Type:            message.Type,
-		UserID:          message.UserID,
-		AppID:           message.AppID,
-		ClusterID:       message.ClusterID,
-	}).SerializeInto(hdrPayload)
-	if err != nil {
-		return fmt.Errorf("error serializing content header: %v", err)
-	}
-	*buf = protocol.AppendFrame(*buf, protocol.FrameHeader, channelID, hdrPayload)
-
-	// --- Body frames ---
-	maxFrameSize := uint32(s.Config.Server.MaxFrameSize)
-	maxBodyPerFrame := int(maxFrameSize) - 8
-	if maxBodyPerFrame <= 0 {
-		maxBodyPerFrame = 4096
-	}
-	for offset := 0; offset < len(message.Body); offset += maxBodyPerFrame {
-		end := offset + maxBodyPerFrame
-		if end > len(message.Body) {
-			end = len(message.Body)
-		}
-		*buf = protocol.AppendFrame(*buf, protocol.FrameBody, channelID, message.Body[offset:end])
-	}
-
-	return nil
+	return s.appendHeaderAndBodyFrames(buf, channelID, message)
 }
 
 // serializeGetDeliveryInto serializes a basic.get-ok (method frame + header
@@ -713,49 +671,7 @@ func (s *Server) serializeGetDeliveryInto(buf *[]byte, channelID uint16, deliver
 	payload = binary.BigEndian.AppendUint32(payload, messageCount)
 	*buf = protocol.AppendFrame(*buf, protocol.FrameMethod, channelID, payload)
 
-	// --- Header frame (content header) ---
-	propertyFlags := buildPropertyFlags(message)
-	var hdrPayload []byte
-	hdrPayload, err := (&protocol.ContentHeader{
-		ClassID:         60,
-		Weight:          0,
-		BodySize:        uint64(len(message.Body)),
-		PropertyFlags:   propertyFlags,
-		Headers:         message.Headers,
-		ContentType:     message.ContentType,
-		ContentEncoding: message.ContentEncoding,
-		DeliveryMode:    message.DeliveryMode,
-		Priority:        message.Priority,
-		CorrelationID:   message.CorrelationID,
-		ReplyTo:         message.ReplyTo,
-		Expiration:      message.Expiration,
-		MessageID:       message.MessageID,
-		Timestamp:       message.Timestamp,
-		Type:            message.Type,
-		UserID:          message.UserID,
-		AppID:           message.AppID,
-		ClusterID:       message.ClusterID,
-	}).SerializeInto(hdrPayload)
-	if err != nil {
-		return fmt.Errorf("error serializing content header: %v", err)
-	}
-	*buf = protocol.AppendFrame(*buf, protocol.FrameHeader, channelID, hdrPayload)
-
-	// --- Body frames ---
-	maxFrameSize := uint32(s.Config.Server.MaxFrameSize)
-	maxBodyPerFrame := int(maxFrameSize) - 8
-	if maxBodyPerFrame <= 0 {
-		maxBodyPerFrame = 4096
-	}
-	for offset := 0; offset < len(message.Body); offset += maxBodyPerFrame {
-		end := offset + maxBodyPerFrame
-		if end > len(message.Body) {
-			end = len(message.Body)
-		}
-		*buf = protocol.AppendFrame(*buf, protocol.FrameBody, channelID, message.Body[offset:end])
-	}
-
-	return nil
+	return s.appendHeaderAndBodyFrames(buf, channelID, message)
 }
 
 // sendBasicDeliver sends a basic.deliver method frame to a consumer.

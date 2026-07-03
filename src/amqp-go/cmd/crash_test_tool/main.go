@@ -65,9 +65,9 @@ func publishMessages(count int, queueName string) error {
 	}
 	defer ch.Close()
 
-	// Publisher confirms not yet implemented in server (Phase 4 TODO)
-	// For now, we'll use a sleep to allow TCP buffers to flush
-	fmt.Println("Publisher confirms not yet implemented, will use delay instead")
+	// Publisher confirms are implemented but this tool uses a simple delay
+	// for crash testing — confirms would add complexity without benefit here
+	fmt.Println("Using delay to allow TCP buffers to flush before crash")
 
 	// Declare queue
 	_, err = ch.QueueDeclare(
