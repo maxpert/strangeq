@@ -20,12 +20,13 @@ type Connection struct {
 	User            interface{}                // Authenticated *interfaces.User (interface{} to avoid import cycle; set once during handshake, immutable thereafter)
 	PendingMessages map[uint16]*PendingMessage // Track messages being published on each channel.
 	// SINGLE-WRITER: accessed only by the processFrames goroutine. No mutex needed.
-	FrameQueue     chan *Frame // Buffer frames between reader and processor goroutines
-	AckQueue       chan *Frame // Buffer ACK/NACK/Reject frames for the ack worker goroutine
-	WriteMutex     sync.Mutex  // Protects socket writes (heartbeat sender + frame processor both write)
-	Closed         atomic.Bool // Atomic flag for connection closure
-	ConsumersDirty atomic.Bool // Set when consumers are added/removed; delivery loop re-scans only when true
-	Blocked        atomic.Bool // Back-pressure flag: true when queue usage > 90%, false when < 80%
+	FrameQueue     chan *Frame   // Buffer frames between reader and processor goroutines
+	AckQueue       chan *Frame   // Buffer ACK/NACK/Reject frames for the ack worker goroutine
+	Done           chan struct{} // Closed during connection teardown to unblock goroutines waiting on AckQueue
+	WriteMutex     sync.Mutex    // Protects socket writes (heartbeat sender + frame processor both write)
+	Closed         atomic.Bool   // Atomic flag for connection closure
+	ConsumersDirty atomic.Bool   // Set when consumers are added/removed; delivery loop re-scans only when true
+	Blocked        atomic.Bool   // Back-pressure flag: true when queue usage > 90%, false when < 80%
 }
 
 // NewConnection creates a new AMQP connection
@@ -36,7 +37,8 @@ func NewConnection(conn net.Conn) *Connection {
 		// Channels: sync.Map needs no initialization
 		PendingMessages: make(map[uint16]*PendingMessage),
 		FrameQueue:      make(chan *Frame, 10000), // 10K frame buffer for reader/processor separation
-		AckQueue:        make(chan *Frame, 1024),  // 1K ACK buffer for off-processor ACK handling
+		AckQueue:        make(chan *Frame, 4096),  // 4K ACK buffer for off-processor ACK handling
+		Done:            make(chan struct{}),
 	}
 }
 

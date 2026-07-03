@@ -669,145 +669,102 @@ func (s *Server) sendBasicDeliver(conn *protocol.Connection, channelID uint16, c
 // handleBasicAck handles the basic.ack method
 // handleBasicAck handles the basic.ack method
 func (s *Server) handleBasicAck(conn *protocol.Connection, channelID uint16, payload []byte) error {
-	// Deserialize the basic.ack method
-	ackMethod := &protocol.BasicAckMethod{}
-	err := ackMethod.Deserialize(payload)
-	if err != nil {
-		s.Log.Error("Failed to deserialize basic.ack",
-			zap.Error(err),
-			zap.String("connection_id", conn.ID),
-			zap.Uint16("channel_id", channelID))
-		return err
+	if len(payload) < 8 {
+		return fmt.Errorf("basic.ack payload too short: %d bytes", len(payload))
+	}
+	deliveryTag := binary.BigEndian.Uint64(payload[:8])
+	var multiple bool
+	if len(payload) >= 10 {
+		flags := binary.BigEndian.Uint16(payload[8:10])
+		multiple = (flags & (1 << 0)) != 0
 	}
 
-	s.Log.Debug("Basic ack received",
-		zap.Uint64("delivery_tag", ackMethod.DeliveryTag),
-		zap.Bool("multiple", ackMethod.Multiple))
-
-	// CRITICAL FIX: Use global delivery index for O(1) consumer lookup
-	// This fixes the broken random consumer lookup that caused 95% of ACKs to route incorrectly
-	consumerTag, ok := s.Broker.GetConsumerForDelivery(ackMethod.DeliveryTag)
+	consumerTag, ok := s.Broker.GetConsumerForDelivery(deliveryTag)
 	if !ok {
 		s.Log.Debug("Delivery tag already processed (consumer cancelled?)",
-			zap.Uint64("delivery_tag", ackMethod.DeliveryTag),
+			zap.Uint64("delivery_tag", deliveryTag),
 			zap.Uint16("channel_id", channelID))
 		return nil
 	}
 
-	// Tell the broker to acknowledge the message
-	err = s.Broker.AcknowledgeMessage(consumerTag, ackMethod.DeliveryTag, ackMethod.Multiple)
+	err := s.Broker.AcknowledgeMessage(consumerTag, deliveryTag, multiple)
 	if err != nil {
 		s.Log.Error("Failed to acknowledge message in broker",
 			zap.Error(err),
 			zap.String("consumer_tag", consumerTag),
-			zap.Uint64("delivery_tag", ackMethod.DeliveryTag),
-			zap.Bool("multiple", ackMethod.Multiple))
+			zap.Uint64("delivery_tag", deliveryTag),
+			zap.Bool("multiple", multiple))
 		return err
 	}
-
-	s.Log.Debug("Message acknowledged",
-		zap.String("consumer_tag", consumerTag),
-		zap.Uint64("delivery_tag", ackMethod.DeliveryTag),
-		zap.Bool("multiple", ackMethod.Multiple),
-		zap.String("connection_id", conn.ID),
-		zap.Uint16("channel_id", channelID))
 
 	return nil
 }
 
 // handleBasicReject handles the basic.reject method
 func (s *Server) handleBasicReject(conn *protocol.Connection, channelID uint16, payload []byte) error {
-	// Deserialize the basic.reject method
-	rejectMethod := &protocol.BasicRejectMethod{}
-	err := rejectMethod.Deserialize(payload)
-	if err != nil {
-		s.Log.Error("Failed to deserialize basic.reject",
-			zap.Error(err),
-			zap.String("connection_id", conn.ID),
-			zap.Uint16("channel_id", channelID))
-		return err
+	if len(payload) < 8 {
+		return fmt.Errorf("basic.reject payload too short: %d bytes", len(payload))
+	}
+	deliveryTag := binary.BigEndian.Uint64(payload[:8])
+	var requeue bool = true // default: requeue
+	if len(payload) >= 10 {
+		flags := binary.BigEndian.Uint16(payload[8:10])
+		requeue = (flags & (1 << 0)) != 0
 	}
 
-	s.Log.Debug("Basic reject received",
-		zap.Uint64("delivery_tag", rejectMethod.DeliveryTag),
-		zap.Bool("requeue", rejectMethod.Requeue))
-
-	// CRITICAL FIX: Use global delivery index for O(1) consumer lookup
-	consumerTag, ok := s.Broker.GetConsumerForDelivery(rejectMethod.DeliveryTag)
+	consumerTag, ok := s.Broker.GetConsumerForDelivery(deliveryTag)
 	if !ok {
 		s.Log.Debug("Delivery tag already processed (consumer cancelled?)",
-			zap.Uint64("delivery_tag", rejectMethod.DeliveryTag),
+			zap.Uint64("delivery_tag", deliveryTag),
 			zap.Uint16("channel_id", channelID))
 		return nil
 	}
 
-	// Tell the broker to reject the message
-	err = s.Broker.RejectMessage(consumerTag, rejectMethod.DeliveryTag, rejectMethod.Requeue)
+	err := s.Broker.RejectMessage(consumerTag, deliveryTag, requeue)
 	if err != nil {
 		s.Log.Error("Failed to reject message in broker",
 			zap.Error(err),
 			zap.String("consumer_tag", consumerTag),
-			zap.Uint64("delivery_tag", rejectMethod.DeliveryTag),
-			zap.Bool("requeue", rejectMethod.Requeue))
+			zap.Uint64("delivery_tag", deliveryTag),
+			zap.Bool("requeue", requeue))
 		return err
 	}
-
-	s.Log.Debug("Message rejected",
-		zap.String("consumer_tag", consumerTag),
-		zap.Uint64("delivery_tag", rejectMethod.DeliveryTag),
-		zap.Bool("requeue", rejectMethod.Requeue),
-		zap.String("connection_id", conn.ID),
-		zap.Uint16("channel_id", channelID))
 
 	return nil
 }
 
 // handleBasicNack handles the basic.nack method
 func (s *Server) handleBasicNack(conn *protocol.Connection, channelID uint16, payload []byte) error {
-	// Deserialize the basic.nack method
-	nackMethod := &protocol.BasicNackMethod{}
-	err := nackMethod.Deserialize(payload)
-	if err != nil {
-		s.Log.Error("Failed to deserialize basic.nack",
-			zap.Error(err),
-			zap.String("connection_id", conn.ID),
-			zap.Uint16("channel_id", channelID))
-		return err
+	if len(payload) < 8 {
+		return fmt.Errorf("basic.nack payload too short: %d bytes", len(payload))
+	}
+	deliveryTag := binary.BigEndian.Uint64(payload[:8])
+	var multiple, requeue bool
+	requeue = true // default: requeue
+	if len(payload) >= 10 {
+		flags := binary.BigEndian.Uint16(payload[8:10])
+		multiple = (flags & (1 << 0)) != 0
+		requeue = (flags & (1 << 1)) != 0
 	}
 
-	s.Log.Debug("Basic nack received",
-		zap.Uint64("delivery_tag", nackMethod.DeliveryTag),
-		zap.Bool("multiple", nackMethod.Multiple),
-		zap.Bool("requeue", nackMethod.Requeue))
-
-	// CRITICAL FIX: Use global delivery index for O(1) consumer lookup
-	consumerTag, ok := s.Broker.GetConsumerForDelivery(nackMethod.DeliveryTag)
+	consumerTag, ok := s.Broker.GetConsumerForDelivery(deliveryTag)
 	if !ok {
 		s.Log.Debug("Delivery tag already processed (consumer cancelled?)",
-			zap.Uint64("delivery_tag", nackMethod.DeliveryTag),
+			zap.Uint64("delivery_tag", deliveryTag),
 			zap.Uint16("channel_id", channelID))
 		return nil
 	}
 
-	// Tell the broker to nack the message
-	err = s.Broker.NacknowledgeMessage(consumerTag, nackMethod.DeliveryTag, nackMethod.Multiple, nackMethod.Requeue)
+	err := s.Broker.NacknowledgeMessage(consumerTag, deliveryTag, multiple, requeue)
 	if err != nil {
 		s.Log.Error("Failed to nack message in broker",
 			zap.Error(err),
 			zap.String("consumer_tag", consumerTag),
-			zap.Uint64("delivery_tag", nackMethod.DeliveryTag),
-			zap.Bool("multiple", nackMethod.Multiple),
-			zap.Bool("requeue", nackMethod.Requeue))
+			zap.Uint64("delivery_tag", deliveryTag),
+			zap.Bool("multiple", multiple),
+			zap.Bool("requeue", requeue))
 		return err
 	}
-
-	s.Log.Debug("Message negatively acknowledged",
-		zap.String("consumer_tag", consumerTag),
-		zap.Uint64("delivery_tag", nackMethod.DeliveryTag),
-		zap.Bool("multiple", nackMethod.Multiple),
-		zap.Bool("requeue", nackMethod.Requeue),
-		zap.String("connection_id", conn.ID),
-		zap.Uint16("channel_id", channelID))
 
 	return nil
 }

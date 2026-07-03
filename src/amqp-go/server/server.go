@@ -327,11 +327,13 @@ func (s *Server) processConnectionFrames(conn *protocol.Connection) {
 		s.Log.Info("Consumer delivery completed", zap.String("connection_id", conn.ID))
 	case <-ackProcessorDone:
 		s.Log.Info("ACK processor completed", zap.String("connection_id", conn.ID))
-		return
 	}
 
 	// Close the connection to unblock reader and processor
 	conn.Conn.Close()
+	// Signal all goroutines that the connection is shutting down.
+	// This unblocks processFrame if it's waiting to send to AckQueue.
+	close(conn.Done)
 
 	// Wait for frame processor to exit (it is the only sender to ackQueue)
 	<-processorDone
@@ -422,8 +424,8 @@ func (s *Server) processFrame(conn *protocol.Connection, frame *protocol.Frame) 
 			select {
 			case conn.AckQueue <- frame:
 				return false, nil
-			default:
-				return true, s.processMethodFrame(conn, frame)
+			case <-conn.Done:
+				return true, nil
 			}
 		}
 		return true, s.processMethodFrame(conn, frame)
