@@ -224,6 +224,7 @@ func BenchmarkAcknowledgeMessage(b *testing.B) {
 		queueName: "bench-ack",
 		stopCh:    make(chan struct{}),
 		done:      make(chan struct{}),
+		gate:      newPrefetchGate(2000),
 	}
 	broker.activeConsumers.Store("bench-ack-consumer", state)
 	defer broker.activeConsumers.Delete("bench-ack-consumer")
