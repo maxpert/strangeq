@@ -38,9 +38,6 @@ type NetworkConfig struct {
 	// Maximum number of connections
 	MaxConnections int
 
-	// Connection timeout in milliseconds
-	ConnectionTimeoutMS int64
-
 	// Heartbeat interval in milliseconds
 	HeartbeatIntervalMS int64
 
@@ -127,37 +124,12 @@ type ServerConfig struct {
 	MaxMessageSize           int64
 
 	// Timeouts and intervals (in milliseconds)
-	ChannelTimeoutMS  int64 // Channel operation timeout
-	MessageTimeoutMS  int64 // Message handling timeout
 	CleanupIntervalMS int64 // Background cleanup interval
-
-	// Memory management
-	// MemoryLimitPercent sets memory threshold as percentage of system RAM (0-100)
-	// Default: 60 (60% of RAM)
-	// Set to 0 to use absolute limit instead
-	MemoryLimitPercent int `json:"memory_limit_percent"`
-
-	// MemoryLimitBytes sets absolute memory limit in bytes
-	// Used when MemoryLimitPercent is 0
-	// Default: 0 (use percentage instead)
-	MemoryLimitBytes int64 `json:"memory_limit_bytes"`
 }
 
 // EngineConfig holds internal engine tuning parameters
 // Phase 6G: Configurable hot-path parameters for performance optimization
 type EngineConfig struct {
-	// ========================================
-	// Queue State Management
-	// ========================================
-
-	// AvailableChannelBuffer is the size of the lock-free available message ID channel
-	// Larger buffer = more memory, more headroom for bursts
-	// Smaller buffer = less memory, must be sized for throughput
-	// Phase 6E: Reduced from 100M to 10M (612 MB memory savings)
-	// Default: 10,000,000 (10M entries = 80 MB per queue)
-	// Memory: 8 bytes per uint64 entry
-	AvailableChannelBuffer int `json:"available_channel_buffer"`
-
 	// ========================================
 	// Ring Buffer (Hot Path)
 	// ========================================
@@ -251,26 +223,9 @@ type EngineConfig struct {
 	// Background Maintenance
 	// ========================================
 
-	// ExpiredMessageCheckIntervalMS is how often to scan for expired messages (milliseconds)
-	// Note: Not yet implemented — reserved for future TTL enforcement feature.
-	// Default: 60000 (60 seconds)
-	ExpiredMessageCheckIntervalMS int64 `json:"expired_message_check_interval_ms"`
-
 	// WALCleanupCheckIntervalMS is how often to check for old WAL files to delete (milliseconds)
 	// Longer = slower cleanup, more disk usage
 	// Shorter = faster cleanup, more overhead
 	// Default: 300000 (5 minutes)
 	WALCleanupCheckIntervalMS int64 `json:"wal_cleanup_check_interval_ms"`
-
-	// OffsetCleanupBatchSize is how many old offsets to delete per cleanup cycle
-	// Larger = faster cleanup, more I/O per cycle
-	// Smaller = slower cleanup, less I/O impact
-	// Default: 1,000
-	OffsetCleanupBatchSize int `json:"offset_cleanup_batch_size"`
-
-	// OffsetCleanupIntervalMS is how often to cleanup acknowledged message offsets (milliseconds)
-	// Longer = less overhead, more stale offsets in memory
-	// Shorter = more overhead, cleaner memory
-	// Default: 30000 (30 seconds)
-	OffsetCleanupIntervalMS int64 `json:"offset_cleanup_interval_ms"`
 }

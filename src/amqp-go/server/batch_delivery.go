@@ -85,6 +85,11 @@ func (s *Server) sendBatchedDeliveries(conn *protocol.Connection, channelID uint
 		}
 	}
 
+	for _, delivery := range deliveries {
+		s.messagesDelivered.Add(1)
+		s.bytesSent.Add(int64(len(delivery.Message.Body)))
+	}
+
 	s.Log.Debug("Batched deliveries sent successfully",
 		zap.String("consumer_tag", consumerTag),
 		zap.Int("batch_size", len(deliveries)))

@@ -223,10 +223,14 @@ func GetPendingMessage() *PendingMessage {
 }
 
 // PutPendingMessage returns a PendingMessage to the pool.
-// INVARIANT: The pool MUST nil/zero all references (Method, Header, Body,
-// Channel) — it must NOT recycle backing data. The broker retains aliases
-// to Body and Header.Headers after PublishMessage stores the message;
-// recycling them here would corrupt stored deliveries.
+//
+// INVARIANT: Message.Body aliases pendingMsg.Body (zero-copy assignment in
+// processCompleteMessage). The broker retains that alias after PublishMessage
+// stores the message. Therefore PutPendingMessage MUST NOT recycle the backing
+// []byte — it MUST only nil the Body reference so the pool Get yields a clean
+// struct. Recycling the slice storage here would corrupt every stored delivery
+// body on the next pool Get. The same rule applies to Header (aliased via
+// ContentHeader), Method, and Channel — nil references only, never reuse.
 func PutPendingMessage(m *PendingMessage) {
 	m.Method = nil
 	m.Header = nil
@@ -248,10 +252,13 @@ func GetContentHeader() *ContentHeader {
 }
 
 // PutContentHeader returns a ContentHeader to the pool.
-// INVARIANT: The pool MUST zero the struct (via *h = ContentHeader{}) —
-// it must NOT recycle backing data (Headers map, string fields). The
-// broker retains aliases to Headers after PublishMessage stores the
-// message; recycling them here would corrupt stored deliveries.
+//
+// INVARIANT: Message.Headers aliases ContentHeader.Headers (zero-copy
+// assignment in processCompleteMessage). The broker retains that alias after
+// PublishMessage stores the message. Therefore PutContentHeader MUST NOT
+// recycle the backing map — it MUST zero the struct via *h = ContentHeader{}
+// so the pool Get yields a clean struct. Recycling the map storage here would
+// corrupt every stored delivery's headers on the next pool Get.
 func PutContentHeader(h *ContentHeader) {
 	*h = ContentHeader{}
 	contentHeaderPool.Put(h)

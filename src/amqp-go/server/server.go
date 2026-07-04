@@ -242,14 +242,33 @@ func (s *Server) cleanupConnection(connection *protocol.Connection) {
 		s.Broker.RequeueAllGetDeliveries()
 	}
 
+	if s.Broker != nil {
+		if sb, ok := s.Broker.(*StorageBrokerAdapter); ok {
+			ownedQueues := sb.broker.GetQueuesOwnedByConnection(connection.ID)
+			for _, qName := range ownedQueues {
+				if _, err := s.Broker.DeleteQueue(qName, false, false); err != nil {
+					s.Log.Warn("Failed to delete exclusive queue on connection close",
+						zap.String("queue", qName),
+						zap.String("connection_id", connection.ID),
+						zap.Error(err))
+				} else {
+					s.Log.Debug("Deleted exclusive queue on connection close",
+						zap.String("queue", qName),
+						zap.String("connection_id", connection.ID))
+				}
+			}
+		}
+	}
+
 	s.Mutex.Lock()
 	delete(s.Connections, connection.ID)
 	s.Mutex.Unlock()
 
-	// Record connection closed
 	if s.MetricsCollector != nil {
 		s.MetricsCollector.RecordConnectionClosed()
 	}
+
+	s.updateConsumersTotal()
 }
 
 // negotiateUint16 returns the minimum of server and client values, where 0
@@ -474,6 +493,9 @@ func (s *Server) readFrames(conn *protocol.Connection, done chan struct{}) {
 				s.Log.Error("Error reading frame from connection",
 					zap.String("connection_id", conn.ID),
 					zap.Error(err))
+				if s.MetricsCollector != nil {
+					s.MetricsCollector.RecordConnectionError("read")
+				}
 			}
 
 			conn.Closed.Store(true)
@@ -482,7 +504,8 @@ func (s *Server) readFrames(conn *protocol.Connection, done chan struct{}) {
 
 		conn.TouchActivity()
 
-		// Enqueue for processing (blocks only if queue is full)
+		s.bytesReceived.Add(int64(frame.Size))
+
 		select {
 		case conn.FrameQueue <- frame:
 			// Frame queued successfully
@@ -525,6 +548,12 @@ func (s *Server) processFrames(conn *protocol.Connection, done chan struct{}) {
 					zap.String("connection_id", conn.ID),
 					zap.Uint16("channel", frame.Channel),
 					zap.Error(err))
+				if s.MetricsCollector != nil {
+					if frame.Channel != 0 {
+						s.MetricsCollector.RecordChannelError("method_processing")
+					}
+					s.MetricsCollector.RecordConnectionError("frame_processing")
+				}
 				conn.Closed.Store(true)
 				return
 			}
@@ -610,6 +639,9 @@ func (s *Server) ackProcessor(conn *protocol.Connection, done chan struct{}) {
 				zap.String("connection_id", conn.ID),
 				zap.Uint16("channel", frame.Channel),
 				zap.Error(err))
+			if s.MetricsCollector != nil {
+				s.MetricsCollector.RecordConnectionError("ack_processing")
+			}
 			conn.Closed.Store(true)
 			return
 		}

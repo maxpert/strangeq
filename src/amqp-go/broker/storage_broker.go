@@ -20,6 +20,20 @@ var ErrConsumerChannelFull = errors.New("consumer channel full")
 // cannot be routed to any queue.
 var ErrNoRoute = errors.New("no route to destination queue")
 
+// ErrExchangeTypeMismatch is returned when a re-declare of an existing
+// exchange specifies a different type. Callers should handle this as a
+// channel-level 406 PreconditionFailed per AMQP 0.9.1 spec.
+var ErrExchangeTypeMismatch = errors.New("exchange type mismatch")
+
+func isSupportedExchangeType(kind string) bool {
+	switch kind {
+	case "direct", "fanout", "topic", "headers":
+		return true
+	default:
+		return false
+	}
+}
+
 // QueueState and its constructor NewQueueState now live in queue_dispatch.go,
 // replacing the old `available chan uint64` with a lock-free tail cursor +
 // condvar park/wake + bounded requeue ring. See queue_dispatch.go for the
@@ -107,6 +121,7 @@ type StorageBroker struct {
 	activeConsumers   sync.Map
 	queueConsumers    sync.Map
 	queueConsumersMu  sync.Map
+	queueOwners       sync.Map
 	deliveryIndex     sync.Map
 	getDeliveryQueues sync.Map
 	globalDeliveryTag atomic.Uint64
@@ -207,6 +222,42 @@ func (b *StorageBroker) initializeDefaultExchanges() {
 func (b *StorageBroker) getQueueConsumersMutex(queueName string) *sync.Mutex {
 	val, _ := b.queueConsumersMu.LoadOrStore(queueName, &sync.Mutex{})
 	return val.(*sync.Mutex)
+}
+
+// SetQueueOwnerIfFree atomically claims ownership of a queue for a connection.
+// Returns true if the caller is now the owner (either it was unowned or already
+// owned by the same connection). Returns false if another connection already
+// owns the queue.
+func (b *StorageBroker) SetQueueOwnerIfFree(queueName, connID string) bool {
+	val, loaded := b.queueOwners.LoadOrStore(queueName, connID)
+	if !loaded {
+		return true
+	}
+	return val.(string) == connID
+}
+
+// GetQueueOwner returns the connection ID that owns the given queue, or
+// ("", false) if no owner is recorded.
+func (b *StorageBroker) GetQueueOwner(queueName string) (string, bool) {
+	val, ok := b.queueOwners.Load(queueName)
+	if !ok {
+		return "", false
+	}
+	return val.(string), true
+}
+
+// GetQueuesOwnedByConnection returns the names of all queues owned by the
+// given connection ID. Used during connection-close teardown to delete
+// exclusive queues.
+func (b *StorageBroker) GetQueuesOwnedByConnection(connID string) []string {
+	var queues []string
+	b.queueOwners.Range(func(key, value interface{}) bool {
+		if value.(string) == connID {
+			queues = append(queues, key.(string))
+		}
+		return true
+	})
+	return queues
 }
 
 // getOrCreateQueueState returns the queue state, creating it if needed (lock-free)
@@ -328,10 +379,14 @@ func (b *StorageBroker) DeclareExchange(name, exchangeType string, durable, auto
 	// If exists, validate properties match
 	if existing != nil {
 		if existing.Kind != exchangeType {
-			return fmt.Errorf("exchange '%s' type mismatch: expected %s, got %s", name, existing.Kind, exchangeType)
+			return fmt.Errorf("%w: exchange '%s' expected %s, got %s", ErrExchangeTypeMismatch, name, existing.Kind, exchangeType)
 		}
 		// Exchange already exists with matching properties
 		return nil
+	}
+
+	if !isSupportedExchangeType(exchangeType) {
+		return fmt.Errorf("unsupported exchange type: %s", exchangeType)
 	}
 
 	// Create new exchange
@@ -518,6 +573,7 @@ func (b *StorageBroker) DeleteQueue(name string, ifUnused, ifEmpty bool) (int, e
 	}
 
 	b.activeQueues.Delete(name)
+	b.queueOwners.Delete(name)
 	if qval, qok := b.queueStates.LoadAndDelete(name); qok {
 		qval.(*QueueState).Close()
 	}
@@ -679,6 +735,13 @@ func (b *StorageBroker) RegisterConsumer(queueName, consumerTag string, consumer
 			return errors.New("queue does not exist")
 		}
 		return err
+	}
+
+	if ownerVal, ok := b.queueOwners.Load(queueName); ok {
+		ownerID := ownerVal.(string)
+		if consumer.Channel != nil && consumer.Channel.Connection != nil && ownerID != consumer.Channel.Connection.ID {
+			return errors.New("queue '" + queueName + "' is exclusive to another connection")
+		}
 	}
 
 	mu := b.getQueueConsumersMutex(queueName)
@@ -915,6 +978,13 @@ func (b *StorageBroker) PublishMessage(exchangeName, routingKey string, message 
 			message.DeliveryTag = msgID
 			storeMsg = message
 		} else {
+			// FANOUT INVARIANT: For fanout (and any multi-queue routing), tail
+			// deliveries (i > 0) MUST deep-copy the Headers map. All queue
+			// copies would otherwise share the same map pointer; a consumer
+			// or internal mutation of one copy's Headers would silently
+			// corrupt every other queue's delivery. The Body slice is not
+			// deep-copied because the AMQP protocol treats message bodies as
+			// immutable after publish — consumers read but never mutate Body.
 			msgCopy := *message
 			msgCopy.DeliveryTag = msgID
 			if message.Headers != nil {
@@ -1195,6 +1265,21 @@ func (b *StorageBroker) GetQueueConsumerCount(queueName string) int {
 		return len(val.([]*ConsumerState))
 	}
 	return 0
+}
+
+func (b *StorageBroker) GetQueueConsumerTags(queueName string) []string {
+	mu := b.getQueueConsumersMutex(queueName)
+	mu.Lock()
+	defer mu.Unlock()
+	if val, ok := b.queueConsumers.Load(queueName); ok {
+		consumers := val.([]*ConsumerState)
+		tags := make([]string, 0, len(consumers))
+		for _, state := range consumers {
+			tags = append(tags, state.consumer.Tag)
+		}
+		return tags
+	}
+	return nil
 }
 
 // updateDurableMetadata updates the durable entity metadata in storage

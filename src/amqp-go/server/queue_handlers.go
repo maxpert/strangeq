@@ -3,6 +3,7 @@ package server
 import (
 	"fmt"
 
+	amqperrors "github.com/maxpert/amqp-go/errors"
 	"github.com/maxpert/amqp-go/interfaces"
 	"github.com/maxpert/amqp-go/protocol"
 	"go.uber.org/zap"
@@ -113,6 +114,17 @@ func (s *Server) handleQueueDeclare(conn *protocol.Connection, channelID uint16,
 			zap.Error(err),
 			zap.String("queue", queueName))
 		return err
+	}
+
+	if declareMethod.Exclusive {
+		if sb, ok := s.Broker.(*StorageBrokerAdapter); ok {
+			if !sb.broker.SetQueueOwnerIfFree(queue.Name, conn.ID) {
+				replyText := fmt.Sprintf("QUEUE_LOCKED - queue '%s' is exclusive to another connection", queue.Name)
+				s.sendChannelClose(conn, channelID, uint16(amqperrors.ResourceLocked), replyText, 50, 10)
+				return fmt.Errorf("queue '%s' is exclusive to another connection", queue.Name)
+			}
+			queue.OwnerConnID = conn.ID
+		}
 	}
 
 	if val, exists := conn.Channels.Load(channelID); exists {
@@ -346,12 +358,29 @@ func (s *Server) handleQueueDelete(conn *protocol.Connection, channelID uint16, 
 		return s.authzChannelError(conn, channelID, err, 50, 40)
 	}
 
+	if sb, ok := s.Broker.(*StorageBrokerAdapter); ok {
+		if ownerID, exists := sb.broker.GetQueueOwner(queueName); exists && ownerID != conn.ID {
+			replyText := fmt.Sprintf("QUEUE_LOCKED - queue '%s' is exclusive to another connection", queueName)
+			s.sendChannelClose(conn, channelID, uint16(amqperrors.ResourceLocked), replyText, 50, 40)
+			return fmt.Errorf("queue '%s' is exclusive to another connection", queueName)
+		}
+	}
+
+	var consumerTags []string
+	if sb, ok := s.Broker.(*StorageBrokerAdapter); ok {
+		consumerTags = sb.broker.GetQueueConsumerTags(queueName)
+	}
+
 	count, err := s.Broker.DeleteQueue(queueName, deleteMethod.IfUnused, deleteMethod.IfEmpty)
 	if err != nil {
 		s.Log.Error("Failed to delete queue",
 			zap.Error(err),
 			zap.String("queue", queueName))
 		return err
+	}
+
+	if len(consumerTags) > 0 {
+		s.notifyConsumersCancelled(consumerTags)
 	}
 
 	if val, exists := conn.Channels.Load(channelID); exists {
@@ -372,4 +401,43 @@ func (s *Server) handleQueueDelete(conn *protocol.Connection, channelID uint16, 
 	}
 
 	return s.sendQueueDeleteOK(conn, channelID, uint32(count))
+}
+
+func (s *Server) notifyConsumersCancelled(consumerTags []string) {
+	s.Mutex.RLock()
+	connections := make([]*protocol.Connection, 0, len(s.Connections))
+	for _, conn := range s.Connections {
+		connections = append(connections, conn)
+	}
+	s.Mutex.RUnlock()
+
+	for _, tag := range consumerTags {
+		for _, conn := range connections {
+			if conn.Closed.Load() {
+				continue
+			}
+			var foundChannel *protocol.Channel
+			conn.Channels.Range(func(key, value interface{}) bool {
+				ch := value.(*protocol.Channel)
+				ch.Mutex.Lock()
+				if consumer, exists := ch.Consumers[tag]; exists {
+					foundChannel = ch
+					close(consumer.Cancel)
+					delete(ch.Consumers, tag)
+				}
+				ch.Mutex.Unlock()
+				return foundChannel == nil
+			})
+			if foundChannel != nil {
+				conn.ConsumersDirty.Store(true)
+				if err := s.sendBasicCancel(conn, foundChannel.ID, tag); err != nil {
+					s.Log.Warn("Failed to send basic.cancel to consumer",
+						zap.String("consumer_tag", tag),
+						zap.String("connection_id", conn.ID),
+						zap.Error(err))
+				}
+				break
+			}
+		}
+	}
 }

@@ -114,3 +114,62 @@ func TestConnectionMetadataFields(t *testing.T) {
 	assert.False(t, conn.ConnectedAt.IsZero())
 	assert.True(t, conn.GetLastActivity().UnixNano() > 0)
 }
+
+func TestThroughputCountersIncrementedOnPublish(t *testing.T) {
+	srv := newTransactionTestServer(t)
+	conn, frameCh := newPipeConnWithFrames(t)
+	setupQueueAndChannel(t, srv, conn, frameCh, "i30-pub-q")
+
+	body := "throughput-publish"
+	err := srv.processCompleteMessage(conn, 1, makePendingMessage("", "i30-pub-q", body))
+	require.NoError(t, err)
+
+	assert.Equal(t, int64(1), srv.messagesPublished.Load(), "messagesPublished must increment on publish")
+	assert.Equal(t, int64(len(body)), srv.bytesReceived.Load(), "bytesReceived must increment by body size on publish")
+}
+
+func TestThroughputCountersIncrementedOnBasicGet(t *testing.T) {
+	srv := newTransactionTestServer(t)
+	conn, frameCh := newPipeConnWithFrames(t)
+	setupQueueAndChannel(t, srv, conn, frameCh, "i30-get-q")
+
+	body := "throughput-get"
+	publishMessageToQueue(t, srv, "i30-get-q", body)
+
+	err := srv.handleBasicGet(conn, 1, encodeBasicGet(t, "i30-get-q", true))
+	require.NoError(t, err)
+
+	nextMethodFrame(t, frameCh)
+	drainFrame(t, frameCh)
+	drainFrame(t, frameCh)
+
+	assert.Equal(t, int64(1), srv.messagesDelivered.Load(), "messagesDelivered must increment on basic.get delivery")
+	assert.Equal(t, int64(len(body)), srv.bytesSent.Load(), "bytesSent must increment by body size on basic.get delivery")
+}
+
+func TestThroughputCountersIncrementedOnBatchDelivery(t *testing.T) {
+	srv := newTransactionTestServer(t)
+	conn, _ := newPipeConnWithFrames(t)
+
+	ch := protocol.NewChannel(1, conn)
+	conn.Channels.Store(uint16(1), ch)
+
+	body := "throughput-batch"
+	deliveries := []*protocol.Delivery{
+		{
+			DeliveryTag: 1,
+			Message: &protocol.Message{
+				Body:       []byte(body),
+				Exchange:   "",
+				RoutingKey: "i30-batch-q",
+			},
+			ConsumerTag: "batch-consumer",
+		},
+	}
+
+	err := srv.sendBatchedDeliveries(conn, 1, "batch-consumer", deliveries)
+	require.NoError(t, err)
+
+	assert.Equal(t, int64(1), srv.messagesDelivered.Load(), "messagesDelivered must increment on batch delivery")
+	assert.Equal(t, int64(len(body)), srv.bytesSent.Load(), "bytesSent must increment by body size on batch delivery")
+}

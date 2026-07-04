@@ -159,6 +159,7 @@ type Queue struct {
 	Arguments    map[string]interface{}
 	Channel      *Channel      // Reference back to parent channel (runtime state, not persisted)
 	MessageCount atomic.Uint64 // In-memory message count (runtime state, not persisted)
+	OwnerConnID  string        // Connection ID that owns this queue (exclusive queues only)
 }
 
 // NewQueue creates a new queue

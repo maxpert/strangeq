@@ -323,6 +323,15 @@ func (s *Server) processCompleteMessage(conn *protocol.Connection, channelID uin
 			zap.Uint16("property_flags", pendingMsg.Header.PropertyFlags))
 	}
 
+	// ALIASING INVARIANT: Message.Body and Message.Headers are zero-copy
+	// aliases to pendingMsg.Body and pendingMsg.Header.Headers respectively.
+	// After PublishMessage stores the message, the caller (processHeaderFrame
+	// or processBodyFrame) recycles the PendingMessage and ContentHeader via
+	// PutPendingMessage / PutContentHeader. Those pool Put helpers MUST only
+	// nil out the references — they MUST NOT recycle the backing []byte or
+	// map storage — because the stored delivery retains these aliases.
+	// Violating this invariant would corrupt every stored message body and
+	// header map on the next pool Get.
 	message := &protocol.Message{
 		Body:            pendingMsg.Body,
 		Headers:         pendingMsg.Header.Headers,
@@ -403,6 +412,9 @@ func (s *Server) processCompleteMessage(conn *protocol.Connection, channelID uin
 	if s.MetricsCollector != nil {
 		s.MetricsCollector.RecordMessagePublished(len(message.Body))
 	}
+
+	s.messagesPublished.Add(1)
+	s.bytesReceived.Add(int64(len(message.Body)))
 
 	if ce := s.Log.Check(zapcore.DebugLevel, "Message successfully routed"); ce != nil {
 		ce.Write(zap.String("exchange", message.Exchange), zap.String("routing_key", message.RoutingKey))
@@ -507,6 +519,8 @@ func (s *Server) handleBasicConsume(conn *protocol.Connection, channelID uint16,
 		return err
 	}
 
+	s.updateConsumersTotal()
+
 	s.Log.Debug("Consumer registered",
 		zap.String("consumer_tag", consumer.Tag),
 		zap.String("queue", consumer.Queue))
@@ -577,6 +591,8 @@ func (s *Server) handleBasicCancel(conn *protocol.Connection, channelID uint16, 
 
 	s.Log.Debug("Consumer cancelled",
 		zap.String("consumer_tag", cancelMethod.ConsumerTag))
+
+	s.updateConsumersTotal()
 
 	return nil
 }
@@ -663,6 +679,9 @@ func (s *Server) handleBasicGet(conn *protocol.Connection, channelID uint16, pay
 	if s.MetricsCollector != nil {
 		s.MetricsCollector.RecordMessageDelivered(len(message.Body))
 	}
+
+	s.messagesDelivered.Add(1)
+	s.bytesSent.Add(int64(len(message.Body)))
 
 	return nil
 }
@@ -765,6 +784,9 @@ func (s *Server) sendBasicDeliver(conn *protocol.Connection, channelID uint16, c
 		s.MetricsCollector.RecordMessageDelivered(len(message.Body))
 	}
 
+	s.messagesDelivered.Add(1)
+	s.bytesSent.Add(int64(len(message.Body)))
+
 	return nil
 }
 
@@ -795,7 +817,14 @@ func (s *Server) handleBasicAck(conn *protocol.Connection, channelID uint16, pay
 	}
 
 	if consumerTag == "" {
-		return s.Broker.AcknowledgeGetDelivery(deliveryTag)
+		err := s.Broker.AcknowledgeGetDelivery(deliveryTag)
+		if err != nil {
+			return err
+		}
+		if s.MetricsCollector != nil {
+			s.MetricsCollector.RecordMessageAcknowledged()
+		}
+		return nil
 	}
 
 	err := s.Broker.AcknowledgeMessage(consumerTag, deliveryTag, multiple)
@@ -842,7 +871,14 @@ func (s *Server) handleBasicReject(conn *protocol.Connection, channelID uint16, 
 	}
 
 	if consumerTag == "" {
-		return s.Broker.RejectGetDelivery(deliveryTag, requeue)
+		err := s.Broker.RejectGetDelivery(deliveryTag, requeue)
+		if err != nil {
+			return err
+		}
+		if s.MetricsCollector != nil {
+			s.MetricsCollector.RecordMessageRejected()
+		}
+		return nil
 	}
 
 	err := s.Broker.RejectMessage(consumerTag, deliveryTag, requeue)
@@ -891,7 +927,14 @@ func (s *Server) handleBasicNack(conn *protocol.Connection, channelID uint16, pa
 	}
 
 	if consumerTag == "" {
-		return s.Broker.NackGetDelivery(deliveryTag, requeue)
+		err := s.Broker.NackGetDelivery(deliveryTag, requeue)
+		if err != nil {
+			return err
+		}
+		if s.MetricsCollector != nil {
+			s.MetricsCollector.RecordMessageRejected()
+		}
+		return nil
 	}
 
 	err := s.Broker.NacknowledgeMessage(consumerTag, deliveryTag, multiple, requeue)
@@ -949,6 +992,12 @@ func (s *Server) handleBasicRecover(conn *protocol.Connection, channelID uint16,
 	}
 
 	return s.sendBasicRecoverOK(conn, channelID)
+}
+
+func (s *Server) updateConsumersTotal() {
+	if s.MetricsCollector != nil && s.Broker != nil {
+		s.MetricsCollector.SetConsumersTotal(len(s.Broker.GetConsumers()))
+	}
 }
 
 // Stop gracefully stops the server

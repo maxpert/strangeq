@@ -39,7 +39,7 @@ func (s *Server) sendConnectionStart(conn *protocol.Connection) error {
 			"publisher_confirms":           true,
 			"exchange_exchange_bindings":   true,
 			"basic.nack":                   true,
-			"consumer_cancel_notify":       false,
+			"consumer_cancel_notify":       true,
 			"connection.blocked":           false,
 			"authentication_failure_close": true,
 		},

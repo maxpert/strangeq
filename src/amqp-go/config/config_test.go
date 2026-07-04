@@ -28,6 +28,10 @@ func TestDefaultConfig(t *testing.T) {
 	assert.Equal(t, int64(256*1024*1024), config.Engine.SegmentSize,
 		"SegmentSize should be 256MB, was 1GB")
 
+	// HeartbeatIntervalMS is wired into sendConnectionTune (server package)
+	assert.Equal(t, int64(60000), config.Network.HeartbeatIntervalMS,
+		"HeartbeatIntervalMS should be 60s by default")
+
 	// Test validation passes
 	err := config.Validate()
 	assert.NoError(t, err)
@@ -212,7 +216,6 @@ network:
   address: ":8080"
   port: 8080
   maxconnections: 1000
-  connectiontimeoutms: 30000
   heartbeatintervalms: 60000
   tcpkeepalive: true
   tcpkeepaliveintervalms: 30000
@@ -228,11 +231,8 @@ server:
   maxchannelsperconnection: 2047
   maxframesize: 131072
   maxmessagesize: 16777216
-  channeltimeoutms: 60000
-  messagetimeoutms: 30000
   cleanupintervalms: 300000
 engine:
-  availablechannelbuffer: 10000000
   ringbuffersize: 65536
   spillthresholdpercent: 80
   walbatchsize: 1000
@@ -245,10 +245,7 @@ engine:
   compactionintervalms: 1800000
   consumerselecttimeoutms: 1
   consumermaxbatchsize: 100
-  expiredmessagecheckintervalms: 60000
   walcleanupcheckintervalms: 300000
-  offsetcleanupbatchsize: 1000
-  offsetcleanupintervalms: 30000
 `
 	err := os.WriteFile(configFile, []byte(yamlContent), 0644)
 	require.NoError(t, err)
@@ -341,32 +338,4 @@ func TestConfigBuilderBuildUnsafe(t *testing.T) {
 	// But validation should fail
 	err := config.Validate()
 	assert.Error(t, err)
-}
-
-func TestConfigNoDeadFields(t *testing.T) {
-	cfg := DefaultConfig()
-
-	assert.Zero(t, cfg.Network.ConnectionTimeoutMS,
-		"ConnectionTimeoutMS is dead and must not be defaulted")
-	assert.Zero(t, cfg.Server.MemoryLimitPercent,
-		"MemoryLimitPercent is dead and must not be defaulted")
-	assert.Zero(t, cfg.Server.MemoryLimitBytes,
-		"MemoryLimitBytes is dead and must not be defaulted")
-	assert.Zero(t, cfg.Engine.AvailableChannelBuffer,
-		"AvailableChannelBuffer is dead and must not be defaulted")
-	assert.Zero(t, cfg.Engine.ExpiredMessageCheckIntervalMS,
-		"ExpiredMessageCheckIntervalMS is dead and must not be defaulted")
-	assert.Zero(t, cfg.Engine.OffsetCleanupBatchSize,
-		"OffsetCleanupBatchSize is dead and must not be defaulted")
-	assert.Zero(t, cfg.Engine.OffsetCleanupIntervalMS,
-		"OffsetCleanupIntervalMS is dead and must not be defaulted")
-	assert.Zero(t, cfg.Server.MessageTimeoutMS,
-		"MessageTimeoutMS is dead and must not be defaulted")
-	assert.Zero(t, cfg.Server.ChannelTimeoutMS,
-		"ChannelTimeoutMS is dead and must not be defaulted")
-
-	assert.Equal(t, int64(60000), cfg.Network.HeartbeatIntervalMS,
-		"HeartbeatIntervalMS is retained for Team C heartbeat wiring")
-
-	assert.NoError(t, cfg.Validate())
 }

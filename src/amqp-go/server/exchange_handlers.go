@@ -1,8 +1,11 @@
 package server
 
 import (
+	"errors"
 	"fmt"
 
+	"github.com/maxpert/amqp-go/broker"
+	amqperrors "github.com/maxpert/amqp-go/errors"
 	"github.com/maxpert/amqp-go/interfaces"
 	"github.com/maxpert/amqp-go/protocol"
 	"go.uber.org/zap"
@@ -93,6 +96,10 @@ func (s *Server) handleExchangeDeclare(conn *protocol.Connection, channelID uint
 	)
 
 	if err != nil {
+		if errors.Is(err, broker.ErrExchangeTypeMismatch) {
+			s.sendChannelClose(conn, channelID, amqperrors.PreconditionFailed, err.Error(), 40, 10)
+			return nil
+		}
 		s.Log.Error("Failed to declare exchange",
 			zap.Error(err),
 			zap.String("exchange", declareMethod.Exchange))

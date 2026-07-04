@@ -121,6 +121,14 @@ func (s *Server) sendBasicCancelOK(conn *protocol.Connection, channelID uint16, 
 	return s.sendMethodResponse(conn, channelID, 60, 31, method)
 }
 
+func (s *Server) sendBasicCancel(conn *protocol.Connection, channelID uint16, consumerTag string) error {
+	method := &protocol.BasicCancelMethod{
+		ConsumerTag: consumerTag,
+		NoWait:      true,
+	}
+	return s.sendMethodResponse(conn, channelID, 60, 30, method)
+}
+
 // sendBasicGetEmpty sends the basic.get-empty method frame
 func (s *Server) sendBasicGetEmpty(conn *protocol.Connection, channelID uint16) error {
 	method := &protocol.BasicGetEmptyMethod{
