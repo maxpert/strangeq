@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/maxpert/amqp-go/broker"
+	amqperrors "github.com/maxpert/amqp-go/errors"
 	"github.com/maxpert/amqp-go/interfaces"
 	"github.com/maxpert/amqp-go/protocol"
 	"github.com/maxpert/amqp-go/transaction"
@@ -61,7 +62,11 @@ func (s *Server) handleBasicQos(conn *protocol.Connection, channelID uint16, pay
 		zap.Uint16("prefetch_count", qosMethod.PrefetchCount),
 		zap.Bool("global", qosMethod.Global))
 
-	// Get the channel
+	if qosMethod.PrefetchSize != 0 {
+		s.sendChannelClose(conn, channelID, 540, "prefetch_size not implemented", 60, 10)
+		return fmt.Errorf("prefetch_size not implemented")
+	}
+
 	value, exists := conn.Channels.Load(channelID)
 	if !exists {
 		return fmt.Errorf("channel %d does not exist", channelID)
@@ -73,12 +78,16 @@ func (s *Server) handleBasicQos(conn *protocol.Connection, channelID uint16, pay
 	channel.PrefetchCount = qosMethod.PrefetchCount
 	channel.PrefetchSize = qosMethod.PrefetchSize
 	channel.GlobalPrefetch = qosMethod.Global
+	consumerTags := make([]string, 0, len(channel.Consumers))
+	for tag := range channel.Consumers {
+		consumerTags = append(consumerTags, tag)
+	}
 	channel.Mutex.Unlock()
 
-	// If global is true, we would apply these settings to all channels
-	// For now, we'll just apply to this channel
+	for _, tag := range consumerTags {
+		s.Broker.UpdateConsumerPrefetch(tag, qosMethod.PrefetchCount)
+	}
 
-	// Send basic.qos-ok response
 	return s.sendBasicQosOK(conn, channelID)
 }
 
@@ -94,6 +103,12 @@ func (s *Server) handleBasicPublish(conn *protocol.Connection, channelID uint16,
 			zap.String("connection_id", conn.ID),
 			zap.Uint16("channel_id", channelID))
 		return err
+	}
+
+	if publishMethod.Immediate {
+		protocol.PutBasicPublishMethod(publishMethod)
+		s.sendConnectionClose(conn, 540, "NOT_IMPLEMENTED - immediate=true is not implemented", 60, 40)
+		return fmt.Errorf("basic.publish immediate=true is not implemented")
 	}
 
 	if ce := s.Log.Check(zapcore.DebugLevel, "Basic publish received"); ce != nil {
@@ -172,6 +187,21 @@ func (s *Server) processHeaderFrame(conn *protocol.Connection, frame *protocol.F
 
 	// Attach the header to the pending message
 	pendingMsg.Header = contentHeader
+
+	// Defense-in-depth: reject oversized messages before allocation.
+	// contentHeader.BodySize is a client-controlled uint64 — without this
+	// check, make([]byte, 0, BodySize) can OOM the broker with a single frame.
+	if s.Config != nil && contentHeader.BodySize > uint64(s.Config.Server.MaxMessageSize) {
+		s.Log.Warn("Message body size exceeds MaxMessageSize, rejecting",
+			zap.Uint64("body_size", contentHeader.BodySize),
+			zap.Int64("max_message_size", s.Config.Server.MaxMessageSize),
+			zap.String("connection_id", conn.ID),
+			zap.Uint16("channel_id", frame.Channel))
+		s.sendChannelClose(conn, frame.Channel, amqperrors.ResourceError,
+			fmt.Sprintf("message body size %d exceeds max %d", contentHeader.BodySize, s.Config.Server.MaxMessageSize),
+			60, 0)
+		return fmt.Errorf("message body size %d exceeds MaxMessageSize %d", contentHeader.BodySize, s.Config.Server.MaxMessageSize)
+	}
 
 	// Pre-allocate body slice to BodySize capacity to eliminate reallocations
 	// during body frame append (saves ~4.6GB allocations at high throughput)
@@ -312,6 +342,12 @@ func (s *Server) processCompleteMessage(conn *protocol.Connection, channelID uin
 		AppID:           pendingMsg.Header.AppID,
 		ClusterID:       pendingMsg.Header.ClusterID,
 		Mandatory:       pendingMsg.Method.Mandatory,
+	}
+
+	if message.UserID != "" && message.UserID != conn.Username {
+		s.sendChannelClose(conn, channelID, amqperrors.PreconditionFailed,
+			fmt.Sprintf("user_id '%s' does not match authenticated user '%s'", message.UserID, conn.Username), 60, 40)
+		return fmt.Errorf("user-id mismatch")
 	}
 
 	// Assign confirm delivery tag if channel is in confirm mode (before
@@ -606,7 +642,7 @@ func (s *Server) handleBasicGet(conn *protocol.Connection, channelID uint16, pay
 		}
 	}()
 
-	if err := s.serializeGetDeliveryInto(buf, channelID, deliveryTag, false, message.Exchange, message.RoutingKey, messageCount, message); err != nil {
+	if err := s.serializeGetDeliveryInto(buf, channelID, deliveryTag, message.Redelivered, message.Exchange, message.RoutingKey, messageCount, message); err != nil {
 		s.Log.Error("Failed to serialize basic.get-ok delivery",
 			zap.Error(err),
 			zap.Uint16("channel_id", channelID))
@@ -772,6 +808,10 @@ func (s *Server) handleBasicAck(conn *protocol.Connection, channelID uint16, pay
 		return err
 	}
 
+	if s.MetricsCollector != nil {
+		s.MetricsCollector.RecordMessageAcknowledged()
+	}
+
 	return nil
 }
 
@@ -813,6 +853,10 @@ func (s *Server) handleBasicReject(conn *protocol.Connection, channelID uint16, 
 			zap.Uint64("delivery_tag", deliveryTag),
 			zap.Bool("requeue", requeue))
 		return err
+	}
+
+	if s.MetricsCollector != nil {
+		s.MetricsCollector.RecordMessageRejected()
 	}
 
 	return nil
@@ -859,6 +903,10 @@ func (s *Server) handleBasicNack(conn *protocol.Connection, channelID uint16, pa
 			zap.Bool("multiple", multiple),
 			zap.Bool("requeue", requeue))
 		return err
+	}
+
+	if s.MetricsCollector != nil {
+		s.MetricsCollector.RecordMessageRejected()
 	}
 
 	return nil

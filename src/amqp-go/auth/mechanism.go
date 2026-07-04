@@ -56,10 +56,27 @@ func (r *Registry) String() string {
 	return strings.Join(r.List(), " ")
 }
 
-// DefaultRegistry returns a registry with PLAIN and ANONYMOUS mechanisms
+// DefaultRegistry returns a registry with only the PLAIN mechanism.
+// ANONYMOUS is NOT included by default — it must be explicitly opted in
+// via RegistryForMechanisms to avoid accidentally allowing unauthenticated
+// remote connections.
 func DefaultRegistry() *Registry {
 	registry := NewRegistry()
 	registry.Register(&PlainMechanism{})
-	registry.Register(&AnonymousMechanism{})
+	return registry
+}
+
+// RegistryForMechanisms returns a registry populated with the mechanisms
+// named in the provided list. PLAIN is always registered. ANONYMOUS is
+// registered only if "ANONYMOUS" appears in names (compared case-insensitively
+// via strings.EqualFold). If names is empty, only PLAIN is registered.
+func RegistryForMechanisms(names []string) *Registry {
+	registry := NewRegistry()
+	registry.Register(&PlainMechanism{})
+	for _, name := range names {
+		if strings.EqualFold(name, "ANONYMOUS") {
+			registry.Register(&AnonymousMechanism{})
+		}
+	}
 	return registry
 }

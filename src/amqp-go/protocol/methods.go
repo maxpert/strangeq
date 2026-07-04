@@ -3,6 +3,10 @@ package protocol
 import (
 	"encoding/binary"
 	"fmt"
+	"math"
+	"strings"
+	"time"
+	"unicode/utf8"
 )
 
 // Method IDs for connection class
@@ -121,10 +125,11 @@ func (m *ConnectionStartMethod) Serialize() ([]byte, error) {
 	}
 	result = append(result, propsBytes...)
 
-	// Mechanisms (long string)
-	// First, join the mechanisms with a space
-	// This is a simplification - in practice, mechanisms might be handled differently
-	mechanismsStr := "PLAIN" // For now, just support PLAIN mechanism
+	// Mechanisms (long string) — join mechanism names with spaces
+	mechanismsStr := strings.Join(m.Mechanisms, " ")
+	if mechanismsStr == "" {
+		mechanismsStr = "PLAIN"
+	}
 	mechBytes := encodeLongString(mechanismsStr)
 	result = append(result, mechBytes...)
 
@@ -305,6 +310,16 @@ func (m *ConnectionTuneMethod) Serialize() ([]byte, error) {
 	return result, nil
 }
 
+func (m *ConnectionTuneMethod) Deserialize(data []byte) error {
+	if len(data) < 8 {
+		return fmt.Errorf("connection.tune too short: need 8 bytes, got %d", len(data))
+	}
+	m.ChannelMax = binary.BigEndian.Uint16(data[0:2])
+	m.FrameMax = binary.BigEndian.Uint32(data[2:6])
+	m.Heartbeat = binary.BigEndian.Uint16(data[6:8])
+	return nil
+}
+
 // ParseConnectionTune parses a connection.tune method from bytes
 func ParseConnectionTune(data []byte) (*ConnectionTuneMethod, error) {
 	method := &ConnectionTuneMethod{}
@@ -467,6 +482,26 @@ func (m *ConnectionCloseMethod) Serialize() ([]byte, error) {
 	return result, nil
 }
 
+func (m *ConnectionCloseMethod) Deserialize(data []byte) error {
+	if len(data) < 2 {
+		return fmt.Errorf("connection.close too short for reply code")
+	}
+	m.ReplyCode = binary.BigEndian.Uint16(data[0:2])
+	offset := 2
+	replyText, newOffset, err := decodeShortString(data, offset)
+	if err != nil {
+		return fmt.Errorf("failed to decode reply text: %w", err)
+	}
+	m.ReplyText = replyText
+	offset = newOffset
+	if offset+4 > len(data) {
+		return fmt.Errorf("connection.close too short for class/method IDs")
+	}
+	m.ClassID = binary.BigEndian.Uint16(data[offset : offset+2])
+	m.MethodID = binary.BigEndian.Uint16(data[offset+2 : offset+4])
+	return nil
+}
+
 // ConnectionCloseOKMethod represents the connection.close-ok method
 type ConnectionCloseOKMethod struct {
 }
@@ -619,25 +654,27 @@ func encodeFieldTable(fields map[string]interface{}) ([]byte, error) {
 	return EncodeFieldTable(fields)
 }
 
-func EncodeShortString(s string) []byte {
-	// Short strings are prefixed with a byte length
-	if len(s) > 255 {
-		// Truncate if longer than 255 characters
-		s = s[:255]
+func clampShortString(s string) string {
+	if len(s) <= 255 {
+		return s
 	}
+	end := 255
+	for end > 0 && !utf8.RuneStart(s[end]) {
+		end--
+	}
+	return s[:end]
+}
+
+func EncodeShortString(s string) []byte {
+	s = clampShortString(s)
 	result := make([]byte, 1+len(s))
 	result[0] = byte(len(s))
 	copy(result[1:], []byte(s))
 	return result
 }
 
-// AppendShortString appends a short string (length-prefixed with a single
-// byte) directly into buf, avoiding the temporary []byte allocation that
-// EncodeShortString creates. This is the zero-alloc version for hot paths.
 func AppendShortString(buf []byte, s string) []byte {
-	if len(s) > 255 {
-		s = s[:255]
-	}
+	s = clampShortString(s)
 	buf = append(buf, byte(len(s)))
 	buf = append(buf, s...)
 	return buf
@@ -672,37 +709,118 @@ func EncodeFieldTable(table map[string]interface{}) ([]byte, error) {
 	return result, nil
 }
 
-// serializeFieldTable serializes a field table
+type Decimal struct {
+	Scale byte
+	Value int32
+}
+
+func writeFieldValue(value interface{}) ([]byte, error) {
+	switch v := value.(type) {
+	case bool:
+		var b byte
+		if v {
+			b = 1
+		}
+		return []byte{'t', b}, nil
+	case int8:
+		return []byte{'b', byte(v)}, nil
+	case uint8:
+		return []byte{'B', v}, nil
+	case int16:
+		buf := make([]byte, 3)
+		buf[0] = 's'
+		binary.BigEndian.PutUint16(buf[1:3], uint16(v))
+		return buf, nil
+	case int32:
+		buf := make([]byte, 5)
+		buf[0] = 'I'
+		binary.BigEndian.PutUint32(buf[1:5], uint32(v))
+		return buf, nil
+	case int:
+		buf := make([]byte, 5)
+		buf[0] = 'I'
+		binary.BigEndian.PutUint32(buf[1:5], uint32(v))
+		return buf, nil
+	case int64:
+		buf := make([]byte, 9)
+		buf[0] = 'l'
+		binary.BigEndian.PutUint64(buf[1:9], uint64(v))
+		return buf, nil
+	case float32:
+		buf := make([]byte, 5)
+		buf[0] = 'f'
+		binary.BigEndian.PutUint32(buf[1:5], math.Float32bits(v))
+		return buf, nil
+	case float64:
+		buf := make([]byte, 9)
+		buf[0] = 'd'
+		binary.BigEndian.PutUint64(buf[1:9], math.Float64bits(v))
+		return buf, nil
+	case string:
+		buf := make([]byte, 5+len(v))
+		buf[0] = 'S'
+		binary.BigEndian.PutUint32(buf[1:5], uint32(len(v)))
+		copy(buf[5:], v)
+		return buf, nil
+	case []interface{}:
+		var elements []byte
+		for _, elem := range v {
+			elemBytes, err := writeFieldValue(elem)
+			if err != nil {
+				return nil, err
+			}
+			elements = append(elements, elemBytes...)
+		}
+		buf := make([]byte, 5+len(elements))
+		buf[0] = 'A'
+		binary.BigEndian.PutUint32(buf[1:5], uint32(len(elements)))
+		copy(buf[5:], elements)
+		return buf, nil
+	case time.Time:
+		buf := make([]byte, 9)
+		buf[0] = 'T'
+		binary.BigEndian.PutUint64(buf[1:9], uint64(v.Unix()))
+		return buf, nil
+	case map[string]interface{}:
+		tblBytes, err := serializeFieldTable(v)
+		if err != nil {
+			return nil, err
+		}
+		buf := make([]byte, 5+len(tblBytes))
+		buf[0] = 'F'
+		binary.BigEndian.PutUint32(buf[1:5], uint32(len(tblBytes)))
+		copy(buf[5:], tblBytes)
+		return buf, nil
+	case []byte:
+		buf := make([]byte, 5+len(v))
+		buf[0] = 'x'
+		binary.BigEndian.PutUint32(buf[1:5], uint32(len(v)))
+		copy(buf[5:], v)
+		return buf, nil
+	case nil:
+		return []byte{'V'}, nil
+	default:
+		return nil, fmt.Errorf("unsupported field value type: %T", value)
+	}
+}
+
 func serializeFieldTable(table map[string]interface{}) ([]byte, error) {
 	var result []byte
 
 	for key, value := range table {
-		// Add key as short string
 		keyBytes := encodeShortString(key)
 		result = append(result, keyBytes...)
 
-		// Add value type indicator and value
-		// This is a simplified approach - in real implementation we'd handle all AMQP field types
-		switch v := value.(type) {
-		case string:
-			result = append(result, 'S') // String type
-			result = append(result, encodeLongString(v)...)
-		case int:
-			result = append(result, 'I') // Integer type
-			intBytes := make([]byte, 4)
-			binary.BigEndian.PutUint32(intBytes, uint32(v))
-			result = append(result, intBytes...)
-		default:
-			// For now, just handle string and integer types with a default string conversion
-			result = append(result, 'S') // String type
-			result = append(result, encodeLongString(fmt.Sprintf("%v", v))...)
+		valueBytes, err := writeFieldValue(value)
+		if err != nil {
+			return nil, err
 		}
+		result = append(result, valueBytes...)
 	}
 
 	return result, nil
 }
 
-// decodeFieldTable deserializes a field table
 func decodeFieldTable(data []byte, offset int) (map[string]interface{}, int, error) {
 	if offset+4 > len(data) {
 		return nil, offset, fmt.Errorf("field table length field missing")
@@ -719,52 +837,148 @@ func decodeFieldTable(data []byte, offset int) (map[string]interface{}, int, err
 	table := make(map[string]interface{})
 
 	for offset < tableEnd {
-		// Read key as short string
-		if offset >= len(data) {
+		if offset >= tableEnd {
 			return nil, offset, fmt.Errorf("field key missing")
 		}
 		keyLen := int(data[offset])
 		offset++
-		if offset+keyLen > len(data) || offset+keyLen > tableEnd {
-			return nil, offset, fmt.Errorf("field key extends beyond data")
+		if offset+keyLen > tableEnd {
+			return nil, offset, fmt.Errorf("field key extends beyond table")
 		}
 		key := string(data[offset : offset+keyLen])
 		offset += keyLen
 
-		// Read value type indicator
-		if offset >= len(data) {
-			return nil, offset, fmt.Errorf("field value type missing for key %s", key)
+		value, newOffset, err := decodeFieldValue(data, offset, tableEnd)
+		if err != nil {
+			return nil, newOffset, fmt.Errorf("failed to decode value for key %s: %w", key, err)
 		}
-		typeIndicator := data[offset]
-		offset++
-
-		// Read value based on type
-		var value interface{}
-		var err error
-		switch typeIndicator {
-		case 'S': // String type
-			value, offset, err = decodeLongString(data, offset)
-			if err != nil {
-				return nil, offset, fmt.Errorf("failed to decode string value for key %s: %v", key, err)
-			}
-		case 'I': // Integer type
-			if offset+4 > len(data) {
-				return nil, offset, fmt.Errorf("integer value missing for key %s", key)
-			}
-			value = int(binary.BigEndian.Uint32(data[offset : offset+4]))
-			offset += 4
-		default:
-			// For now, handle as string
-			value, offset, err = decodeLongString(data, offset)
-			if err != nil {
-				return nil, offset, fmt.Errorf("failed to decode value for key %s: %v", key, err)
-			}
-		}
-
+		offset = newOffset
 		table[key] = value
 	}
 
 	return table, offset, nil
+}
+
+func decodeFieldValue(data []byte, offset, end int) (interface{}, int, error) {
+	if offset >= end {
+		return nil, offset, fmt.Errorf("field value type missing")
+	}
+	typeIndicator := data[offset]
+	offset++
+
+	switch typeIndicator {
+	case 't':
+		if offset+1 > end {
+			return nil, offset, fmt.Errorf("bool value extends beyond data")
+		}
+		return data[offset] != 0, offset + 1, nil
+	case 'b':
+		if offset+1 > end {
+			return nil, offset, fmt.Errorf("int8 value extends beyond data")
+		}
+		return int8(data[offset]), offset + 1, nil
+	case 'B':
+		if offset+1 > end {
+			return nil, offset, fmt.Errorf("uint8 value extends beyond data")
+		}
+		return uint8(data[offset]), offset + 1, nil
+	case 's':
+		if offset+2 > end {
+			return nil, offset, fmt.Errorf("int16 value extends beyond data")
+		}
+		return int16(binary.BigEndian.Uint16(data[offset : offset+2])), offset + 2, nil
+	case 'I':
+		if offset+4 > end {
+			return nil, offset, fmt.Errorf("int32 value extends beyond data")
+		}
+		return int32(binary.BigEndian.Uint32(data[offset : offset+4])), offset + 4, nil
+	case 'l':
+		if offset+8 > end {
+			return nil, offset, fmt.Errorf("int64 value extends beyond data")
+		}
+		return int64(binary.BigEndian.Uint64(data[offset : offset+8])), offset + 8, nil
+	case 'f':
+		if offset+4 > end {
+			return nil, offset, fmt.Errorf("float32 value extends beyond data")
+		}
+		return math.Float32frombits(binary.BigEndian.Uint32(data[offset : offset+4])), offset + 4, nil
+	case 'd':
+		if offset+8 > end {
+			return nil, offset, fmt.Errorf("float64 value extends beyond data")
+		}
+		return math.Float64frombits(binary.BigEndian.Uint64(data[offset : offset+8])), offset + 8, nil
+	case 'D':
+		if offset+5 > end {
+			return nil, offset, fmt.Errorf("decimal value extends beyond data")
+		}
+		return Decimal{Scale: data[offset], Value: int32(binary.BigEndian.Uint32(data[offset+1 : offset+5]))}, offset + 5, nil
+	case 'T':
+		if offset+8 > end {
+			return nil, offset, fmt.Errorf("timestamp value extends beyond data")
+		}
+		return time.Unix(int64(binary.BigEndian.Uint64(data[offset:offset+8])), 0).UTC(), offset + 8, nil
+	case 'S':
+		if offset+4 > end {
+			return nil, offset, fmt.Errorf("string length extends beyond data")
+		}
+		strLen := binary.BigEndian.Uint32(data[offset : offset+4])
+		offset += 4
+		if int(strLen) > end-offset {
+			return nil, offset, fmt.Errorf("string value extends beyond data")
+		}
+		return string(data[offset : offset+int(strLen)]), offset + int(strLen), nil
+	case 'x':
+		if offset+4 > end {
+			return nil, offset, fmt.Errorf("byte array length extends beyond data")
+		}
+		arrLen := binary.BigEndian.Uint32(data[offset : offset+4])
+		offset += 4
+		if int(arrLen) > end-offset {
+			return nil, offset, fmt.Errorf("byte array value extends beyond data")
+		}
+		out := make([]byte, arrLen)
+		copy(out, data[offset:offset+int(arrLen)])
+		return out, offset + int(arrLen), nil
+	case 'F':
+		if offset+4 > end {
+			return nil, offset, fmt.Errorf("nested table length extends beyond data")
+		}
+		tblLen := binary.BigEndian.Uint32(data[offset : offset+4])
+		subEnd := offset + 4 + int(tblLen)
+		if subEnd > end {
+			return nil, offset, fmt.Errorf("nested table extends beyond data")
+		}
+		nested, _, err := decodeFieldTable(data[offset:subEnd], 0)
+		if err != nil {
+			return nil, offset, fmt.Errorf("failed to decode nested table: %w", err)
+		}
+		return nested, subEnd, nil
+	case 'A':
+		if offset+4 > end {
+			return nil, offset, fmt.Errorf("array length extends beyond data")
+		}
+		arrLen := binary.BigEndian.Uint32(data[offset : offset+4])
+		arrStart := offset + 4
+		arrEnd := arrStart + int(arrLen)
+		if arrEnd > end {
+			return nil, offset, fmt.Errorf("array extends beyond data")
+		}
+		arr := []interface{}{}
+		arrOffset := arrStart
+		for arrOffset < arrEnd {
+			elem, newOffset, err := decodeFieldValue(data, arrOffset, arrEnd)
+			if err != nil {
+				return nil, arrOffset, fmt.Errorf("failed to decode array element: %w", err)
+			}
+			arr = append(arr, elem)
+			arrOffset = newOffset
+		}
+		return arr, arrEnd, nil
+	case 'V':
+		return nil, offset, nil
+	default:
+		return nil, offset, fmt.Errorf("unknown field value type: 0x%02X", typeIndicator)
+	}
 }
 
 // decodeShortString decodes a short string from data at the given offset
@@ -843,26 +1057,23 @@ func (m *ExchangeDeclareMethod) Serialize() ([]byte, error) {
 	// bit 10: internal
 	// bit 11: no-wait
 	// bits 12-15: unused (set to 0)
-	flags := uint16(0)
+	var flags byte
 	if m.Passive {
-		flags |= (1 << 7) // bit 7
+		flags |= (1 << 0)
 	}
 	if m.Durable {
-		flags |= (1 << 8) // bit 8
+		flags |= (1 << 1)
 	}
 	if m.AutoDelete {
-		flags |= (1 << 9) // bit 9
+		flags |= (1 << 2)
 	}
 	if m.Internal {
-		flags |= (1 << 10) // bit 10
+		flags |= (1 << 3)
 	}
 	if m.NoWait {
-		flags |= (1 << 11) // bit 11
+		flags |= (1 << 4)
 	}
-
-	flagBytes := make([]byte, 2)
-	binary.BigEndian.PutUint16(flagBytes, flags)
-	result = append(result, flagBytes...)
+	result = append(result, flags)
 
 	// Arguments (field table)
 	argsBytes, err := encodeFieldTable(m.Arguments)
@@ -908,19 +1119,19 @@ func (m *ExchangeDeclareMethod) Deserialize(data []byte) error {
 	m.Type = exchangeType
 	offset = newOffset
 
-	// Flags (uint16)
-	if offset+2 > len(data) {
+	// Flags (single byte — AMQP 0.9.1 packs bit fields into bytes)
+	if offset >= len(data) {
 		return fmt.Errorf("flags field missing")
 	}
-	flags := binary.BigEndian.Uint16(data[offset : offset+2])
-	offset += 2
+	flags := data[offset]
+	offset++
 
 	// Extract flags
-	m.Passive = (flags & (1 << 7)) != 0
-	m.Durable = (flags & (1 << 8)) != 0
-	m.AutoDelete = (flags & (1 << 9)) != 0
-	m.Internal = (flags & (1 << 10)) != 0
-	m.NoWait = (flags & (1 << 11)) != 0
+	m.Passive = (flags & (1 << 0)) != 0
+	m.Durable = (flags & (1 << 1)) != 0
+	m.AutoDelete = (flags & (1 << 2)) != 0
+	m.Internal = (flags & (1 << 3)) != 0
+	m.NoWait = (flags & (1 << 4)) != 0
 
 	// Arguments (field table)
 	if offset+4 <= len(data) { // Need at least 4 bytes for the field table length
@@ -1082,34 +1293,23 @@ func (m *QueueDeclareMethod) Serialize() ([]byte, error) {
 	queueBytes := encodeShortString(m.Queue)
 	result = append(result, queueBytes...)
 
-	// Now we need to pack the flags together:
-	// bits: 0-6: unused (set to 0)
-	// bit 7: passive
-	// bit 8: durable
-	// bit 9: exclusive
-	// bit 10: auto-delete
-	// bit 11: no-wait
-	// bits 12-15: unused (set to 0)
-	flags := uint16(0)
+	var flags byte
 	if m.Passive {
-		flags |= (1 << 7) // bit 7
+		flags |= (1 << 0)
 	}
 	if m.Durable {
-		flags |= (1 << 8) // bit 8
+		flags |= (1 << 1)
 	}
 	if m.Exclusive {
-		flags |= (1 << 9) // bit 9
+		flags |= (1 << 2)
 	}
 	if m.AutoDelete {
-		flags |= (1 << 10) // bit 10
+		flags |= (1 << 3)
 	}
 	if m.NoWait {
-		flags |= (1 << 11) // bit 11
+		flags |= (1 << 4)
 	}
-
-	flagBytes := make([]byte, 2)
-	binary.BigEndian.PutUint16(flagBytes, flags)
-	result = append(result, flagBytes...)
+	result = append(result, flags)
 
 	// Arguments (field table)
 	argsBytes, err := encodeFieldTable(m.Arguments)
@@ -1144,22 +1344,22 @@ func (m *QueueDeclareMethod) Deserialize(data []byte) error {
 	m.Queue = queue
 	offset = newOffset
 
-	// Flags (uint16)
-	if offset+2 > len(data) {
+	// Flags (single byte — AMQP 0.9.1 packs bit fields into bytes)
+	if offset >= len(data) {
 		return fmt.Errorf("flags field missing")
 	}
-	flags := binary.BigEndian.Uint16(data[offset : offset+2])
-	offset += 2
+	flags := data[offset]
+	offset++
 
 	// Extract flags
-	m.Passive = (flags & (1 << 7)) != 0
-	m.Durable = (flags & (1 << 8)) != 0
-	m.Exclusive = (flags & (1 << 9)) != 0
-	m.AutoDelete = (flags & (1 << 10)) != 0
-	m.NoWait = (flags & (1 << 11)) != 0
+	m.Passive = (flags & (1 << 0)) != 0
+	m.Durable = (flags & (1 << 1)) != 0
+	m.Exclusive = (flags & (1 << 2)) != 0
+	m.AutoDelete = (flags & (1 << 3)) != 0
+	m.NoWait = (flags & (1 << 4)) != 0
 
 	// Arguments (field table)
-	if offset+4 <= len(data) { // Need at least 4 bytes for the field table length
+	if offset+4 <= len(data) {
 		var err error
 		m.Arguments, offset, err = decodeFieldTable(data, offset)
 		if err != nil {

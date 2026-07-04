@@ -6,15 +6,25 @@ import (
 	"time"
 )
 
+const requeueInitialCap = 4096
+
+type requeueEntry struct {
+	tag         uint64
+	redelivered bool
+}
+
 type QueueState struct {
 	tail           atomic.Uint64
 	head           atomic.Uint64
 	minAckCursor   atomic.Uint64
+	waiting        atomic.Int64
 	inflight       atomic.Int64
 	wake           chan struct{}
 	parkedCount    atomic.Int64
 	requeueMu      sync.Mutex
-	requeueTags    []uint64
+	requeueBuf     []requeueEntry
+	requeueHead    int
+	requeueLen     int
 	requeueCount   atomic.Int64
 	depthHighWM    atomic.Uint64
 	inflightOwners sync.Map
@@ -28,6 +38,7 @@ func NewQueueState(depthHighWM uint64) *QueueState {
 		wake:        make(chan struct{}, 128),
 		stopCh:      make(chan struct{}),
 		parkTimeout: 1 * time.Millisecond,
+		requeueBuf:  make([]requeueEntry, requeueInitialCap),
 	}
 	qs.depthHighWM.Store(depthHighWM)
 	return qs
@@ -86,6 +97,7 @@ func (qs *QueueState) Publish(tag uint64) {
 			break
 		}
 	}
+	qs.waiting.Add(1)
 	qs.NotifyNewMessage()
 }
 
@@ -118,24 +130,24 @@ func (qs *QueueState) WakeAll() {
 	}
 }
 
-func (qs *QueueState) Claim(stop <-chan struct{}, timer *time.Timer) (uint64, bool) {
-	if t, ok := qs.tryPopRequeue(); ok {
-		return t, true
+func (qs *QueueState) Claim(stop <-chan struct{}, timer *time.Timer) (uint64, bool, bool) {
+	if t, r, ok := qs.tryPopRequeue(); ok {
+		return t, r, true
 	}
 	for {
 		t := qs.tail.Load()
 		h := qs.head.Load()
 		if t < h {
 			if qs.tail.CompareAndSwap(t, t+1) {
-				return t, true
+				return t, false, true
 			}
 			continue
 		}
-		if t2, ok := qs.tryPopRequeue(); ok {
-			return t2, true
+		if t2, r, ok := qs.tryPopRequeue(); ok {
+			return t2, r, true
 		}
 		if !qs.park(stop, timer) {
-			return 0, false
+			return 0, false, false
 		}
 	}
 }
@@ -176,36 +188,61 @@ func (qs *QueueState) park(stop <-chan struct{}, timer *time.Timer) bool {
 
 func (qs *QueueState) Requeue(tag uint64) {
 	qs.requeueMu.Lock()
-	if qs.requeueTags == nil {
-		qs.requeueTags = make([]uint64, 0, 4096)
+	bufCap := cap(qs.requeueBuf)
+	if qs.requeueLen >= bufCap {
+		newCap := bufCap * 2
+		newBuf := make([]requeueEntry, newCap)
+		for i := 0; i < qs.requeueLen; i++ {
+			newBuf[i] = qs.requeueBuf[(qs.requeueHead+i)%bufCap]
+		}
+		qs.requeueBuf = newBuf
+		qs.requeueHead = 0
+		bufCap = newCap
 	}
-	qs.requeueTags = append(qs.requeueTags, tag)
+	writeIdx := (qs.requeueHead + qs.requeueLen) % bufCap
+	qs.requeueBuf[writeIdx] = requeueEntry{tag: tag, redelivered: true}
+	qs.requeueLen++
 	qs.requeueCount.Add(1)
 	qs.requeueMu.Unlock()
+	qs.waiting.Add(1)
 	qs.inflight.Add(-1)
 	qs.NotifyNewMessage()
 }
 
-func (qs *QueueState) tryPopRequeue() (uint64, bool) {
+func (qs *QueueState) tryPopRequeue() (uint64, bool, bool) {
 	if qs.requeueCount.Load() <= 0 {
-		return 0, false
+		return 0, false, false
 	}
 	qs.requeueMu.Lock()
-	if len(qs.requeueTags) == 0 {
+	if qs.requeueLen == 0 {
 		qs.requeueMu.Unlock()
-		return 0, false
+		return 0, false, false
 	}
-	tag := qs.requeueTags[0]
-	qs.requeueTags = qs.requeueTags[1:]
+	bufCap := cap(qs.requeueBuf)
+	entry := qs.requeueBuf[qs.requeueHead]
+	qs.requeueHead = (qs.requeueHead + 1) % bufCap
+	qs.requeueLen--
 	qs.requeueCount.Add(-1)
-	if len(qs.requeueTags) == 0 {
-		qs.requeueTags = nil
+
+	if qs.requeueLen > 0 && qs.requeueLen < bufCap/4 && bufCap > requeueInitialCap*2 {
+		newCap := bufCap / 2
+		if newCap < requeueInitialCap {
+			newCap = requeueInitialCap
+		}
+		newBuf := make([]requeueEntry, newCap)
+		for i := 0; i < qs.requeueLen; i++ {
+			newBuf[i] = qs.requeueBuf[(qs.requeueHead+i)%bufCap]
+		}
+		qs.requeueBuf = newBuf
+		qs.requeueHead = 0
 	}
+
 	qs.requeueMu.Unlock()
-	return tag, true
+	return entry.tag, entry.redelivered, true
 }
 
 func (qs *QueueState) ClaimInflight(tag uint64) {
+	qs.waiting.Add(-1)
 	qs.inflight.Add(1)
 }
 
@@ -231,28 +268,43 @@ func (qs *QueueState) AckAdvance(tag uint64) {
 	qs.NotifyNewMessage()
 }
 
-func (qs *QueueState) Recover(minTag, maxTag uint64) {
+func (qs *QueueState) GapSkipAdvance(tag uint64) {
+	if qs.inflight.Load() == 0 && qs.requeueCount.Load() <= 0 {
+		qs.minAckCursor.Store(qs.head.Load())
+	} else if tag == qs.minAckCursor.Load() {
+		qs.minAckCursor.CompareAndSwap(tag, tag+1)
+	}
+	qs.NotifyNewMessage()
+}
+
+func (qs *QueueState) Recover(minTag, maxTag, count uint64) {
 	qs.tail.Store(minTag)
 	if maxTag < minTag {
 		maxTag = minTag
 	}
 	qs.head.Store(maxTag + 1)
 	qs.minAckCursor.Store(minTag)
+	qs.waiting.Store(int64(count))
 	qs.inflight.Store(0)
 	qs.requeueMu.Lock()
-	qs.requeueTags = nil
+	qs.requeueBuf = make([]requeueEntry, requeueInitialCap)
+	qs.requeueHead = 0
+	qs.requeueLen = 0
 	qs.requeueCount.Store(0)
 	qs.requeueMu.Unlock()
 	qs.NotifyNewMessage()
 }
 
 func (qs *QueueState) Depth() uint64 {
-	h := qs.head.Load()
-	c := qs.minAckCursor.Load()
-	if h <= c {
-		return 0
+	w := qs.waiting.Load()
+	if w < 0 {
+		w = 0
 	}
-	return h - c
+	i := qs.inflight.Load()
+	if i < 0 {
+		i = 0
+	}
+	return uint64(w + i)
 }
 
 func (qs *QueueState) DepthHighWM() uint64 {
@@ -306,22 +358,13 @@ func (qs *QueueState) LoadInflight(msgID uint64) (string, bool) {
 	if !ok {
 		return "", false
 	}
-	return v.(string), true
+	return v.(string), ok
 }
 
 func (qs *QueueState) DeleteInflight(msgID uint64) {
 	qs.inflightOwners.Delete(msgID)
 }
 
-// RangeInflightForConsumer iterates over all in-flight delivery tags owned
-// by the given consumer tag. Used during consumer cancellation to find
-// messages that have already left consumer.Messages (pulled by the server's
-// forwarder goroutine or sent to the client) but have not yet been ACKed.
-//
-// Tags are collected in a first pass and fn is called in a second pass.
-// This is critical because sync.Map.Range does not guarantee visiting all
-// keys when entries are deleted concurrently during iteration — including
-// by fn itself. Collecting first ensures no tags are skipped.
 func (qs *QueueState) RangeInflightForConsumer(consumerTag string, fn func(deliveryTag uint64)) {
 	var tags []uint64
 	qs.inflightOwners.Range(func(key, value interface{}) bool {
@@ -338,5 +381,6 @@ func (qs *QueueState) RangeInflightForConsumer(consumerTag string, fn func(deliv
 func (qs *QueueState) Head() uint64         { return qs.head.Load() }
 func (qs *QueueState) Tail() uint64         { return qs.tail.Load() }
 func (qs *QueueState) InflightCount() int64 { return qs.inflight.Load() }
+func (qs *QueueState) WaitingCount() int64  { return qs.waiting.Load() }
 func (qs *QueueState) RequeueDepth() int64  { return qs.requeueCount.Load() }
 func (qs *QueueState) ParkedCount() int64   { return qs.parkedCount.Load() }

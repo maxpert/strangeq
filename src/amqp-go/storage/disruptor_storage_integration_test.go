@@ -20,7 +20,8 @@ func TestDisruptorStorage_DurableMessageWALIntegration(t *testing.T) {
 	defer wal.Close()
 
 	// Create storage with WAL
-	storage := NewDisruptorStorageWithDataDir(tmpDir)
+	storage, err := NewDisruptorStorageWithDataDir(tmpDir)
+	require.NoError(t, err)
 	storage.wal = wal
 
 	// Create a queue
@@ -71,7 +72,8 @@ func TestDisruptorStorage_TransientMessageNoWAL(t *testing.T) {
 	defer wal.Close()
 
 	// Create storage with WAL
-	storage := NewDisruptorStorageWithDataDir(tmpDir)
+	storage, err := NewDisruptorStorageWithDataDir(tmpDir)
+	require.NoError(t, err)
 	storage.wal = wal
 
 	// Create a queue
@@ -118,7 +120,8 @@ func TestDisruptorStorage_DurableMessageAcknowledge(t *testing.T) {
 	defer wal.Close()
 
 	// Create storage with WAL
-	storage := NewDisruptorStorageWithDataDir(tmpDir)
+	storage, err := NewDisruptorStorageWithDataDir(tmpDir)
+	require.NoError(t, err)
 	storage.wal = wal
 
 	// Create a queue
@@ -180,7 +183,8 @@ func TestDisruptorStorage_MultiQueueDurableMessages(t *testing.T) {
 	defer wal.Close()
 
 	// Create storage with WAL
-	storage := NewDisruptorStorageWithDataDir(tmpDir)
+	storage, err := NewDisruptorStorageWithDataDir(tmpDir)
+	require.NoError(t, err)
 	storage.wal = wal
 
 	// Create multiple queues
@@ -236,7 +240,8 @@ func TestDisruptorStorage_WALFallback(t *testing.T) {
 	defer wal.Close()
 
 	// Create storage with WAL
-	storage := NewDisruptorStorageWithDataDir(tmpDir)
+	storage, err := NewDisruptorStorageWithDataDir(tmpDir)
+	require.NoError(t, err)
 	storage.wal = wal
 
 	// Create a queue

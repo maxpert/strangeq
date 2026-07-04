@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -10,6 +11,18 @@ import (
 	"github.com/maxpert/amqp-go/interfaces"
 	"github.com/maxpert/amqp-go/protocol"
 )
+
+// isListenerClosedErr returns true if the error indicates the listener
+// was already closed (used to suppress redundant close errors during
+// force shutdown when Server.Stop has already run).
+func isListenerClosedErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "use of closed network connection") ||
+		strings.Contains(msg, "already closed")
+}
 
 // LifecycleState represents the current state of the server
 type LifecycleState int
@@ -146,13 +159,6 @@ func (lm *LifecycleManager) Start(ctx context.Context) error {
 		}
 	}
 
-	// Start system metrics collection in background
-	lm.wg.Add(1)
-	go func() {
-		defer lm.wg.Done()
-		lm.server.startSystemMetricsCollection(lm.ctx)
-	}()
-
 	// Start the server in a goroutine
 	lm.wg.Add(1)
 	go func() {
@@ -255,9 +261,12 @@ func (lm *LifecycleManager) Shutdown() error {
 
 // forceShutdown performs a forceful shutdown
 func (lm *LifecycleManager) forceShutdown() error {
-	// Close server listener if it exists
-	if lm.server.Listener != nil {
-		if err := lm.server.Listener.Close(); err != nil {
+	// Stop the server — cancels metrics collector and closes the listener.
+	// Guard against double-close: Server.Stop may have already been called
+	// (e.g. via StartWithQuitChannel), and the listener may already be closed.
+	if err := lm.server.Stop(); err != nil {
+		// Ignore "already closed" errors from redundant close calls
+		if !isListenerClosedErr(err) {
 			lm.setError(fmt.Errorf("failed to close server listener: %w", err))
 		}
 	}
@@ -354,17 +363,16 @@ func (lm *LifecycleManager) GetStats() *interfaces.ServerStats {
 	}
 
 	return &interfaces.ServerStats{
-		Uptime:      lm.GetUptime(),
-		Connections: connectionCount,
-		Channels:    channelCount,
-		Exchanges:   exchangeCount,
-		Queues:      queueCount,
-		Consumers:   consumerCount,
-		// TODO: Add message counters when available
-		MessagesPublished: 0,
-		MessagesDelivered: 0,
-		BytesReceived:     0,
-		BytesSent:         0,
+		Uptime:            lm.GetUptime(),
+		Connections:       connectionCount,
+		Channels:          channelCount,
+		Exchanges:         exchangeCount,
+		Queues:            queueCount,
+		Consumers:         consumerCount,
+		MessagesPublished: lm.server.messagesPublished.Load(),
+		MessagesDelivered: lm.server.messagesDelivered.Load(),
+		BytesReceived:     lm.server.bytesReceived.Load(),
+		BytesSent:         lm.server.bytesSent.Load(),
 	}
 }
 
@@ -391,11 +399,11 @@ func (lm *LifecycleManager) GetConnections() []interfaces.ConnectionInfo {
 		connInfo := interfaces.ConnectionInfo{
 			ID:            id,
 			RemoteAddress: remoteAddr,
-			Username:      "guest", // TODO: Add username field to Connection struct
+			Username:      conn.Username,
 			VirtualHost:   conn.Vhost,
 			Channels:      channelCount,
-			ConnectedAt:   time.Now(), // TODO: Add ConnectedAt field to Connection struct
-			LastActivity:  time.Now(), // TODO: Add LastActivity field to Connection struct
+			ConnectedAt:   conn.ConnectedAt,
+			LastActivity:  conn.GetLastActivity(),
 		}
 
 		connections = append(connections, connInfo)

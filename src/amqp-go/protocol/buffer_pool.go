@@ -222,6 +222,11 @@ func GetPendingMessage() *PendingMessage {
 	return m
 }
 
+// PutPendingMessage returns a PendingMessage to the pool.
+// INVARIANT: The pool MUST nil/zero all references (Method, Header, Body,
+// Channel) — it must NOT recycle backing data. The broker retains aliases
+// to Body and Header.Headers after PublishMessage stores the message;
+// recycling them here would corrupt stored deliveries.
 func PutPendingMessage(m *PendingMessage) {
 	m.Method = nil
 	m.Header = nil
@@ -242,6 +247,11 @@ func GetContentHeader() *ContentHeader {
 	return h
 }
 
+// PutContentHeader returns a ContentHeader to the pool.
+// INVARIANT: The pool MUST zero the struct (via *h = ContentHeader{}) —
+// it must NOT recycle backing data (Headers map, string fields). The
+// broker retains aliases to Headers after PublishMessage stores the
+// message; recycling them here would corrupt stored deliveries.
 func PutContentHeader(h *ContentHeader) {
 	*h = ContentHeader{}
 	contentHeaderPool.Put(h)

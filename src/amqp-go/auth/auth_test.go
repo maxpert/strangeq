@@ -1,10 +1,12 @@
 package auth
 
 import (
+	"fmt"
 	"os"
 	"testing"
 
 	"github.com/maxpert/amqp-go/interfaces"
+	"golang.org/x/crypto/bcrypt"
 )
 
 func TestPlainMechanism(t *testing.T) {
@@ -140,10 +142,10 @@ func TestRegistry(t *testing.T) {
 func TestDefaultRegistry(t *testing.T) {
 	registry := DefaultRegistry()
 
-	// Should have PLAIN and ANONYMOUS
+	// DefaultRegistry now includes only PLAIN (ANONYMOUS is opt-in only)
 	names := registry.List()
-	if len(names) != 2 {
-		t.Errorf("Expected 2 mechanisms in default registry, got %d", len(names))
+	if len(names) != 1 {
+		t.Errorf("Expected 1 mechanism in default registry, got %d", len(names))
 	}
 
 	// Test PLAIN is available
@@ -152,25 +154,38 @@ func TestDefaultRegistry(t *testing.T) {
 		t.Error("Expected PLAIN mechanism in default registry")
 	}
 
-	// Test ANONYMOUS is available
+	// Test ANONYMOUS is NOT available by default
 	_, err = registry.Get("ANONYMOUS")
+	if err == nil {
+		t.Error("ANONYMOUS should NOT be in default registry (opt-in only)")
+	}
+
+	// RegistryForMechanisms can opt in to ANONYMOUS
+	regWithAnon := RegistryForMechanisms([]string{"PLAIN", "ANONYMOUS"})
+	_, err = regWithAnon.Get("ANONYMOUS")
 	if err != nil {
-		t.Error("Expected ANONYMOUS mechanism in default registry")
+		t.Error("RegistryForMechanisms should include ANONYMOUS when explicitly listed")
 	}
 }
 
 func TestFileAuthenticator(t *testing.T) {
-	// Create a temporary auth file
 	authFile := "/tmp/test_auth.json"
 	defer os.Remove(authFile)
 
-	// Test creating new authenticator (will create default file)
+	hash, err := bcrypt.GenerateFromPassword([]byte("guest"), bcrypt.DefaultCost)
+	if err != nil {
+		t.Fatalf("failed to hash password: %v", err)
+	}
+	authData := fmt.Sprintf(`{"users":[{"username":"guest","password_hash":%q,"vhost_permissions":[{"vhost":"/","permission":{"configure":".*","write":".*","read":".*"}}],"tags":["administrator"],"groups":["guest"],"loopback_only":true}]}`, string(hash))
+	if err := os.WriteFile(authFile, []byte(authData), 0600); err != nil {
+		t.Fatalf("failed to write auth file: %v", err)
+	}
+
 	auth, err := NewFileAuthenticator(authFile)
 	if err != nil {
 		t.Fatalf("Failed to create file authenticator: %v", err)
 	}
 
-	// Test authenticating with default guest user
 	user, err := auth.Authenticate("guest", "guest")
 	if err != nil {
 		t.Errorf("Expected successful authentication with default guest user, got error: %v", err)
@@ -179,19 +194,16 @@ func TestFileAuthenticator(t *testing.T) {
 		t.Errorf("Expected username 'guest', got '%s'", user.Username)
 	}
 
-	// Test failed authentication (wrong password)
 	_, err = auth.Authenticate("guest", "wrongpass")
 	if err == nil {
 		t.Error("Expected authentication to fail with wrong password")
 	}
 
-	// Test failed authentication (unknown user)
 	_, err = auth.Authenticate("unknown", "password")
 	if err == nil {
 		t.Error("Expected authentication to fail with unknown user")
 	}
 
-	// Test GetUser
 	user, err = auth.GetUser("guest")
 	if err != nil {
 		t.Errorf("Expected to get guest user, got error: %v", err)
@@ -200,16 +212,21 @@ func TestFileAuthenticator(t *testing.T) {
 		t.Errorf("Expected username 'guest', got '%s'", user.Username)
 	}
 
-	// Test GetUser with unknown user
 	_, err = auth.GetUser("unknown")
 	if err == nil {
 		t.Error("Expected error when getting unknown user")
 	}
 
-	// Test RefreshUser
 	err = auth.RefreshUser(user)
 	if err != nil {
 		t.Errorf("Expected successful refresh, got error: %v", err)
+	}
+}
+
+func TestFileAuthenticator_MissingFileReturnsError(t *testing.T) {
+	_, err := NewFileAuthenticator("/tmp/nonexistent_auth_file_12345.json")
+	if err == nil {
+		t.Error("NewFileAuthenticator must return error when auth file does not exist (no auto-create)")
 	}
 }
 

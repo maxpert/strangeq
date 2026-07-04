@@ -2,9 +2,11 @@ package server
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/maxpert/amqp-go/config"
@@ -38,6 +40,11 @@ type Server struct {
 	MetricsCollector   MetricsCollector
 	StartTime          time.Time
 	metricsCancel      context.CancelFunc
+
+	messagesPublished atomic.Int64
+	messagesDelivered atomic.Int64
+	bytesReceived     atomic.Int64
+	bytesSent         atomic.Int64
 }
 
 // NewServer creates a new AMQP server with default storage
@@ -153,10 +160,18 @@ func (s *Server) handleConnection(conn net.Conn) {
 	// Create a new connection instance (updated to match fixed structures.go)
 	connection := protocol.NewConnection(conn)
 
-	// Add to server's connections
+	// Add to server's connections, enforcing MaxConnections
 	s.Mutex.Lock()
 	if s.Shutdown {
 		s.Mutex.Unlock()
+		conn.Close()
+		return
+	}
+	if s.Config.Network.MaxConnections > 0 && len(s.Connections) >= s.Config.Network.MaxConnections {
+		s.Mutex.Unlock()
+		s.Log.Warn("Max connections exceeded, refusing connection",
+			zap.String("connection_id", connection.ID),
+			zap.Int("max", s.Config.Network.MaxConnections))
 		conn.Close()
 		return
 	}
@@ -173,6 +188,13 @@ func (s *Server) handleConnection(conn net.Conn) {
 	// after the handshake completes (line 312)
 	s.processConnectionFrames(connection)
 
+	s.cleanupConnection(connection)
+}
+
+// cleanupConnection tears down all per-channel state for a connection:
+// cancels consumers, closes channels, cleans up transaction state, and
+// removes the connection from the server's connection map.
+func (s *Server) cleanupConnection(connection *protocol.Connection) {
 	// Clean up on connection close - iterate all channels and cancel consumers
 	connection.Channels.Range(func(key, value interface{}) bool {
 		channel := value.(*protocol.Channel)
@@ -186,18 +208,29 @@ func (s *Server) handleConnection(conn net.Conn) {
 		channel.Closed = true
 		channel.Mutex.Unlock()
 
+		connection.ChannelCount.Add(-1)
+
+		// Clean up transaction state for this channel to prevent
+		// cross-connection state leak where stale tx state keyed by
+		// channelID persists after the connection is gone.
+		if s.TransactionManager != nil {
+			s.TransactionManager.Close(channel.ID)
+		}
+
 		// Unregister from broker (stops poll goroutines)
-		for _, consumerTag := range consumerTags {
-			err := s.Broker.UnregisterConsumer(consumerTag)
-			if err != nil {
-				s.Log.Warn("Failed to unregister consumer on connection close",
-					zap.String("consumer_tag", consumerTag),
-					zap.String("connection_id", connection.ID),
-					zap.Error(err))
-			} else {
-				s.Log.Debug("Unregistered consumer on connection close",
-					zap.String("consumer_tag", consumerTag),
-					zap.String("connection_id", connection.ID))
+		if s.Broker != nil {
+			for _, consumerTag := range consumerTags {
+				err := s.Broker.UnregisterConsumer(consumerTag)
+				if err != nil {
+					s.Log.Warn("Failed to unregister consumer on connection close",
+						zap.String("consumer_tag", consumerTag),
+						zap.String("connection_id", connection.ID),
+						zap.Error(err))
+				} else {
+					s.Log.Debug("Unregistered consumer on connection close",
+						zap.String("consumer_tag", consumerTag),
+						zap.String("connection_id", connection.ID))
+				}
 			}
 		}
 
@@ -205,7 +238,9 @@ func (s *Server) handleConnection(conn net.Conn) {
 	})
 
 	// Requeue any orphaned basic.get deliveries (no_ack=false, unacked)
-	s.Broker.RequeueAllGetDeliveries()
+	if s.Broker != nil {
+		s.Broker.RequeueAllGetDeliveries()
+	}
 
 	s.Mutex.Lock()
 	delete(s.Connections, connection.ID)
@@ -217,11 +252,41 @@ func (s *Server) handleConnection(conn net.Conn) {
 	}
 }
 
-// NOTE: memoryMonitor implementation moved to server/memory_monitor.go for Phase 2 (lock-free unbounded channels)
+// negotiateUint16 returns the minimum of server and client values, where 0
+// means unlimited (the non-zero value wins; if both are 0, returns 0).
+func negotiateUint16(server, client uint16) uint16 {
+	if server == 0 {
+		return client
+	}
+	if client == 0 {
+		return server
+	}
+	if server < client {
+		return server
+	}
+	return client
+}
+
+// negotiateUint32 returns the minimum of server and client values, where 0
+// means unlimited (the non-zero value wins; if both are 0, returns 0).
+func negotiateUint32(server, client uint32) uint32 {
+	if server == 0 {
+		return client
+	}
+	if client == 0 {
+		return server
+	}
+	if server < client {
+		return server
+	}
+	return client
+}
 
 // processConnectionFrames reads and processes frames from a connection
 func (s *Server) processConnectionFrames(conn *protocol.Connection) {
 	defer conn.Conn.Close()
+
+	handshakeCap := uint32(131072 + 8)
 
 	// Send connection start frame
 	if err := s.sendConnectionStart(conn); err != nil {
@@ -229,12 +294,13 @@ func (s *Server) processConnectionFrames(conn *protocol.Connection) {
 		return
 	}
 
-	// Wait for connection.start-ok from client
-	frame, err := protocol.ReadFrameOptimized(conn.Conn)
+	conn.Conn.SetReadDeadline(time.Now().Add(30 * time.Second))
+	frame, err := protocol.ReadFrameOptimizedWithLimit(conn.Conn, handshakeCap)
 	if err != nil {
 		s.Log.Error("Error reading connection.start-ok", zap.Error(err))
 		return
 	}
+	conn.TouchActivity()
 
 	if frame.Type != protocol.FrameMethod {
 		s.Log.Error("Expected method frame", zap.Int("type", int(frame.Type)))
@@ -264,23 +330,54 @@ func (s *Server) processConnectionFrames(conn *protocol.Connection) {
 	}
 
 	// Wait for connection.tune-ok from client
-	frame, err = protocol.ReadFrameOptimized(conn.Conn)
+	conn.Conn.SetReadDeadline(time.Now().Add(30 * time.Second))
+	frame, err = protocol.ReadFrameOptimizedWithLimit(conn.Conn, handshakeCap)
 	if err != nil {
 		s.Log.Error("Error reading connection.tune-ok", zap.Error(err))
 		return
 	}
+	conn.TouchActivity()
 
 	if frame.Type != protocol.FrameMethod {
 		s.Log.Error("Expected method frame", zap.Int("type", int(frame.Type)))
 		return
 	}
 
+	// Parse tune-ok payload and store negotiated values on conn
+	if len(frame.Payload) >= 4 {
+		clientChMax, clientFrameMax, clientHeartbeat, parseErr := parseConnectionTuneOK(frame.Payload[4:])
+		if parseErr != nil {
+			s.Log.Error("Failed to parse connection.tune-ok", zap.Error(parseErr))
+			return
+		}
+
+		serverChMax := uint16(s.Config.Server.MaxChannelsPerConnection)
+		serverFrameMax := uint32(s.Config.Server.MaxFrameSize)
+		serverHeartbeat := uint16(s.Config.Network.HeartbeatIntervalMS / 1000)
+
+		negotiatedChMax := negotiateUint16(serverChMax, clientChMax)
+		negotiatedFrameMax := negotiateUint32(serverFrameMax, clientFrameMax)
+		negotiatedHeartbeat := negotiateUint16(serverHeartbeat, clientHeartbeat)
+
+		conn.MaxChannels = negotiatedChMax
+		conn.MaxFrameSize = negotiatedFrameMax
+		conn.HeartbeatSec.Store(uint32(negotiatedHeartbeat))
+
+		s.Log.Debug("Negotiated connection parameters",
+			zap.String("connection_id", conn.ID),
+			zap.Uint16("channel_max", negotiatedChMax),
+			zap.Uint32("frame_max", negotiatedFrameMax),
+			zap.Uint16("heartbeat", negotiatedHeartbeat))
+	}
+
 	// Wait for connection.open from client
-	frame, err = protocol.ReadFrameOptimized(conn.Conn)
+	conn.Conn.SetReadDeadline(time.Now().Add(30 * time.Second))
+	frame, err = protocol.ReadFrameOptimizedWithLimit(conn.Conn, handshakeCap)
 	if err != nil {
 		s.Log.Error("Error reading connection.open", zap.Error(err))
 		return
 	}
+	conn.TouchActivity()
 
 	if frame.Type != protocol.FrameMethod {
 		s.Log.Error("Expected method frame", zap.Int("type", int(frame.Type)))
@@ -292,6 +389,9 @@ func (s *Server) processConnectionFrames(conn *protocol.Connection) {
 		s.Log.Error("Error processing connection.open", zap.Error(err))
 		return
 	}
+
+	// Clear handshake deadline; readFrames will manage read deadlines for heartbeats
+	conn.Conn.SetReadDeadline(time.Time{})
 
 	// At this point, the connection handshake is complete
 	s.Log.Info("Connection handshake completed", zap.String("connection_id", conn.ID))
@@ -352,10 +452,23 @@ func (s *Server) readFrames(conn *protocol.Connection, done chan struct{}) {
 	defer close(conn.FrameQueue) // Signal processor to stop
 
 	for {
-		// Read frame from TCP connection with optimized pooling (never blocks on processing)
-		frame, err := protocol.ReadFrameOptimized(conn.Conn)
+		hb := conn.HeartbeatSec.Load()
+		if hb > 0 {
+			conn.Conn.SetReadDeadline(time.Now().Add(time.Duration(2*hb) * time.Second))
+		}
+
+		maxSize := conn.MaxFrameSize
+		if maxSize == 0 {
+			maxSize = protocol.MaxInboundFrameSize
+		}
+		frame, err := protocol.ReadFrameOptimizedWithLimit(conn.Conn, maxSize)
 		if err != nil {
-			if err.Error() == "EOF" {
+			if ne, ok := err.(net.Error); ok && ne.Timeout() {
+				if hb > 0 {
+					s.Log.Info("heartbeat missed, closing dead connection",
+						zap.String("connection_id", conn.ID))
+				}
+			} else if err.Error() == "EOF" {
 				s.Log.Info("Connection closed by client", zap.String("connection_id", conn.ID))
 			} else {
 				s.Log.Error("Error reading frame from connection",
@@ -363,11 +476,11 @@ func (s *Server) readFrames(conn *protocol.Connection, done chan struct{}) {
 					zap.Error(err))
 			}
 
-			// Mark connection as closed
 			conn.Closed.Store(true)
-
 			return
 		}
+
+		conn.TouchActivity()
 
 		// Enqueue for processing (blocks only if queue is full)
 		select {
@@ -402,6 +515,12 @@ func (s *Server) processFrames(conn *protocol.Connection, done chan struct{}) {
 				protocol.PutFrame(frame)
 			}
 			if err != nil {
+				if errors.Is(err, errClientRequestedClose) {
+					s.Log.Info("Connection closed by client",
+						zap.String("connection_id", conn.ID))
+					conn.Closed.Store(true)
+					return
+				}
 				s.Log.Error("Error processing frame",
 					zap.String("connection_id", conn.ID),
 					zap.Uint16("channel", frame.Channel),
@@ -503,10 +622,15 @@ func (s *Server) ackProcessor(conn *protocol.Connection, done chan struct{}) {
 func (s *Server) sendHeartbeats(conn *protocol.Connection, done chan struct{}) {
 	defer close(done)
 
-	// Send heartbeats very frequently (every 5 seconds) to prevent timeout
-	// even under heavy load with WriteMutex contention.
-	// TODO: Use negotiated heartbeat value from connection.tune
-	heartbeatInterval := 5 * time.Second
+	hb := conn.HeartbeatSec.Load()
+	if hb == 0 {
+		return
+	}
+
+	heartbeatInterval := time.Duration(hb) * time.Second / 2
+	if heartbeatInterval < 1*time.Second {
+		heartbeatInterval = 1 * time.Second
+	}
 	ticker := time.NewTicker(heartbeatInterval)
 	defer ticker.Stop()
 

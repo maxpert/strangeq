@@ -20,7 +20,8 @@ func newTestPendingAck(consumerTag string, deliveryTag uint64) *protocol.Pending
 }
 
 func TestConsumerPendingAcksIndex_BasicCorrectness(t *testing.T) {
-	ds := NewDisruptorStorage()
+	ds, err := NewDisruptorStorage()
+	require.NoError(t, err)
 
 	require.NoError(t, ds.StorePendingAck(newTestPendingAck("A", 1)))
 	require.NoError(t, ds.StorePendingAck(newTestPendingAck("A", 2)))
@@ -81,7 +82,8 @@ func TestConsumerPendingAcksIndex_SupersetInvariant(t *testing.T) {
 	tagBase := func(c int, tag uint64) uint64 { return uint64(c)*1000 + tag }
 	ctag := func(c int) string { return fmt.Sprintf("C%d", c) }
 
-	ds := NewDisruptorStorage()
+	ds, err := NewDisruptorStorage()
+	require.NoError(t, err)
 	var wg sync.WaitGroup
 
 	// Phase 1: every consumer stores its own disjoint tag range concurrently.
@@ -214,7 +216,8 @@ func TestConsumerPendingAcksIndex_ReStoreRace(t *testing.T) {
 	const consumers = 16
 	const raceTags = 100
 
-	ds := NewDisruptorStorage()
+	ds, err := NewDisruptorStorage()
+	require.NoError(t, err)
 	var wg sync.WaitGroup
 	ctag := func(c int) string { return fmt.Sprintf("R%d", c) }
 	dtag := func(c int, tag uint64) uint64 { return uint64(c)*100000 + tag }
@@ -258,7 +261,8 @@ func TestConsumerPendingAcksIndex_AdversarialNoRaces(t *testing.T) {
 	const tags = 200
 	const iters = 80
 
-	ds := NewDisruptorStorage()
+	ds, err := NewDisruptorStorage()
+	require.NoError(t, err)
 	var wg sync.WaitGroup
 
 	for tag := uint64(1); tag <= tags; tag++ {
@@ -352,8 +356,9 @@ func deliveryTags(acks []*protocol.PendingAck) []uint64 {
 
 func errPendingAckNotFoundSentinel(t *testing.T) error {
 	t.Helper()
-	ds := NewDisruptorStorage()
-	_, err := ds.GetPendingAck("", 1<<30)
+	ds, err := NewDisruptorStorage()
+	require.NoError(t, err)
+	_, err = ds.GetPendingAck("", 1<<30)
 	require.Error(t, err)
 	return err
 }
@@ -365,7 +370,10 @@ func BenchmarkGetConsumerPendingAcks_Indexed(b *testing.B) {
 	const consumers = 200
 	const tagsPerConsumer = 100
 
-	ds := NewDisruptorStorage()
+	ds, err := NewDisruptorStorage()
+	if err != nil {
+		b.Fatal(err)
+	}
 	for c := 0; c < consumers; c++ {
 		ct := fmt.Sprintf("C%d", c)
 		for tag := uint64(1); tag <= tagsPerConsumer; tag++ {
@@ -387,7 +395,10 @@ func BenchmarkGetConsumerPendingAcks_FullScanBaseline(b *testing.B) {
 	const consumers = 200
 	const tagsPerConsumer = 100
 
-	ds := NewDisruptorStorage()
+	ds, err := NewDisruptorStorage()
+	if err != nil {
+		b.Fatal(err)
+	}
 	for c := 0; c < consumers; c++ {
 		ct := fmt.Sprintf("C%d", c)
 		for tag := uint64(1); tag <= tagsPerConsumer; tag++ {

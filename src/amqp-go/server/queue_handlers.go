@@ -115,8 +115,6 @@ func (s *Server) handleQueueDeclare(conn *protocol.Connection, channelID uint16,
 		return err
 	}
 
-	// AMQP 0.9.1 spec "queue-known" rule: track the last declared queue on
-	// the channel so subsequent methods with empty queue name can resolve it.
 	if val, exists := conn.Channels.Load(channelID); exists {
 		ch := val.(*protocol.Channel)
 		ch.Mutex.Lock()
@@ -124,15 +122,20 @@ func (s *Server) handleQueueDeclare(conn *protocol.Connection, channelID uint16,
 		ch.Mutex.Unlock()
 	}
 
-	// Record queue declared metric
 	if s.MetricsCollector != nil {
 		s.MetricsCollector.RecordQueueDeclared()
 	}
 
-	// Send queue.declare-ok response with queue info (spec: must return the
-	// actual queue name, including server-generated names)
+	if declareMethod.NoWait {
+		return nil
+	}
+
 	msgCount := uint32(queue.MessageCount.Load())
-	return s.sendQueueDeclareOK(conn, channelID, queue.Name, msgCount, 0)
+	consumerCount := uint32(0)
+	if sb, ok := s.Broker.(*StorageBrokerAdapter); ok {
+		consumerCount = uint32(sb.broker.GetQueueConsumerCount(queue.Name))
+	}
+	return s.sendQueueDeclareOK(conn, channelID, queue.Name, msgCount, consumerCount)
 }
 
 // handleQueueBind handles the queue.bind method
@@ -343,8 +346,7 @@ func (s *Server) handleQueueDelete(conn *protocol.Connection, channelID uint16, 
 		return s.authzChannelError(conn, channelID, err, 50, 40)
 	}
 
-	// Call the broker to delete the queue
-	err = s.Broker.DeleteQueue(queueName, deleteMethod.IfUnused, deleteMethod.IfEmpty)
+	count, err := s.Broker.DeleteQueue(queueName, deleteMethod.IfUnused, deleteMethod.IfEmpty)
 	if err != nil {
 		s.Log.Error("Failed to delete queue",
 			zap.Error(err),
@@ -352,7 +354,6 @@ func (s *Server) handleQueueDelete(conn *protocol.Connection, channelID uint16, 
 		return err
 	}
 
-	// Clear the current queue if it was the one deleted
 	if val, exists := conn.Channels.Load(channelID); exists {
 		ch := val.(*protocol.Channel)
 		ch.Mutex.Lock()
@@ -362,11 +363,13 @@ func (s *Server) handleQueueDelete(conn *protocol.Connection, channelID uint16, 
 		ch.Mutex.Unlock()
 	}
 
-	// Record queue deleted metric
 	if s.MetricsCollector != nil {
 		s.MetricsCollector.RecordQueueDeleted()
 	}
 
-	// Send queue.delete-ok response with number of deleted messages
-	return s.sendQueueDeleteOK(conn, channelID, 0)
+	if deleteMethod.NoWait {
+		return nil
+	}
+
+	return s.sendQueueDeleteOK(conn, channelID, uint32(count))
 }

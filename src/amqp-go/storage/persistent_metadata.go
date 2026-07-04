@@ -1,6 +1,7 @@
 package storage
 
 import (
+	"encoding/binary"
 	"fmt"
 	"io"
 	"os"
@@ -22,6 +23,7 @@ const (
 	ConsumersDir        = "consumers"
 	FileExtension       = ".cbor"
 	TempFileExtension   = ".tmp"
+	DeliveryTagFile     = "delivery_tag"
 )
 
 // PersistentMetadataStore implements persistent metadata storage using CBOR binary format
@@ -910,6 +912,30 @@ func (pm *PersistentMetadataStore) LoadAllMetadata() (
 	}
 
 	return exchanges, queues, bindings, consumers, nil
+}
+
+func (pm *PersistentMetadataStore) SaveDeliveryTagCounter(tag uint64) error {
+	data := make([]byte, 8)
+	binary.BigEndian.PutUint64(data, tag)
+	path := filepath.Join(pm.baseDir, DeliveryTagFile)
+	pm.mutex.Lock()
+	defer pm.mutex.Unlock()
+	return pm.atomicWrite(path, data)
+}
+
+func (pm *PersistentMetadataStore) LoadDeliveryTagCounter() (uint64, error) {
+	path := filepath.Join(pm.baseDir, DeliveryTagFile)
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return 0, nil
+		}
+		return 0, fmt.Errorf("failed to read delivery tag counter: %w", err)
+	}
+	if len(data) < 8 {
+		return 0, nil
+	}
+	return binary.BigEndian.Uint64(data), nil
 }
 
 // Close closes the metadata store (no-op for JSON files)

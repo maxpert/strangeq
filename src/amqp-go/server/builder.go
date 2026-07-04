@@ -2,8 +2,10 @@ package server
 
 import (
 	"fmt"
+	"os"
 	"time"
 
+	"github.com/maxpert/amqp-go/auth"
 	"github.com/maxpert/amqp-go/broker"
 	"github.com/maxpert/amqp-go/config"
 	"github.com/maxpert/amqp-go/interfaces"
@@ -133,6 +135,7 @@ func (b *ServerBuilder) WithAuthenticator(auth interfaces.Authenticator) *Server
 func (b *ServerBuilder) WithFileAuthentication(userFile string) *ServerBuilder {
 	b.config.Security.AuthenticationEnabled = true
 	b.config.Security.AuthenticationBackend = "file"
+	b.config.Security.AuthenticationFilePath = userFile
 	if b.config.Security.AuthenticationConfig == nil {
 		b.config.Security.AuthenticationConfig = make(map[string]interface{})
 	}
@@ -205,11 +208,15 @@ func (b *ServerBuilder) Build() (*Server, error) {
 	} else {
 		// Create new disruptor storage with configurable checkpoint interval and engine config
 		checkpointInterval := time.Duration(b.config.Storage.CheckpointIntervalMS) * time.Millisecond
-		storageImpl = storage.NewDisruptorStorageWithEngineConfig(
+		var err error
+		storageImpl, err = storage.NewDisruptorStorageWithEngineConfig(
 			b.config.Storage.Path,
 			checkpointInterval,
 			b.config.GetEngine(),
 		)
+		if err != nil {
+			return nil, fmt.Errorf("failed to initialize durable storage at %q: %w", b.config.Storage.Path, err)
+		}
 		if checkpointInterval == 0 {
 			logger.Info("Using disruptor-based storage with offset checkpointing disabled")
 		} else {
@@ -254,6 +261,45 @@ func (b *ServerBuilder) Build() (*Server, error) {
 		metricsCollector = &NoOpMetricsCollector{}
 	}
 
+	// Wire authentication: if WithAuthenticator was called, it implies auth is on.
+	var authenticator interfaces.Authenticator
+	if b.authenticator != nil {
+		b.config.Security.AuthenticationEnabled = true
+		authenticator = b.authenticator
+	}
+
+	// If auth is enabled but no authenticator was provided, construct from config.
+	if authenticator == nil && b.config.Security.AuthenticationEnabled {
+		var err error
+		authenticator, err = b.constructAuthenticator()
+		if err != nil {
+			return nil, fmt.Errorf("failed to initialize authenticator: %w", err)
+		}
+		if authenticator == nil {
+			return nil, fmt.Errorf("authentication enabled but authenticator construction yielded nil (fail-closed)")
+		}
+	}
+
+	// Build mechanism registry from configured mechanisms (default PLAIN only).
+	// Do NOT use auth.DefaultRegistry() — it does not include ANONYMOUS (opt-in only).
+	var mechanismRegistry MechanismRegistry
+	mechanisms := b.config.Security.AuthMechanisms
+	if len(mechanisms) == 0 {
+		mechanisms = []string{"PLAIN"}
+	}
+	registry := auth.RegistryForMechanisms(mechanisms)
+	mechanismRegistry = NewMechanismRegistryAdapter(registry)
+
+	// If auth is enabled, fail-closed if authenticator or registry is nil.
+	if b.config.Security.AuthenticationEnabled {
+		if authenticator == nil {
+			return nil, fmt.Errorf("authentication enabled but no authenticator available (fail-closed)")
+		}
+		if mechanismRegistry == nil {
+			return nil, fmt.Errorf("authentication enabled but no mechanism registry available (fail-closed)")
+		}
+	}
+
 	// Create the server
 	server := &Server{
 		Addr:               b.config.Network.Address,
@@ -262,8 +308,15 @@ func (b *ServerBuilder) Build() (*Server, error) {
 		Config:             b.config,
 		Broker:             unifiedBroker,
 		TransactionManager: transactionManager,
+		Authenticator:      authenticator,
+		MechanismRegistry:  mechanismRegistry,
 		MetricsCollector:   metricsCollector,
 		StartTime:          time.Now(),
+	}
+
+	// Propagate metrics collector to storage if it supports SetMetrics.
+	if sm, ok := storageImpl.(interface{ SetMetrics(storage.StorageMetrics) }); ok {
+		sm.SetMetrics(metricsCollector)
 	}
 
 	// Create and attach lifecycle manager
@@ -284,6 +337,43 @@ func (b *ServerBuilder) Build() (*Server, error) {
 	}
 
 	return server, nil
+}
+
+// constructAuthenticator builds an authenticator from the security config.
+// It is called when AuthenticationEnabled is true but no authenticator was
+// explicitly provided via WithAuthenticator. Returns nil, nil if auth is
+// disabled. Returns an error if the backend is unknown or the auth file
+// does not exist (fail-closed — never auto-create a default guest file).
+func (b *ServerBuilder) constructAuthenticator() (interfaces.Authenticator, error) {
+	backend := b.config.Security.AuthenticationBackend
+	if backend == "" {
+		backend = "file"
+	}
+
+	switch backend {
+	case "file":
+		authPath := b.config.Security.AuthenticationFilePath
+		if authPath == "" {
+			if uf, ok := b.config.Security.AuthenticationConfig["user_file"]; ok {
+				if s, ok := uf.(string); ok {
+					authPath = s
+				}
+			}
+		}
+		if authPath == "" {
+			return nil, fmt.Errorf("file authentication enabled but no auth file path configured")
+		}
+		if _, err := os.Stat(authPath); os.IsNotExist(err) {
+			return nil, fmt.Errorf("auth file does not exist: %s", authPath)
+		}
+		authenticator, err := auth.NewFileAuthenticator(authPath)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create file authenticator: %w", err)
+		}
+		return authenticator, nil
+	default:
+		return nil, fmt.Errorf("unsupported authentication backend: %s", backend)
+	}
 }
 
 // ZapLoggerAdapter adapts zap.Logger to interfaces.Logger
@@ -346,7 +436,8 @@ func (w *brokerWrapper) DeclareQueue(name string, durable, autoDelete, exclusive
 }
 
 func (w *brokerWrapper) DeleteQueue(name string, ifUnused, ifEmpty bool) error {
-	return w.unifiedBroker.DeleteQueue(name, ifUnused, ifEmpty)
+	_, err := w.unifiedBroker.DeleteQueue(name, ifUnused, ifEmpty)
+	return err
 }
 
 func (w *brokerWrapper) PurgeQueue(name string) (int, error) {

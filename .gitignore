@@ -23,6 +23,8 @@ dist/
 /amqp-go
 /amqp-server
 amqp-server-*
+/src/amqp-go/crash_test_tool
+/src/amqp-go/cmd/crash_test_tool/crash_test_tool
 
 # IDE
 .idea/

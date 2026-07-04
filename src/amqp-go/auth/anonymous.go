@@ -30,8 +30,9 @@ func (a *AnonymousMechanism) Authenticate(response []byte, authenticator interfa
 				},
 			},
 		},
-		Tags:   []string{"administrator"},
-		Groups: []string{"guest"},
+		Tags:         []string{"administrator"},
+		Groups:       []string{"guest"},
+		LoopbackOnly: true,
 		Metadata: map[string]interface{}{
 			"mechanism": "ANONYMOUS",
 		},

@@ -94,15 +94,15 @@ type QueueRing struct {
 	closed atomic.Bool
 }
 
-func NewDisruptorStorage() *DisruptorStorage {
+func NewDisruptorStorage() (*DisruptorStorage, error) {
 	return NewDisruptorStorageWithDataDir("./data")
 }
 
-func NewDisruptorStorageWithDataDir(dataDir string) *DisruptorStorage {
+func NewDisruptorStorageWithDataDir(dataDir string) (*DisruptorStorage, error) {
 	return NewDisruptorStorageWithCheckpointInterval(dataDir, DefaultCheckpointInterval)
 }
 
-func NewDisruptorStorageWithCheckpointInterval(dataDir string, checkpointInterval time.Duration) *DisruptorStorage {
+func NewDisruptorStorageWithCheckpointInterval(dataDir string, checkpointInterval time.Duration) (*DisruptorStorage, error) {
 	return NewDisruptorStorageWithEngineConfig(dataDir, checkpointInterval, interfaces.EngineConfig{})
 }
 
@@ -143,7 +143,7 @@ func SegmentConfigFromEngine(ec interfaces.EngineConfig) SegmentConfig {
 	return cfg
 }
 
-func NewDisruptorStorageWithEngineConfig(dataDir string, checkpointInterval time.Duration, engineCfg interfaces.EngineConfig) *DisruptorStorage {
+func NewDisruptorStorageWithEngineConfig(dataDir string, checkpointInterval time.Duration, engineCfg interfaces.EngineConfig) (*DisruptorStorage, error) {
 	ringBufferSize := engineCfg.RingBufferSize
 	if ringBufferSize <= 0 {
 		ringBufferSize = DefaultRingBufferSize
@@ -159,7 +159,7 @@ func NewDisruptorStorageWithEngineConfig(dataDir string, checkpointInterval time
 
 	metadataStore, err := NewPersistentMetadataStore(dataDir)
 	if err != nil {
-		metadataStore = nil
+		return nil, fmt.Errorf("failed to create metadata store: %w", err)
 	}
 
 	offsetStore, err := NewOffsetCheckpointStoreWithInterval(dataDir, checkpointInterval)
@@ -172,12 +172,12 @@ func NewDisruptorStorageWithEngineConfig(dataDir string, checkpointInterval time
 
 	walManager, err := NewWALManagerWithConfig(dataDir, walCfg)
 	if err != nil {
-		walManager = nil
+		return nil, fmt.Errorf("failed to create WAL manager: %w", err)
 	}
 
 	segmentManager, err := NewSegmentManagerWithConfig(dataDir, segCfg)
 	if err != nil {
-		segmentManager = nil
+		return nil, fmt.Errorf("failed to create segment manager: %w", err)
 	}
 
 	if walManager != nil && segmentManager != nil {
@@ -193,7 +193,7 @@ func NewDisruptorStorageWithEngineConfig(dataDir string, checkpointInterval time
 		segments:       segmentManager,
 		transactions:   make(map[string]*interfaces.Transaction),
 		dataDir:        dataDir,
-	}
+	}, nil
 }
 
 func (ds *DisruptorStorage) SetMetrics(metrics StorageMetrics) {
@@ -255,6 +255,10 @@ func (ds *DisruptorStorage) LoadMessageFromRecovery(queueName string, message *p
 }
 
 func (ds *DisruptorStorage) StoreMessage(queueName string, message *protocol.Message) error {
+	if ds.wal == nil && message.DeliveryMode == 2 {
+		return fmt.Errorf("cannot persist durable message: WAL unavailable for queue %s", queueName)
+	}
+
 	ring := ds.getOrCreateQueueRing(queueName)
 
 	if ds.wal != nil && message.DeliveryMode == 2 {
@@ -869,21 +873,49 @@ func (ds *DisruptorStorage) RepairCorruption(autoRepair bool) (*protocol.Recover
 }
 
 func (ds *DisruptorStorage) GetRecoverableMessages() (map[string][]*protocol.Message, error) {
-	if ds.wal == nil {
-		return make(map[string][]*protocol.Message), nil
-	}
-
-	recoveredMessages, err := ds.wal.RecoverFromWAL()
-	if err != nil {
-		return nil, fmt.Errorf("WAL recovery failed: %w", err)
-	}
-
 	messagesByQueue := make(map[string][]*protocol.Message)
-	for _, recoveryMsg := range recoveredMessages {
-		messagesByQueue[recoveryMsg.QueueName] = append(
-			messagesByQueue[recoveryMsg.QueueName],
-			recoveryMsg.Message,
-		)
+
+	if ds.wal != nil {
+		recoveredMessages, err := ds.wal.RecoverFromWAL()
+		if err != nil {
+			return nil, fmt.Errorf("WAL recovery failed: %w", err)
+		}
+
+		for _, recoveryMsg := range recoveredMessages {
+			messagesByQueue[recoveryMsg.QueueName] = append(
+				messagesByQueue[recoveryMsg.QueueName],
+				recoveryMsg.Message,
+			)
+		}
+	}
+
+	if ds.segments != nil {
+		segmentMessages, err := ds.segments.RecoverFromSegments()
+		if err != nil {
+			return nil, fmt.Errorf("segment recovery failed: %w", err)
+		}
+
+		walKeys := make(map[string]map[uint64]bool)
+		for queueName, msgs := range messagesByQueue {
+			if walKeys[queueName] == nil {
+				walKeys[queueName] = make(map[uint64]bool)
+			}
+			for _, msg := range msgs {
+				walKeys[queueName][msg.DeliveryTag] = true
+			}
+		}
+
+		for queueName, segMsgs := range segmentMessages {
+			for _, rm := range segMsgs {
+				if walKeys[queueName] != nil && walKeys[queueName][rm.Offset] {
+					continue
+				}
+				messagesByQueue[queueName] = append(
+					messagesByQueue[queueName],
+					rm.Message,
+				)
+			}
+		}
 	}
 
 	return messagesByQueue, nil
@@ -897,6 +929,20 @@ func (ds *DisruptorStorage) ExecuteAtomic(operations func(txnStorage interfaces.
 	ds.txMutex.Lock()
 	defer ds.txMutex.Unlock()
 	return operations(ds)
+}
+
+func (ds *DisruptorStorage) SaveDeliveryTagCounter(tag uint64) error {
+	if ds.metadataStore == nil {
+		return fmt.Errorf("metadata store not initialized")
+	}
+	return ds.metadataStore.SaveDeliveryTagCounter(tag)
+}
+
+func (ds *DisruptorStorage) LoadDeliveryTagCounter() (uint64, error) {
+	if ds.metadataStore == nil {
+		return 0, nil
+	}
+	return ds.metadataStore.LoadDeliveryTagCounter()
 }
 
 func (ds *DisruptorStorage) Close() error {

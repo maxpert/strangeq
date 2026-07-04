@@ -11,9 +11,19 @@ import (
 func (s *Server) processChannelSpecificMethod(conn *protocol.Connection, channelID uint16, methodID uint16, payload []byte) error {
 	switch methodID {
 	case protocol.ChannelOpen: // Method ID 10 for channel class
+		if conn.MaxChannels > 0 && conn.ChannelCount.Load() >= int32(conn.MaxChannels) {
+			s.Log.Warn("Max channels per connection exceeded",
+				zap.Uint16("channel_id", channelID),
+				zap.String("connection_id", conn.ID),
+				zap.Uint16("max", conn.MaxChannels))
+			s.sendChannelClose(conn, channelID, 503, "CHANNEL_ERROR - too many channels", 20, 10)
+			return nil
+		}
+
 		// Create new channel
 		newChannel := protocol.NewChannel(channelID, conn)
 		conn.Channels.Store(channelID, newChannel)
+		conn.ChannelCount.Add(1)
 
 		s.Log.Debug("Channel opened",
 			zap.Uint16("channel_id", channelID),
@@ -118,6 +128,7 @@ func (s *Server) processChannelSpecificMethod(conn *protocol.Connection, channel
 
 			// Remove channel from connection
 			conn.Channels.Delete(channelID)
+			conn.ChannelCount.Add(-1)
 
 			// Clean up transaction state for this channel
 			if s.TransactionManager != nil {

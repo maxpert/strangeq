@@ -68,8 +68,7 @@ func (f *FileAuthenticator) load() error {
 	data, err := os.ReadFile(f.filePath)
 	if err != nil {
 		if os.IsNotExist(err) {
-			// Create default auth file with guest user
-			return f.createDefaultFile()
+			return fmt.Errorf("auth file does not exist: %s", f.filePath)
 		}
 		return fmt.Errorf("failed to read auth file: %w", err)
 	}
@@ -106,58 +105,6 @@ func (f *FileAuthenticator) load() error {
 			}
 			log.Printf("[auth] WARNING: migrated legacy permissions for user %q to vhost_permissions on / — please update auth file", user.Username)
 		}
-		f.users[user.Username] = user
-	}
-
-	return nil
-}
-
-// createDefaultFile creates a default auth file with guest user
-func (f *FileAuthenticator) createDefaultFile() error {
-	// Create bcrypt hash for "guest" password
-	hash, err := bcrypt.GenerateFromPassword([]byte("guest"), bcrypt.DefaultCost)
-	if err != nil {
-		return fmt.Errorf("failed to hash default password: %w", err)
-	}
-
-	defaultFile := AuthFile{
-		Users: []UserEntry{
-			{
-				Username:     "guest",
-				PasswordHash: string(hash),
-				VHostPermissions: []interfaces.VHostPermission{
-					{
-						VHost: "/",
-						Permission: interfaces.Permission{
-							Configure: ".*",
-							Write:     ".*",
-							Read:      ".*",
-						},
-					},
-				},
-				Tags:         []string{"administrator"},
-				Groups:       []string{"guest"},
-				LoopbackOnly: true,
-				Metadata: map[string]interface{}{
-					"created": "default",
-				},
-			},
-		},
-	}
-
-	data, err := json.MarshalIndent(defaultFile, "", "  ")
-	if err != nil {
-		return fmt.Errorf("failed to marshal default auth file: %w", err)
-	}
-
-	if err := os.WriteFile(f.filePath, data, 0600); err != nil {
-		return fmt.Errorf("failed to write default auth file: %w", err)
-	}
-
-	// Load the default file
-	f.users = make(map[string]*UserEntry)
-	for i := range defaultFile.Users {
-		user := &defaultFile.Users[i]
 		f.users[user.Username] = user
 	}
 

@@ -21,7 +21,10 @@ import (
 func createTestStorageBroker(t testing.TB) (*broker.StorageBroker, func()) {
 	t.Helper()
 	tmpDir := t.TempDir()
-	store := storage.NewDisruptorStorageWithDataDir(tmpDir)
+	store, err := storage.NewDisruptorStorageWithDataDir(tmpDir)
+	if err != nil {
+		t.Fatalf("failed to create storage: %v", err)
+	}
 	engineConfig := interfaces.EngineConfig{
 		RingBufferSize:          65536,
 		SpillThresholdPercent:   80,

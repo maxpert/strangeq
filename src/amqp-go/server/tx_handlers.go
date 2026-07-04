@@ -72,7 +72,13 @@ func (s *Server) handleTxSelect(conn *protocol.Connection, channelID uint16, pay
 
 	// Send tx.select-ok response
 	response := protocol.NewTxSelectOKFrame(channelID)
-	return protocol.WriteFrameToConnection(conn, response)
+	if err := protocol.WriteFrameToConnection(conn, response); err != nil {
+		return err
+	}
+	if s.MetricsCollector != nil {
+		s.MetricsCollector.RecordTransactionStarted()
+	}
+	return nil
 }
 
 // handleTxCommit handles the tx.commit method
@@ -110,10 +116,12 @@ func (s *Server) handleTxCommit(conn *protocol.Connection, channelID uint16, pay
 			s.Log.Error("Failed to commit transaction",
 				zap.Error(err),
 				zap.Uint16("channel_id", channelID))
-			return err
+			s.sendChannelClose(conn, channelID, amqperrors.InternalError, "transaction commit failed", 90, 30)
+			return nil
 		}
 	} else {
-		return fmt.Errorf("transactions not supported")
+		s.sendChannelClose(conn, channelID, amqperrors.InternalError, "transactions not supported", 90, 30)
+		return nil
 	}
 
 	// Send confirms for published messages after successful commit
@@ -133,7 +141,13 @@ func (s *Server) handleTxCommit(conn *protocol.Connection, channelID uint16, pay
 
 	// Send tx.commit-ok response
 	response := protocol.NewTxCommitOKFrame(channelID)
-	return protocol.WriteFrameToConnection(conn, response)
+	if err := protocol.WriteFrameToConnection(conn, response); err != nil {
+		return err
+	}
+	if s.MetricsCollector != nil {
+		s.MetricsCollector.RecordTransactionCommitted()
+	}
+	return nil
 }
 
 // handleTxRollback handles the tx.rollback method
@@ -167,5 +181,11 @@ func (s *Server) handleTxRollback(conn *protocol.Connection, channelID uint16, p
 
 	// Send tx.rollback-ok response
 	response := protocol.NewTxRollbackOKFrame(channelID)
-	return protocol.WriteFrameToConnection(conn, response)
+	if err := protocol.WriteFrameToConnection(conn, response); err != nil {
+		return err
+	}
+	if s.MetricsCollector != nil {
+		s.MetricsCollector.RecordTransactionRolledback()
+	}
+	return nil
 }

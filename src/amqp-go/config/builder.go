@@ -44,12 +44,6 @@ func (b *ConfigBuilder) WithMaxConnections(max int) *ConfigBuilder {
 	return b
 }
 
-// WithConnectionTimeout sets the connection timeout
-func (b *ConfigBuilder) WithConnectionTimeout(timeout time.Duration) *ConfigBuilder {
-	b.config.Network.ConnectionTimeoutMS = timeout.Milliseconds()
-	return b
-}
-
 // WithHeartbeat sets the heartbeat interval
 func (b *ConfigBuilder) WithHeartbeat(interval time.Duration) *ConfigBuilder {
 	b.config.Network.HeartbeatIntervalMS = interval.Milliseconds()
@@ -191,14 +185,6 @@ func (b *ConfigBuilder) WithProtocolLimits(maxChannels int, maxFrameSize int, ma
 	b.config.Server.MaxChannelsPerConnection = maxChannels
 	b.config.Server.MaxFrameSize = maxFrameSize
 	b.config.Server.MaxMessageSize = maxMessageSize
-	return b
-}
-
-// WithTimeouts sets various timeout settings
-func (b *ConfigBuilder) WithTimeouts(channelTimeout, messageTimeout, cleanupInterval time.Duration) *ConfigBuilder {
-	b.config.Server.ChannelTimeoutMS = channelTimeout.Milliseconds()
-	b.config.Server.MessageTimeoutMS = messageTimeout.Milliseconds()
-	b.config.Server.CleanupIntervalMS = cleanupInterval.Milliseconds()
 	return b
 }
 

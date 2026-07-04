@@ -21,7 +21,6 @@ func DefaultConfig() *AMQPConfig {
 			Address:                ":5672",
 			Port:                   5672,
 			MaxConnections:         1000,
-			ConnectionTimeoutMS:    30000, // 30 seconds
 			HeartbeatIntervalMS:    60000, // 60 seconds
 			TCPKeepAlive:           true,
 			TCPKeepAliveIntervalMS: 30000, // 30 seconds
@@ -66,16 +65,9 @@ func DefaultConfig() *AMQPConfig {
 			MaxChannelsPerConnection: 2047,
 			MaxFrameSize:             131072,   // 128KB
 			MaxMessageSize:           16777216, // 16MB
-			ChannelTimeoutMS:         60000,    // 60 seconds
-			MessageTimeoutMS:         30000,    // 30 seconds
 			CleanupIntervalMS:        300000,   // 5 minutes
-			MemoryLimitPercent:       60,       // 60% of RAM (RabbitMQ default)
-			MemoryLimitBytes:         0,        // 0 = use percentage
 		},
 		Engine: interfaces.EngineConfig{
-			// Queue State Management
-			AvailableChannelBuffer: 100000, // 100K = 800 KB per queue (was 10M = 80 MB)
-
 			// Ring Buffer (Hot Path)
 			RingBufferSize:        65536, // 64K messages = ~6.5 MB per queue
 			SpillThresholdPercent: 80,    // Start spilling at 80% = 51,200 messages
@@ -97,10 +89,7 @@ func DefaultConfig() *AMQPConfig {
 			ConsumerMaxBatchSize:    100, // Max 100 messages per consumer per poll
 
 			// Background Maintenance
-			ExpiredMessageCheckIntervalMS: 60000,  // 60 seconds
-			WALCleanupCheckIntervalMS:     300000, // 5 minutes
-			OffsetCleanupBatchSize:        1000,   // Delete 1,000 offsets per cycle
-			OffsetCleanupIntervalMS:       30000,  // 30 seconds
+			WALCleanupCheckIntervalMS: 300000, // 5 minutes
 		},
 	}
 }
@@ -150,10 +139,6 @@ func (c *AMQPConfig) Validate() error {
 		return fmt.Errorf("max connections must be positive: %d", c.Network.MaxConnections)
 	}
 
-	if c.Network.ConnectionTimeoutMS <= 0 {
-		return fmt.Errorf("connection timeout must be positive: %d ms", c.Network.ConnectionTimeoutMS)
-	}
-
 	// Validate storage configuration
 	if c.Storage.Path == "" {
 		return fmt.Errorf("storage path cannot be empty")
@@ -194,10 +179,6 @@ func (c *AMQPConfig) Validate() error {
 	}
 
 	// Validate engine configuration
-	if c.Engine.AvailableChannelBuffer <= 0 {
-		return fmt.Errorf("available channel buffer must be positive: %d", c.Engine.AvailableChannelBuffer)
-	}
-
 	if c.Engine.RingBufferSize <= 0 || (c.Engine.RingBufferSize&(c.Engine.RingBufferSize-1)) != 0 {
 		return fmt.Errorf("ring buffer size must be a power of 2: %d", c.Engine.RingBufferSize)
 	}
@@ -246,20 +227,8 @@ func (c *AMQPConfig) Validate() error {
 		return fmt.Errorf("consumer max batch size must be positive: %d", c.Engine.ConsumerMaxBatchSize)
 	}
 
-	if c.Engine.ExpiredMessageCheckIntervalMS <= 0 {
-		return fmt.Errorf("expired message check interval must be positive: %d ms", c.Engine.ExpiredMessageCheckIntervalMS)
-	}
-
 	if c.Engine.WALCleanupCheckIntervalMS <= 0 {
 		return fmt.Errorf("WAL cleanup check interval must be positive: %d ms", c.Engine.WALCleanupCheckIntervalMS)
-	}
-
-	if c.Engine.OffsetCleanupBatchSize <= 0 {
-		return fmt.Errorf("offset cleanup batch size must be positive: %d", c.Engine.OffsetCleanupBatchSize)
-	}
-
-	if c.Engine.OffsetCleanupIntervalMS <= 0 {
-		return fmt.Errorf("offset cleanup interval must be positive: %d ms", c.Engine.OffsetCleanupIntervalMS)
 	}
 
 	return nil

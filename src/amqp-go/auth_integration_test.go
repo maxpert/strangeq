@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"os"
 	"testing"
 	"time"
@@ -9,29 +10,63 @@ import (
 
 	"github.com/maxpert/amqp-go/auth"
 	"github.com/maxpert/amqp-go/config"
+	"github.com/maxpert/amqp-go/interfaces"
 	"github.com/maxpert/amqp-go/server"
+	"golang.org/x/crypto/bcrypt"
 )
+
+type anonymousAuth struct{}
+
+func (a *anonymousAuth) Mechanism() string { return "ANONYMOUS" }
+func (a *anonymousAuth) Response() string  { return "" }
+
+func writeRootTestAuthFile(t *testing.T, path string) {
+	t.Helper()
+	hash, err := bcrypt.GenerateFromPassword([]byte("guest"), bcrypt.MinCost)
+	if err != nil {
+		t.Fatalf("Failed to hash password: %v", err)
+	}
+	authFile := struct {
+		Users []auth.UserEntry `json:"users"`
+	}{
+		Users: []auth.UserEntry{
+			{
+				Username:     "guest",
+				PasswordHash: string(hash),
+				VHostPermissions: []interfaces.VHostPermission{
+					{VHost: "/", Permission: interfaces.Permission{Configure: ".*", Write: ".*", Read: ".*"}},
+				},
+				Tags:         []string{"administrator"},
+				LoopbackOnly: true,
+			},
+		},
+	}
+	data, err := json.MarshalIndent(authFile, "", "  ")
+	if err != nil {
+		t.Fatalf("Failed to marshal auth file: %v", err)
+	}
+	if err := os.WriteFile(path, data, 0600); err != nil {
+		t.Fatalf("Failed to write auth file: %v", err)
+	}
+}
 
 // TestAuthenticationPLAIN tests PLAIN mechanism authentication
 func TestAuthenticationPLAIN(t *testing.T) {
-	// Create auth file
 	authFile := "/tmp/test_auth_plain.json"
 	defer os.Remove(authFile)
+	writeRootTestAuthFile(t, authFile)
 
-	// Start server with PLAIN authentication
 	cfg := config.DefaultConfig()
 	cfg.Network.Address = ":15672"
 	cfg.Security.AuthenticationEnabled = true
 	cfg.Security.AuthenticationFilePath = authFile
 	cfg.Security.AuthMechanisms = []string{"PLAIN"}
 
-	// Create file authenticator (will auto-create with guest user)
 	authenticator, err := auth.NewFileAuthenticator(authFile)
 	if err != nil {
 		t.Fatalf("Failed to create authenticator: %v", err)
 	}
 
-	// Create mechanism registry
 	registry := auth.DefaultRegistry()
 
 	// Create server
@@ -99,18 +134,25 @@ func TestAuthenticationPLAIN(t *testing.T) {
 
 // TestAuthenticationANONYMOUS tests ANONYMOUS mechanism authentication
 func TestAuthenticationANONYMOUS(t *testing.T) {
-	// Start server with ANONYMOUS authentication
+	authFile := "/tmp/test_auth_anon.json"
+	defer os.Remove(authFile)
+	writeRootTestAuthFile(t, authFile)
+
 	cfg := config.DefaultConfig()
 	cfg.Network.Address = ":15673"
 	cfg.Security.AuthenticationEnabled = true
-	cfg.Security.AuthMechanisms = []string{"ANONYMOUS"}
+	cfg.Security.AuthMechanisms = []string{"PLAIN", "ANONYMOUS"}
 
-	// Create mechanism registry
-	registry := auth.DefaultRegistry()
+	authenticator, err := auth.NewFileAuthenticator(authFile)
+	if err != nil {
+		t.Fatalf("Failed to create authenticator: %v", err)
+	}
 
-	// Create server
+	registry := auth.RegistryForMechanisms([]string{"PLAIN", "ANONYMOUS"})
+
 	srv := server.NewServer(cfg.Network.Address)
 	srv.Config = cfg
+	srv.Authenticator = authenticator
 	srv.MechanismRegistry = server.NewMechanismRegistryAdapter(registry)
 
 	// Start server in background
@@ -125,16 +167,16 @@ func TestAuthenticationANONYMOUS(t *testing.T) {
 
 	// Test anonymous authentication (any credentials should work)
 	t.Run("AnonymousAccess", func(t *testing.T) {
-		// Note: AMQP client libraries typically require PLAIN for standard connections
-		// ANONYMOUS is advertised but client still uses PLAIN format
-		// The ANONYMOUS mechanism in our server accepts any credentials
-		conn, err := amqp.Dial("amqp://anything:anything@localhost:15673/")
+		conn, err := amqp.DialConfig("amqp://localhost:15673/", amqp.Config{
+			SASL: []amqp.Authentication{
+				&anonymousAuth{},
+			},
+		})
 		if err != nil {
 			t.Fatalf("Failed to connect with anonymous authentication: %v", err)
 		}
 		defer conn.Close()
 
-		// Create channel to verify connection works
 		ch, err := conn.Channel()
 		if err != nil {
 			t.Fatalf("Failed to create channel: %v", err)
@@ -203,24 +245,21 @@ func TestAuthenticationDisabled(t *testing.T) {
 
 // TestAuthenticationWithMessaging tests that authenticated connections can publish/consume
 func TestAuthenticationWithMessaging(t *testing.T) {
-	// Create auth file
 	authFile := "/tmp/test_auth_messaging.json"
 	defer os.Remove(authFile)
+	writeRootTestAuthFile(t, authFile)
 
-	// Start server with PLAIN authentication
 	cfg := config.DefaultConfig()
 	cfg.Network.Address = ":15675"
 	cfg.Security.AuthenticationEnabled = true
 	cfg.Security.AuthenticationFilePath = authFile
 	cfg.Security.AuthMechanisms = []string{"PLAIN"}
 
-	// Create file authenticator
 	authenticator, err := auth.NewFileAuthenticator(authFile)
 	if err != nil {
 		t.Fatalf("Failed to create authenticator: %v", err)
 	}
 
-	// Create mechanism registry
 	registry := auth.DefaultRegistry()
 
 	// Create server

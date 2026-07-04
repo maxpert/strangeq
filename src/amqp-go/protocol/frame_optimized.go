@@ -22,10 +22,9 @@ import (
 // Use these functions in high-throughput scenarios where every allocation matters.
 // For typical use cases, the standard frame operations are sufficient.
 
-// ReadFrameOptimized reads a frame from an io.Reader with buffer pooling.
-// This reduces allocations by using a pooled header buffer.
-// Returns 3 allocations vs 4 for the standard ReadFrame.
-func ReadFrameOptimized(reader io.Reader) (*Frame, error) {
+const MaxInboundFrameSize = 128 * 1024 * 1024
+
+func ReadFrameOptimizedWithLimit(reader io.Reader, maxSize uint32) (*Frame, error) {
 	headerPtr := getFrameHeader()
 	header := *headerPtr
 	defer putFrameHeader(headerPtr)
@@ -38,6 +37,10 @@ func ReadFrameOptimized(reader io.Reader) (*Frame, error) {
 	frameType := header[0]
 	channel := binary.BigEndian.Uint16(header[1:3])
 	size := binary.BigEndian.Uint32(header[3:7])
+
+	if size > maxSize {
+		return nil, fmt.Errorf("frame size %d exceeds max %d", size, maxSize)
+	}
 
 	payload := make([]byte, size+1)
 	_, err = io.ReadFull(reader, payload)
@@ -55,6 +58,10 @@ func ReadFrameOptimized(reader io.Reader) (*Frame, error) {
 	frame.Size = size
 	frame.Payload = payload[:size]
 	return frame, nil
+}
+
+func ReadFrameOptimized(reader io.Reader) (*Frame, error) {
+	return ReadFrameOptimizedWithLimit(reader, MaxInboundFrameSize)
 }
 
 // AppendFrame appends a complete AMQP frame (type + channel + size + payload

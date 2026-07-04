@@ -25,7 +25,10 @@ func newGetPurgeTestServer(t *testing.T) *Server {
 	cfg := config.DefaultConfig()
 	cfg.Storage.Path = t.TempDir()
 
-	storageImpl := storage.NewDisruptorStorageWithDataDir(cfg.Storage.Path)
+	storageImpl, err := storage.NewDisruptorStorageWithDataDir(cfg.Storage.Path)
+	if err != nil {
+		t.Fatalf("failed to create storage: %v", err)
+	}
 	storageBroker := broker.NewStorageBroker(storageImpl, cfg.GetEngine())
 	unifiedBroker := NewStorageBrokerAdapter(storageBroker)
 

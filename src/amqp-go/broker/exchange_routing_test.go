@@ -13,7 +13,8 @@ import (
 // createTestBroker creates a test broker with in-memory storage
 func createTestBroker(t testing.TB) (*StorageBroker, func()) {
 	tmpDir := t.TempDir()
-	store := storage.NewDisruptorStorageWithDataDir(tmpDir)
+	store, err := storage.NewDisruptorStorageWithDataDir(tmpDir)
+	require.NoError(t, err)
 
 	engineConfig := interfaces.EngineConfig{
 		RingBufferSize:          65536,

@@ -1,6 +1,8 @@
 package server
 
 import (
+	"encoding/binary"
+	"errors"
 	"fmt"
 	"net"
 
@@ -9,6 +11,21 @@ import (
 	"github.com/maxpert/amqp-go/protocol"
 	"go.uber.org/zap"
 )
+
+var errClientRequestedClose = errors.New("connection closed by client")
+
+// parseConnectionTuneOK parses the connection.tune-ok payload (after the
+// 4-byte class/method ID) and extracts the negotiated parameters.
+// The payload layout is: ChannelMax (uint16), FrameMax (uint32), Heartbeat (uint16).
+func parseConnectionTuneOK(payload []byte) (channelMax uint16, frameMax uint32, heartbeat uint16, err error) {
+	if len(payload) < 8 {
+		return 0, 0, 0, fmt.Errorf("tune-ok payload too short: %d bytes", len(payload))
+	}
+	channelMax = binary.BigEndian.Uint16(payload[0:2])
+	frameMax = binary.BigEndian.Uint32(payload[2:6])
+	heartbeat = binary.BigEndian.Uint16(payload[6:8])
+	return channelMax, frameMax, heartbeat, nil
+}
 
 // sendConnectionStart sends the connection.start method frame
 func (s *Server) sendConnectionStart(conn *protocol.Connection) error {
@@ -22,8 +39,8 @@ func (s *Server) sendConnectionStart(conn *protocol.Connection) error {
 			"publisher_confirms":           true,
 			"exchange_exchange_bindings":   true,
 			"basic.nack":                   true,
-			"consumer_cancel_notify":       true,
-			"connection.blocked":           true,
+			"consumer_cancel_notify":       false,
+			"connection.blocked":           false,
 			"authentication_failure_close": true,
 		},
 	}
@@ -63,11 +80,14 @@ func (s *Server) sendConnectionStart(conn *protocol.Connection) error {
 
 // sendConnectionTune sends the connection.tune method frame
 func (s *Server) sendConnectionTune(conn *protocol.Connection) error {
-	// Create the connection.tune method
+	channelMax := uint16(s.Config.Server.MaxChannelsPerConnection)
+	frameMax := uint32(s.Config.Server.MaxFrameSize)
+	heartbeat := uint16(s.Config.Network.HeartbeatIntervalMS / 1000)
+
 	tuneMethod := &protocol.ConnectionTuneMethod{
-		ChannelMax: 65535,  // Maximum number of channels allowed per connection
-		FrameMax:   131072, // Maximum frame size in bytes
-		Heartbeat:  60,     // Heartbeat interval in seconds (0 = disabled)
+		ChannelMax: channelMax,
+		FrameMax:   frameMax,
+		Heartbeat:  heartbeat,
 	}
 
 	methodData, err := tuneMethod.Serialize()
@@ -151,16 +171,16 @@ func (s *Server) processConnectionOpen(conn *protocol.Connection, frame *protoco
 		if conn.User == nil {
 			s.Log.Warn("Authorization enabled but no authenticated user",
 				zap.String("connection_id", conn.ID))
-			s.sendConnectionClose(conn, amqperrors.AccessRefused, "ACCESS_REFUSED",
-				"authorization enabled but no authenticated user")
+			s.sendConnectionClose(conn, amqperrors.AccessRefused,
+				"authorization enabled but no authenticated user", 10, 40)
 			return fmt.Errorf("authorization enabled but no authenticated user")
 		}
 		user, ok := conn.User.(*interfaces.User)
 		if !ok {
 			s.Log.Warn("Unsupported user type for authorization",
 				zap.String("connection_id", conn.ID))
-			s.sendConnectionClose(conn, amqperrors.AccessRefused, "ACCESS_REFUSED",
-				"unsupported user type for authorization")
+			s.sendConnectionClose(conn, amqperrors.AccessRefused,
+				"unsupported user type for authorization", 10, 40)
 			return fmt.Errorf("unsupported user type for authorization")
 		}
 
@@ -182,8 +202,8 @@ func (s *Server) processConnectionOpen(conn *protocol.Connection, frame *protoco
 				zap.String("connection_id", conn.ID),
 				zap.String("username", user.Username),
 				zap.String("vhost", vhost))
-			s.sendConnectionClose(conn, amqperrors.InvalidPath, "INVALID_PATH",
-				fmt.Sprintf("access to vhost %s refused for user %s", vhost, user.Username))
+			s.sendConnectionClose(conn, amqperrors.InvalidPath,
+				fmt.Sprintf("access to vhost %s refused for user %s", vhost, user.Username), 10, 40)
 			return fmt.Errorf("access to vhost %s refused for user %s", vhost, user.Username)
 		}
 
@@ -193,8 +213,8 @@ func (s *Server) processConnectionOpen(conn *protocol.Connection, frame *protoco
 			s.Log.Warn("Loopback restriction violated",
 				zap.String("connection_id", conn.ID),
 				zap.String("username", user.Username))
-			s.sendConnectionClose(conn, amqperrors.AccessRefused, "ACCESS_REFUSED",
-				fmt.Sprintf("user %s can only connect via localhost", user.Username))
+			s.sendConnectionClose(conn, amqperrors.AccessRefused,
+				fmt.Sprintf("user %s can only connect via localhost", user.Username), 10, 40)
 			return fmt.Errorf("user %s can only connect via localhost", user.Username)
 		}
 	} else if conn.User != nil {
@@ -208,8 +228,8 @@ func (s *Server) processConnectionOpen(conn *protocol.Connection, frame *protoco
 				s.Log.Warn("Loopback restriction violated",
 					zap.String("connection_id", conn.ID),
 					zap.String("username", user.Username))
-				s.sendConnectionClose(conn, amqperrors.AccessRefused, "ACCESS_REFUSED",
-					fmt.Sprintf("user %s can only connect via localhost", user.Username))
+				s.sendConnectionClose(conn, amqperrors.AccessRefused,
+					fmt.Sprintf("user %s can only connect via localhost", user.Username), 10, 40)
 				return fmt.Errorf("user %s can only connect via localhost", user.Username)
 			}
 		}
@@ -247,7 +267,7 @@ func (s *Server) handleConnectionStartOK(conn *protocol.Connection, payload []by
 		s.Log.Error("Failed to parse connection.start-ok",
 			zap.String("connection_id", conn.ID),
 			zap.Error(err))
-		return s.sendConnectionClose(conn, 503, "COMMAND_INVALID", "Failed to parse connection.start-ok")
+		return s.sendConnectionClose(conn, 503, "Failed to parse connection.start-ok", 10, 11)
 	}
 
 	s.Log.Debug("Connection.start-ok parsed",
@@ -257,54 +277,58 @@ func (s *Server) handleConnectionStartOK(conn *protocol.Connection, payload []by
 
 	// Check if authentication is enabled
 	if s.Config != nil && !s.Config.Security.AuthenticationEnabled {
-		// Authentication disabled, allow connection
+		// Authentication disabled, allow connection as guest
 		conn.Username = "guest"
 		s.Log.Info("Authentication disabled, allowing connection as guest",
 			zap.String("connection_id", conn.ID))
 		return nil
 	}
 
-	// Perform authentication if authenticator is available
-	if s.Authenticator != nil && s.MechanismRegistry != nil {
-		// Get the mechanism
-		mechanism, err := s.MechanismRegistry.Get(startOK.Mechanism)
-		if err != nil {
-			s.Log.Warn("Unsupported authentication mechanism",
-				zap.String("connection_id", conn.ID),
-				zap.String("mechanism", startOK.Mechanism),
-				zap.Error(err))
-			return s.sendConnectionClose(conn, 403, "ACCESS_REFUSED", fmt.Sprintf("Unsupported mechanism: %s", startOK.Mechanism))
-		}
-
-		// Authenticate using the mechanism
-		userInterface, err := mechanism.Authenticate(startOK.Response, s.Authenticator)
-		if err != nil {
-			s.Log.Warn("Authentication failed",
-				zap.String("connection_id", conn.ID),
-				zap.String("mechanism", startOK.Mechanism),
-				zap.Error(err))
-			return s.sendConnectionClose(conn, 403, "ACCESS_REFUSED", "Authentication failed")
-		}
-
-		// Extract username from authenticated user
-		if user, ok := userInterface.(*interfaces.User); ok {
-			conn.Username = user.Username
-			conn.User = user
-			s.Log.Info("User authenticated successfully",
-				zap.String("connection_id", conn.ID),
-				zap.String("username", user.Username),
-				zap.String("mechanism", startOK.Mechanism))
-		} else {
-			conn.Username = "authenticated"
-			s.Log.Info("Authentication successful",
-				zap.String("connection_id", conn.ID),
-				zap.String("mechanism", startOK.Mechanism))
-		}
-	} else {
-		// No authenticator configured, allow connection as guest
-		conn.Username = "guest"
-		s.Log.Info("No authenticator configured, allowing connection as guest",
+	// Fail-closed: if auth is enabled but no authenticator or mechanism registry,
+	// do NOT fall through to guest — refuse the connection.
+	if s.Authenticator == nil || s.MechanismRegistry == nil {
+		s.Log.Error("Authentication enabled but authenticator or mechanism registry is nil",
 			zap.String("connection_id", conn.ID))
+		return s.sendConnectionClose(conn, amqperrors.InternalError,
+			"authentication enabled but no authenticator configured", 10, 11)
+	}
+
+	// Get the mechanism
+	mechanism, err := s.MechanismRegistry.Get(startOK.Mechanism)
+	if err != nil {
+		s.Log.Warn("Unsupported authentication mechanism",
+			zap.String("connection_id", conn.ID),
+			zap.String("mechanism", startOK.Mechanism),
+			zap.Error(err))
+		return s.sendConnectionClose(conn, 403,
+			fmt.Sprintf("Unsupported mechanism: %s", startOK.Mechanism), 10, 11)
+	}
+
+	// Authenticate using the mechanism
+	userInterface, err := mechanism.Authenticate(startOK.Response, s.Authenticator)
+	if err != nil {
+		s.Log.Warn("Authentication failed",
+			zap.String("connection_id", conn.ID),
+			zap.String("mechanism", startOK.Mechanism),
+			zap.Error(err))
+		_ = s.sendConnectionClose(conn, 403,
+			"Authentication failed", 10, 11)
+		return fmt.Errorf("authentication failed: %w", err)
+	}
+
+	// Extract username from authenticated user
+	if user, ok := userInterface.(*interfaces.User); ok {
+		conn.Username = user.Username
+		conn.User = user
+		s.Log.Info("User authenticated successfully",
+			zap.String("connection_id", conn.ID),
+			zap.String("username", user.Username),
+			zap.String("mechanism", startOK.Mechanism))
+	} else {
+		conn.Username = "authenticated"
+		s.Log.Info("Authentication successful",
+			zap.String("connection_id", conn.ID),
+			zap.String("mechanism", startOK.Mechanism))
 	}
 
 	return nil
@@ -318,9 +342,12 @@ func (s *Server) processConnectionMethod(conn *protocol.Connection, methodID uin
 		s.Log.Debug("Received connection.start-ok", zap.String("connection_id", conn.ID))
 		return s.handleConnectionStartOK(conn, payload)
 	case protocol.ConnectionTuneOK: // Method ID 31 for connection class
-		// Process connection.tune-ok
 		s.Log.Debug("Received connection.tune-ok", zap.String("connection_id", conn.ID))
 		return nil
+	case protocol.ConnectionSecureOK: // Method ID 21 — multi-step SASL not supported
+		s.Log.Warn("Received unexpected connection.secure-ok (multi-step SASL not supported)",
+			zap.String("connection_id", conn.ID))
+		return s.sendConnectionClose(conn, 503, "COMMAND_INVALID - multi-step SASL not supported", 10, 21)
 	case protocol.ConnectionOpenOK: // Method ID 41 for connection class
 		// Process connection.open-ok
 		s.Log.Debug("Received connection.open-ok", zap.String("connection_id", conn.ID))
@@ -328,8 +355,11 @@ func (s *Server) processConnectionMethod(conn *protocol.Connection, methodID uin
 	case protocol.ConnectionClose: // Method ID 50 for connection class
 		// Process connection.close
 		s.Log.Info("Received connection.close", zap.String("connection_id", conn.ID))
-		// Send connection.close-ok and close the connection
-		return s.sendConnectionCloseOK(conn)
+		if err := s.sendConnectionCloseOK(conn); err != nil {
+			s.Log.Error("Failed to send connection.close-ok", zap.Error(err))
+		}
+		conn.Closed.Store(true)
+		return errClientRequestedClose
 	default:
 		s.Log.Warn("Unknown connection method ID",
 			zap.Uint16("method_id", methodID),
@@ -339,12 +369,12 @@ func (s *Server) processConnectionMethod(conn *protocol.Connection, methodID uin
 }
 
 // sendConnectionClose sends the connection.close method frame
-func (s *Server) sendConnectionClose(conn *protocol.Connection, replyCode uint16, replyText, classMethod string) error {
+func (s *Server) sendConnectionClose(conn *protocol.Connection, replyCode uint16, replyText string, classID, methodID uint16) error {
 	closeMethod := &protocol.ConnectionCloseMethod{
 		ReplyCode: replyCode,
 		ReplyText: replyText,
-		ClassID:   0, // Set based on classMethod if needed
-		MethodID:  0, // Set based on classMethod if needed
+		ClassID:   classID,
+		MethodID:  methodID,
 	}
 
 	methodData, err := closeMethod.Serialize()

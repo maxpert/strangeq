@@ -5,6 +5,7 @@ import (
 
 	"github.com/maxpert/amqp-go/interfaces"
 	"github.com/maxpert/amqp-go/protocol"
+	"github.com/stretchr/testify/require"
 )
 
 func TestP3_RingBufferSizeFromConfig(t *testing.T) {
@@ -16,7 +17,8 @@ func TestP3_RingBufferSizeFromConfig(t *testing.T) {
 		SpillThresholdPercent: 75,
 	}
 
-	ds := NewDisruptorStorageWithEngineConfig(t.TempDir(), 5000, ec)
+	ds, err := NewDisruptorStorageWithEngineConfig(t.TempDir(), 5000, ec)
+	require.NoError(t, err)
 
 	ring := ds.getOrCreateQueueRing("test-queue-p3")
 
@@ -39,7 +41,8 @@ func TestP3_RingBufferMaskWorks(t *testing.T) {
 		SpillThresholdPercent: 80,
 	}
 
-	ds := NewDisruptorStorageWithEngineConfig(t.TempDir(), 5000, ec)
+	ds, err := NewDisruptorStorageWithEngineConfig(t.TempDir(), 5000, ec)
+	require.NoError(t, err)
 
 	msg := &protocol.Message{
 		DeliveryTag:  uint64(customSize),
@@ -68,7 +71,8 @@ func TestP3_DefaultsWhenConfigZero(t *testing.T) {
 
 	ec := interfaces.EngineConfig{}
 
-	ds := NewDisruptorStorageWithEngineConfig(t.TempDir(), 5000, ec)
+	ds, err := NewDisruptorStorageWithEngineConfig(t.TempDir(), 5000, ec)
+	require.NoError(t, err)
 
 	if ds.ringBufferSize != DefaultRingBufferSize {
 		t.Errorf("default ring size: got %d, want %d", ds.ringBufferSize, DefaultRingBufferSize)
@@ -90,7 +94,8 @@ func TestP3_SpillThresholdAtCorrectPercent(t *testing.T) {
 		SpillThresholdPercent: 50,
 	}
 
-	ds := NewDisruptorStorageWithEngineConfig(t.TempDir(), 5000, ec)
+	ds, err := NewDisruptorStorageWithEngineConfig(t.TempDir(), 5000, ec)
+	require.NoError(t, err)
 	defer ds.Close()
 
 	expectedSpill := uint64(customSize) * 50 / 100

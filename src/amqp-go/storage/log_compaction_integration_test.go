@@ -37,7 +37,8 @@ func TestLogCompaction_FullLifecycle(t *testing.T) {
 	totalMessages := messagesPerQueue * len(queues)
 
 	// === Step 1: Create DisruptorStorage with custom config ===
-	ds := NewDisruptorStorageWithEngineConfig(tmpDir, 5*time.Second, engineCfg)
+	ds, err := NewDisruptorStorageWithEngineConfig(tmpDir, 5*time.Second, engineCfg)
+	require.NoError(t, err)
 	require.NotNil(t, ds)
 	require.NotNil(t, ds.wal, "WAL manager should be initialized")
 	require.NotNil(t, ds.segments, "Segment manager should be initialized")
@@ -174,7 +175,8 @@ func TestLogCompaction_FullLifecycle(t *testing.T) {
 	ds.Close()
 
 	// Reopen with same config
-	ds2 := NewDisruptorStorageWithEngineConfig(tmpDir, 5*time.Second, engineCfg)
+	ds2, err := NewDisruptorStorageWithEngineConfig(tmpDir, 5*time.Second, engineCfg)
+	require.NoError(t, err)
 	require.NotNil(t, ds2)
 	require.NotNil(t, ds2.wal)
 
@@ -364,7 +366,8 @@ func TestLogCompaction_TierFallback(t *testing.T) {
 		WALChannelBuffer:  5000,
 	}
 
-	ds := NewDisruptorStorageWithEngineConfig(tmpDir, 5*time.Second, engineCfg)
+	ds, err := NewDisruptorStorageWithEngineConfig(tmpDir, 5*time.Second, engineCfg)
+	require.NoError(t, err)
 	require.NotNil(t, ds)
 
 	queue := "tier_test"
@@ -378,7 +381,7 @@ func TestLogCompaction_TierFallback(t *testing.T) {
 		DeliveryMode: 2,
 		DeliveryTag:  42,
 	}
-	err := ds.StoreMessage(queue, msg)
+	err = ds.StoreMessage(queue, msg)
 	require.NoError(t, err)
 	time.Sleep(50 * time.Millisecond)
 

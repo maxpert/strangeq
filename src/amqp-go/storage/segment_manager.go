@@ -6,6 +6,8 @@ import (
 	"hash/crc32"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -86,10 +88,6 @@ type QueueSegments struct {
 	// Compaction state
 	lastCompaction time.Time
 	compactionMux  sync.Mutex
-
-	// Checkpoint state
-	lastCheckpoint       time.Time
-	lastCheckpointOffset uint64
 
 	// Metrics collector
 	metrics SegmentMetrics
@@ -419,14 +417,16 @@ func (sm *SegmentManager) getOrCreateQueueSegments(queueName string) *QueueSegme
 		metrics:        sm.metrics,
 	}
 
+	// Load existing segments before opening a new active segment
+	segments.loadExistingSegments()
+
 	// Create first segment
 	if err := segments.openNextSegment(); err != nil {
 		return nil
 	}
 
 	// Start background goroutines
-	segments.wg.Add(3)
-	go segments.checkpointLoop()
+	segments.wg.Add(2)
 	go segments.compactionLoop()
 	go segments.batchAckLoop()
 
@@ -616,26 +616,6 @@ func (qs *QueueSegments) openNextSegmentLocked() error {
 	return nil
 }
 
-// checkpointLoop periodically checkpoints WAL to segments
-func (qs *QueueSegments) checkpointLoop() {
-	defer qs.wg.Done()
-
-	ticker := time.NewTicker(qs.cfg.CheckpointInterval)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ticker.C:
-			// Phase 6C will implement actual checkpointing from WAL
-			// For now, this is a placeholder
-			qs.lastCheckpoint = time.Now()
-
-		case <-qs.stopChan:
-			return
-		}
-	}
-}
-
 // compactionLoop periodically checks if compaction is needed
 func (qs *QueueSegments) compactionLoop() {
 	defer qs.wg.Done()
@@ -778,6 +758,195 @@ func (qs *QueueSegments) writeIndexToDisk(segmentNum uint64, index *SegmentIndex
 	}
 
 	return file.Sync()
+}
+
+func (qs *QueueSegments) loadExistingSegments() {
+	entries, err := os.ReadDir(qs.dataDir)
+	if err != nil {
+		return
+	}
+
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), SegmentFileExtension) {
+			continue
+		}
+
+		name := strings.TrimSuffix(entry.Name(), SegmentFileExtension)
+		segmentNum, err := strconv.ParseUint(name, 10, 64)
+		if err != nil {
+			continue
+		}
+
+		segPath := filepath.Join(qs.dataDir, entry.Name())
+		_ = qs.loadSegmentFile(segmentNum, segPath)
+	}
+}
+
+func (qs *QueueSegments) loadSegmentFile(segmentNum uint64, segPath string) error {
+	file, err := os.OpenFile(segPath, os.O_RDWR, 0644)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+
+	stat, err := file.Stat()
+	if err != nil {
+		return err
+	}
+	fileSize := stat.Size()
+
+	index := make(map[uint64]int64)
+	var minOffset, maxOffset uint64
+	var messageCount uint64
+	var pos int64
+
+	for {
+		if pos+8 > fileSize {
+			break
+		}
+
+		header := make([]byte, 8)
+		if _, err := file.ReadAt(header, pos); err != nil {
+			break
+		}
+
+		storedCRC := binary.BigEndian.Uint32(header[0:4])
+		dataLen := binary.BigEndian.Uint32(header[4:8])
+
+		if pos+8+int64(dataLen) > fileSize {
+			break
+		}
+
+		data := make([]byte, dataLen)
+		if _, err := file.ReadAt(data, pos+8); err != nil {
+			break
+		}
+
+		crcData := make([]byte, 4+dataLen)
+		copy(crcData[0:4], header[4:8])
+		copy(crcData[4:], data)
+		if crc32.ChecksumIEEE(crcData) != storedCRC {
+			break
+		}
+
+		if len(data) < 4 {
+			break
+		}
+		queueLen := binary.BigEndian.Uint32(data[0:4])
+		offStart := 4 + int(queueLen)
+		if offStart+8 > len(data) {
+			break
+		}
+		offset := binary.BigEndian.Uint64(data[offStart : offStart+8])
+
+		index[offset] = pos
+		if minOffset == 0 || offset < minOffset {
+			minOffset = offset
+		}
+		if offset > maxOffset {
+			maxOffset = offset
+		}
+		messageCount++
+		pos += 8 + int64(dataLen)
+	}
+
+	if pos < fileSize {
+		_ = file.Truncate(pos)
+	}
+
+	readFile, err := os.Open(segPath)
+	if err != nil {
+		return err
+	}
+
+	seg := &SegmentFile{
+		segmentNum: segmentNum,
+		path:       segPath,
+		indexPath:  filepath.Join(qs.dataDir, fmt.Sprintf("%020d%s", segmentNum, SegmentIndexFileExtension)),
+		file:       readFile,
+		index:      index,
+		minOffset:  minOffset,
+		maxOffset:  maxOffset,
+	}
+	seg.messageCount.Store(messageCount)
+	seg.fileSize.Store(pos)
+
+	qs.sealedMutex.Lock()
+	qs.sealedSegments[segmentNum] = seg
+	qs.sealedMutex.Unlock()
+
+	return nil
+}
+
+func (qs *QueueSegments) collectAllMessages() []*RecoveryMessage {
+	var messages []*RecoveryMessage
+
+	qs.sealedMutex.RLock()
+	for _, seg := range qs.sealedSegments {
+		seg.mutex.RLock()
+		for offset, position := range seg.index {
+			msg, err := readSegmentMessageAt(seg.file, position)
+			if err == nil {
+				messages = append(messages, &RecoveryMessage{
+					QueueName: qs.queueName,
+					Offset:    offset,
+					Message:   msg,
+				})
+			}
+		}
+		seg.mutex.RUnlock()
+	}
+	qs.sealedMutex.RUnlock()
+
+	qs.mutex.Lock()
+	currentSeg := qs.currentSegment
+	currentIdx := qs.currentIndex
+	qs.mutex.Unlock()
+
+	if currentSeg != nil && currentIdx != nil {
+		currentIdx.mutex.RLock()
+		for offset, position := range currentIdx.entries {
+			msg, err := readSegmentMessageAt(currentSeg.file, position)
+			if err == nil {
+				messages = append(messages, &RecoveryMessage{
+					QueueName: qs.queueName,
+					Offset:    offset,
+					Message:   msg,
+				})
+			}
+		}
+		currentIdx.mutex.RUnlock()
+	}
+
+	return messages
+}
+
+func (sm *SegmentManager) RecoverFromSegments() (map[string][]*RecoveryMessage, error) {
+	result := make(map[string][]*RecoveryMessage)
+
+	entries, err := os.ReadDir(sm.dataDir)
+	if err != nil {
+		return result, nil
+	}
+
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+
+		queueName := entry.Name()
+		qs := sm.getOrCreateQueueSegments(queueName)
+		if qs == nil {
+			continue
+		}
+
+		messages := qs.collectAllMessages()
+		if len(messages) > 0 {
+			result[queueName] = messages
+		}
+	}
+
+	return result, nil
 }
 
 // close stops background goroutines and closes files

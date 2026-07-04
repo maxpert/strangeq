@@ -11,12 +11,14 @@ import (
 
 // MockExecutor implements TransactionExecutor for testing
 type MockExecutor struct {
-	publishes []PublishCall
-	acks      []AckCall
-	nacks     []NackCall
-	rejects   []RejectCall
-	fail      bool
-	failOn    string
+	publishes        []PublishCall
+	acks             []AckCall
+	nacks            []NackCall
+	rejects          []RejectCall
+	fail             bool
+	failOn           string
+	failOnNthPublish int
+	publishCount     int
 }
 
 type PublishCall struct {
@@ -47,6 +49,12 @@ type RejectCall struct {
 func (m *MockExecutor) ExecutePublish(exchange, routingKey string, message *protocol.Message) error {
 	if m.fail && m.failOn == "publish" {
 		return assert.AnError
+	}
+	if m.failOnNthPublish > 0 {
+		m.publishCount++
+		if m.publishCount == m.failOnNthPublish {
+			return assert.AnError
+		}
 	}
 	m.publishes = append(m.publishes, PublishCall{
 		Exchange:   exchange,
@@ -100,6 +108,8 @@ func (m *MockExecutor) Reset() {
 	m.rejects = nil
 	m.fail = false
 	m.failOn = ""
+	m.failOnNthPublish = 0
+	m.publishCount = 0
 }
 
 func TestNewTransactionManager(t *testing.T) {
@@ -310,10 +320,10 @@ func TestTransactionManagerCommitFailure(t *testing.T) {
 	assert.Error(t, err)
 	assert.Contains(t, err.Error(), "failed to commit transaction")
 
-	// Operations should still be pending
+	// After failed Commit, operations are cleared (new contract: unconditional cleanup)
 	operations, err := tm.GetPendingOperations(channelID)
 	assert.NoError(t, err)
-	assert.Len(t, operations, 1)
+	assert.Empty(t, operations)
 }
 
 func TestTransactionManagerClose(t *testing.T) {

@@ -8,6 +8,15 @@ import (
 	"go.uber.org/zap"
 )
 
+func isSupportedExchangeType(kind string) bool {
+	switch kind {
+	case "direct", "fanout", "topic", "headers":
+		return true
+	default:
+		return false
+	}
+}
+
 // processExchangeMethod handles exchange-related methods
 func (s *Server) processExchangeMethod(conn *protocol.Connection, channelID uint16, methodID uint16, payload []byte) error {
 	switch methodID {
@@ -60,7 +69,6 @@ func (s *Server) handleExchangeDeclare(conn *protocol.Connection, channelID uint
 			40, 10)
 	}
 
-	// Authorization check: exchange.declare requires configure permission on exchange
 	if err := s.authorize(conn, channelID, interfaces.Operation{
 		Action:       interfaces.ActionConfigure,
 		ResourceType: interfaces.ResourceExchange,
@@ -70,7 +78,11 @@ func (s *Server) handleExchangeDeclare(conn *protocol.Connection, channelID uint
 		return s.authzChannelError(conn, channelID, err, 40, 10)
 	}
 
-	// Call the broker to declare the exchange
+	if !declareMethod.Passive && !isSupportedExchangeType(declareMethod.Type) {
+		s.sendConnectionClose(conn, 503, "COMMAND_INVALID - unsupported exchange type", 40, 10)
+		return fmt.Errorf("unsupported exchange type: %s", declareMethod.Type)
+	}
+
 	err = s.Broker.DeclareExchange(
 		declareMethod.Exchange,
 		declareMethod.Type,
@@ -87,12 +99,14 @@ func (s *Server) handleExchangeDeclare(conn *protocol.Connection, channelID uint
 		return err
 	}
 
-	// Record exchange declared metric
 	if s.MetricsCollector != nil {
 		s.MetricsCollector.RecordExchangeDeclared()
 	}
 
-	// Send exchange.declare-ok response
+	if declareMethod.NoWait {
+		return nil
+	}
+
 	return s.sendExchangeDeclareOK(conn, channelID)
 }
 

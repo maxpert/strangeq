@@ -16,6 +16,10 @@ type RecoveryManager struct {
 	logger  *zap.Logger
 }
 
+type deliveryTagCounterLoader interface {
+	LoadDeliveryTagCounter() (uint64, error)
+}
+
 // NewRecoveryManager creates a new recovery manager
 func NewRecoveryManager(storage interfaces.Storage, broker UnifiedBroker, logger *zap.Logger) *RecoveryManager {
 	return &RecoveryManager{
@@ -240,17 +244,14 @@ func (r *RecoveryManager) recoverPersistentMessages(stats *protocol.RecoveryStat
 		// claimable immediately; gaps (tags acked before restart) are
 		// skipped at delivery time via the GetMessage-not-found path.
 		var minTag, maxTag uint64
+		var queueCount uint64
 		hasRecovered := false
 		for _, message := range messages {
-			// Track highest delivery tag for globalDeliveryTag restoration
 			if message.DeliveryTag > maxDeliveryTag {
 				maxDeliveryTag = message.DeliveryTag
 			}
 
-			// Only recover messages with DeliveryMode=2 (persistent)
 			if message.DeliveryMode == 2 {
-				// Load message directly into ring buffer WITHOUT re-writing to WAL
-				// Messages are already in WAL, we're loading FROM WAL into memory
 				err := r.storage.LoadMessageFromRecovery(queueName, message)
 				if err != nil {
 					r.logger.Error("Failed to load recovered message into ring buffer",
@@ -268,16 +269,22 @@ func (r *RecoveryManager) recoverPersistentMessages(stats *protocol.RecoveryStat
 						maxTag = message.DeliveryTag
 					}
 					hasRecovered = true
+					queueCount++
 					r.logger.Debug("Loaded recovered message into ring buffer",
 						zap.String("queue", queueName),
 						zap.Uint64("delivery_tag", message.DeliveryTag))
 				}
 			}
 		}
-		// Initialize the queue's dispatch cursor from the recovered range
-		// so consumers can claim [minTag, maxTag] as soon as they register.
 		if hasRecovered {
-			r.broker.RecoverQueue(queueName, minTag, maxTag)
+			r.broker.RecoverQueue(queueName, minTag, maxTag, queueCount)
+		}
+	}
+
+	if loader, ok := r.storage.(deliveryTagCounterLoader); ok {
+		persistedTag, err := loader.LoadDeliveryTagCounter()
+		if err == nil && persistedTag > maxDeliveryTag {
+			maxDeliveryTag = persistedTag
 		}
 	}
 

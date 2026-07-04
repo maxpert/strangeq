@@ -3,12 +3,18 @@ package protocol
 import (
 	"crypto/rand"
 	"fmt"
-	mrand "math/rand"
 	"net"
 	"sync"
 	"sync/atomic"
 	"time"
 )
+
+var idFallbackCounter atomic.Uint64
+
+func fallbackID(prefix string) string {
+	n := idFallbackCounter.Add(1)
+	return fmt.Sprintf("%s.%d.%d", prefix, time.Now().UnixNano(), n)
+}
 
 // Connection represents an AMQP connection
 type Connection struct {
@@ -27,11 +33,21 @@ type Connection struct {
 	Closed         atomic.Bool   // Atomic flag for connection closure
 	ConsumersDirty atomic.Bool   // Set when consumers are added/removed; delivery loop re-scans only when true
 	Blocked        atomic.Bool   // Back-pressure flag: true when queue usage > 90%, false when < 80%
+
+	// Negotiated connection parameters (set during handshake)
+	MaxFrameSize uint32        // Maximum frame size negotiated with client (0 = unlimited)
+	MaxChannels  uint16        // Maximum channels negotiated with client (0 = unlimited)
+	HeartbeatSec atomic.Uint32 // Negotiated heartbeat interval in seconds (0 = disabled)
+	ChannelCount atomic.Int32  // Current number of open channels on this connection
+
+	// Connection metadata for stats/reporting
+	ConnectedAt  time.Time    // When the connection was established
+	LastActivity atomic.Int64 // UnixNano of last activity (updated on frame read/write)
 }
 
 // NewConnection creates a new AMQP connection
 func NewConnection(conn net.Conn) *Connection {
-	return &Connection{
+	c := &Connection{
 		ID:   generateID(),
 		Conn: conn,
 		// Channels: sync.Map needs no initialization
@@ -39,7 +55,20 @@ func NewConnection(conn net.Conn) *Connection {
 		FrameQueue:      make(chan *Frame, 10000), // 10K frame buffer for reader/processor separation
 		AckQueue:        make(chan *Frame, 4096),  // 4K ACK buffer for off-processor ACK handling
 		Done:            make(chan struct{}),
+		ConnectedAt:     time.Now(),
 	}
+	c.TouchActivity()
+	return c
+}
+
+// TouchActivity updates the last-activity timestamp to now.
+func (c *Connection) TouchActivity() {
+	c.LastActivity.Store(time.Now().UnixNano())
+}
+
+// GetLastActivity returns the last-activity timestamp.
+func (c *Connection) GetLastActivity() time.Time {
+	return time.Unix(0, c.LastActivity.Load())
 }
 
 // Channel represents an AMQP channel
@@ -208,11 +237,7 @@ func generateID() string {
 	b := make([]byte, 16)
 	_, err := rand.Read(b)
 	if err != nil {
-		// This shouldn't happen in practice, but if it does, we'll use a simple fallback
-		// Seed the math/rand package to ensure it generates different values
-		mrand.Seed(time.Now().UnixNano())
-		fallbackID := mrand.Int63()
-		return fmt.Sprintf("conn-%d", fallbackID)
+		return fallbackID("conn")
 	}
 
 	return fmt.Sprintf("%x", b)
@@ -227,8 +252,7 @@ func GenerateQueueName() string {
 	b := make([]byte, 16)
 	_, err := rand.Read(b)
 	if err != nil {
-		mrand.Seed(time.Now().UnixNano())
-		return fmt.Sprintf("amq.gen.%d", mrand.Int63())
+		return fallbackID("amq.gen")
 	}
 	return "amq.gen." + fmt.Sprintf("%x", b)
 }

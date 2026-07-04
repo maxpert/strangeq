@@ -12,6 +12,8 @@ amqp-server
 /bin
 /benchmark/benchmark
 /benchmark/perftest
+/cmd/crash_test_tool/crash_test_tool
+/crash_test_tool
 
 # Go
 *.test

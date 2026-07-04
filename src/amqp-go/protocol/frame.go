@@ -71,6 +71,10 @@ func (f *Frame) UnmarshalBinary(data []byte) error {
 
 // ReadFrame reads a frame from an io.Reader
 func ReadFrame(reader io.Reader) (*Frame, error) {
+	return ReadFrameWithLimit(reader, MaxInboundFrameSize)
+}
+
+func ReadFrameWithLimit(reader io.Reader, maxSize uint32) (*Frame, error) {
 	// Read the frame header (first 7 bytes: type, channel, size)
 	header := make([]byte, 7)
 	_, err := io.ReadFull(reader, header)
@@ -81,6 +85,10 @@ func ReadFrame(reader io.Reader) (*Frame, error) {
 	frameType := header[0]
 	channel := binary.BigEndian.Uint16(header[1:3])
 	size := binary.BigEndian.Uint32(header[3:7])
+
+	if size > maxSize {
+		return nil, fmt.Errorf("frame size %d exceeds max %d", size, maxSize)
+	}
 
 	// Read the payload + end-byte
 	payload := make([]byte, size+1) // +1 for end-byte
@@ -136,10 +144,7 @@ func WriteFrame(writer io.Writer, frame *Frame) error {
 // WriteFrameToConnection writes a frame to a connection with mutex protection for thread-safe writes.
 // This should be used when writing to a *Connection to ensure thread-safety.
 func WriteFrameToConnection(conn *Connection, frame *Frame) error {
-	// Lock for thread-safe socket writes
 	conn.WriteMutex.Lock()
 	defer conn.WriteMutex.Unlock()
-
-	// Write the frame using the optimized writer
 	return WriteFrame(conn.Conn, frame)
 }

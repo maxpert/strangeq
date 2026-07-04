@@ -101,7 +101,7 @@ func (b *ackTestBroker) DeleteExchange(name string, ifUnused bool) error { retur
 func (b *ackTestBroker) DeclareQueue(name string, durable, autoDelete, exclusive bool, arguments map[string]interface{}) (*protocol.Queue, error) {
 	return &protocol.Queue{Name: name}, nil
 }
-func (b *ackTestBroker) DeleteQueue(name string, ifUnused, ifEmpty bool) error { return nil }
+func (b *ackTestBroker) DeleteQueue(name string, ifUnused, ifEmpty bool) (int, error) { return 0, nil }
 func (b *ackTestBroker) BindQueue(queueName, exchangeName, routingKey string, arguments map[string]interface{}) error {
 	return nil
 }
@@ -172,7 +172,7 @@ func (b *ackTestBroker) GetConsumerForDelivery(deliveryTag uint64) (string, bool
 	return tag, ok
 }
 
-func (b *ackTestBroker) RecoverQueue(queueName string, minTag, maxTag uint64)        {}
+func (b *ackTestBroker) RecoverQueue(queueName string, minTag, maxTag, count uint64) {}
 func (b *ackTestBroker) AdvanceDeliveryTag(tag uint64)                               {}
 func (b *ackTestBroker) RebuildDeliveryIndex(deliveryTag uint64, consumerTag string) {}
 func (b *ackTestBroker) GetMessageForGet(queueName string, noAck bool) (*protocol.Message, uint64, uint32, error) {
@@ -183,11 +183,12 @@ func (b *ackTestBroker) AcknowledgeGetDelivery(deliveryTag uint64) error { retur
 func (b *ackTestBroker) RejectGetDelivery(deliveryTag uint64, requeue bool) error {
 	return nil
 }
-func (b *ackTestBroker) NackGetDelivery(deliveryTag uint64, requeue bool) error { return nil }
-func (b *ackTestBroker) RequeueAllGetDeliveries()                               {}
-func (b *ackTestBroker) GetQueues() map[string]*protocol.Queue                  { return nil }
-func (b *ackTestBroker) GetExchanges() map[string]*protocol.Exchange            { return nil }
-func (b *ackTestBroker) GetConsumers() map[string]*protocol.Consumer            { return nil }
+func (b *ackTestBroker) NackGetDelivery(deliveryTag uint64, requeue bool) error          { return nil }
+func (b *ackTestBroker) RequeueAllGetDeliveries()                                        {}
+func (b *ackTestBroker) GetQueues() map[string]*protocol.Queue                           { return nil }
+func (b *ackTestBroker) GetExchanges() map[string]*protocol.Exchange                     { return nil }
+func (b *ackTestBroker) GetConsumers() map[string]*protocol.Consumer                     { return nil }
+func (b *ackTestBroker) UpdateConsumerPrefetch(consumerTag string, prefetchCount uint16) {}
 
 func newAckTestServer(broker *ackTestBroker) *Server {
 	return &Server{

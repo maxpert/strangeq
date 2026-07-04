@@ -41,7 +41,7 @@ func TestDispatch_FIFOClaimOrder(t *testing.T) {
 			qs.Publish(i)
 		}
 		for want := uint64(0); want < 5; want++ {
-			tag, ok := qs.Claim(stop, testTimer(qs))
+			tag, _, ok := qs.Claim(stop, testTimer(qs))
 			if !ok {
 				t.Fatalf("Claim %d returned !ok", want)
 			}
@@ -77,7 +77,7 @@ func TestDispatch_CompetingConsumersDistinct(t *testing.T) {
 					if atomic.LoadInt64(&claims) <= 0 {
 						return
 					}
-					tag, ok := qs.Claim(stop, testTimer(qs))
+					tag, _, ok := qs.Claim(stop, testTimer(qs))
 					if !ok {
 						return
 					}
@@ -117,7 +117,7 @@ func TestDispatch_ParkWake(t *testing.T) {
 
 		gotTag := make(chan uint64, 1)
 		go func() {
-			tag, ok := qs.Claim(stop, testTimer(qs))
+			tag, _, ok := qs.Claim(stop, testTimer(qs))
 			if !ok {
 				gotTag <- ^uint64(0)
 				return
@@ -155,7 +155,7 @@ func TestDispatch_ParkWakeMultiple(t *testing.T) {
 		got := make(chan uint64, consumers)
 		for i := 0; i < consumers; i++ {
 			go func() {
-				tag, ok := qs.Claim(stop, testTimer(qs))
+				tag, _, ok := qs.Claim(stop, testTimer(qs))
 				if !ok {
 					got <- ^uint64(0)
 					return
@@ -193,7 +193,7 @@ func TestDispatch_ClaimStopPrecheck(t *testing.T) {
 
 		done := make(chan struct{})
 		go func() {
-			if _, ok := qs.Claim(stop, testTimer(qs)); ok {
+			if _, _, ok := qs.Claim(stop, testTimer(qs)); ok {
 				t.Error("expected !ok when stop already closed")
 			}
 			close(done)
@@ -215,7 +215,7 @@ func TestDispatch_WakeAllUnblocksParked(t *testing.T) {
 
 		done := make(chan struct{})
 		go func() {
-			if _, ok := qs.Claim(stop, testTimer(qs)); ok {
+			if _, _, ok := qs.Claim(stop, testTimer(qs)); ok {
 				t.Error("expected !ok after WakeAll+stopped")
 			}
 			close(done)
@@ -242,27 +242,31 @@ func TestDispatch_RequeuePreservesTagAndFIFO(t *testing.T) {
 		for i := uint64(0); i < 3; i++ {
 			qs.Publish(i)
 		}
-		t0, _ := qs.Claim(stop, testTimer(qs))
-		t1, _ := qs.Claim(stop, testTimer(qs))
-		t2, _ := qs.Claim(stop, testTimer(qs))
+		t0, _, _ := qs.Claim(stop, testTimer(qs))
+		t1, _, _ := qs.Claim(stop, testTimer(qs))
+		t2, _, _ := qs.Claim(stop, testTimer(qs))
 		if t0 != 0 || t1 != 1 || t2 != 2 {
 			t.Fatalf("initial claims %d,%d,%d want 0,1,2", t0, t1, t2)
 		}
 
+		qs.ClaimInflight(0)
+		qs.ClaimInflight(1)
+		qs.ClaimInflight(2)
+
 		qs.Requeue(1)
 		qs.Requeue(2)
 
-		r1, ok := qs.Claim(stop, testTimer(qs))
+		r1, _, ok := qs.Claim(stop, testTimer(qs))
 		if !ok || r1 != 1 {
 			t.Errorf("first requeue claim = %d (ok=%v), want 1", r1, ok)
 		}
-		r2, ok := qs.Claim(stop, testTimer(qs))
+		r2, _, ok := qs.Claim(stop, testTimer(qs))
 		if !ok || r2 != 2 {
 			t.Errorf("second requeue claim = %d (ok=%v), want 2", r2, ok)
 		}
 
 		qs.Publish(3)
-		r3, ok := qs.Claim(stop, testTimer(qs))
+		r3, _, ok := qs.Claim(stop, testTimer(qs))
 		if !ok || r3 != 3 {
 			t.Errorf("fresh claim after requeue = %d (ok=%v), want 3", r3, ok)
 		}
@@ -280,11 +284,11 @@ func TestDispatch_RequeueWakesParked(t *testing.T) {
 			qs.Publish(i)
 		}
 		for i := uint64(0); i < 7; i++ {
-			if _, ok := qs.Claim(stop, testTimer(qs)); !ok {
+			if _, _, ok := qs.Claim(stop, testTimer(qs)); !ok {
 				t.Fatalf("warmup claim %d failed", i)
 			}
 		}
-		tag, ok := qs.Claim(stop, testTimer(qs))
+		tag, _, ok := qs.Claim(stop, testTimer(qs))
 		if !ok || tag != 7 {
 			t.Fatalf("claim = %d (ok=%v), want 7", tag, ok)
 		}
@@ -292,7 +296,7 @@ func TestDispatch_RequeueWakesParked(t *testing.T) {
 
 		got := make(chan uint64, 1)
 		go func() {
-			t2, _ := qs.Claim(stop, testTimer(qs))
+			t2, _, _ := qs.Claim(stop, testTimer(qs))
 			got <- t2
 		}()
 
@@ -316,10 +320,10 @@ func TestDispatch_RecoverRange(t *testing.T) {
 		stop, cancel := makeStop()
 		defer cancel()
 
-		qs.Recover(100, 102)
+		qs.Recover(100, 102, 3)
 
 		for want := uint64(100); want <= 102; want++ {
-			tag, ok := qs.Claim(stop, testTimer(qs))
+			tag, _, ok := qs.Claim(stop, testTimer(qs))
 			if !ok {
 				t.Fatalf("Claim %d returned !ok after Recover", want)
 			}
@@ -337,15 +341,15 @@ func TestDispatch_RecoverThenPublish(t *testing.T) {
 		stop, cancel := makeStop()
 		defer cancel()
 
-		qs.Recover(10, 10)
-		t10, _ := qs.Claim(stop, testTimer(qs))
+		qs.Recover(10, 10, 1)
+		t10, _, _ := qs.Claim(stop, testTimer(qs))
 		if t10 != 10 {
 			t.Fatalf("recovered claim = %d, want 10", t10)
 		}
 
 		got := make(chan uint64, 1)
 		go func() {
-			t2, _ := qs.Claim(stop, testTimer(qs))
+			t2, _, _ := qs.Claim(stop, testTimer(qs))
 			got <- t2
 		}()
 		<-time.After(50 * time.Millisecond)
@@ -370,8 +374,8 @@ func TestDispatch_BackpressureBlocksPublisher(t *testing.T) {
 
 		qs.Publish(0)
 		qs.Publish(1)
-		t0, _ := qs.Claim(stop, testTimer(qs))
-		t1, _ := qs.Claim(stop, testTimer(qs))
+		t0, _, _ := qs.Claim(stop, testTimer(qs))
+		t1, _, _ := qs.Claim(stop, testTimer(qs))
 		qs.ClaimInflight(t0)
 		qs.ClaimInflight(t1)
 
@@ -401,7 +405,7 @@ func TestDispatch_BackpressureStopExits(t *testing.T) {
 		stop := qs.StopCh()
 
 		qs.Publish(0)
-		t0, _ := qs.Claim(stop, testTimer(qs))
+		t0, _, _ := qs.Claim(stop, testTimer(qs))
 		qs.ClaimInflight(t0)
 
 		done := make(chan bool, 1)
@@ -437,18 +441,18 @@ func TestDispatch_DepthAccounting(t *testing.T) {
 		}
 
 		for i := uint64(0); i < 5; i++ {
-			tag, _ := qs.Claim(stop, testTimer(qs))
+			tag, _, _ := qs.Claim(stop, testTimer(qs))
 			qs.ClaimInflight(tag)
 		}
 
 		qs.AckAdvance(3)
-		if d := qs.Depth(); d > 5 {
-			t.Errorf("Depth after ack3 = %d, should not exceed 5", d)
+		if d := qs.Depth(); d != 4 {
+			t.Errorf("Depth after ack3 = %d, want 4", d)
 		}
 
 		qs.AckAdvance(0)
-		if d := qs.Depth(); d != 4 && d != 5 {
-			t.Errorf("Depth after ack0 = %d, want 4 or 5", d)
+		if d := qs.Depth(); d != 3 {
+			t.Errorf("Depth after ack0 = %d, want 3", d)
 		}
 
 		qs.AckAdvance(1)
@@ -468,7 +472,7 @@ func TestDispatch_DepthWithRequeue(t *testing.T) {
 		defer cancel()
 
 		qs.Publish(0)
-		tag, _ := qs.Claim(stop, testTimer(qs))
+		tag, _, _ := qs.Claim(stop, testTimer(qs))
 		qs.ClaimInflight(tag)
 		if d := qs.Depth(); d != 1 {
 			t.Fatalf("Depth = %d, want 1", d)
@@ -485,7 +489,7 @@ func TestDispatch_DepthWithRequeue(t *testing.T) {
 			t.Errorf("RequeueDepth = %d, want 1", qs.RequeueDepth())
 		}
 
-		tag2, _ := qs.Claim(stop, testTimer(qs))
+		tag2, _, _ := qs.Claim(stop, testTimer(qs))
 		if tag2 != tag {
 			t.Errorf("redelivered tag %d, want %d", tag2, tag)
 		}
@@ -505,7 +509,7 @@ func TestDispatch_CloseExits(t *testing.T) {
 
 		consDone := make(chan struct{})
 		go func() {
-			if _, ok := qs.Claim(stop, testTimer(qs)); ok {
+			if _, _, ok := qs.Claim(stop, testTimer(qs)); ok {
 				t.Error("Claim returned ok after Close")
 			}
 			close(consDone)
@@ -529,7 +533,7 @@ func TestDispatch_DuplicateWakesCoalesce(t *testing.T) {
 
 		got := make(chan uint64, 1)
 		go func() {
-			tag, _ := qs.Claim(stop, testTimer(qs))
+			tag, _, _ := qs.Claim(stop, testTimer(qs))
 			got <- tag
 		}()
 
@@ -586,7 +590,7 @@ func TestDispatch_ConcurrentPublishClaimRequeue(t *testing.T) {
 			go func() {
 				defer consWG.Done()
 				for {
-					tag, ok := qs.Claim(stop, testTimer(qs))
+					tag, _, ok := qs.Claim(stop, testTimer(qs))
 					if !ok {
 						return
 					}
@@ -661,7 +665,7 @@ func TestDispatch_ConcurrentPublishClaimRequeue_Race(t *testing.T) {
 			go func() {
 				defer consWG.Done()
 				for {
-					tag, ok := qs.Claim(stop, testTimer(qs))
+					tag, _, ok := qs.Claim(stop, testTimer(qs))
 					if !ok {
 						return
 					}
@@ -713,7 +717,7 @@ func TestDispatch_RequeueUnbounded(t *testing.T) {
 		}
 		tags := make([]uint64, N)
 		for i := uint64(0); i < N; i++ {
-			tag, ok := qs.Claim(stop, testTimer(qs))
+			tag, _, ok := qs.Claim(stop, testTimer(qs))
 			if !ok {
 				t.Fatalf("claim %d failed", i)
 			}
@@ -729,7 +733,7 @@ func TestDispatch_RequeueUnbounded(t *testing.T) {
 
 		seen := make(map[uint64]bool, N)
 		for i := uint64(0); i < N; i++ {
-			tag, ok := qs.Claim(stop, testTimer(qs))
+			tag, _, ok := qs.Claim(stop, testTimer(qs))
 			if !ok {
 				t.Fatalf("drain claim %d failed", i)
 			}
@@ -770,7 +774,7 @@ func TestDispatch_NoAllocOnClaim(t *testing.T) {
 				}
 			}
 			timer.Reset(qs.parkTimeout)
-			if _, ok := qs.Claim(stop, timer); !ok {
+			if _, _, ok := qs.Claim(stop, timer); !ok {
 				t.Fatal("warmup claim parked")
 			}
 		}
@@ -783,7 +787,7 @@ func TestDispatch_NoAllocOnClaim(t *testing.T) {
 				}
 			}
 			timer.Reset(qs.parkTimeout)
-			if _, ok := qs.Claim(stop, timer); !ok {
+			if _, _, ok := qs.Claim(stop, timer); !ok {
 				t.Fatal("measured claim parked")
 			}
 		})
@@ -824,7 +828,7 @@ func TestDispatch_CloseDuringClaim(t *testing.T) {
 			go func() {
 				defer wg.Done()
 				for {
-					tag, ok := qs.Claim(stop, testTimer(qs))
+					tag, _, ok := qs.Claim(stop, testTimer(qs))
 					if !ok {
 						return
 					}
@@ -851,7 +855,7 @@ func TestDispatch_AckAdvanceWakesPublisher(t *testing.T) {
 		defer cancel()
 
 		qs.Publish(0)
-		t0, _ := qs.Claim(stop, testTimer(qs))
+		t0, _, _ := qs.Claim(stop, testTimer(qs))
 		qs.ClaimInflight(t0)
 
 		unblocked := make(chan struct{})

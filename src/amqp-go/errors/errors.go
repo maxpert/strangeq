@@ -43,15 +43,9 @@ const (
 	PreconditionFailed = 406
 
 	// Channel errors
-	ContentTooLarge     = 311
-	NoRoute             = 312
-	NoConsumers         = 313
-	ConnectionForced2   = 320
-	InvalidPath2        = 402
-	AccessRefused2      = 403
-	NotFound2           = 404
-	ResourceLocked2     = 405
-	PreconditionFailed2 = 406
+	ContentTooLarge = 311
+	NoRoute         = 312
+	NoConsumers     = 313
 
 	// Frame errors
 	FrameError       = 501
@@ -393,50 +387,11 @@ func NewConfigValidationError(section, key, reason string) *ConfigError {
 
 // Helper functions for common error checking
 
-// IsConnectionError checks if an error is a ConnectionError
-func IsConnectionError(err error) bool {
-	var connErr *ConnectionError
-	return errors.As(err, &connErr)
-}
-
-// IsChannelError checks if an error is a ChannelError
-func IsChannelError(err error) bool {
-	var chanErr *ChannelError
-	return errors.As(err, &chanErr)
-}
-
-// IsNotFound checks if an error indicates a resource was not found
-func IsNotFound(err error) bool {
-	var amqpErr *AMQPError
-	if errors.As(err, &amqpErr) {
-		return amqpErr.Code == NotFound || amqpErr.Code == NotFound2
-	}
-	return false
-}
-
-// IsPreconditionFailed checks if an error indicates a precondition failed
-func IsPreconditionFailed(err error) bool {
-	var amqpErr *AMQPError
-	if errors.As(err, &amqpErr) {
-		return amqpErr.Code == PreconditionFailed || amqpErr.Code == PreconditionFailed2
-	}
-	return false
-}
-
 // IsAccessRefused checks if an error indicates access was refused
 func IsAccessRefused(err error) bool {
 	var amqpErr *AMQPError
 	if errors.As(err, &amqpErr) {
-		return amqpErr.Code == AccessRefused || amqpErr.Code == AccessRefused2
+		return amqpErr.Code == AccessRefused
 	}
 	return false
-}
-
-// GetErrorCode returns the AMQP error code if the error is an AMQPError
-func GetErrorCode(err error) int {
-	var amqpErr *AMQPError
-	if errors.As(err, &amqpErr) {
-		return amqpErr.Code
-	}
-	return 0
 }

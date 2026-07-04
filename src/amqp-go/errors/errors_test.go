@@ -321,68 +321,47 @@ func TestConfigValidationError(t *testing.T) {
 	assert.Contains(t, err.Message, "file does not exist")
 }
 
-func TestIsConnectionError(t *testing.T) {
-	connErr := NewConnectionForced("conn-123", "shutdown")
-	chanErr := NewChannelError(NotFound, "not found", "conn-123", 1)
-	genericErr := errors.New("generic error")
-
-	assert.True(t, IsConnectionError(connErr))
-	assert.False(t, IsConnectionError(chanErr))
-	assert.False(t, IsConnectionError(genericErr))
-}
-
-func TestIsChannelError(t *testing.T) {
-	chanErr := NewChannelError(NotFound, "not found", "conn-123", 1)
-	connErr := NewConnectionForced("conn-123", "shutdown")
-	genericErr := errors.New("generic error")
-
-	assert.True(t, IsChannelError(chanErr))
-	assert.False(t, IsChannelError(connErr))
-	assert.False(t, IsChannelError(genericErr))
-}
-
-func TestIsNotFound(t *testing.T) {
-	notFoundErr := NewQueueNotFound("test-queue", "basic.consume")
-	notFound2Err := &AMQPError{Code: NotFound2, Message: "not found"}
-	accessErr := NewAccessRefused("conn-123", "denied")
-	genericErr := errors.New("generic error")
-
-	assert.True(t, IsNotFound(notFoundErr))
-	assert.True(t, IsNotFound(notFound2Err))
-	assert.False(t, IsNotFound(accessErr))
-	assert.False(t, IsNotFound(genericErr))
-}
-
-func TestIsPreconditionFailed(t *testing.T) {
-	precondErr := NewQueueNotEmpty("test-queue", "queue.delete")
-	precond2Err := &AMQPError{Code: PreconditionFailed2, Message: "precondition failed"}
-	notFoundErr := NewQueueNotFound("test-queue", "basic.consume")
-	genericErr := errors.New("generic error")
-
-	assert.True(t, IsPreconditionFailed(precondErr))
-	assert.True(t, IsPreconditionFailed(precond2Err))
-	assert.False(t, IsPreconditionFailed(notFoundErr))
-	assert.False(t, IsPreconditionFailed(genericErr))
-}
-
 func TestIsAccessRefused(t *testing.T) {
 	accessErr := NewAccessRefused("conn-123", "denied")
-	access2Err := &AMQPError{Code: AccessRefused2, Message: "access denied"}
+	canonicalAccessErr := &AMQPError{Code: AccessRefused, Message: "access denied"}
 	notFoundErr := NewQueueNotFound("test-queue", "basic.consume")
 	genericErr := errors.New("generic error")
 
 	assert.True(t, IsAccessRefused(accessErr))
-	assert.True(t, IsAccessRefused(access2Err))
+	assert.True(t, IsAccessRefused(canonicalAccessErr))
 	assert.False(t, IsAccessRefused(notFoundErr))
 	assert.False(t, IsAccessRefused(genericErr))
 }
 
-func TestGetErrorCode(t *testing.T) {
-	amqpErr := NewQueueNotFound("test-queue", "basic.consume")
-	genericErr := errors.New("generic error")
+func TestDuplicateConstantsRemoved(t *testing.T) {
+	codes := map[string]int{
+		"ConnectionForced":   ConnectionForced,
+		"InvalidPath":        InvalidPath,
+		"AccessRefused":      AccessRefused,
+		"NotFound":           NotFound,
+		"ResourceLocked":     ResourceLocked,
+		"PreconditionFailed": PreconditionFailed,
+	}
 
-	assert.Equal(t, NotFound, GetErrorCode(amqpErr))
-	assert.Equal(t, 0, GetErrorCode(genericErr))
+	expected := map[string]int{
+		"ConnectionForced":   320,
+		"InvalidPath":        402,
+		"AccessRefused":      403,
+		"NotFound":           404,
+		"ResourceLocked":     405,
+		"PreconditionFailed": 406,
+	}
+	for name, code := range expected {
+		assert.Equal(t, code, codes[name], "%s must retain its AMQP spec value", name)
+	}
+
+	seen := make(map[int]string, len(codes))
+	for name, code := range codes {
+		if prev, dup := seen[code]; dup {
+			t.Fatalf("duplicate error code %d shared by %s and %s — *2 constants must be removed", code, prev, name)
+		}
+		seen[code] = name
+	}
 }
 
 func TestWrappedErrors(t *testing.T) {

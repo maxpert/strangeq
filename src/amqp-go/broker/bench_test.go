@@ -12,7 +12,7 @@ func startDrainer(qs *QueueState, broker *StorageBroker, queueName string, stop 
 	for w := 0; w < workers; w++ {
 		go func() {
 			for {
-				tag, ok := qs.Claim(stop, testTimer(qs))
+				tag, _, ok := qs.Claim(stop, testTimer(qs))
 				if !ok {
 					return
 				}
@@ -38,7 +38,7 @@ func BenchmarkQueueDispatch_Claim(b *testing.B) {
 	b.ResetTimer()
 
 	for i := 0; i < b.N; i++ {
-		if _, ok := qs.Claim(stop, testTimer(qs)); !ok {
+		if _, _, ok := qs.Claim(stop, testTimer(qs)); !ok {
 			b.Fatal("claim failed")
 		}
 	}
@@ -67,7 +67,7 @@ func BenchmarkQueueDispatch_PublishClaimRoundtrip(b *testing.B) {
 
 	for i := uint64(0); i < uint64(b.N); i++ {
 		qs.Publish(i)
-		if _, ok := qs.Claim(stop, testTimer(qs)); !ok {
+		if _, _, ok := qs.Claim(stop, testTimer(qs)); !ok {
 			b.Fatal("claim failed")
 		}
 	}
@@ -88,7 +88,7 @@ func BenchmarkQueueDispatch_ConcurrentPublishClaim(b *testing.B) {
 		for pb.Next() {
 			tag := tagCounter.Add(1)
 			qs.Publish(tag)
-			if _, ok := qs.Claim(stop, testTimer(qs)); !ok {
+			if _, _, ok := qs.Claim(stop, testTimer(qs)); !ok {
 				b.Fatal("claim failed")
 			}
 		}
@@ -103,7 +103,7 @@ func BenchmarkQueueDispatch_Requeue(b *testing.B) {
 
 	for i := uint64(0); i < uint64(b.N); i++ {
 		qs.Publish(i)
-		tag, ok := qs.Claim(stop, testTimer(qs))
+		tag, _, ok := qs.Claim(stop, testTimer(qs))
 		if !ok {
 			b.Fatal("claim failed")
 		}
@@ -126,7 +126,7 @@ func BenchmarkQueueDispatch_AckAdvance(b *testing.B) {
 
 	for i := uint64(0); i < uint64(b.N); i++ {
 		qs.Publish(i)
-		tag, ok := qs.Claim(stop, testTimer(qs))
+		tag, _, ok := qs.Claim(stop, testTimer(qs))
 		if !ok {
 			b.Fatal("claim failed")
 		}
@@ -290,12 +290,12 @@ func BenchmarkPublishConsumeAck_Roundtrip(b *testing.B) {
 		if err := broker.PublishMessage("", "bench-rt", msg); err != nil {
 			b.Fatal(err)
 		}
-		tag, ok := qs.Claim(stop, testTimer(qs))
+		tag, _, ok := qs.Claim(stop, testTimer(qs))
 		if !ok {
 			b.Fatal("claim failed")
 		}
 		if _, err := broker.storage.GetMessage("bench-rt", tag); err != nil {
-			qs.AckAdvance(tag)
+			qs.GapSkipAdvance(tag)
 			continue
 		}
 		qs.ClaimInflight(tag)

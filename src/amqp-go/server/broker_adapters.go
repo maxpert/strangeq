@@ -27,7 +27,7 @@ func (a *StorageBrokerAdapter) DeclareQueue(name string, durable, autoDelete, ex
 	return a.broker.DeclareQueue(name, durable, autoDelete, exclusive, arguments)
 }
 
-func (a *StorageBrokerAdapter) DeleteQueue(name string, ifUnused, ifEmpty bool) error {
+func (a *StorageBrokerAdapter) DeleteQueue(name string, ifUnused, ifEmpty bool) (int, error) {
 	return a.broker.DeleteQueue(name, ifUnused, ifEmpty)
 }
 
@@ -107,8 +107,8 @@ func (a *StorageBrokerAdapter) AdvanceDeliveryTag(tag uint64) {
 	a.broker.AdvanceDeliveryTag(tag)
 }
 
-func (a *StorageBrokerAdapter) RecoverQueue(queueName string, minTag, maxTag uint64) {
-	a.broker.RecoverQueue(queueName, minTag, maxTag)
+func (a *StorageBrokerAdapter) RecoverQueue(queueName string, minTag, maxTag, count uint64) {
+	a.broker.RecoverQueue(queueName, minTag, maxTag, count)
 }
 
 func (a *StorageBrokerAdapter) RebuildDeliveryIndex(deliveryTag uint64, consumerTag string) {
@@ -125,4 +125,8 @@ func (a *StorageBrokerAdapter) GetExchanges() map[string]*protocol.Exchange {
 
 func (a *StorageBrokerAdapter) GetConsumers() map[string]*protocol.Consumer {
 	return a.broker.GetConsumers()
+}
+
+func (a *StorageBrokerAdapter) UpdateConsumerPrefetch(consumerTag string, prefetchCount uint16) {
+	a.broker.UpdateConsumerPrefetch(consumerTag, prefetchCount)
 }

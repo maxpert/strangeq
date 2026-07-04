@@ -11,7 +11,7 @@ type UnifiedBroker interface {
 
 	// Queue operations
 	DeclareQueue(name string, durable, autoDelete, exclusive bool, arguments map[string]interface{}) (*protocol.Queue, error)
-	DeleteQueue(name string, ifUnused, ifEmpty bool) error
+	DeleteQueue(name string, ifUnused, ifEmpty bool) (int, error)
 
 	// Binding operations
 	BindQueue(queueName, exchangeName, routingKey string, arguments map[string]interface{}) error
@@ -55,7 +55,7 @@ type UnifiedBroker interface {
 	// recovered message tag range [minTag, maxTag], making recovered
 	// messages immediately claimable by consumers. Replaces the old
 	// per-message EnqueueRecoveredMessage.
-	RecoverQueue(queueName string, minTag, maxTag uint64)
+	RecoverQueue(queueName string, minTag, maxTag, count uint64)
 
 	// Recovery support — advances global delivery tag past recovered tags
 	AdvanceDeliveryTag(tag uint64)
@@ -67,4 +67,6 @@ type UnifiedBroker interface {
 	GetQueues() map[string]*protocol.Queue
 	GetExchanges() map[string]*protocol.Exchange
 	GetConsumers() map[string]*protocol.Consumer
+
+	UpdateConsumerPrefetch(consumerTag string, prefetchCount uint16)
 }

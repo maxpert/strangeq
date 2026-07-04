@@ -31,7 +31,7 @@ func TestA1Integration_PublishConsumeAck(t *testing.T) {
 	var tag uint64
 	var ok bool
 	for {
-		tag, ok = queueState.Claim(stop, testTimer(queueState))
+		tag, _, ok = queueState.Claim(stop, testTimer(queueState))
 		if !ok {
 			t.Fatal("Claim failed")
 		}
@@ -49,7 +49,7 @@ func TestA1Integration_PublishConsumeAck(t *testing.T) {
 			queueState.AckAdvance(tag)
 			break
 		}
-		queueState.AckAdvance(tag)
+		queueState.GapSkipAdvance(tag)
 	}
 
 	if d := queueState.Depth(); d != 0 {
@@ -85,7 +85,7 @@ func TestA1Integration_FanoutMultipleQueues(t *testing.T) {
 		var tag uint64
 		var ok bool
 		for {
-			tag, ok = qs.Claim(stop, testTimer(qs))
+			tag, _, ok = qs.Claim(stop, testTimer(qs))
 			cancel()
 			if !ok {
 				t.Errorf("Claim for %s failed", queue)
@@ -127,7 +127,7 @@ func TestA1Integration_RejectRequeue(t *testing.T) {
 	var tag1 uint64
 	var ok bool
 	for {
-		tag1, ok = qs.Claim(stop, testTimer(qs))
+		tag1, _, ok = qs.Claim(stop, testTimer(qs))
 		if !ok {
 			t.Fatal("first Claim failed")
 		}
@@ -142,7 +142,7 @@ func TestA1Integration_RejectRequeue(t *testing.T) {
 
 	var tag2 uint64
 	for {
-		tag2, ok = qs.Claim(stop, testTimer(qs))
+		tag2, _, ok = qs.Claim(stop, testTimer(qs))
 		if !ok {
 			t.Fatal("second Claim failed after requeue")
 		}
@@ -244,12 +244,12 @@ func TestA1Integration_ConcurrentPublishConsume(t *testing.T) {
 		go func() {
 			defer consWG.Done()
 			for {
-				tag, ok := qs.Claim(stop, testTimer(qs))
+				tag, _, ok := qs.Claim(stop, testTimer(qs))
 				if !ok {
 					return
 				}
 				if _, err := broker.storage.GetMessage("test-concurrent", tag); err != nil {
-					qs.AckAdvance(tag)
+					qs.GapSkipAdvance(tag)
 					continue
 				}
 				qs.ClaimInflight(tag)

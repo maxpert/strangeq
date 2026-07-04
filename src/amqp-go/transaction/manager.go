@@ -153,10 +153,11 @@ func (tm *DefaultTransactionManager) Commit(channelID uint16) error {
 	}
 
 	if tm.executor == nil {
+		tx.operations = tx.operations[:0]
+		tx.state = interfaces.TransactionStateNone
 		return fmt.Errorf("no transaction executor available")
 	}
 
-	// Execute operations atomically if possible
 	var err error
 	if tm.atomicStorage != nil {
 		err = tm.executeAtomically(tx.operations)
@@ -164,15 +165,15 @@ func (tm *DefaultTransactionManager) Commit(channelID uint16) error {
 		err = tm.executeSequentially(tx.operations)
 	}
 
+	tx.operations = tx.operations[:0]
+
 	if err != nil {
+		tx.state = interfaces.TransactionStateNone
 		return fmt.Errorf("failed to commit transaction for channel %d: %w", channelID, err)
 	}
 
-	// Clear operations and reset state to active (still in transactional mode)
-	tx.operations = tx.operations[:0]
 	tx.state = interfaces.TransactionStateActive
 
-	// Update statistics
 	atomic.AddInt64(&tm.stats.totalCommits, 1)
 
 	return nil

@@ -1,7 +1,6 @@
 package interfaces
 
 import (
-	"context"
 	"errors"
 	"net"
 	"regexp"
@@ -198,27 +197,6 @@ func NormalizeExchangeName(name string) string {
 		return DefaultExchangeName
 	}
 	return name
-}
-
-// Server defines the interface for AMQP server implementations
-type Server interface {
-	// Start starts the server with the given context
-	Start(ctx context.Context) error
-
-	// Stop gracefully stops the server
-	Stop(ctx context.Context) error
-
-	// Shutdown forcefully shuts down the server
-	Shutdown() error
-
-	// Health returns the server health status
-	Health() HealthStatus
-
-	// GetStats returns server statistics
-	GetStats() *ServerStats
-
-	// GetConnections returns active connections
-	GetConnections() []ConnectionInfo
 }
 
 // HealthStatus represents server health information

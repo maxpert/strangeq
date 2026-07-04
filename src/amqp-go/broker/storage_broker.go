@@ -1,7 +1,6 @@
 package broker
 
 import (
-	"context"
 	"errors"
 	"fmt"
 	"reflect"
@@ -12,7 +11,6 @@ import (
 
 	"github.com/maxpert/amqp-go/interfaces"
 	"github.com/maxpert/amqp-go/protocol"
-	"golang.org/x/sync/semaphore"
 )
 
 // ErrConsumerChannelFull is returned when a consumer channel is full and cannot accept more messages
@@ -28,30 +26,91 @@ var ErrNoRoute = errors.New("no route to destination queue")
 // full design.
 
 // ConsumerState tracks the state of an active consumer for pull-based delivery
+type prefetchGate struct {
+	limit    atomic.Int64
+	inflight atomic.Int64
+	wake     chan struct{}
+	stopped  atomic.Bool
+}
+
+func newPrefetchGate(limit int64) *prefetchGate {
+	g := &prefetchGate{wake: make(chan struct{}, 1)}
+	g.limit.Store(limit)
+	return g
+}
+
+func (g *prefetchGate) acquire(stop <-chan struct{}) bool {
+	for {
+		if g.stopped.Load() {
+			return false
+		}
+		lim := g.limit.Load()
+		inf := g.inflight.Load()
+		if inf < lim {
+			if g.inflight.CompareAndSwap(inf, inf+1) {
+				return true
+			}
+			continue
+		}
+		select {
+		case <-g.wake:
+		case <-stop:
+			return false
+		}
+	}
+}
+
+func (g *prefetchGate) release(n int64) {
+	g.inflight.Add(-n)
+	select {
+	case g.wake <- struct{}{}:
+	default:
+	}
+}
+
+func (g *prefetchGate) updateLimit(newLimit int64) {
+	g.limit.Store(newLimit)
+	select {
+	case g.wake <- struct{}{}:
+	default:
+	}
+}
+
+func (g *prefetchGate) stop() {
+	g.stopped.Store(true)
+	select {
+	case g.wake <- struct{}{}:
+	default:
+	}
+}
+
 type ConsumerState struct {
-	consumer    *protocol.Consumer
-	queueName   string
-	prefetchSem *semaphore.Weighted // Prefetch flow control (nil for unlimited)
-	semCtx      context.Context     // Context for semaphore cancellation
-	semCancel   context.CancelFunc  // Cancel function for semaphore
-	stopCh      chan struct{}       // Stop signal for goroutine
-	stopOnce    sync.Once           // Ensures stopCh is closed exactly once
-	done        chan struct{}       // Closed when consumerPollLoop has fully exited
+	consumer  *protocol.Consumer
+	queueName string
+	gate      *prefetchGate
+	stopCh    chan struct{}
+	stopOnce  sync.Once
+	done      chan struct{}
 }
 
 // StorageBroker manages exchanges, queues, and routing using persistent storage
 // All fields use lock-free data structures for maximum concurrency
+type MetricsCollector interface {
+	RecordMessageRedelivered()
+}
+
 type StorageBroker struct {
 	storage           interfaces.Storage
 	engineConfig      interfaces.EngineConfig
-	queueStates       sync.Map      // queueName -> *QueueState (lock-free)
-	activeQueues      sync.Map      // queueName -> *protocol.Queue (lock-free)
-	activeConsumers   sync.Map      // consumerTag -> *ConsumerState (lock-free)
-	queueConsumers    sync.Map      // queueName -> []*ConsumerState (lock-free)
-	queueConsumersMu  sync.Map      // queueName -> *sync.Mutex (protects queueConsumers slice mutation)
-	deliveryIndex     sync.Map      // deliveryTag → consumerTag (global delivery lookup for O(1) ACK routing)
-	getDeliveryQueues sync.Map      // deliveryTag → queueName (for basic.get ack/reject/nack routing)
-	globalDeliveryTag atomic.Uint64 // Global counter for unique delivery tags across all queues
+	queueStates       sync.Map
+	activeQueues      sync.Map
+	activeConsumers   sync.Map
+	queueConsumers    sync.Map
+	queueConsumersMu  sync.Map
+	deliveryIndex     sync.Map
+	getDeliveryQueues sync.Map
+	globalDeliveryTag atomic.Uint64
+	metricsCollector  MetricsCollector
 }
 
 // NewStorageBroker creates a new storage-backed broker instance
@@ -60,13 +119,30 @@ func NewStorageBroker(storage interfaces.Storage, engineConfig interfaces.Engine
 	broker := &StorageBroker{
 		storage:      storage,
 		engineConfig: engineConfig,
-		// All sync.Map fields don't need initialization
 	}
 
-	// Initialize with default exchanges
 	broker.initializeDefaultExchanges()
 
 	return broker
+}
+
+func (b *StorageBroker) SetMetricsCollector(mc MetricsCollector) {
+	b.metricsCollector = mc
+}
+
+func (b *StorageBroker) UpdateConsumerPrefetch(consumerTag string, prefetchCount uint16) {
+	val, ok := b.activeConsumers.Load(consumerTag)
+	if !ok {
+		return
+	}
+	state := val.(*ConsumerState)
+	var limit int64
+	if prefetchCount == 0 {
+		limit = 2000
+	} else {
+		limit = int64(prefetchCount)
+	}
+	state.gate.updateLimit(limit)
 }
 
 // initializeDefaultExchanges creates the standard AMQP exchanges
@@ -175,23 +251,17 @@ func (b *StorageBroker) consumerPollLoop(state *ConsumerState, queueState *Queue
 	parkTimer := time.NewTimer(queueState.parkTimeout)
 	defer parkTimer.Stop()
 	for {
-		if state.prefetchSem != nil {
-			if err := state.prefetchSem.Acquire(state.semCtx, 1); err != nil {
-				return
-			}
-		}
-
-		tag, ok := queueState.Claim(state.stopCh, parkTimer)
-		if !ok {
-			// Consumer stopped, release unused permit and exit
-			if state.prefetchSem != nil {
-				state.prefetchSem.Release(1)
-			}
+		if !state.gate.acquire(state.stopCh) {
 			return
 		}
 
-		// STAGE 3: Deliver message (blocking send provides backpressure)
-		b.deliverMessage(queueState, state, tag)
+		tag, redelivered, ok := queueState.Claim(state.stopCh, parkTimer)
+		if !ok {
+			state.gate.release(1)
+			return
+		}
+
+		b.deliverMessage(queueState, state, tag, redelivered)
 	}
 }
 
@@ -199,82 +269,51 @@ func (b *StorageBroker) consumerPollLoop(state *ConsumerState, queueState *Queue
 // This provides natural TCP backpressure when consumer is slow
 // Messages are never put back in normal operation, preserving FIFO order
 // Put-backs only occur on shutdown/cancellation (rare events) via Requeue
-func (b *StorageBroker) deliverMessage(queueState *QueueState, state *ConsumerState, msgID uint64) {
-	// Mark as in-flight: ownership map + depth counter.
-	queueState.StoreInflight(msgID, state.consumer.Tag)
-	queueState.ClaimInflight(msgID)
+func (b *StorageBroker) deliverMessage(queueState *QueueState, state *ConsumerState, msgID uint64, redelivered bool) {
 	b.deliveryIndex.Store(msgID, state.consumer.Tag)
 
-	// Get message from storage
 	message, err := b.storage.GetMessage(state.queueName, msgID)
 	if err != nil {
-		// Message not found (gap in recovered range, or spilled/corrupted).
-		// Treat as resolved: release in-flight accounting and permit, then
-		// continue to the next claim. The tag is gone and must not count
-		// toward queue depth.
-		queueState.DeleteInflight(msgID)
 		b.deliveryIndex.Delete(msgID)
-		queueState.AckAdvance(msgID)
-		if state.prefetchSem != nil {
-			state.prefetchSem.Release(1)
-		}
+		queueState.GapSkipAdvance(msgID)
+		state.gate.release(1)
 		return
 	}
 
-	// Create pending ack record
+	queueState.StoreInflight(msgID, state.consumer.Tag)
+	queueState.ClaimInflight(msgID)
+
 	pendingAck := &protocol.PendingAck{
-		QueueName:   state.queueName,
-		DeliveryTag: msgID,
-		ConsumerTag: state.consumer.Tag,
-		// DeliveredAt and MessageID intentionally omitted:
-		// - MessageID is never read in production (only in tests)
-		// - DeliveredAt is only read in crash recovery (recovery_manager.go),
-		//   and pending acks are in-memory only (not persisted), so
-		//   GetAllPendingAcks returns empty after restart. The IsZero()
-		//   guard in recovery skips the age check for zero-valued timestamps.
+		QueueName:       state.queueName,
+		DeliveryTag:     msgID,
+		ConsumerTag:     state.consumer.Tag,
 		RedeliveryCount: 0,
-		Redelivered:     false,
+		Redelivered:     redelivered,
 	}
 
-	// Create delivery
 	delivery := &protocol.Delivery{
 		Message:     message,
 		DeliveryTag: msgID,
-		Redelivered: false,
+		Redelivered: redelivered,
 		Exchange:    message.Exchange,
 		RoutingKey:  message.RoutingKey,
 		ConsumerTag: state.consumer.Tag,
 	}
 
-	// BLOCKING send to consumer channel with cancellation support
-	// This provides TCP backpressure - if consumer is slow, we block here
-	// Semaphore permit is held until ACK arrives
+	if redelivered && b.metricsCollector != nil {
+		b.metricsCollector.RecordMessageRedelivered()
+	}
+
 	select {
 	case state.consumer.Messages <- delivery:
-		// Success! Register with AckCursor for wraparound tracking
 		b.storage.DeliverToConsumer(state.queueName, state.consumer.Tag, msgID)
 		b.storage.StorePendingAck(pendingAck)
-		// Semaphore permit remains held until ACK/NACK/Reject
 
 	case <-state.stopCh:
-		// Consumer stopped - put message back via Requeue so another
-		// consumer redelivers it. Requeue releases the in-flight slot
-		// (depth counter) and pushes the tag to the requeue ring.
 		queueState.DeleteInflight(msgID)
 		b.deliveryIndex.Delete(msgID)
 		queueState.Requeue(msgID)
-		if state.prefetchSem != nil {
-			state.prefetchSem.Release(1)
-		}
-
-	case <-state.semCtx.Done():
-		// Context cancelled - put message back via Requeue.
-		queueState.DeleteInflight(msgID)
-		b.deliveryIndex.Delete(msgID)
-		queueState.Requeue(msgID)
-		if state.prefetchSem != nil {
-			state.prefetchSem.Release(1)
-		}
+		state.gate.release(1)
 	}
 }
 
@@ -328,16 +367,14 @@ func (b *StorageBroker) DeclareExchange(name, exchangeType string, durable, auto
 
 // DeleteExchange removes an exchange
 func (b *StorageBroker) DeleteExchange(name string, ifUnused bool) error {
-	// Check if exchange exists (lock-free)
 	_, err := b.storage.GetExchange(name)
 	if err != nil {
 		if errors.Is(err, interfaces.ErrExchangeNotFound) {
-			return nil // Exchange doesn't exist, consider it deleted
+			return nil
 		}
 		return err
 	}
 
-	// If ifUnused is true, check for bindings
 	if ifUnused {
 		bindings, err := b.storage.GetExchangeBindings(name)
 		if err != nil {
@@ -345,6 +382,26 @@ func (b *StorageBroker) DeleteExchange(name string, ifUnused bool) error {
 		}
 		if len(bindings) > 0 {
 			return fmt.Errorf("exchange '%s' in use", name)
+		}
+	}
+
+	queueBindings, _ := b.storage.GetExchangeBindings(name)
+	for _, bnd := range queueBindings {
+		b.storage.DeleteBinding(bnd.QueueName, bnd.ExchangeName, bnd.RoutingKey)
+	}
+
+	fromBindings, _ := b.storage.GetExchangeBindingsFrom(name)
+	for _, eb := range fromBindings {
+		b.storage.DeleteExchangeBinding(eb.Source, eb.Destination, eb.RoutingKey)
+	}
+
+	allExchanges, _ := b.storage.ListExchanges()
+	for _, exch := range allExchanges {
+		exchBindings, _ := b.storage.GetExchangeBindingsFrom(exch.Name)
+		for _, eb := range exchBindings {
+			if eb.Destination == name {
+				b.storage.DeleteExchangeBinding(eb.Source, eb.Destination, eb.RoutingKey)
+			}
 		}
 	}
 
@@ -401,47 +458,41 @@ func (b *StorageBroker) DeclareQueue(name string, durable, autoDelete, exclusive
 }
 
 // DeleteQueue removes a queue
-func (b *StorageBroker) DeleteQueue(name string, ifUnused, ifEmpty bool) error {
-	// Check if queue exists (lock-free)
+func (b *StorageBroker) DeleteQueue(name string, ifUnused, ifEmpty bool) (int, error) {
 	_, err := b.storage.GetQueue(name)
 	if err != nil {
 		if errors.Is(err, interfaces.ErrQueueNotFound) {
-			return nil // Queue doesn't exist, consider it deleted
+			return 0, nil
 		}
-		return err
+		return 0, err
 	}
 
-	// Check if unused (no consumers)
 	if ifUnused {
 		consumers, err := b.storage.GetQueueConsumers(name)
 		if err != nil {
-			return fmt.Errorf("failed to check queue consumers: %w", err)
+			return 0, fmt.Errorf("failed to check queue consumers: %w", err)
 		}
 		if len(consumers) > 0 {
-			return fmt.Errorf("queue '%s' in use", name)
+			return 0, fmt.Errorf("queue '%s' in use", name)
 		}
 	}
 
-	// Check if empty (no messages)
 	if ifEmpty {
 		count, err := b.storage.GetQueueMessageCount(name)
 		if err != nil {
-			return fmt.Errorf("failed to check queue message count: %w", err)
+			return 0, fmt.Errorf("failed to check queue message count: %w", err)
 		}
 		if count > 0 {
-			return fmt.Errorf("queue '%s' not empty", name)
+			return 0, fmt.Errorf("queue '%s' not empty", name)
 		}
 	}
 
-	// Stop all consumers for this queue (protected by per-queue mutex)
 	mu := b.getQueueConsumersMutex(name)
 	mu.Lock()
 	if val, ok := b.queueConsumers.Load(name); ok {
 		consumers := val.([]*ConsumerState)
 		for _, state := range consumers {
-			if state.semCancel != nil {
-				state.semCancel()
-			}
+			state.gate.stop()
 			state.stopOnce.Do(func() { close(state.stopCh) })
 			b.activeConsumers.Delete(state.consumer.Tag)
 		}
@@ -449,10 +500,8 @@ func (b *StorageBroker) DeleteQueue(name string, ifUnused, ifEmpty bool) error {
 	b.queueConsumers.Delete(name)
 	mu.Unlock()
 
-	// Delete all messages in the queue
-	b.storage.PurgeQueue(name)
+	purgedCount, _ := b.storage.PurgeQueue(name)
 
-	// Delete all bindings for this queue
 	bindings, err := b.storage.GetQueueBindings(name)
 	if err == nil {
 		for _, binding := range bindings {
@@ -460,7 +509,6 @@ func (b *StorageBroker) DeleteQueue(name string, ifUnused, ifEmpty bool) error {
 		}
 	}
 
-	// Delete all consumers for this queue
 	consumers, err := b.storage.GetQueueConsumers(name)
 	if err == nil {
 		for _, consumer := range consumers {
@@ -469,15 +517,16 @@ func (b *StorageBroker) DeleteQueue(name string, ifUnused, ifEmpty bool) error {
 		}
 	}
 
-	// Remove from active caches (lock-free)
 	b.activeQueues.Delete(name)
-	// Close the dispatch cursor: wakes parked consumers and blocked
-	// publishers so they exit promptly, then drop our reference.
 	if qval, qok := b.queueStates.LoadAndDelete(name); qok {
 		qval.(*QueueState).Close()
 	}
 
-	return b.storage.DeleteQueue(name)
+	err = b.storage.DeleteQueue(name)
+	if err != nil {
+		return purgedCount, err
+	}
+	return purgedCount, nil
 }
 
 // BindQueue binds a queue to an exchange
@@ -517,7 +566,19 @@ func (b *StorageBroker) BindQueue(queueName, exchangeName, routingKey string, ar
 
 // UnbindQueue removes a binding between queue and exchange
 func (b *StorageBroker) UnbindQueue(queueName, exchangeName, routingKey string) error {
-	return b.storage.DeleteBinding(queueName, exchangeName, routingKey)
+	if err := b.storage.DeleteBinding(queueName, exchangeName, routingKey); err != nil {
+		return err
+	}
+
+	if exch, err := b.storage.GetExchange(exchangeName); err == nil && exch.AutoDelete {
+		bindings, _ := b.storage.GetExchangeBindings(exchangeName)
+		fromBindings, _ := b.storage.GetExchangeBindingsFrom(exchangeName)
+		if len(bindings) == 0 && len(fromBindings) == 0 {
+			b.DeleteExchange(exchangeName, false)
+		}
+	}
+
+	return nil
 }
 
 // BindExchange binds a destination exchange to a source exchange with a routing key.
@@ -565,7 +626,19 @@ func (b *StorageBroker) BindExchange(destination, source, routingKey string, arg
 
 // UnbindExchange removes an exchange-to-exchange binding.
 func (b *StorageBroker) UnbindExchange(destination, source, routingKey string) error {
-	return b.storage.DeleteExchangeBinding(source, destination, routingKey)
+	if err := b.storage.DeleteExchangeBinding(source, destination, routingKey); err != nil {
+		return err
+	}
+
+	if exch, err := b.storage.GetExchange(source); err == nil && exch.AutoDelete {
+		bindings, _ := b.storage.GetExchangeBindings(source)
+		fromBindings, _ := b.storage.GetExchangeBindingsFrom(source)
+		if len(bindings) == 0 && len(fromBindings) == 0 {
+			b.DeleteExchange(source, false)
+		}
+	}
+
+	return nil
 }
 
 // wouldCreateCycle checks if binding destination→source would create a cycle.
@@ -600,7 +673,6 @@ func (b *StorageBroker) reachableFrom(current, target string, visited map[string
 
 // RegisterConsumer registers a new consumer for a queue
 func (b *StorageBroker) RegisterConsumer(queueName, consumerTag string, consumer *protocol.Consumer) error {
-	// Check if queue exists (lock-free)
 	_, err := b.storage.GetQueue(queueName)
 	if err != nil {
 		if errors.Is(err, interfaces.ErrQueueNotFound) {
@@ -609,44 +681,47 @@ func (b *StorageBroker) RegisterConsumer(queueName, consumerTag string, consumer
 		return err
 	}
 
-	// Get or create queue state (lock-free)
+	mu := b.getQueueConsumersMutex(queueName)
+	mu.Lock()
+	if consumer.Exclusive {
+		if val, ok := b.queueConsumers.Load(queueName); ok && len(val.([]*ConsumerState)) > 0 {
+			mu.Unlock()
+			return errors.New("exclusive consumer cannot join queue with existing consumers")
+		}
+	} else {
+		if val, ok := b.queueConsumers.Load(queueName); ok {
+			for _, c := range val.([]*ConsumerState) {
+				if c.consumer.Exclusive {
+					mu.Unlock()
+					return errors.New("cannot add consumer to queue with exclusive consumer")
+				}
+			}
+		}
+	}
+	mu.Unlock()
+
 	queueState := b.getOrCreateQueueState(queueName)
 
-	// Calculate semaphore capacity for prefetch flow control
-	var prefetchSem *semaphore.Weighted
-	var semCtx context.Context
-	var semCancel context.CancelFunc
-
 	prefetchCount := consumer.PrefetchCount
+	var gateLimit int64
 	if prefetchCount == 0 {
-		// Unlimited prefetch: use RabbitMQ quorum queue limit (2000)
-		prefetchSem = semaphore.NewWeighted(2000)
-		semCtx, semCancel = context.WithCancel(context.Background())
+		gateLimit = 2000
 	} else {
-		// Limited prefetch: use exact prefetch count
-		prefetchSem = semaphore.NewWeighted(int64(prefetchCount))
-		semCtx, semCancel = context.WithCancel(context.Background())
+		gateLimit = int64(prefetchCount)
 	}
 
-	// Create consumer state
 	state := &ConsumerState{
-		consumer:    consumer,
-		queueName:   queueName,
-		prefetchSem: prefetchSem,
-		semCtx:      semCtx,
-		semCancel:   semCancel,
-		stopCh:      make(chan struct{}),
-		done:        make(chan struct{}),
+		consumer:  consumer,
+		queueName: queueName,
+		gate:      newPrefetchGate(gateLimit),
+		stopCh:    make(chan struct{}),
+		done:      make(chan struct{}),
 	}
 
-	// Store in sync.Map (lock-free)
 	b.activeConsumers.Store(consumerTag, state)
 
-	// Register consumer with AckCursor for wraparound safety tracking
 	b.storage.RegisterConsumerCursor(queueName, consumerTag)
 
-	// Add to queue consumers list (protected by per-queue mutex to prevent lost updates)
-	mu := b.getQueueConsumersMutex(queueName)
 	mu.Lock()
 	defer mu.Unlock()
 	val, _ := b.queueConsumers.LoadOrStore(queueName, []*ConsumerState{})
@@ -654,10 +729,8 @@ func (b *StorageBroker) RegisterConsumer(queueName, consumerTag string, consumer
 	consumers = append(consumers, state)
 	b.queueConsumers.Store(queueName, consumers)
 
-	// Start polling goroutine
 	go b.consumerPollLoop(state, queueState)
 
-	// Store consumer in storage
 	err = b.storage.StoreConsumer(queueName, consumerTag, consumer)
 	if err != nil {
 		return fmt.Errorf("failed to store consumer: %w", err)
@@ -681,19 +754,8 @@ func (b *StorageBroker) UnregisterConsumer(consumerTag string) error {
 	}
 	state := val.(*ConsumerState)
 
-	// 1. Cancel semaphore context — unblocks the poll loop if it is parked
-	//    in prefetchSem.Acquire(semCtx, 1).
-	if state.semCancel != nil {
-		state.semCancel()
-	}
+	state.gate.stop()
 
-	// 2. Stop the poll loop (idempotent via sync.Once). After this, the poll
-	//    loop's Claim() returns false (stopCh path) and deliverMessage's
-	//    select takes the stopCh branch (requeuing the in-flight message).
-	//    NOTE: Go's select chooses randomly when both the send case and the
-	//    stopCh case are ready, so deliverMessage MAY still send one last
-	//    message to consumer.Messages before the loop exits. We handle this
-	//    by draining the channel after the loop has fully exited (step 6).
 	state.stopOnce.Do(func() { close(state.stopCh) })
 
 	// 3. Wake all parked consumers on this queue so the unregistered
@@ -748,7 +810,7 @@ drainComplete:
 	//    channel buffer, or already sent to the client over TCP) but were
 	//    never ACKed. Without this scan, they would be permanently
 	//    orphaned. Messages that were already requeued by deliverMessage's
-	//    stopCh/semCtx path or by the drain above are no longer in
+	//    stopCh path or by the drain above are no longer in
 	//    inflightOwners (DeleteInflight was called), so there is no
 	//    double-requeue.
 	//
@@ -765,10 +827,9 @@ drainComplete:
 	//    than it actually is and potentially failing to apply backpressure.
 	b.storage.UnregisterConsumerCursor(state.queueName, consumerTag)
 
-	// 9. Remove from queueConsumers list (protected by per-queue mutex)
 	mu := b.getQueueConsumersMutex(state.queueName)
 	mu.Lock()
-	defer mu.Unlock()
+	lastConsumer := false
 	if val, ok := b.queueConsumers.Load(state.queueName); ok {
 		consumers := val.([]*ConsumerState)
 		newConsumers := make([]*ConsumerState, 0, len(consumers)-1)
@@ -781,10 +842,17 @@ drainComplete:
 			b.queueConsumers.Store(state.queueName, newConsumers)
 		} else {
 			b.queueConsumers.Delete(state.queueName)
+			lastConsumer = true
+		}
+	}
+	mu.Unlock()
+
+	if lastConsumer {
+		if q, err := b.storage.GetQueue(state.queueName); err == nil && q.AutoDelete {
+			b.DeleteQueue(state.queueName, false, false)
 		}
 	}
 
-	// 10. Delete from storage
 	err := b.storage.DeleteConsumer(state.queueName, consumerTag)
 	if err != nil && !errors.Is(err, interfaces.ErrConsumerNotFound) {
 		return err
@@ -844,14 +912,18 @@ func (b *StorageBroker) PublishMessage(exchangeName, routingKey string, message 
 
 		var storeMsg *protocol.Message
 		if i == 0 {
-			// First (and often only) queue: store the original directly.
-			// message is freshly allocated in processCompleteMessage — no aliasing.
 			message.DeliveryTag = msgID
 			storeMsg = message
 		} else {
-			// Fanout: each subsequent queue needs its own *Message with its own DeliveryTag.
 			msgCopy := *message
 			msgCopy.DeliveryTag = msgID
+			if message.Headers != nil {
+				h := make(map[string]interface{}, len(message.Headers))
+				for k, v := range message.Headers {
+					h[k] = v
+				}
+				msgCopy.Headers = h
+			}
 			storeMsg = &msgCopy
 		}
 
@@ -947,6 +1019,7 @@ func (b *StorageBroker) collectTargetQueues(exchange *protocol.Exchange, routing
 				}
 			}
 		}
+	default:
 	}
 
 	exchBindings, err := b.storage.GetExchangeBindingsFrom(exchange.Name)
@@ -965,6 +1038,7 @@ func (b *StorageBroker) collectTargetQueues(exchange *protocol.Exchange, routing
 			match = b.matchTopicPattern(eb.RoutingKey, routingKey)
 		case "headers":
 			match = b.matchHeaders(eb.Arguments, message.Headers)
+		default:
 		}
 		if !match {
 			continue
@@ -1105,16 +1179,22 @@ func (b *StorageBroker) GetExchanges() map[string]*protocol.Exchange {
 
 // GetConsumers returns all active consumers (for management interface)
 func (b *StorageBroker) GetConsumers() map[string]*protocol.Consumer {
-	// Return copy of active consumers (lock-free iteration)
 	result := make(map[string]*protocol.Consumer)
 	b.activeConsumers.Range(func(key, value interface{}) bool {
 		tag := key.(string)
 		state := value.(*ConsumerState)
 		result[tag] = state.consumer
-		return true // continue iteration
+		return true
 	})
 
 	return result
+}
+
+func (b *StorageBroker) GetQueueConsumerCount(queueName string) int {
+	if val, ok := b.queueConsumers.Load(queueName); ok {
+		return len(val.([]*ConsumerState))
+	}
+	return 0
 }
 
 // updateDurableMetadata updates the durable entity metadata in storage
@@ -1215,9 +1295,7 @@ func (b *StorageBroker) AcknowledgeMessage(consumerTag string, deliveryTag uint6
 			}
 		}
 		queueState.SetMinAckCursor(b.storage.GetMinAckCursor(state.queueName))
-		if state.prefetchSem != nil && ackedCount > 0 {
-			state.prefetchSem.Release(int64(ackedCount))
-		}
+		state.gate.release(int64(ackedCount))
 	} else {
 		// Acknowledge single message
 		// Atomic guard against duplicate ACK or concurrent cleanup in
@@ -1244,10 +1322,7 @@ func (b *StorageBroker) AcknowledgeMessage(consumerTag string, deliveryTag uint6
 		queueState.DeleteInflight(deliveryTag)
 		queueState.AckAdvance(deliveryTag)
 
-		// Release semaphore permit (frees capacity for next message)
-		if state.prefetchSem != nil {
-			state.prefetchSem.Release(1)
-		}
+		state.gate.release(1)
 	}
 
 	// Done - polling loop will acquire permit and pull next message
@@ -1291,9 +1366,7 @@ func (b *StorageBroker) RejectMessage(consumerTag string, deliveryTag uint64, re
 	}
 
 	// Release semaphore permit (frees capacity for next message)
-	if state.prefetchSem != nil {
-		state.prefetchSem.Release(1)
-	}
+	state.gate.release(1)
 
 	return nil
 }
@@ -1338,9 +1411,7 @@ func (b *StorageBroker) NacknowledgeMessage(consumerTag string, deliveryTag uint
 			}
 		}
 		queueState.SetMinAckCursor(b.storage.GetMinAckCursor(state.queueName))
-		if state.prefetchSem != nil && nackedCount > 0 {
-			state.prefetchSem.Release(int64(nackedCount))
-		}
+		state.gate.release(int64(nackedCount))
 	} else {
 		// Nacknowledge single message
 		// Atomic guard against duplicate nack or concurrent cleanup in
@@ -1365,10 +1436,7 @@ func (b *StorageBroker) NacknowledgeMessage(consumerTag string, deliveryTag uint
 			queueState.AckAdvance(deliveryTag)
 		}
 
-		// Release semaphore permit (frees capacity for next message)
-		if state.prefetchSem != nil {
-			state.prefetchSem.Release(1)
-		}
+		state.gate.release(1)
 	}
 
 	return nil
@@ -1420,9 +1488,9 @@ func (b *StorageBroker) AdvanceDeliveryTag(tag uint64) {
 //
 // If the queue has no recovered messages, callers should pass (0, 0) — tail
 // and head stay at 0 and consumers park until the first Publish.
-func (b *StorageBroker) RecoverQueue(queueName string, minTag, maxTag uint64) {
+func (b *StorageBroker) RecoverQueue(queueName string, minTag, maxTag, count uint64) {
 	queueState := b.getOrCreateQueueState(queueName)
-	queueState.Recover(minTag, maxTag)
+	queueState.Recover(minTag, maxTag, count)
 }
 
 // GetMessageForGet attempts to synchronously retrieve the next message from a
@@ -1449,9 +1517,12 @@ func (b *StorageBroker) GetMessageForGet(queueName string, noAck bool) (*protoco
 	var tag uint64
 	var message *protocol.Message
 
-	if t, ok := queueState.tryPopRequeue(); ok {
+	if t, r, ok := queueState.tryPopRequeue(); ok {
 		tag = t
 		message, _ = b.storage.GetMessage(queueName, tag)
+		if message != nil {
+			message.Redelivered = r
+		}
 	}
 
 	if message == nil {
@@ -1467,7 +1538,7 @@ func (b *StorageBroker) GetMessageForGet(queueName string, noAck bool) (*protoco
 			tag = t
 			msg, err := b.storage.GetMessage(queueName, tag)
 			if err != nil {
-				queueState.AckAdvance(tag)
+				queueState.GapSkipAdvance(tag)
 				continue
 			}
 			message = msg
@@ -1511,8 +1582,12 @@ func (b *StorageBroker) PurgeQueue(name string) (int, error) {
 	if val, ok := b.queueStates.Load(name); ok {
 		qs := val.(*QueueState)
 		qs.tail.Store(qs.head.Load())
+		qs.waiting.Store(0)
+		qs.inflight.Store(0)
 		qs.requeueMu.Lock()
-		qs.requeueTags = nil
+		qs.requeueBuf = make([]requeueEntry, requeueInitialCap)
+		qs.requeueHead = 0
+		qs.requeueLen = 0
 		qs.requeueCount.Store(0)
 		qs.requeueMu.Unlock()
 		qs.WakeAll()
@@ -1606,9 +1681,7 @@ func (b *StorageBroker) RequeueAllForConsumer(consumerTag string) error {
 
 	queueState.SetMinAckCursor(b.storage.GetMinAckCursor(state.queueName))
 
-	if state.prefetchSem != nil && requeuedCount > 0 {
-		state.prefetchSem.Release(int64(requeuedCount))
-	}
+	state.gate.release(int64(requeuedCount))
 
 	return nil
 }
