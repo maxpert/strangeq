@@ -191,7 +191,21 @@ func (pm *PersistentMetadataStore) loadBindingsFromDisk() ([]*interfaces.QueueBi
 	return bindings, nil
 }
 
-// atomicWrite writes data to a file atomically using temp file + rename
+// atomicWrite writes data to a file atomically and durably using a
+// temp file + fsync + rename + directory fsync sequence.
+//
+// Durability (SQ-3): plain os.WriteFile + os.Rename leaves both the file's data
+// and the rename itself in the page cache. On a crash or power loss before the
+// OS flushes, topology (queues/exchanges/bindings) can vanish, or the rename
+// can land pointing at a zero-length or partially written file on some
+// filesystems. To prevent that we:
+//  1. write the temp file, fsync it (data durable) and close it,
+//  2. rename it into place (atomic replace),
+//  3. fsync the parent directory so the rename entry is durable.
+//
+// This is a declare-time path (not the message hot path), so correctness is
+// favored over speed. There is exactly one file fsync and one directory fsync
+// per write — no more syncing than required.
 func (pm *PersistentMetadataStore) atomicWrite(path string, data []byte) error {
 	// Ensure parent directory exists
 	dir := filepath.Dir(path)
@@ -199,16 +213,38 @@ func (pm *PersistentMetadataStore) atomicWrite(path string, data []byte) error {
 		return fmt.Errorf("failed to create directory: %w", err)
 	}
 
-	// Write to temp file
+	// Write to temp file and fsync it before renaming so its contents are on
+	// stable storage. Any error cleans up the temp file so no .tmp is left
+	// behind and the failure is surfaced (never swallowed).
 	tempPath := path + TempFileExtension
-	if err := os.WriteFile(tempPath, data, 0644); err != nil {
+	f, err := os.OpenFile(tempPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
+	if err != nil {
+		return fmt.Errorf("failed to create temp file: %w", err)
+	}
+	if _, err := f.Write(data); err != nil {
+		_ = f.Close()
+		_ = os.Remove(tempPath)
 		return fmt.Errorf("failed to write temp file: %w", err)
+	}
+	if err := f.Sync(); err != nil {
+		_ = f.Close()
+		_ = os.Remove(tempPath)
+		return fmt.Errorf("failed to fsync temp file: %w", err)
+	}
+	if err := f.Close(); err != nil {
+		_ = os.Remove(tempPath)
+		return fmt.Errorf("failed to close temp file: %w", err)
 	}
 
 	// Atomic rename
 	if err := os.Rename(tempPath, path); err != nil {
-		os.Remove(tempPath) // Clean up on failure
+		_ = os.Remove(tempPath) // Clean up on failure
 		return fmt.Errorf("failed to rename temp file: %w", err)
+	}
+
+	// fsync the parent directory so the rename survives a crash/power loss.
+	if err := syncDir(dir); err != nil {
+		return fmt.Errorf("failed to fsync directory: %w", err)
 	}
 
 	return nil

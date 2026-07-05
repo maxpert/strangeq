@@ -2,8 +2,10 @@ package storage
 
 import (
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"hash/crc32"
+	"io"
 	"os"
 	"path/filepath"
 	"sync"
@@ -21,11 +23,43 @@ const (
 	DefaultWALFileSize     = 512 * 1024 * 1024     // 512 MB per WAL file
 	WALFileExtension       = ".wal"
 
-	// Shared WAL message format:
+	// Shared WAL message (record) format:
 	// [4 bytes CRC32][4 bytes length][4 bytes queueNameLen][queueName][8 bytes offset]
 	// [4 bytes exchangeLen][exchange][4 bytes routingKeyLen][routingKey][1 byte deliveryMode][4 bytes bodyLen][body]
-	// Note: Header is variable-length (depends on queue name, exchange, and routing key lengths)
+	// Note: The record is variable-length (depends on queue name, exchange, and routing key lengths)
+
+	// WAL file-level header (SQ-4): written once at the start of every NEW WAL
+	// file. It lets recovery detect the on-disk format version before parsing
+	// records. The magic is deliberately not a valid start of a record (a real
+	// record begins with a 4-byte CRC then a 4-byte length); a first-byte
+	// collision with an actual CRC value is astronomically unlikely, so a byte
+	// prefix compare is a safe way to sniff versioned vs. legacy files.
+	WALMagic         = "SQWAL"           // 5-byte file magic
+	WALFormatVersion = uint8(1)          // current file format version
+	WALHeaderSize    = len(WALMagic) + 1 // magic + 1 version byte = 6 bytes
+	WALLegacyVersion = uint8(0)          // headerless files predating SQ-4
+
+	// Reserved record-type mechanism (SQ-4, DEFINED ONLY — NOT IMPLEMENTED).
+	//
+	// v1 files have no per-record type tag on disk: every record is implicitly
+	// a message record (WALRecordTypeMessage). A future v2 format will add a
+	// 1-byte record-type tag immediately after the [CRC][length] framing, so
+	// that non-message records (e.g. a transaction-boundary marker) can be
+	// interleaved with message records in the same file. Recovery keys off the
+	// file-level version byte to decide whether that per-record tag is present:
+	//   v1: [CRC][len][<message payload>]
+	//   v2: [CRC][len][1-byte recordType][<payload for that type>]
+	// The constant below is reserved now so the value is stable when v2 lands;
+	// no code writes or parses a record-type tag yet.
+	WALRecordTypeMessage    = uint8(0) // implicit type of every v1 record
+	WALRecordTypeTxBoundary = uint8(1) // RESERVED for v2 transaction-boundary marker
 )
+
+// ErrUnsupportedWALVersion indicates a WAL file begins with the SQWAL magic but
+// carries a format version this build cannot parse. Recovery surfaces this as a
+// hard error rather than silently skipping the file, since silently ignoring an
+// unknown-version file could drop durable messages.
+var ErrUnsupportedWALVersion = errors.New("unsupported WAL file format version")
 
 // WALConfig holds configurable parameters for the WAL manager
 type WALConfig struct {
@@ -331,7 +365,13 @@ func (wm *WALManager) RecoverFromWAL() ([]*RecoveryMessage, error) {
 		filePath := filepath.Join(sharedDir, file.Name())
 		messages, err := wm.sharedWAL.scanWALFile(filePath)
 		if err != nil {
-			// Log error but continue with other files
+			// An unknown/unsupported file format version is a hard error: we
+			// must not silently skip a file that may hold durable messages.
+			if errors.Is(err, ErrUnsupportedWALVersion) {
+				return nil, fmt.Errorf("WAL recovery aborted for %s: %w", file.Name(), err)
+			}
+			// Other errors (e.g. transient open/read failures, torn tail) are
+			// best-effort — log and continue with other files.
 			continue
 		}
 
@@ -358,6 +398,17 @@ func (qw *QueueWAL) scanWALFile(filePath string) ([]*RecoveryMessage, error) {
 		return nil, err
 	}
 	defer file.Close()
+
+	// Detect the file-level header (SQ-4) and start parsing records after it.
+	// Legacy (v0) files have no header and parse from offset 0. An
+	// unknown-version header returns a hard error rather than skipping.
+	dataStart, _, err := walFileDataStart(file)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := file.Seek(dataStart, io.SeekStart); err != nil {
+		return nil, err
+	}
 
 	var messages []*RecoveryMessage
 
@@ -744,6 +795,36 @@ func (qw *QueueWAL) openNextFile() error {
 		return fmt.Errorf("failed to open WAL file: %w", err)
 	}
 
+	// Determine the current size so we (a) only write the file-level header on a
+	// genuinely new/empty file and (b) seed fileOffset to the true end of the
+	// file. Seeding from the real size keeps the offset index correct when an
+	// existing file is reopened and appended to (e.g. a restart that reuses the
+	// same file number, or a legacy headerless file that is being appended to).
+	stat, err := file.Stat()
+	if err != nil {
+		_ = file.Close()
+		return fmt.Errorf("failed to stat WAL file: %w", err)
+	}
+	size := stat.Size()
+
+	// Write the file-level header (magic + version) only on a brand-new file
+	// (SQ-4). The header is flushed to disk together with the first record
+	// batch's fdatasync — one small write per file, never per record. Records
+	// therefore begin at WALHeaderSize. A pre-existing file keeps whatever
+	// header (or none, for legacy v0 files) it already has; we never write a
+	// second header, and records continue at the real end of file.
+	if size == 0 {
+		header := make([]byte, 0, WALHeaderSize)
+		header = append(header, WALMagic...)
+		header = append(header, WALFormatVersion)
+		n, werr := file.Write(header)
+		if werr != nil {
+			_ = file.Close()
+			return fmt.Errorf("failed to write WAL file header: %w", werr)
+		}
+		size = int64(n)
+	}
+
 	// Open a read-only handle for ReadAt (currentFile is O_WRONLY, can't ReadAt)
 	readFile, err := os.Open(filename)
 	if err != nil {
@@ -758,8 +839,41 @@ func (qw *QueueWAL) openNextFile() error {
 
 	qw.currentFile = file
 	qw.currentReadFile = readFile
-	qw.fileOffset.Store(0)
+	qw.fileOffset.Store(size)
 	return nil
+}
+
+// walFileDataStart inspects the beginning of an open WAL file and reports the
+// byte offset at which record data begins, plus the detected format version.
+//
+// Detection (SQ-4):
+//   - If the first WALHeaderSize bytes start with WALMagic, the file is
+//     versioned. The trailing byte is the version; if it is not a version this
+//     build understands, ErrUnsupportedWALVersion is returned (a clear error,
+//     never a silent skip). Records begin at WALHeaderSize.
+//   - Otherwise the file is a legacy (v0) headerless file written before SQ-4;
+//     records begin at offset 0 so existing data dirs keep working.
+//   - A file too short to hold a header is treated as legacy/empty (start 0).
+func walFileDataStart(f *os.File) (dataStart int64, version uint8, err error) {
+	hdr := make([]byte, WALHeaderSize)
+	n, rerr := f.ReadAt(hdr, 0)
+	if n < WALHeaderSize {
+		// Too short to contain a header (possibly empty). Non-EOF read errors
+		// are surfaced; short/empty files parse from offset 0 as legacy.
+		if rerr != nil && rerr != io.EOF {
+			return 0, WALLegacyVersion, rerr
+		}
+		return 0, WALLegacyVersion, nil
+	}
+	if string(hdr[:len(WALMagic)]) != WALMagic {
+		// No magic → legacy headerless file.
+		return 0, WALLegacyVersion, nil
+	}
+	v := hdr[len(WALMagic)]
+	if v != WALFormatVersion {
+		return 0, v, fmt.Errorf("%w: got %d, want %d", ErrUnsupportedWALVersion, v, WALFormatVersion)
+	}
+	return int64(WALHeaderSize), v, nil
 }
 
 // cleanupLoop processes ACKs and deletes old WAL files
@@ -1105,6 +1219,16 @@ func (qw *QueueWAL) readMessageFromFile(queueName string, filePath string, offse
 		return nil, err
 	}
 	defer file.Close()
+
+	// Skip the file-level header (SQ-4) before scanning records. Legacy files
+	// parse from offset 0.
+	dataStart, _, err := walFileDataStart(file)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := file.Seek(dataStart, io.SeekStart); err != nil {
+		return nil, err
+	}
 
 	// Sequential scan through shared WAL entries
 	for {

@@ -26,6 +26,15 @@ const (
 
 	// Segment message format: [4 bytes CRC32][4 bytes length][8 bytes offset][N bytes message]
 	SegmentHeaderSize = 16
+
+	// SQ-4 NOTE: segment files intentionally do NOT carry a file-level format
+	// version header (unlike WAL files). Adding one here is not trivially
+	// symmetric with the WAL change: segment index positions are absolute file
+	// offsets, and compaction (compactSegment) rewrites a segment in place via
+	// serializeSegmentMessage + rename, which would need to re-emit and re-skip
+	// a header on every rewrite. Versioning segments is deferred until there is
+	// a concrete format change that requires it; the WAL header alone satisfies
+	// the Wave 0 durability requirement.
 )
 
 // SegmentConfig holds configurable parameters for the segment manager
