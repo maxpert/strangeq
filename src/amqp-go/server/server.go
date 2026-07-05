@@ -457,8 +457,13 @@ func (s *Server) processConnectionFrames(conn *protocol.Connection) {
 	// This unblocks processFrame if it's waiting to send to AckQueue.
 	close(conn.Done)
 
-	// Wait for frame processor to exit (it is the only sender to ackQueue)
+	// Wait for BOTH senders to ackQueue to exit before closing it. The frame
+	// processor routes acks it dequeues, and (since the SQ-0 fix) the reader
+	// diverts acks directly. processFrames may exit on error before the reader
+	// closes FrameQueue, so we must explicitly wait for the reader too;
+	// otherwise a late reader ack-send could hit a closed channel and panic.
 	<-processorDone
+	<-readerDone
 	// Close ackQueue so ackProcessor drains remaining frames and exits
 	close(conn.AckQueue)
 	<-ackProcessorDone
@@ -470,7 +475,37 @@ func (s *Server) readFrames(conn *protocol.Connection, done chan struct{}) {
 	defer close(done)
 	defer close(conn.FrameQueue) // Signal processor to stop
 
+	// pending holds non-ack frames that could not be handed to processFrames
+	// without blocking, because its FrameQueue is full while a basic.publish is
+	// parked in QueueState.WaitForCapacity. Buffering them here (in order) keeps
+	// the reader draining the socket, so it can keep diverting acks — the very
+	// frames that release the prefetch gate and drain the queue, lifting the
+	// backpressure that stalls processFrames. Without this, the reader would
+	// block on the full FrameQueue, acks queued behind the parked publish on
+	// the same connection would never be read, and a client that both publishes
+	// and consumes over one connection would deadlock (SQ-0 secondary effect).
+	// It drains back to nil as soon as processFrames makes progress.
+	var pending []*protocol.Frame
+
 	for {
+		// Opportunistically hand buffered frames to processFrames whenever it
+		// has drained space. Non-blocking: never wait on a full FrameQueue.
+		for len(pending) > 0 {
+			select {
+			case conn.FrameQueue <- pending[0]:
+				pending[0] = nil
+				pending = pending[1:]
+				continue
+			case <-conn.Done:
+				return
+			default:
+			}
+			break
+		}
+		if len(pending) == 0 {
+			pending = nil // release backing array once fully drained
+		}
+
 		hb := conn.HeartbeatSec.Load()
 		if hb > 0 {
 			conn.Conn.SetReadDeadline(time.Now().Add(time.Duration(2*hb) * time.Second))
@@ -506,11 +541,45 @@ func (s *Server) readFrames(conn *protocol.Connection, done chan struct{}) {
 
 		s.bytesReceived.Add(int64(frame.Size))
 
+		// Divert basic.ack/nack/reject straight to the ACK processor,
+		// bypassing FrameQueue and the (potentially publish-blocked)
+		// processFrames goroutine. A basic.publish that hits queue
+		// backpressure blocks processFrames in QueueState.WaitForCapacity;
+		// if acks had to wait behind it in FrameQueue, the very acks that
+		// release the prefetch gate — and thereby drain the queue and lift
+		// the backpressure — could never be processed. A client that
+		// publishes and consumes over one connection would then deadlock.
+		// ackProcessor never blocks on broker backpressure, so routing acks
+		// here keeps the backpressure-relief path permanently live. (Acks
+		// were already handled on a separate goroutine, so this introduces
+		// no new reordering — it only moves the diversion point earlier.)
+		if isAckFrame(frame) {
+			select {
+			case conn.AckQueue <- frame:
+			case <-conn.Done:
+				protocol.PutFrame(frame)
+				return
+			}
+			continue
+		}
+
+		// Enqueue for processFrames. If frames are already buffered we must
+		// append to preserve per-channel frame order (a publish's method,
+		// header and body frames must stay contiguous). Otherwise try a
+		// non-blocking send and fall back to the buffer when FrameQueue is
+		// full — the reader must never block here or acks stall behind it.
+		if len(pending) > 0 {
+			pending = append(pending, frame)
+			continue
+		}
 		select {
 		case conn.FrameQueue <- frame:
 			// Frame queued successfully
-		case <-done:
+		case <-conn.Done:
+			protocol.PutFrame(frame)
 			return
+		default:
+			pending = append(pending, frame)
 		}
 	}
 }
