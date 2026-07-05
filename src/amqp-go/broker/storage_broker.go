@@ -98,13 +98,32 @@ func (g *prefetchGate) stop() {
 	}
 }
 
+// releaseGate returns prefetch credit for n acknowledged/rejected/requeued
+// messages, unless the consumer bypasses the gate (no-ack or prefetch 0), in
+// which case no credit was ever taken and releasing would drive the gate's
+// inflight counter negative.
+func (s *ConsumerState) releaseGate(n int64) {
+	if !s.bypassGate.Load() {
+		s.gate.release(n)
+	}
+}
+
 type ConsumerState struct {
 	consumer  *protocol.Consumer
 	queueName string
 	gate      *prefetchGate
-	stopCh    chan struct{}
-	stopOnce  sync.Once
-	done      chan struct{}
+	// bypassGate is set when the consumer must not be prefetch-gated: either it
+	// is no-ack (per AMQP 0.9.1 prefetch is ignored under no-ack) or its
+	// prefetch-count is 0 (which the spec defines as "no limit" / unlimited).
+	// When set, the poll loop delivers without acquiring gate credit, and the
+	// ack/nack/reject paths must not release credit they never took. Gating a
+	// prefetch-0 consumer with a fixed cap deadlocks a client whose ack cadence
+	// is coarser than that cap (e.g. multi-ack every N > cap): it can never
+	// receive enough messages to emit the ack that would reopen the gate.
+	bypassGate atomic.Bool
+	stopCh     chan struct{}
+	stopOnce   sync.Once
+	done       chan struct{}
 }
 
 // StorageBroker manages exchanges, queues, and routing using persistent storage
@@ -151,6 +170,8 @@ func (b *StorageBroker) UpdateConsumerPrefetch(consumerTag string, prefetchCount
 		return
 	}
 	state := val.(*ConsumerState)
+	// prefetch-count 0 keeps the large finite cap; a non-zero value re-gates at
+	// that limit. No-ack consumers always bypass the gate regardless.
 	var limit int64
 	if prefetchCount == 0 {
 		limit = 2000
@@ -158,6 +179,7 @@ func (b *StorageBroker) UpdateConsumerPrefetch(consumerTag string, prefetchCount
 		limit = int64(prefetchCount)
 	}
 	state.gate.updateLimit(limit)
+	state.bypassGate.Store(state.consumer.NoAck)
 }
 
 // initializeDefaultExchanges creates the standard AMQP exchanges
@@ -297,22 +319,35 @@ func (b *StorageBroker) computeDepthHighWM() uint64 {
 // Stage 1: Acquire semaphore permit (blocks if at prefetch limit)
 // Stage 2: Claim a delivery tag from the queue's tail cursor (parks if none)
 // Stage 3: Deliver message with blocking send (provides TCP backpressure)
+//
+// The prefetch gate is bypassed entirely for no-ack consumers. Per AMQP 0.9.1,
+// QoS prefetch limits are IGNORED when no-ack is set: a no-ack delivery is an
+// implicit acknowledgement, so there is no outstanding-unacked window to bound.
+// Gating a no-ack consumer would deadlock — it never acks, so gate credit would
+// never be returned (SQ-0).
 func (b *StorageBroker) consumerPollLoop(state *ConsumerState, queueState *QueueState) {
 	defer close(state.done)
 	parkTimer := time.NewTimer(queueState.parkTimeout)
 	defer parkTimer.Stop()
 	for {
-		if !state.gate.acquire(state.stopCh) {
-			return
+		// Capture the bypass decision once per iteration so the acquire and any
+		// matching release stay paired even if a concurrent basic.qos flips it.
+		bypass := state.bypassGate.Load()
+		if !bypass {
+			if !state.gate.acquire(state.stopCh) {
+				return
+			}
 		}
 
 		tag, redelivered, ok := queueState.Claim(state.stopCh, parkTimer)
 		if !ok {
-			state.gate.release(1)
+			if !bypass {
+				state.gate.release(1)
+			}
 			return
 		}
 
-		b.deliverMessage(queueState, state, tag, redelivered)
+		b.deliverMessage(queueState, state, tag, redelivered, bypass)
 	}
 }
 
@@ -320,14 +355,17 @@ func (b *StorageBroker) consumerPollLoop(state *ConsumerState, queueState *Queue
 // This provides natural TCP backpressure when consumer is slow
 // Messages are never put back in normal operation, preserving FIFO order
 // Put-backs only occur on shutdown/cancellation (rare events) via Requeue
-func (b *StorageBroker) deliverMessage(queueState *QueueState, state *ConsumerState, msgID uint64, redelivered bool) {
+func (b *StorageBroker) deliverMessage(queueState *QueueState, state *ConsumerState, msgID uint64, redelivered bool, bypassGate bool) {
+	noAck := state.consumer.NoAck
 	b.deliveryIndex.Store(msgID, state.consumer.Tag)
 
 	message, err := b.storage.GetMessage(state.queueName, msgID)
 	if err != nil {
 		b.deliveryIndex.Delete(msgID)
 		queueState.GapSkipAdvance(msgID)
-		state.gate.release(1)
+		if !bypassGate {
+			state.gate.release(1)
+		}
 		return
 	}
 
@@ -355,17 +393,67 @@ func (b *StorageBroker) deliverMessage(queueState *QueueState, state *ConsumerSt
 		b.metricsCollector.RecordMessageRedelivered()
 	}
 
-	select {
-	case state.consumer.Messages <- delivery:
+	// For manual-ack, record the pending ack and mark the message delivered on
+	// the ack cursor BEFORE handing it to the consumer. A fast client can
+	// acknowledge as soon as it receives the delivery; a multi-ack in
+	// particular enumerates the consumer's pending acks to size its gate
+	// release. If StorePendingAck ran after the send, that enumeration could
+	// miss this tag, under-releasing the gate. The leaked credit accumulates
+	// until the effective prefetch window falls below the client's ack cadence
+	// and delivery wedges (the MultiAck deadlock). Storing first closes the
+	// race; the stopCh path below unwinds it if the hand-off never happens.
+	if !noAck {
 		b.storage.DeliverToConsumer(state.queueName, state.consumer.Tag, msgID)
 		b.storage.StorePendingAck(pendingAck)
+	}
+
+	select {
+	case state.consumer.Messages <- delivery:
+		if noAck {
+			// No-ack: a successful send is an implicit acknowledgement per
+			// AMQP 0.9.1. Immediately reclaim depth and drop the message from
+			// storage — it is not redeliverable once sent, so we do not store
+			// a pending ack and do not track it for redelivery. The
+			// deliveryIndex LoadAndDelete guard keeps this race-free against a
+			// concurrent UnregisterConsumer requeue: whichever side wins the
+			// LoadAndDelete owns the tag; the other becomes a no-op.
+			if _, loaded := b.deliveryIndex.LoadAndDelete(msgID); loaded {
+				b.ackDelivered(queueState, state.queueName, state.consumer.Tag, msgID)
+			}
+		}
+		// Manual-ack bookkeeping was already recorded above.
 
 	case <-state.stopCh:
+		// The hand-off never happened (consumer cancelled/shutting down): undo
+		// the pre-send manual-ack bookkeeping and requeue for another consumer.
+		if !noAck {
+			b.storage.DeletePendingAck(state.queueName, msgID)
+			b.storage.NackFromConsumer(state.queueName, state.consumer.Tag, msgID)
+		}
 		queueState.DeleteInflight(msgID)
 		b.deliveryIndex.Delete(msgID)
 		queueState.Requeue(msgID)
-		state.gate.release(1)
+		if !bypassGate {
+			state.gate.release(1)
+		}
 	}
+}
+
+// ackDelivered performs the storage and queue bookkeeping to acknowledge a
+// single already-delivered message: delete it from storage, clear any pending
+// ack, notify the ack cursor, sync the min-ack cursor for ring-overwrite safety
+// and backpressure, and advance the queue depth frontier (inflight−1). The
+// caller is responsible for the deliveryIndex LoadAndDelete guard and for
+// releasing the prefetch gate (no-ack deliveries hold no gate credit). Shared
+// by the manual single-message ack path and the no-ack implicit-ack path so the
+// two stay in lockstep.
+func (b *StorageBroker) ackDelivered(queueState *QueueState, queueName, consumerTag string, deliveryTag uint64) {
+	b.storage.DeleteMessage(queueName, deliveryTag)
+	b.storage.DeletePendingAck(queueName, deliveryTag)
+	b.storage.AckFromConsumer(queueName, consumerTag, deliveryTag)
+	queueState.SetMinAckCursor(b.storage.GetMinAckCursor(queueName))
+	queueState.DeleteInflight(deliveryTag)
+	queueState.AckAdvance(deliveryTag)
 }
 
 // DeclareExchange creates or updates an exchange
@@ -765,6 +853,12 @@ func (b *StorageBroker) RegisterConsumer(queueName, consumerTag string, consumer
 
 	queueState := b.getOrCreateQueueState(queueName)
 
+	// A no-ack consumer ignores prefetch entirely (per AMQP 0.9.1) and bypasses
+	// the gate. For an explicit prefetch-count we gate at that limit. For
+	// prefetch-count 0 the spec says "no limit"; we apply a large finite cap
+	// rather than a true unbounded gate, because an unbounded unacked set makes
+	// the ack cursor's lowest-unacked rescan O(n) per ack (O(n^2) overall). The
+	// cap still bounds the set so per-ack work stays small.
 	prefetchCount := consumer.PrefetchCount
 	var gateLimit int64
 	if prefetchCount == 0 {
@@ -780,6 +874,7 @@ func (b *StorageBroker) RegisterConsumer(queueName, consumerTag string, consumer
 		stopCh:    make(chan struct{}),
 		done:      make(chan struct{}),
 	}
+	state.bypassGate.Store(consumer.NoAck)
 
 	b.activeConsumers.Store(consumerTag, state)
 
@@ -1380,7 +1475,7 @@ func (b *StorageBroker) AcknowledgeMessage(consumerTag string, deliveryTag uint6
 			}
 		}
 		queueState.SetMinAckCursor(b.storage.GetMinAckCursor(state.queueName))
-		state.gate.release(int64(ackedCount))
+		state.releaseGate(int64(ackedCount))
 	} else {
 		// Acknowledge single message
 		// Atomic guard against duplicate ACK or concurrent cleanup in
@@ -1390,24 +1485,12 @@ func (b *StorageBroker) AcknowledgeMessage(consumerTag string, deliveryTag uint6
 		if _, loaded := b.deliveryIndex.LoadAndDelete(deliveryTag); !loaded {
 			return nil
 		}
-		// Delete message and pending ack from storage
-		b.storage.DeleteMessage(state.queueName, deliveryTag)
-		b.storage.DeletePendingAck(state.queueName, deliveryTag)
+		// Delete the message, clear its pending ack, notify the AckCursor,
+		// sync the min-ack cursor for backpressure, and advance the depth
+		// frontier (may jump minAckCursor to head if the queue drained).
+		b.ackDelivered(queueState, state.queueName, state.consumer.Tag, deliveryTag)
 
-		// Notify AckCursor that this consumer acked this tag
-		b.storage.AckFromConsumer(state.queueName, state.consumer.Tag, deliveryTag)
-
-		// Sync the true minAckCursor from storage's AckCursor (which tracks
-		// per-consumer lowest unacked with O(1) lookup) into QueueState for
-		// accurate backpressure depth calculation.
-		queueState.SetMinAckCursor(b.storage.GetMinAckCursor(state.queueName))
-
-		// Remove from inflight ownership and advance the depth frontier
-		// (may jump minAckCursor to head if queue drained).
-		queueState.DeleteInflight(deliveryTag)
-		queueState.AckAdvance(deliveryTag)
-
-		state.gate.release(1)
+		state.releaseGate(1)
 	}
 
 	// Done - polling loop will acquire permit and pull next message
@@ -1451,7 +1534,7 @@ func (b *StorageBroker) RejectMessage(consumerTag string, deliveryTag uint64, re
 	}
 
 	// Release semaphore permit (frees capacity for next message)
-	state.gate.release(1)
+	state.releaseGate(1)
 
 	return nil
 }
@@ -1496,7 +1579,7 @@ func (b *StorageBroker) NacknowledgeMessage(consumerTag string, deliveryTag uint
 			}
 		}
 		queueState.SetMinAckCursor(b.storage.GetMinAckCursor(state.queueName))
-		state.gate.release(int64(nackedCount))
+		state.releaseGate(int64(nackedCount))
 	} else {
 		// Nacknowledge single message
 		// Atomic guard against duplicate nack or concurrent cleanup in
@@ -1521,7 +1604,7 @@ func (b *StorageBroker) NacknowledgeMessage(consumerTag string, deliveryTag uint
 			queueState.AckAdvance(deliveryTag)
 		}
 
-		state.gate.release(1)
+		state.releaseGate(1)
 	}
 
 	return nil
@@ -1766,7 +1849,7 @@ func (b *StorageBroker) RequeueAllForConsumer(consumerTag string) error {
 
 	queueState.SetMinAckCursor(b.storage.GetMinAckCursor(state.queueName))
 
-	state.gate.release(int64(requeuedCount))
+	state.releaseGate(int64(requeuedCount))
 
 	return nil
 }

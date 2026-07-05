@@ -1923,13 +1923,14 @@ func (m *BasicConsumeMethod) Serialize() ([]byte, error) {
 	consumerTagBytes := encodeShortString(m.ConsumerTag)
 	result = append(result, consumerTagBytes...)
 
-	// Flags (uint16)
+	// Flags (single octet, per AMQP 0.9.1 — the four bits pack into ONE byte,
+	// not a uint16; a spec-compliant client sends exactly one octet here).
 	// bit 0: no-local
 	// bit 1: no-ack
 	// bit 2: exclusive
 	// bit 3: no-wait
-	// bits 4-15: unused
-	flags := uint16(0)
+	// bits 4-7: unused
+	var flags byte
 	if m.NoLocal {
 		flags |= (1 << 0)
 	}
@@ -1942,10 +1943,7 @@ func (m *BasicConsumeMethod) Serialize() ([]byte, error) {
 	if m.NoWait {
 		flags |= (1 << 3)
 	}
-
-	flagBytes := make([]byte, 2)
-	binary.BigEndian.PutUint16(flagBytes, flags)
-	result = append(result, flagBytes...)
+	result = append(result, flags)
 
 	// Arguments (field table)
 	argsBytes, err := encodeFieldTable(m.Arguments)
@@ -1993,8 +1991,11 @@ func (m *BasicConsumeMethod) Deserialize(data []byte) error {
 		offset = newOffset
 	}
 
-	// Flags (uint16)
-	if offset+2 > len(data) {
+	// Flags (single octet, per AMQP 0.9.1 — the four bits pack into ONE byte,
+	// not a uint16). Reading two bytes here misaligned the arguments table and
+	// decoded no-ack from the wrong byte, so a spec-compliant client's no-ack
+	// consumer was silently treated as manual-ack (SQ-0 deadlock).
+	if offset >= len(data) {
 		// If not enough bytes for flags, use defaults
 		m.NoLocal = false
 		m.NoAck = false
@@ -2002,8 +2003,8 @@ func (m *BasicConsumeMethod) Deserialize(data []byte) error {
 		m.NoWait = false
 		// Arguments are handled below
 	} else {
-		flags := binary.BigEndian.Uint16(data[offset : offset+2])
-		offset += 2
+		flags := data[offset]
+		offset++
 
 		// Extract flags
 		m.NoLocal = (flags & (1 << 0)) != 0
@@ -2142,17 +2143,14 @@ func (m *BasicGetMethod) Serialize() ([]byte, error) {
 	queueBytes := encodeShortString(m.Queue)
 	result = append(result, queueBytes...)
 
-	// NoAck (packed into flags)
+	// NoAck (single octet, per AMQP 0.9.1 — not a uint16)
 	// bit 0: no-ack
-	// bits 1-15: unused
-	flags := uint16(0)
+	// bits 1-7: unused
+	var flags byte
 	if m.NoAck {
 		flags |= (1 << 0)
 	}
-
-	flagBytes := make([]byte, 2)
-	binary.BigEndian.PutUint16(flagBytes, flags)
-	result = append(result, flagBytes...)
+	result = append(result, flags)
 
 	return result, nil
 }
@@ -2180,10 +2178,12 @@ func (m *BasicGetMethod) Deserialize(data []byte) error {
 	m.Queue = queue
 	offset = newOffset
 
-	// Flags (uint16)
-	if offset+2 <= len(data) {
-		flags := binary.BigEndian.Uint16(data[offset : offset+2])
-		offset += 2
+	// Flags (single octet, per AMQP 0.9.1 — not a uint16). basic.get carries
+	// exactly one trailing flags byte; reading two bytes here made no-ack from
+	// a spec-compliant client fall through to the default (false).
+	if offset < len(data) {
+		flags := data[offset]
+		offset++
 
 		// Extract flags
 		m.NoAck = (flags & (1 << 0)) != 0
