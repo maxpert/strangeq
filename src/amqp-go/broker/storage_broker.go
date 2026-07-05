@@ -450,12 +450,44 @@ func (b *StorageBroker) deliverMessage(queueState *QueueState, state *ConsumerSt
 // by the manual single-message ack path and the no-ack implicit-ack path so the
 // two stay in lockstep.
 func (b *StorageBroker) ackDelivered(queueState *QueueState, queueName, consumerTag string, deliveryTag uint64) {
+	b.finishAck(queueState, queueName, consumerTag, deliveryTag)
+	queueState.SetMinAckCursor(b.storage.GetMinAckCursor(queueName))
+}
+
+// finishAck performs the per-tag storage and queue bookkeeping to positively
+// acknowledge one already-settled delivery: delete the message, clear its
+// pending ack, notify the AckCursor, drop it from the inflight owner map, and
+// advance the queue depth frontier. It does NOT release the prefetch gate (the
+// settle() winner already did) and does NOT sync the min-ack cursor — callers
+// sync it once (per-ack for single ack via ackDelivered, once-after-the-loop for
+// multi-ack) to keep the O(consumers) recompute off the per-tag path. The tag
+// must already have been claimed via settle().
+func (b *StorageBroker) finishAck(queueState *QueueState, queueName, consumerTag string, deliveryTag uint64) {
 	b.storage.DeleteMessage(queueName, deliveryTag)
 	b.storage.DeletePendingAck(queueName, deliveryTag)
 	b.storage.AckFromConsumer(queueName, consumerTag, deliveryTag)
-	queueState.SetMinAckCursor(b.storage.GetMinAckCursor(queueName))
 	queueState.DeleteInflight(deliveryTag)
 	queueState.AckAdvance(deliveryTag)
+}
+
+// finishNack performs the per-tag storage and queue bookkeeping to negatively
+// acknowledge one already-settled delivery (basic.reject, basic.nack, and
+// basic.recover requeue-all share it): drop it from the inflight owner map,
+// remove it from the AckCursor unacked set, clear its pending ack, then either
+// requeue it for redelivery or discard it and advance the depth frontier. Like
+// finishAck it does NOT release the prefetch gate (settle() owns that) and does
+// NOT sync the min-ack cursor. The tag must already have been claimed via
+// settle().
+func (b *StorageBroker) finishNack(queueState *QueueState, queueName, consumerTag string, deliveryTag uint64, requeue bool) {
+	queueState.DeleteInflight(deliveryTag)
+	b.storage.NackFromConsumer(queueName, consumerTag, deliveryTag)
+	b.storage.DeletePendingAck(queueName, deliveryTag)
+	if requeue {
+		queueState.Requeue(deliveryTag)
+	} else {
+		b.storage.DeleteMessage(queueName, deliveryTag)
+		queueState.AckAdvance(deliveryTag)
+	}
 }
 
 // settle removes a tag from the single delivery ledger (deliveryIndex) and
@@ -1490,29 +1522,28 @@ func (b *StorageBroker) AcknowledgeMessage(consumerTag string, deliveryTag uint6
 	queueState := b.getOrCreateQueueState(state.queueName)
 
 	if multiple {
-		ackedCount := 0
-		pendingAcks, err := b.storage.GetConsumerPendingAcks(consumerTag)
-		if err == nil {
-			for _, pendingAck := range pendingAcks {
-				if pendingAck.DeliveryTag <= deliveryTag {
-					// Atomic guard: claim the tag. If already processed
-					// (by cleanup in UnregisterConsumer or a duplicate
-					// multiple-ACK), skip to avoid double-decrementing
-					// the inflight counter.
-					if _, loaded := b.deliveryIndex.LoadAndDelete(pendingAck.DeliveryTag); !loaded {
-						continue
-					}
-					b.storage.DeleteMessage(pendingAck.QueueName, pendingAck.DeliveryTag)
-					b.storage.DeletePendingAck(pendingAck.QueueName, pendingAck.DeliveryTag)
-					b.storage.AckFromConsumer(pendingAck.QueueName, consumerTag, pendingAck.DeliveryTag)
-					queueState.DeleteInflight(pendingAck.DeliveryTag)
-					queueState.AckAdvance(pendingAck.DeliveryTag)
-					ackedCount++
-				}
+		// Enumerate the consumer's authoritative unacked set (the AckCursor's
+		// unacked map, gate-bounded so this is O(prefetch), not O(queue)) and
+		// route every tag <= deliveryTag through settle(). Each settle win IS the
+		// one gate-credit release for that tag, so the total release equals the
+		// number of tags actually settled — never a separately-computed count
+		// that can skew from the acquired credits (design §3). Stale or
+		// already-settled tags lose the LoadAndDelete and are skipped with no
+		// release. The enumeration is a complete-at-ack-time superset: OnDeliver
+		// runs before the channel send, and deliveries to one consumer are FIFO,
+		// so any tag the client could have received (and thus multi-acked) is
+		// present here.
+		tags, _ := b.storage.GetUnackedTags(state.queueName, consumerTag)
+		for _, tag := range tags {
+			if tag > deliveryTag {
+				continue
 			}
+			if _, won := b.settle(tag); !won {
+				continue
+			}
+			b.finishAck(queueState, state.queueName, consumerTag, tag)
 		}
 		queueState.SetMinAckCursor(b.storage.GetMinAckCursor(state.queueName))
-		state.releaseGate(int64(ackedCount))
 	} else {
 		// Acknowledge single message. Settle funnels the LoadAndDelete guard
 		// (against duplicate ACK or concurrent UnregisterConsumer cleanup) and
@@ -1547,24 +1578,7 @@ func (b *StorageBroker) RejectMessage(consumerTag string, deliveryTag uint64, re
 	if _, won := b.settle(deliveryTag); !won {
 		return nil
 	}
-
-	// Remove from inflight ownership
-	queueState.DeleteInflight(deliveryTag)
-
-	// Notify AckCursor (NACK removes from unacked set regardless of requeue)
-	b.storage.NackFromConsumer(state.queueName, state.consumer.Tag, deliveryTag)
-
-	// Reject always requeues or discards — no PendingAck dependency needed.
-	// The message was stored in deliverMessage; here we either requeue it
-	// for redelivery or delete it.
-	if requeue {
-		b.storage.DeletePendingAck(state.queueName, deliveryTag)
-		queueState.Requeue(deliveryTag)
-	} else {
-		b.storage.DeletePendingAck(state.queueName, deliveryTag)
-		b.storage.DeleteMessage(state.queueName, deliveryTag)
-		queueState.AckAdvance(deliveryTag)
-	}
+	b.finishNack(queueState, state.queueName, state.consumer.Tag, deliveryTag, requeue)
 
 	return nil
 }
@@ -1581,35 +1595,21 @@ func (b *StorageBroker) NacknowledgeMessage(consumerTag string, deliveryTag uint
 	queueState := b.getOrCreateQueueState(state.queueName)
 
 	if multiple {
-		nackedCount := 0
-		pendingAcks, err := b.storage.GetConsumerPendingAcks(consumerTag)
-		if err == nil {
-			for _, pendingAck := range pendingAcks {
-				if pendingAck.DeliveryTag <= deliveryTag {
-					// Atomic guard: claim the tag. If already processed
-					// (by cleanup in UnregisterConsumer or a duplicate
-					// multiple-NACK), skip to avoid double-decrementing
-					// the inflight counter.
-					if _, loaded := b.deliveryIndex.LoadAndDelete(pendingAck.DeliveryTag); !loaded {
-						continue
-					}
-					queueState.DeleteInflight(pendingAck.DeliveryTag)
-					b.storage.NackFromConsumer(pendingAck.QueueName, consumerTag, pendingAck.DeliveryTag)
-
-					if requeue {
-						b.storage.DeletePendingAck(pendingAck.QueueName, pendingAck.DeliveryTag)
-						queueState.Requeue(pendingAck.DeliveryTag)
-					} else {
-						b.storage.DeletePendingAck(pendingAck.QueueName, pendingAck.DeliveryTag)
-						b.storage.DeleteMessage(pendingAck.QueueName, pendingAck.DeliveryTag)
-						queueState.AckAdvance(pendingAck.DeliveryTag)
-					}
-					nackedCount++
-				}
+		// Enumerate-and-settle over the consumer's authoritative unacked set,
+		// mirroring multi-ack (design §3): every tag <= deliveryTag is claimed
+		// via settle() (its LoadAndDelete win is the one gate-credit release),
+		// then requeued or discarded. No separately-computed release count.
+		tags, _ := b.storage.GetUnackedTags(state.queueName, consumerTag)
+		for _, tag := range tags {
+			if tag > deliveryTag {
+				continue
 			}
+			if _, won := b.settle(tag); !won {
+				continue
+			}
+			b.finishNack(queueState, state.queueName, consumerTag, tag, requeue)
 		}
 		queueState.SetMinAckCursor(b.storage.GetMinAckCursor(state.queueName))
-		state.releaseGate(int64(nackedCount))
 	} else {
 		// Nacknowledge single message. Settle funnels the LoadAndDelete guard
 		// (against duplicate nack or concurrent UnregisterConsumer cleanup) and
@@ -1617,20 +1617,7 @@ func (b *StorageBroker) NacknowledgeMessage(consumerTag string, deliveryTag uint
 		if _, won := b.settle(deliveryTag); !won {
 			return nil
 		}
-		// Remove from inflight ownership
-		queueState.DeleteInflight(deliveryTag)
-
-		// Notify AckCursor (NACK removes from unacked set)
-		b.storage.NackFromConsumer(state.queueName, state.consumer.Tag, deliveryTag)
-
-		if requeue {
-			b.storage.DeletePendingAck(state.queueName, deliveryTag)
-			queueState.Requeue(deliveryTag)
-		} else {
-			b.storage.DeletePendingAck(state.queueName, deliveryTag)
-			b.storage.DeleteMessage(state.queueName, deliveryTag)
-			queueState.AckAdvance(deliveryTag)
-		}
+		b.finishNack(queueState, state.queueName, state.consumer.Tag, deliveryTag, requeue)
 	}
 
 	return nil
@@ -1857,25 +1844,20 @@ func (b *StorageBroker) RequeueAllForConsumer(consumerTag string) error {
 
 	queueState := b.getOrCreateQueueState(state.queueName)
 
-	pendingAcks, err := b.storage.GetConsumerPendingAcks(consumerTag)
-	if err != nil {
-		return err
-	}
-
-	requeuedCount := 0
-	for _, pendingAck := range pendingAcks {
-		if _, loaded := b.deliveryIndex.LoadAndDelete(pendingAck.DeliveryTag); !loaded {
+	// Enumerate-and-settle the consumer's entire unacked set (no deliveryTag
+	// bound: basic.recover requeues everything). settle() funnels the
+	// LoadAndDelete guard and the one gate-credit release per tag; finishNack
+	// with requeue=true removes each tag from the AckCursor unacked set (so a
+	// later redelivery's OnDeliver re-adds it cleanly) before requeuing it.
+	tags, _ := b.storage.GetUnackedTags(state.queueName, consumerTag)
+	for _, tag := range tags {
+		if _, won := b.settle(tag); !won {
 			continue
 		}
-		queueState.DeleteInflight(pendingAck.DeliveryTag)
-		b.storage.DeletePendingAck(pendingAck.QueueName, pendingAck.DeliveryTag)
-		queueState.Requeue(pendingAck.DeliveryTag)
-		requeuedCount++
+		b.finishNack(queueState, state.queueName, consumerTag, tag, true)
 	}
 
 	queueState.SetMinAckCursor(b.storage.GetMinAckCursor(state.queueName))
-
-	state.releaseGate(int64(requeuedCount))
 
 	return nil
 }
