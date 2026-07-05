@@ -361,11 +361,11 @@ func (b *StorageBroker) deliverMessage(queueState *QueueState, state *ConsumerSt
 
 	message, err := b.storage.GetMessage(state.queueName, msgID)
 	if err != nil {
-		b.deliveryIndex.Delete(msgID)
+		// Gap tag (recovered/acked message no longer in storage). Settle funnels
+		// the LoadAndDelete + gate release; only the depth-frontier advance is
+		// path-specific. The tag was Stored above, so this side owns the release.
+		b.settle(msgID)
 		queueState.GapSkipAdvance(msgID)
-		if !bypassGate {
-			state.gate.release(1)
-		}
 		return
 	}
 
@@ -426,15 +426,17 @@ func (b *StorageBroker) deliverMessage(queueState *QueueState, state *ConsumerSt
 	case <-state.stopCh:
 		// The hand-off never happened (consumer cancelled/shutting down): undo
 		// the pre-send manual-ack bookkeeping and requeue for another consumer.
-		if !noAck {
-			b.storage.DeletePendingAck(state.queueName, msgID)
-			b.storage.NackFromConsumer(state.queueName, state.consumer.Tag, msgID)
-		}
-		queueState.DeleteInflight(msgID)
-		b.deliveryIndex.Delete(msgID)
-		queueState.Requeue(msgID)
-		if !bypassGate {
-			state.gate.release(1)
+		// Settle funnels the LoadAndDelete + gate release; guarding on the win
+		// makes this structurally safe against a concurrent ack/cancel that may
+		// have already claimed the same tag (Hardening 1) — only the winner
+		// requeues, so there is no double-requeue or double-release.
+		if _, won := b.settle(msgID); won {
+			if !noAck {
+				b.storage.DeletePendingAck(state.queueName, msgID)
+				b.storage.NackFromConsumer(state.queueName, state.consumer.Tag, msgID)
+			}
+			queueState.DeleteInflight(msgID)
+			queueState.Requeue(msgID)
 		}
 	}
 }
@@ -454,6 +456,41 @@ func (b *StorageBroker) ackDelivered(queueState *QueueState, queueName, consumer
 	queueState.SetMinAckCursor(b.storage.GetMinAckCursor(queueName))
 	queueState.DeleteInflight(deliveryTag)
 	queueState.AckAdvance(deliveryTag)
+}
+
+// settle removes a tag from the single delivery ledger (deliveryIndex) and
+// releases exactly the one prefetch credit that its delivery consumed. It is the
+// ONLY place manual-ack prefetch credit is returned. The LoadAndDelete is the
+// linearization point: exactly one caller wins per tag, so the release is neither
+// doubled, skipped, nor computed from a scanned count. Every terminal transition
+// (single/multi ack, reject, single/multi nack, requeue, and the poll-loop
+// cleanup paths) funnels through here so that gate.inflight is exact by
+// construction — equal to the number of live deliveryIndex entries for the
+// consumer at every quiescent point (design §2).
+//
+// Returns the owning ConsumerState (nil for a basic.get delivery, whose consumer
+// tag is "", or a consumer that has since been unregistered) and whether this
+// caller won the LoadAndDelete. A false return means the tag was already settled
+// by a concurrent ack/cancel/requeue and the caller must treat it as a no-op.
+//
+// The one legitimate release that does NOT go through settle is the poll loop's
+// Claim-failure path: it holds a reserved credit for which no tag was ever
+// Stored, so it releases directly and cannot race any tag owner.
+func (b *StorageBroker) settle(tag uint64) (*ConsumerState, bool) {
+	v, won := b.deliveryIndex.LoadAndDelete(tag)
+	if !won {
+		return nil, false // lost to a concurrent ack / cancel / requeue — no-op
+	}
+	st, _ := b.activeConsumers.Load(v.(string))
+	// Safe comma-ok assertion: when the consumer is absent (basic.get "" tag or a
+	// consumer that was unregistered) st is a nil interface, so cs is a typed nil
+	// and we must NOT dereference it. releaseGate is a no-op under bypassGate
+	// (no-ack / prefetch-0), so no credit is returned where none was taken.
+	cs, _ := st.(*ConsumerState)
+	if cs != nil {
+		cs.releaseGate(1)
+	}
+	return cs, true
 }
 
 // DeclareExchange creates or updates an exchange
@@ -1477,20 +1514,17 @@ func (b *StorageBroker) AcknowledgeMessage(consumerTag string, deliveryTag uint6
 		queueState.SetMinAckCursor(b.storage.GetMinAckCursor(state.queueName))
 		state.releaseGate(int64(ackedCount))
 	} else {
-		// Acknowledge single message
-		// Atomic guard against duplicate ACK or concurrent cleanup in
-		// UnregisterConsumer: LoadAndDelete ensures only one caller
-		// processes this tag, preventing double-decrement of the inflight
-		// counter.
-		if _, loaded := b.deliveryIndex.LoadAndDelete(deliveryTag); !loaded {
+		// Acknowledge single message. Settle funnels the LoadAndDelete guard
+		// (against duplicate ACK or concurrent UnregisterConsumer cleanup) and
+		// the single gate-credit release. Only the winner runs the path-specific
+		// bookkeeping below.
+		if _, won := b.settle(deliveryTag); !won {
 			return nil
 		}
 		// Delete the message, clear its pending ack, notify the AckCursor,
 		// sync the min-ack cursor for backpressure, and advance the depth
 		// frontier (may jump minAckCursor to head if the queue drained).
 		b.ackDelivered(queueState, state.queueName, state.consumer.Tag, deliveryTag)
-
-		state.releaseGate(1)
 	}
 
 	// Done - polling loop will acquire permit and pull next message
@@ -1508,10 +1542,9 @@ func (b *StorageBroker) RejectMessage(consumerTag string, deliveryTag uint64, re
 	// Get queue state
 	queueState := b.getOrCreateQueueState(state.queueName)
 
-	// Atomic guard against duplicate reject or concurrent cleanup in
-	// UnregisterConsumer: LoadAndDelete ensures only one caller processes
-	// this tag, preventing double-decrement of the inflight counter.
-	if _, loaded := b.deliveryIndex.LoadAndDelete(deliveryTag); !loaded {
+	// Settle funnels the LoadAndDelete guard (against duplicate reject or
+	// concurrent UnregisterConsumer cleanup) and the single gate-credit release.
+	if _, won := b.settle(deliveryTag); !won {
 		return nil
 	}
 
@@ -1532,9 +1565,6 @@ func (b *StorageBroker) RejectMessage(consumerTag string, deliveryTag uint64, re
 		b.storage.DeleteMessage(state.queueName, deliveryTag)
 		queueState.AckAdvance(deliveryTag)
 	}
-
-	// Release semaphore permit (frees capacity for next message)
-	state.releaseGate(1)
 
 	return nil
 }
@@ -1581,12 +1611,10 @@ func (b *StorageBroker) NacknowledgeMessage(consumerTag string, deliveryTag uint
 		queueState.SetMinAckCursor(b.storage.GetMinAckCursor(state.queueName))
 		state.releaseGate(int64(nackedCount))
 	} else {
-		// Nacknowledge single message
-		// Atomic guard against duplicate nack or concurrent cleanup in
-		// UnregisterConsumer: LoadAndDelete ensures only one caller
-		// processes this tag, preventing double-decrement of the inflight
-		// counter.
-		if _, loaded := b.deliveryIndex.LoadAndDelete(deliveryTag); !loaded {
+		// Nacknowledge single message. Settle funnels the LoadAndDelete guard
+		// (against duplicate nack or concurrent UnregisterConsumer cleanup) and
+		// the single gate-credit release.
+		if _, won := b.settle(deliveryTag); !won {
 			return nil
 		}
 		// Remove from inflight ownership
@@ -1603,8 +1631,6 @@ func (b *StorageBroker) NacknowledgeMessage(consumerTag string, deliveryTag uint
 			b.storage.DeleteMessage(state.queueName, deliveryTag)
 			queueState.AckAdvance(deliveryTag)
 		}
-
-		state.releaseGate(1)
 	}
 
 	return nil
