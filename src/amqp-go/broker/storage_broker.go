@@ -440,13 +440,19 @@ func (b *StorageBroker) deliverMessage(queueState *QueueState, state *ConsumerSt
 	select {
 	case state.consumer.Messages <- delivery:
 		if noAck {
-			// No-ack: a successful send is an implicit acknowledgement per AMQP
-			// 0.9.1. settle claims the ledger entry (releaseGate is a no-op under
-			// bypassGate) and ackDelivered reclaims depth and drops the message.
-			// The LoadAndDelete guard keeps this race-free against a concurrent
+			// No-ack fast path (§4): a successful send is an implicit ack. The
+			// delivery never joined the unacked window — deliver() stored no
+			// pending ack and never called OnDeliver — so settle here does the
+			// minimum: claim the ledger entry (releaseGate is a no-op under
+			// bypassGate) then drop the message from storage and decrement queue
+			// depth. Deliberately NO DeletePendingAck, NO AckFromConsumer, and NO
+			// min-ack recompute: that AckCursor machinery is pure overhead on the
+			// throughput-critical no-ack path (the 2x-goal scenario). The
+			// LoadAndDelete guard keeps this race-free against a concurrent
 			// UnregisterConsumer requeue: whichever side wins owns the tag.
 			if _, won := b.settle(msgID); won {
-				b.ackDelivered(queueState, state.queueName, state.consumer.Tag, msgID)
+				b.storage.DeleteMessage(state.queueName, msgID)
+				queueState.AckAdvance(msgID)
 			}
 		}
 		// Manual-ack bookkeeping was already recorded in deliver().

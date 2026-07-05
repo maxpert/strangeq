@@ -26,6 +26,9 @@ func DefaultConfig() *AMQPConfig {
 			TCPKeepAliveIntervalMS: 30000, // 30 seconds
 			ReadBufferSize:         8192,
 			WriteBufferSize:        8192,
+
+			ReaderOverflowFlowBytes:    8 << 20,  // 8 MiB: assert channel.flow(false)
+			ReaderOverflowHardCapBytes: 64 << 20, // 64 MiB: close the connection
 		},
 		Storage: interfaces.StorageConfig{
 			Path:                 "./data",

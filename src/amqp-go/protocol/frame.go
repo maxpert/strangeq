@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
+	"time"
 )
 
 // Frame types as defined in the AMQP specification
@@ -147,4 +148,19 @@ func WriteFrameToConnection(conn *Connection, frame *Frame) error {
 	conn.WriteMutex.Lock()
 	defer conn.WriteMutex.Unlock()
 	return WriteFrame(conn.Conn, frame)
+}
+
+// WriteFrameToConnectionWithDeadline writes a frame under the connection write
+// mutex, bounding the socket write with a deadline so a wedged (non-reading)
+// peer cannot block the caller indefinitely. Used for server-initiated control
+// frames such as reader-overflow channel.flow, which are sent from the reader
+// goroutine and must never park it. The deadline is set and cleared while
+// holding the write mutex, so it never leaks onto a concurrent writer.
+func WriteFrameToConnectionWithDeadline(conn *Connection, frame *Frame, d time.Duration) error {
+	conn.WriteMutex.Lock()
+	defer conn.WriteMutex.Unlock()
+	_ = conn.Conn.SetWriteDeadline(time.Now().Add(d))
+	err := WriteFrame(conn.Conn, frame)
+	_ = conn.Conn.SetWriteDeadline(time.Time{})
+	return err
 }

@@ -48,6 +48,22 @@ type NetworkConfig struct {
 	// Buffer sizes
 	ReadBufferSize  int
 	WriteBufferSize int
+
+	// ReaderOverflowFlowBytes is the per-connection reader-overflow backlog (in
+	// bytes of buffered inbound frames) at which the server asserts
+	// channel.flow(active=false) to the client, asking it to pause publishing.
+	// The reader keeps draining the socket (so acks keep flowing) while the
+	// backlog persists, and resumes with channel.flow(active=true) once it fully
+	// drains. Best-effort: a client that ignores flow keeps growing the backlog
+	// until the hard cap. Default: 8 MiB. 0 disables the flow signal.
+	ReaderOverflowFlowBytes int64
+
+	// ReaderOverflowHardCapBytes is the hard per-connection cap on the
+	// reader-overflow backlog. When the buffered inbound frame bytes exceed it,
+	// the connection is closed (DoS / runaway-publisher protection) rather than
+	// growing memory without bound. Must exceed ReaderOverflowFlowBytes.
+	// Default: 64 MiB. 0 disables the cap (unbounded — not recommended).
+	ReaderOverflowHardCapBytes int64
 }
 
 // StorageConfig holds storage-related configuration

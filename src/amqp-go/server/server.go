@@ -485,7 +485,19 @@ func (s *Server) readFrames(conn *protocol.Connection, done chan struct{}) {
 	// the same connection would never be read, and a client that both publishes
 	// and consumes over one connection would deadlock (SQ-0 secondary effect).
 	// It drains back to nil as soon as processFrames makes progress.
+	//
+	// SQ-0 step 6: this buffer is BOUNDED by two per-connection mechanisms
+	// (design §6.1). When its byte footprint crosses ReaderOverflowFlowBytes we
+	// assert channel.flow(active=false) to the client (best-effort ask to pause
+	// publishing) and resume with channel.flow(active=true) when it fully
+	// drains; if it exceeds the hard ReaderOverflowHardCapBytes cap (a client
+	// ignoring flow, or a pure-publish flood) we close the connection rather
+	// than grow memory without bound.
 	var pending []*protocol.Frame
+	var pendingBytes int64
+	flowPaused := false
+	flowLimit := s.Config.Network.ReaderOverflowFlowBytes
+	hardCap := s.Config.Network.ReaderOverflowHardCapBytes
 
 	for {
 		// Opportunistically hand buffered frames to processFrames whenever it
@@ -493,6 +505,7 @@ func (s *Server) readFrames(conn *protocol.Connection, done chan struct{}) {
 		for len(pending) > 0 {
 			select {
 			case conn.FrameQueue <- pending[0]:
+				pendingBytes -= int64(pending[0].Size)
 				pending[0] = nil
 				pending = pending[1:]
 				continue
@@ -504,6 +517,13 @@ func (s *Server) readFrames(conn *protocol.Connection, done chan struct{}) {
 		}
 		if len(pending) == 0 {
 			pending = nil // release backing array once fully drained
+			pendingBytes = 0
+			// Backlog cleared: lift the earlier flow-off signal so the client
+			// may resume publishing.
+			if flowPaused {
+				flowPaused = false
+				s.setConnectionFlow(conn, true)
+			}
 		}
 
 		hb := conn.HeartbeatSec.Load()
@@ -563,23 +583,56 @@ func (s *Server) readFrames(conn *protocol.Connection, done chan struct{}) {
 			continue
 		}
 
-		// Enqueue for processFrames. If frames are already buffered we must
-		// append to preserve per-channel frame order (a publish's method,
-		// header and body frames must stay contiguous). Otherwise try a
-		// non-blocking send and fall back to the buffer when FrameQueue is
-		// full — the reader must never block here or acks stall behind it.
-		if len(pending) > 0 {
-			pending = append(pending, frame)
-			continue
+		// Enqueue for processFrames. Try a non-blocking direct hand-off only when
+		// nothing is buffered (buffering must preserve per-channel frame order —
+		// a publish's method, header and body frames must stay contiguous). When
+		// FrameQueue is full, buffer instead; the reader must never block here or
+		// acks stall behind it.
+		if len(pending) == 0 {
+			select {
+			case conn.FrameQueue <- frame:
+				continue // queued directly
+			case <-conn.Done:
+				protocol.PutFrame(frame)
+				return
+			default:
+				// FrameQueue full — fall through to bounded buffering.
+			}
 		}
-		select {
-		case conn.FrameQueue <- frame:
-			// Frame queued successfully
-		case <-conn.Done:
-			protocol.PutFrame(frame)
+		pending = append(pending, frame)
+		pendingBytes += int64(frame.Size)
+
+		// Hard cap: a client ignoring flow, or flooding publishes while never
+		// consuming, must not grow reader memory without bound. Close it.
+		if hardCap > 0 && pendingBytes > hardCap {
+			s.Log.Warn("reader overflow exceeded hard cap; closing connection",
+				zap.String("connection_id", conn.ID),
+				zap.Int64("pending_bytes", pendingBytes),
+				zap.Int64("hard_cap_bytes", hardCap))
+			if s.MetricsCollector != nil {
+				s.MetricsCollector.RecordConnectionError("reader_overflow")
+			}
+			conn.Closed.Store(true)
+			conn.Conn.Close()
 			return
-		default:
-			pending = append(pending, frame)
+		}
+
+		// Soft threshold: ask the client to pause publishing via channel.flow.
+		// Best-effort and deadline-bounded so a non-reading client cannot wedge
+		// the reader; if the signal cannot be delivered, close the connection to
+		// bound memory.
+		if !flowPaused && flowLimit > 0 && pendingBytes >= flowLimit {
+			flowPaused = true
+			if err := s.setConnectionFlow(conn, false); err != nil {
+				s.Log.Warn("reader overflow: channel.flow(false) send failed; closing connection",
+					zap.String("connection_id", conn.ID), zap.Error(err))
+				conn.Closed.Store(true)
+				conn.Conn.Close()
+				return
+			}
+			s.Log.Info("reader overflow: asserted channel.flow(false)",
+				zap.String("connection_id", conn.ID),
+				zap.Int64("pending_bytes", pendingBytes))
 		}
 	}
 }

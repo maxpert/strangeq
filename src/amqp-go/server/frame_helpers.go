@@ -3,6 +3,7 @@ package server
 import (
 	"encoding/binary"
 	"fmt"
+	"time"
 
 	"github.com/maxpert/amqp-go/protocol"
 )
@@ -49,6 +50,43 @@ func (s *Server) sendChannelCloseOK(conn *protocol.Connection, channelID uint16)
 // current active state per AMQP 0.9.1 spec.
 func (s *Server) sendChannelFlowOK(conn *protocol.Connection, channelID uint16, active bool) error {
 	return s.sendMethodResponse(conn, channelID, 20, 21, &protocol.ChannelFlowOKMethod{Active: active})
+}
+
+// readerFlowWriteTimeout bounds a server-initiated reader-overflow channel.flow
+// write so a client that has stopped reading its socket cannot wedge the reader
+// goroutine on the send.
+const readerFlowWriteTimeout = 5 * time.Second
+
+// sendChannelFlow sends a server-initiated channel.flow (class 20, method 20) on
+// one channel, asking the client to pause (active=false) or resume (active=true)
+// content frames. The write is deadline-bounded because it is issued from the
+// reader goroutine, which must never park (see setConnectionFlow / readFrames).
+func (s *Server) sendChannelFlow(conn *protocol.Connection, channelID uint16, active bool) error {
+	data, err := (&protocol.ChannelFlowMethod{Active: active}).Serialize()
+	if err != nil {
+		return err
+	}
+	frame := protocol.EncodeMethodFrameForChannel(channelID, 20, 20, data)
+	return protocol.WriteFrameToConnectionWithDeadline(conn, frame, readerFlowWriteTimeout)
+}
+
+// setConnectionFlow asserts channel.flow(active) on every open channel of the
+// connection (channel 0 is the control channel and is skipped). Used by the
+// reader-overflow backpressure path to tell a fast publisher to pause and later
+// resume. Returns the first send error, if any.
+func (s *Server) setConnectionFlow(conn *protocol.Connection, active bool) error {
+	var firstErr error
+	conn.Channels.Range(func(k, _ interface{}) bool {
+		chID, ok := k.(uint16)
+		if !ok || chID == 0 {
+			return true
+		}
+		if err := s.sendChannelFlow(conn, chID, active); err != nil && firstErr == nil {
+			firstErr = err
+		}
+		return true
+	})
+	return firstErr
 }
 
 // sendExchangeDeclareOK sends the exchange.declare-ok method frame
