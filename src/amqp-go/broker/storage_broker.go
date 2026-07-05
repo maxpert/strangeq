@@ -25,6 +25,23 @@ var ErrNoRoute = errors.New("no route to destination queue")
 // channel-level 406 PreconditionFailed per AMQP 0.9.1 spec.
 var ErrExchangeTypeMismatch = errors.New("exchange type mismatch")
 
+// defaultUnlimitedPrefetchCap is the fallback finite gate cap for a prefetch-0
+// manual-ack consumer when EngineConfig.UnlimitedPrefetchCap is unset (0). It
+// must exceed the coarsest supported client ack cadence (see the config field
+// doc): the head-to-head MultiAck1000 benchmark multi-acks every 1000 messages
+// and needs a window strictly greater than 1000 to make progress.
+const defaultUnlimitedPrefetchCap = 2000
+
+// unlimitedPrefetchCap returns the configured finite cap applied to a prefetch-0
+// manual-ack consumer, falling back to defaultUnlimitedPrefetchCap when the
+// engine config leaves it unset (e.g. a manually-constructed test EngineConfig).
+func (b *StorageBroker) unlimitedPrefetchCap() int64 {
+	if b.engineConfig.UnlimitedPrefetchCap > 0 {
+		return int64(b.engineConfig.UnlimitedPrefetchCap)
+	}
+	return defaultUnlimitedPrefetchCap
+}
+
 func isSupportedExchangeType(kind string) bool {
 	switch kind {
 	case "direct", "fanout", "topic", "headers":
@@ -174,7 +191,7 @@ func (b *StorageBroker) UpdateConsumerPrefetch(consumerTag string, prefetchCount
 	// that limit. No-ack consumers always bypass the gate regardless.
 	var limit int64
 	if prefetchCount == 0 {
-		limit = 2000
+		limit = b.unlimitedPrefetchCap()
 	} else {
 		limit = int64(prefetchCount)
 	}
@@ -347,7 +364,40 @@ func (b *StorageBroker) consumerPollLoop(state *ConsumerState, queueState *Queue
 			return
 		}
 
-		b.deliverMessage(queueState, state, tag, redelivered, bypass)
+		b.deliverMessage(queueState, state, tag, redelivered)
+	}
+}
+
+// deliver is the single pre-send bookkeeping funnel (Hardening 2). It records
+// EVERY structure that represents a live delivery, and NOTHING may reach the
+// consumer before it returns — anything that sends before OnDeliver runs would
+// be invisible to a concurrent multi-ack's unacked-set enumeration and would
+// silently under-ack. In one place it:
+//   - Stores the deliveryIndex ledger entry — the settle() key that every
+//     terminal transition claims via LoadAndDelete, and the credit-exactness
+//     invariant's source of truth.
+//   - Claims queue-depth inflight (waiting-1, inflight+1) and records the
+//     inflight owner (used by consumer-cancel cleanup).
+//   - For manual-ack ONLY: marks the tag delivered on the AckCursor (OnDeliver,
+//     which multi-ack enumerates) and stores its pending ack. No-ack deliveries
+//     take no gate credit, join no unacked window, and get none of this
+//     machinery (§4).
+//
+// The gate credit itself was already reserved by the poll loop's acquire; deliver
+// does not touch it. It runs only after GetMessage has succeeded, so a gap tag
+// never reaches here (its reserved credit is released tagless in deliverMessage).
+func (b *StorageBroker) deliver(queueState *QueueState, state *ConsumerState, msgID uint64, redelivered bool) {
+	b.deliveryIndex.Store(msgID, state.consumer.Tag)
+	queueState.StoreInflight(msgID, state.consumer.Tag)
+	queueState.ClaimInflight(msgID)
+	if !state.consumer.NoAck {
+		b.storage.DeliverToConsumer(state.queueName, state.consumer.Tag, msgID)
+		b.storage.StorePendingAck(&protocol.PendingAck{
+			QueueName:   state.queueName,
+			DeliveryTag: msgID,
+			ConsumerTag: state.consumer.Tag,
+			Redelivered: redelivered,
+		})
 	}
 }
 
@@ -355,29 +405,20 @@ func (b *StorageBroker) consumerPollLoop(state *ConsumerState, queueState *Queue
 // This provides natural TCP backpressure when consumer is slow
 // Messages are never put back in normal operation, preserving FIFO order
 // Put-backs only occur on shutdown/cancellation (rare events) via Requeue
-func (b *StorageBroker) deliverMessage(queueState *QueueState, state *ConsumerState, msgID uint64, redelivered bool, bypassGate bool) {
+func (b *StorageBroker) deliverMessage(queueState *QueueState, state *ConsumerState, msgID uint64, redelivered bool) {
 	noAck := state.consumer.NoAck
-	b.deliveryIndex.Store(msgID, state.consumer.Tag)
 
 	message, err := b.storage.GetMessage(state.queueName, msgID)
 	if err != nil {
-		// Gap tag (recovered/acked message no longer in storage). Settle funnels
-		// the LoadAndDelete + gate release; only the depth-frontier advance is
-		// path-specific. The tag was Stored above, so this side owns the release.
-		b.settle(msgID)
+		// Gap tag (recovered/acked message no longer in storage). deliver() —
+		// which Stores the ledger entry — has not run, so no tag exists for any
+		// terminal path to claim. The poll loop's reserved credit is therefore
+		// tagless and released directly (it cannot race any owner, exactly like
+		// the Claim-failure path); only the depth-frontier advance is
+		// path-specific.
+		state.releaseGate(1)
 		queueState.GapSkipAdvance(msgID)
 		return
-	}
-
-	queueState.StoreInflight(msgID, state.consumer.Tag)
-	queueState.ClaimInflight(msgID)
-
-	pendingAck := &protocol.PendingAck{
-		QueueName:       state.queueName,
-		DeliveryTag:     msgID,
-		ConsumerTag:     state.consumer.Tag,
-		RedeliveryCount: 0,
-		Redelivered:     redelivered,
 	}
 
 	delivery := &protocol.Delivery{
@@ -393,50 +434,34 @@ func (b *StorageBroker) deliverMessage(queueState *QueueState, state *ConsumerSt
 		b.metricsCollector.RecordMessageRedelivered()
 	}
 
-	// For manual-ack, record the pending ack and mark the message delivered on
-	// the ack cursor BEFORE handing it to the consumer. A fast client can
-	// acknowledge as soon as it receives the delivery; a multi-ack in
-	// particular enumerates the consumer's pending acks to size its gate
-	// release. If StorePendingAck ran after the send, that enumeration could
-	// miss this tag, under-releasing the gate. The leaked credit accumulates
-	// until the effective prefetch window falls below the client's ack cadence
-	// and delivery wedges (the MultiAck deadlock). Storing first closes the
-	// race; the stopCh path below unwinds it if the hand-off never happens.
-	if !noAck {
-		b.storage.DeliverToConsumer(state.queueName, state.consumer.Tag, msgID)
-		b.storage.StorePendingAck(pendingAck)
-	}
+	// Record all pre-send bookkeeping in one place before the message can reach
+	// the consumer (see deliver()).
+	b.deliver(queueState, state, msgID, redelivered)
 
 	select {
 	case state.consumer.Messages <- delivery:
 		if noAck {
-			// No-ack: a successful send is an implicit acknowledgement per
-			// AMQP 0.9.1. Immediately reclaim depth and drop the message from
-			// storage — it is not redeliverable once sent, so we do not store
-			// a pending ack and do not track it for redelivery. The
-			// deliveryIndex LoadAndDelete guard keeps this race-free against a
-			// concurrent UnregisterConsumer requeue: whichever side wins the
-			// LoadAndDelete owns the tag; the other becomes a no-op.
-			if _, loaded := b.deliveryIndex.LoadAndDelete(msgID); loaded {
+			// No-ack: a successful send is an implicit acknowledgement per AMQP
+			// 0.9.1. settle claims the ledger entry (releaseGate is a no-op under
+			// bypassGate) and ackDelivered reclaims depth and drops the message.
+			// The LoadAndDelete guard keeps this race-free against a concurrent
+			// UnregisterConsumer requeue: whichever side wins owns the tag.
+			if _, won := b.settle(msgID); won {
 				b.ackDelivered(queueState, state.queueName, state.consumer.Tag, msgID)
 			}
 		}
-		// Manual-ack bookkeeping was already recorded above.
+		// Manual-ack bookkeeping was already recorded in deliver().
 
 	case <-state.stopCh:
 		// The hand-off never happened (consumer cancelled/shutting down): undo
-		// the pre-send manual-ack bookkeeping and requeue for another consumer.
-		// Settle funnels the LoadAndDelete + gate release; guarding on the win
-		// makes this structurally safe against a concurrent ack/cancel that may
-		// have already claimed the same tag (Hardening 1) — only the winner
-		// requeues, so there is no double-requeue or double-release.
+		// the pre-send bookkeeping and requeue for another consumer. Settle
+		// funnels the LoadAndDelete + gate release; guarding on the win makes
+		// this structurally safe against a concurrent ack/cancel that may have
+		// already claimed the same tag (Hardening 1) — only the winner requeues.
+		// finishNack's manual-ack cursor / pending-ack cleanup is a harmless
+		// no-op for a no-ack delivery (which recorded neither).
 		if _, won := b.settle(msgID); won {
-			if !noAck {
-				b.storage.DeletePendingAck(state.queueName, msgID)
-				b.storage.NackFromConsumer(state.queueName, state.consumer.Tag, msgID)
-			}
-			queueState.DeleteInflight(msgID)
-			queueState.Requeue(msgID)
+			b.finishNack(queueState, state.queueName, state.consumer.Tag, msgID, true)
 		}
 	}
 }
@@ -931,7 +956,7 @@ func (b *StorageBroker) RegisterConsumer(queueName, consumerTag string, consumer
 	prefetchCount := consumer.PrefetchCount
 	var gateLimit int64
 	if prefetchCount == 0 {
-		gateLimit = 2000
+		gateLimit = b.unlimitedPrefetchCap()
 	} else {
 		gateLimit = int64(prefetchCount)
 	}

@@ -85,8 +85,9 @@ func DefaultConfig() *AMQPConfig {
 			CompactionIntervalMS:        1800000,           // 30 minutes
 
 			// Consumer Delivery
-			ConsumerSelectTimeoutMS: 1,   // 1 millisecond (500µs rounded up)
-			ConsumerMaxBatchSize:    100, // Max 100 messages per consumer per poll
+			ConsumerSelectTimeoutMS: 1,    // 1 millisecond (500µs rounded up)
+			ConsumerMaxBatchSize:    100,  // Max 100 messages per consumer per poll
+			UnlimitedPrefetchCap:    2000, // Finite gate cap for prefetch-0 manual-ack consumers
 
 			// Background Maintenance
 			WALCleanupCheckIntervalMS: 300000, // 5 minutes

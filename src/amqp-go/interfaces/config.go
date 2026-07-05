@@ -219,6 +219,17 @@ type EngineConfig struct {
 	// Default: 100
 	ConsumerMaxBatchSize int `json:"consumer_max_batch_size"`
 
+	// UnlimitedPrefetchCap is the finite prefetch-gate cap applied to a
+	// manual-ack consumer that requests prefetch-count 0 ("unlimited" per AMQP
+	// 0.9.1). A true unbounded unacked set makes the ack cursor's lowest-unacked
+	// rescan O(n) per ack; a finite cap keeps it small. The cap MUST exceed the
+	// coarsest client ack cadence you intend to support: a consumer that
+	// multi-acks every N messages needs a window > N to ever emit the ack that
+	// reopens the gate (e.g. multi-ack-every-1000 requires a cap of at least
+	// ~1024). No-ack consumers ignore this entirely (they bypass the gate).
+	// Default: 2000
+	UnlimitedPrefetchCap int `json:"unlimited_prefetch_cap"`
+
 	// ========================================
 	// Background Maintenance
 	// ========================================
