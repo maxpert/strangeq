@@ -256,7 +256,6 @@ func BenchmarkAcknowledgeMessage(b *testing.B) {
 		})
 		broker.storage.DeliverToConsumer("bench-ack", "bench-ack-consumer", tag)
 		broker.deliveryIndex.Store(tag, "bench-ack-consumer")
-		qs.StoreInflight(tag, "bench-ack-consumer")
 		qs.ClaimInflight(tag)
 		b.StartTimer()
 
@@ -304,7 +303,6 @@ func BenchmarkPublishConsumeAck_Roundtrip(b *testing.B) {
 		broker.storage.DeleteMessage("bench-rt", tag)
 		broker.storage.AckFromConsumer("bench-rt", "bench-rt-consumer", tag)
 		qs.SetMinAckCursor(broker.storage.GetMinAckCursor("bench-rt"))
-		qs.DeleteInflight(tag)
 		qs.AckAdvance(tag)
 	}
 }

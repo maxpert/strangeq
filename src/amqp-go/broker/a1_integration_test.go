@@ -45,7 +45,6 @@ func TestA1Integration_PublishConsumeAck(t *testing.T) {
 			broker.storage.DeleteMessage("test-ack", tag)
 			broker.storage.AckFromConsumer("test-ack", "test-consumer", tag)
 			queueState.SetMinAckCursor(broker.storage.GetMinAckCursor("test-ack"))
-			queueState.DeleteInflight(tag)
 			queueState.AckAdvance(tag)
 			break
 		}
@@ -137,7 +136,6 @@ func TestA1Integration_RejectRequeue(t *testing.T) {
 	}
 
 	qs.ClaimInflight(tag1)
-	qs.DeleteInflight(tag1)
 	qs.Requeue(tag1)
 
 	var tag2 uint64

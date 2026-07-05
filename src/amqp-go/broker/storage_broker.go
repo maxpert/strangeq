@@ -374,10 +374,10 @@ func (b *StorageBroker) consumerPollLoop(state *ConsumerState, queueState *Queue
 // be invisible to a concurrent multi-ack's unacked-set enumeration and would
 // silently under-ack. In one place it:
 //   - Stores the deliveryIndex ledger entry — the settle() key that every
-//     terminal transition claims via LoadAndDelete, and the credit-exactness
-//     invariant's source of truth.
-//   - Claims queue-depth inflight (waiting-1, inflight+1) and records the
-//     inflight owner (used by consumer-cancel cleanup).
+//     terminal transition claims via LoadAndDelete, the credit-exactness
+//     invariant's source of truth, AND the per-consumer ownership record that
+//     consumer-cancel cleanup scans (deliveryIndex maps tag -> consumer tag).
+//   - Claims queue-depth inflight (waiting-1, inflight+1).
 //   - For manual-ack ONLY: marks the tag delivered on the AckCursor (OnDeliver,
 //     which multi-ack enumerates) and stores its pending ack. No-ack deliveries
 //     take no gate credit, join no unacked window, and get none of this
@@ -388,7 +388,6 @@ func (b *StorageBroker) consumerPollLoop(state *ConsumerState, queueState *Queue
 // never reaches here (its reserved credit is released tagless in deliverMessage).
 func (b *StorageBroker) deliver(queueState *QueueState, state *ConsumerState, msgID uint64, redelivered bool) {
 	b.deliveryIndex.Store(msgID, state.consumer.Tag)
-	queueState.StoreInflight(msgID, state.consumer.Tag)
 	queueState.ClaimInflight(msgID)
 	if !state.consumer.NoAck {
 		b.storage.DeliverToConsumer(state.queueName, state.consumer.Tag, msgID)
@@ -481,8 +480,8 @@ func (b *StorageBroker) ackDelivered(queueState *QueueState, queueName, consumer
 
 // finishAck performs the per-tag storage and queue bookkeeping to positively
 // acknowledge one already-settled delivery: delete the message, clear its
-// pending ack, notify the AckCursor, drop it from the inflight owner map, and
-// advance the queue depth frontier. It does NOT release the prefetch gate (the
+// pending ack, notify the AckCursor, and advance the queue depth frontier. It
+// does NOT release the prefetch gate (the
 // settle() winner already did) and does NOT sync the min-ack cursor — callers
 // sync it once (per-ack for single ack via ackDelivered, once-after-the-loop for
 // multi-ack) to keep the O(consumers) recompute off the per-tag path. The tag
@@ -491,20 +490,18 @@ func (b *StorageBroker) finishAck(queueState *QueueState, queueName, consumerTag
 	b.storage.DeleteMessage(queueName, deliveryTag)
 	b.storage.DeletePendingAck(queueName, deliveryTag)
 	b.storage.AckFromConsumer(queueName, consumerTag, deliveryTag)
-	queueState.DeleteInflight(deliveryTag)
 	queueState.AckAdvance(deliveryTag)
 }
 
 // finishNack performs the per-tag storage and queue bookkeeping to negatively
 // acknowledge one already-settled delivery (basic.reject, basic.nack, and
-// basic.recover requeue-all share it): drop it from the inflight owner map,
-// remove it from the AckCursor unacked set, clear its pending ack, then either
+// basic.recover requeue-all share it): remove it from the AckCursor unacked
+// set, clear its pending ack, then either
 // requeue it for redelivery or discard it and advance the depth frontier. Like
 // finishAck it does NOT release the prefetch gate (settle() owns that) and does
 // NOT sync the min-ack cursor. The tag must already have been claimed via
 // settle().
 func (b *StorageBroker) finishNack(queueState *QueueState, queueName, consumerTag string, deliveryTag uint64, requeue bool) {
-	queueState.DeleteInflight(deliveryTag)
 	b.storage.NackFromConsumer(queueName, consumerTag, deliveryTag)
 	b.storage.DeletePendingAck(queueName, deliveryTag)
 	if requeue {
@@ -1056,21 +1053,33 @@ func (b *StorageBroker) UnregisterConsumer(consumerTag string) error {
 	}
 drainComplete:
 
-	// 7. Scan inflightOwners for remaining in-flight messages owned by this
-	//    consumer. These are deliveries that already LEFT consumer.Messages
+	// 7. Scan the deliveryIndex ledger for remaining in-flight messages owned by
+	//    this consumer. These are deliveries that already LEFT consumer.Messages
 	//    (pulled by the server's forwarder goroutine, sitting in the fanIn
-	//    channel buffer, or already sent to the client over TCP) but were
-	//    never ACKed. Without this scan, they would be permanently
-	//    orphaned. Messages that were already requeued by deliverMessage's
-	//    stopCh path or by the drain above are no longer in
-	//    inflightOwners (DeleteInflight was called), so there is no
-	//    double-requeue.
+	//    channel buffer, or already sent to the client over TCP) but were never
+	//    ACKed. Without this scan, they would be permanently orphaned. The
+	//    deliveryIndex maps tag -> consumer tag and is the single ownership
+	//    record (step 5 deleted the duplicate QueueState.inflightOwners map).
+	//    Messages already claimed by deliverMessage's stopCh path, the drain
+	//    above, or a concurrent ack are gone from the ledger (LoadAndDelete), so
+	//    requeueInflightDelivery's own LoadAndDelete guard makes this a no-op for
+	//    them — no double-requeue. basic.get deliveries carry an empty consumer
+	//    tag and are correctly skipped by the consumer-tag filter. Tags are
+	//    collected first so the requeue's LoadAndDelete does not mutate the map
+	//    mid-Range.
 	//
-	//    The scan is O(total inflight for this queue) — acceptable because
-	//    consumer cancellation is a rare event.
-	queueState.RangeInflightForConsumer(consumerTag, func(deliveryTag uint64) {
-		b.requeueInflightDelivery(queueState, state.queueName, deliveryTag)
+	//    The scan is O(total in-flight deliveries broker-wide) — acceptable
+	//    because consumer cancellation is a rare event.
+	var orphanedTags []uint64
+	b.deliveryIndex.Range(func(key, value interface{}) bool {
+		if value.(string) == consumerTag {
+			orphanedTags = append(orphanedTags, key.(uint64))
+		}
+		return true
 	})
+	for _, deliveryTag := range orphanedTags {
+		b.requeueInflightDelivery(queueState, state.queueName, deliveryTag)
+	}
 
 	// 8. Unregister from AckCursor — safe now: all in-flight messages have
 	//    been requeued, so minAckCursor recomputation won't skip them. If
@@ -1123,7 +1132,6 @@ func (b *StorageBroker) requeueInflightDelivery(qs *QueueState, queueName string
 	if _, loaded := b.deliveryIndex.LoadAndDelete(deliveryTag); !loaded {
 		return
 	}
-	qs.DeleteInflight(deliveryTag)
 	qs.Requeue(deliveryTag)
 	b.storage.DeletePendingAck(queueName, deliveryTag)
 }
@@ -1763,7 +1771,6 @@ func (b *StorageBroker) GetMessageForGet(queueName string, noAck bool) (*protoco
 	}
 
 	if !noAck {
-		queueState.StoreInflight(tag, "")
 		queueState.ClaimInflight(tag)
 		b.deliveryIndex.Store(tag, "")
 		b.getDeliveryQueues.Store(tag, queueName)
@@ -1818,7 +1825,6 @@ func (b *StorageBroker) AcknowledgeGetDelivery(deliveryTag uint64) error {
 	queueState := b.getOrCreateQueueState(queueName)
 	b.storage.DeleteMessage(queueName, deliveryTag)
 	b.storage.DeletePendingAck(queueName, deliveryTag)
-	queueState.DeleteInflight(deliveryTag)
 	queueState.AckAdvance(deliveryTag)
 	queueState.SetMinAckCursor(b.storage.GetMinAckCursor(queueName))
 
@@ -1838,7 +1844,6 @@ func (b *StorageBroker) RejectGetDelivery(deliveryTag uint64, requeue bool) erro
 	queueName := val.(string)
 
 	queueState := b.getOrCreateQueueState(queueName)
-	queueState.DeleteInflight(deliveryTag)
 	b.storage.DeletePendingAck(queueName, deliveryTag)
 
 	if requeue {
@@ -1902,7 +1907,6 @@ func (b *StorageBroker) RequeueAllGetDeliveries() {
 		b.getDeliveryQueues.Delete(deliveryTag)
 
 		queueState := b.getOrCreateQueueState(queueName)
-		queueState.DeleteInflight(deliveryTag)
 		b.storage.DeletePendingAck(queueName, deliveryTag)
 		queueState.Requeue(deliveryTag)
 
