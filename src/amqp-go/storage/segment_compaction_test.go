@@ -40,20 +40,20 @@ func TestSegment_DeletedCountIncrement(t *testing.T) {
 	require.True(t, ok)
 	qs := val.(*QueueSegments)
 
-	// Batch ACK is asynchronous — wait for all 60 ACKs to be applied
-	require.Eventually(t, func() bool {
-		qs.bitmapMutex.RLock()
-		count := int(qs.ackBitmap.GetCardinality())
-		qs.bitmapMutex.RUnlock()
-		return count >= 60
-	}, 1*time.Second, 5*time.Millisecond, "batch ACKs should be applied")
-
 	// Check current segment (messages should be there since we didn't seal)
 	qs.mutex.Lock()
 	currentSeg := qs.currentSegment
 	qs.mutex.Unlock()
 
 	require.NotNil(t, currentSeg)
+
+	// Batch ACK is asynchronous, and the segment deletedCount is applied after
+	// the ack bitmap — poll the value the test asserts, not an earlier signal,
+	// or a loaded machine fails here with a partially applied batch.
+	require.Eventually(t, func() bool {
+		return currentSeg.deletedCount.Load() >= 60
+	}, 5*time.Second, 5*time.Millisecond, "batch ACKs should be applied to segment deletedCount")
+
 	assert.Equal(t, uint64(60), currentSeg.deletedCount.Load(),
 		"deletedCount should be 60 after ACKing 60 of 100 messages")
 	assert.Equal(t, uint64(100), currentSeg.messageCount.Load(),
