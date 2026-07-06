@@ -245,11 +245,106 @@ func (tm *DefaultTransactionManager) ExecuteAtomic(channelID uint16, operations 
 	})
 }
 
-// executeAtomically executes all operations within a single atomic transaction
+// txStagingExecutor is implemented by executors that can route a publish through
+// a transactional storage staging view (SQ-8).
+type txStagingExecutor interface {
+	ExecutePublishStaged(txnStore interfaces.Storage, exchange, routingKey string, message *protocol.Message) (deferred []func(), err error)
+}
+
+// executeAtomically executes all operations within a single all-or-nothing
+// transaction (SQ-8). Publishes are routed through the storage staging view so
+// their durable writes and ring inserts are committed atomically (bracketed by
+// WAL transaction-boundary markers); their consumer-visibility side effects are
+// deferred and applied only after the atomic commit succeeds. If any operation
+// fails, ExecuteAtomic rolls back the whole buffered unit and the deferred
+// visibility actions are never run — nothing published in the transaction
+// becomes durable or visible.
+//
+// Acks/nacks/rejects are applied inline within the atomic scope via the normal
+// executor; their storage settlement participates in the transaction, while the
+// broker's in-memory consumer bookkeeping is applied as it executes.
 func (tm *DefaultTransactionManager) executeAtomically(operations []*interfaces.TransactionOperation) error {
-	return tm.atomicStorage.ExecuteAtomic(func(txnStorage interfaces.Storage) error {
-		return tm.executeSequentially(operations)
+	var deferred []func()
+
+	err := tm.atomicStorage.ExecuteAtomic(func(txnStorage interfaces.Storage) error {
+		return tm.executeStaged(txnStorage, operations, &deferred)
 	})
+	if err != nil {
+		return err
+	}
+
+	// Commit succeeded and is durable: make the published messages visible to
+	// consumers.
+	for _, apply := range deferred {
+		apply()
+	}
+	return nil
+}
+
+// executeStaged runs the transaction's operations against the staging storage.
+// Publishes use the staged path (deferred visibility) when the executor
+// supports it; if not, they fall back to immediate execution. Settlements run
+// inline.
+func (tm *DefaultTransactionManager) executeStaged(txnStorage interfaces.Storage, operations []*interfaces.TransactionOperation, deferred *[]func()) error {
+	stager, canStage := tm.executor.(txStagingExecutor)
+
+	for _, op := range operations {
+		switch op.Type {
+		case interfaces.OpPublish:
+			if canStage {
+				d, err := stager.ExecutePublishStaged(txnStorage, op.Exchange, op.RoutingKey, op.Message)
+				if err != nil {
+					if errors.Is(err, errTxStagingUnsupported) {
+						// Executor advertises no staging for this broker: fall
+						// back to immediate publish for the rest of this op.
+						canStage = false
+						if perr := tm.executePublishInline(op); perr != nil {
+							return perr
+						}
+						continue
+					}
+					if !errors.Is(err, broker.ErrNoRoute) {
+						return fmt.Errorf("failed to execute publish: %w", err)
+					}
+					continue
+				}
+				*deferred = append(*deferred, d...)
+				continue
+			}
+			if err := tm.executePublishInline(op); err != nil {
+				return err
+			}
+
+		case interfaces.OpAck:
+			if err := tm.executor.ExecuteAck(op.ConsumerTag, op.DeliveryTag, op.Multiple); err != nil {
+				return fmt.Errorf("failed to execute ack: %w", err)
+			}
+
+		case interfaces.OpNack:
+			if err := tm.executor.ExecuteNack(op.ConsumerTag, op.DeliveryTag, op.Multiple, op.Requeue); err != nil {
+				return fmt.Errorf("failed to execute nack: %w", err)
+			}
+
+		case interfaces.OpReject:
+			if err := tm.executor.ExecuteReject(op.ConsumerTag, op.DeliveryTag, op.Requeue); err != nil {
+				return fmt.Errorf("failed to execute reject: %w", err)
+			}
+
+		default:
+			return fmt.Errorf("unknown transaction operation type: %d", op.Type)
+		}
+	}
+	return nil
+}
+
+// executePublishInline publishes immediately (non-staged fallback), tolerating
+// an unroutable message exactly as executeSequentially does.
+func (tm *DefaultTransactionManager) executePublishInline(op *interfaces.TransactionOperation) error {
+	err := tm.executor.ExecutePublish(op.Exchange, op.RoutingKey, op.Message)
+	if err != nil && !errors.Is(err, broker.ErrNoRoute) {
+		return fmt.Errorf("failed to execute publish: %w", err)
+	}
+	return nil
 }
 
 // executeSequentially executes operations one by one

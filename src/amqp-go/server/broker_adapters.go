@@ -2,6 +2,7 @@ package server
 
 import (
 	"github.com/maxpert/amqp-go/broker"
+	"github.com/maxpert/amqp-go/interfaces"
 	"github.com/maxpert/amqp-go/protocol"
 )
 
@@ -49,6 +50,12 @@ func (a *StorageBrokerAdapter) UnbindExchange(destination, source, routingKey st
 
 func (a *StorageBrokerAdapter) PublishMessage(exchangeName, routingKey string, message *protocol.Message) error {
 	return a.broker.PublishMessage(exchangeName, routingKey, message)
+}
+
+// PublishMessageTx routes a transactional publish through the atomic storage
+// staging view (SQ-8), returning deferred visibility actions to run post-commit.
+func (a *StorageBrokerAdapter) PublishMessageTx(txnStore interfaces.Storage, exchangeName, routingKey string, message *protocol.Message) ([]func(), error) {
+	return a.broker.PublishMessageTx(txnStore, exchangeName, routingKey, message)
 }
 
 func (a *StorageBrokerAdapter) RegisterConsumer(queueName, consumerTag string, consumer *protocol.Consumer) error {

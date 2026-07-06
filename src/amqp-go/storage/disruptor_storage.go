@@ -925,10 +925,29 @@ func (ds *DisruptorStorage) MarkRecoveryComplete(stats *protocol.RecoveryStats) 
 	return nil
 }
 
+// ExecuteAtomic runs operations as one all-or-nothing unit (SQ-8).
+//
+// The callback is handed a staging storage view that BUFFERS every StoreMessage
+// (publish) and DeleteMessage (settlement) rather than applying it. If the
+// callback returns an error, the buffer is dropped and nothing is applied — no
+// partial publishes land in a queue, no partial settlements take effect. If the
+// callback succeeds, the buffered set is committed atomically: durable publishes
+// are written to the WAL bracketed by transaction-boundary markers with a single
+// fsync (so recovery is all-or-nothing across a crash), then ring state and
+// settlements are applied.
+//
+// Commits are serialized on txMutex; this is the deliberate slow path and does
+// not touch the WAL group-commit hot path used by ordinary publishes.
 func (ds *DisruptorStorage) ExecuteAtomic(operations func(txnStorage interfaces.Storage) error) error {
 	ds.txMutex.Lock()
 	defer ds.txMutex.Unlock()
-	return operations(ds)
+
+	staging := &txStagingStorage{DisruptorStorage: ds}
+	if err := operations(staging); err != nil {
+		// Roll back: nothing buffered has been applied.
+		return err
+	}
+	return staging.commit()
 }
 
 func (ds *DisruptorStorage) SaveDeliveryTagCounter(tag uint64) error {
