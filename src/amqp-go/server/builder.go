@@ -297,6 +297,9 @@ func (b *ServerBuilder) Build() (*Server, error) {
 		MechanismRegistry:  mechanismRegistry,
 		MetricsCollector:   metricsCollector,
 		StartTime:          time.Now(),
+		// SQ-5: default durability barrier — a publish is confirmable when
+		// Broker.PublishMessage returns (WAL group-commit fsync for durables).
+		ConfirmBarrier: brokerSyncBarrier{broker: unifiedBroker},
 	}
 
 	// Propagate metrics collector to storage if it supports SetMetrics.

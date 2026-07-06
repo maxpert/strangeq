@@ -59,6 +59,11 @@ type stats struct {
 	consumed  atomic.Int64
 	confirmed atomic.Int64
 
+	// Confirm-mode failure accounting: publishes never confirmed within the
+	// post-run grace period, and negative confirms (basic.nack).
+	unconfirmed atomic.Int64
+	nacked      atomic.Int64
+
 	consumerLatency *latencyHistogram
 	confirmLatency  *latencyHistogram
 }
@@ -72,16 +77,18 @@ func newStats() *stats {
 
 func main() {
 	var (
-		url       = flag.String("url", "amqp://guest:guest@localhost:5672/", "AMQP server URL")
-		producers = flag.Int("producers", 1, "Number of producer goroutines")
-		consumers = flag.Int("consumers", 1, "Number of consumer goroutines")
-		duration  = flag.Duration("duration", 30*time.Second, "Test run duration")
-		size      = flag.Int("size", 1024, "Message body size in bytes")
-		confirm   = flag.Bool("confirm", false, "Enable publisher confirms and track confirm latency")
-		prefetch  = flag.Int("prefetch", 100, "Consumer QoS prefetch count")
-		queue     = flag.String("queue", "perf-test", "Queue name")
-		durable   = flag.Bool("durable", false, "Declare durable queue and use persistent messages")
-		exchange  = flag.String("exchange", "", "Exchange name (default = default exchange)")
+		url          = flag.String("url", "amqp://guest:guest@localhost:5672/", "AMQP server URL")
+		producers    = flag.Int("producers", 1, "Number of producer goroutines")
+		consumers    = flag.Int("consumers", 1, "Number of consumer goroutines")
+		duration     = flag.Duration("duration", 30*time.Second, "Test run duration")
+		size         = flag.Int("size", 1024, "Message body size in bytes")
+		confirm      = flag.Bool("confirm", false, "Enable publisher confirms and track confirmed msgs/s; the run FAILS if any publish is never confirmed")
+		confirmGrace = flag.Duration("confirm-grace", 15*time.Second, "How long to wait after the run for outstanding confirms to drain (confirm mode)")
+		outstanding  = flag.Int("outstanding", 1000, "Max unconfirmed publishes in flight per producer (confirm mode; mirrors RabbitMQ PerfTest --confirm). 0 = unbounded")
+		prefetch     = flag.Int("prefetch", 100, "Consumer QoS prefetch count")
+		queue        = flag.String("queue", "perf-test", "Queue name")
+		durable      = flag.Bool("durable", false, "Declare durable queue and use persistent messages")
+		exchange     = flag.String("exchange", "", "Exchange name (default = default exchange)")
 	)
 	flag.Parse()
 
@@ -105,7 +112,7 @@ func main() {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			runProducer(ctx, *url, *queue, *exchange, *size, *durable, *confirm, st)
+			runProducer(ctx, *url, *queue, *exchange, *size, *durable, *confirm, *confirmGrace, *outstanding, st)
 		}()
 	}
 
@@ -124,6 +131,15 @@ func main() {
 
 	elapsed := time.Since(startTime)
 	printSummary(elapsed, *confirm, st)
+
+	// Confirm mode is a correctness gate, not just a benchmark: a publish that
+	// is never confirmed (or is nacked) fails the whole run.
+	if *confirm {
+		if unconfirmed, nacked := st.unconfirmed.Load(), st.nacked.Load(); unconfirmed > 0 || nacked > 0 {
+			fmt.Printf("\nFAIL: %d publish(es) never confirmed, %d nacked\n", unconfirmed, nacked)
+			os.Exit(1)
+		}
+	}
 }
 
 func printPerSecondStats(ctx context.Context, st *stats) {
@@ -180,6 +196,11 @@ func printSummary(elapsed time.Duration, withConfirm bool, st *stats) {
 	fmt.Printf("Published : %d total  |  %.0f avg/s\n", pub, float64(pub)/secs)
 	fmt.Printf("Consumed  : %d total  |  %.0f avg/s\n", con, float64(con)/secs)
 	fmt.Printf("Lost      : %d (%.2f%%)\n", lost, lostPct)
+	if withConfirm {
+		confirmed := st.confirmed.Load()
+		fmt.Printf("Confirmed : %d total  |  %.0f avg/s  (unconfirmed: %d, nacked: %d)\n",
+			confirmed, float64(confirmed)/secs, st.unconfirmed.Load(), st.nacked.Load())
+	}
 
 	if st.consumerLatency.totalCount() > 0 {
 		fmt.Printf("Consumer latency  p50=%s  p75=%s  p95=%s  p99=%s  p99.9=%s\n",
@@ -212,7 +233,7 @@ func formatDuration(d time.Duration) string {
 	return fmt.Sprintf("%.0fµs", float64(d)/float64(time.Microsecond))
 }
 
-func runProducer(ctx context.Context, url, queueName, exchange string, size int, durable, useConfirm bool, st *stats) {
+func runProducer(ctx context.Context, url, queueName, exchange string, size int, durable, useConfirm bool, confirmGrace time.Duration, outstanding int, st *stats) {
 	conn, err := amqp.Dial(url)
 	if err != nil {
 		log.Printf("producer: connect failed: %v", err)
@@ -243,17 +264,35 @@ func runProducer(ctx context.Context, url, queueName, exchange string, size int,
 		var pendingMu sync.Mutex
 		pending := make(map[uint64]time.Time)
 
+		// inFlight caps unconfirmed publishes so the benchmark measures confirm
+		// throughput rather than how far a flood can outrun broker backpressure.
+		var inFlight chan struct{}
+		if outstanding > 0 {
+			inFlight = make(chan struct{}, outstanding)
+		}
+		releaseInFlight := func() {
+			if inFlight != nil {
+				select {
+				case <-inFlight:
+				default:
+				}
+			}
+		}
+
 		go func() {
 			for c := range confirmCh {
-				if !c.Ack {
-					continue
-				}
-				st.confirmed.Add(1)
 				now := time.Now()
 				pendingMu.Lock()
 				ts, ok := pending[c.DeliveryTag]
 				delete(pending, c.DeliveryTag)
 				pendingMu.Unlock()
+				releaseInFlight()
+				if !c.Ack {
+					// A nack is a (negative) response, but it still fails the run.
+					st.nacked.Add(1)
+					continue
+				}
+				st.confirmed.Add(1)
 				if ok {
 					st.confirmLatency.record(now.Sub(ts))
 				}
@@ -266,11 +305,41 @@ func runProducer(ctx context.Context, url, queueName, exchange string, size int,
 			deliveryMode = amqp.Persistent
 		}
 
+		// drainConfirms waits (bounded by confirmGrace) for every outstanding
+		// publish to be confirmed; whatever remains counts as never-confirmed
+		// and fails the run.
+		drainConfirms := func() {
+			deadline := time.Now().Add(confirmGrace)
+			for {
+				pendingMu.Lock()
+				remaining := len(pending)
+				pendingMu.Unlock()
+				if remaining == 0 {
+					return
+				}
+				if time.Now().After(deadline) {
+					log.Printf("producer: %d publish(es) never confirmed after %s grace", remaining, confirmGrace)
+					st.unconfirmed.Add(int64(remaining))
+					return
+				}
+				time.Sleep(10 * time.Millisecond)
+			}
+		}
+
 		for {
 			select {
 			case <-ctx.Done():
+				drainConfirms()
 				return
 			default:
+				if inFlight != nil {
+					select {
+					case inFlight <- struct{}{}:
+					case <-ctx.Done():
+						drainConfirms()
+						return
+					}
+				}
 				// Record publish time under lock before publishing so the
 				// confirm goroutine never misses an entry.
 				seqNo := ch.GetNextPublishSeqNo()
@@ -289,7 +358,9 @@ func runProducer(ctx context.Context, url, queueName, exchange string, size int,
 					pendingMu.Lock()
 					delete(pending, seqNo)
 					pendingMu.Unlock()
+					releaseInFlight()
 					if ctx.Err() != nil {
+						drainConfirms()
 						return
 					}
 					log.Printf("producer: publish error: %v", err)

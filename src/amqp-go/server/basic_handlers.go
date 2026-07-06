@@ -363,10 +363,12 @@ func (s *Server) processCompleteMessage(conn *protocol.Connection, channelID uin
 	// Assign confirm delivery tag if channel is in confirm mode (before
 	// transactional check so the tag is sequential across all publishes).
 	var confirmTag uint64
+	var confirmCh *protocol.Channel
 	if val, ok := conn.Channels.Load(channelID); ok {
 		ch := val.(*protocol.Channel)
 		if ch.ConfirmMode.Load() {
 			confirmTag = ch.ConfirmSequence.Add(1)
+			confirmCh = ch
 		}
 	}
 
@@ -384,7 +386,16 @@ func (s *Server) processCompleteMessage(conn *protocol.Connection, channelID uin
 		publishStart = time.Now()
 	}
 
-	err := s.Broker.PublishMessage(message.Exchange, message.RoutingKey, message)
+	// SQ-5: on the confirm path, publish through the durability barrier — its
+	// return is the event that makes confirmTag safe to ack. The default
+	// barrier is Broker.PublishMessage itself, so the non-confirm hot path
+	// below stays exactly as before (zero new work when confirm mode is off).
+	var err error
+	if confirmTag > 0 && s.ConfirmBarrier != nil {
+		err = s.ConfirmBarrier.PublishAndAwaitDurable(message.Exchange, message.RoutingKey, message)
+	} else {
+		err = s.Broker.PublishMessage(message.Exchange, message.RoutingKey, message)
+	}
 
 	if s.MetricsCollector != nil {
 		s.MetricsCollector.RecordPublishLatency(time.Since(publishStart).Seconds())
@@ -399,7 +410,10 @@ func (s *Server) processCompleteMessage(conn *protocol.Connection, channelID uin
 				return retErr
 			}
 			if confirmTag > 0 {
-				return s.sendBasicAck(conn, channelID, confirmTag, false)
+				// The basic.return frames are already written; advancing the
+				// watermark only now guarantees no batched ack covering this
+				// tag can precede the return on the wire.
+				return s.confirmPublishDurable(conn, confirmCh, confirmTag)
 			}
 			return nil
 		}
@@ -422,7 +436,10 @@ func (s *Server) processCompleteMessage(conn *protocol.Connection, channelID uin
 	}
 
 	if confirmTag > 0 {
-		return s.sendBasicAck(conn, channelID, confirmTag, false)
+		// SQ-5: batched publisher confirms — advance the per-channel watermark
+		// and flush inline (idle) or via the connection's confirm flusher
+		// (pipelined), instead of one basic.ack write per publish.
+		return s.confirmPublishDurable(conn, confirmCh, confirmTag)
 	}
 
 	return nil

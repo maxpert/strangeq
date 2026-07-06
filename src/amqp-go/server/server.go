@@ -42,6 +42,11 @@ type Server struct {
 	StartTime          time.Time
 	metricsCancel      context.CancelFunc
 
+	// ConfirmBarrier decides when a publish on a confirm-mode channel becomes
+	// confirmable (SQ-5). Nil falls back to Broker.PublishMessage directly,
+	// which is also what the default barrier does.
+	ConfirmBarrier DurabilityBarrier
+
 	messagesPublished atomic.Int64
 	messagesDelivered atomic.Int64
 	bytesReceived     atomic.Int64
@@ -488,6 +493,11 @@ func (s *Server) processConnectionFrames(conn *protocol.Connection) {
 	conn.ConsumersDirty.Store(true)
 	go s.consumerDeliveryLoop(conn, consumerDeliveryDone)
 
+	// Start publisher-confirm flusher (SQ-5: batches basic.ack writes for
+	// pipelining confirm-mode publishers)
+	confirmFlusherDone := make(chan struct{})
+	go s.confirmFlusher(conn, confirmFlusherDone)
+
 	// Wait for any goroutine to finish (connection close or error)
 	select {
 	case <-readerDone:
@@ -518,6 +528,9 @@ func (s *Server) processConnectionFrames(conn *protocol.Connection) {
 	// Close ackQueue so ackProcessor drains remaining frames and exits
 	close(conn.AckQueue)
 	<-ackProcessorDone
+	// The confirm flusher exits on conn.Done (closed above); if it was mid-write
+	// the closed socket fails the write and it exits on its own error path.
+	<-confirmFlusherDone
 }
 
 // readFrames reads frames from TCP connection and enqueues them for processing

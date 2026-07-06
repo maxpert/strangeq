@@ -97,6 +97,24 @@ func (s *Server) processChannelSpecificMethod(conn *protocol.Connection, channel
 			zap.Uint16("channel_id", channelID),
 			zap.String("connection_id", conn.ID))
 
+		// SQ-5: flush any durable-but-unacked publisher confirms and seal
+		// the channel's confirm state BEFORE teardown and channel.close-ok,
+		// so the client receives every outstanding confirm and no straggling
+		// flusher pass can write an ack on the closed channel afterwards.
+		if value, exists := conn.Channels.Load(channelID); exists {
+			channel := value.(*protocol.Channel)
+			if channel.ConfirmMode.Load() {
+				if err := channel.FlushAndCloseConfirms(func(tag uint64, multiple bool) error {
+					return s.sendBasicAck(conn, channelID, tag, multiple)
+				}); err != nil {
+					s.Log.Warn("Failed to flush publisher confirms on channel close",
+						zap.Uint16("channel_id", channelID),
+						zap.String("connection_id", conn.ID),
+						zap.Error(err))
+				}
+			}
+		}
+
 		s.teardownChannel(conn, channelID)
 
 		// Send channel.close-ok
@@ -143,6 +161,16 @@ func (s *Server) teardownChannel(conn *protocol.Connection, channelID uint16) {
 	select {
 	case channel.FlowWake <- struct{}{}:
 	default:
+	}
+
+	// Seal the channel's publisher-confirm state (SQ-5) so a straggling
+	// confirm-flusher pass cannot write a basic.ack for this channel after
+	// teardown. On the client-initiated close path the caller has already
+	// flushed real acks and sealed (this is then a no-op); on the
+	// server-initiated close-ok path any unflushed confirms are dropped —
+	// per AMQP semantics a channel error fails outstanding confirms.
+	if channel.ConfirmMode.Load() {
+		_ = channel.FlushAndCloseConfirms(func(uint64, bool) error { return nil })
 	}
 
 	// Cancel all consumers on this channel

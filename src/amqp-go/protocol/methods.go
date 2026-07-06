@@ -1815,21 +1815,17 @@ func (m *BasicPublishMethod) Serialize() ([]byte, error) {
 	routingKeyBytes := encodeShortString(m.RoutingKey)
 	result = append(result, routingKeyBytes...)
 
-	// Flags (uint16)
-	// bit 0: mandatory
-	// bit 1: immediate
-	// bits 2-15: unused
-	flags := uint16(0)
+	// Flags: AMQP 0.9.1 packs consecutive bit arguments into a SINGLE octet
+	// (bit 0: mandatory, bit 1: immediate). This was historically encoded as a
+	// uint16, which real clients do not send — see Deserialize.
+	var flags byte
 	if m.Mandatory {
-		flags |= (1 << 0)
+		flags |= 1 << 0
 	}
 	if m.Immediate {
-		flags |= (1 << 1)
+		flags |= 1 << 1
 	}
-
-	flagBytes := make([]byte, 2)
-	binary.BigEndian.PutUint16(flagBytes, flags)
-	result = append(result, flagBytes...)
+	result = append(result, flags)
 
 	return result, nil
 }
@@ -1868,19 +1864,21 @@ func (m *BasicPublishMethod) Deserialize(data []byte) error {
 	m.RoutingKey = routingKey
 	offset = newOffset
 
-	// Flags (uint16)
-	if offset+2 > len(data) {
-		// If not enough bytes for flags, use defaults (false for both)
+	// Flags: single octet per AMQP 0.9.1 bit packing (bit 0: mandatory,
+	// bit 1: immediate). The previous implementation read a uint16 here; real
+	// clients send exactly one octet, so the length guard always fired and the
+	// mandatory/immediate flags were silently dropped for every wire publish
+	// (basic.return never triggered for actual clients). Found while writing
+	// the SQ-5 mandatory-unroutable confirm integration test.
+	if offset >= len(data) {
+		// No flag octet: default both to false.
 		m.Mandatory = false
 		m.Immediate = false
 		return nil
 	}
-	flags := binary.BigEndian.Uint16(data[offset : offset+2])
-	offset += 2
-
-	// Extract flags
-	m.Mandatory = (flags & (1 << 0)) != 0
-	m.Immediate = (flags & (1 << 1)) != 0
+	flags := data[offset]
+	m.Mandatory = flags&(1<<0) != 0
+	m.Immediate = flags&(1<<1) != 0
 
 	return nil
 }
