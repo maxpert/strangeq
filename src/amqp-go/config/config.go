@@ -26,6 +26,9 @@ func DefaultConfig() *AMQPConfig {
 			TCPKeepAliveIntervalMS: 30000, // 30 seconds
 			ReadBufferSize:         8192,
 			WriteBufferSize:        8192,
+
+			ReaderOverflowFlowBytes:    8 << 20,  // 8 MiB: assert channel.flow(false)
+			ReaderOverflowHardCapBytes: 64 << 20, // 64 MiB: close the connection
 		},
 		Storage: interfaces.StorageConfig{
 			Path:                 "./data",
@@ -85,8 +88,9 @@ func DefaultConfig() *AMQPConfig {
 			CompactionIntervalMS:        1800000,           // 30 minutes
 
 			// Consumer Delivery
-			ConsumerSelectTimeoutMS: 1,   // 1 millisecond (500µs rounded up)
-			ConsumerMaxBatchSize:    100, // Max 100 messages per consumer per poll
+			ConsumerSelectTimeoutMS: 1,    // 1 millisecond (500µs rounded up)
+			ConsumerMaxBatchSize:    100,  // Max 100 messages per consumer per poll
+			UnlimitedPrefetchCap:    2000, // Finite gate cap for prefetch-0 manual-ack consumers
 
 			// Background Maintenance
 			WALCleanupCheckIntervalMS: 300000, // 5 minutes

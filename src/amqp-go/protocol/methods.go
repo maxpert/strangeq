@@ -1923,13 +1923,14 @@ func (m *BasicConsumeMethod) Serialize() ([]byte, error) {
 	consumerTagBytes := encodeShortString(m.ConsumerTag)
 	result = append(result, consumerTagBytes...)
 
-	// Flags (uint16)
+	// Flags (single octet, per AMQP 0.9.1 — the four bits pack into ONE byte,
+	// not a uint16; a spec-compliant client sends exactly one octet here).
 	// bit 0: no-local
 	// bit 1: no-ack
 	// bit 2: exclusive
 	// bit 3: no-wait
-	// bits 4-15: unused
-	flags := uint16(0)
+	// bits 4-7: unused
+	var flags byte
 	if m.NoLocal {
 		flags |= (1 << 0)
 	}
@@ -1942,10 +1943,7 @@ func (m *BasicConsumeMethod) Serialize() ([]byte, error) {
 	if m.NoWait {
 		flags |= (1 << 3)
 	}
-
-	flagBytes := make([]byte, 2)
-	binary.BigEndian.PutUint16(flagBytes, flags)
-	result = append(result, flagBytes...)
+	result = append(result, flags)
 
 	// Arguments (field table)
 	argsBytes, err := encodeFieldTable(m.Arguments)
@@ -1993,8 +1991,11 @@ func (m *BasicConsumeMethod) Deserialize(data []byte) error {
 		offset = newOffset
 	}
 
-	// Flags (uint16)
-	if offset+2 > len(data) {
+	// Flags (single octet, per AMQP 0.9.1 — the four bits pack into ONE byte,
+	// not a uint16). Reading two bytes here misaligned the arguments table and
+	// decoded no-ack from the wrong byte, so a spec-compliant client's no-ack
+	// consumer was silently treated as manual-ack (SQ-0 deadlock).
+	if offset >= len(data) {
 		// If not enough bytes for flags, use defaults
 		m.NoLocal = false
 		m.NoAck = false
@@ -2002,8 +2003,8 @@ func (m *BasicConsumeMethod) Deserialize(data []byte) error {
 		m.NoWait = false
 		// Arguments are handled below
 	} else {
-		flags := binary.BigEndian.Uint16(data[offset : offset+2])
-		offset += 2
+		flags := data[offset]
+		offset++
 
 		// Extract flags
 		m.NoLocal = (flags & (1 << 0)) != 0
@@ -2142,17 +2143,14 @@ func (m *BasicGetMethod) Serialize() ([]byte, error) {
 	queueBytes := encodeShortString(m.Queue)
 	result = append(result, queueBytes...)
 
-	// NoAck (packed into flags)
+	// NoAck (single octet, per AMQP 0.9.1 — not a uint16)
 	// bit 0: no-ack
-	// bits 1-15: unused
-	flags := uint16(0)
+	// bits 1-7: unused
+	var flags byte
 	if m.NoAck {
 		flags |= (1 << 0)
 	}
-
-	flagBytes := make([]byte, 2)
-	binary.BigEndian.PutUint16(flagBytes, flags)
-	result = append(result, flagBytes...)
+	result = append(result, flags)
 
 	return result, nil
 }
@@ -2180,10 +2178,12 @@ func (m *BasicGetMethod) Deserialize(data []byte) error {
 	m.Queue = queue
 	offset = newOffset
 
-	// Flags (uint16)
-	if offset+2 <= len(data) {
-		flags := binary.BigEndian.Uint16(data[offset : offset+2])
-		offset += 2
+	// Flags (single octet, per AMQP 0.9.1 — not a uint16). basic.get carries
+	// exactly one trailing flags byte; reading two bytes here made no-ack from
+	// a spec-compliant client fall through to the default (false).
+	if offset < len(data) {
+		flags := data[offset]
+		offset++
 
 		// Extract flags
 		m.NoAck = (flags & (1 << 0)) != 0
@@ -2311,54 +2311,28 @@ type BasicAckMethod struct {
 	Multiple    bool
 }
 
-// Serialize encodes the BasicAckMethod into a byte slice
+// Serialize encodes the BasicAckMethod into a byte slice.
+// AMQP 0.9.1: delivery-tag (longlong) followed by a SINGLE OCTET bit-field
+// (bit 0: multiple). A former encoding wrote the bits as a big-endian uint16,
+// which a spec client decodes as multiple=false — silently turning batched
+// confirm/ack streams into per-message ones on the wire.
 func (m *BasicAckMethod) Serialize() ([]byte, error) {
-	var result []byte
-
-	// Delivery tag (long long integer - 64-bit)
-	deliveryTagBytes := make([]byte, 8)
-	binary.BigEndian.PutUint64(deliveryTagBytes, m.DeliveryTag)
-	result = append(result, deliveryTagBytes...)
-
-	// Multiple (packed into flags)
-	// bit 0: multiple
-	// bits 1-15: unused
-	flags := uint16(0)
+	result := make([]byte, 9)
+	binary.BigEndian.PutUint64(result[:8], m.DeliveryTag)
 	if m.Multiple {
-		flags |= (1 << 0)
+		result[8] |= 0x01
 	}
-
-	flagBytes := make([]byte, 2)
-	binary.BigEndian.PutUint16(flagBytes, flags)
-	result = append(result, flagBytes...)
-
 	return result, nil
 }
 
-// Deserialize decodes the BasicAckMethod from a byte slice
+// Deserialize decodes the BasicAckMethod from a byte slice (spec octet
+// bit-field; an 8-byte payload without the flag octet defaults multiple=false).
 func (m *BasicAckMethod) Deserialize(data []byte) error {
 	if len(data) < 8 { // Need at least delivery tag (8 bytes)
 		return fmt.Errorf("basic.ack method data too short")
 	}
-
-	offset := 0
-
-	// Delivery tag (long long integer - 64-bit)
-	m.DeliveryTag = binary.BigEndian.Uint64(data[offset : offset+8])
-	offset += 8
-
-	// Flags (uint16)
-	if offset+2 <= len(data) {
-		flags := binary.BigEndian.Uint16(data[offset : offset+2])
-		offset += 2
-
-		// Extract flags
-		m.Multiple = (flags & (1 << 0)) != 0
-	} else {
-		// Default to false if flags not provided
-		m.Multiple = false
-	}
-
+	m.DeliveryTag = binary.BigEndian.Uint64(data[:8])
+	m.Multiple = len(data) >= 9 && data[8]&0x01 != 0
 	return nil
 }
 
@@ -2368,54 +2342,30 @@ type BasicRejectMethod struct {
 	Requeue     bool
 }
 
-// Serialize encodes the BasicRejectMethod into a byte slice
+// Serialize encodes the BasicRejectMethod into a byte slice.
+// AMQP 0.9.1: delivery-tag (longlong) + a SINGLE OCTET bit-field (bit 0:
+// requeue). See BasicAckMethod.Serialize for why this must not be a uint16.
 func (m *BasicRejectMethod) Serialize() ([]byte, error) {
-	var result []byte
-
-	// Delivery tag (long long integer - 64-bit)
-	deliveryTagBytes := make([]byte, 8)
-	binary.BigEndian.PutUint64(deliveryTagBytes, m.DeliveryTag)
-	result = append(result, deliveryTagBytes...)
-
-	// Requeue (packed into flags)
-	// bit 0: requeue
-	// bits 1-15: unused
-	flags := uint16(0)
+	result := make([]byte, 9)
+	binary.BigEndian.PutUint64(result[:8], m.DeliveryTag)
 	if m.Requeue {
-		flags |= (1 << 0)
+		result[8] |= 0x01
 	}
-
-	flagBytes := make([]byte, 2)
-	binary.BigEndian.PutUint16(flagBytes, flags)
-	result = append(result, flagBytes...)
-
 	return result, nil
 }
 
-// Deserialize decodes the BasicRejectMethod from a byte slice
+// Deserialize decodes the BasicRejectMethod from a byte slice (spec octet
+// bit-field; an 8-byte payload without the flag octet keeps the requeue=true
+// default).
 func (m *BasicRejectMethod) Deserialize(data []byte) error {
 	if len(data) < 8 { // Need at least delivery tag (8 bytes)
 		return fmt.Errorf("basic.reject method data too short")
 	}
-
-	offset := 0
-
-	// Delivery tag (long long integer - 64-bit)
-	m.DeliveryTag = binary.BigEndian.Uint64(data[offset : offset+8])
-	offset += 8
-
-	// Flags (uint16)
-	if offset+2 <= len(data) {
-		flags := binary.BigEndian.Uint16(data[offset : offset+2])
-		offset += 2
-
-		// Extract flags
-		m.Requeue = (flags & (1 << 0)) != 0
-	} else {
-		// Default to true if flags not provided (requeue by default)
-		m.Requeue = true
+	m.DeliveryTag = binary.BigEndian.Uint64(data[:8])
+	m.Requeue = true // spec default when the flag octet is absent
+	if len(data) >= 9 {
+		m.Requeue = data[8]&0x01 != 0
 	}
-
 	return nil
 }
 
@@ -2426,60 +2376,36 @@ type BasicNackMethod struct {
 	Requeue     bool
 }
 
-// Serialize encodes the BasicNackMethod into a byte slice
+// Serialize encodes the BasicNackMethod into a byte slice.
+// AMQP 0.9.1: delivery-tag (longlong) + a SINGLE OCTET bit-field (bit 0:
+// multiple, bit 1: requeue). See BasicAckMethod.Serialize for why this must
+// not be a uint16.
 func (m *BasicNackMethod) Serialize() ([]byte, error) {
-	var result []byte
-
-	// Delivery tag (long long integer - 64-bit)
-	deliveryTagBytes := make([]byte, 8)
-	binary.BigEndian.PutUint64(deliveryTagBytes, m.DeliveryTag)
-	result = append(result, deliveryTagBytes...)
-
-	// Flags (uint16)
-	// bit 0: multiple
-	// bit 1: requeue
-	// bits 2-15: unused
-	flags := uint16(0)
+	result := make([]byte, 9)
+	binary.BigEndian.PutUint64(result[:8], m.DeliveryTag)
 	if m.Multiple {
-		flags |= (1 << 0)
+		result[8] |= 0x01
 	}
 	if m.Requeue {
-		flags |= (1 << 1)
+		result[8] |= 0x02
 	}
-
-	flagBytes := make([]byte, 2)
-	binary.BigEndian.PutUint16(flagBytes, flags)
-	result = append(result, flagBytes...)
-
 	return result, nil
 }
 
-// Deserialize decodes the BasicNackMethod from a byte slice
+// Deserialize decodes the BasicNackMethod from a byte slice (spec octet
+// bit-field; an 8-byte payload without the flag octet keeps the requeue=true
+// default).
 func (m *BasicNackMethod) Deserialize(data []byte) error {
 	if len(data) < 8 { // Need at least delivery tag (8 bytes)
 		return fmt.Errorf("basic.nack method data too short")
 	}
-
-	offset := 0
-
-	// Delivery tag (long long integer - 64-bit)
-	m.DeliveryTag = binary.BigEndian.Uint64(data[offset : offset+8])
-	offset += 8
-
-	// Flags (uint16)
-	if offset+2 <= len(data) {
-		flags := binary.BigEndian.Uint16(data[offset : offset+2])
-		offset += 2
-
-		// Extract flags
-		m.Multiple = (flags & (1 << 0)) != 0
-		m.Requeue = (flags & (1 << 1)) != 0
-	} else {
-		// Default values if flags not provided
-		m.Multiple = false
-		m.Requeue = true // Requeue by default
+	m.DeliveryTag = binary.BigEndian.Uint64(data[:8])
+	m.Multiple = false
+	m.Requeue = true // spec default when the flag octet is absent
+	if len(data) >= 9 {
+		m.Multiple = data[8]&0x01 != 0
+		m.Requeue = data[8]&0x02 != 0
 	}
-
 	return nil
 }
 

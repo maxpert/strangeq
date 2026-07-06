@@ -48,6 +48,22 @@ type NetworkConfig struct {
 	// Buffer sizes
 	ReadBufferSize  int
 	WriteBufferSize int
+
+	// ReaderOverflowFlowBytes is the per-connection reader-overflow backlog (in
+	// bytes of buffered inbound frames) at which the server asserts
+	// channel.flow(active=false) to the client, asking it to pause publishing.
+	// The reader keeps draining the socket (so acks keep flowing) while the
+	// backlog persists, and resumes with channel.flow(active=true) once it fully
+	// drains. Best-effort: a client that ignores flow keeps growing the backlog
+	// until the hard cap. Default: 8 MiB. 0 disables the flow signal.
+	ReaderOverflowFlowBytes int64
+
+	// ReaderOverflowHardCapBytes is the hard per-connection cap on the
+	// reader-overflow backlog. When the buffered inbound frame bytes exceed it,
+	// the connection is closed (DoS / runaway-publisher protection) rather than
+	// growing memory without bound. Must exceed ReaderOverflowFlowBytes.
+	// Default: 64 MiB. 0 disables the cap (unbounded — not recommended).
+	ReaderOverflowHardCapBytes int64
 }
 
 // StorageConfig holds storage-related configuration
@@ -218,6 +234,17 @@ type EngineConfig struct {
 	// Smaller = better fairness, lower throughput
 	// Default: 100
 	ConsumerMaxBatchSize int `json:"consumer_max_batch_size"`
+
+	// UnlimitedPrefetchCap is the finite prefetch-gate cap applied to a
+	// manual-ack consumer that requests prefetch-count 0 ("unlimited" per AMQP
+	// 0.9.1). A true unbounded unacked set makes the ack cursor's lowest-unacked
+	// rescan O(n) per ack; a finite cap keeps it small. The cap MUST exceed the
+	// coarsest client ack cadence you intend to support: a consumer that
+	// multi-acks every N messages needs a window > N to ever emit the ack that
+	// reopens the gate (e.g. multi-ack-every-1000 requires a cap of at least
+	// ~1024). No-ack consumers ignore this entirely (they bypass the gate).
+	// Default: 2000
+	UnlimitedPrefetchCap int `json:"unlimited_prefetch_cap"`
 
 	// ========================================
 	// Background Maintenance

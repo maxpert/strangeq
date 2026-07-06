@@ -14,23 +14,22 @@ type requeueEntry struct {
 }
 
 type QueueState struct {
-	tail           atomic.Uint64
-	head           atomic.Uint64
-	minAckCursor   atomic.Uint64
-	waiting        atomic.Int64
-	inflight       atomic.Int64
-	wake           chan struct{}
-	parkedCount    atomic.Int64
-	requeueMu      sync.Mutex
-	requeueBuf     []requeueEntry
-	requeueHead    int
-	requeueLen     int
-	requeueCount   atomic.Int64
-	depthHighWM    atomic.Uint64
-	inflightOwners sync.Map
-	closed         atomic.Bool
-	stopCh         chan struct{}
-	parkTimeout    time.Duration
+	tail         atomic.Uint64
+	head         atomic.Uint64
+	minAckCursor atomic.Uint64
+	waiting      atomic.Int64
+	inflight     atomic.Int64
+	wake         chan struct{}
+	parkedCount  atomic.Int64
+	requeueMu    sync.Mutex
+	requeueBuf   []requeueEntry
+	requeueHead  int
+	requeueLen   int
+	requeueCount atomic.Int64
+	depthHighWM  atomic.Uint64
+	closed       atomic.Bool
+	stopCh       chan struct{}
+	parkTimeout  time.Duration
 }
 
 func NewQueueState(depthHighWM uint64) *QueueState {
@@ -347,35 +346,6 @@ func (qs *QueueState) Close() {
 
 func (qs *QueueState) StopCh() <-chan struct{} {
 	return qs.stopCh
-}
-
-func (qs *QueueState) StoreInflight(msgID uint64, consumerTag string) {
-	qs.inflightOwners.Store(msgID, consumerTag)
-}
-
-func (qs *QueueState) LoadInflight(msgID uint64) (string, bool) {
-	v, ok := qs.inflightOwners.Load(msgID)
-	if !ok {
-		return "", false
-	}
-	return v.(string), ok
-}
-
-func (qs *QueueState) DeleteInflight(msgID uint64) {
-	qs.inflightOwners.Delete(msgID)
-}
-
-func (qs *QueueState) RangeInflightForConsumer(consumerTag string, fn func(deliveryTag uint64)) {
-	var tags []uint64
-	qs.inflightOwners.Range(func(key, value interface{}) bool {
-		if value.(string) == consumerTag {
-			tags = append(tags, key.(uint64))
-		}
-		return true
-	})
-	for _, tag := range tags {
-		fn(tag)
-	}
 }
 
 func (qs *QueueState) Head() uint64         { return qs.head.Load() }

@@ -77,13 +77,18 @@ func (s *Server) processChannelSpecificMethod(conn *protocol.Connection, channel
 			return err
 		}
 
-		if value, exists := conn.Channels.Load(channelID); exists {
-			channel := value.(*protocol.Channel)
-			channel.FlowActive.Store(flowOKMethod.Active)
-			s.Log.Debug("Channel flow-ok received",
-				zap.Uint16("channel_id", channelID),
-				zap.Bool("active", flowOKMethod.Active))
-		}
+		// The client's flow-ok confirms OUR channel.flow request about the
+		// CLIENT's content direction (client -> server publishes). It must NOT
+		// be stored into FlowActive: that flag gates the SERVER -> client
+		// delivery direction and is controlled exclusively by client-initiated
+		// channel.flow (case above). Writing the echo here wedged the broker —
+		// the server's reader-overflow flow(false) was echoed back as
+		// flow-ok(false), which parked forwardConsumerMessages, halting the very
+		// deliveries (and thus acks) that drain the overflow: a self-inflicted
+		// deadlock. flow-ok is acknowledgement only; just log it.
+		s.Log.Debug("Channel flow-ok received",
+			zap.Uint16("channel_id", channelID),
+			zap.Bool("active", flowOKMethod.Active))
 
 		return nil
 

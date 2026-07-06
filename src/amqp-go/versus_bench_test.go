@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"os"
+	"strconv"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -42,6 +43,14 @@ func versusURI(b *testing.B) (string, func()) {
 	cfg := config.DefaultConfig()
 	cfg.Network.Address = addr
 	cfg.Storage.Path = b.TempDir()
+	// Optional override for tuning the prefetch-0 gate cap (see
+	// EngineConfig.UnlimitedPrefetchCap), e.g. PREFETCH0_CAP=1024 to compare cap
+	// values head-to-head. Must stay > the MultiAck1000 ack cadence (1000).
+	if v := os.Getenv("PREFETCH0_CAP"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			cfg.Engine.UnlimitedPrefetchCap = n
+		}
+	}
 
 	srv, err := server.NewServerBuilder().WithConfig(cfg).Build()
 	if err != nil {
@@ -115,9 +124,11 @@ func BenchmarkVersus_AutoAck(b *testing.B) {
 	}
 
 	body := make([]byte, versusMsgSize)
+	var received atomic.Int64
 	done := make(chan struct{})
 	go func() {
 		for range msgs {
+			received.Add(1)
 		}
 		close(done)
 	}()
@@ -132,7 +143,7 @@ func BenchmarkVersus_AutoAck(b *testing.B) {
 	}
 
 	b.StopTimer()
-	time.Sleep(500 * time.Millisecond)
+	waitForConsumed(b, &received, int64(b.N))
 	ch.Close()
 	<-done
 }
@@ -148,9 +159,11 @@ func BenchmarkVersus_ManualAck(b *testing.B) {
 	}
 
 	body := make([]byte, versusMsgSize)
+	var received atomic.Int64
 	done := make(chan struct{})
 	go func() {
 		for d := range msgs {
+			received.Add(1)
 			d.Ack(false)
 		}
 		close(done)
@@ -166,7 +179,7 @@ func BenchmarkVersus_ManualAck(b *testing.B) {
 	}
 
 	b.StopTimer()
-	time.Sleep(500 * time.Millisecond)
+	waitForConsumed(b, &received, int64(b.N))
 	ch.Close()
 	<-done
 }
@@ -182,11 +195,17 @@ func BenchmarkVersus_MultiAck1000(b *testing.B) {
 	}
 
 	body := make([]byte, versusMsgSize)
+	// received is asserted after the run: a benchmark that only times the
+	// publish loop can "pass" while consumption silently wedges (this exact
+	// benchmark once wedged at ~2000 received because the server dropped the
+	// multiple flag from basic.ack, and nothing noticed).
+	var received atomic.Int64
 	done := make(chan struct{})
 	go func() {
 		var count int
 		for d := range msgs {
 			count++
+			received.Store(int64(count))
 			if count%1000 == 0 {
 				d.Ack(true)
 			}
@@ -204,7 +223,32 @@ func BenchmarkVersus_MultiAck1000(b *testing.B) {
 	}
 
 	b.StopTimer()
-	time.Sleep(500 * time.Millisecond)
+	waitForConsumed(b, &received, int64(b.N))
 	ch.Close()
 	<-done
+}
+
+// waitForConsumed fails the benchmark if the consumer does not receive every
+// published message within a generous deadline. This turns silent consumption
+// wedges (deadlocks, credit leaks) into hard benchmark failures instead of
+// cosmetic publish-throughput passes.
+func waitForConsumed(b *testing.B, received *atomic.Int64, want int64) {
+	b.Helper()
+	deadline := time.Now().Add(30 * time.Second)
+	last, lastProgress := int64(-1), time.Now()
+	for {
+		r := received.Load()
+		if r >= want {
+			return
+		}
+		if r != last {
+			last, lastProgress = r, time.Now()
+		} else if time.Since(lastProgress) > 10*time.Second {
+			b.Fatalf("consumption stalled: received %d of %d (no progress for 10s)", r, want)
+		}
+		if time.Now().After(deadline) {
+			b.Fatalf("consumption incomplete: received %d of %d after 30s", r, want)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
 }

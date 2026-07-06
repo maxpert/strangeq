@@ -457,8 +457,13 @@ func (s *Server) processConnectionFrames(conn *protocol.Connection) {
 	// This unblocks processFrame if it's waiting to send to AckQueue.
 	close(conn.Done)
 
-	// Wait for frame processor to exit (it is the only sender to ackQueue)
+	// Wait for BOTH senders to ackQueue to exit before closing it. The frame
+	// processor routes acks it dequeues, and (since the SQ-0 fix) the reader
+	// diverts acks directly. processFrames may exit on error before the reader
+	// closes FrameQueue, so we must explicitly wait for the reader too;
+	// otherwise a late reader ack-send could hit a closed channel and panic.
 	<-processorDone
+	<-readerDone
 	// Close ackQueue so ackProcessor drains remaining frames and exits
 	close(conn.AckQueue)
 	<-ackProcessorDone
@@ -470,7 +475,108 @@ func (s *Server) readFrames(conn *protocol.Connection, done chan struct{}) {
 	defer close(done)
 	defer close(conn.FrameQueue) // Signal processor to stop
 
+	// pending holds non-ack frames that could not be handed to processFrames
+	// without blocking, because its FrameQueue is full while a basic.publish is
+	// parked in QueueState.WaitForCapacity. Buffering them here (in order) keeps
+	// the reader draining the socket, so it can keep diverting acks — the very
+	// frames that release the prefetch gate and drain the queue, lifting the
+	// backpressure that stalls processFrames. Without this, the reader would
+	// block on the full FrameQueue, acks queued behind the parked publish on
+	// the same connection would never be read, and a client that both publishes
+	// and consumes over one connection would deadlock (SQ-0 secondary effect).
+	// It drains back to nil as soon as processFrames makes progress.
+	//
+	// SQ-0 step 6: this buffer is BOUNDED by two per-connection mechanisms
+	// (design §6.1). When its byte footprint crosses ReaderOverflowFlowBytes we
+	// assert channel.flow(active=false) to the client (best-effort ask to pause
+	// publishing) and resume with channel.flow(active=true) when it fully
+	// drains; if it exceeds the hard ReaderOverflowHardCapBytes cap (a client
+	// ignoring flow, or a pure-publish flood) we close the connection rather
+	// than grow memory without bound.
+	var pending []*protocol.Frame
+	var pendingBytes int64
+	flowPaused := false
+	flowLimit := s.Config.Network.ReaderOverflowFlowBytes
+	hardCap := s.Config.Network.ReaderOverflowHardCapBytes
+
+	// The channel.flow writes are issued from a dedicated sender goroutine, NOT
+	// from the reader. The reader must never block — not even on the connection
+	// WriteMutex. If it did, a cross-process cycle wedges the connection: a
+	// delivery writer holds WriteMutex blocked on a full client TCP window; the
+	// client's dispatch goroutine (which would drain that window) is itself
+	// blocked sending its flow-ok behind the client publisher's send mutex; the
+	// publisher is blocked because OUR reader stopped reading while waiting on
+	// WriteMutex. Handing the write to a separate goroutine keeps the reader
+	// reading, which unwinds that cycle from the client side. Latest-wins
+	// semantics: the reader stores the desired state and pokes the wake channel;
+	// the sender collapses bursts of transitions to the newest state.
+	flowDesiredActive := &atomic.Bool{}
+	flowDesiredActive.Store(true)
+	flowWake := make(chan struct{}, 1)
+	flowQuit := make(chan struct{})
+	defer close(flowQuit)
+	go func() {
+		lastSent := true
+		for {
+			select {
+			case <-flowWake:
+			case <-flowQuit:
+				return
+			case <-conn.Done:
+				return
+			}
+			want := flowDesiredActive.Load()
+			if want == lastSent {
+				continue
+			}
+			if err := s.setConnectionFlow(conn, want); err != nil {
+				// Could not deliver the pause signal (client not reading its
+				// socket). The reader's hard cap still bounds memory; closing
+				// here just accelerates the inevitable teardown.
+				s.Log.Warn("reader overflow: channel.flow send failed; closing connection",
+					zap.String("connection_id", conn.ID), zap.Bool("active", want), zap.Error(err))
+				conn.Closed.Store(true)
+				conn.Conn.Close()
+				return
+			}
+			lastSent = want
+		}
+	}()
+	requestFlow := func(active bool) {
+		flowDesiredActive.Store(active)
+		select {
+		case flowWake <- struct{}{}:
+		default:
+		}
+	}
+
 	for {
+		// Opportunistically hand buffered frames to processFrames whenever it
+		// has drained space. Non-blocking: never wait on a full FrameQueue.
+		for len(pending) > 0 {
+			select {
+			case conn.FrameQueue <- pending[0]:
+				pendingBytes -= int64(pending[0].Size)
+				pending[0] = nil
+				pending = pending[1:]
+				continue
+			case <-conn.Done:
+				return
+			default:
+			}
+			break
+		}
+		if len(pending) == 0 {
+			pending = nil // release backing array once fully drained
+			pendingBytes = 0
+			// Backlog cleared: lift the earlier flow-off signal so the client
+			// may resume publishing.
+			if flowPaused {
+				flowPaused = false
+				requestFlow(true)
+			}
+		}
+
 		hb := conn.HeartbeatSec.Load()
 		if hb > 0 {
 			conn.Conn.SetReadDeadline(time.Now().Add(time.Duration(2*hb) * time.Second))
@@ -506,11 +612,72 @@ func (s *Server) readFrames(conn *protocol.Connection, done chan struct{}) {
 
 		s.bytesReceived.Add(int64(frame.Size))
 
-		select {
-		case conn.FrameQueue <- frame:
-			// Frame queued successfully
-		case <-done:
+		// Divert basic.ack/nack/reject straight to the ACK processor,
+		// bypassing FrameQueue and the (potentially publish-blocked)
+		// processFrames goroutine. A basic.publish that hits queue
+		// backpressure blocks processFrames in QueueState.WaitForCapacity;
+		// if acks had to wait behind it in FrameQueue, the very acks that
+		// release the prefetch gate — and thereby drain the queue and lift
+		// the backpressure — could never be processed. A client that
+		// publishes and consumes over one connection would then deadlock.
+		// ackProcessor never blocks on broker backpressure, so routing acks
+		// here keeps the backpressure-relief path permanently live. (Acks
+		// were already handled on a separate goroutine, so this introduces
+		// no new reordering — it only moves the diversion point earlier.)
+		if isAckFrame(frame) {
+			select {
+			case conn.AckQueue <- frame:
+			case <-conn.Done:
+				protocol.PutFrame(frame)
+				return
+			}
+			continue
+		}
+
+		// Enqueue for processFrames. Try a non-blocking direct hand-off only when
+		// nothing is buffered (buffering must preserve per-channel frame order —
+		// a publish's method, header and body frames must stay contiguous). When
+		// FrameQueue is full, buffer instead; the reader must never block here or
+		// acks stall behind it.
+		if len(pending) == 0 {
+			select {
+			case conn.FrameQueue <- frame:
+				continue // queued directly
+			case <-conn.Done:
+				protocol.PutFrame(frame)
+				return
+			default:
+				// FrameQueue full — fall through to bounded buffering.
+			}
+		}
+		pending = append(pending, frame)
+		pendingBytes += int64(frame.Size)
+
+		// Hard cap: a client ignoring flow, or flooding publishes while never
+		// consuming, must not grow reader memory without bound. Close it.
+		if hardCap > 0 && pendingBytes > hardCap {
+			s.Log.Warn("reader overflow exceeded hard cap; closing connection",
+				zap.String("connection_id", conn.ID),
+				zap.Int64("pending_bytes", pendingBytes),
+				zap.Int64("hard_cap_bytes", hardCap))
+			if s.MetricsCollector != nil {
+				s.MetricsCollector.RecordConnectionError("reader_overflow")
+			}
+			conn.Closed.Store(true)
+			conn.Conn.Close()
 			return
+		}
+
+		// Soft threshold: ask the client to pause publishing via channel.flow.
+		// Best-effort, delivered by the flow-sender goroutine so the reader
+		// itself never blocks on the write (or on the WriteMutex). A client that
+		// ignores the signal keeps growing the backlog into the hard cap above.
+		if !flowPaused && flowLimit > 0 && pendingBytes >= flowLimit {
+			flowPaused = true
+			requestFlow(false)
+			s.Log.Info("reader overflow: requesting channel.flow(false)",
+				zap.String("connection_id", conn.ID),
+				zap.Int64("pending_bytes", pendingBytes))
 		}
 	}
 }
