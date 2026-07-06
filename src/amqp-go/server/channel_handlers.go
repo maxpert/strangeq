@@ -105,6 +105,21 @@ func (s *Server) processChannelSpecificMethod(conn *protocol.Connection, channel
 			case channel.FlowWake <- struct{}{}:
 			default:
 			}
+
+			// SQ-5: flush any durable-but-unacked publisher confirms and seal
+			// the channel's confirm state BEFORE channel.close-ok, so the
+			// client receives every outstanding confirm and no straggling
+			// flusher pass can write an ack on the closed channel afterwards.
+			if channel.ConfirmMode.Load() {
+				if err := channel.FlushAndCloseConfirms(func(tag uint64, multiple bool) error {
+					return s.sendBasicAck(conn, channelID, tag, multiple)
+				}); err != nil {
+					s.Log.Warn("Failed to flush publisher confirms on channel close",
+						zap.Uint16("channel_id", channelID),
+						zap.String("connection_id", conn.ID),
+						zap.Error(err))
+				}
+			}
 			// Cancel all consumers on this channel
 			channel.Mutex.Lock()
 			consumerTags := make([]string, 0, len(channel.Consumers))

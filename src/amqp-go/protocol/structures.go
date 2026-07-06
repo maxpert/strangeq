@@ -44,6 +44,7 @@ type Connection struct {
 	FrameQueue     chan *Frame   // Buffer frames between reader and processor goroutines
 	AckQueue       chan *Frame   // Buffer ACK/NACK/Reject frames for the ack worker goroutine
 	Done           chan struct{} // Closed during connection teardown to unblock goroutines waiting on AckQueue
+	ConfirmWake    chan struct{} // SQ-5: capacity-1 poke channel for the publisher-confirm flusher goroutine
 	WriteMutex     sync.Mutex    // Protects socket writes (heartbeat sender + frame processor both write)
 	Closed         atomic.Bool   // Atomic flag for connection closure
 	ConsumersDirty atomic.Bool   // Set when consumers are added/removed; delivery loop re-scans only when true
@@ -84,6 +85,7 @@ func NewConnectionWithReadBuffer(conn net.Conn, bufSize int) *Connection {
 		PendingMessages: make(map[uint16]*PendingMessage),
 		FrameQueue:      make(chan *Frame, 10000), // 10K frame buffer for reader/processor separation
 		AckQueue:        make(chan *Frame, 4096),  // 4K ACK buffer for off-processor ACK handling
+		ConfirmWake:     make(chan struct{}, 1),   // SQ-5: pokes coalesce; see WakeConfirmFlusher
 		Done:            make(chan struct{}),
 		ConnectedAt:     time.Now(),
 	}
@@ -99,6 +101,20 @@ func (c *Connection) TouchActivity() {
 // GetLastActivity returns the last-activity timestamp.
 func (c *Connection) GetLastActivity() time.Time {
 	return time.Unix(0, c.LastActivity.Load())
+}
+
+// WakeConfirmFlusher pokes the connection's publisher-confirm flusher goroutine
+// (SQ-5). Non-blocking and lock-free: pokes coalesce in the capacity-1 channel,
+// which is exactly the batching mechanism — while the flusher is busy writing
+// one basic.ack, any number of newly durable publishes fold into the single
+// pending poke, and the next flush covers them all with one multiple=true ack.
+// Safe on a zero-value Connection (nil chan): the send can never proceed, so
+// the default branch is taken.
+func (c *Connection) WakeConfirmFlusher() {
+	select {
+	case c.ConfirmWake <- struct{}{}:
+	default:
+	}
 }
 
 // Channel represents an AMQP channel
@@ -117,6 +133,17 @@ type Channel struct {
 	FlowWake        chan struct{}        // signaled to wake parked forwarders when flow resumes/closes
 	ConfirmMode     atomic.Bool          // confirm.select state: true = server sends basic.ack for each publish
 	ConfirmSequence atomic.Uint64        // channel-scoped delivery tag sequence for publisher confirms
+
+	// SQ-5: publisher-confirm batching state. The per-publish hot path touches
+	// ONLY confirmDurable (a lock-free CAS-max watermark). confirmFlushMu is a
+	// BATCH-granularity lock: it is taken once per flushed basic.ack (never per
+	// message) and serializes ack emission so the client always observes a
+	// strictly increasing confirm-tag stream. confirmAcked is mutated only under
+	// confirmFlushMu but is an atomic so HasUnflushedConfirms can peek lock-free.
+	confirmDurable atomic.Uint64 // highest contiguous tag past the durability barrier
+	confirmAcked   atomic.Uint64 // highest tag already acked to the client
+	confirmFlushMu sync.Mutex    // serializes confirm flushes and channel-close suppression
+	confirmClosed  bool          // set on channel close; suppresses further confirm acks
 
 	// SQ-18: per-channel wire delivery-tag remapping.
 	//
@@ -165,6 +192,80 @@ func NewChannel(id uint16, conn *Connection) *Channel {
 	}
 	ch.FlowActive.Store(true) // Flow is active by default per AMQP spec
 	return ch
+}
+
+// AdvanceConfirmDurable records that every publisher-confirm tag <= tag on this
+// channel has crossed the durability barrier and is safe to ack (SQ-5).
+// Lock-free CAS-max: safe from any goroutine and never regresses the watermark.
+//
+// CONTIGUITY CONTRACT: because a later flush acks the watermark with
+// multiple=true (confirming ALL tags <= watermark), callers must deliver
+// barrier crossings for a channel in non-decreasing tag order. Today this holds
+// trivially: publishes on a channel are processed serially by the connection's
+// frame-processor goroutine and the synchronous barrier completes each tag
+// before the next publish starts. A future asynchronous barrier (e.g. WAL
+// group-commit completion callbacks) must preserve per-channel completion order
+// or fold out-of-order completions into a contiguous watermark before calling
+// this.
+func (c *Channel) AdvanceConfirmDurable(tag uint64) {
+	for {
+		cur := c.confirmDurable.Load()
+		if tag <= cur || c.confirmDurable.CompareAndSwap(cur, tag) {
+			return
+		}
+	}
+}
+
+// HasUnflushedConfirms reports whether this channel has durable publisher
+// confirms not yet acked to the client. Lock-free; used by the confirm flusher
+// to skip idle channels without taking the flush lock.
+func (c *Channel) HasUnflushedConfirms() bool {
+	return c.confirmDurable.Load() > c.confirmAcked.Load()
+}
+
+// FlushConfirms sends at most ONE basic.ack covering every durable-but-unacked
+// publisher-confirm tag on this channel (SQ-5). send is invoked with
+// (tag, multiple) — multiple=true iff the ack covers more than one tag — while
+// the flush lock is held, so concurrent flushers (inline flush on the frame
+// processor and the per-connection flusher goroutine) emit acks in strictly
+// increasing tag order and never double-ack. A no-op if the channel's confirm
+// state is closed or nothing is pending. Returns send's error without marking
+// the tags acked, so a failed write is retryable (in practice a write error
+// tears the connection down).
+func (c *Channel) FlushConfirms(send func(tag uint64, multiple bool) error) error {
+	c.confirmFlushMu.Lock()
+	defer c.confirmFlushMu.Unlock()
+	return c.flushConfirmsLocked(send)
+}
+
+// FlushAndCloseConfirms performs a final confirm flush and marks the channel
+// closed for confirms, all under one critical section (SQ-5). After it returns,
+// no goroutine can emit another confirm ack for this channel — required on
+// channel.close so a straggling flusher pass cannot write a basic.ack after the
+// channel.close-ok. The final flush error is returned but the closed mark is
+// applied regardless.
+func (c *Channel) FlushAndCloseConfirms(send func(tag uint64, multiple bool) error) error {
+	c.confirmFlushMu.Lock()
+	defer c.confirmFlushMu.Unlock()
+	err := c.flushConfirmsLocked(send)
+	c.confirmClosed = true
+	return err
+}
+
+func (c *Channel) flushConfirmsLocked(send func(tag uint64, multiple bool) error) error {
+	if c.confirmClosed {
+		return nil
+	}
+	durable := c.confirmDurable.Load()
+	acked := c.confirmAcked.Load()
+	if durable <= acked {
+		return nil
+	}
+	if err := send(durable, durable > acked+1); err != nil {
+		return err
+	}
+	c.confirmAcked.Store(durable)
+	return nil
 }
 
 // NextWireTag mints the next strictly-increasing per-channel wire delivery tag
