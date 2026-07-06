@@ -19,7 +19,7 @@ import (
 const (
 	// WAL settings
 	DefaultWALBatchSize    = 1000                  // Messages per batch
-	DefaultWALBatchTimeout = 10 * time.Millisecond // Batch flush timeout
+	DefaultWALBatchTimeout = 10 * time.Millisecond // Legacy batch flush timeout (no longer gates flushing; see WALConfig.BatchTimeout)
 	DefaultWALFileSize     = 512 * 1024 * 1024     // 512 MB per WAL file
 	WALFileExtension       = ".wal"
 
@@ -73,7 +73,11 @@ var ErrUnsupportedWALVersion = errors.New("unsupported WAL file format version")
 
 // WALConfig holds configurable parameters for the WAL manager
 type WALConfig struct {
-	BatchSize          int
+	BatchSize int
+	// BatchTimeout is retained for configuration compatibility but no longer
+	// gates flushing: the batch writer flushes as soon as writeChan is drained
+	// (drain-then-flush group commit), so a lone synchronous writer is never
+	// stalled waiting for a batch ticker. See batchWriterLoop.
 	BatchTimeout       time.Duration
 	FileSize           int64
 	ChannelBuffer      int
@@ -643,35 +647,57 @@ func (wm *WALManager) createSharedWAL() (*QueueWAL, error) {
 	return wal, nil
 }
 
-// batchWriterLoop batches writes and flushes periodically
+// batchWriterLoop implements group commit for synchronous WAL writes:
+// it greedily coalesces every request already queued in writeChan (writers
+// that arrived while the previous batch was fsyncing) into one batch, then
+// flushes immediately.
+//
+// Flushing as soon as writeChan is drained — instead of holding a
+// sub-BatchSize batch until a BatchTimeout ticker fired, as this loop
+// previously did — is what keeps a lone synchronous writer fast: with the
+// old ticker design every solo Write() stalled for up to BatchTimeout
+// (10ms by default, ~100 writes/s), which presented as a publisher wedge
+// once a queue ring crossed the spill threshold and every transient publish
+// became a synchronous WAL write. Concurrent writers still amortize one
+// fsync across the whole drained batch, so group-commit throughput is
+// preserved; the batch size now self-tunes to arrival-rate × fsync-latency
+// (capped at BatchSize) rather than arrival-rate × BatchTimeout.
 func (qw *QueueWAL) batchWriterLoop() {
 	defer qw.wg.Done()
 
 	batch := make([]*writeRequest, 0, qw.cfg.BatchSize)
-	ticker := time.NewTicker(qw.cfg.BatchTimeout)
-	defer ticker.Stop()
 
 	for {
 		select {
 		case req := <-qw.writeChan:
 			batch = append(batch, req)
-			if len(batch) >= qw.cfg.BatchSize {
-				qw.flushBatch(batch)
-				batch = batch[:0]
+			// Coalesce everything already queued, up to BatchSize.
+		drain:
+			for len(batch) < qw.cfg.BatchSize {
+				select {
+				case r := <-qw.writeChan:
+					batch = append(batch, r)
+				default:
+					break drain
+				}
 			}
-
-		case <-ticker.C:
-			if len(batch) > 0 {
-				qw.flushBatch(batch)
-				batch = batch[:0]
-			}
+			qw.flushBatch(batch)
+			batch = batch[:0]
 
 		case <-qw.stopChan:
-			// Final flush
-			if len(batch) > 0 {
-				qw.flushBatch(batch)
+			// Final flush: drain anything still queued so no Write() caller
+			// is left blocked forever on its done channel during shutdown.
+			for {
+				select {
+				case r := <-qw.writeChan:
+					batch = append(batch, r)
+				default:
+					if len(batch) > 0 {
+						qw.flushBatch(batch)
+					}
+					return
+				}
 			}
-			return
 		}
 	}
 }

@@ -28,7 +28,11 @@ func createTestBroker(t testing.TB) (*StorageBroker, func()) {
 	broker := NewStorageBroker(store, engineConfig)
 
 	cleanup := func() {
-		// Storage cleanup handled by TempDir
+		// Close the storage (rings, metadata store, offset store, WAL,
+		// segments) so tests and benchmarks don't leak the storage goroutine
+		// sets. Benchmark N-escalation used to leak one full WAL+segment
+		// goroutine set per escalation run.
+		_ = store.Close()
 	}
 
 	return broker, cleanup

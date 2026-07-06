@@ -153,16 +153,24 @@ func BenchmarkPublishMessage_SingleQueue(b *testing.B) {
 	defer cancel()
 	startDrainer(qs, broker, "bench-pub", stop, 4)
 
-	msg := &protocol.Message{
-		Body:       make([]byte, 256),
-		Exchange:   "",
-		RoutingKey: "bench-pub",
-	}
+	// PublishMessage takes ownership of the message (it mutates DeliveryTag
+	// and stores the pointer in the queue ring), so each publish must use a
+	// fresh Message. Reusing one Message across iterations aliased the same
+	// pointer in many ring slots; every DeleteMessage then failed its
+	// tag-identity check, the ring count never decreased, and past the spill
+	// threshold every publish became a synchronous WAL write — presenting as
+	// a benchmark wedge. The Body is immutable after publish and safe to share.
+	body := make([]byte, 256)
 
 	b.ReportAllocs()
 	b.ResetTimer()
 
 	for i := 0; i < b.N; i++ {
+		msg := &protocol.Message{
+			Body:       body,
+			Exchange:   "",
+			RoutingKey: "bench-pub",
+		}
 		if err := broker.PublishMessage("", "bench-pub", msg); err != nil {
 			b.Fatal(err)
 		}
@@ -192,16 +200,19 @@ func BenchmarkPublishMessage_MultiQueue(b *testing.B) {
 		startDrainer(qss[i], broker, qname, stop, 2)
 	}
 
-	msg := &protocol.Message{
-		Body:       make([]byte, 256),
-		Exchange:   "bench-fanout",
-		RoutingKey: "",
-	}
+	// Fresh Message per publish: PublishMessage takes ownership (see
+	// BenchmarkPublishMessage_SingleQueue).
+	body := make([]byte, 256)
 
 	b.ReportAllocs()
 	b.ResetTimer()
 
 	for i := 0; i < b.N; i++ {
+		msg := &protocol.Message{
+			Body:       body,
+			Exchange:   "bench-fanout",
+			RoutingKey: "",
+		}
 		if err := broker.PublishMessage("bench-fanout", "", msg); err != nil {
 			b.Fatal(err)
 		}
@@ -277,16 +288,19 @@ func BenchmarkPublishConsumeAck_Roundtrip(b *testing.B) {
 	stop, cancel := makeStop()
 	defer cancel()
 
-	msg := &protocol.Message{
-		Body:       make([]byte, 256),
-		Exchange:   "",
-		RoutingKey: "bench-rt",
-	}
+	// Fresh Message per publish: PublishMessage takes ownership (see
+	// BenchmarkPublishMessage_SingleQueue).
+	body := make([]byte, 256)
 
 	b.ReportAllocs()
 	b.ResetTimer()
 
 	for i := 0; i < b.N; i++ {
+		msg := &protocol.Message{
+			Body:       body,
+			Exchange:   "",
+			RoutingKey: "bench-rt",
+		}
 		if err := broker.PublishMessage("", "bench-rt", msg); err != nil {
 			b.Fatal(err)
 		}

@@ -182,9 +182,10 @@ type EngineConfig struct {
 	// Default: 1,000 messages
 	WALBatchSize int `json:"wal_batch_size"`
 
-	// WALBatchTimeoutMS is max time to wait before flushing partial WAL batch (milliseconds)
-	// Longer = better batching, higher latency
-	// Shorter = lower latency, less efficient batching
+	// WALBatchTimeoutMS is retained for configuration compatibility but no
+	// longer gates WAL batch flushing: the batch writer flushes as soon as its
+	// request channel is drained (drain-then-flush group commit), so a lone
+	// synchronous writer is never stalled waiting for a batch timer.
 	// Default: 10 (10ms)
 	WALBatchTimeoutMS int64 `json:"wal_batch_timeout_ms"`
 
