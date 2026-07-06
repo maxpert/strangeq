@@ -1,6 +1,7 @@
 package server
 
 import (
+	"bufio"
 	"encoding/binary"
 	"net"
 	"testing"
@@ -44,8 +45,11 @@ func nonAckPublishFrameBytes(t testing.TB, payloadSize int) []byte {
 // buffer after a single frame, and no processFrames draining it.
 func newOverflowTestConn(serverConn net.Conn) *protocol.Connection {
 	return &protocol.Connection{
-		ID:         "overflow-test",
-		Conn:       serverConn,
+		ID:   "overflow-test",
+		Conn: serverConn,
+		// readFrames reads through Reader (SQ-1), never the raw Conn; a
+		// struct-literal Connection must wire it up explicitly.
+		Reader:     bufio.NewReader(serverConn),
 		FrameQueue: make(chan *protocol.Frame, 1),
 		AckQueue:   make(chan *protocol.Frame, 16),
 		Done:       make(chan struct{}),

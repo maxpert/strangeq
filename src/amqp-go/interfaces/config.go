@@ -49,6 +49,12 @@ type NetworkConfig struct {
 	ReadBufferSize  int
 	WriteBufferSize int
 
+	// ReadCoalesceBufferSize is the size (bytes) of the per-connection
+	// bufio.Reader that coalesces frame reads (SQ-1). Larger buffers amortize
+	// more frames per read syscall at the cost of per-connection memory.
+	// Default: 65536 (64 KiB). <=0 falls back to the default.
+	ReadCoalesceBufferSize int
+
 	// ReaderOverflowFlowBytes is the per-connection reader-overflow backlog (in
 	// bytes of buffered inbound frames) at which the server asserts
 	// channel.flow(active=false) to the client, asking it to pause publishing.

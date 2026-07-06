@@ -157,8 +157,10 @@ func (s *Server) handleConnection(conn net.Conn) {
 		return
 	}
 
-	// Create a new connection instance (updated to match fixed structures.go)
-	connection := protocol.NewConnection(conn)
+	// Create a new connection instance. All frame reads for this connection are
+	// coalesced through a bufio.Reader (SQ-1); the 8-byte protocol header above
+	// was read raw before the buffer existed, so no buffered bytes are lost.
+	connection := protocol.NewConnectionWithReadBuffer(conn, s.Config.Network.ReadCoalesceBufferSize)
 
 	// Add to server's connections, enforcing MaxConnections
 	s.Mutex.Lock()
@@ -314,7 +316,7 @@ func (s *Server) processConnectionFrames(conn *protocol.Connection) {
 	}
 
 	conn.Conn.SetReadDeadline(time.Now().Add(30 * time.Second))
-	frame, err := protocol.ReadFrameOptimizedWithLimit(conn.Conn, handshakeCap)
+	frame, err := protocol.ReadFrameOptimizedWithLimit(conn.Reader, handshakeCap)
 	if err != nil {
 		s.Log.Error("Error reading connection.start-ok", zap.Error(err))
 		return
@@ -350,7 +352,7 @@ func (s *Server) processConnectionFrames(conn *protocol.Connection) {
 
 	// Wait for connection.tune-ok from client
 	conn.Conn.SetReadDeadline(time.Now().Add(30 * time.Second))
-	frame, err = protocol.ReadFrameOptimizedWithLimit(conn.Conn, handshakeCap)
+	frame, err = protocol.ReadFrameOptimizedWithLimit(conn.Reader, handshakeCap)
 	if err != nil {
 		s.Log.Error("Error reading connection.tune-ok", zap.Error(err))
 		return
@@ -391,7 +393,7 @@ func (s *Server) processConnectionFrames(conn *protocol.Connection) {
 
 	// Wait for connection.open from client
 	conn.Conn.SetReadDeadline(time.Now().Add(30 * time.Second))
-	frame, err = protocol.ReadFrameOptimizedWithLimit(conn.Conn, handshakeCap)
+	frame, err = protocol.ReadFrameOptimizedWithLimit(conn.Reader, handshakeCap)
 	if err != nil {
 		s.Log.Error("Error reading connection.open", zap.Error(err))
 		return
@@ -586,7 +588,7 @@ func (s *Server) readFrames(conn *protocol.Connection, done chan struct{}) {
 		if maxSize == 0 {
 			maxSize = protocol.MaxInboundFrameSize
 		}
-		frame, err := protocol.ReadFrameOptimizedWithLimit(conn.Conn, maxSize)
+		frame, err := protocol.ReadFrameOptimizedWithLimit(conn.Reader, maxSize)
 		if err != nil {
 			if ne, ok := err.(net.Error); ok && ne.Timeout() {
 				if hb > 0 {

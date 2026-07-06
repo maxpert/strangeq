@@ -1,13 +1,22 @@
 package protocol
 
 import (
+	"bufio"
 	"crypto/rand"
 	"fmt"
+	"io"
 	"net"
 	"sync"
 	"sync/atomic"
 	"time"
 )
+
+// DefaultReadBufferSize is the default size of the per-connection buffered
+// reader that coalesces frame reads (SQ-1). A single publish is three frames
+// (method + content-header + body); without buffering every frame costs ~2 raw
+// read syscalls straight off net.Conn, so a 3-frame publish burns ~6. A 64 KiB
+// buffer lets io.ReadFull pull many frames' worth of bytes per syscall.
+const DefaultReadBufferSize = 64 * 1024
 
 var idFallbackCounter atomic.Uint64
 
@@ -18,8 +27,14 @@ func fallbackID(prefix string) string {
 
 // Connection represents an AMQP connection
 type Connection struct {
-	ID              string
-	Conn            net.Conn
+	ID   string
+	Conn net.Conn
+	// Reader is the buffered read side of Conn. ALL frame reads for the
+	// connection MUST go through Reader (never Conn directly) from the handshake
+	// onward; reading the raw Conn after buffering starts would discard bytes
+	// already pulled into the buffer. SetReadDeadline stays on the raw Conn —
+	// bufio.Reader delegates the underlying deadline transparently (SQ-1).
+	Reader          io.Reader
 	Channels        sync.Map                   // map[uint16]*Channel - concurrent-safe map
 	Vhost           string                     // Virtual host for this connection
 	Username        string                     // Authenticated username
@@ -45,11 +60,26 @@ type Connection struct {
 	LastActivity atomic.Int64 // UnixNano of last activity (updated on frame read/write)
 }
 
-// NewConnection creates a new AMQP connection
+// NewConnection creates a new AMQP connection with the default read-buffer size.
 func NewConnection(conn net.Conn) *Connection {
+	return NewConnectionWithReadBuffer(conn, DefaultReadBufferSize)
+}
+
+// NewConnectionWithReadBuffer creates a new AMQP connection whose frame reads are
+// coalesced through a bufio.Reader of bufSize bytes (SQ-1). A non-positive
+// bufSize falls back to DefaultReadBufferSize. The buffered reader wraps conn;
+// callers must route every frame read through c.Reader, and keep SetReadDeadline
+// on c.Conn.
+func NewConnectionWithReadBuffer(conn net.Conn, bufSize int) *Connection {
+	if bufSize <= 0 {
+		bufSize = DefaultReadBufferSize
+	}
 	c := &Connection{
 		ID:   generateID(),
 		Conn: conn,
+		// conn may be nil in unit tests that never read frames; bufio tolerates a
+		// nil underlying reader until the first Read.
+		Reader: bufio.NewReaderSize(conn, bufSize),
 		// Channels: sync.Map needs no initialization
 		PendingMessages: make(map[uint16]*PendingMessage),
 		FrameQueue:      make(chan *Frame, 10000), // 10K frame buffer for reader/processor separation
