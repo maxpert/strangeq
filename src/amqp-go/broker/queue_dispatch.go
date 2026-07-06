@@ -30,6 +30,27 @@ type QueueState struct {
 	closed       atomic.Bool
 	stopCh       chan struct{}
 	parkTimeout  time.Duration
+
+	// policy is the queue's resolved x-argument policy (SQ-7), set at declare
+	// time (client declare and durable recovery both route through
+	// StorageBroker.DeclareQueue). It is attached here — on the per-queue
+	// hot-path struct — so Wave 2 enforcement (TTL SQ-9, DLX SQ-10,
+	// max-length SQ-11) costs exactly one atomic load plus a nil branch on
+	// paths that already hold the QueueState (publish, delivery, reject).
+	// nil means "no policy". Lockless by design.
+	policy atomic.Pointer[QueuePolicy]
+}
+
+// Policy returns the queue's resolved policy, or nil if the queue has no
+// known x-arguments. Safe for concurrent use; a single atomic load.
+func (qs *QueueState) Policy() *QueuePolicy {
+	return qs.policy.Load()
+}
+
+// SetPolicy atomically replaces the queue's resolved policy. Called from
+// declare/recovery paths only — never on the hot path.
+func (qs *QueueState) SetPolicy(p *QueuePolicy) {
+	qs.policy.Store(p)
 }
 
 func NewQueueState(depthHighWM uint64) *QueueState {

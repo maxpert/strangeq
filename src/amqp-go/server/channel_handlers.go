@@ -97,57 +97,25 @@ func (s *Server) processChannelSpecificMethod(conn *protocol.Connection, channel
 			zap.Uint16("channel_id", channelID),
 			zap.String("connection_id", conn.ID))
 
-		// Clean up channel resources
-		if value, exists := conn.Channels.Load(channelID); exists {
-			channel := value.(*protocol.Channel)
-			// Wake any forwarder parked on flow control so it can observe stop
-			select {
-			case channel.FlowWake <- struct{}{}:
-			default:
-			}
-			// Cancel all consumers on this channel
-			channel.Mutex.Lock()
-			consumerTags := make([]string, 0, len(channel.Consumers))
-			for consumerTag := range channel.Consumers {
-				consumerTags = append(consumerTags, consumerTag)
-			}
-			channel.Consumers = make(map[string]*protocol.Consumer) // Clear all consumers
-			channel.Closed = true
-			channel.Mutex.Unlock()
-			conn.ConsumersDirty.Store(true)
-
-			// Unregister consumers from broker (stops poll goroutines)
-			for _, consumerTag := range consumerTags {
-				err := s.Broker.UnregisterConsumer(consumerTag)
-				if err != nil {
-					s.Log.Warn("Failed to unregister consumer on channel close",
-						zap.String("consumer_tag", consumerTag),
-						zap.Uint16("channel_id", channelID),
-						zap.Error(err))
-				} else {
-					s.Log.Debug("Unregistered consumer on channel close",
-						zap.String("consumer_tag", consumerTag),
-						zap.Uint16("channel_id", channelID))
-				}
-			}
-
-			// Remove channel from connection
-			conn.Channels.Delete(channelID)
-			conn.ChannelCount.Add(-1)
-
-			// Clean up transaction state for this channel
-			if s.TransactionManager != nil {
-				s.TransactionManager.Close(channelID)
-			}
-
-			// Record channel closed metric
-			if s.MetricsCollector != nil {
-				s.MetricsCollector.RecordChannelClosed()
-			}
-		}
+		s.teardownChannel(conn, channelID)
 
 		// Send channel.close-ok
 		return s.sendChannelCloseOK(conn, channelID)
+
+	case protocol.ChannelCloseOK: // Method ID 41 — client confirms a server-initiated channel.close
+		// The server sent channel.close (e.g. a 406 PreconditionFailed soft
+		// error from sendChannelClose) and the client replied close-ok. This
+		// completes the close handshake: tear down the channel's resources
+		// and keep the CONNECTION alive. Before this case existed, close-ok
+		// fell through to the default branch, whose returned error tore down
+		// the whole connection — turning every channel-level soft error into
+		// a connection loss.
+		s.Log.Debug("Channel close-ok received",
+			zap.Uint16("channel_id", channelID),
+			zap.String("connection_id", conn.ID))
+
+		s.teardownChannel(conn, channelID)
+		return nil
 
 	default:
 		s.Log.Warn("Unknown channel method ID",
@@ -155,5 +123,65 @@ func (s *Server) processChannelSpecificMethod(conn *protocol.Connection, channel
 			zap.Uint16("channel_id", channelID),
 			zap.String("connection_id", conn.ID))
 		return fmt.Errorf("unknown channel method ID: %d", methodID)
+	}
+}
+
+// teardownChannel releases all per-channel resources: cancels and
+// unregisters the channel's consumers, removes the channel from the
+// connection, closes its transaction state, and records metrics. Called for
+// both directions of the close handshake — client-initiated channel.close
+// and the client's close-ok reply to a server-initiated channel.close.
+// Idempotent: a second call for the same channel ID is a no-op.
+func (s *Server) teardownChannel(conn *protocol.Connection, channelID uint16) {
+	value, exists := conn.Channels.Load(channelID)
+	if !exists {
+		return
+	}
+	channel := value.(*protocol.Channel)
+
+	// Wake any forwarder parked on flow control so it can observe stop
+	select {
+	case channel.FlowWake <- struct{}{}:
+	default:
+	}
+
+	// Cancel all consumers on this channel
+	channel.Mutex.Lock()
+	consumerTags := make([]string, 0, len(channel.Consumers))
+	for consumerTag := range channel.Consumers {
+		consumerTags = append(consumerTags, consumerTag)
+	}
+	channel.Consumers = make(map[string]*protocol.Consumer) // Clear all consumers
+	channel.Closed = true
+	channel.Mutex.Unlock()
+	conn.ConsumersDirty.Store(true)
+
+	// Unregister consumers from broker (stops poll goroutines)
+	for _, consumerTag := range consumerTags {
+		err := s.Broker.UnregisterConsumer(consumerTag)
+		if err != nil {
+			s.Log.Warn("Failed to unregister consumer on channel close",
+				zap.String("consumer_tag", consumerTag),
+				zap.Uint16("channel_id", channelID),
+				zap.Error(err))
+		} else {
+			s.Log.Debug("Unregistered consumer on channel close",
+				zap.String("consumer_tag", consumerTag),
+				zap.Uint16("channel_id", channelID))
+		}
+	}
+
+	// Remove channel from connection
+	conn.Channels.Delete(channelID)
+	conn.ChannelCount.Add(-1)
+
+	// Clean up transaction state for this channel
+	if s.TransactionManager != nil {
+		s.TransactionManager.Close(channelID)
+	}
+
+	// Record channel closed metric
+	if s.MetricsCollector != nil {
+		s.MetricsCollector.RecordChannelClosed()
 	}
 }

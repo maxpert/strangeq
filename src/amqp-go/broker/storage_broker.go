@@ -316,6 +316,18 @@ func (b *StorageBroker) getOrCreateQueueState(queueName string) *QueueState {
 	return actual.(*QueueState)
 }
 
+// GetQueuePolicy returns the resolved x-argument policy for a queue, or nil
+// when the queue has no policy or no runtime state. Intended for inspection
+// (tests, management) — hot paths should use QueueState.Policy() on a
+// QueueState they already hold.
+func (b *StorageBroker) GetQueuePolicy(queueName string) *QueuePolicy {
+	val, ok := b.queueStates.Load(queueName)
+	if !ok {
+		return nil
+	}
+	return val.(*QueueState).Policy()
+}
+
 // computeDepthHighWM derives the per-queue backpressure high-water mark from
 // the engine config: ring buffer size × spill threshold %. This is the depth
 // (head - minAckCursor) at which publishers block or spill. Falls back to
@@ -666,10 +678,31 @@ func (b *StorageBroker) DeclareQueue(name string, durable, autoDelete, exclusive
 		// Add to active cache (lock-free)
 		b.activeQueues.Store(name, existing)
 
-		// Ensure queue state exists
-		b.getOrCreateQueueState(name)
+		// Ensure queue state exists and carries the resolved policy. The
+		// stored (original) arguments win: redeclare arguments are not
+		// compared today (known gap — AMQP 0.9.1 says differing args should
+		// be a 406), so they must not overwrite the policy either. This
+		// branch also covers recovery when the storage backend already holds
+		// the durable queue across restarts. Resolution errors are tolerated
+		// here (nil policy) so queues persisted before validation existed
+		// remain usable.
+		qs := b.getOrCreateQueueState(name)
+		if policy, perr := ResolveQueuePolicy(existing.Arguments); perr == nil {
+			qs.SetPolicy(policy)
+		}
 
 		return existing, nil
+	}
+
+	// Resolve the typed queue policy from x-arguments ONCE, at declare time
+	// (SQ-7). Invalid known arguments fail the declare before anything is
+	// stored; the server layer maps ErrInvalidQueueArgument to a channel-level
+	// 406 PreconditionFailed. This is also the recovery path: durable queues
+	// are re-declared through this method on restart, so the policy is
+	// re-resolved from the persisted arguments by the same function.
+	policy, err := ResolveQueuePolicy(arguments)
+	if err != nil {
+		return nil, fmt.Errorf("queue '%s': %w", name, err)
 	}
 
 	// Create new queue
@@ -684,8 +717,9 @@ func (b *StorageBroker) DeclareQueue(name string, durable, autoDelete, exclusive
 	// Add to active cache (lock-free)
 	b.activeQueues.Store(name, queue)
 
-	// Ensure queue state exists
-	b.getOrCreateQueueState(name)
+	// Ensure queue state exists and attach the resolved policy (nil when no
+	// known x-arguments were supplied).
+	b.getOrCreateQueueState(name).SetPolicy(policy)
 
 	// Update durable entity metadata if this is a durable queue
 	if queue.Durable {
