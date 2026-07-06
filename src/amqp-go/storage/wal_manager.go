@@ -35,24 +35,34 @@ const (
 	// collision with an actual CRC value is astronomically unlikely, so a byte
 	// prefix compare is a safe way to sniff versioned vs. legacy files.
 	WALMagic         = "SQWAL"           // 5-byte file magic
-	WALFormatVersion = uint8(1)          // current file format version
+	WALFormatVersion = uint8(2)          // current file format version (SQ-8: v2 adds per-record type tag)
 	WALHeaderSize    = len(WALMagic) + 1 // magic + 1 version byte = 6 bytes
 	WALLegacyVersion = uint8(0)          // headerless files predating SQ-4
+	WALVersion1      = uint8(1)          // SQ-4 versioned files, no per-record type tag
 
-	// Reserved record-type mechanism (SQ-4, DEFINED ONLY — NOT IMPLEMENTED).
+	// Per-record type mechanism (SQ-4 reserved, SQ-8 implemented).
 	//
-	// v1 files have no per-record type tag on disk: every record is implicitly
-	// a message record (WALRecordTypeMessage). A future v2 format will add a
-	// 1-byte record-type tag immediately after the [CRC][length] framing, so
-	// that non-message records (e.g. a transaction-boundary marker) can be
-	// interleaved with message records in the same file. Recovery keys off the
-	// file-level version byte to decide whether that per-record tag is present:
-	//   v1: [CRC][len][<message payload>]
-	//   v2: [CRC][len][1-byte recordType][<payload for that type>]
-	// The constant below is reserved now so the value is stable when v2 lands;
-	// no code writes or parses a record-type tag yet.
-	WALRecordTypeMessage    = uint8(0) // implicit type of every v1 record
-	WALRecordTypeTxBoundary = uint8(1) // RESERVED for v2 transaction-boundary marker
+	// v0/v1 files have no per-record type tag on disk: every record is
+	// implicitly a message record (WALRecordTypeMessage). v2 adds a 1-byte
+	// record-type tag immediately after the [CRC][length] framing, so that
+	// non-message records (transaction-boundary markers) can be interleaved
+	// with message records in the same file. Recovery keys off the file-level
+	// version byte to decide whether that per-record tag is present:
+	//   v0/v1: [CRC][len][<message payload>]
+	//   v2:    [CRC][len][1-byte recordType][<payload for that type>]
+	WALRecordTypeMessage    = uint8(0) // implicit type of every v0/v1 record
+	WALRecordTypeTxBoundary = uint8(1) // v2 transaction-boundary marker (SQ-8)
+
+	// Transaction-boundary marker kinds. A committed transaction is written as
+	// one contiguous, single-fsync unit: Begin, the transaction's message
+	// records, then Commit. Recovery buffers records seen after a Begin and only
+	// emits them once the matching Commit is read; a Begin with no Commit (a
+	// crash mid-transaction, or a torn tail) is discarded — this is what makes
+	// transaction commit all-or-nothing across a crash (SQ-8). Marker payload is
+	// [1-byte kind][8-byte epoch].
+	WALTxMarkerBegin      = uint8(0)
+	WALTxMarkerCommit     = uint8(1)
+	walTxMarkerPayloadLen = 9 // kind(1) + epoch(8)
 )
 
 // ErrUnsupportedWALVersion indicates a WAL file begins with the SQWAL magic but
@@ -154,6 +164,11 @@ type QueueWAL struct {
 	// Background goroutines
 	stopChan chan struct{}
 	wg       sync.WaitGroup
+
+	// txEpoch issues a monotonically increasing id per atomic transaction write
+	// (SQ-8). It pairs a Begin marker with its Commit marker so recovery can
+	// detect a stray/torn commit whose begin is missing.
+	txEpoch atomic.Uint64
 }
 
 // offsetLocation tracks where an offset lives in the WAL
@@ -294,6 +309,98 @@ func (wm *WALManager) Write(queueName string, message *protocol.Message, offset 
 	return <-doneChan
 }
 
+// WriteTxAtomic durably writes a set of message records as one all-or-nothing
+// transaction unit (SQ-8): a Begin marker, the records, then a Commit marker,
+// appended contiguously and fsynced exactly once. Recovery only applies the
+// records if the trailing Commit marker is present, so a crash before the fsync
+// completes (or a torn tail) leaves the whole transaction uncommitted.
+//
+// This is deliberately a SLOW PATH that is independent of the group-commit
+// batch writer (batchWriterLoop/flushBatch) and its CAS ring — transaction
+// commit favors correctness over throughput and must not be interleaved with
+// unrelated messages, so the records are written directly under fileMutex
+// rather than through writeChan.
+func (wm *WALManager) WriteTxAtomic(records []*RecoveryMessage) error {
+	if wm.sharedWAL == nil {
+		return fmt.Errorf("shared WAL not initialized")
+	}
+	return wm.sharedWAL.writeTxAtomic(records)
+}
+
+func (qw *QueueWAL) writeTxAtomic(records []*RecoveryMessage) error {
+	if len(records) == 0 {
+		return nil
+	}
+
+	qw.fileMutex.Lock()
+	defer qw.fileMutex.Unlock()
+
+	currentFileNum := qw.fileNum.Load()
+	startPos := qw.fileOffset.Load()
+	epoch := qw.txEpoch.Add(1)
+
+	// Serialize [Begin][record...][Commit] into a single contiguous buffer and
+	// record each message record's start position for the offset index.
+	buf := serializeTxMarker(WALTxMarkerBegin, epoch)
+	positions := make([]int64, len(records))
+	for i, rec := range records {
+		positions[i] = startPos + int64(len(buf))
+		buf = append(buf, qw.serializeMessageVersioned(WALFormatVersion, rec.QueueName, rec.Message, rec.Offset)...)
+	}
+	buf = append(buf, serializeTxMarker(WALTxMarkerCommit, epoch)...)
+
+	n, err := qw.currentFile.Write(buf)
+	if err != nil {
+		if qw.metrics != nil {
+			qw.metrics.RecordWALWriteError()
+		}
+		return fmt.Errorf("WAL transaction write failed: %w", err)
+	}
+
+	// Single fsync makes the whole bracketed unit durable. The Commit marker is
+	// the last thing written, so if this fsync does not complete the tail
+	// (Commit) is lost and recovery discards the transaction.
+	fsyncStart := time.Now()
+	fsyncErr := fdatasyncFile(qw.currentFile)
+	if qw.metrics != nil {
+		qw.metrics.RecordWALFsync(time.Since(fsyncStart).Seconds())
+		if fsyncErr != nil {
+			qw.metrics.RecordWALWriteError()
+		}
+	}
+	if fsyncErr != nil {
+		return fmt.Errorf("WAL transaction fsync failed: %w", fsyncErr)
+	}
+	if qw.metrics != nil {
+		for range records {
+			qw.metrics.RecordWALWrite()
+		}
+	}
+
+	// Durable: publish the records to the offset index and current-file offset
+	// set so they are readable/ackable exactly like batch-written messages.
+	qw.offsetIndexMutex.Lock()
+	for i, rec := range records {
+		qw.offsetIndex[rec.Offset] = &offsetLocation{
+			fileNum:      currentFileNum,
+			filePosition: positions[i],
+		}
+	}
+	qw.offsetIndexMutex.Unlock()
+
+	qw.currentFileOffsetsMutex.Lock()
+	for _, rec := range records {
+		qw.currentFileOffsets.Add(rec.Offset)
+	}
+	qw.currentFileOffsetsMutex.Unlock()
+
+	newOffset := qw.fileOffset.Add(int64(n))
+	if newOffset >= qw.cfg.FileSize {
+		qw.rollFile()
+	}
+	return nil
+}
+
 // Acknowledge marks a message as ACKed
 func (wm *WALManager) Acknowledge(queueName string, offset uint64) {
 	if wm.sharedWAL == nil {
@@ -401,8 +508,9 @@ func (qw *QueueWAL) scanWALFile(filePath string) ([]*RecoveryMessage, error) {
 
 	// Detect the file-level header (SQ-4) and start parsing records after it.
 	// Legacy (v0) files have no header and parse from offset 0. An
-	// unknown-version header returns a hard error rather than skipping.
-	dataStart, _, err := walFileDataStart(file)
+	// unknown-version header returns a hard error rather than skipping. The
+	// version drives whether records carry a per-record type tag (v2, SQ-8).
+	dataStart, version, err := walFileDataStart(file)
 	if err != nil {
 		return nil, err
 	}
@@ -411,6 +519,15 @@ func (qw *QueueWAL) scanWALFile(filePath string) ([]*RecoveryMessage, error) {
 	}
 
 	var messages []*RecoveryMessage
+
+	// Transaction-boundary state (SQ-8). Message records that appear between a
+	// Begin marker and its matching Commit marker are buffered and only emitted
+	// once the Commit is read. A Begin with no Commit (crash mid-transaction or
+	// a torn tail) leaves txBuf pending at EOF and is discarded — uncommitted
+	// transaction operations are never applied.
+	inTx := false
+	var txEpoch uint64
+	var txBuf []*RecoveryMessage
 
 	for {
 		// Read CRC field (4 bytes)
@@ -448,91 +565,45 @@ func (qw *QueueWAL) scanWALFile(filePath string) ([]*RecoveryMessage, error) {
 			continue
 		}
 
-		// Deserialize entry
-		pos := 0
+		recType, payload := recordTypeAndPayload(version, data)
 
-		// Read queue name
-		if pos+4 > len(data) {
-			continue
+		switch recType {
+		case WALRecordTypeTxBoundary:
+			if len(payload) < walTxMarkerPayloadLen {
+				continue
+			}
+			kind := payload[0]
+			epoch := binary.BigEndian.Uint64(payload[1:9])
+			switch kind {
+			case WALTxMarkerBegin:
+				inTx = true
+				txEpoch = epoch
+				txBuf = txBuf[:0]
+			case WALTxMarkerCommit:
+				// Only commit a transaction whose Begin we actually saw with a
+				// matching epoch; a stray/torn commit is ignored.
+				if inTx && epoch == txEpoch {
+					messages = append(messages, txBuf...)
+				}
+				inTx = false
+				txBuf = txBuf[:0]
+			}
+
+		default: // WALRecordTypeMessage
+			recoveryMsg, ok := deserializeMessagePayload(payload)
+			if !ok {
+				continue
+			}
+			if inTx {
+				txBuf = append(txBuf, recoveryMsg)
+			} else {
+				messages = append(messages, recoveryMsg)
+			}
 		}
-		queueLen := binary.BigEndian.Uint32(data[pos : pos+4])
-		pos += 4
-
-		if pos+int(queueLen) > len(data) {
-			continue
-		}
-		queueName := string(data[pos : pos+int(queueLen)])
-		pos += int(queueLen)
-
-		// Read offset
-		if pos+8 > len(data) {
-			continue
-		}
-		offset := binary.BigEndian.Uint64(data[pos : pos+8])
-		pos += 8
-
-		// Read exchange
-		if pos+4 > len(data) {
-			continue
-		}
-		exchangeLen := binary.BigEndian.Uint32(data[pos : pos+4])
-		pos += 4
-
-		if pos+int(exchangeLen) > len(data) {
-			continue
-		}
-		exchange := string(data[pos : pos+int(exchangeLen)])
-		pos += int(exchangeLen)
-
-		// Read routing key
-		if pos+4 > len(data) {
-			continue
-		}
-		routingKeyLen := binary.BigEndian.Uint32(data[pos : pos+4])
-		pos += 4
-
-		if pos+int(routingKeyLen) > len(data) {
-			continue
-		}
-		routingKey := string(data[pos : pos+int(routingKeyLen)])
-		pos += int(routingKeyLen)
-
-		// Read delivery mode
-		if pos+1 > len(data) {
-			continue
-		}
-		deliveryMode := data[pos]
-		pos += 1
-
-		// Read body
-		if pos+4 > len(data) {
-			continue
-		}
-		bodyLen := binary.BigEndian.Uint32(data[pos : pos+4])
-		pos += 4
-
-		if pos+int(bodyLen) > len(data) {
-			continue
-		}
-		body := data[pos : pos+int(bodyLen)]
-
-		// Create recovery message
-		recoveryMsg := &RecoveryMessage{
-			QueueName: queueName,
-			Offset:    offset,
-			Message: &protocol.Message{
-				Exchange:     exchange,
-				RoutingKey:   routingKey,
-				DeliveryMode: deliveryMode,
-				Body:         body,
-				DeliveryTag:  offset,
-				Redelivered:  true, // Mark as redelivered for recovery
-			},
-		}
-
-		messages = append(messages, recoveryMsg)
 	}
 
+	// EOF with a transaction still open: the Commit marker was never durable,
+	// so these operations are uncommitted and must not be applied.
 	return messages, nil
 }
 
@@ -706,14 +777,32 @@ func (qw *QueueWAL) flushBatch(batch []*writeRequest) {
 	}
 }
 
-// serializeMessage serializes a message with CRC, length, queue name, and offset
-// SHARED WAL Format: [CRC][length][queue_len][queue][offset][exchange_len][exchange][routing_key_len][routing_key][delivery_mode][body_len][body]
+// serializeMessage serializes a message record in the current WAL format.
 func (qw *QueueWAL) serializeMessage(queueName string, message *protocol.Message, offset uint64) []byte {
+	return qw.serializeMessageVersioned(WALFormatVersion, queueName, message, offset)
+}
+
+// serializeMessageVersioned serializes a message with CRC, length, and (for v2+)
+// a record-type tag, followed by queue name and offset.
+//
+// Framing:
+//
+//	v0/v1: [CRC][length][queue_len][queue][offset][exchange_len][exchange][routing_key_len][routing_key][delivery_mode][body_len][body]
+//	v2:    [CRC][length][type=Message][queue_len]...[body]
+//
+// The version parameter exists so tests can craft legacy (v0/v1) records; the
+// production write path always uses WALFormatVersion. Single allocation.
+func (qw *QueueWAL) serializeMessageVersioned(version uint8, queueName string, message *protocol.Message, offset uint64) []byte {
 	buf := make([]byte, 0, len(message.Body)+len(message.Exchange)+len(message.RoutingKey)+len(queueName)+256)
 
 	// Reserve space for CRC and length
 	buf = append(buf, 0, 0, 0, 0) // CRC32 placeholder
 	buf = append(buf, 0, 0, 0, 0) // Length placeholder
+
+	// v2+: per-record type tag immediately after the framing.
+	if version >= WALFormatVersion {
+		buf = append(buf, WALRecordTypeMessage)
+	}
 
 	// Write queue name
 	buf = binary.BigEndian.AppendUint32(buf, uint32(len(queueName)))
@@ -746,6 +835,110 @@ func (qw *QueueWAL) serializeMessage(queueName string, message *protocol.Message
 	binary.BigEndian.PutUint32(buf[0:4], crc)
 
 	return buf
+}
+
+// serializeTxMarker serializes a transaction-boundary marker record (SQ-8, v2
+// only): [CRC][length][type=TxBoundary][kind][epoch]. kind is Begin or Commit.
+func serializeTxMarker(kind uint8, epoch uint64) []byte {
+	buf := make([]byte, 0, 8+1+walTxMarkerPayloadLen)
+	buf = append(buf, 0, 0, 0, 0) // CRC placeholder
+	buf = append(buf, 0, 0, 0, 0) // length placeholder
+	buf = append(buf, WALRecordTypeTxBoundary)
+	buf = append(buf, kind)
+	buf = binary.BigEndian.AppendUint64(buf, epoch)
+
+	dataLen := len(buf) - 8
+	binary.BigEndian.PutUint32(buf[4:8], uint32(dataLen))
+	crc := crc32.ChecksumIEEE(buf[4:])
+	binary.BigEndian.PutUint32(buf[0:4], crc)
+	return buf
+}
+
+// recordTypeAndPayload splits a CRC-verified record's data region into its
+// record type and the type-specific payload, honoring the file format version.
+// For v0/v1 (no on-disk type tag) every record is a message.
+func recordTypeAndPayload(version uint8, data []byte) (recType uint8, payload []byte) {
+	if version >= WALFormatVersion {
+		if len(data) < 1 {
+			return WALRecordTypeMessage, data
+		}
+		return data[0], data[1:]
+	}
+	return WALRecordTypeMessage, data
+}
+
+// deserializeMessagePayload parses a message record's payload (everything after
+// the record-type tag) into a RecoveryMessage. Returns ok=false on a truncated
+// or malformed payload so callers can skip it.
+func deserializeMessagePayload(payload []byte) (*RecoveryMessage, bool) {
+	pos := 0
+	if pos+4 > len(payload) {
+		return nil, false
+	}
+	queueLen := binary.BigEndian.Uint32(payload[pos : pos+4])
+	pos += 4
+	if pos+int(queueLen) > len(payload) {
+		return nil, false
+	}
+	queueName := string(payload[pos : pos+int(queueLen)])
+	pos += int(queueLen)
+
+	if pos+8 > len(payload) {
+		return nil, false
+	}
+	offset := binary.BigEndian.Uint64(payload[pos : pos+8])
+	pos += 8
+
+	if pos+4 > len(payload) {
+		return nil, false
+	}
+	exchangeLen := binary.BigEndian.Uint32(payload[pos : pos+4])
+	pos += 4
+	if pos+int(exchangeLen) > len(payload) {
+		return nil, false
+	}
+	exchange := string(payload[pos : pos+int(exchangeLen)])
+	pos += int(exchangeLen)
+
+	if pos+4 > len(payload) {
+		return nil, false
+	}
+	routingKeyLen := binary.BigEndian.Uint32(payload[pos : pos+4])
+	pos += 4
+	if pos+int(routingKeyLen) > len(payload) {
+		return nil, false
+	}
+	routingKey := string(payload[pos : pos+int(routingKeyLen)])
+	pos += int(routingKeyLen)
+
+	if pos+1 > len(payload) {
+		return nil, false
+	}
+	deliveryMode := payload[pos]
+	pos++
+
+	if pos+4 > len(payload) {
+		return nil, false
+	}
+	bodyLen := binary.BigEndian.Uint32(payload[pos : pos+4])
+	pos += 4
+	if pos+int(bodyLen) > len(payload) {
+		return nil, false
+	}
+	body := payload[pos : pos+int(bodyLen)]
+
+	return &RecoveryMessage{
+		QueueName: queueName,
+		Offset:    offset,
+		Message: &protocol.Message{
+			Exchange:     exchange,
+			RoutingKey:   routingKey,
+			DeliveryMode: deliveryMode,
+			Body:         body,
+			DeliveryTag:  offset,
+			Redelivered:  true,
+		},
+	}, true
 }
 
 // rollFile rolls to a new WAL file when size limit reached
@@ -870,7 +1063,10 @@ func walFileDataStart(f *os.File) (dataStart int64, version uint8, err error) {
 		return 0, WALLegacyVersion, nil
 	}
 	v := hdr[len(WALMagic)]
-	if v != WALFormatVersion {
+	// This build understands v1 (SQ-4, no per-record type tag) and v2 (SQ-8,
+	// per-record type tag). Any other version is a hard error, never a silent
+	// skip. The returned version drives record parsing (type tag present iff v2).
+	if v != WALVersion1 && v != WALFormatVersion {
 		return 0, v, fmt.Errorf("%w: got %d, want %d", ErrUnsupportedWALVersion, v, WALFormatVersion)
 	}
 	return int64(WALHeaderSize), v, nil
@@ -1099,6 +1295,14 @@ func (qw *QueueWAL) readMessageAtPosition(queueName string, fileNum uint64, file
 		return nil, fmt.Errorf("CRC mismatch for offset %d (expected %d, got %d)", expectedOffset, crc, calculatedCRC)
 	}
 
+	// The offset index is populated only by writes made in the current process,
+	// which always use the current WAL format (v2). Strip the per-record type
+	// tag and confirm it is a message record before parsing the payload.
+	recType, data := recordTypeAndPayload(WALFormatVersion, data)
+	if recType != WALRecordTypeMessage {
+		return nil, fmt.Errorf("unexpected WAL record type %d for offset %d", recType, expectedOffset)
+	}
+
 	// Deserialize SHARED WAL format: [queue_len][queue][offset][exchange_len][exchange][routing_key_len][routing_key][body_len][body]
 	pos := 0
 
@@ -1221,8 +1425,8 @@ func (qw *QueueWAL) readMessageFromFile(queueName string, filePath string, offse
 	defer file.Close()
 
 	// Skip the file-level header (SQ-4) before scanning records. Legacy files
-	// parse from offset 0.
-	dataStart, _, err := walFileDataStart(file)
+	// parse from offset 0. The version drives per-record type-tag parsing (v2).
+	dataStart, version, err := walFileDataStart(file)
 	if err != nil {
 		return nil, err
 	}
@@ -1265,83 +1469,21 @@ func (qw *QueueWAL) readMessageFromFile(queueName string, filePath string, offse
 			return nil, fmt.Errorf("CRC mismatch in sequential scan")
 		}
 
-		// Deserialize: [queue_len][queue][offset][exchange_len][exchange]...
-		pos := 0
-
-		// Read queue name
-		if pos+4 > len(data) {
-			return nil, fmt.Errorf("data too short for queue length")
+		recType, payload := recordTypeAndPayload(version, data)
+		if recType != WALRecordTypeMessage {
+			// Transaction-boundary marker (or any non-message record): skip.
+			continue
 		}
-		queueLen := binary.BigEndian.Uint32(data[pos : pos+4])
-		pos += 4
 
-		if pos+int(queueLen) > len(data) {
-			return nil, fmt.Errorf("data too short for queue name")
+		rm, ok := deserializeMessagePayload(payload)
+		if !ok {
+			return nil, fmt.Errorf("malformed message record in sequential scan")
 		}
-		entryQueueName := string(data[pos : pos+int(queueLen)])
-		pos += int(queueLen)
-
-		// Read offset
-		if pos+8 > len(data) {
-			return nil, fmt.Errorf("data too short for offset")
-		}
-		msgOffset := binary.BigEndian.Uint64(data[pos : pos+8])
-		pos += 8
 
 		// Check if this is the message we're looking for
-		if msgOffset == offset && entryQueueName == queueName {
-			// Found it! Now deserialize the full message
-			// Read exchange
-			if pos+4 > len(data) {
-				return nil, fmt.Errorf("data too short for exchange length")
-			}
-			exchangeLen := binary.BigEndian.Uint32(data[pos : pos+4])
-			pos += 4
-
-			if pos+int(exchangeLen) > len(data) {
-				return nil, fmt.Errorf("data too short for exchange")
-			}
-			exchange := string(data[pos : pos+int(exchangeLen)])
-			pos += int(exchangeLen)
-
-			// Read routing key
-			if pos+4 > len(data) {
-				return nil, fmt.Errorf("data too short for routing key length")
-			}
-			routingKeyLen := binary.BigEndian.Uint32(data[pos : pos+4])
-			pos += 4
-
-			if pos+int(routingKeyLen) > len(data) {
-				return nil, fmt.Errorf("data too short for routing key")
-			}
-			routingKey := string(data[pos : pos+int(routingKeyLen)])
-			pos += int(routingKeyLen)
-
-			// Read delivery mode
-			if pos+1 > len(data) {
-				return nil, fmt.Errorf("data too short for delivery mode")
-			}
-			deliveryMode := data[pos]
-			pos += 1
-
-			// Read body length then body (matches serializeMessage format)
-			if pos+4 > len(data) {
-				return nil, fmt.Errorf("data too short for body length")
-			}
-			bodyLen := binary.BigEndian.Uint32(data[pos : pos+4])
-			pos += 4
-
-			if pos+int(bodyLen) > len(data) {
-				return nil, fmt.Errorf("data too short for body")
-			}
-			body := data[pos : pos+int(bodyLen)]
-
-			return &protocol.Message{
-				Exchange:     exchange,
-				RoutingKey:   routingKey,
-				DeliveryMode: deliveryMode,
-				Body:         body,
-			}, nil
+		if rm.Offset == offset && rm.QueueName == queueName {
+			rm.Message.Redelivered = false
+			return rm.Message, nil
 		}
 
 		// Not the right message, continue scanning

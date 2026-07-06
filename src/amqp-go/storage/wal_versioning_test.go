@@ -121,7 +121,10 @@ func TestWAL_LegacyHeaderlessRecovery(t *testing.T) {
 			Body:         []byte(fmt.Sprintf("legacy-%d", i)),
 			DeliveryMode: 2,
 		}
-		buf = append(buf, qw.serializeMessage("legacy_q", msg, uint64(100+i))...)
+		// Build genuine legacy (v1/v0) records with NO per-record type tag. The
+		// canonical serializer now emits v2 (SQ-8), so a legacy fixture must ask
+		// for the older format explicitly.
+		buf = append(buf, qw.serializeMessageVersioned(WALVersion1, "legacy_q", msg, uint64(100+i))...)
 	}
 
 	// Write it directly with NO SQWAL header, mimicking a pre-SQ-4 file. Use a

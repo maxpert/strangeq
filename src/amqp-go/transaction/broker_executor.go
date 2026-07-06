@@ -1,10 +1,23 @@
 package transaction
 
 import (
+	"errors"
 	"fmt"
 
+	"github.com/maxpert/amqp-go/interfaces"
 	"github.com/maxpert/amqp-go/protocol"
 )
+
+// errTxStagingUnsupported signals that the underlying broker cannot route a
+// publish through a transactional storage staging view (SQ-8), so the caller
+// must fall back to the non-staged execution path.
+var errTxStagingUnsupported = errors.New("broker does not support transactional publish staging")
+
+// txPublishBroker is implemented by brokers that can route a publish through an
+// atomic storage staging view, deferring consumer visibility until commit.
+type txPublishBroker interface {
+	PublishMessageTx(txnStore interfaces.Storage, exchange, routingKey string, message *protocol.Message) ([]func(), error)
+}
 
 // UnifiedBrokerExecutorInterface defines interface for unified brokers that can act as transaction executors
 type UnifiedBrokerExecutorInterface interface {
@@ -36,6 +49,22 @@ func (ube *UnifiedBrokerExecutor) ExecutePublish(exchange, routingKey string, me
 	}
 
 	return ube.broker.PublishMessage(exchange, routingKey, message)
+}
+
+// ExecutePublishStaged routes a publish through the transactional storage
+// staging view (SQ-8) if the broker supports it, returning deferred visibility
+// actions that the transaction manager runs only after the atomic commit
+// succeeds. Brokers without staging support return errTxStagingUnsupported so
+// the caller can fall back to immediate (non-atomic) execution.
+func (ube *UnifiedBrokerExecutor) ExecutePublishStaged(txnStore interfaces.Storage, exchange, routingKey string, message *protocol.Message) ([]func(), error) {
+	if ube.broker == nil {
+		return nil, fmt.Errorf("no unified broker available for executing publish")
+	}
+	tb, ok := ube.broker.(txPublishBroker)
+	if !ok {
+		return nil, errTxStagingUnsupported
+	}
+	return tb.PublishMessageTx(txnStore, exchange, routingKey, message)
 }
 
 // ExecuteAck executes a message acknowledgment operation

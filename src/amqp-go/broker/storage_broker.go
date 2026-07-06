@@ -1216,6 +1216,85 @@ func (b *StorageBroker) PublishMessage(exchangeName, routingKey string, message 
 	return nil
 }
 
+// PublishMessageTx is the transactional (SQ-8) sibling of PublishMessage. It
+// performs identical routing and delivery-tag assignment, but writes the message
+// to the supplied transactional storage view (txnStore) instead of the live
+// broker storage, and DEFERS making the message visible to consumers.
+//
+// The returned closures perform the "make visible" step (advance the per-queue
+// head cursor and wake consumers). The caller runs them only AFTER the atomic
+// storage commit has succeeded, so a transaction that aborts (a later operation
+// fails) leaves nothing durable AND nothing visible — no consumer can observe a
+// message from a transaction that never committed. This preserves the invariant
+// that a message becomes visible only after it is durable.
+//
+// This is the slow path; it deliberately duplicates PublishMessage rather than
+// refactoring it, to leave the non-transactional publish hot path untouched.
+func (b *StorageBroker) PublishMessageTx(txnStore interfaces.Storage, exchangeName, routingKey string, message *protocol.Message) ([]func(), error) {
+	exchange, err := b.storage.GetExchange(exchangeName)
+	if err != nil {
+		if errors.Is(err, interfaces.ErrExchangeNotFound) {
+			return nil, fmt.Errorf("exchange '%s' not found", exchangeName)
+		}
+		return nil, err
+	}
+
+	targetQueues, err := b.findTargetQueues(exchange, routingKey, message)
+	if err != nil {
+		return nil, err
+	}
+
+	if len(targetQueues) == 0 {
+		if message.Mandatory {
+			return nil, ErrNoRoute
+		}
+		return nil, nil
+	}
+
+	deferred := make([]func(), 0, len(targetQueues))
+
+	for i, queueName := range targetQueues {
+		queueState := b.getOrCreateQueueState(queueName)
+
+		if !queueState.WaitForCapacity(queueState.StopCh()) {
+			return nil, fmt.Errorf("queue '%s' closed during backpressure wait", queueName)
+		}
+
+		msgID := b.globalDeliveryTag.Add(1)
+
+		var storeMsg *protocol.Message
+		if i == 0 {
+			message.DeliveryTag = msgID
+			storeMsg = message
+		} else {
+			// Same FANOUT INVARIANT as PublishMessage: deep-copy the Headers map
+			// for tail deliveries so queue copies never share a map pointer.
+			msgCopy := *message
+			msgCopy.DeliveryTag = msgID
+			if message.Headers != nil {
+				h := make(map[string]interface{}, len(message.Headers))
+				for k, v := range message.Headers {
+					h[k] = v
+				}
+				msgCopy.Headers = h
+			}
+			storeMsg = &msgCopy
+		}
+
+		// Stage the store into the transactional view (buffered until commit).
+		if err := txnStore.StoreMessage(queueName, storeMsg); err != nil {
+			return nil, fmt.Errorf("failed to stage message to queue '%s': %w", queueName, err)
+		}
+
+		// Defer visibility until after the atomic commit succeeds.
+		qs := queueState
+		id := msgID
+		deferred = append(deferred, func() { qs.Publish(id) })
+	}
+
+	return deferred, nil
+}
+
 // findTargetQueues determines which queues should receive the message.
 // It follows both queue bindings and exchange-to-exchange bindings recursively,
 // using a visited set for cycle protection and a seen set for queue deduplication.
