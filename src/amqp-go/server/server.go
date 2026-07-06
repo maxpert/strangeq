@@ -605,9 +605,14 @@ func (s *Server) readFrames(conn *protocol.Connection, done chan struct{}) {
 		// Opportunistically hand buffered frames to processFrames whenever it
 		// has drained space. Non-blocking: never wait on a full FrameQueue.
 		for len(pending) > 0 {
+			// Capture Size before the send: once processFrames receives the
+			// frame it may pool it, and the recycled frame can be overwritten
+			// while we still hold the stale reference.
+			head := pending[0]
+			headSize := int64(head.Size)
 			select {
-			case conn.FrameQueue <- pending[0]:
-				pendingBytes -= int64(pending[0].Size)
+			case conn.FrameQueue <- head:
+				pendingBytes -= headSize
 				pending[0] = nil
 				pending = pending[1:]
 				continue
@@ -751,6 +756,10 @@ func (s *Server) processFrames(conn *protocol.Connection, done chan struct{}) {
 				continue
 			}
 
+			// Capture before processFrame: it may transfer frame ownership
+			// (AckQueue hand-off) or we pool it right after — either way the
+			// next owner can overwrite the frame while we still hold the ref.
+			frameChannel := frame.Channel
 			pooled, err := s.processFrame(conn, frame)
 			if pooled {
 				protocol.PutFrame(frame)
@@ -764,10 +773,10 @@ func (s *Server) processFrames(conn *protocol.Connection, done chan struct{}) {
 				}
 				s.Log.Error("Error processing frame",
 					zap.String("connection_id", conn.ID),
-					zap.Uint16("channel", frame.Channel),
+					zap.Uint16("channel", frameChannel),
 					zap.Error(err))
 				if s.MetricsCollector != nil {
-					if frame.Channel != 0 {
+					if frameChannel != 0 {
 						s.MetricsCollector.RecordChannelError("method_processing")
 					}
 					s.MetricsCollector.RecordConnectionError("frame_processing")
@@ -850,12 +859,15 @@ func (s *Server) processAckFrame(conn *protocol.Connection, frame *protocol.Fram
 func (s *Server) ackProcessor(conn *protocol.Connection, done chan struct{}) {
 	defer close(done)
 	for frame := range conn.AckQueue {
+		// Capture before PutFrame: the pool may recycle the frame to another
+		// goroutine's GetFrame, which overwrites it while we still hold the ref.
+		frameChannel := frame.Channel
 		err := s.processAckFrame(conn, frame)
 		protocol.PutFrame(frame)
 		if err != nil {
 			s.Log.Error("Error processing ACK frame",
 				zap.String("connection_id", conn.ID),
-				zap.Uint16("channel", frame.Channel),
+				zap.Uint16("channel", frameChannel),
 				zap.Error(err))
 			if s.MetricsCollector != nil {
 				s.MetricsCollector.RecordConnectionError("ack_processing")

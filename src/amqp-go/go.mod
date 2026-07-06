@@ -3,6 +3,7 @@ module github.com/maxpert/amqp-go
 go 1.25.1
 
 require (
+	github.com/HdrHistogram/hdrhistogram-go v1.2.0
 	github.com/RoaringBitmap/roaring v1.9.4
 	github.com/fxamacker/cbor/v2 v2.9.0
 	github.com/knadh/koanf/parsers/yaml v1.1.0
@@ -20,7 +21,6 @@ require (
 )
 
 require (
-	github.com/HdrHistogram/hdrhistogram-go v1.2.0 // indirect
 	github.com/beorn7/perks v1.0.1 // indirect
 	github.com/bits-and-blooms/bitset v1.12.0 // indirect
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
