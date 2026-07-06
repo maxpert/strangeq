@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -1188,11 +1189,15 @@ func (b *StorageBroker) PublishMessage(exchangeName, routingKey string, message 
 		return err
 	}
 
-	// Find target queues based on exchange type and routing
-	targetQueues, err := b.findTargetQueues(exchange, routingKey, message)
-	if err != nil {
+	// Find target queues based on exchange type and routing. The pooled
+	// scratch keeps this allocation-free; it is owned by this goroutine for
+	// the duration of the call and nothing below retains rs.queues.
+	rs := acquireRouteScratch()
+	defer releaseRouteScratch(rs)
+	if err := b.routeMessage(exchange, routingKey, message, rs); err != nil {
 		return err
 	}
+	targetQueues := rs.queues
 
 	if len(targetQueues) == 0 {
 		if message.Mandatory {
@@ -1274,10 +1279,15 @@ func (b *StorageBroker) PublishMessageTx(txnStore interfaces.Storage, exchangeNa
 		return nil, err
 	}
 
-	targetQueues, err := b.findTargetQueues(exchange, routingKey, message)
-	if err != nil {
+	// Same pooled-scratch routing as PublishMessage. The deferred visibility
+	// closures below capture only the QueueState and message ID — never
+	// rs.queues — so releasing the scratch on return is safe.
+	rs := acquireRouteScratch()
+	defer releaseRouteScratch(rs)
+	if err := b.routeMessage(exchange, routingKey, message, rs); err != nil {
 		return nil, err
 	}
+	targetQueues := rs.queues
 
 	if len(targetQueues) == 0 {
 		if message.Mandatory {
@@ -1330,38 +1340,146 @@ func (b *StorageBroker) PublishMessageTx(txnStore interfaces.Storage, exchangeNa
 	return deferred, nil
 }
 
-// findTargetQueues determines which queues should receive the message.
-// It follows both queue bindings and exchange-to-exchange bindings recursively,
-// using a visited set for cycle protection and a seen set for queue deduplication.
-func (b *StorageBroker) findTargetQueues(exchange *protocol.Exchange, routingKey string, message *protocol.Message) ([]string, error) {
-	seen := make(map[string]struct{})
-	visited := make(map[string]struct{})
-	var queues []string
-	if err := b.collectTargetQueues(exchange, routingKey, message, seen, visited, &queues); err != nil {
-		return nil, err
-	}
-	return queues, nil
+// routeScratch holds per-publish routing state. Instances are pooled so the
+// publish hot path performs zero steady-state heap allocations: the queues
+// slice, seen set, and visited set are all reused across publishes.
+//
+// Ownership contract (race safety without locks): a scratch obtained from
+// acquireRouteScratch is owned exclusively by the calling goroutine until
+// releaseRouteScratch returns it to the pool. Neither the scratch nor its
+// queues slice may be retained, returned, or shared past the release — copy
+// anything that must outlive the publish (see findTargetQueues).
+type routeScratch struct {
+	// queues accumulates target queue names in routing order.
+	queues []string
+	// seen deduplicates queues across multiple matching bindings; visited
+	// provides cycle protection for exchange-to-exchange bindings. Both are
+	// lazily allocated: the default-exchange and direct-no-e2e fast paths in
+	// routeMessage never touch them.
+	seen    map[string]struct{}
+	visited map[string]struct{}
 }
 
-func (b *StorageBroker) collectTargetQueues(exchange *protocol.Exchange, routingKey string, message *protocol.Message, seen map[string]struct{}, visited map[string]struct{}, queues *[]string) error {
-	if _, ok := visited[exchange.Name]; ok {
+var routeScratchPool = sync.Pool{
+	New: func() interface{} { return &routeScratch{} },
+}
+
+func acquireRouteScratch() *routeScratch {
+	return routeScratchPool.Get().(*routeScratch)
+}
+
+func releaseRouteScratch(rs *routeScratch) {
+	routeScratchPool.Put(rs)
+}
+
+// resetMaps prepares the dedup/cycle sets for the recursive routing path,
+// allocating them on first use of a pooled scratch and clearing them after.
+func (rs *routeScratch) resetMaps() {
+	if rs.seen == nil {
+		rs.seen = make(map[string]struct{}, 8)
+		rs.visited = make(map[string]struct{}, 4)
+		return
+	}
+	clear(rs.seen)
+	clear(rs.visited)
+}
+
+// routeMessage is the single routing entry point: it resolves the set of
+// queues that should receive a message published to exchange with routingKey
+// and stores them in rs.queues (resetting any previous contents). It is
+// shared by PublishMessage and PublishMessageTx, and is the re-entry point
+// for future dead-letter-exchange routing (SQ-10).
+//
+// Routing is read-only and lock-free. Two allocation fast paths cover the
+// overwhelmingly common cases without touching the dedup/visited maps:
+//
+//  1. Default exchange: routes to at most one queue named by the routing key.
+//  2. Direct exchange with no exchange-to-exchange bindings: a linear scan of
+//     the exchange's bindings, deduplicated by scanning the (small) result
+//     slice instead of a map.
+//
+// Fanout, topic, and headers exchanges — and any exchange with
+// exchange-to-exchange bindings — use the recursive map-based path
+// (collectTargetQueues), which preserves cycle protection and dedup semantics.
+func (b *StorageBroker) routeMessage(exchange *protocol.Exchange, routingKey string, message *protocol.Message, rs *routeScratch) error {
+	rs.queues = rs.queues[:0]
+
+	// Fast path 1: the default exchange routes directly to the queue named by
+	// the routing key. No bindings, no recursion, no maps.
+	if exchange.Name == "" {
+		if _, ok := b.activeQueues.Load(routingKey); ok {
+			rs.queues = append(rs.queues, routingKey)
+			return nil
+		}
+		if _, err := b.storage.GetQueue(routingKey); err == nil {
+			rs.queues = append(rs.queues, routingKey)
+		}
 		return nil
 	}
-	visited[exchange.Name] = struct{}{}
+
+	// Fast path 2: direct exchange with no exchange-to-exchange bindings.
+	if exchange.Kind == "direct" {
+		exchBindings, err := b.storage.GetExchangeBindingsFrom(exchange.Name)
+		if err != nil {
+			return fmt.Errorf("failed to get exchange-to-exchange bindings: %w", err)
+		}
+		if len(exchBindings) == 0 {
+			bindings, err := b.storage.GetExchangeBindings(exchange.Name)
+			if err != nil {
+				return fmt.Errorf("failed to get exchange bindings: %w", err)
+			}
+			for _, binding := range bindings {
+				if binding.RoutingKey == routingKey && !slices.Contains(rs.queues, binding.QueueName) {
+					rs.queues = append(rs.queues, binding.QueueName)
+				}
+			}
+			return nil
+		}
+	}
+
+	// General path: recursive traversal with map-based dedup and cycle
+	// protection. The maps come from the pooled scratch, so this path is
+	// also allocation-free in steady state.
+	rs.resetMaps()
+	return b.collectTargetQueues(exchange, routingKey, message, rs)
+}
+
+// findTargetQueues resolves target queues into a freshly allocated slice.
+// It is a convenience wrapper over routeMessage for callers (tests, future
+// dead-letter handling) that need a result outliving the routing call; the
+// hot publish paths use routeMessage with a pooled scratch directly.
+func (b *StorageBroker) findTargetQueues(exchange *protocol.Exchange, routingKey string, message *protocol.Message) ([]string, error) {
+	rs := acquireRouteScratch()
+	defer releaseRouteScratch(rs)
+	if err := b.routeMessage(exchange, routingKey, message, rs); err != nil {
+		return nil, err
+	}
+	if len(rs.queues) == 0 {
+		return nil, nil
+	}
+	// Copy out: rs.queues is pooled and must not escape this call.
+	return slices.Clone(rs.queues), nil
+}
+
+func (b *StorageBroker) collectTargetQueues(exchange *protocol.Exchange, routingKey string, message *protocol.Message, rs *routeScratch) error {
+	if _, ok := rs.visited[exchange.Name]; ok {
+		return nil
+	}
+	rs.visited[exchange.Name] = struct{}{}
 
 	if exchange.Name == "" {
-		if _, ok := seen[routingKey]; ok {
+		if _, ok := rs.seen[routingKey]; ok {
 			return nil
 		}
 		if _, ok := b.activeQueues.Load(routingKey); ok {
-			*queues = append(*queues, routingKey)
-			seen[routingKey] = struct{}{}
+			rs.queues = append(rs.queues, routingKey)
+			rs.seen[routingKey] = struct{}{}
 			return nil
 		}
 		_, err := b.storage.GetQueue(routingKey)
 		if err == nil {
-			*queues = append(*queues, routingKey)
-			seen[routingKey] = struct{}{}
+			rs.queues = append(rs.queues, routingKey)
+			rs.seen[routingKey] = struct{}{}
 		}
 		return nil
 	}
@@ -1375,34 +1493,34 @@ func (b *StorageBroker) collectTargetQueues(exchange *protocol.Exchange, routing
 	case "direct":
 		for _, binding := range bindings {
 			if binding.RoutingKey == routingKey {
-				if _, ok := seen[binding.QueueName]; !ok {
-					*queues = append(*queues, binding.QueueName)
-					seen[binding.QueueName] = struct{}{}
+				if _, ok := rs.seen[binding.QueueName]; !ok {
+					rs.queues = append(rs.queues, binding.QueueName)
+					rs.seen[binding.QueueName] = struct{}{}
 				}
 			}
 		}
 	case "fanout":
 		for _, binding := range bindings {
-			if _, ok := seen[binding.QueueName]; !ok {
-				*queues = append(*queues, binding.QueueName)
-				seen[binding.QueueName] = struct{}{}
+			if _, ok := rs.seen[binding.QueueName]; !ok {
+				rs.queues = append(rs.queues, binding.QueueName)
+				rs.seen[binding.QueueName] = struct{}{}
 			}
 		}
 	case "topic":
 		for _, binding := range bindings {
 			if b.matchTopicPattern(binding.RoutingKey, routingKey) {
-				if _, ok := seen[binding.QueueName]; !ok {
-					*queues = append(*queues, binding.QueueName)
-					seen[binding.QueueName] = struct{}{}
+				if _, ok := rs.seen[binding.QueueName]; !ok {
+					rs.queues = append(rs.queues, binding.QueueName)
+					rs.seen[binding.QueueName] = struct{}{}
 				}
 			}
 		}
 	case "headers":
 		for _, binding := range bindings {
 			if b.matchHeaders(binding.Arguments, message.Headers) {
-				if _, ok := seen[binding.QueueName]; !ok {
-					*queues = append(*queues, binding.QueueName)
-					seen[binding.QueueName] = struct{}{}
+				if _, ok := rs.seen[binding.QueueName]; !ok {
+					rs.queues = append(rs.queues, binding.QueueName)
+					rs.seen[binding.QueueName] = struct{}{}
 				}
 			}
 		}
@@ -1434,7 +1552,7 @@ func (b *StorageBroker) collectTargetQueues(exchange *protocol.Exchange, routing
 		if err != nil {
 			continue
 		}
-		if err := b.collectTargetQueues(destExchange, routingKey, message, seen, visited, queues); err != nil {
+		if err := b.collectTargetQueues(destExchange, routingKey, message, rs); err != nil {
 			return err
 		}
 	}
