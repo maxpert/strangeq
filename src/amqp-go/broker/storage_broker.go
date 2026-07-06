@@ -427,6 +427,7 @@ func (b *StorageBroker) deliverMessage(queueState *QueueState, state *ConsumerSt
 		Exchange:    message.Exchange,
 		RoutingKey:  message.RoutingKey,
 		ConsumerTag: state.consumer.Tag,
+		NoAck:       noAck,
 	}
 
 	if redelivered && b.metricsCollector != nil {

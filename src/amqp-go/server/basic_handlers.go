@@ -643,6 +643,20 @@ func (s *Server) handleBasicGet(conn *protocol.Connection, channelID uint16, pay
 		return s.sendBasicGetEmpty(conn, channelID)
 	}
 
+	// SQ-18: translate the broker msgID into a per-channel monotonic wire
+	// delivery tag so basic.get deliveries share the channel's tag space with
+	// basic.deliver (and cumulative acks over a mixed stream stay coherent).
+	// Manual-ack gets are tracked so their ack/nack/reject can be routed back to
+	// the msgID-keyed broker get-delivery ledger; no-ack gets are never acked.
+	wireTag := deliveryTag
+	if v, ok := conn.Channels.Load(channelID); ok {
+		channel := v.(*protocol.Channel)
+		wireTag = channel.NextWireTag()
+		if !getMethod.NoAck {
+			channel.TrackDelivery(wireTag, deliveryTag, "", true)
+		}
+	}
+
 	const maxPoolSize = 131 * 1024
 	estimatedSize := deliveryOverheadEstimate + len(message.Body)
 	var buf *[]byte
@@ -658,7 +672,7 @@ func (s *Server) handleBasicGet(conn *protocol.Connection, channelID uint16, pay
 		}
 	}()
 
-	if err := s.serializeGetDeliveryInto(buf, channelID, deliveryTag, message.Redelivered, message.Exchange, message.RoutingKey, messageCount, message); err != nil {
+	if err := s.serializeGetDeliveryInto(buf, channelID, wireTag, message.Redelivered, message.Exchange, message.RoutingKey, messageCount, message); err != nil {
 		s.Log.Error("Failed to serialize basic.get-ok delivery",
 			zap.Error(err),
 			zap.Uint16("channel_id", channelID))
@@ -836,45 +850,82 @@ func parseBasicNackArgs(payload []byte) (deliveryTag uint64, multiple, requeue b
 	return deliveryTag, multiple, requeue, nil
 }
 
+// wireChannel returns the channel for channelID, or nil when it is not
+// registered. Real connections always register a channel via channel.open
+// before any delivery; a nil result (some unit tests) selects the legacy
+// wire-tag == msgID fallback in resolveDeliveryTag.
+func (s *Server) wireChannel(conn *protocol.Connection, channelID uint16) *protocol.Channel {
+	if v, ok := conn.Channels.Load(channelID); ok {
+		return v.(*protocol.Channel)
+	}
+	return nil
+}
+
+// resolveDeliveryTag (SQ-18) translates a wire delivery tag received on
+// basic.ack/nack/reject into the broker identity behind it and removes the
+// tracking entry (the tag is about to be settled). With a channel present the
+// per-channel wire-tag table is authoritative; without one it falls back to
+// treating the wire tag as the broker msgID (legacy path). known=false means
+// the tag is unknown or already settled (duplicate/no-ack/stale) and the caller
+// must no-op, matching AMQP's tolerant handling of stale acks.
+func (s *Server) resolveDeliveryTag(channel *protocol.Channel, wireTag uint64) (msgID uint64, consumerTag string, isGet, known bool) {
+	if channel != nil {
+		ref, ok := channel.TakeWireTag(wireTag)
+		if !ok {
+			return 0, "", false, false
+		}
+		return ref.MsgID, ref.ConsumerTag, ref.IsGet, true
+	}
+	ctag, ok := s.Broker.GetConsumerForDelivery(wireTag)
+	if !ok {
+		return 0, "", false, false
+	}
+	return wireTag, ctag, ctag == "", true
+}
+
 // handleBasicAck handles the basic.ack method
 func (s *Server) handleBasicAck(conn *protocol.Connection, channelID uint16, payload []byte) error {
-	deliveryTag, multiple, err := parseBasicAckArgs(payload)
+	wireTag, multiple, err := parseBasicAckArgs(payload)
 	if err != nil {
 		return err
 	}
+	channel := s.wireChannel(conn, channelID)
+	tx := s.TransactionManager != nil && s.TransactionManager.IsTransactional(channelID)
 
-	consumerTag, ok := s.Broker.GetConsumerForDelivery(deliveryTag)
-	if !ok {
-		s.Log.Debug("Delivery tag already processed (consumer cancelled?)",
-			zap.Uint64("delivery_tag", deliveryTag),
-			zap.Uint16("channel_id", channelID))
-		return nil
-	}
-
-	// Buffer into transaction if channel is in transactional mode
-	if s.TransactionManager != nil && s.TransactionManager.IsTransactional(channelID) {
-		op := transaction.NewAckOperation(consumerTag, deliveryTag, multiple)
-		return s.TransactionManager.AddOperation(channelID, op)
-	}
-
-	if consumerTag == "" {
-		err := s.Broker.AcknowledgeGetDelivery(deliveryTag)
-		if err != nil {
-			return err
-		}
+	// Non-transactional cumulative ack spans every consumer on the channel
+	// (SQ-18): the client's "all tags <= N" may cover deliveries that came from
+	// different queues, so it cannot be routed to a single consumer's broker
+	// multi-ack. The per-channel wire-tag table is the channel-wide unacked set.
+	if multiple && !tx {
+		s.cumulativeSettle(channel, wireTag, settleAck, false)
 		if s.MetricsCollector != nil {
 			s.MetricsCollector.RecordMessageAcknowledged()
 		}
 		return nil
 	}
 
-	err = s.Broker.AcknowledgeMessage(consumerTag, deliveryTag, multiple)
-	if err != nil {
+	msgID, consumerTag, isGet, known := s.resolveDeliveryTag(channel, wireTag)
+	if !known {
+		s.Log.Debug("Delivery tag already processed (consumer cancelled?)",
+			zap.Uint64("delivery_tag", wireTag),
+			zap.Uint16("channel_id", channelID))
+		return nil
+	}
+
+	if tx {
+		op := transaction.NewAckOperation(consumerTag, msgID, multiple)
+		return s.TransactionManager.AddOperation(channelID, op)
+	}
+
+	if isGet {
+		if err := s.Broker.AcknowledgeGetDelivery(msgID); err != nil {
+			return err
+		}
+	} else if err := s.Broker.AcknowledgeMessage(consumerTag, msgID, false); err != nil {
 		s.Log.Error("Failed to acknowledge message in broker",
 			zap.Error(err),
 			zap.String("consumer_tag", consumerTag),
-			zap.Uint64("delivery_tag", deliveryTag),
-			zap.Bool("multiple", multiple))
+			zap.Uint64("msg_id", msgID))
 		return err
 	}
 
@@ -887,42 +938,35 @@ func (s *Server) handleBasicAck(conn *protocol.Connection, channelID uint16, pay
 
 // handleBasicReject handles the basic.reject method
 func (s *Server) handleBasicReject(conn *protocol.Connection, channelID uint16, payload []byte) error {
-	deliveryTag, requeue, err := parseBasicRejectArgs(payload)
+	wireTag, requeue, err := parseBasicRejectArgs(payload)
 	if err != nil {
 		return err
 	}
+	channel := s.wireChannel(conn, channelID)
 
-	consumerTag, ok := s.Broker.GetConsumerForDelivery(deliveryTag)
-	if !ok {
+	msgID, consumerTag, isGet, known := s.resolveDeliveryTag(channel, wireTag)
+	if !known {
 		s.Log.Debug("Delivery tag already processed (consumer cancelled?)",
-			zap.Uint64("delivery_tag", deliveryTag),
+			zap.Uint64("delivery_tag", wireTag),
 			zap.Uint16("channel_id", channelID))
 		return nil
 	}
 
 	// Buffer into transaction if channel is in transactional mode
 	if s.TransactionManager != nil && s.TransactionManager.IsTransactional(channelID) {
-		op := transaction.NewRejectOperation(consumerTag, deliveryTag, requeue)
+		op := transaction.NewRejectOperation(consumerTag, msgID, requeue)
 		return s.TransactionManager.AddOperation(channelID, op)
 	}
 
-	if consumerTag == "" {
-		err := s.Broker.RejectGetDelivery(deliveryTag, requeue)
-		if err != nil {
+	if isGet {
+		if err := s.Broker.RejectGetDelivery(msgID, requeue); err != nil {
 			return err
 		}
-		if s.MetricsCollector != nil {
-			s.MetricsCollector.RecordMessageRejected()
-		}
-		return nil
-	}
-
-	err = s.Broker.RejectMessage(consumerTag, deliveryTag, requeue)
-	if err != nil {
+	} else if err := s.Broker.RejectMessage(consumerTag, msgID, requeue); err != nil {
 		s.Log.Error("Failed to reject message in broker",
 			zap.Error(err),
 			zap.String("consumer_tag", consumerTag),
-			zap.Uint64("delivery_tag", deliveryTag),
+			zap.Uint64("msg_id", msgID),
 			zap.Bool("requeue", requeue))
 		return err
 	}
@@ -936,43 +980,45 @@ func (s *Server) handleBasicReject(conn *protocol.Connection, channelID uint16, 
 
 // handleBasicNack handles the basic.nack method
 func (s *Server) handleBasicNack(conn *protocol.Connection, channelID uint16, payload []byte) error {
-	deliveryTag, multiple, requeue, err := parseBasicNackArgs(payload)
+	wireTag, multiple, requeue, err := parseBasicNackArgs(payload)
 	if err != nil {
 		return err
 	}
+	channel := s.wireChannel(conn, channelID)
+	tx := s.TransactionManager != nil && s.TransactionManager.IsTransactional(channelID)
 
-	consumerTag, ok := s.Broker.GetConsumerForDelivery(deliveryTag)
-	if !ok {
-		s.Log.Debug("Delivery tag already processed (consumer cancelled?)",
-			zap.Uint64("delivery_tag", deliveryTag),
-			zap.Uint16("channel_id", channelID))
-		return nil
-	}
-
-	// Buffer into transaction if channel is in transactional mode
-	if s.TransactionManager != nil && s.TransactionManager.IsTransactional(channelID) {
-		op := transaction.NewNackOperation(consumerTag, deliveryTag, multiple, requeue)
-		return s.TransactionManager.AddOperation(channelID, op)
-	}
-
-	if consumerTag == "" {
-		err := s.Broker.NackGetDelivery(deliveryTag, requeue)
-		if err != nil {
-			return err
-		}
+	// Non-transactional cumulative nack spans every consumer on the channel
+	// (SQ-18), mirroring cumulative ack.
+	if multiple && !tx {
+		s.cumulativeSettle(channel, wireTag, settleNack, requeue)
 		if s.MetricsCollector != nil {
 			s.MetricsCollector.RecordMessageRejected()
 		}
 		return nil
 	}
 
-	err = s.Broker.NacknowledgeMessage(consumerTag, deliveryTag, multiple, requeue)
-	if err != nil {
+	msgID, consumerTag, isGet, known := s.resolveDeliveryTag(channel, wireTag)
+	if !known {
+		s.Log.Debug("Delivery tag already processed (consumer cancelled?)",
+			zap.Uint64("delivery_tag", wireTag),
+			zap.Uint16("channel_id", channelID))
+		return nil
+	}
+
+	if tx {
+		op := transaction.NewNackOperation(consumerTag, msgID, multiple, requeue)
+		return s.TransactionManager.AddOperation(channelID, op)
+	}
+
+	if isGet {
+		if err := s.Broker.NackGetDelivery(msgID, requeue); err != nil {
+			return err
+		}
+	} else if err := s.Broker.NacknowledgeMessage(consumerTag, msgID, false, requeue); err != nil {
 		s.Log.Error("Failed to nack message in broker",
 			zap.Error(err),
 			zap.String("consumer_tag", consumerTag),
-			zap.Uint64("delivery_tag", deliveryTag),
-			zap.Bool("multiple", multiple),
+			zap.Uint64("msg_id", msgID),
 			zap.Bool("requeue", requeue))
 		return err
 	}
@@ -982,6 +1028,55 @@ func (s *Server) handleBasicNack(conn *protocol.Connection, channelID uint16, pa
 	}
 
 	return nil
+}
+
+// settleKind selects the terminal transition applied by cumulativeSettle.
+type settleKind int
+
+const (
+	settleAck settleKind = iota
+	settleNack
+)
+
+// cumulativeSettle applies a cumulative (multiple=true) ack or nack to every
+// still-outstanding wire tag <= wireTag on the channel — across ALL consumers
+// and any tracked basic.get deliveries (SQ-18). Each tag is settled through the
+// broker's single-message path (its own settle() LoadAndDelete linearization
+// point), so credit accounting stays exact and requeue-reused msgIDs cannot be
+// over-settled. When channel is nil (legacy tests) it falls back to routing the
+// wire tag (== msgID) to the owning consumer's broker multi-ack.
+func (s *Server) cumulativeSettle(channel *protocol.Channel, wireTag uint64, kind settleKind, requeue bool) {
+	if channel == nil {
+		ctag, ok := s.Broker.GetConsumerForDelivery(wireTag)
+		if !ok {
+			return
+		}
+		switch {
+		case ctag == "" && kind == settleAck:
+			s.Broker.AcknowledgeGetDelivery(wireTag)
+		case ctag == "":
+			s.Broker.NackGetDelivery(wireTag, requeue)
+		case kind == settleAck:
+			s.Broker.AcknowledgeMessage(ctag, wireTag, true)
+		default:
+			s.Broker.NacknowledgeMessage(ctag, wireTag, true, requeue)
+		}
+		return
+	}
+
+	refs := channel.TakeWireTagsUpTo(wireTag)
+	for _, ref := range refs {
+		switch {
+		case ref.IsGet && kind == settleAck:
+			s.Broker.AcknowledgeGetDelivery(ref.MsgID)
+		case ref.IsGet:
+			s.Broker.NackGetDelivery(ref.MsgID, requeue)
+		case kind == settleAck:
+			s.Broker.AcknowledgeMessage(ref.ConsumerTag, ref.MsgID, false)
+		default:
+			s.Broker.NacknowledgeMessage(ref.ConsumerTag, ref.MsgID, false, requeue)
+		}
+	}
 }
 
 func (s *Server) handleBasicRecover(conn *protocol.Connection, channelID uint16, payload []byte) error {

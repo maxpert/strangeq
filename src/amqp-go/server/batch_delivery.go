@@ -20,6 +20,16 @@ func (s *Server) sendBatchedDeliveries(conn *protocol.Connection, channelID uint
 		zap.Uint16("channel_id", channelID),
 		zap.Int("batch_size", len(deliveries)))
 
+	// SQ-18: resolve the channel so each delivery can be stamped with a
+	// per-channel monotonic wire delivery tag (and manual-ack deliveries tracked
+	// for later ack translation). A missing channel (e.g. some unit tests invoke
+	// this without a registered channel) falls back to the broker msgID as the
+	// wire tag, preserving legacy behaviour.
+	var channel *protocol.Channel
+	if v, ok := conn.Channels.Load(channelID); ok {
+		channel = v.(*protocol.Channel)
+	}
+
 	estimatedSize := 0
 	for _, d := range deliveries {
 		if d.Message != nil {
@@ -42,11 +52,22 @@ func (s *Server) sendBatchedDeliveries(conn *protocol.Connection, channelID uint
 	}()
 
 	for _, delivery := range deliveries {
+		// Stamp the per-channel monotonic wire tag. Manual-ack deliveries are
+		// tracked (wire tag -> broker msgID) so the client's ack can be
+		// translated; no-ack deliveries take a tag but are never tracked (they
+		// are settled at send time and never acked).
+		wireTag := delivery.DeliveryTag
+		if channel != nil {
+			wireTag = channel.NextWireTag()
+			if !delivery.NoAck {
+				channel.TrackDelivery(wireTag, delivery.DeliveryTag, delivery.ConsumerTag, false)
+			}
+		}
 		err := s.serializeDeliveryInto(
 			batchBuf,
 			channelID,
 			consumerTag,
-			delivery.DeliveryTag,
+			wireTag,
 			delivery.Redelivered,
 			delivery.Exchange,
 			delivery.RoutingKey,

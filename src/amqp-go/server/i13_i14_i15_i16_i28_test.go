@@ -253,6 +253,11 @@ func TestMetricsRejectedAndRedeliveredThroughRealPath(t *testing.T) {
 	select {
 	case delivery := <-consumer.Messages:
 		assert.False(t, delivery.Redelivered, "first delivery must not be redelivered")
+		// SQ-18: this test reads directly from consumer.Messages, bypassing the
+		// real delivery path that assigns and tracks the per-channel wire tag.
+		// Register that mapping so handleBasicReject can translate the tag back
+		// to the broker msgID.
+		channel.TrackDelivery(delivery.DeliveryTag, delivery.DeliveryTag, delivery.ConsumerTag, false)
 		err := srv.handleBasicReject(conn, 1, makeRejectPayload(delivery.DeliveryTag, true))
 		require.NoError(t, err)
 		assert.Equal(t, int64(1), spy.rejects.Load(), "RecordMessageRejected must fire through handleBasicReject")
