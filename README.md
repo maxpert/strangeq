@@ -33,7 +33,7 @@ RabbitMQ is the gold standard for AMQP 0.9.1, but it runs on the Erlang VM — a
 - `basic.recover` for redelivering unacknowledged messages
 - `queue.purge` for removing all messages from a queue
 - `channel.flow` / `channel.flow-ok` for start/stop of content frames
-- 1.07–1.36x faster throughput than RabbitMQ 4.3 on same hardware (see benchmarks below)
+- 1.27–1.39x faster throughput than RabbitMQ 4.3 on same hardware (see benchmarks below)
 - Prometheus metrics and pprof profiling
 - Lock-free per-queue ring buffer with per-slot CAS
 - Batch TCP writes and ACK offloading
@@ -262,15 +262,15 @@ Key engine tuning parameters:
 
 ### Head-to-Head vs RabbitMQ 4.3
 
-Same machine, same Go client ([amqp091-go](https://github.com/rabbitmq/amqp091-go)), 12-byte messages, durable queue, transient messages, 1 publisher + 1 consumer.
+Same machine, same Go client ([amqp091-go](https://github.com/rabbitmq/amqp091-go)), 12-byte messages, durable queue, transient messages, 1 publisher + 1 consumer. StrangeQ numbers are medians of 5 runs at `-benchtime=2s`; the benchmarks fail unless every published message is also consumed, so throughput includes full end-to-end delivery, not just publish acceptance.
 
 | Benchmark | Broker | Median (ns/op) | msg/s | B/op | allocs/op | Ratio |
 |-----------|--------|----------------|-------|------|-----------|-------|
-| Auto-ack | StrangeQ | 3,463 | 289K | 1,371 | 32 | 1.14x |
+| Auto-ack | StrangeQ | 2,911 | 343K | 3,261 | 66 | 1.35x |
 | Auto-ack | RabbitMQ | 3,931 | 254K | | | |
-| Manual ack | StrangeQ | 3,412 | 293K | 1,451 | 34 | 1.36x |
+| Manual ack | StrangeQ | 3,342 | 299K | 1,364 | 33 | 1.39x |
 | Manual ack | RabbitMQ | 4,641 | 215K | | | |
-| Multi-ack 1000 | StrangeQ | 3,831 | 261K | 1,418 | 33 | 1.07x |
+| Multi-ack 1000 | StrangeQ | 3,216 | 311K | 3,893 | 78 | 1.27x |
 | Multi-ack 1000 | RabbitMQ | 4,099 | 244K | | | |
 
 ### Running the Benchmarks
