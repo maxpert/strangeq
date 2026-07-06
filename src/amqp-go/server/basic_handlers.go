@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"math"
 	"time"
 
 	"github.com/maxpert/amqp-go/broker"
@@ -1046,6 +1047,12 @@ const (
 // over-settled. When channel is nil (legacy tests) it falls back to routing the
 // wire tag (== msgID) to the owning consumer's broker multi-ack.
 func (s *Server) cumulativeSettle(channel *protocol.Channel, wireTag uint64, kind settleKind, requeue bool) {
+	// Spec: delivery-tag 0 with multiple=true means "every outstanding delivery
+	// on the channel". Wire tags are 1-based, so 0 would otherwise match nothing
+	// and ack-all / nack-all would silently no-op.
+	if wireTag == 0 {
+		wireTag = math.MaxUint64
+	}
 	if channel == nil {
 		ctag, ok := s.Broker.GetConsumerForDelivery(wireTag)
 		if !ok {

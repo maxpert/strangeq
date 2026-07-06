@@ -493,3 +493,104 @@ func TestSQ18_CumulativeMultiAckAcrossQueues(t *testing.T) {
 		t.Logf("cumulative multi-ack on tag %d settled all %d channel deliveries; nothing redelivered", maxTag, perQueue*2)
 	}
 }
+
+// TestSQ18_AckAllWithDeliveryTagZero exercises basic.ack(delivery-tag=0,
+// multiple=true), which the spec defines as "acknowledge every outstanding
+// delivery on the channel" — across all consumers/queues.
+//
+// WHY THIS FAILS WITHOUT THE GUARD: wire tags are 1-based, so a cumulative
+// settle bounded by tag 0 matches nothing and ack-all silently no-ops; every
+// delivery is requeued at channel close and redelivered.
+func TestSQ18_AckAllWithDeliveryTagZero(t *testing.T) {
+	uri, stop := sq18Server(t)
+	defer stop()
+
+	qA := "sq18-ackall-A"
+	qB := "sq18-ackall-B"
+	const perQueue = 20
+
+	conn, err := amqp.Dial(uri)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	ch, err := conn.Channel()
+	if err != nil {
+		t.Fatalf("channel: %v", err)
+	}
+	if err := ch.Qos(10000, 0, false); err != nil {
+		t.Fatalf("qos: %v", err)
+	}
+	for _, q := range []string{qA, qB} {
+		if _, err := ch.QueueDeclare(q, false, false, false, false, nil); err != nil {
+			t.Fatalf("declare %s: %v", q, err)
+		}
+	}
+	for i := 0; i < perQueue; i++ {
+		for _, q := range []string{qA, qB} {
+			if err := ch.Publish("", q, false, false, amqp.Publishing{Body: []byte(fmt.Sprintf("%s-%d", q, i))}); err != nil {
+				t.Fatalf("publish: %v", err)
+			}
+		}
+	}
+
+	consA, err := ch.Consume(qA, "cA", false, false, false, false, nil)
+	if err != nil {
+		t.Fatalf("consume A: %v", err)
+	}
+	consB, err := ch.Consume(qB, "cB", false, false, false, false, nil)
+	if err != nil {
+		t.Fatalf("consume B: %v", err)
+	}
+	_ = sq18Collect(t, consA, consB, perQueue*2, 10*time.Second)
+
+	// Ack-all: delivery-tag 0 + multiple=true settles every outstanding
+	// delivery on the channel.
+	if err := ch.Ack(0, true); err != nil {
+		t.Fatalf("ack-all: %v", err)
+	}
+
+	time.Sleep(ackDrain)
+	_ = ch.Close()
+	_ = conn.Close()
+	time.Sleep(300 * time.Millisecond)
+
+	conn2, err := amqp.Dial(uri)
+	if err != nil {
+		t.Fatalf("dial2: %v", err)
+	}
+	defer conn2.Close()
+	ch2, err := conn2.Channel()
+	if err != nil {
+		t.Fatalf("channel2: %v", err)
+	}
+	if err := ch2.Qos(10000, 0, false); err != nil {
+		t.Fatalf("qos2: %v", err)
+	}
+	c2A, err := ch2.Consume(qA, "c2A", false, false, false, false, nil)
+	if err != nil {
+		t.Fatalf("consume2 A: %v", err)
+	}
+	c2B, err := ch2.Consume(qB, "c2B", false, false, false, false, nil)
+	if err != nil {
+		t.Fatalf("consume2 B: %v", err)
+	}
+
+	redelivered := map[string]int{}
+	deadline := time.After(2 * time.Second)
+	for done := false; !done; {
+		select {
+		case d := <-c2A:
+			redelivered[string(d.Body)]++
+			_ = d.Ack(false)
+		case d := <-c2B:
+			redelivered[string(d.Body)]++
+			_ = d.Ack(false)
+		case <-deadline:
+			done = true
+		}
+	}
+
+	if len(redelivered) != 0 {
+		t.Errorf("ack-all (tag 0, multiple=true) failed to settle %d message(s); redelivered: %v", len(redelivered), redelivered)
+	}
+}
