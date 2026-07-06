@@ -1,8 +1,10 @@
 package server
 
 import (
+	"errors"
 	"fmt"
 
+	"github.com/maxpert/amqp-go/broker"
 	amqperrors "github.com/maxpert/amqp-go/errors"
 	"github.com/maxpert/amqp-go/interfaces"
 	"github.com/maxpert/amqp-go/protocol"
@@ -110,6 +112,14 @@ func (s *Server) handleQueueDeclare(conn *protocol.Connection, channelID uint16,
 	)
 
 	if err != nil {
+		// Malformed known x-arguments (SQ-7 policy validation) are a
+		// channel-level soft error: 406 PreconditionFailed, keep the
+		// connection alive. Mirrors the ErrExchangeTypeMismatch handling in
+		// handleExchangeDeclare.
+		if errors.Is(err, broker.ErrInvalidQueueArgument) {
+			s.sendChannelClose(conn, channelID, amqperrors.PreconditionFailed, err.Error(), 50, 10)
+			return nil
+		}
 		s.Log.Error("Failed to declare queue",
 			zap.Error(err),
 			zap.String("queue", queueName))
