@@ -1143,7 +1143,15 @@ func (b *StorageBroker) requeueInflightDelivery(qs *QueueState, queueName string
 	b.storage.DeletePendingAck(queueName, deliveryTag)
 }
 
-// PublishMessage publishes a message to an exchange
+// PublishMessage publishes a message to an exchange.
+//
+// Ownership: the broker takes ownership of message — it mutates
+// message.DeliveryTag and stores the pointer directly in the first target
+// queue's ring. Callers must pass a fresh Message per publish and must not
+// reuse or mutate it afterwards (sharing the Body slice is fine; bodies are
+// treated as immutable after publish). Reusing one Message object across
+// publishes aliases the same pointer in multiple ring slots, which breaks the
+// ring's tag-identity checks and permanently leaks ring count.
 func (b *StorageBroker) PublishMessage(exchangeName, routingKey string, message *protocol.Message) error {
 	// Get exchange (lock-free)
 	exchange, err := b.storage.GetExchange(exchangeName)

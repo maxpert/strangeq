@@ -78,7 +78,7 @@ func DefaultConfig() *AMQPConfig {
 
 			// Write-Ahead Log (WAL)
 			WALBatchSize:      1000,              // 1,000 messages per batch
-			WALBatchTimeoutMS: 5,                 // 5ms max wait (halves tail latency for lone durable messages)
+			WALBatchTimeoutMS: 5,                 // retained for compatibility; flushing is drain-then-flush, not timer-gated
 			WALFileSize:       512 * 1024 * 1024, // 512 MB per WAL file
 			WALChannelBuffer:  10000,             // 10K buffered requests
 
