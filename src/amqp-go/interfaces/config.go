@@ -45,7 +45,10 @@ type NetworkConfig struct {
 	TCPKeepAlive           bool
 	TCPKeepAliveIntervalMS int64 // TCP keepalive interval in milliseconds
 
-	// Buffer sizes
+	// Socket buffer sizes (SQ-2). Applied as SO_RCVBUF / SO_SNDBUF on accepted
+	// TCP connections (TLS is unwrapped to its underlying socket). Default 256
+	// KiB each; operators may raise up to ~1 MiB for high-bandwidth links. <=0
+	// leaves the OS default in place.
 	ReadBufferSize  int
 	WriteBufferSize int
 

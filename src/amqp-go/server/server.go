@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"net"
@@ -139,8 +140,56 @@ func (s *Server) acceptLoop() error {
 	}
 }
 
+// underlyingTCPConn returns the *net.TCPConn beneath conn, unwrapping a
+// *tls.Conn if necessary, or nil if conn is not TCP-backed (e.g. a net.Pipe in
+// tests). tls.Conn.NetConn exposes the socket the TLS session runs over.
+func underlyingTCPConn(conn net.Conn) *net.TCPConn {
+	switch c := conn.(type) {
+	case *net.TCPConn:
+		return c
+	case *tls.Conn:
+		if inner, ok := c.NetConn().(*net.TCPConn); ok {
+			return inner
+		}
+	}
+	return nil
+}
+
+// tuneSocket applies TCP-level tuning to a freshly accepted connection (SQ-2):
+//   - TCP_NODELAY (disable Nagle) so small confirm/RPC frames flush immediately
+//     instead of waiting to coalesce. Nagle interacting with the peer's delayed
+//     ACK can stall a publish-confirm round trip up to ~40ms.
+//   - SO_RCVBUF / SO_SNDBUF sized from Network.Read/WriteBufferSize so the
+//     kernel can hold larger in-flight windows under throughput bursts.
+//
+// It is a no-op for non-TCP connections. Failures are logged, not fatal — the
+// connection is still usable, just untuned.
+func (s *Server) tuneSocket(conn net.Conn) {
+	tcp := underlyingTCPConn(conn)
+	if tcp == nil {
+		return
+	}
+	if err := tcp.SetNoDelay(true); err != nil {
+		s.Log.Warn("SetNoDelay failed", zap.Error(err))
+	}
+	if n := s.Config.Network.ReadBufferSize; n > 0 {
+		if err := tcp.SetReadBuffer(n); err != nil {
+			s.Log.Warn("SetReadBuffer failed", zap.Int("bytes", n), zap.Error(err))
+		}
+	}
+	if n := s.Config.Network.WriteBufferSize; n > 0 {
+		if err := tcp.SetWriteBuffer(n); err != nil {
+			s.Log.Warn("SetWriteBuffer failed", zap.Int("bytes", n), zap.Error(err))
+		}
+	}
+}
+
 // handleConnection handles a new client connection
 func (s *Server) handleConnection(conn net.Conn) {
+	// Tune the socket before the handshake so NoDelay/buffer sizing apply to the
+	// whole connection lifetime, including connection.start-ok latency.
+	s.tuneSocket(conn)
+
 	// First, check the protocol header
 	protoHeader := make([]byte, 8)
 	_, err := conn.Read(protoHeader)

@@ -23,10 +23,10 @@ func DefaultConfig() *AMQPConfig {
 			MaxConnections:         1000,
 			HeartbeatIntervalMS:    60000, // 60 seconds
 			TCPKeepAlive:           true,
-			TCPKeepAliveIntervalMS: 30000, // 30 seconds
-			ReadBufferSize:         8192,
-			WriteBufferSize:        8192,
-			ReadCoalesceBufferSize: 64 * 1024, // 64 KiB bufio read-coalescing buffer (SQ-1)
+			TCPKeepAliveIntervalMS: 30000,      // 30 seconds
+			ReadBufferSize:         256 * 1024, // 256 KiB SO_RCVBUF (SQ-2)
+			WriteBufferSize:        256 * 1024, // 256 KiB SO_SNDBUF (SQ-2)
+			ReadCoalesceBufferSize: 64 * 1024,  // 64 KiB bufio read-coalescing buffer (SQ-1)
 
 			ReaderOverflowFlowBytes:    8 << 20,  // 8 MiB: assert channel.flow(false)
 			ReaderOverflowHardCapBytes: 64 << 20, // 64 MiB: close the connection
