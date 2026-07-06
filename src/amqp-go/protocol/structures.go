@@ -117,6 +117,37 @@ type Channel struct {
 	FlowWake        chan struct{}        // signaled to wake parked forwarders when flow resumes/closes
 	ConfirmMode     atomic.Bool          // confirm.select state: true = server sends basic.ack for each publish
 	ConfirmSequence atomic.Uint64        // channel-scoped delivery tag sequence for publisher confirms
+
+	// SQ-18: per-channel wire delivery-tag remapping.
+	//
+	// A single channel may consume from multiple queues (and/or interleave
+	// basic.get) whose broker-internal message IDs are drawn from one global,
+	// per-message counter. Emitting those raw msgIDs as the wire delivery tag
+	// makes the channel's tag stream non-monotonic (AMQP 0.9.1 requires a
+	// per-channel strictly increasing sequence) and breaks cumulative acks
+	// (basic.ack/nack with multiple=true), whose "all tags <= N" semantics span
+	// every consumer on the channel — a client's single cumulative ack must be
+	// able to settle earlier deliveries that came from a *different* queue.
+	//
+	// wireTagSeq mints the monotonic per-channel wire tags (1,2,3,...). The
+	// table maps each still-unacked wire tag back to the underlying broker
+	// (msgID, consumer) so ack/nack/reject can be translated to the msgID-keyed
+	// broker ledger. No-ack deliveries are implicitly settled at send time and
+	// are never acked by the client, so they consume a wire tag (to keep the
+	// stream monotonic) but are deliberately NOT tracked here — keeping the
+	// no-ack fast path allocation-free and map-free.
+	wireTagSeq   atomic.Uint64
+	wireTagMu    sync.Mutex
+	wireTagTable map[uint64]WireDeliveryRef
+}
+
+// WireDeliveryRef records the broker-internal identity behind an outstanding
+// wire delivery tag so acknowledgements addressed by wire tag can be routed to
+// the correct msgID-keyed broker settle path.
+type WireDeliveryRef struct {
+	MsgID       uint64
+	ConsumerTag string // "" for a basic.get delivery
+	IsGet       bool
 }
 
 // NewChannel creates a new AMQP channel
@@ -130,9 +161,66 @@ func NewChannel(id uint16, conn *Connection) *Channel {
 		PrefetchSize:   0,     // No limit by default
 		GlobalPrefetch: false, // Per-consumer by default
 		FlowWake:       make(chan struct{}, 1),
+		wireTagTable:   make(map[uint64]WireDeliveryRef),
 	}
 	ch.FlowActive.Store(true) // Flow is active by default per AMQP spec
 	return ch
+}
+
+// NextWireTag mints the next strictly-increasing per-channel wire delivery tag
+// (1-based). Cheap and lock-free; safe to call from the delivery loop and the
+// basic.get handler concurrently.
+func (c *Channel) NextWireTag() uint64 {
+	return c.wireTagSeq.Add(1)
+}
+
+// TrackDelivery records the broker identity behind a wire tag so a later
+// acknowledgement addressed by that wire tag can be translated back to the
+// msgID-keyed broker ledger. Only manual-ack deliveries are tracked.
+func (c *Channel) TrackDelivery(wireTag, msgID uint64, consumerTag string, isGet bool) {
+	c.wireTagMu.Lock()
+	c.wireTagTable[wireTag] = WireDeliveryRef{MsgID: msgID, ConsumerTag: consumerTag, IsGet: isGet}
+	c.wireTagMu.Unlock()
+}
+
+// ResolveWireTag returns the broker identity behind a wire tag WITHOUT removing
+// it (used by transactional buffering, where settlement is deferred to commit).
+func (c *Channel) ResolveWireTag(wireTag uint64) (WireDeliveryRef, bool) {
+	c.wireTagMu.Lock()
+	ref, ok := c.wireTagTable[wireTag]
+	c.wireTagMu.Unlock()
+	return ref, ok
+}
+
+// TakeWireTag atomically resolves and removes the entry for a single wire tag.
+// A miss means the tag was already settled (duplicate ack, or a no-ack / stale
+// tag) and the caller must treat it as a no-op.
+func (c *Channel) TakeWireTag(wireTag uint64) (WireDeliveryRef, bool) {
+	c.wireTagMu.Lock()
+	ref, ok := c.wireTagTable[wireTag]
+	if ok {
+		delete(c.wireTagTable, wireTag)
+	}
+	c.wireTagMu.Unlock()
+	return ref, ok
+}
+
+// TakeWireTagsUpTo removes and returns every still-outstanding wire tag <= upto
+// on the channel — the cumulative-ack (multiple=true) working set. It spans all
+// consumers on the channel, which is exactly why cumulative acks now settle
+// deliveries that originated from different queues. Bounded by the channel's
+// outstanding-unacked window (sum of per-consumer prefetch), so O(window).
+func (c *Channel) TakeWireTagsUpTo(upto uint64) []WireDeliveryRef {
+	c.wireTagMu.Lock()
+	var refs []WireDeliveryRef
+	for w, ref := range c.wireTagTable {
+		if w <= upto {
+			refs = append(refs, ref)
+			delete(c.wireTagTable, w)
+		}
+	}
+	c.wireTagMu.Unlock()
+	return refs
 }
 
 // Exchange represents an AMQP exchange
@@ -231,11 +319,12 @@ type Message struct {
 // Delivery represents a message delivery to a consumer
 type Delivery struct {
 	Message     *Message
-	DeliveryTag uint64
+	DeliveryTag uint64 // broker-internal msgID (NOT the wire delivery tag; see Channel wire-tag remapping)
 	Redelivered bool
 	Exchange    string
 	RoutingKey  string
 	ConsumerTag string
+	NoAck       bool // consumer is no-ack: settled at send time, never acked by the client
 }
 
 // PendingMessage represents a message in the process of being published

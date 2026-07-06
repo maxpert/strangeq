@@ -568,6 +568,11 @@ func TestA2_AckConcurrentWithPublish(t *testing.T) {
 	conn := protocol.NewConnection(serverConn)
 	ch := protocol.NewChannel(1, conn)
 	conn.Channels.Store(uint16(1), ch)
+	// SQ-18: deliveries are addressed on the wire by a per-channel wire tag that
+	// the server maps back to (msgID, consumer). This test injects a raw ack for
+	// tag 99 without going through the real delivery path, so register the wire
+	// tag -> (msgID 99, "test-consumer") mapping the delivery path would have.
+	ch.TrackDelivery(99, 99, "test-consumer", false)
 
 	processorDone := make(chan struct{})
 	go srv.processFrames(conn, processorDone)
