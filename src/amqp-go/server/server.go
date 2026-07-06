@@ -499,6 +499,57 @@ func (s *Server) readFrames(conn *protocol.Connection, done chan struct{}) {
 	flowLimit := s.Config.Network.ReaderOverflowFlowBytes
 	hardCap := s.Config.Network.ReaderOverflowHardCapBytes
 
+	// The channel.flow writes are issued from a dedicated sender goroutine, NOT
+	// from the reader. The reader must never block — not even on the connection
+	// WriteMutex. If it did, a cross-process cycle wedges the connection: a
+	// delivery writer holds WriteMutex blocked on a full client TCP window; the
+	// client's dispatch goroutine (which would drain that window) is itself
+	// blocked sending its flow-ok behind the client publisher's send mutex; the
+	// publisher is blocked because OUR reader stopped reading while waiting on
+	// WriteMutex. Handing the write to a separate goroutine keeps the reader
+	// reading, which unwinds that cycle from the client side. Latest-wins
+	// semantics: the reader stores the desired state and pokes the wake channel;
+	// the sender collapses bursts of transitions to the newest state.
+	flowDesiredActive := &atomic.Bool{}
+	flowDesiredActive.Store(true)
+	flowWake := make(chan struct{}, 1)
+	flowQuit := make(chan struct{})
+	defer close(flowQuit)
+	go func() {
+		lastSent := true
+		for {
+			select {
+			case <-flowWake:
+			case <-flowQuit:
+				return
+			case <-conn.Done:
+				return
+			}
+			want := flowDesiredActive.Load()
+			if want == lastSent {
+				continue
+			}
+			if err := s.setConnectionFlow(conn, want); err != nil {
+				// Could not deliver the pause signal (client not reading its
+				// socket). The reader's hard cap still bounds memory; closing
+				// here just accelerates the inevitable teardown.
+				s.Log.Warn("reader overflow: channel.flow send failed; closing connection",
+					zap.String("connection_id", conn.ID), zap.Bool("active", want), zap.Error(err))
+				conn.Closed.Store(true)
+				conn.Conn.Close()
+				return
+			}
+			lastSent = want
+		}
+	}()
+	requestFlow := func(active bool) {
+		flowDesiredActive.Store(active)
+		select {
+		case flowWake <- struct{}{}:
+		default:
+		}
+	}
+
 	for {
 		// Opportunistically hand buffered frames to processFrames whenever it
 		// has drained space. Non-blocking: never wait on a full FrameQueue.
@@ -522,7 +573,7 @@ func (s *Server) readFrames(conn *protocol.Connection, done chan struct{}) {
 			// may resume publishing.
 			if flowPaused {
 				flowPaused = false
-				s.setConnectionFlow(conn, true)
+				requestFlow(true)
 			}
 		}
 
@@ -618,19 +669,13 @@ func (s *Server) readFrames(conn *protocol.Connection, done chan struct{}) {
 		}
 
 		// Soft threshold: ask the client to pause publishing via channel.flow.
-		// Best-effort and deadline-bounded so a non-reading client cannot wedge
-		// the reader; if the signal cannot be delivered, close the connection to
-		// bound memory.
+		// Best-effort, delivered by the flow-sender goroutine so the reader
+		// itself never blocks on the write (or on the WriteMutex). A client that
+		// ignores the signal keeps growing the backlog into the hard cap above.
 		if !flowPaused && flowLimit > 0 && pendingBytes >= flowLimit {
 			flowPaused = true
-			if err := s.setConnectionFlow(conn, false); err != nil {
-				s.Log.Warn("reader overflow: channel.flow(false) send failed; closing connection",
-					zap.String("connection_id", conn.ID), zap.Error(err))
-				conn.Closed.Store(true)
-				conn.Conn.Close()
-				return
-			}
-			s.Log.Info("reader overflow: asserted channel.flow(false)",
+			requestFlow(false)
+			s.Log.Info("reader overflow: requesting channel.flow(false)",
 				zap.String("connection_id", conn.ID),
 				zap.Int64("pending_bytes", pendingBytes))
 		}

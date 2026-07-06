@@ -175,7 +175,13 @@ func TestChannelFlowHandler_ActivatesAndSignalsWake(t *testing.T) {
 
 // --- Handler: channel.flow-ok ---
 
-func TestChannelFlowOKHandler_UpdatesFlowActiveNoResponse(t *testing.T) {
+// A client's channel.flow-ok acknowledges a server-initiated channel.flow about
+// the CLIENT's publish direction. It must NOT be written into FlowActive, which
+// gates the SERVER -> client delivery direction and is controlled only by
+// client-initiated channel.flow. (Storing the echo used to wedge the broker:
+// the reader-overflow flow(false) came back as flow-ok(false) and parked the
+// delivery forwarders, halting the very acks that drain the overflow.)
+func TestChannelFlowOKHandler_DoesNotTouchFlowActiveNoResponse(t *testing.T) {
 	srv, conn, clientConn, ch := setupFlowTest(t)
 	defer clientConn.Close()
 	defer conn.Conn.Close()
@@ -186,7 +192,8 @@ func TestChannelFlowOKHandler_UpdatesFlowActiveNoResponse(t *testing.T) {
 	require.NoError(t, err)
 
 	require.NoError(t, srv.processChannelSpecificMethod(conn, 1, protocol.ChannelFlowOK, payload))
-	assert.False(t, ch.FlowActive.Load(), "FlowActive must be updated from flow-ok")
+	assert.True(t, ch.FlowActive.Load(),
+		"FlowActive (server->client delivery gate) must not change on the client's flow-ok echo")
 
 	require.NoError(t, clientConn.SetReadDeadline(time.Now().Add(100*time.Millisecond)))
 	buf := make([]byte, 128)
