@@ -61,35 +61,36 @@ func makePendingMessage(exchange, routingKey, body string) *protocol.PendingMess
 	}
 }
 
+// The ack/reject/nack payload builders emit the AMQP 0.9.1 wire format:
+// delivery-tag (longlong) + a SINGLE OCTET bit-field — 9 bytes, exactly what
+// spec clients send.
 func makeAckPayload(deliveryTag uint64, multiple bool) []byte {
-	payload := make([]byte, 10)
+	payload := make([]byte, 9)
 	binary.BigEndian.PutUint64(payload[:8], deliveryTag)
 	if multiple {
-		binary.BigEndian.PutUint16(payload[8:10], 1)
+		payload[8] |= 0x01
 	}
 	return payload
 }
 
 func makeRejectPayload(deliveryTag uint64, requeue bool) []byte {
-	payload := make([]byte, 10)
+	payload := make([]byte, 9)
 	binary.BigEndian.PutUint64(payload[:8], deliveryTag)
 	if requeue {
-		binary.BigEndian.PutUint16(payload[8:10], 1)
+		payload[8] |= 0x01
 	}
 	return payload
 }
 
 func makeNackPayload(deliveryTag uint64, multiple, requeue bool) []byte {
-	payload := make([]byte, 10)
+	payload := make([]byte, 9)
 	binary.BigEndian.PutUint64(payload[:8], deliveryTag)
-	var flags uint16
 	if multiple {
-		flags |= 1
+		payload[8] |= 0x01
 	}
 	if requeue {
-		flags |= 2
+		payload[8] |= 0x02
 	}
-	binary.BigEndian.PutUint16(payload[8:10], flags)
 	return payload
 }
 

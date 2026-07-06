@@ -790,16 +790,57 @@ func (s *Server) sendBasicDeliver(conn *protocol.Connection, channelID uint16, c
 	return nil
 }
 
+// AMQP 0.9.1 packs the trailing bit arguments of basic.ack / basic.reject /
+// basic.nack into a SINGLE OCTET at payload[8], so a spec client's payload is
+// exactly 9 bytes. Reading two bytes here (a former uint16 decode) can never
+// match that framing: basic.ack "multiple" always parsed false — silently
+// turning every client multi-ack into a single ack until the prefetch window
+// filled and delivery wedged (BenchmarkVersus_MultiAck1000) — and reject/nack
+// "requeue" always parsed as the default. An 8-byte payload (no flag octet) is
+// tolerated for wire-compat with the pre-fix encoder and keeps each method's
+// spec defaults.
+
+func parseBasicAckArgs(payload []byte) (deliveryTag uint64, multiple bool, err error) {
+	if len(payload) < 8 {
+		return 0, false, fmt.Errorf("basic.ack payload too short: %d bytes", len(payload))
+	}
+	deliveryTag = binary.BigEndian.Uint64(payload[:8])
+	if len(payload) >= 9 {
+		multiple = payload[8]&0x01 != 0
+	}
+	return deliveryTag, multiple, nil
+}
+
+func parseBasicRejectArgs(payload []byte) (deliveryTag uint64, requeue bool, err error) {
+	if len(payload) < 8 {
+		return 0, false, fmt.Errorf("basic.reject payload too short: %d bytes", len(payload))
+	}
+	deliveryTag = binary.BigEndian.Uint64(payload[:8])
+	requeue = true // spec default when the flag octet is absent
+	if len(payload) >= 9 {
+		requeue = payload[8]&0x01 != 0
+	}
+	return deliveryTag, requeue, nil
+}
+
+func parseBasicNackArgs(payload []byte) (deliveryTag uint64, multiple, requeue bool, err error) {
+	if len(payload) < 8 {
+		return 0, false, false, fmt.Errorf("basic.nack payload too short: %d bytes", len(payload))
+	}
+	deliveryTag = binary.BigEndian.Uint64(payload[:8])
+	requeue = true // spec default when the flag octet is absent
+	if len(payload) >= 9 {
+		multiple = payload[8]&0x01 != 0
+		requeue = payload[8]&0x02 != 0
+	}
+	return deliveryTag, multiple, requeue, nil
+}
+
 // handleBasicAck handles the basic.ack method
 func (s *Server) handleBasicAck(conn *protocol.Connection, channelID uint16, payload []byte) error {
-	if len(payload) < 8 {
-		return fmt.Errorf("basic.ack payload too short: %d bytes", len(payload))
-	}
-	deliveryTag := binary.BigEndian.Uint64(payload[:8])
-	var multiple bool
-	if len(payload) >= 10 {
-		flags := binary.BigEndian.Uint16(payload[8:10])
-		multiple = (flags & (1 << 0)) != 0
+	deliveryTag, multiple, err := parseBasicAckArgs(payload)
+	if err != nil {
+		return err
 	}
 
 	consumerTag, ok := s.Broker.GetConsumerForDelivery(deliveryTag)
@@ -827,7 +868,7 @@ func (s *Server) handleBasicAck(conn *protocol.Connection, channelID uint16, pay
 		return nil
 	}
 
-	err := s.Broker.AcknowledgeMessage(consumerTag, deliveryTag, multiple)
+	err = s.Broker.AcknowledgeMessage(consumerTag, deliveryTag, multiple)
 	if err != nil {
 		s.Log.Error("Failed to acknowledge message in broker",
 			zap.Error(err),
@@ -846,14 +887,9 @@ func (s *Server) handleBasicAck(conn *protocol.Connection, channelID uint16, pay
 
 // handleBasicReject handles the basic.reject method
 func (s *Server) handleBasicReject(conn *protocol.Connection, channelID uint16, payload []byte) error {
-	if len(payload) < 8 {
-		return fmt.Errorf("basic.reject payload too short: %d bytes", len(payload))
-	}
-	deliveryTag := binary.BigEndian.Uint64(payload[:8])
-	var requeue bool = true // default: requeue
-	if len(payload) >= 10 {
-		flags := binary.BigEndian.Uint16(payload[8:10])
-		requeue = (flags & (1 << 0)) != 0
+	deliveryTag, requeue, err := parseBasicRejectArgs(payload)
+	if err != nil {
+		return err
 	}
 
 	consumerTag, ok := s.Broker.GetConsumerForDelivery(deliveryTag)
@@ -881,7 +917,7 @@ func (s *Server) handleBasicReject(conn *protocol.Connection, channelID uint16, 
 		return nil
 	}
 
-	err := s.Broker.RejectMessage(consumerTag, deliveryTag, requeue)
+	err = s.Broker.RejectMessage(consumerTag, deliveryTag, requeue)
 	if err != nil {
 		s.Log.Error("Failed to reject message in broker",
 			zap.Error(err),
@@ -900,16 +936,9 @@ func (s *Server) handleBasicReject(conn *protocol.Connection, channelID uint16, 
 
 // handleBasicNack handles the basic.nack method
 func (s *Server) handleBasicNack(conn *protocol.Connection, channelID uint16, payload []byte) error {
-	if len(payload) < 8 {
-		return fmt.Errorf("basic.nack payload too short: %d bytes", len(payload))
-	}
-	deliveryTag := binary.BigEndian.Uint64(payload[:8])
-	var multiple, requeue bool
-	requeue = true // default: requeue
-	if len(payload) >= 10 {
-		flags := binary.BigEndian.Uint16(payload[8:10])
-		multiple = (flags & (1 << 0)) != 0
-		requeue = (flags & (1 << 1)) != 0
+	deliveryTag, multiple, requeue, err := parseBasicNackArgs(payload)
+	if err != nil {
+		return err
 	}
 
 	consumerTag, ok := s.Broker.GetConsumerForDelivery(deliveryTag)
@@ -937,7 +966,7 @@ func (s *Server) handleBasicNack(conn *protocol.Connection, channelID uint16, pa
 		return nil
 	}
 
-	err := s.Broker.NacknowledgeMessage(consumerTag, deliveryTag, multiple, requeue)
+	err = s.Broker.NacknowledgeMessage(consumerTag, deliveryTag, multiple, requeue)
 	if err != nil {
 		s.Log.Error("Failed to nack message in broker",
 			zap.Error(err),

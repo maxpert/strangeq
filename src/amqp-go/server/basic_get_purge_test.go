@@ -455,10 +455,10 @@ func TestBasicGetWithAckTrackingThenRejectRequeue(t *testing.T) {
 	drainFrame(t, frameCh) // header
 	drainFrame(t, frameCh) // body
 
-	// Reject with requeue=true
-	rejectPayload := make([]byte, 10)
+	// Reject with requeue=true (spec wire format: 9 bytes, flag octet at [8])
+	rejectPayload := make([]byte, 9)
 	binary.BigEndian.PutUint64(rejectPayload[:8], deliveryTag)
-	binary.BigEndian.PutUint16(rejectPayload[8:10], 1) // requeue bit 0 = 1
+	rejectPayload[8] = 0x01 // bit 0 = requeue
 
 	err = srv.handleBasicReject(conn, 1, rejectPayload)
 	require.NoError(t, err)
@@ -492,10 +492,10 @@ func TestBasicGetWithAckTrackingThenNack(t *testing.T) {
 	drainFrame(t, frameCh) // header
 	drainFrame(t, frameCh) // body
 
-	// Nack with requeue=true
-	nackPayload := make([]byte, 10)
+	// Nack with requeue=true (spec wire format: 9 bytes, flag octet at [8])
+	nackPayload := make([]byte, 9)
 	binary.BigEndian.PutUint64(nackPayload[:8], deliveryTag)
-	binary.BigEndian.PutUint16(nackPayload[8:10], 2) // bit 1 = requeue
+	nackPayload[8] = 0x02 // bit 1 = requeue
 
 	err = srv.handleBasicNack(conn, 1, nackPayload)
 	require.NoError(t, err)
