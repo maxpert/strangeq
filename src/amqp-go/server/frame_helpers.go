@@ -358,3 +358,17 @@ func (s *Server) sendBasicAck(conn *protocol.Connection, channelID uint16, deliv
 	}
 	return s.sendMethodResponse(conn, channelID, 60, 80, method)
 }
+
+// sendBasicNack sends a basic.nack method frame to the client. Used for SQ-11
+// x-overflow=reject-publish: the broker refused the publish because a target
+// queue is at/over its x-max-length / x-max-length-bytes limit, so the
+// publisher confirm for that tag is settled as a negative acknowledgement
+// (requeue is always false — the message was never enqueued).
+func (s *Server) sendBasicNack(conn *protocol.Connection, channelID uint16, deliveryTag uint64, multiple, requeue bool) error {
+	method := &protocol.BasicNackMethod{
+		DeliveryTag: deliveryTag,
+		Multiple:    multiple,
+		Requeue:     requeue,
+	}
+	return s.sendMethodResponse(conn, channelID, 60, 120, method)
+}

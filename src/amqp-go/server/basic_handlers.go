@@ -438,6 +438,26 @@ func (s *Server) processCompleteMessage(conn *protocol.Connection, channelID uin
 			}
 			return nil
 		}
+		if errors.Is(err, broker.ErrMaxLengthExceeded) {
+			// SQ-11 x-overflow=reject-publish: a target queue refused the
+			// message because it is at/over its x-max-length / x-max-length-bytes
+			// limit. The broker neither stored nor dead-lettered it. Signal the
+			// publisher, in priority order:
+			//   - confirm mode: settle the confirm tag as a basic.nack the
+			//     contiguous ack watermark can never re-confirm (the definitive,
+			//     RabbitMQ-faithful signal; supersedes a mandatory return),
+			//   - else mandatory: return the refused message so a non-confirm
+			//     publisher gets feedback (StrangeQ extension — RabbitMQ does not
+			//     return a routable-but-full message; see W7 divergence notes),
+			//   - else: silently drop (RabbitMQ parity).
+			if confirmTag > 0 {
+				return s.settleConfirmNack(conn, confirmCh, confirmTag)
+			}
+			if message.Mandatory {
+				return s.sendBasicReturn(conn, channelID, 312, "NO_ROUTE", message.Exchange, message.RoutingKey, message)
+			}
+			return nil
+		}
 		s.Log.Error("Failed to route message",
 			zap.Error(err),
 			zap.String("exchange", message.Exchange),

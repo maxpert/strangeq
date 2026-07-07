@@ -38,6 +38,16 @@ type QueueState struct {
 	// policy costs nothing. Lockless atomic.
 	readyBytes atomic.Int64
 
+	// maxLenMu serializes the reject-publish (x-overflow=reject-publish)
+	// admission decision — the read of WaitingCount()/ReadyBytes() and the
+	// matching Publish()/AddReadyBytes() increment — so concurrent publishers
+	// can never both pass the AT-OR-OVER check at count == limit-1 and push the
+	// ready set permanently past the cap (SQ-11). It is taken ONLY on the
+	// reject-publish admission path: queues with no policy or with the drop-head
+	// default never touch it (drop-head self-corrects on the next publish, so it
+	// tolerates transient overshoot lock-free). Zero cost on the hot path.
+	maxLenMu sync.Mutex
+
 	// policy is the queue's resolved x-argument policy (SQ-7), set at declare
 	// time (client declare and durable recovery both route through
 	// StorageBroker.DeclareQueue). It is attached here — on the per-queue
@@ -282,6 +292,42 @@ func (qs *QueueState) tryPopRequeue() (uint64, bool, bool) {
 func (qs *QueueState) ClaimInflight(tag uint64) {
 	qs.waiting.Add(-1)
 	qs.inflight.Add(1)
+}
+
+// PopOldestReady pops the tag of the globally-oldest READY message for SQ-11
+// drop-head eviction. It mirrors Claim's ordering — the requeue ring FIRST
+// (redelivered messages are dispatched before tail-cursor ones and are therefore
+// older in the queue), then the tail cursor — so the popped message is the exact
+// one that would be delivered next, and the just-published newest message
+// (highest tail tag) is popped last. Returns (0, false) when no ready message
+// exists.
+//
+// Like Claim it does NOT touch `waiting` or `inflight`: the caller inspects the
+// tag first, then either GapSkipAdvance()s a gap tag (a tag never stored / already
+// acked, which was never counted as ready) or completes the eviction of a real
+// message via ClaimInflight()+AckAdvance(). Going through inflight for real
+// evictions keeps AckAdvance from mis-jumping minAckCursor while live deliveries
+// are outstanding (a concurrent real ack keeps `remaining` non-zero).
+func (qs *QueueState) PopOldestReady() (uint64, bool) {
+	if t, _, ok := qs.tryPopRequeue(); ok {
+		return t, true
+	}
+	for {
+		t := qs.tail.Load()
+		h := qs.head.Load()
+		if t < h {
+			if qs.tail.CompareAndSwap(t, t+1) {
+				return t, true
+			}
+			continue
+		}
+		// tail caught up to head: excess may still sit in the requeue ring
+		// (tail>=head), so try it once more before giving up.
+		if t2, _, ok := qs.tryPopRequeue(); ok {
+			return t2, true
+		}
+		return 0, false
+	}
 }
 
 func (qs *QueueState) AckAdvance(tag uint64) {

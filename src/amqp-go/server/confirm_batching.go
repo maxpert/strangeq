@@ -88,6 +88,20 @@ func (s *Server) flushChannelConfirms(conn *protocol.Connection, ch *protocol.Ch
 	})
 }
 
+// settleConfirmNack settles confirm tag `tag` on `ch` as a basic.nack (SQ-11
+// x-overflow=reject-publish) WITHOUT the contiguous ack watermark ever
+// re-confirming it. It force-flushes the durable-but-unacked confirms strictly
+// below `tag` as one cumulative basic.ack, emits
+// basic.nack(tag, multiple=false, requeue=false), then advances the watermark
+// past the settled hole. See protocol.Channel.SettleConfirmNack for the full
+// interlock proof — this is only the server-side frame wiring.
+func (s *Server) settleConfirmNack(conn *protocol.Connection, ch *protocol.Channel, tag uint64) error {
+	return ch.SettleConfirmNack(tag,
+		func(t uint64, multiple bool) error { return s.sendBasicAck(conn, ch.ID, t, multiple) },
+		func(t uint64) error { return s.sendBasicNack(conn, ch.ID, t, false, false) },
+	)
+}
+
 // confirmFlusher is the per-connection publisher-confirm flusher goroutine. It
 // wakes on ConfirmWake pokes, scans the connection's channels, and flushes each
 // channel's pending confirms as one batched ack. Exits when the connection's

@@ -379,6 +379,9 @@ func (b *StorageBroker) republishToTargets(srcQueueName string, targets []string
 			continue
 		}
 		qs.Publish(msgID)
+		// SQ-11: keep the DLX target's ready-bytes counter consistent when the
+		// target itself enforces x-max-length-bytes.
+		addReadyBytesOnEnqueue(qs, qs.Policy(), len(storeMsg.Body))
 		first = false
 	}
 }
