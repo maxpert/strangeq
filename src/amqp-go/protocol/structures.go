@@ -436,6 +436,15 @@ type Message struct {
 	AppID           string
 	ClusterID       string
 	Mandatory       bool
+	// EnqueueUnixMilli is the absolute publish/enqueue instant in Unix
+	// milliseconds, used by SQ-9 (W4) as the anchor for per-message and
+	// per-queue TTL deadline evaluation across a restart. W2 only makes this
+	// field DURABLE (persisted in the WAL/segment message record and
+	// reconstructed on recovery); it does NOT stamp it — W4 owns stamping it at
+	// publish and deriving effective TTL. A zero value means "unset" (no TTL
+	// anchor recorded), so the field costs nothing on the non-durable/no-TTL
+	// hot path where it is never written.
+	EnqueueUnixMilli int64
 }
 
 // Delivery represents a message delivery to a consumer

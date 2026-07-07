@@ -867,6 +867,19 @@ func serializeFieldTable(table map[string]interface{}) ([]byte, error) {
 	return result, nil
 }
 
+// DecodeFieldTable decodes a length-prefixed AMQP field table from the start of
+// data (the exact byte layout EncodeFieldTable produces: a uint32 length prefix
+// followed by the encoded entries). It is the public counterpart to
+// EncodeFieldTable, used by the durable storage layer (W2) to reconstruct a
+// persisted message's Headers with field types intact — int64 ('l'),
+// timestamp ('T'), and field-array ('A') values round-trip exactly, which is
+// what the x-death dead-letter header relies on. Returns an empty map for an
+// empty table.
+func DecodeFieldTable(data []byte) (map[string]interface{}, error) {
+	table, _, err := decodeFieldTable(data, 0)
+	return table, err
+}
+
 func decodeFieldTable(data []byte, offset int) (map[string]interface{}, int, error) {
 	if offset+4 > len(data) {
 		return nil, offset, fmt.Errorf("field table length field missing")

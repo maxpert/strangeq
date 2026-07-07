@@ -982,8 +982,17 @@ func (qs *QueueSegments) close() {
 // Helper functions
 
 // serializeSegmentMessage serializes a message with full AMQP metadata.
-// Format: [CRC][length][queue_len][queue][offset][exchange_len][exchange][routing_key_len][routing_key][delivery_mode][body_len][body]
-// This matches the WAL serialization format to preserve Exchange, RoutingKey, DeliveryMode.
+// Format: [CRC][length][queue_len][queue][offset][exchange_len][exchange][routing_key_len][routing_key][delivery_mode][body_len][body][extensions]
+// This matches the WAL serialization format to preserve Exchange, RoutingKey,
+// DeliveryMode, and the W2 extension block (Headers/Expiration/EnqueueUnixMilli).
+//
+// Segment files carry no file-level format version (see the note at the top of
+// this file), so unlike the WAL there is no version byte to gate on: every new
+// segment record carries the extension block, and readSegmentMessageAt detects
+// a pre-W2 record structurally (no trailing bytes after the body). This keeps
+// checkpointed segment-resident messages byte-compatible with recovery and
+// preserves x-death across compaction (compactSegment round-trips through this
+// serializer).
 func serializeSegmentMessage(message *protocol.Message, offset uint64) []byte {
 	bodySize := len(message.Body)
 	totalSize := 8 + 4 + len(message.Exchange) + 4 + len(message.RoutingKey) + 1 + 4 + bodySize + 256
@@ -1016,6 +1025,10 @@ func serializeSegmentMessage(message *protocol.Message, offset uint64) []byte {
 	// Write body
 	buf = binary.BigEndian.AppendUint32(buf, uint32(bodySize))
 	buf = append(buf, message.Body...)
+
+	// Persist the W2 message extension block (Headers/Expiration/
+	// EnqueueUnixMilli) after the body, identical to the WAL v3 layout.
+	buf = appendMessageExtensions(buf, message)
 
 	// Calculate actual length (excluding CRC and length fields)
 	dataLen := len(buf) - 8
@@ -1117,12 +1130,18 @@ func readSegmentMessageAt(file *os.File, position int64) (*protocol.Message, err
 		return nil, fmt.Errorf("invalid segment data: too short for body")
 	}
 	body := data[pos : pos+int(bodyLen)]
+	pos += int(bodyLen)
 
-	return &protocol.Message{
+	msg := &protocol.Message{
 		DeliveryTag:  offset,
 		Body:         body,
 		Exchange:     exchange,
 		RoutingKey:   routingKey,
 		DeliveryMode: deliveryMode,
-	}, nil
+	}
+	// W2 records carry a Headers/Expiration/EnqueueUnixMilli extension block
+	// after the body; pre-W2 records stop at the body and default those fields.
+	readMessageExtensions(data, pos, msg)
+
+	return msg, nil
 }

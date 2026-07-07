@@ -210,3 +210,81 @@ func TestFieldTableUnsupportedTypeReturnsError(t *testing.T) {
 		t.Fatal("Expected error for unsupported type, got nil")
 	}
 }
+
+// TestDecodeFieldTablePublicXDeath verifies the public DecodeFieldTable wrapper
+// (used by the durable storage layer, W2) reconstructs an x-death field array
+// with its field types intact: int64 count, timestamp time, and a field-array
+// of longstr routing-keys. These are the exact types RabbitMQ's dead-letter
+// x-death header carries, and losing any of them on recovery corrupts x-death.
+func TestDecodeFieldTablePublicXDeath(t *testing.T) {
+	deathTime := time.Unix(1720000000, 0).UTC()
+	original := map[string]interface{}{
+		"x-death": []interface{}{
+			map[string]interface{}{
+				"count":        int64(3),
+				"reason":       "expired",
+				"queue":        "src-q",
+				"time":         deathTime,
+				"exchange":     "dlx",
+				"routing-keys": []interface{}{"rk-a", "rk-b"},
+			},
+		},
+		"x-attempt": int64(7),
+	}
+
+	encoded, err := EncodeFieldTable(original)
+	if err != nil {
+		t.Fatalf("EncodeFieldTable failed: %v", err)
+	}
+
+	decoded, err := DecodeFieldTable(encoded)
+	if err != nil {
+		t.Fatalf("DecodeFieldTable failed: %v", err)
+	}
+
+	if v, ok := decoded["x-attempt"].(int64); !ok || v != 7 {
+		t.Errorf("x-attempt: expected int64 7, got %v (%T)", decoded["x-attempt"], decoded["x-attempt"])
+	}
+
+	arr, ok := decoded["x-death"].([]interface{})
+	if !ok || len(arr) != 1 {
+		t.Fatalf("x-death: expected 1-element field array, got %v (%T)", decoded["x-death"], decoded["x-death"])
+	}
+	entry, ok := arr[0].(map[string]interface{})
+	if !ok {
+		t.Fatalf("x-death[0]: expected field table, got %T", arr[0])
+	}
+	if c, ok := entry["count"].(int64); !ok || c != 3 {
+		t.Errorf("count: expected int64 3, got %v (%T)", entry["count"], entry["count"])
+	}
+	tm, ok := entry["time"].(time.Time)
+	if !ok {
+		t.Fatalf("time: expected time.Time, got %T", entry["time"])
+	}
+	if tm.Unix() != deathTime.Unix() {
+		t.Errorf("time: expected unix %d, got %d", deathTime.Unix(), tm.Unix())
+	}
+	rks, ok := entry["routing-keys"].([]interface{})
+	if !ok || len(rks) != 2 {
+		t.Fatalf("routing-keys: expected 2-element field array, got %v (%T)", entry["routing-keys"], entry["routing-keys"])
+	}
+	if rks[0] != "rk-a" || rks[1] != "rk-b" {
+		t.Errorf("routing-keys: expected [rk-a rk-b], got %v", rks)
+	}
+}
+
+// TestDecodeFieldTableEmpty verifies DecodeFieldTable returns an empty (non-nil)
+// map for the empty table EncodeFieldTable(nil) produces.
+func TestDecodeFieldTableEmpty(t *testing.T) {
+	encoded, err := EncodeFieldTable(nil)
+	if err != nil {
+		t.Fatalf("EncodeFieldTable(nil) failed: %v", err)
+	}
+	decoded, err := DecodeFieldTable(encoded)
+	if err != nil {
+		t.Fatalf("DecodeFieldTable failed: %v", err)
+	}
+	if len(decoded) != 0 {
+		t.Errorf("expected empty table, got %v", decoded)
+	}
+}

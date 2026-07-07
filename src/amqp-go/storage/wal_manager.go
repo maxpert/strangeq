@@ -35,21 +35,34 @@ const (
 	// collision with an actual CRC value is astronomically unlikely, so a byte
 	// prefix compare is a safe way to sniff versioned vs. legacy files.
 	WALMagic         = "SQWAL"           // 5-byte file magic
-	WALFormatVersion = uint8(2)          // current file format version (SQ-8: v2 adds per-record type tag)
 	WALHeaderSize    = len(WALMagic) + 1 // magic + 1 version byte = 6 bytes
 	WALLegacyVersion = uint8(0)          // headerless files predating SQ-4
 	WALVersion1      = uint8(1)          // SQ-4 versioned files, no per-record type tag
+	WALVersion2      = uint8(2)          // SQ-8 files: per-record type tag, no message extensions
+	WALVersion3      = uint8(3)          // W2 files: per-record type tag + persisted message extensions (Headers/Expiration/EnqueueUnixMilli)
+	WALFormatVersion = WALVersion3       // current file format version
 
-	// Per-record type mechanism (SQ-4 reserved, SQ-8 implemented).
+	// Per-record type mechanism (SQ-4 reserved, SQ-8 implemented) and message
+	// extensions (W2).
 	//
 	// v0/v1 files have no per-record type tag on disk: every record is
 	// implicitly a message record (WALRecordTypeMessage). v2 adds a 1-byte
 	// record-type tag immediately after the [CRC][length] framing, so that
 	// non-message records (transaction-boundary markers) can be interleaved
-	// with message records in the same file. Recovery keys off the file-level
-	// version byte to decide whether that per-record tag is present:
-	//   v0/v1: [CRC][len][<message payload>]
-	//   v2:    [CRC][len][1-byte recordType][<payload for that type>]
+	// with message records in the same file. v3 additionally persists a message
+	// record's Headers/Expiration/EnqueueUnixMilli as an extension block after
+	// the body (see serializeMessageVersioned). Two independent, version-gated
+	// aspects therefore exist:
+	//   - the per-record type tag is present iff version >= WALVersion2;
+	//   - message extensions are present iff version >= WALVersion3 on the WRITE
+	//     path, but on the READ path their presence is detected structurally
+	//     (trailing bytes after the body) rather than by version, so a single
+	//     physical file that mixes older-version records with v3 records — which
+	//     happens when a pre-W2 file is reopened and appended to on restart — is
+	//     recovered correctly regardless of the file-level header version.
+	//   v0/v1: [CRC][len][<message payload, no extensions>]
+	//   v2:    [CRC][len][1-byte recordType][<message payload, no extensions>]
+	//   v3:    [CRC][len][1-byte recordType][<message payload>[extensions]]
 	WALRecordTypeMessage    = uint8(0) // implicit type of every v0/v1 record
 	WALRecordTypeTxBoundary = uint8(1) // v2 transaction-boundary marker (SQ-8)
 
@@ -826,7 +839,7 @@ func (qw *QueueWAL) serializeMessageVersioned(version uint8, queueName string, m
 	buf = append(buf, 0, 0, 0, 0) // Length placeholder
 
 	// v2+: per-record type tag immediately after the framing.
-	if version >= WALFormatVersion {
+	if version >= WALVersion2 {
 		buf = append(buf, WALRecordTypeMessage)
 	}
 
@@ -851,6 +864,14 @@ func (qw *QueueWAL) serializeMessageVersioned(version uint8, queueName string, m
 	// Write body
 	buf = binary.BigEndian.AppendUint32(buf, uint32(len(message.Body)))
 	buf = append(buf, message.Body...)
+
+	// v3+: persist the message extension block (Headers/Expiration/
+	// EnqueueUnixMilli) after the body. Older versions stop at the body; on the
+	// read path the block's presence is detected structurally (trailing bytes),
+	// so an old record and a v3 record can coexist in one physical file.
+	if version >= WALVersion3 {
+		buf = appendMessageExtensions(buf, message)
+	}
 
 	// Calculate actual length (excluding CRC and length fields)
 	dataLen := len(buf) - 8
@@ -882,9 +903,10 @@ func serializeTxMarker(kind uint8, epoch uint64) []byte {
 
 // recordTypeAndPayload splits a CRC-verified record's data region into its
 // record type and the type-specific payload, honoring the file format version.
-// For v0/v1 (no on-disk type tag) every record is a message.
+// The per-record type tag is present iff version >= WALVersion2; for v0/v1 (no
+// on-disk type tag) every record is implicitly a message.
 func recordTypeAndPayload(version uint8, data []byte) (recType uint8, payload []byte) {
-	if version >= WALFormatVersion {
+	if version >= WALVersion2 {
 		if len(data) < 1 {
 			return WALRecordTypeMessage, data
 		}
@@ -952,19 +974,99 @@ func deserializeMessagePayload(payload []byte) (*RecoveryMessage, bool) {
 		return nil, false
 	}
 	body := payload[pos : pos+int(bodyLen)]
+	pos += int(bodyLen)
+
+	msg := &protocol.Message{
+		Exchange:     exchange,
+		RoutingKey:   routingKey,
+		DeliveryMode: deliveryMode,
+		Body:         body,
+		DeliveryTag:  offset,
+		Redelivered:  true,
+	}
+	// v3+ records carry a Headers/Expiration/EnqueueUnixMilli extension block
+	// after the body; older records stop here and default those fields.
+	readMessageExtensions(payload, pos, msg)
 
 	return &RecoveryMessage{
 		QueueName: queueName,
 		Offset:    offset,
-		Message: &protocol.Message{
-			Exchange:     exchange,
-			RoutingKey:   routingKey,
-			DeliveryMode: deliveryMode,
-			Body:         body,
-			DeliveryTag:  offset,
-			Redelivered:  true,
-		},
+		Message:   msg,
 	}, true
+}
+
+// appendMessageExtensions appends the W2 message extension block — Expiration,
+// EnqueueUnixMilli, and Headers — to buf, in that order:
+//
+//	[expiration_len:4][expiration][enqueue_unix_milli:8][headers_field_table]
+//
+// The headers field table is self-describing (its own uint32 length prefix, as
+// produced by protocol.EncodeFieldTable), so an empty/nil Headers costs 4
+// bytes. Shared by the WAL (v3+) and segment serializers so both persist an
+// identical block. A Headers map holding a value the AMQP field-table encoder
+// cannot emit (e.g. a Decimal, which the wire codec decodes but does not
+// re-encode) is persisted as an empty table rather than corrupting the record
+// or losing the message body — a bounded, pre-existing encoder limitation, not
+// one W2 introduces.
+func appendMessageExtensions(buf []byte, message *protocol.Message) []byte {
+	buf = binary.BigEndian.AppendUint32(buf, uint32(len(message.Expiration)))
+	buf = append(buf, message.Expiration...)
+	buf = binary.BigEndian.AppendUint64(buf, uint64(message.EnqueueUnixMilli))
+	if len(message.Headers) == 0 {
+		// Fast path for the common no-headers message: append an empty field
+		// table (uint32 length 0) directly, avoiding the EncodeFieldTable
+		// allocation on the durable write.
+		return binary.BigEndian.AppendUint32(buf, 0)
+	}
+	headerBytes, err := protocol.EncodeFieldTable(message.Headers)
+	if err != nil {
+		return binary.BigEndian.AppendUint32(buf, 0) // empty field table
+	}
+	return append(buf, headerBytes...)
+}
+
+// readMessageExtensions reconstructs the W2 extension block (Expiration,
+// EnqueueUnixMilli, Headers) from payload starting at pos and populates them on
+// message. It is best-effort and never fails the surrounding record: pos at the
+// end of payload means an old-format record with no extension block (the fields
+// stay at their zero values), and any malformed/truncated extension bytes stop
+// parsing with whatever was reconstructed so far — a durable message is never
+// dropped for the sake of its extension metadata (the record already passed a
+// CRC check, so this is defensive). An empty decoded headers table is
+// normalized to nil so a message with no headers reconstructs identically
+// whether it was written before or after W2.
+func readMessageExtensions(payload []byte, pos int, message *protocol.Message) {
+	if pos >= len(payload) {
+		return // old-format record: no extension block
+	}
+	if pos+4 > len(payload) {
+		return
+	}
+	expLen := int(binary.BigEndian.Uint32(payload[pos : pos+4]))
+	pos += 4
+	if expLen < 0 || pos+expLen > len(payload) {
+		return
+	}
+	message.Expiration = string(payload[pos : pos+expLen])
+	pos += expLen
+
+	if pos+8 > len(payload) {
+		return
+	}
+	message.EnqueueUnixMilli = int64(binary.BigEndian.Uint64(payload[pos : pos+8]))
+	pos += 8
+
+	if pos+4 > len(payload) {
+		return
+	}
+	tblLen := int(binary.BigEndian.Uint32(payload[pos : pos+4]))
+	end := pos + 4 + tblLen
+	if tblLen < 0 || end > len(payload) {
+		return
+	}
+	if headers, err := protocol.DecodeFieldTable(payload[pos:end]); err == nil && len(headers) > 0 {
+		message.Headers = headers
+	}
 }
 
 // rollFile rolls to a new WAL file when size limit reached
@@ -1089,10 +1191,12 @@ func walFileDataStart(f *os.File) (dataStart int64, version uint8, err error) {
 		return 0, WALLegacyVersion, nil
 	}
 	v := hdr[len(WALMagic)]
-	// This build understands v1 (SQ-4, no per-record type tag) and v2 (SQ-8,
-	// per-record type tag). Any other version is a hard error, never a silent
-	// skip. The returned version drives record parsing (type tag present iff v2).
-	if v != WALVersion1 && v != WALFormatVersion {
+	// This build understands v1 (SQ-4, no per-record type tag), v2 (SQ-8,
+	// per-record type tag), and v3 (W2, per-record type tag + message
+	// extensions). Any other version is a hard error, never a silent skip. The
+	// returned version drives record parsing (type tag present iff >= v2;
+	// message extensions are detected structurally, not by version).
+	if v != WALVersion1 && v != WALVersion2 && v != WALVersion3 {
 		return 0, v, fmt.Errorf("%w: got %d, want %d", ErrUnsupportedWALVersion, v, WALFormatVersion)
 	}
 	return int64(WALHeaderSize), v, nil
@@ -1322,96 +1426,33 @@ func (qw *QueueWAL) readMessageAtPosition(queueName string, fileNum uint64, file
 	}
 
 	// The offset index is populated only by writes made in the current process,
-	// which always use the current WAL format (v2). Strip the per-record type
-	// tag and confirm it is a message record before parsing the payload.
-	recType, data := recordTypeAndPayload(WALFormatVersion, data)
+	// which always use the current WAL format (v3). Strip the per-record type
+	// tag, confirm it is a message record, and reconstruct via the shared
+	// payload parser so the live read path recovers the message extensions
+	// (Headers/Expiration/EnqueueUnixMilli) exactly like crash recovery does.
+	recType, payload := recordTypeAndPayload(WALFormatVersion, data)
 	if recType != WALRecordTypeMessage {
 		return nil, fmt.Errorf("unexpected WAL record type %d for offset %d", recType, expectedOffset)
 	}
 
-	// Deserialize SHARED WAL format: [queue_len][queue][offset][exchange_len][exchange][routing_key_len][routing_key][body_len][body]
-	pos := 0
-
-	// Read queue name
-	if len(data) < 4 {
-		return nil, fmt.Errorf("invalid WAL data: too short for queue length")
-	}
-	queueLen := binary.BigEndian.Uint32(data[pos : pos+4])
-	pos += 4
-	if len(data) < pos+int(queueLen) {
-		return nil, fmt.Errorf("invalid WAL data: too short for queue name")
-	}
-	entryQueueName := string(data[pos : pos+int(queueLen)])
-	pos += int(queueLen)
-
-	// Validate queue name matches (for multi-queue isolation)
-	if entryQueueName != queueName {
-		return nil, fmt.Errorf("queue name mismatch: expected %s, got %s", queueName, entryQueueName)
+	rm, ok := deserializeMessagePayload(payload)
+	if !ok {
+		return nil, fmt.Errorf("invalid WAL data: malformed message record for offset %d", expectedOffset)
 	}
 
-	// Read offset
-	if len(data) < pos+8 {
-		return nil, fmt.Errorf("invalid WAL data: too short for offset")
+	// Validate queue name matches (for multi-queue isolation) and the offset.
+	if rm.QueueName != queueName {
+		return nil, fmt.Errorf("queue name mismatch: expected %s, got %s", queueName, rm.QueueName)
 	}
-	msgOffset := binary.BigEndian.Uint64(data[pos : pos+8])
-	pos += 8
-
-	// Verify offset matches
-	if msgOffset != expectedOffset {
-		return nil, fmt.Errorf("offset mismatch: expected %d, got %d", expectedOffset, msgOffset)
+	if rm.Offset != expectedOffset {
+		return nil, fmt.Errorf("offset mismatch: expected %d, got %d", expectedOffset, rm.Offset)
 	}
 
-	// Read exchange
-	if len(data) < 4 {
-		return nil, fmt.Errorf("invalid WAL data: too short for exchange length")
-	}
-	exchangeLen := binary.BigEndian.Uint32(data[pos : pos+4])
-	pos += 4
-	if len(data) < pos+int(exchangeLen) {
-		return nil, fmt.Errorf("invalid WAL data: too short for exchange")
-	}
-	exchange := string(data[pos : pos+int(exchangeLen)])
-	pos += int(exchangeLen)
-
-	// Read routing key
-	if len(data) < pos+4 {
-		return nil, fmt.Errorf("invalid WAL data: too short for routing key length")
-	}
-	routingKeyLen := binary.BigEndian.Uint32(data[pos : pos+4])
-	pos += 4
-	if len(data) < pos+int(routingKeyLen) {
-		return nil, fmt.Errorf("invalid WAL data: too short for routing key")
-	}
-	routingKey := string(data[pos : pos+int(routingKeyLen)])
-	pos += int(routingKeyLen)
-
-	// Read delivery mode
-	if len(data) < pos+1 {
-		return nil, fmt.Errorf("invalid WAL data: too short for delivery mode")
-	}
-	deliveryMode := data[pos]
-	pos += 1
-
-	// Read body
-	if len(data) < pos+4 {
-		return nil, fmt.Errorf("invalid WAL data: too short for body length")
-	}
-	bodyLen := binary.BigEndian.Uint32(data[pos : pos+4])
-	pos += 4
-	if len(data) < pos+int(bodyLen) {
-		return nil, fmt.Errorf("invalid WAL data: too short for body")
-	}
-	body := data[pos : pos+int(bodyLen)]
-
-	message := &protocol.Message{
-		Body:         body,
-		Exchange:     exchange,
-		RoutingKey:   routingKey,
-		DeliveryMode: deliveryMode,
-		DeliveryTag:  msgOffset,
-	}
-
-	return message, nil
+	// This is a positional re-read, not a post-restart redelivery, so the
+	// message is not marked redelivered (deserializeMessagePayload defaults it
+	// to true for the crash-recovery path).
+	rm.Message.Redelivered = false
+	return rm.Message, nil
 }
 
 // readMessageSequential does sequential scan fallback (slow, only for unindexed messages)
