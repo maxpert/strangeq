@@ -24,6 +24,25 @@ import (
 	"github.com/maxpert/amqp-go/protocol"
 )
 
+// parsePerMessageTTLMillis parses the AMQP per-message `expiration` property (a
+// decimal string of milliseconds) into its TTL and whether it is a VALID
+// non-negative integer. Empty, malformed/non-numeric, or negative values return
+// (0, false) → "no per-message TTL" (the exact behavior is locked against real
+// RabbitMQ in W7). This is the single source of truth for "is there a usable
+// per-message TTL", shared by effectiveTTLMillis (the deadline math) and the
+// publish stamp guards (so a malformed expiration is never stamped with an
+// anchor it can never expire against).
+func parsePerMessageTTLMillis(expiration string) (int64, bool) {
+	if expiration == "" {
+		return 0, false
+	}
+	ms, err := strconv.ParseInt(expiration, 10, 64)
+	if err != nil || ms < 0 {
+		return 0, false
+	}
+	return ms, true
+}
+
 // effectiveTTLMillis returns the effective time-to-live for msg on a queue with
 // policy p, in milliseconds, and whether any TTL applies at all. It is
 // min(per-message expiration, queue x-message-ttl) per RabbitMQ. A malformed or
@@ -36,14 +55,11 @@ func effectiveTTLMillis(msg *protocol.Message, p *QueuePolicy) (int64, bool) {
 		ttl = p.MessageTTL.Milliseconds()
 		has = true
 	}
-	if msg.Expiration != "" {
-		if ms, err := strconv.ParseInt(msg.Expiration, 10, 64); err == nil && ms >= 0 {
-			if !has || ms < ttl {
-				ttl = ms
-			}
-			has = true
+	if ms, ok := parsePerMessageTTLMillis(msg.Expiration); ok {
+		if !has || ms < ttl {
+			ttl = ms
 		}
-		// Malformed/non-numeric/negative per-message expiration → ignored.
+		has = true
 	}
 	return ttl, has
 }

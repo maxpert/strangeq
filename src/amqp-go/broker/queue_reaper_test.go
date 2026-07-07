@@ -208,42 +208,46 @@ func TestReaperClaimLinearization_NoDoubleDecrement(t *testing.T) {
 	require.Equal(t, 0, cnt, "storage must hold no leftover messages")
 }
 
-// TestPublishMessageTx_StampsDeadlineAtCommit pins SQ-9's transactional rule:
-// the TTL anchor is stamped when the post-commit visibility closure runs (commit
-// time), NOT when the message is staged, so a tx-published message's TTL counts
-// from commit. Using the live store as the transactional view keeps the ring
-// pointer stable, so the post-commit stamp is observable — exactly the stamping
-// contract the server's real atomic-commit path relies on.
-func TestPublishMessageTx_StampsDeadlineAtCommit(t *testing.T) {
+// TestPublishMessageTx_StampsDurableAnchorAtCommit pins SQ-9's transactional
+// rule: the TTL anchor is stamped inside PublishMessageTx — which the tx manager
+// runs at COMMIT time (it buffers publish operations and executes them within
+// ExecuteAtomic) — and BEFORE the durable stage, so the anchor both counts from
+// commit AND is part of the durable write (it survives restart; see
+// TestRecovery_DurableTxTTL_ExpiredWhileDown). The message object is created "at
+// client-publish time" with no anchor; only the commit-time PublishMessageTx run
+// stamps it, with the commit-instant clock.
+func TestPublishMessageTx_StampsDurableAnchorAtCommit(t *testing.T) {
 	b, cleanup := createTestBroker(t)
 	defer cleanup()
 
 	clk := &ttlTestClock{}
-	const bufferTime = int64(3_000_000)
-	clk.set(bufferTime)
+	clk.set(3_000_000) // "client publish" instant: message buffered, NOT stamped
 	b.SetTTLClock(clk.now)
 
 	declareTTLQueue(t, b, "q", map[string]interface{}{"x-message-ttl": 10000})
 
 	msg := &protocol.Message{RoutingKey: "q", Body: []byte("tx")}
+
+	// Time passes while the transaction is open; the manager runs PublishMessageTx
+	// only at commit.
+	const commitTime = int64(3_005_000)
+	clk.set(commitTime)
+
 	deferred, err := b.PublishMessageTx(b.storage, "", "q", msg)
 	require.NoError(t, err)
 	require.Len(t, deferred, 1)
 
-	// Staging must NOT stamp the anchor (TTL does not count from buffer time).
-	require.Equal(t, int64(0), msg.EnqueueUnixMilli, "tx staging must not stamp the TTL anchor")
+	// Stamped at the commit instant (PublishMessageTx run), not the earlier
+	// buffered-publish instant.
+	require.Equal(t, commitTime, msg.EnqueueUnixMilli, "tx TTL anchor must be stamped at commit")
 
-	// Time passes between staging and commit.
-	const commitTime = int64(3_005_000)
-	clk.set(commitTime)
-
-	// Run the post-commit visibility closures (the "commit" step).
 	for _, fn := range deferred {
 		fn()
 	}
 
+	// And it is part of the durable store write (stamped BEFORE StoreMessage).
 	stored, err := b.storage.GetMessage("q", msg.DeliveryTag)
 	require.NoError(t, err)
 	require.Equal(t, commitTime, stored.EnqueueUnixMilli,
-		"tx TTL anchor must be stamped at commit time, not buffer time")
+		"the persisted copy must carry the commit-time anchor")
 }

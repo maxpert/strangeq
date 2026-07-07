@@ -207,6 +207,36 @@ func TestTTL_ZeroTTL_DroppedNotDelivered(t *testing.T) {
 		"ttl=0 message must be dropped, not delivered")
 }
 
+// TestTTL_MalformedExpiration_NotStampedAndDelivered verifies a message with a
+// malformed/non-numeric per-message expiration on a queue with NO queue TTL is
+// treated as having no TTL: it is NOT stamped with an anchor at publish (so the
+// delivery head-check never even recomputes a deadline for it) and it is
+// delivered normally regardless of how much wall-clock time passes. Pins the
+// W7 "malformed expiration = no-TTL" divergence at the stamp boundary.
+func TestTTL_MalformedExpiration_NotStampedAndDelivered(t *testing.T) {
+	b, cleanup := createTestBroker(t)
+	defer cleanup()
+
+	clk := &ttlTestClock{}
+	clk.set(800_000)
+	b.SetTTLClock(clk.now)
+
+	declareTTLQueue(t, b, "q", nil) // no queue-level TTL
+	m := &protocol.Message{RoutingKey: "q", Body: []byte("keep"), Expiration: "not-a-number"}
+	require.NoError(t, b.PublishMessage("", "q", m))
+
+	// The anchor must be unset (malformed expiration is not stamped).
+	stored, err := b.storage.GetMessage("q", m.DeliveryTag)
+	require.NoError(t, err)
+	require.Equal(t, int64(0), stored.EnqueueUnixMilli, "malformed expiration must not stamp an anchor")
+
+	// Even far in the "future", the message is delivered — it never expires.
+	clk.advance(1 << 40)
+	got := drainOne(t, b, "q")
+	require.NotNil(t, got, "a malformed-expiration message must be delivered, never expired")
+	require.Equal(t, []byte("keep"), got.Body)
+}
+
 // BenchmarkDeliver_NoTTL_ZeroCost proves the SQ-9 delivery-time TTL check is
 // genuinely zero-cost on the no-TTL hot path: it installs a TTL clock that
 // counts every read and drives the full deliverMessage path with messages that

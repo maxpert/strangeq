@@ -509,11 +509,9 @@ func (b *StorageBroker) deliverMessage(queueState *QueueState, state *ConsumerSt
 	// BenchmarkDeliver_NoTTL_ZeroCost. An expired message is dead-lettered
 	// (reason=expired) or dropped instead of delivered.
 	p := queueState.Policy()
-	if message.EnqueueUnixMilli != 0 {
-		if deadline, ok := messageDeadlineMillis(message, p); ok && b.ttlNowMillis() >= deadline {
-			b.dropExpiredOnDelivery(queueState, state, message, msgID, p)
-			return
-		}
+	if message.EnqueueUnixMilli != 0 && messageExpired(message, p, b.ttlNowMillis()) {
+		b.dropExpiredOnDelivery(queueState, state, message, msgID, p)
+		return
 	}
 
 	delivery := &protocol.Delivery{
@@ -1444,11 +1442,14 @@ func (b *StorageBroker) PublishMessage(exchangeName, routingKey string, message 
 	}
 
 	// W4 SQ-9: stamp the durable TTL anchor (enqueue instant) up front for a
-	// per-message expiration, shared by every fanout copy. Localized here to
-	// keep the W5 (max-length) merge surface minimal; the queue-level
+	// VALID per-message expiration, shared by every fanout copy. Localized here
+	// to keep the W5 (max-length) merge surface minimal; the queue-level
 	// x-message-ttl anchor is stamped per copy in the enqueue loop below (it
-	// needs the target queue's policy). No clock read when no per-message TTL.
-	if message.Expiration != "" && message.EnqueueUnixMilli == 0 {
+	// needs the target queue's policy). A malformed/negative expiration is NOT
+	// stamped — it has no usable deadline, so stamping an anchor would only make
+	// the delivery head-check recompute a never-expiring deadline forever. No
+	// clock read when no per-message TTL.
+	if _, ok := parsePerMessageTTLMillis(message.Expiration); ok && message.EnqueueUnixMilli == 0 {
 		message.EnqueueUnixMilli = b.ttlNowMillis()
 	}
 
@@ -1569,6 +1570,19 @@ func (b *StorageBroker) PublishMessageTx(txnStore interfaces.Storage, exchangeNa
 		return nil, nil
 	}
 
+	// W4 SQ-9: stamp the durable TTL anchor for a VALID per-message expiration
+	// HERE, in PublishMessageTx, which the tx manager runs at COMMIT time (it
+	// buffers publish operations and executes them inside ExecuteAtomic). Stamping
+	// before txnStore.StoreMessage — NOT in the post-commit visibility closure —
+	// means the anchor is part of the durable WAL write, so a durable tx+TTL
+	// message recovers with its deadline intact and still expires. The stamp
+	// instant is the commit instant (PublishMessageTx runs at commit), so a
+	// tx-published TTL counts from commit. Malformed/negative expiration is not
+	// stamped (see PublishMessage).
+	if _, ok := parsePerMessageTTLMillis(message.Expiration); ok && message.EnqueueUnixMilli == 0 {
+		message.EnqueueUnixMilli = b.ttlNowMillis()
+	}
+
 	deferred := make([]func(), 0, len(targetQueues))
 
 	for i, queueName := range targetQueues {
@@ -1599,47 +1613,30 @@ func (b *StorageBroker) PublishMessageTx(txnStore interfaces.Storage, exchangeNa
 			storeMsg = &msgCopy
 		}
 
+		// W4 SQ-9: stamp the TTL anchor for a queue-level x-message-ttl target that
+		// carried no per-message expiration, per copy (it needs the target queue's
+		// policy). Like the top-of-function stamp this runs at commit time and
+		// BEFORE the durable stage below, so the anchor is persisted.
+		if storeMsg.EnqueueUnixMilli == 0 {
+			if p := queueState.Policy(); p != nil && p.HasMessageTTL {
+				storeMsg.EnqueueUnixMilli = b.ttlNowMillis()
+			}
+		}
+
 		// Stage the store into the transactional view (buffered until commit).
 		if err := txnStore.StoreMessage(queueName, storeMsg); err != nil {
 			return nil, fmt.Errorf("failed to stage message to queue '%s': %w", queueName, err)
 		}
 
-		// Defer visibility until after the atomic commit succeeds.
+		// Defer ONLY consumer visibility until after the atomic commit succeeds.
+		// The TTL anchor is already stamped above (part of the durable write), so
+		// the closure does no TTL work.
 		qs := queueState
 		id := msgID
-		sm := storeMsg
-		deferred = append(deferred, func() {
-			// W4 SQ-9: stamp the TTL anchor at COMMIT (closure-run time), not at
-			// buffer/stage time, so a transaction's TTL counts from commit — the
-			// FIRST statement of the closure per merge coordination with W5.
-			b.stampCommitTTLAnchor(sm, qs)
-			qs.Publish(id)
-		})
+		deferred = append(deferred, func() { qs.Publish(id) })
 	}
 
 	return deferred, nil
-}
-
-// stampCommitTTLAnchor stamps the durable TTL anchor on a transactionally
-// published message at commit time (when the visibility closure runs), so a
-// tx-published message's TTL counts from commit rather than from when it was
-// staged. A DURABLE tx message that crashes between the commit's storage write
-// and this in-memory stamp loses its anchor on recovery (treated as no-TTL) — a
-// bounded divergence documented for W7; non-tx publishes stamp before StoreMessage
-// and are crash-safe.
-func (b *StorageBroker) stampCommitTTLAnchor(msg *protocol.Message, qs *QueueState) {
-	if msg.EnqueueUnixMilli != 0 {
-		return
-	}
-	applies := msg.Expiration != ""
-	if !applies {
-		if p := qs.Policy(); p != nil && p.HasMessageTTL {
-			applies = true
-		}
-	}
-	if applies {
-		msg.EnqueueUnixMilli = b.ttlNowMillis()
-	}
 }
 
 // routeScratch holds per-publish routing state. Instances are pooled so the
@@ -2295,11 +2292,9 @@ func (b *StorageBroker) GetMessageForGet(queueName string, noAck bool) (*protoco
 		if message != nil {
 			// W4 SQ-9: drop an expired requeued message instead of returning it;
 			// fall through to the tail cursor for the next candidate.
-			if message.EnqueueUnixMilli != 0 {
-				if deadline, ok := messageDeadlineMillis(message, p); ok && b.ttlNowMillis() >= deadline {
-					b.dropExpiredOnGet(queueState, queueName, message, tag, p)
-					message = nil
-				}
+			if message.EnqueueUnixMilli != 0 && messageExpired(message, p, b.ttlNowMillis()) {
+				b.dropExpiredOnGet(queueState, queueName, message, tag, p)
+				message = nil
 			}
 			if message != nil {
 				message.Redelivered = r
@@ -2327,11 +2322,9 @@ func (b *StorageBroker) GetMessageForGet(queueName string, noAck bool) (*protoco
 			// (reason=expired) or drop an expired message rather than returning
 			// it, then keep walking the cursor. Depth accounting is gated on the
 			// ring-delete win (see dropExpiredOnGet), reconciling with the reaper.
-			if msg.EnqueueUnixMilli != 0 {
-				if deadline, ok := messageDeadlineMillis(msg, p); ok && b.ttlNowMillis() >= deadline {
-					b.dropExpiredOnGet(queueState, queueName, msg, tag, p)
-					continue
-				}
+			if msg.EnqueueUnixMilli != 0 && messageExpired(msg, p, b.ttlNowMillis()) {
+				b.dropExpiredOnGet(queueState, queueName, msg, tag, p)
+				continue
 			}
 			message = msg
 			break

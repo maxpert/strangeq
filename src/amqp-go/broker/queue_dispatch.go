@@ -359,10 +359,16 @@ func (qs *QueueState) Recover(minTag, maxTag, count uint64) {
 	if maxTag < minTag {
 		maxTag = minTag
 	}
-	qs.head.Store(maxTag + 1)
 	qs.minAckCursor.Store(minTag)
-	qs.waiting.Store(int64(count))
 	qs.inflight.Store(0)
+	// Store `waiting` BEFORE `head`: head is the visibility gate the SQ-9 reaper
+	// scans against (it walks tail→head), so publishing the recovered depth first
+	// closes the window where a reaper sweep between the two stores could decrement
+	// `waiting` only to have it clobbered by a later waiting.Store. Under Go's
+	// sequentially-consistent atomics, a reaper that observes the new head is then
+	// guaranteed to observe the already-set waiting, and its ReapDrop applies on top.
+	qs.waiting.Store(int64(count))
+	qs.head.Store(maxTag + 1)
 	qs.requeueMu.Lock()
 	qs.requeueBuf = make([]requeueEntry, requeueInitialCap)
 	qs.requeueHead = 0
