@@ -227,6 +227,11 @@ func (b *StorageBroker) reapTTLSweep(name string, qs *QueueState, p *QueuePolicy
 		}
 		if b.deleteIfPresent(name, t.tag) {
 			qs.ReapDrop()
+			// SQ-11: the expired message left the ready set — account its bytes
+			// when the queue enforces x-max-length-bytes, gated on the same
+			// ring-removal win as the `waiting` decrement so the byte counter
+			// never drifts up (which would spuriously reject/evict live messages).
+			subReadyBytesOnClaim(qs, p, len(t.msg.Body))
 		}
 	}
 

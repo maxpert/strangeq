@@ -96,12 +96,24 @@ func (b *StorageBroker) dropHeadEvictOne(qs *QueueState, queueName string, polic
 			// deadLetter never touches the live pointer and returns nil on drop.
 			_ = b.deadLetter(policy, queueName, msg, DeadLetterMaxLen)
 		}
+		// Gate the depth accounting on winning the ring removal so it reconciles
+		// with the SQ-9 reaper (see the queue_reaper.go linearization note): on a
+		// consumer-less queue with BOTH x-message-ttl and drop-head, the reaper and
+		// this eviction can select the same tag. Exactly one wins deleteIfPresent
+		// and decrements depth; the loser advances the frontier (GapSkipAdvance) and
+		// tries the next oldest — never a double `waiting` decrement that
+		// under-counts the ready set and lets depth exceed x-max-length. For a
+		// no-TTL drop-head queue (the common case) deleteIfPresent always wins, so
+		// this path stays allocation/latency-equivalent to an unconditional delete.
+		if !b.deleteIfPresent(queueName, tag) {
+			qs.GapSkipAdvance(tag)
+			continue
+		}
+		b.storage.DeletePendingAck(queueName, tag)
 		// Ready -> gone for a real message: ClaimInflight (waiting-1, inflight+1)
 		// then AckAdvance (inflight-1) reuses the delivery bookkeeping and keeps
 		// minAckCursor safe against concurrent real deliveries.
 		qs.ClaimInflight(tag)
-		b.storage.DeleteMessage(queueName, tag)
-		b.storage.DeletePendingAck(queueName, tag)
 		if policy.HasMaxLengthBytes && bodyLen > 0 {
 			qs.SubReadyBytes(bodyLen)
 		}
@@ -121,9 +133,11 @@ func addReadyBytesOnEnqueue(qs *QueueState, p *QueuePolicy, bodyLen int) {
 }
 
 // subReadyBytesOnClaim subtracts body bytes from the ready-bytes counter when
-// the queue enforces x-max-length-bytes. Called at each claim site (consumer
-// delivery, manual-ack basic.get) after ClaimInflight, mirroring the `waiting`
-// decrement so the counter tracks exactly the ready set.
+// the queue enforces x-max-length-bytes. Called at EVERY ready-set removal site —
+// consumer delivery, manual-ack and no-ack basic.get, and the SQ-9 TTL-expiry
+// drops (delivery/get head-check and reaper) — alongside the `waiting` decrement,
+// so the byte counter tracks exactly the ready set and never drifts. p may be nil
+// (per-message TTL with no queue policy): the guard handles it.
 func subReadyBytesOnClaim(qs *QueueState, p *QueuePolicy, bodyLen int) {
 	if p != nil && p.HasMaxLengthBytes {
 		qs.SubReadyBytes(int64(bodyLen))

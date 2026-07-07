@@ -599,6 +599,10 @@ func (b *StorageBroker) dropExpiredOnDelivery(qs *QueueState, state *ConsumerSta
 	state.releaseGate(1)
 	if won {
 		qs.ReapDrop()
+		// SQ-11: the expired message left the ready set — account its bytes when
+		// the queue enforces x-max-length-bytes, gated on the same ring-removal win
+		// as the `waiting` decrement so the byte counter never drifts up.
+		subReadyBytesOnClaim(qs, p, len(msg.Body))
 	} else {
 		qs.GapSkipAdvance(tag)
 	}
@@ -615,6 +619,10 @@ func (b *StorageBroker) dropExpiredOnGet(qs *QueueState, queueName string, msg *
 	}
 	if b.deleteIfPresent(queueName, tag) {
 		qs.ReapDrop()
+		// SQ-11: the expired message left the ready set — account its bytes when
+		// the queue enforces x-max-length-bytes, gated on the same ring-removal win
+		// as the `waiting` decrement so the byte counter never drifts up.
+		subReadyBytesOnClaim(qs, p, len(msg.Body))
 	} else {
 		qs.GapSkipAdvance(tag)
 	}
@@ -2481,6 +2489,26 @@ func (b *StorageBroker) GetMessageForGet(queueName string, noAck bool) (*protoco
 			DeliveryTag: tag,
 			ConsumerTag: "",
 		})
+	} else {
+		// No-ack basic.get is an implicit ack (§4): the message must be settled
+		// HERE, mirroring the push no-ack settle branch. Remove it from storage and
+		// account queue depth, gated on winning the ring removal so it reconciles
+		// with the SQ-9 reaper (a consumer-less TTL queue's reaper can target the
+		// same tag, exactly like the head-check drop paths). On a win the message is
+		// already removed by deleteIfPresent, so we only settle the counters —
+		// ClaimInflight (waiting-1, inflight+1) + subReadyBytesOnClaim + AckAdvance
+		// (inflight-1) — matching how the reaper/head-check remove-then-account. On
+		// a loss the reaper already removed and accounted the tag, so we advance the
+		// depth frontier without touching the counters (GapSkipAdvance). Without
+		// this branch a no-ack basic.get leaked the message (durable redelivery
+		// after restart) and drifted both `waiting` and `readyBytes` upward.
+		if b.deleteIfPresent(queueName, tag) {
+			queueState.ClaimInflight(tag)
+			subReadyBytesOnClaim(queueState, p, len(message.Body))
+			queueState.AckAdvance(tag)
+		} else {
+			queueState.GapSkipAdvance(tag)
+		}
 	}
 
 	return message, tag, remaining, nil
