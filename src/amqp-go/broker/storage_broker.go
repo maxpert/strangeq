@@ -2080,6 +2080,21 @@ func (b *StorageBroker) GetQueueConsumerCount(queueName string) int {
 	return 0
 }
 
+// GetQueueMessageCount returns the number of messages currently in the queue's
+// storage ring — the same count basic.get reports in get-ok. Used to populate
+// queue.declare-ok / queue.declare-passive-ok's message-count field (the
+// protocol.Queue.MessageCount runtime counter is never maintained, so reading it
+// always yielded 0 — a wire-fidelity bug caught by the W7 conformance suite,
+// since RabbitMQ returns the real ready count on every declare). Returns 0 for an
+// unknown / uninitialised queue.
+func (b *StorageBroker) GetQueueMessageCount(queueName string) uint32 {
+	count, err := b.storage.GetQueueMessageCount(queueName)
+	if err != nil || count < 0 {
+		return 0
+	}
+	return uint32(count)
+}
+
 func (b *StorageBroker) GetQueueConsumerTags(queueName string) []string {
 	mu := b.getQueueConsumersMutex(queueName)
 	mu.Lock()
