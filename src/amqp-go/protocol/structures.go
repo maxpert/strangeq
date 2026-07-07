@@ -320,6 +320,74 @@ func (c *Channel) flushConfirmsLocked(send func(tag uint64, multiple bool) error
 	return nil
 }
 
+// SettleConfirmNack settles a rejected publish (SQ-11 x-overflow=reject-publish)
+// on a publisher-confirm channel WITHOUT the contiguous ack watermark ever
+// re-confirming the nacked tag (frozen shared interface, spec §3 item 7).
+//
+// THE PROBLEM: SQ-5 confirms are a single lock-free CAS-max watermark flushed as
+// ONE basic.ack(multiple=true) covering every tag <= the watermark. That
+// representation cannot express "tag N nacked, tag N+1 acked" — advancing the
+// watermark past N would emit an ack that also covers N, so the client would see
+// BOTH a nack and a covering ack for N (a silent confirm-protocol violation).
+// Merely "not advancing the watermark" is also insufficient: the next durable
+// tag (N+1) would flush an ack whose cumulative range still starts at N and
+// re-confirms it.
+//
+// THE FIX, all under confirmFlushMu so no concurrent flusher can interleave:
+//
+//  1. Flush every durable-but-unacked confirm strictly BELOW N as one
+//     cumulative sendAck (multiple=true when it covers >1 tag). In the broker
+//     the frame processor advances confirmDurable serially and never makes the
+//     rejected tag N durable (its publish failed), so confirmDurable <= N-1
+//     here — the flush is capped at N-1 defensively regardless.
+//  2. Emit sendNack(N) — basic.nack(N, multiple=false, requeue=false). Never
+//     cumulative: it must settle only N.
+//  3. Advance BOTH confirmAcked and confirmDurable to N so the hole at N is
+//     settled. A later flush then computes its cumulative range from acked=N,
+//     i.e. starting at N+1, so it can never re-confirm N.
+//
+// Result (asserted by conformance/unit tests): the client observes exactly one
+// nack for N and no ack that re-confirms N. A no-op if confirm state is closed.
+func (c *Channel) SettleConfirmNack(n uint64, sendAck func(tag uint64, multiple bool) error, sendNack func(tag uint64) error) error {
+	c.confirmFlushMu.Lock()
+	defer c.confirmFlushMu.Unlock()
+	if c.confirmClosed {
+		return nil
+	}
+
+	// 1. Flush durable confirms strictly below N as one cumulative ack.
+	acked := c.confirmAcked.Load()
+	durable := c.confirmDurable.Load()
+	flushTo := durable
+	if flushTo >= n {
+		flushTo = n - 1 // never ack N or beyond
+	}
+	if flushTo > acked {
+		if err := sendAck(flushTo, flushTo > acked+1); err != nil {
+			return err
+		}
+		c.confirmAcked.Store(flushTo)
+	}
+
+	// 2. Nack N — settles only N (never cumulative).
+	if err := sendNack(n); err != nil {
+		return err
+	}
+
+	// 3. Advance both watermarks past N so the hole is settled and a later
+	//    multiple=true ack starts at N+1 and never re-confirms N.
+	if c.confirmAcked.Load() < n {
+		c.confirmAcked.Store(n)
+	}
+	for {
+		cur := c.confirmDurable.Load()
+		if cur >= n || c.confirmDurable.CompareAndSwap(cur, n) {
+			break
+		}
+	}
+	return nil
+}
+
 // NextWireTag mints the next strictly-increasing per-channel wire delivery tag
 // (1-based). Cheap and lock-free; safe to call from the delivery loop and the
 // basic.get handler concurrently.

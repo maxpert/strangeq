@@ -451,6 +451,12 @@ func (b *StorageBroker) deliverMessage(queueState *QueueState, state *ConsumerSt
 	// the consumer (see deliver()).
 	b.deliver(queueState, state, msgID, redelivered)
 
+	// SQ-11 max-length: the claimed message left the ready set (deliver ->
+	// ClaimInflight). Subtract its bytes when the queue enforces
+	// x-max-length-bytes. The policy load is shared with SQ-9 TTL (W4); one
+	// atomic load + a not-taken branch when neither feature is set.
+	subReadyBytesOnClaim(queueState, queueState.Policy(), len(message.Body))
+
 	select {
 	case state.consumer.Messages <- delivery:
 		if noAck {
@@ -525,6 +531,12 @@ func (b *StorageBroker) finishNack(queueState *QueueState, queueName, consumerTa
 	b.storage.NackFromConsumer(queueName, consumerTag, deliveryTag)
 	b.storage.DeletePendingAck(queueName, deliveryTag)
 	if requeue {
+		// SQ-11: the message re-enters the ready set — restore its bytes when
+		// the queue enforces x-max-length-bytes. Divergence (documented, W7):
+		// unlike RabbitMQ we do NOT drop-head a requeue that pushes the queue
+		// back over the cap; the transient overshoot is bounded by the requeued
+		// set and re-trimmed on the next publish.
+		b.restoreReadyBytesOnRequeue(queueState, queueName, deliveryTag)
 		queueState.Requeue(deliveryTag)
 		return
 	}
@@ -1273,6 +1285,9 @@ func (b *StorageBroker) requeueInflightDelivery(qs *QueueState, queueName string
 	if _, loaded := b.deliveryIndex.LoadAndDelete(deliveryTag); !loaded {
 		return
 	}
+	// SQ-11: consumer-cancel drain re-enters the message into the ready set —
+	// restore its bytes when the queue enforces x-max-length-bytes.
+	b.restoreReadyBytesOnRequeue(qs, queueName, deliveryTag)
 	qs.Requeue(deliveryTag)
 	b.storage.DeletePendingAck(queueName, deliveryTag)
 }
@@ -1314,11 +1329,34 @@ func (b *StorageBroker) PublishMessage(exchangeName, routingKey string, message 
 	}
 
 	// Enqueue to all target queues (lock-free, no consumer iteration)
+	rejected := false
 	for i, queueName := range targetQueues {
 		queueState := b.getOrCreateQueueState(queueName)
 
 		if !queueState.WaitForCapacity(queueState.StopCh()) {
 			return fmt.Errorf("queue '%s' closed during backpressure wait", queueName)
+		}
+
+		// SQ-11 max-length: one policy load per target queue (nil => no policy
+		// => every branch below is not taken). For x-overflow=reject-publish,
+		// refuse the incoming message BEFORE any store/enqueue when the queue is
+		// AT OR OVER its limit; the message is not enqueued to this target and
+		// not dead-lettered. drop-head is applied AFTER enqueue (below).
+		p := queueState.Policy()
+		// For reject-publish, the AT-OR-OVER check and the matching enqueue must
+		// be atomic w.r.t. other publishers to this queue: two publishers both
+		// observing count == limit-1 would otherwise both accept and push the
+		// ready set permanently past the cap. maxLenMu serializes only this
+		// admission path; drop-head and no-policy queues stay lock-free.
+		rejectPublish := p != nil && p.Overflow == OverflowRejectPublish &&
+			(p.HasMaxLength || p.HasMaxLengthBytes)
+		if rejectPublish {
+			queueState.maxLenMu.Lock()
+			if maxLenRejectsPublish(queueState, p) {
+				queueState.maxLenMu.Unlock()
+				rejected = true
+				continue
+			}
 		}
 
 		msgID := b.globalDeliveryTag.Add(1)
@@ -1350,6 +1388,9 @@ func (b *StorageBroker) PublishMessage(exchangeName, routingKey string, message 
 		// Store to persistent storage
 		err := b.storage.StoreMessage(queueName, storeMsg)
 		if err != nil {
+			if rejectPublish {
+				queueState.maxLenMu.Unlock()
+			}
 			return fmt.Errorf("failed to store message to queue '%s': %w", queueName, err)
 		}
 
@@ -1357,9 +1398,29 @@ func (b *StorageBroker) PublishMessage(exchangeName, routingKey string, message 
 		// Replaces the old `available <- msgID` channel send.
 		queueState.Publish(msgID)
 
+		// SQ-11 max-length: byte accounting + drop-head eviction AFTER the
+		// enqueue, so the just-published newest message is retained and the
+		// globally-oldest ready message is evicted first.
+		if p != nil {
+			addReadyBytesOnEnqueue(queueState, p, len(storeMsg.Body))
+			if p.Overflow == OverflowDropHead && (p.HasMaxLength || p.HasMaxLengthBytes) {
+				b.dropHeadTrim(queueState, queueName, p)
+			}
+		}
+		if rejectPublish {
+			// Admission (check + Publish + AddReadyBytes) is complete and now
+			// visible under the cap; release so the next publisher re-checks.
+			queueState.maxLenMu.Unlock()
+		}
+
 		// Done - polling loops will discover it (NO consumer iteration needed)
 	}
 
+	if rejected {
+		// At least one reject-publish target refused the message; the server
+		// layer nacks (confirm) / returns (mandatory) / drops the publisher.
+		return ErrMaxLengthExceeded
+	}
 	return nil
 }
 
@@ -1441,7 +1502,24 @@ func (b *StorageBroker) PublishMessageTx(txnStore interfaces.Storage, exchangeNa
 		// Defer visibility until after the atomic commit succeeds.
 		qs := queueState
 		id := msgID
-		deferred = append(deferred, func() { qs.Publish(id) })
+		qn := queueName
+		p := queueState.Policy()
+		bodyLen := len(storeMsg.Body)
+		deferred = append(deferred, func() {
+			qs.Publish(id)
+			// SQ-11 max-length for transactional publishes: byte accounting +
+			// drop-head eviction run AFTER the post-commit visibility. Since the
+			// message is already durably committed, reject-publish is NOT
+			// enforced here (refusing it would strand a durable message) — a
+			// reject-publish queue accepts tx publishes (documented divergence;
+			// W7 locks the exact tx-vs-reject-publish semantics).
+			if p != nil {
+				addReadyBytesOnEnqueue(qs, p, bodyLen)
+				if p.Overflow == OverflowDropHead && (p.HasMaxLength || p.HasMaxLengthBytes) {
+					b.dropHeadTrim(qs, qn, p)
+				}
+			}
+		})
 	}
 
 	return deferred, nil
@@ -2060,6 +2138,24 @@ func (b *StorageBroker) AdvanceDeliveryTag(tag uint64) {
 func (b *StorageBroker) RecoverQueue(queueName string, minTag, maxTag, count uint64) {
 	queueState := b.getOrCreateQueueState(queueName)
 	queueState.Recover(minTag, maxTag, count)
+
+	// SQ-11: reconstruct the ready-bytes counter for a durable queue that
+	// enforces x-max-length-bytes so the byte limit is enforced correctly after
+	// a restart. Queue metadata (and thus the policy) is recovered BEFORE
+	// messages (recovery steps 3 then 5), so the policy is already attached.
+	// One-time, cold, and only for byte-limited queues; gaps (tags acked before
+	// restart) return not-found and are skipped.
+	if p := queueState.Policy(); p != nil && p.HasMaxLengthBytes && count > 0 {
+		var total int64
+		for tag := minTag; tag <= maxTag; tag++ {
+			if msg, err := b.storage.GetMessage(queueName, tag); err == nil && msg != nil {
+				total += int64(len(msg.Body))
+			}
+		}
+		if total > 0 {
+			queueState.AddReadyBytes(total)
+		}
+	}
 }
 
 // GetMessageForGet attempts to synchronously retrieve the next message from a
@@ -2127,6 +2223,8 @@ func (b *StorageBroker) GetMessageForGet(queueName string, noAck bool) (*protoco
 
 	if !noAck {
 		queueState.ClaimInflight(tag)
+		// SQ-11 max-length: claimed message left the ready set.
+		subReadyBytesOnClaim(queueState, queueState.Policy(), len(message.Body))
 		b.deliveryIndex.Store(tag, "")
 		b.getDeliveryQueues.Store(tag, queueName)
 		b.storage.StorePendingAck(&protocol.PendingAck{
@@ -2152,6 +2250,7 @@ func (b *StorageBroker) PurgeQueue(name string) (int, error) {
 		qs.tail.Store(qs.head.Load())
 		qs.waiting.Store(0)
 		qs.inflight.Store(0)
+		qs.readyBytes.Store(0) // SQ-11: purge clears the ready-bytes counter
 		qs.requeueMu.Lock()
 		qs.requeueBuf = make([]requeueEntry, requeueInitialCap)
 		qs.requeueHead = 0
@@ -2202,6 +2301,8 @@ func (b *StorageBroker) RejectGetDelivery(deliveryTag uint64, requeue bool) erro
 	b.storage.DeletePendingAck(queueName, deliveryTag)
 
 	if requeue {
+		// SQ-11: restore ready bytes when the queue enforces x-max-length-bytes.
+		b.restoreReadyBytesOnRequeue(queueState, queueName, deliveryTag)
 		queueState.Requeue(deliveryTag)
 	} else {
 		// Dead-letter (reason=rejected) before discarding, mirroring finishNack:
@@ -2267,6 +2368,8 @@ func (b *StorageBroker) RequeueAllGetDeliveries() {
 
 		queueState := b.getOrCreateQueueState(queueName)
 		b.storage.DeletePendingAck(queueName, deliveryTag)
+		// SQ-11: restore ready bytes when the queue enforces x-max-length-bytes.
+		b.restoreReadyBytesOnRequeue(queueState, queueName, deliveryTag)
 		queueState.Requeue(deliveryTag)
 
 		return true
