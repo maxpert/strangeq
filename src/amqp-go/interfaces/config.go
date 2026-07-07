@@ -128,6 +128,45 @@ type SecurityConfig struct {
 	BlockedHosts []string
 }
 
+// ResourceAlarmConfig configures the RabbitMQ-style resource alarms (SQ-12):
+// when the broker process is low on memory or the storage disk is low on free
+// space, publishers are throttled (connection.blocked is emitted to opted-in
+// clients and their readers are paused for TCP backpressure) until the pressure
+// clears. These fields are named distinctly from the Security.Blocked* auth
+// allow/deny lists, which are unrelated.
+//
+// When Enabled is false — or both arms resolve to a zero threshold — the alarm
+// monitor goroutine is never spawned and the broker does zero RSS/Statfs
+// sampling (the unset zero-cost contract). Thresholds default to RabbitMQ's own
+// defaults so flipping Enabled behaves like RabbitMQ out of the box.
+type ResourceAlarmConfig struct {
+	// Enabled turns the resource-alarm monitor on. Default false (dormant):
+	// no monitor goroutine, no memory/disk sampling.
+	Enabled bool `json:"enabled"`
+
+	// MemoryHighWatermark is the fraction of detected total memory (cgroup limit
+	// or machine RAM) at or above which process RSS trips the memory alarm —
+	// the vm_memory_high_watermark equivalent. Default 0.4. A value <= 0
+	// disables the memory arm.
+	MemoryHighWatermark float64 `json:"memory_high_watermark"`
+
+	// DiskFreeLimitBytes is the free-space floor (in bytes) on the storage disk
+	// below which the disk alarm trips — the disk_free_limit equivalent.
+	// Default 52428800 (50 MB). A value <= 0 disables the disk arm.
+	DiskFreeLimitBytes int64 `json:"disk_free_limit_bytes"`
+
+	// Hysteresis is the fractional margin between the set and clear thresholds
+	// used to prevent alarm flapping. The memory alarm clears when RSS falls to
+	// MemoryHighWatermark*(1-Hysteresis) of total; the disk alarm clears when
+	// free space rises to DiskFreeLimitBytes*(1+Hysteresis). Default 0.05 (5%).
+	Hysteresis float64 `json:"hysteresis"`
+
+	// CheckIntervalMS is the alarm monitor's sampling cadence in milliseconds —
+	// deliberately faster than the 60s system-metrics ticker so alarms react
+	// promptly. Default 2000 (2s). A value <= 0 falls back to the default.
+	CheckIntervalMS int64 `json:"check_interval_ms"`
+}
+
 // ServerConfig holds server information configuration
 type ServerConfig struct {
 	// Server identification

@@ -130,18 +130,18 @@ func (s *Server) handleBasicPublish(conn *protocol.Connection, channelID uint16,
 		return s.authzChannelError(conn, channelID, err, 60, 40)
 	}
 
-	// RabbitMQ-style memory alarm: Log warning when queue usage is high but DO NOT close connection
-	// With 10GB threshold and BrokerV2 architecture, we prioritize connection stability over strict memory limits
-	blocked := conn.Blocked.Load()
-
-	if blocked {
-		// Log warning but continue processing to maintain connection stability
-		// RabbitMQ blocks publishers but keeps connections alive - we do the same
-		s.Log.Warn("High memory usage detected but allowing publish to maintain connection stability",
+	// SQ-12 resource alarm: when a memory/disk alarm is active, RabbitMQ blocks
+	// publishers but keeps the connection alive. The actual backpressure is the
+	// per-connection reader-pause (server.go), which defers *subsequent* reads;
+	// this in-flight publish still completes. Read the global alarm bitmask (one
+	// atomic load) rather than the now-retired per-connection depth flag.
+	if s.alarmState.Load() != 0 {
+		// Informational only — the reader-pause throttles new publishes; this one
+		// proceeds so it (and any confirm) settles normally.
+		s.Log.Warn("resource alarm active; publisher throttled via reader-pause but allowing in-flight publish",
 			zap.String("connection_id", conn.ID),
 			zap.Uint16("channel_id", channelID),
 			zap.String("exchange", publishMethod.Exchange))
-		// Continue processing instead of returning error
 	}
 
 	// Create a pending message to track this publication
@@ -312,6 +312,17 @@ func (s *Server) processBodyFrame(conn *protocol.Connection, frame *protocol.Fra
 
 // processCompleteMessage processes a message that has been fully received (method + header + body)
 func (s *Server) processCompleteMessage(conn *protocol.Connection, channelID uint16, pendingMsg *protocol.PendingMessage) error {
+	// SQ-12 publish gate: a single atomic load with a not-taken branch when no
+	// resource alarm is active (the common case), preserving the unset zero-cost
+	// contract. When an alarm IS active this publish still completes and (in
+	// confirm mode) is confirmed — the reader-pause defers only the *subsequent*
+	// unread publishes (the one-publish-plus-in-flight slack of the
+	// readFrames/processFrames goroutine split). We count it as a
+	// published-while-blocked observation but never withhold its ack.
+	if s.alarmState.Load() != 0 {
+		s.publishedWhileBlocked.Add(1)
+	}
+
 	if ce := s.Log.Check(zapcore.DebugLevel, "Processing complete message"); ce != nil {
 		ce.Write(zap.String("exchange", pendingMsg.Method.Exchange),
 			zap.String("routing_key", pendingMsg.Method.RoutingKey),

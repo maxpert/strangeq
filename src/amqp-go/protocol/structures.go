@@ -54,7 +54,28 @@ type Connection struct {
 	WriteMutex     sync.Mutex    // Protects socket writes (heartbeat sender + frame processor both write)
 	Closed         atomic.Bool   // Atomic flag for connection closure
 	ConsumersDirty atomic.Bool   // Set when consumers are added/removed; delivery loop re-scans only when true
-	Blocked        atomic.Bool   // Back-pressure flag: true when queue usage > 90%, false when < 80%
+
+	// DepthBackpressure is a reserved per-connection queue-depth backpressure
+	// flag (true when queue usage is high). It is currently written nowhere;
+	// SQ-12 resource-alarm backpressure is driven by the server's global
+	// alarmState, not this field. Renamed from Blocked for clarity — the
+	// resource-alarm state a client is told about lives in AlarmNotified below.
+	DepthBackpressure atomic.Bool
+
+	// AlarmNotified tracks whether SQ-12 has told this (opted-in) client it is
+	// blocked: true after connection.blocked was sent, false after
+	// connection.unblocked. It makes edge emission exactly-once per connection
+	// and resolves the race between the monitor's broadcast and a connection
+	// that joins mid-alarm. Only meaningful for clients that advertised the
+	// connection.blocked capability.
+	AlarmNotified atomic.Bool
+
+	// AlarmWake is a capacity-1 poke channel that unparks this connection's
+	// reader when a resource alarm clears (SQ-12). The monitor pokes it
+	// (non-blocking) after storing alarmState=0; the parked reader re-checks the
+	// authoritative alarmState after receiving the poke, so a coalesced or
+	// racing poke cannot wedge it (lost-wakeup-free).
+	AlarmWake chan struct{}
 
 	// Negotiated connection parameters (set during handshake)
 	MaxFrameSize uint32        // Maximum frame size negotiated with client (0 = unlimited)
@@ -92,6 +113,7 @@ func NewConnectionWithReadBuffer(conn net.Conn, bufSize int) *Connection {
 		FrameQueue:      make(chan *Frame, 10000), // 10K frame buffer for reader/processor separation
 		AckQueue:        make(chan *Frame, 4096),  // 4K ACK buffer for off-processor ACK handling
 		ConfirmWake:     make(chan struct{}, 1),   // SQ-5: pokes coalesce; see WakeConfirmFlusher
+		AlarmWake:       make(chan struct{}, 1),   // SQ-12: pokes coalesce; unparks the reader on alarm clear
 		Done:            make(chan struct{}),
 		ConnectedAt:     time.Now(),
 	}
