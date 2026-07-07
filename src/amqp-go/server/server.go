@@ -62,8 +62,29 @@ type Server struct {
 	// alarmState is the SQ-12 resource-alarm bitmask: bit0 = memory (AlarmMemory),
 	// bit1 = disk (AlarmDisk). Zero means no active alarm. The publish gate is a
 	// single atomic load + not-taken branch when unset. W6/SQ-12 drives the bits
-	// from the AlarmMonitor; W1 only provides the field and accessor.
+	// from the AlarmMonitor; W1 only provides the field and accessor. alarmState
+	// itself doubles as the "publishBlocked" flag the reader-pause consults.
 	alarmState atomic.Uint32
+
+	// publishedWhileBlocked counts publishes that completed while a resource
+	// alarm was active (SQ-12). Only written on the not-taken publish-gate
+	// branch (rare), so it does not need hot-path cache-line isolation.
+	publishedWhileBlocked atomic.Int64
+
+	// alarm holds the resolved resource-alarm thresholds + samplers (SQ-12), or
+	// nil when resource alarms are disabled. When nil the monitor goroutine is
+	// never spawned and the broker does zero RSS/Statfs sampling (the unset
+	// zero-cost contract). Set once during Build; read-only thereafter.
+	alarm *alarmThresholds
+
+	// alarmParkProbe overrides the reader-park liveness re-arm interval (SQ-12).
+	// Zero falls back to defaultAlarmParkProbe. Tests set it small; production
+	// leaves it at the default.
+	alarmParkProbe time.Duration
+
+	// alarmCancel stops the alarm monitor goroutine on shutdown; nil when the
+	// monitor was never started.
+	alarmCancel context.CancelFunc
 }
 
 // Resource-alarm bits stored in Server.alarmState (SQ-12). Part of the Wave 2
@@ -127,6 +148,13 @@ func (s *Server) Start() error {
 		s.Mutex.Unlock()
 		go s.startSystemMetricsCollection(ctx)
 		s.Log.Info("Started system metrics collection")
+	}
+
+	// SQ-12: start the resource-alarm monitor (no-op / not spawned when alarms
+	// are disabled — the unset zero-cost contract).
+	if s.startAlarmMonitor() {
+		s.Log.Info("Started resource-alarm monitor",
+			zap.Duration("interval", s.alarm.interval))
 	}
 
 	return s.acceptLoop()
@@ -525,6 +553,12 @@ func (s *Server) processConnectionFrames(conn *protocol.Connection) {
 	confirmFlusherDone := make(chan struct{})
 	go s.confirmFlusher(conn, confirmFlusherDone)
 
+	// SQ-12: a freshly handshaked connection has not published yet, so it is
+	// consumer-only and must NOT be blocked (RabbitMQ blocks publishers, not
+	// consumers) — no emission here and its reader is never paused. It becomes
+	// blocked, with the handshake/clear race reconciled, at its first publish
+	// under an active alarm (blockPublisherConnection in processCompleteMessage).
+
 	// Wait for any goroutine to finish (connection close or error)
 	select {
 	case <-readerDone:
@@ -586,6 +620,11 @@ func (s *Server) readFrames(conn *protocol.Connection, done chan struct{}) {
 	// than grow memory without bound.
 	var pending []*protocol.Frame
 	var pendingBytes int64
+	// deadlineActive tracks whether a read deadline is currently set on the
+	// socket. Post-handshake the deadline is cleared, so it starts false. It only
+	// matters on hb==0 connections, where it lets us clear a stale SQ-12
+	// liveness-probe deadline exactly once instead of on every frame.
+	deadlineActive := false
 	flowPaused := false
 	flowLimit := s.Config.Network.ReaderOverflowFlowBytes
 	hardCap := s.Config.Network.ReaderOverflowHardCapBytes
@@ -673,9 +712,48 @@ func (s *Server) readFrames(conn *protocol.Connection, done chan struct{}) {
 			}
 		}
 
+		// SQ-12 reader-pause backpressure: one atomic load per iteration (the hot
+		// per-frame gate; zero-cost when unset). While a resource alarm is active
+		// stop pulling application frames so TCP backpressure throttles the
+		// publisher. Frames already read (in FrameQueue / pending) still drain and
+		// their publishes complete — only subsequent unread publishes are deferred.
+		//
+		// Only PUBLISHING connections are paused (RabbitMQ parity): a consumer-only
+		// connection (HasPublished false) is never parked, so its acks/consumes/
+		// control frames keep flowing and a memory alarm can clear as queues drain.
+		// The HasPublished load is short-circuited behind alarmState, so it adds no
+		// cost on the unset hot path.
+		probing := false
+		if s.alarmState.Load() != 0 && conn.HasPublished.Load() {
+			probing = s.parkReaderWhileAlarmed(conn)
+			// The connection may have torn down while we were parked.
+			select {
+			case <-conn.Done:
+				return
+			default:
+			}
+		}
+
+		// Compute the read deadline AFTER any park so a long park never counts
+		// toward the heartbeat-missed window (heartbeat false-close bug). hb is
+		// fixed for the connection's lifetime, so the deadlineActive bookkeeping
+		// only ever clears a stale liveness-probe deadline on an hb==0 connection.
 		hb := conn.HeartbeatSec.Load()
-		if hb > 0 {
+		switch {
+		case hb > 0:
 			conn.Conn.SetReadDeadline(time.Now().Add(time.Duration(2*hb) * time.Second))
+			deadlineActive = true
+		case probing:
+			// Heartbeats disabled but we broke out of the alarm park to probe:
+			// bound the read so a quiet-but-alive peer does not wedge us; a dead
+			// peer surfaces as a read error (heartbeat-disabled liveness bug).
+			conn.Conn.SetReadDeadline(time.Now().Add(s.alarmParkProbeInterval()))
+			deadlineActive = true
+		case deadlineActive:
+			// hb==0 and not probing: clear the stale probe deadline exactly once
+			// so a normal blocking read resumes.
+			conn.Conn.SetReadDeadline(time.Time{})
+			deadlineActive = false
 		}
 
 		maxSize := conn.MaxFrameSize
@@ -688,6 +766,10 @@ func (s *Server) readFrames(conn *protocol.Connection, done chan struct{}) {
 				if hb > 0 {
 					s.Log.Info("heartbeat missed, closing dead connection",
 						zap.String("connection_id", conn.ID))
+				} else if probing && s.alarmState.Load() != 0 {
+					// Liveness probe timed out on a quiet, still-blocked peer with
+					// heartbeats disabled — not a death. Re-park instead of closing.
+					continue
 				}
 			} else if err.Error() == "EOF" {
 				s.Log.Info("Connection closed by client", zap.String("connection_id", conn.ID))
@@ -1040,10 +1122,14 @@ func (s *Server) Stop() error {
 	s.Shutdown = true
 	ln := s.Listener
 	cancel := s.metricsCancel
+	alarmCancel := s.alarmCancel
 	s.Mutex.Unlock()
 
 	if cancel != nil {
 		cancel()
+	}
+	if alarmCancel != nil {
+		alarmCancel()
 	}
 
 	if ln != nil {
@@ -1077,6 +1163,13 @@ func (s *Server) StartWithQuitChannel(quit <-chan struct{}) error {
 		s.Mutex.Unlock()
 		go s.startSystemMetricsCollection(ctx)
 		s.Log.Info("Started system metrics collection")
+	}
+
+	// SQ-12: start the resource-alarm monitor (no-op / not spawned when alarms
+	// are disabled — the unset zero-cost contract).
+	if s.startAlarmMonitor() {
+		s.Log.Info("Started resource-alarm monitor",
+			zap.Duration("interval", s.alarm.interval))
 	}
 
 	// Accept connections
@@ -1113,9 +1206,13 @@ func (s *Server) StartWithQuitChannel(quit <-chan struct{}) error {
 			s.Mutex.Lock()
 			s.Shutdown = true
 			cancel := s.metricsCancel
+			alarmCancel := s.alarmCancel
 			s.Mutex.Unlock()
 			if cancel != nil {
 				cancel()
+			}
+			if alarmCancel != nil {
+				alarmCancel()
 			}
 			listener.Close()
 			return nil

@@ -300,6 +300,9 @@ func (b *ServerBuilder) Build() (*Server, error) {
 		// SQ-5: default durability barrier — a publish is confirmable when
 		// Broker.PublishMessage returns (WAL group-commit fsync for durables).
 		ConfirmBarrier: brokerSyncBarrier{broker: unifiedBroker},
+		// SQ-12: resolve resource-alarm thresholds + samplers. nil when alarms
+		// are disabled, in which case the monitor is never spawned (zero-cost).
+		alarm: buildAlarmThresholds(b.config),
 	}
 
 	// Propagate metrics collector to storage if it supports SetMetrics.

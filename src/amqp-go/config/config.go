@@ -56,6 +56,17 @@ func DefaultConfig() *AMQPConfig {
 			AllowedHosts:           []string{},
 			BlockedHosts:           []string{},
 		},
+		ResourceAlarms: interfaces.ResourceAlarmConfig{
+			// Dormant by default so the unset zero-cost contract holds under
+			// sustained-throughput benches (no monitor goroutine, no RSS/Statfs
+			// sampling). Thresholds match RabbitMQ's defaults so an operator who
+			// flips Enabled=true gets RabbitMQ-equivalent behavior.
+			Enabled:             false,
+			MemoryHighWatermark: 0.4,              // 40% of total RAM (vm_memory_high_watermark)
+			DiskFreeLimitBytes:  50 * 1024 * 1024, // 50 MB free-space floor (disk_free_limit)
+			Hysteresis:          0.05,             // 5% set/clear margin to avoid flapping
+			CheckIntervalMS:     2000,             // 2s monitor cadence (faster than the 60s metrics ticker)
+		},
 		Server: interfaces.ServerConfig{
 			Name:                     "amqp-go-server",
 			Version:                  "0.9.1",
@@ -101,11 +112,12 @@ func DefaultConfig() *AMQPConfig {
 
 // AMQPConfig implements the Config interface
 type AMQPConfig struct {
-	Network  interfaces.NetworkConfig  `json:"network"`
-	Storage  interfaces.StorageConfig  `json:"storage"`
-	Security interfaces.SecurityConfig `json:"security"`
-	Server   interfaces.ServerConfig   `json:"server"`
-	Engine   interfaces.EngineConfig   `json:"engine"`
+	Network        interfaces.NetworkConfig       `json:"network"`
+	Storage        interfaces.StorageConfig       `json:"storage"`
+	Security       interfaces.SecurityConfig      `json:"security"`
+	Server         interfaces.ServerConfig        `json:"server"`
+	Engine         interfaces.EngineConfig        `json:"engine"`
+	ResourceAlarms interfaces.ResourceAlarmConfig `json:"resource_alarms"`
 }
 
 // GetNetwork returns network configuration
@@ -131,6 +143,11 @@ func (c *AMQPConfig) GetServer() interfaces.ServerConfig {
 // GetEngine returns engine tuning configuration
 func (c *AMQPConfig) GetEngine() interfaces.EngineConfig {
 	return c.Engine
+}
+
+// GetResourceAlarms returns the resource-alarm configuration (SQ-12).
+func (c *AMQPConfig) GetResourceAlarms() interfaces.ResourceAlarmConfig {
+	return c.ResourceAlarms
 }
 
 // Validate validates the configuration
