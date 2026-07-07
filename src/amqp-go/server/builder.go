@@ -426,6 +426,19 @@ func parseZapLevel(level string) zap.AtomicLevel {
 }
 
 func createZapLogger(level, logFile string) (*zap.Logger, error) {
+	// "silent" bypasses zap.Config entirely rather than mapping to a level
+	// above Fatal: a real core still pays for encoding + a sink write on
+	// every log-site guard check, and every "info"-level connection
+	// lifecycle log plus the unconditional Error() on read-loop teardown
+	// (server.go's readFrames) would otherwise land on stdout — go test
+	// folds a test binary's stdout and stderr into one stream, so those
+	// writes interleave mid-line with -bench output and corrupt it. Used by
+	// benchmarks that spin up an embedded server (see versusURI in
+	// versus_bench_test.go) where any log write is noise, not signal.
+	if level == "silent" {
+		return zap.NewNop(), nil
+	}
+
 	var zapConfig zap.Config
 
 	if level == "debug" {

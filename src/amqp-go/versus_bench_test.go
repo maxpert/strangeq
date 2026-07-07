@@ -43,6 +43,13 @@ func versusURI(b *testing.B) (string, func()) {
 	cfg := config.DefaultConfig()
 	cfg.Network.Address = addr
 	cfg.Storage.Path = b.TempDir()
+	// Silence the embedded server's logger. go test folds a test binary's
+	// stdout and stderr into a single stream, so any Info/Error log write
+	// (e.g. the unconditional "Error reading frame from connection" on
+	// srv.Stop()'s abrupt close) lands mid-line with the -bench result line
+	// go test is concurrently assembling, corrupting the exact ns/op fields
+	// benchstat parses. See createZapLogger's "silent" level.
+	cfg.Server.LogLevel = "silent"
 	// Optional override for tuning the prefetch-0 gate cap (see
 	// EngineConfig.UnlimitedPrefetchCap), e.g. PREFETCH0_CAP=1024 to compare cap
 	// values head-to-head. Must stay > the MultiAck1000 ack cadence (1000).

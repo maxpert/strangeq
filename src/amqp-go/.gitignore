@@ -8,6 +8,7 @@
 # Build artifacts
 amqp-go
 amqp-server
+/benchgate
 /dist
 /bin
 /benchmark/benchmark
@@ -44,3 +45,7 @@ logs/
 # Test coverage
 coverage.out
 cover.htmltest-data/
+
+# Perf-gate scratch output (bench-gate/bench-baseline-refresh intermediate
+# results; only testdata/bench-baseline.txt is committed — see Makefile).
+/build/
