@@ -1,4 +1,4 @@
-.PHONY: build build-server build-perftest test bench-baseline bench-throughput bench-durable bench-large clean bench-gate bench-baseline-refresh
+.PHONY: build build-server build-perftest test bench-baseline bench-throughput bench-durable bench-large clean bench-gate bench-baseline-refresh conformance conformance-strangeq conformance-rabbitmq
 
 AMQP_URL ?= amqp://guest:guest@localhost:5672/
 
@@ -31,6 +31,30 @@ bench-large: build-perftest
 
 clean:
 	rm -f amqp-server perftest
+
+# ----------------------------------------------------------------------------
+# RabbitMQ conformance suite (design doc "W7 — RabbitMQ conformance suite").
+# ONE set of amqp091-go assertions, behind the `conformance` build tag, runs
+# against whichever broker AMQP_TARGET selects, so both are held to
+# byte-identical wire expectations. `conformance` runs the embedded-StrangeQ
+# side (the default CI path — no external broker needed). `conformance-rabbitmq`
+# runs the SAME suite against a real RabbitMQ 4.x on $(AMQP_URL) to re-lock the
+# expected bytes; start one with:
+#   docker run -d --rm --name sq-conformance-rmq -p 5672:5672 -p 15672:15672 \
+#       rabbitmq:4-management
+# and remove it (docker rm -f sq-conformance-rmq) when done. Documented
+# StrangeQ-vs-RabbitMQ divergences are target-aware assertions (green on both);
+# a `-v` run enumerates them via DIVERGENCE[...] / LOCK[...] log lines.
+CONFORMANCE_PKGS ?= . ./server
+CONFORMANCE_RUN  ?= TestConformance
+
+conformance: conformance-strangeq
+
+conformance-strangeq:
+	go test -tags=conformance -run '$(CONFORMANCE_RUN)' $(CONFORMANCE_PKGS) -count=1 -v
+
+conformance-rabbitmq:
+	AMQP_TARGET=rabbitmq go test -tags=conformance -run '$(CONFORMANCE_RUN)' $(CONFORMANCE_PKGS) -count=1 -v -timeout 300s
 
 # ----------------------------------------------------------------------------
 # Perf-gate: no-regression referee for Wave 2 (design doc "W0 — Perf-gate

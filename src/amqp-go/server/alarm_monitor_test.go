@@ -134,7 +134,9 @@ func TestAlarmReason(t *testing.T) {
 		{0, ""},
 		{AlarmMemory, "low on memory"},
 		{AlarmDisk, "low on disk"},
-		{AlarmMemory | AlarmDisk, "low on memory & low on disk"},
+		// Combined string empirically locked against real RabbitMQ 4.3.2 in W7
+		// (captured byte value, not a derived order). See alarmReason's comment.
+		{AlarmMemory | AlarmDisk, "low on disk & memory"},
 	}
 	for _, tc := range cases {
 		if got := alarmReason(tc.bits); got != tc.want {

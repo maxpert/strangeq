@@ -2080,6 +2080,32 @@ func (b *StorageBroker) GetQueueConsumerCount(queueName string) int {
 	return 0
 }
 
+// GetQueueReadyCount returns the number of READY messages in a queue — published
+// and requeued messages that are available for delivery, EXCLUDING messages that
+// are delivered-but-unacked (inflight). This is RabbitMQ's queue.declare-ok
+// message_count semantics. Used to populate queue.declare-ok /
+// queue.declare-passive-ok (the protocol.Queue.MessageCount runtime counter is
+// never maintained, so reading it always yielded 0 — a wire-fidelity bug caught
+// by the W7 conformance suite).
+//
+// The storage ring count (basic.get's source) is deliberately NOT used here: the
+// ring still holds inflight-unacked messages until they are acked, so it counts
+// ready+unacked and over-reports vs RabbitMQ. QueueState.waiting is decremented
+// on ClaimInflight and re-incremented on Requeue, so WaitingCount is the true
+// ready depth. Returns 0 for an unknown / uninitialised queue (read-only load;
+// never creates a queue state).
+func (b *StorageBroker) GetQueueReadyCount(queueName string) uint32 {
+	val, ok := b.queueStates.Load(queueName)
+	if !ok {
+		return 0
+	}
+	ready := val.(*QueueState).WaitingCount()
+	if ready < 0 {
+		return 0
+	}
+	return uint32(ready)
+}
+
 func (b *StorageBroker) GetQueueConsumerTags(queueName string) []string {
 	mu := b.getQueueConsumersMutex(queueName)
 	mu.Lock()
