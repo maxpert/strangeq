@@ -1,0 +1,178 @@
+goos: darwin
+goarch: arm64
+pkg: github.com/maxpert/amqp-go
+cpu: Apple M4 Max
+BenchmarkVersus_AutoAck-16         	   50000	      4579 ns/op	    3455 B/op	      65 allocs/op
+BenchmarkVersus_AutoAck-16         	   50000	      4262 ns/op	    3381 B/op	      65 allocs/op
+BenchmarkVersus_AutoAck-16         	   50000	      4224 ns/op	    3352 B/op	      65 allocs/op
+BenchmarkVersus_AutoAck-16         	   50000	      3986 ns/op	    3292 B/op	      65 allocs/op
+BenchmarkVersus_AutoAck-16         	   50000	      4092 ns/op	    3364 B/op	      65 allocs/op
+BenchmarkVersus_AutoAck-16         	   50000	      4008 ns/op	    3355 B/op	      65 allocs/op
+BenchmarkVersus_AutoAck-16         	   50000	      4039 ns/op	    3341 B/op	      65 allocs/op
+BenchmarkVersus_AutoAck-16         	   50000	      4148 ns/op	    3331 B/op	      65 allocs/op
+BenchmarkVersus_AutoAck-16         	   50000	      4101 ns/op	    3336 B/op	      65 allocs/op
+BenchmarkVersus_AutoAck-16         	   50000	      3943 ns/op	    3326 B/op	      65 allocs/op
+BenchmarkVersus_ManualAck-16       	   50000	      3375 ns/op	    1536 B/op	      34 allocs/op
+BenchmarkVersus_ManualAck-16       	   50000	      3563 ns/op	    1557 B/op	      34 allocs/op
+BenchmarkVersus_ManualAck-16       	   50000	      3446 ns/op	    1555 B/op	      34 allocs/op
+BenchmarkVersus_ManualAck-16       	   50000	      3364 ns/op	    1550 B/op	      34 allocs/op
+BenchmarkVersus_ManualAck-16       	   50000	      3404 ns/op	    1558 B/op	      34 allocs/op
+BenchmarkVersus_ManualAck-16       	   50000	      3299 ns/op	    1537 B/op	      34 allocs/op
+BenchmarkVersus_ManualAck-16       	   50000	      3410 ns/op	    1536 B/op	      34 allocs/op
+BenchmarkVersus_ManualAck-16       	   50000	      3320 ns/op	    1547 B/op	      34 allocs/op
+BenchmarkVersus_ManualAck-16       	   50000	      3435 ns/op	    1544 B/op	      34 allocs/op
+BenchmarkVersus_ManualAck-16       	   50000	      3395 ns/op	    1548 B/op	      34 allocs/op
+BenchmarkVersus_MultiAck1000-16    	   50000	      4068 ns/op	    3993 B/op	      77 allocs/op
+BenchmarkVersus_MultiAck1000-16    	   50000	      4162 ns/op	    3984 B/op	      77 allocs/op
+BenchmarkVersus_MultiAck1000-16    	   50000	      4129 ns/op	    3950 B/op	      77 allocs/op
+BenchmarkVersus_MultiAck1000-16    	   50000	      4185 ns/op	    3966 B/op	      77 allocs/op
+BenchmarkVersus_MultiAck1000-16    	   50000	      4071 ns/op	    3955 B/op	      77 allocs/op
+BenchmarkVersus_MultiAck1000-16    	   50000	      4208 ns/op	    3947 B/op	      77 allocs/op
+BenchmarkVersus_MultiAck1000-16    	   50000	      4084 ns/op	    3939 B/op	      77 allocs/op
+BenchmarkVersus_MultiAck1000-16    	   50000	      4083 ns/op	    3941 B/op	      77 allocs/op
+BenchmarkVersus_MultiAck1000-16    	   50000	      4186 ns/op	    3959 B/op	      77 allocs/op
+BenchmarkVersus_MultiAck1000-16    	   50000	      4076 ns/op	    3927 B/op	      77 allocs/op
+PASS
+ok  	github.com/maxpert/amqp-go	21.729s
+goos: darwin
+goarch: arm64
+pkg: github.com/maxpert/amqp-go/broker
+cpu: Apple M4 Max
+BenchmarkQueueDispatch_Claim-16                     	   50000	       176.9 ns/op	     248 B/op	       3 allocs/op
+BenchmarkQueueDispatch_Claim-16                     	   50000	       141.2 ns/op	     248 B/op	       3 allocs/op
+BenchmarkQueueDispatch_Claim-16                     	   50000	       124.8 ns/op	     248 B/op	       3 allocs/op
+BenchmarkQueueDispatch_Claim-16                     	   50000	       115.8 ns/op	     248 B/op	       3 allocs/op
+BenchmarkQueueDispatch_Claim-16                     	   50000	       107.1 ns/op	     248 B/op	       3 allocs/op
+BenchmarkQueueDispatch_Claim-16                     	   50000	        98.00 ns/op	     248 B/op	       3 allocs/op
+BenchmarkQueueDispatch_Claim-16                     	   50000	        88.71 ns/op	     248 B/op	       3 allocs/op
+BenchmarkQueueDispatch_Claim-16                     	   50000	        82.99 ns/op	     248 B/op	       3 allocs/op
+BenchmarkQueueDispatch_Claim-16                     	   50000	        84.23 ns/op	     248 B/op	       3 allocs/op
+BenchmarkQueueDispatch_Claim-16                     	   50000	        80.39 ns/op	     248 B/op	       3 allocs/op
+BenchmarkQueueDispatch_Publish-16                   	   50000	         5.071 ns/op	       0 B/op	       0 allocs/op
+BenchmarkQueueDispatch_Publish-16                   	   50000	         5.071 ns/op	       0 B/op	       0 allocs/op
+BenchmarkQueueDispatch_Publish-16                   	   50000	         5.077 ns/op	       0 B/op	       0 allocs/op
+BenchmarkQueueDispatch_Publish-16                   	   50000	         5.097 ns/op	       0 B/op	       0 allocs/op
+BenchmarkQueueDispatch_Publish-16                   	   50000	         4.740 ns/op	       0 B/op	       0 allocs/op
+BenchmarkQueueDispatch_Publish-16                   	   50000	         4.691 ns/op	       0 B/op	       0 allocs/op
+BenchmarkQueueDispatch_Publish-16                   	   50000	         4.837 ns/op	       0 B/op	       0 allocs/op
+BenchmarkQueueDispatch_Publish-16                   	   50000	         4.856 ns/op	       0 B/op	       0 allocs/op
+BenchmarkQueueDispatch_Publish-16                   	   50000	         4.641 ns/op	       0 B/op	       0 allocs/op
+BenchmarkQueueDispatch_Publish-16                   	   50000	         4.665 ns/op	       0 B/op	       0 allocs/op
+BenchmarkQueueDispatch_PublishClaimRoundtrip-16     	   50000	        75.01 ns/op	     248 B/op	       3 allocs/op
+BenchmarkQueueDispatch_PublishClaimRoundtrip-16     	   50000	        73.80 ns/op	     248 B/op	       3 allocs/op
+BenchmarkQueueDispatch_PublishClaimRoundtrip-16     	   50000	        73.38 ns/op	     248 B/op	       3 allocs/op
+BenchmarkQueueDispatch_PublishClaimRoundtrip-16     	   50000	        72.79 ns/op	     248 B/op	       3 allocs/op
+BenchmarkQueueDispatch_PublishClaimRoundtrip-16     	   50000	        73.12 ns/op	     248 B/op	       3 allocs/op
+BenchmarkQueueDispatch_PublishClaimRoundtrip-16     	   50000	        70.63 ns/op	     248 B/op	       3 allocs/op
+BenchmarkQueueDispatch_PublishClaimRoundtrip-16     	   50000	        73.90 ns/op	     248 B/op	       3 allocs/op
+BenchmarkQueueDispatch_PublishClaimRoundtrip-16     	   50000	        76.78 ns/op	     248 B/op	       3 allocs/op
+BenchmarkQueueDispatch_PublishClaimRoundtrip-16     	   50000	        75.42 ns/op	     248 B/op	       3 allocs/op
+BenchmarkQueueDispatch_PublishClaimRoundtrip-16     	   50000	        74.26 ns/op	     248 B/op	       3 allocs/op
+BenchmarkQueueDispatch_ConcurrentPublishClaim-16    	   50000	       593.2 ns/op	     249 B/op	       3 allocs/op
+BenchmarkQueueDispatch_ConcurrentPublishClaim-16    	   50000	       618.9 ns/op	     248 B/op	       3 allocs/op
+BenchmarkQueueDispatch_ConcurrentPublishClaim-16    	   50000	       598.4 ns/op	     248 B/op	       3 allocs/op
+BenchmarkQueueDispatch_ConcurrentPublishClaim-16    	   50000	       588.1 ns/op	     248 B/op	       3 allocs/op
+BenchmarkQueueDispatch_ConcurrentPublishClaim-16    	   50000	       561.8 ns/op	     248 B/op	       3 allocs/op
+BenchmarkQueueDispatch_ConcurrentPublishClaim-16    	   50000	       569.6 ns/op	     248 B/op	       3 allocs/op
+BenchmarkQueueDispatch_ConcurrentPublishClaim-16    	   50000	       579.4 ns/op	     248 B/op	       3 allocs/op
+BenchmarkQueueDispatch_ConcurrentPublishClaim-16    	   50000	       604.4 ns/op	     248 B/op	       3 allocs/op
+BenchmarkQueueDispatch_ConcurrentPublishClaim-16    	   50000	       577.8 ns/op	     248 B/op	       3 allocs/op
+BenchmarkQueueDispatch_ConcurrentPublishClaim-16    	   50000	       584.4 ns/op	     248 B/op	       3 allocs/op
+BenchmarkQueueDispatch_Requeue-16                   	   50000	         8.912 ns/op	      39 B/op	       0 allocs/op
+BenchmarkQueueDispatch_Requeue-16                   	   50000	        10.01 ns/op	      39 B/op	       0 allocs/op
+BenchmarkQueueDispatch_Requeue-16                   	   50000	        10.70 ns/op	      39 B/op	       0 allocs/op
+BenchmarkQueueDispatch_Requeue-16                   	   50000	         9.625 ns/op	      39 B/op	       0 allocs/op
+BenchmarkQueueDispatch_Requeue-16                   	   50000	        10.14 ns/op	      39 B/op	       0 allocs/op
+BenchmarkQueueDispatch_Requeue-16                   	   50000	         9.540 ns/op	      39 B/op	       0 allocs/op
+BenchmarkQueueDispatch_Requeue-16                   	   50000	        10.01 ns/op	      39 B/op	       0 allocs/op
+BenchmarkQueueDispatch_Requeue-16                   	   50000	        10.15 ns/op	      39 B/op	       0 allocs/op
+BenchmarkQueueDispatch_Requeue-16                   	   50000	        10.12 ns/op	      39 B/op	       0 allocs/op
+BenchmarkQueueDispatch_Requeue-16                   	   50000	        10.22 ns/op	      39 B/op	       0 allocs/op
+BenchmarkQueueDispatch_AckAdvance-16                	   50000	         4.862 ns/op	       0 B/op	       0 allocs/op
+BenchmarkQueueDispatch_AckAdvance-16                	   50000	         4.867 ns/op	       0 B/op	       0 allocs/op
+BenchmarkQueueDispatch_AckAdvance-16                	   50000	         4.783 ns/op	       0 B/op	       0 allocs/op
+BenchmarkQueueDispatch_AckAdvance-16                	   50000	         4.637 ns/op	       0 B/op	       0 allocs/op
+BenchmarkQueueDispatch_AckAdvance-16                	   50000	         5.181 ns/op	       0 B/op	       0 allocs/op
+BenchmarkQueueDispatch_AckAdvance-16                	   50000	         4.400 ns/op	       0 B/op	       0 allocs/op
+BenchmarkQueueDispatch_AckAdvance-16                	   50000	         4.747 ns/op	       0 B/op	       0 allocs/op
+BenchmarkQueueDispatch_AckAdvance-16                	   50000	         4.666 ns/op	       0 B/op	       0 allocs/op
+BenchmarkQueueDispatch_AckAdvance-16                	   50000	         4.519 ns/op	       0 B/op	       0 allocs/op
+BenchmarkQueueDispatch_AckAdvance-16                	   50000	         4.868 ns/op	       0 B/op	       0 allocs/op
+BenchmarkPublishMessage_SingleQueue-16              	   50000	       943.0 ns/op	     537 B/op	       4 allocs/op
+BenchmarkPublishMessage_SingleQueue-16              	   50000	       866.7 ns/op	     536 B/op	       4 allocs/op
+BenchmarkPublishMessage_SingleQueue-16              	   50000	       915.6 ns/op	     536 B/op	       4 allocs/op
+BenchmarkPublishMessage_SingleQueue-16              	   50000	       904.1 ns/op	     536 B/op	       4 allocs/op
+BenchmarkPublishMessage_SingleQueue-16              	   50000	       893.6 ns/op	     536 B/op	       4 allocs/op
+BenchmarkPublishMessage_SingleQueue-16              	   50000	       981.6 ns/op	     536 B/op	       4 allocs/op
+BenchmarkPublishMessage_SingleQueue-16              	   50000	       957.9 ns/op	     536 B/op	       4 allocs/op
+BenchmarkPublishMessage_SingleQueue-16              	   50000	       915.8 ns/op	     536 B/op	       4 allocs/op
+BenchmarkPublishMessage_SingleQueue-16              	   50000	       872.6 ns/op	     536 B/op	       4 allocs/op
+BenchmarkPublishMessage_SingleQueue-16              	   50000	       898.9 ns/op	     536 B/op	       4 allocs/op
+BenchmarkPublishMessage_MultiQueue-16               	   50000	     91749 ns/op	   29846 B/op	     400 allocs/op
+BenchmarkPublishMessage_MultiQueue-16               	   50000	     90597 ns/op	   29846 B/op	     400 allocs/op
+BenchmarkPublishMessage_MultiQueue-16               	   50000	     91367 ns/op	   29845 B/op	     400 allocs/op
+BenchmarkPublishMessage_MultiQueue-16               	   50000	     89983 ns/op	   29845 B/op	     400 allocs/op
+BenchmarkPublishMessage_MultiQueue-16               	   50000	     90108 ns/op	   29845 B/op	     400 allocs/op
+BenchmarkPublishMessage_MultiQueue-16               	   50000	     90527 ns/op	   29846 B/op	     400 allocs/op
+BenchmarkPublishMessage_MultiQueue-16               	   50000	     89931 ns/op	   29845 B/op	     400 allocs/op
+BenchmarkPublishMessage_MultiQueue-16               	   50000	     90237 ns/op	   29845 B/op	     400 allocs/op
+BenchmarkPublishMessage_MultiQueue-16               	   50000	     90539 ns/op	   29846 B/op	     400 allocs/op
+BenchmarkPublishMessage_MultiQueue-16               	   50000	     90614 ns/op	   29845 B/op	     400 allocs/op
+BenchmarkPublishMessage_MultiQueueTopic-16          	   50000	     92738 ns/op	   29846 B/op	     400 allocs/op
+BenchmarkPublishMessage_MultiQueueTopic-16          	   50000	     91355 ns/op	   29846 B/op	     400 allocs/op
+BenchmarkPublishMessage_MultiQueueTopic-16          	   50000	     92314 ns/op	   29845 B/op	     400 allocs/op
+BenchmarkPublishMessage_MultiQueueTopic-16          	   50000	     92925 ns/op	   29845 B/op	     400 allocs/op
+BenchmarkPublishMessage_MultiQueueTopic-16          	   50000	     92882 ns/op	   29846 B/op	     400 allocs/op
+BenchmarkPublishMessage_MultiQueueTopic-16          	   50000	     92126 ns/op	   29845 B/op	     400 allocs/op
+BenchmarkPublishMessage_MultiQueueTopic-16          	   50000	     92484 ns/op	   29845 B/op	     400 allocs/op
+BenchmarkPublishMessage_MultiQueueTopic-16          	   50000	     91317 ns/op	   29845 B/op	     400 allocs/op
+BenchmarkPublishMessage_MultiQueueTopic-16          	   50000	     91673 ns/op	   29845 B/op	     400 allocs/op
+BenchmarkPublishMessage_MultiQueueTopic-16          	   50000	     90573 ns/op	   29845 B/op	     400 allocs/op
+BenchmarkDeliverMessage_ManualAck-16                	   50000	      1879 ns/op	     760 B/op	      16 allocs/op
+BenchmarkDeliverMessage_ManualAck-16                	   50000	      1862 ns/op	     761 B/op	      16 allocs/op
+BenchmarkDeliverMessage_ManualAck-16                	   50000	      1877 ns/op	     759 B/op	      16 allocs/op
+BenchmarkDeliverMessage_ManualAck-16                	   50000	      1862 ns/op	     760 B/op	      16 allocs/op
+BenchmarkDeliverMessage_ManualAck-16                	   50000	      1861 ns/op	     758 B/op	      16 allocs/op
+BenchmarkDeliverMessage_ManualAck-16                	   50000	      1828 ns/op	     760 B/op	      16 allocs/op
+BenchmarkDeliverMessage_ManualAck-16                	   50000	      1834 ns/op	     760 B/op	      16 allocs/op
+BenchmarkDeliverMessage_ManualAck-16                	   50000	      1844 ns/op	     760 B/op	      16 allocs/op
+BenchmarkDeliverMessage_ManualAck-16                	   50000	      1844 ns/op	     759 B/op	      16 allocs/op
+BenchmarkDeliverMessage_ManualAck-16                	   50000	      1887 ns/op	     757 B/op	      16 allocs/op
+BenchmarkAcknowledgeMessage-16                      	   50000	       711.8 ns/op	       0 B/op	       0 allocs/op
+BenchmarkAcknowledgeMessage-16                      	   50000	       766.4 ns/op	       0 B/op	       0 allocs/op
+BenchmarkAcknowledgeMessage-16                      	   50000	       748.3 ns/op	       0 B/op	       0 allocs/op
+BenchmarkAcknowledgeMessage-16                      	   50000	       704.2 ns/op	       0 B/op	       0 allocs/op
+BenchmarkAcknowledgeMessage-16                      	   50000	       741.1 ns/op	       0 B/op	       0 allocs/op
+BenchmarkAcknowledgeMessage-16                      	   50000	       741.5 ns/op	       0 B/op	       0 allocs/op
+BenchmarkAcknowledgeMessage-16                      	   50000	       724.4 ns/op	       0 B/op	       0 allocs/op
+BenchmarkAcknowledgeMessage-16                      	   50000	       728.7 ns/op	       0 B/op	       0 allocs/op
+BenchmarkAcknowledgeMessage-16                      	   50000	       693.1 ns/op	       0 B/op	       0 allocs/op
+BenchmarkAcknowledgeMessage-16                      	   50000	       707.4 ns/op	       0 B/op	       0 allocs/op
+BenchmarkPublishConsumeAck_Roundtrip-16             	   50000	       616.9 ns/op	     672 B/op	       7 allocs/op
+BenchmarkPublishConsumeAck_Roundtrip-16             	   50000	       711.5 ns/op	     672 B/op	       7 allocs/op
+BenchmarkPublishConsumeAck_Roundtrip-16             	   50000	       637.2 ns/op	     672 B/op	       7 allocs/op
+BenchmarkPublishConsumeAck_Roundtrip-16             	   50000	       736.2 ns/op	     672 B/op	       7 allocs/op
+BenchmarkPublishConsumeAck_Roundtrip-16             	   50000	       872.2 ns/op	     672 B/op	       7 allocs/op
+BenchmarkPublishConsumeAck_Roundtrip-16             	   50000	       907.5 ns/op	     672 B/op	       7 allocs/op
+BenchmarkPublishConsumeAck_Roundtrip-16             	   50000	       615.4 ns/op	     672 B/op	       7 allocs/op
+BenchmarkPublishConsumeAck_Roundtrip-16             	   50000	       559.9 ns/op	     672 B/op	       7 allocs/op
+BenchmarkPublishConsumeAck_Roundtrip-16             	   50000	       657.2 ns/op	     672 B/op	       7 allocs/op
+BenchmarkPublishConsumeAck_Roundtrip-16             	   50000	       753.3 ns/op	     672 B/op	       7 allocs/op
+PASS
+ok  	github.com/maxpert/amqp-go/broker	158.992s
+goos: darwin
+goarch: arm64
+pkg: github.com/maxpert/amqp-go/server
+cpu: Apple M4 Max
+BenchmarkProcessCompleteMessage-16    	   50000	       794.8 ns/op	     544 B/op	       3 allocs/op
+BenchmarkProcessCompleteMessage-16    	   50000	       408.1 ns/op	     544 B/op	       3 allocs/op
+BenchmarkProcessCompleteMessage-16    	   50000	       551.9 ns/op	     544 B/op	       3 allocs/op
+BenchmarkProcessCompleteMessage-16    	   50000	       627.7 ns/op	     544 B/op	       3 allocs/op
+BenchmarkProcessCompleteMessage-16    	   50000	       640.1 ns/op	     544 B/op	       3 allocs/op
+BenchmarkProcessCompleteMessage-16    	   50000	       729.7 ns/op	     544 B/op	       3 allocs/op
+BenchmarkProcessCompleteMessage-16    	   50000	       605.6 ns/op	     544 B/op	       3 allocs/op
+BenchmarkProcessCompleteMessage-16    	   50000	       434.9 ns/op	     544 B/op	       3 allocs/op
+BenchmarkProcessCompleteMessage-16    	   50000	       578.8 ns/op	     544 B/op	       3 allocs/op
+BenchmarkProcessCompleteMessage-16    	   50000	       641.2 ns/op	     544 B/op	       3 allocs/op
+PASS
+ok  	github.com/maxpert/amqp-go/server	1.845s
