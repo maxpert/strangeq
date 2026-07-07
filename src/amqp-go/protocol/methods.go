@@ -21,6 +21,11 @@ const (
 	ConnectionOpenOK   = 41
 	ConnectionClose    = 50
 	ConnectionCloseOK  = 51
+	// ConnectionBlocked / ConnectionUnblocked are the RabbitMQ connection.blocked
+	// extension (SQ-12). The server emits them to opted-in clients when a
+	// resource alarm is raised/cleared. Part of the Wave 2 frozen wire contract.
+	ConnectionBlocked   = 60
+	ConnectionUnblocked = 61
 )
 
 // Method IDs for channel class
@@ -510,6 +515,47 @@ type ConnectionCloseOKMethod struct {
 func (m *ConnectionCloseOKMethod) Serialize() ([]byte, error) {
 	// Connection.close-ok has no content
 	return []byte{}, nil
+}
+
+// ConnectionBlockedMethod represents the connection.blocked method (10.60), the
+// RabbitMQ resource-alarm extension. It carries a single human-readable reason
+// shortstr (e.g. "low on memory"). Emitted by the broker (SQ-12) to clients
+// that advertised the connection.blocked capability.
+type ConnectionBlockedMethod struct {
+	Reason string
+}
+
+// Serialize encodes the ConnectionBlockedMethod into a byte slice (one shortstr).
+func (m *ConnectionBlockedMethod) Serialize() ([]byte, error) {
+	return encodeShortString(m.Reason), nil
+}
+
+// Deserialize decodes the ConnectionBlockedMethod from a byte slice.
+func (m *ConnectionBlockedMethod) Deserialize(data []byte) error {
+	reason, _, err := decodeShortString(data, 0)
+	if err != nil {
+		return fmt.Errorf("failed to decode connection.blocked reason: %w", err)
+	}
+	m.Reason = reason
+	return nil
+}
+
+// ConnectionUnblockedMethod represents the connection.unblocked method (10.61),
+// the RabbitMQ resource-alarm extension. It has no fields; the broker emits it
+// when the last active resource alarm clears.
+type ConnectionUnblockedMethod struct {
+}
+
+// Serialize encodes the ConnectionUnblockedMethod into a byte slice (empty body).
+func (m *ConnectionUnblockedMethod) Serialize() ([]byte, error) {
+	// connection.unblocked has no content
+	return []byte{}, nil
+}
+
+// Deserialize decodes the ConnectionUnblockedMethod from a byte slice. The
+// method has no fields, so any (including empty) input is accepted.
+func (m *ConnectionUnblockedMethod) Deserialize(_ []byte) error {
+	return nil
 }
 
 // ChannelOpenMethod represents the channel.open method

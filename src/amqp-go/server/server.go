@@ -51,6 +51,33 @@ type Server struct {
 	messagesDelivered atomic.Int64
 	bytesReceived     atomic.Int64
 	bytesSent         atomic.Int64
+
+	// _alarmPad separates alarmState from the hot per-message write counters
+	// above. alarmState is loaded on every publish (the SQ-12 gate) but the
+	// counters above are stored on every publish/deliver; without a cache-line
+	// gap the read-mostly alarmState would false-share with those hot writes and
+	// bounce the line between cores. One 64-byte cache line of padding.
+	_alarmPad [64]byte
+
+	// alarmState is the SQ-12 resource-alarm bitmask: bit0 = memory (AlarmMemory),
+	// bit1 = disk (AlarmDisk). Zero means no active alarm. The publish gate is a
+	// single atomic load + not-taken branch when unset. W6/SQ-12 drives the bits
+	// from the AlarmMonitor; W1 only provides the field and accessor.
+	alarmState atomic.Uint32
+}
+
+// Resource-alarm bits stored in Server.alarmState (SQ-12). Part of the Wave 2
+// frozen contract: bit0 = memory pressure, bit1 = disk pressure.
+const (
+	AlarmMemory uint32 = 1 << 0
+	AlarmDisk   uint32 = 1 << 1
+)
+
+// AlarmState returns the current resource-alarm bitmask (see AlarmMemory /
+// AlarmDisk). A single atomic load; safe for concurrent use. The publish hot
+// path uses this to gate on active alarms (SQ-12).
+func (s *Server) AlarmState() uint32 {
+	return s.alarmState.Load()
 }
 
 // NewServer creates a new AMQP server with default storage

@@ -40,7 +40,7 @@ func (s *Server) sendConnectionStart(conn *protocol.Connection) error {
 			"exchange_exchange_bindings":   true,
 			"basic.nack":                   true,
 			"consumer_cancel_notify":       true,
-			"connection.blocked":           false,
+			"connection.blocked":           true,
 			"authentication_failure_close": true,
 		},
 	}
@@ -269,6 +269,11 @@ func (s *Server) handleConnectionStartOK(conn *protocol.Connection, payload []by
 			zap.Error(err))
 		return s.sendConnectionClose(conn, 503, "Failed to parse connection.start-ok", 10, 11)
 	}
+
+	// Capture the client-advertised properties/capabilities once, before any
+	// auth branch returns. SQ-12 gates connection.blocked emission on the
+	// client's connection.blocked capability (conn.ClientSupportsBlocked()).
+	conn.ClientProperties = startOK.ClientProperties
 
 	s.Log.Debug("Connection.start-ok parsed",
 		zap.String("connection_id", conn.ID),

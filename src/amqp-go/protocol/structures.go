@@ -34,12 +34,18 @@ type Connection struct {
 	// onward; reading the raw Conn after buffering starts would discard bytes
 	// already pulled into the buffer. SetReadDeadline stays on the raw Conn —
 	// bufio.Reader delegates the underlying deadline transparently (SQ-1).
-	Reader          io.Reader
-	Channels        sync.Map                   // map[uint16]*Channel - concurrent-safe map
-	Vhost           string                     // Virtual host for this connection
-	Username        string                     // Authenticated username
-	User            interface{}                // Authenticated *interfaces.User (interface{} to avoid import cycle; set once during handshake, immutable thereafter)
-	PendingMessages map[uint16]*PendingMessage // Track messages being published on each channel.
+	Reader   io.Reader
+	Channels sync.Map    // map[uint16]*Channel - concurrent-safe map
+	Vhost    string      // Virtual host for this connection
+	Username string      // Authenticated username
+	User     interface{} // Authenticated *interfaces.User (interface{} to avoid import cycle; set once during handshake, immutable thereafter)
+	// ClientProperties holds the properties/capabilities the client advertised
+	// in connection.start-ok, captured during the handshake and immutable
+	// thereafter. nil until start-ok is parsed. SQ-12 gates
+	// connection.blocked/unblocked emission on the client's advertised
+	// connection.blocked capability (see ClientSupportsBlocked).
+	ClientProperties map[string]interface{}
+	PendingMessages  map[uint16]*PendingMessage // Track messages being published on each channel.
 	// SINGLE-WRITER: accessed only by the processFrames goroutine. No mutex needed.
 	FrameQueue     chan *Frame   // Buffer frames between reader and processor goroutines
 	AckQueue       chan *Frame   // Buffer ACK/NACK/Reject frames for the ack worker goroutine
@@ -91,6 +97,21 @@ func NewConnectionWithReadBuffer(conn net.Conn, bufSize int) *Connection {
 	}
 	c.TouchActivity()
 	return c
+}
+
+// ClientSupportsBlocked reports whether the client advertised the
+// connection.blocked capability in its connection.start-ok client-properties.
+// Per the RabbitMQ resource-alarm extension, blocked/unblocked frames are
+// emitted ONLY to clients that opt in via capabilities."connection.blocked" =
+// true (SQ-12). Safe on a nil ClientProperties map and tolerant of malformed
+// property types — anything other than an explicit true reads as unsupported.
+func (c *Connection) ClientSupportsBlocked() bool {
+	caps, ok := c.ClientProperties["capabilities"].(map[string]interface{})
+	if !ok {
+		return false
+	}
+	v, ok := caps["connection.blocked"].(bool)
+	return ok && v
 }
 
 // TouchActivity updates the last-activity timestamp to now.

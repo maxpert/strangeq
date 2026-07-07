@@ -31,6 +31,13 @@ type QueueState struct {
 	stopCh       chan struct{}
 	parkTimeout  time.Duration
 
+	// readyBytes tracks the total body bytes of ready (not-yet-delivered)
+	// messages for x-max-length-bytes enforcement (SQ-11). It is left at zero
+	// and untouched by the dispatch hot paths in W1 — SQ-11 wires the add on
+	// enqueue and the sub on claim/ack/evict — so an unset max-length-bytes
+	// policy costs nothing. Lockless atomic.
+	readyBytes atomic.Int64
+
 	// policy is the queue's resolved x-argument policy (SQ-7), set at declare
 	// time (client declare and durable recovery both route through
 	// StorageBroker.DeclareQueue). It is attached here — on the per-queue
@@ -375,3 +382,16 @@ func (qs *QueueState) InflightCount() int64 { return qs.inflight.Load() }
 func (qs *QueueState) WaitingCount() int64  { return qs.waiting.Load() }
 func (qs *QueueState) RequeueDepth() int64  { return qs.requeueCount.Load() }
 func (qs *QueueState) ParkedCount() int64   { return qs.parkedCount.Load() }
+
+// ReadyBytes returns the tracked total body bytes of ready messages, used by
+// SQ-11 for x-max-length-bytes enforcement. A single atomic load.
+func (qs *QueueState) ReadyBytes() int64 { return qs.readyBytes.Load() }
+
+// AddReadyBytes adds n to the ready-bytes counter and returns the new value.
+// SQ-11 calls this on enqueue. Lockless.
+func (qs *QueueState) AddReadyBytes(n int64) int64 { return qs.readyBytes.Add(n) }
+
+// SubReadyBytes subtracts n from the ready-bytes counter and returns the new
+// value. SQ-11 calls this when a ready message is claimed, acked, or evicted.
+// Lockless.
+func (qs *QueueState) SubReadyBytes(n int64) int64 { return qs.readyBytes.Add(-n) }
