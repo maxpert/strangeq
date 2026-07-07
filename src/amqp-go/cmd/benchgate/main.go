@@ -23,6 +23,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 )
 
 func main() {
@@ -88,9 +89,21 @@ func run(args []string, stdout, stderr io.Writer) int {
 		}
 	}
 
-	for pkg := range baselineByPkg {
+	// A package the baseline covers but this run has none of is the
+	// package-wide version of statusMissingFromNew (evaluate.go): every
+	// benchmark in it was dropped, not just one, most likely because a
+	// whole `go test <pkg> -bench=...` invocation was removed from the
+	// Makefile or its regex stopped matching anything. Silently accepting
+	// that would let the gate's own scope shrink to nothing without anyone
+	// noticing — a hard failure, not an info line.
+	for _, pkg := range sortedKeys(baselineByPkg) {
 		if _, ok := newByPkg[pkg]; !ok {
-			fmt.Fprintf(stdout, "benchgate: %s: in baseline but not in this run — benchmark removed or -bench filter changed\n", pkg)
+			allRegressions = append(allRegressions, regression{
+				pkg:  pkg,
+				name: "(entire package)",
+				reason: "is in the baseline but this run has no section for it" +
+					" (removed from the Makefile, or its -bench filter now matches nothing)",
+			})
 		}
 	}
 
@@ -149,6 +162,17 @@ func runBenchstat(toolsDir, scratchDir, pkg string, baselineBody, newBody []byte
 		return nil, fmt.Errorf("benchstat: %w", err)
 	}
 	return out, nil
+}
+
+// sortedKeys returns m's keys in sorted order, for deterministic output
+// ordering (map iteration order is randomized).
+func sortedKeys(m map[string][]byte) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
 }
 
 // sanitizePkgName turns an import path into a filesystem-safe file name

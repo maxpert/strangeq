@@ -106,6 +106,62 @@ Foo-8,100n,1%,110n,1%,+not-a-number%,p=0.001 n=10
 	}
 }
 
+// TestParseBenchstatCSV_MissingFromNew uses the exact truncated-row shape
+// captured from a real benchstat run comparing a two-benchmark baseline
+// against a new run missing one of them: the dropped benchmark's row is
+// right-truncated to 3 fields (name, value, CI) — no vs-base/P columns,
+// because there is nothing on the "new" side to compare against.
+func TestParseBenchstatCSV_MissingFromNew(t *testing.T) {
+	input := `,old.txt,,new.txt,,,
+,sec/op,CI,sec/op,CI,vs base,P
+A-8,1.0000000000000001e-07,∞,1.0000000000000001e-07,∞,~,p=1.000 n=3
+B-8,5.0000000000000004e-08,∞
+geomean,7.071067811865489e-08,,9.999999999999994e-08,,+0.00%,
+`
+	results, err := parseBenchstatCSV([]byte(input))
+	if err != nil {
+		t.Fatalf("parseBenchstatCSV: %v", err)
+	}
+	if len(results) != 2 {
+		t.Fatalf("got %d results, want 2: %+v", len(results), results)
+	}
+	if results[0].name != "A-8" || results[0].status != statusCompared {
+		t.Errorf("A-8: got %+v, want statusCompared", results[0])
+	}
+	if results[1].name != "B-8" || results[1].status != statusMissingFromNew {
+		t.Errorf("B-8: got %+v, want statusMissingFromNew", results[1])
+	}
+	// The dropped row's raw value ("5e-08") must never be misread as a
+	// delta percentage — this used to silently parse as a bogus tiny
+	// "significant" delta.
+	if results[1].significant {
+		t.Errorf("B-8: significant=true derived from a raw value, not a real delta: %+v", results[1])
+	}
+}
+
+// TestParseBenchstatCSV_MissingFromBaseline mirrors the above for a
+// benchmark added in the new run: the row is 5 fields with the first
+// value/CI slot empty (name,"","",value,CI), since there is nothing on the
+// "old" side.
+func TestParseBenchstatCSV_MissingFromBaseline(t *testing.T) {
+	input := `,old.txt,,new.txt,,,
+,sec/op,CI,sec/op,CI,vs base,P
+A-8,1.0000000000000001e-07,∞,1.0000000000000001e-07,∞,~,p=1.000 n=3
+C-8,,,9.99e-07,∞
+geomean,9.999999999999994e-08,,3.1606961258558185e-07,,+0.00%,
+`
+	results, err := parseBenchstatCSV([]byte(input))
+	if err != nil {
+		t.Fatalf("parseBenchstatCSV: %v", err)
+	}
+	if len(results) != 2 {
+		t.Fatalf("got %d results, want 2: %+v", len(results), results)
+	}
+	if results[1].name != "C-8" || results[1].status != statusMissingFromBaseline {
+		t.Errorf("C-8: got %+v, want statusMissingFromBaseline", results[1])
+	}
+}
+
 func TestIsUnitHeader(t *testing.T) {
 	cases := map[string]bool{
 		"sec/op":             true,

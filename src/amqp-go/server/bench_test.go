@@ -17,17 +17,24 @@ import (
 // TransactionManager, etc. that processCompleteMessage's plain-publish path
 // never touches). A large ring buffer keeps every published message resident
 // in memory for the whole benchmark: this bench never drains its queue, and
-// the default 64K-entry / 80%-spill config (config.DefaultConfig) sits close
-// enough to a -benchtime=50000x run that crossing it mid-run would inject a
-// WAL-write detour into only the later iterations — exactly the kind of
-// hidden variance a "low-variance" gate benchmark must not have.
+// storage's actual default (DisruptorStorage.DefaultRingBufferSize =
+// 1024*256, 80% spill = 209,715 messages) sits well within reach of the
+// large -benchtime this benchmark needs (see BenchmarkProcessCompleteMessage's
+// doc comment) — crossing it mid-run would silently switch the back half of
+// the run onto the synchronous WAL group-commit path instead of the pure
+// in-memory ring, which is both a correctness-of-measurement problem (only
+// LATER iterations pay a completely different cost) and, under real disk
+// contention, was observed to make the whole run stall for minutes waiting
+// on WAL batch commits. NewDisruptorStorageWithEngineConfig (not
+// NewDisruptorStorageWithDataDir, which ignores cfg.Engine entirely and
+// always uses the default) is what actually wires RingBufferSize through.
 func newProcessCompleteMessageBenchServer(b *testing.B) *Server {
 	b.Helper()
 	cfg := config.DefaultConfig()
 	cfg.Storage.Path = b.TempDir()
-	cfg.Engine.RingBufferSize = 1 << 20 // power of 2, required by cfg.Validate()
+	cfg.Engine.RingBufferSize = 1 << 21 // power of 2; ~1.67M-message spill threshold at 80%
 
-	storageImpl, err := storage.NewDisruptorStorageWithDataDir(cfg.Storage.Path)
+	storageImpl, err := storage.NewDisruptorStorageWithEngineConfig(cfg.Storage.Path, storage.DefaultCheckpointInterval, cfg.GetEngine())
 	if err != nil {
 		b.Fatalf("failed to create storage: %v", err)
 	}
@@ -81,18 +88,34 @@ func BenchmarkProcessCompleteMessage(b *testing.B) {
 	b.ResetTimer()
 
 	for i := 0; i < b.N; i++ {
-		pendingMsg := &protocol.PendingMessage{
-			Method: &protocol.BasicPublishMethod{
-				Exchange:   "",
-				RoutingKey: queueName,
-			},
-			Header: &protocol.ContentHeader{
-				BodySize: uint64(len(body)),
-			},
-			Body:     body,
-			Received: uint64(len(body)),
-		}
-		if err := srv.processCompleteMessage(conn, 1, pendingMsg); err != nil {
+		// Acquire/release through the real pools (protocol.Get*/Put*), the
+		// same sequence processHeaderFrame/processBodyFrame use around every
+		// real call to processCompleteMessage (basic_handlers.go). A
+		// benchmark that instead allocates a fresh
+		// PendingMessage/BasicPublishMethod/ContentHeader per iteration
+		// measures its own harness overhead, not the hot path: those three
+		// struct literals are exactly the "3 allocs/op, 544 B/op" this
+		// benchmark used to report before switching to the pools, none of
+		// it attributable to processCompleteMessage itself.
+		method := protocol.GetBasicPublishMethod()
+		method.RoutingKey = queueName
+
+		hdr := protocol.GetContentHeader()
+		hdr.BodySize = uint64(len(body))
+
+		pendingMsg := protocol.GetPendingMessage()
+		pendingMsg.Method = method
+		pendingMsg.Header = hdr
+		pendingMsg.Body = body
+		pendingMsg.Received = uint64(len(body))
+
+		err := srv.processCompleteMessage(conn, 1, pendingMsg)
+
+		protocol.PutBasicPublishMethod(pendingMsg.Method)
+		protocol.PutContentHeader(pendingMsg.Header)
+		protocol.PutPendingMessage(pendingMsg)
+
+		if err != nil {
 			b.Fatal(err)
 		}
 	}

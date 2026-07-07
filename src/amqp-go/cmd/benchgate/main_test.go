@@ -142,6 +142,79 @@ func TestRun_MissingBaselineSectionIsNotFatal(t *testing.T) {
 	}
 }
 
+// TestRun_WholePackageDroppedIsHardFailure proves that a package the
+// baseline covers but this run has no section for at all (e.g. its `go test
+// <pkg> -bench=...` line was removed from the Makefile) fails the gate,
+// rather than only printing an info line — every benchmark in it evaded the
+// gate by disappearing, not by regressing.
+func TestRun_WholePackageDroppedIsHardFailure(t *testing.T) {
+	dir := t.TempDir()
+
+	baseline := pkgBlock("pkg/dropped", benchLines("BenchmarkWholePkgGone", 100, tenJitterSamples(100)))
+	newRun := pkgBlock("pkg/other", benchLines("BenchmarkStillHere", 50, tenJitterSamples(50)))
+
+	baselinePath := filepath.Join(dir, "baseline.txt")
+	newPath := filepath.Join(dir, "new.txt")
+	writeFileT(t, baselinePath, baseline)
+	writeFileT(t, newPath, newRun)
+
+	var stdout, stderr bytes.Buffer
+	code := run([]string{
+		"-baseline", baselinePath,
+		"-new", newPath,
+		"-tools-dir", realToolsDir,
+		"-scratch-dir", filepath.Join(dir, "scratch"),
+	}, &stdout, &stderr)
+
+	if code != 1 {
+		t.Fatalf("got exit code %d, want 1 (a whole package disappearing must fail the gate)\nstdout:\n%s\nstderr:\n%s", code, stdout.String(), stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "pkg/dropped") {
+		t.Errorf("stderr does not identify the dropped package:\n%s", stderr.String())
+	}
+}
+
+// TestRun_BenchmarkDroppedFromExistingPackageIsHardFailure proves the
+// finer-grained case: pkg/mixed is present in both baseline and new (so it
+// IS benchstat-compared), but one of its two baselined benchmarks no longer
+// appears in the new run — e.g. deleted, or no longer matched by the
+// -bench regex. That single benchmark must fail the gate even though its
+// sibling in the same package passes cleanly.
+func TestRun_BenchmarkDroppedFromExistingPackageIsHardFailure(t *testing.T) {
+	dir := t.TempDir()
+
+	baseline := pkgBlock("pkg/mixed",
+		benchLines("BenchmarkKept", 100, tenJitterSamples(100))+
+			benchLines("BenchmarkDropped", 50, tenJitterSamples(50)))
+	newRun := pkgBlock("pkg/mixed", benchLines("BenchmarkKept", 100, tenJitterSamples(100)))
+
+	baselinePath := filepath.Join(dir, "baseline.txt")
+	newPath := filepath.Join(dir, "new.txt")
+	writeFileT(t, baselinePath, baseline)
+	writeFileT(t, newPath, newRun)
+
+	var stdout, stderr bytes.Buffer
+	code := run([]string{
+		"-baseline", baselinePath,
+		"-new", newPath,
+		"-tools-dir", realToolsDir,
+		"-scratch-dir", filepath.Join(dir, "scratch"),
+	}, &stdout, &stderr)
+
+	if code != 1 {
+		t.Fatalf("got exit code %d, want 1 (a benchmark disappearing from a still-gated package must fail)\nstdout:\n%s\nstderr:\n%s", code, stdout.String(), stderr.String())
+	}
+	// benchstat's display names drop the "Benchmark" prefix (e.g. "Foo-8",
+	// not "BenchmarkFoo-8" — see TestRun_CatchesInjectedRegressionOverThreshold's
+	// equivalent "Foo" substring check above).
+	if !strings.Contains(stderr.String(), "Dropped-8") {
+		t.Errorf("stderr does not identify the dropped benchmark:\n%s", stderr.String())
+	}
+	if strings.Contains(stderr.String(), "Kept-8") {
+		t.Errorf("the still-present benchmark was wrongly flagged:\n%s", stderr.String())
+	}
+}
+
 func writeFileT(t *testing.T, path, content string) {
 	t.Helper()
 	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {

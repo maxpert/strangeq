@@ -97,6 +97,39 @@ func TestEvaluate_AllocsOp_JitterNeverFails(t *testing.T) {
 	}
 }
 
+// TestEvaluate_MissingFromNew_HardFailsOnce proves a benchmark dropped from
+// the new run (present in the baseline, absent here) always fails the gate,
+// and is reported once per benchmark rather than once per metric table even
+// though statusMissingFromNew rows appear in all three (sec/op, B/op,
+// allocs/op).
+func TestEvaluate_MissingFromNew_HardFailsOnce(t *testing.T) {
+	results := []benchResult{
+		{metric: "sec/op", name: "Dropped-8", status: statusMissingFromNew},
+		{metric: "B/op", name: "Dropped-8", status: statusMissingFromNew},
+		{metric: "allocs/op", name: "Dropped-8", status: statusMissingFromNew},
+	}
+	got := evaluate("pkg", results, 2.0)
+	if len(got) != 1 {
+		t.Fatalf("got %d regressions, want 1 (deduplicated across metric tables): %+v", len(got), got)
+	}
+	if got[0].name != "Dropped-8" {
+		t.Errorf("got %+v", got[0])
+	}
+}
+
+// TestEvaluate_MissingFromBaseline_NeverFails proves a benchmark newly
+// added in this run (not yet in the baseline) never fails — it's
+// informational, so adding coverage doesn't self-block before
+// make bench-baseline-refresh is run.
+func TestEvaluate_MissingFromBaseline_NeverFails(t *testing.T) {
+	results := []benchResult{
+		{metric: "sec/op", name: "New-8", status: statusMissingFromBaseline},
+	}
+	if got := evaluate("pkg", results, 2.0); len(got) != 0 {
+		t.Fatalf("got %d regressions for a new, not-yet-baselined benchmark, want 0: %+v", len(got), got)
+	}
+}
+
 func TestEvaluate_MultipleBenchmarks_OnlyFailingOnesReported(t *testing.T) {
 	results := []benchResult{
 		{metric: "sec/op", name: "Fast-8", significant: true, deltaPct: 0.5},
