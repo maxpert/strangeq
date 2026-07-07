@@ -2458,8 +2458,13 @@ func (b *StorageBroker) GetMessageForGet(queueName string, noAck bool) (*protoco
 		return nil, 0, 0, nil
 	}
 
-	countBefore, _ := b.storage.GetQueueMessageCount(queueName)
-	remaining := uint32(countBefore)
+	// basic.get-ok message-count is RabbitMQ's "messages remaining": the READY
+	// depth EXCLUDING the message being returned. It is symmetric with the
+	// queue.declare-ok ready-count (GetQueueReadyCount == WaitingCount); the
+	// storage ring count would include delivered-but-unacked messages and
+	// over-report. The selected message is still counted in `waiting` here
+	// (ClaimInflight runs below, only for manual-ack gets), so subtract one for it.
+	remaining := b.GetQueueReadyCount(queueName)
 	if remaining > 0 {
 		remaining--
 	}

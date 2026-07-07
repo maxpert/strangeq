@@ -325,10 +325,30 @@ func (b *StorageBroker) deadLetter(policy *QueuePolicy, srcQueueName string, msg
 // high-water mark would otherwise stall basic.reject/nack on the connection's
 // frame goroutine.
 //
-// Baseline overflow behavior is drop-on-full (documented divergence to lock
-// against RabbitMQ in W7, which applies the TARGET queue's own x-overflow).
-// SQ-11 (W5) hooks in at the AtHighWaterMark check below to consult the target's
-// x-overflow policy (drop-head vs reject) instead of the unconditional drop.
+// TARGET-OVERFLOW ENFORCEMENT (Bug#3): each target queue's own x-max-length /
+// x-overflow policy is honored, matching RabbitMQ (which applies the target's
+// overflow policy to a dead-lettered message, so the target never overshoots its
+// configured cap). Per target, its policy is loaded ONCE and applied without ever
+// blocking:
+//   - x-overflow=reject-publish AND the target is AT-OR-OVER its limit
+//     (maxLenRejectsPublish): the dead-letter is DROPPED for this target — a
+//     system dead-letter cannot be nacked back to a publisher, so dropping is the
+//     RabbitMQ-equivalent — and surfaced via recordDeadLetterOverflow. The
+//     at-or-over check + the matching enqueue run under the target's maxLenMu
+//     (mirroring PublishMessage) so concurrent republishes cannot both admit past
+//     the cap.
+//   - otherwise the message is stored + published + byte-accounted, then a
+//     drop-head target with a limit is trimmed (dropHeadTrim) so it stays AT its
+//     cap. dropHeadTrim runs AFTER enqueue with NO lock held: it recursively
+//     dead-letters the evicted head (reason=maxlen) through this same seam, and
+//     holding a lock across that recursion could deadlock. Cycle detection keeps
+//     the recursion finite (the evicted head cannot loop back into a queue already
+//     in its x-death set).
+//
+// The AtHighWaterMark check remains as the physical-ring backstop (never block; a
+// ring at its depth high-water mark drops rather than stalls the frame goroutine).
+// For a policy-limited target the ring HWM is far above x-max-length, so the
+// x-max-length semantics above are what give RabbitMQ parity.
 //
 // The per-target copy mirrors the PublishMessage fanout invariant: the first
 // successfully-enqueued target reuses the clone directly; subsequent targets
@@ -344,9 +364,28 @@ func (b *StorageBroker) republishToTargets(srcQueueName string, targets []string
 
 		qs := b.getOrCreateQueueState(target)
 
-		// Non-blocking overflow gate (SQ-11 hook). Baseline: drop-on-full.
+		// Physical-ring backstop: never block (no WaitForCapacity) and never
+		// overshoot the ring high-water mark.
 		if qs.AtHighWaterMark() {
 			continue
+		}
+
+		// Single policy load per target, used by every branch below.
+		p := qs.Policy()
+
+		// x-overflow=reject-publish: refuse the dead-letter when the target is
+		// AT-OR-OVER its limit. maxLenMu makes the check+enqueue atomic w.r.t. other
+		// admitters (normal publishers and concurrent republishes), so two dead-
+		// letters cannot both observe count==limit-1 and both push past the cap.
+		rejectPublish := p != nil && p.Overflow == OverflowRejectPublish &&
+			(p.HasMaxLength || p.HasMaxLengthBytes)
+		if rejectPublish {
+			qs.maxLenMu.Lock()
+			if maxLenRejectsPublish(qs, p) {
+				qs.maxLenMu.Unlock()
+				b.recordDeadLetterOverflow(srcQueueName, target)
+				continue
+			}
 		}
 
 		msgID := b.globalDeliveryTag.Add(1)
@@ -375,21 +414,38 @@ func (b *StorageBroker) republishToTargets(srcQueueName string, targets []string
 		// hook — rather than dropped silently. Behavior is unchanged: drop and
 		// continue.
 		if err := b.storage.StoreMessage(target, storeMsg); err != nil {
+			if rejectPublish {
+				qs.maxLenMu.Unlock()
+			}
 			b.recordDeadLetterDrop(srcQueueName, target, err)
 			continue
 		}
 		qs.Publish(msgID)
 		// SQ-11: keep the DLX target's ready-bytes counter consistent when the
 		// target itself enforces x-max-length-bytes.
-		addReadyBytesOnEnqueue(qs, qs.Policy(), len(storeMsg.Body))
+		addReadyBytesOnEnqueue(qs, p, len(storeMsg.Body))
+		if rejectPublish {
+			// Admission (check + Publish + AddReadyBytes) is complete and now
+			// visible under the cap; release so the next admitter re-checks.
+			qs.maxLenMu.Unlock()
+		}
+
+		// drop-head with a limit: trim AFTER enqueue (lock-free) so the target
+		// stays AT its cap, evicting the globally-oldest ready message. dropHeadTrim
+		// dead-letters each eviction through this same seam; no lock is held here.
+		if p != nil && p.Overflow == OverflowDropHead && (p.HasMaxLength || p.HasMaxLengthBytes) {
+			b.dropHeadTrim(qs, target, p)
+		}
 		first = false
 	}
 }
 
 // deadLetterDropRecorder is an OPTIONAL metrics hook. A MetricsCollector may
-// additionally implement it to count dead-letter republishes dropped because the
-// target store failed (a genuine message loss). It is discovered via a type
-// assertion, so existing collectors need not implement it.
+// additionally implement it to count dead-letter republishes dropped — whether
+// because the target store failed (a genuine message loss) or because the target
+// refused the dead-letter under its x-overflow=reject-publish policy (Bug#3). It
+// is discovered via a type assertion, so existing collectors need not implement
+// it.
 type deadLetterDropRecorder interface {
 	RecordDeadLetterDropped()
 }
@@ -401,6 +457,21 @@ type deadLetterDropRecorder interface {
 func (b *StorageBroker) recordDeadLetterDrop(srcQueueName, target string, cause error) {
 	log.Printf("WARN: dead-letter republish dropped a message from queue %q to target %q: store failed: %v",
 		srcQueueName, target, cause)
+	if rec, ok := b.metricsCollector.(deadLetterDropRecorder); ok {
+		rec.RecordDeadLetterDropped()
+	}
+}
+
+// recordDeadLetterOverflow surfaces a policy-driven overflow drop (Bug#3): a dead-
+// letter refused because the TARGET queue is at its x-max-length with
+// x-overflow=reject-publish. A system-generated dead-letter cannot be nacked back
+// to a publisher, so RabbitMQ-equivalent behavior is to drop it. This is a
+// deliberate policy outcome (unlike a store-failure loss), but a silently
+// vanishing dead-letter is still worth surfacing — a WARN plus the shared optional
+// metrics counter.
+func (b *StorageBroker) recordDeadLetterOverflow(srcQueueName, target string) {
+	log.Printf("WARN: dead-letter from queue %q dropped: target %q is at its x-max-length with x-overflow=reject-publish",
+		srcQueueName, target)
 	if rec, ok := b.metricsCollector.(deadLetterDropRecorder); ok {
 		rec.RecordDeadLetterDropped()
 	}

@@ -261,21 +261,19 @@ func TestConformance_MaxLenDropHeadToDLX(t *testing.T) {
 }
 
 // ----------------------------------------------------------------------------
-// SQ-10 W7-lock divergence — DLX-target-full behavior (CONFIRMED-REAL, W7 finding).
+// SQ-10 — DLX-target-full behavior (PARITY; W7 finding #11 FIXED in Bug#3).
 //
 // When a dead-lettered message is routed into a DLX target queue that is already
-// at its own x-max-length, the two brokers differ:
-//   - RabbitMQ applies the TARGET queue's own x-overflow. With the default
-//     drop-head, the target evicts its oldest and ACCEPTS the dead-letter, so it
-//     stays at its cap (depth 1) holding the NEWEST body.
-//   - StrangeQ does NOT enforce the target's x-max-length on the dead-letter
-//     republish path: republishToTargets gates only on the ring backpressure
-//     high-water mark (AtHighWaterMark), not on policy.MaxLength / x-overflow
-//     (which are enforced only on the normal PublishMessage path). So the target
-//     OVERSHOOTS its cap — it keeps BOTH messages (depth 2). No message is lost,
-//     but x-max-length is silently exceeded on dead-letter, unlike RabbitMQ.
-// This is a real gap in the DLX/max-length interaction (SQ-10/SQ-11 territory),
-// not a cheap W7 fix — locked here and flagged in w7-report as a finding.
+// at its own x-max-length, both brokers now apply the TARGET queue's own
+// x-overflow. With the default drop-head the target evicts its oldest and ACCEPTS
+// the dead-letter, so it stays AT its cap (depth 1) holding the NEWEST body.
+//
+// This was a CONFIRMED-REAL divergence in W7: StrangeQ's republishToTargets gated
+// only on the ring backpressure high-water mark (AtHighWaterMark), not on the
+// target's policy.MaxLength / x-overflow, so the target OVERSHOT its cap (kept
+// BOTH, depth 2). Bug#3 wired the target-overflow policy into republishToTargets
+// (reuse of the W5 max_length helpers, still non-blocking), so the two brokers
+// now agree — asserted as parity here and re-verified against real RabbitMQ 4.x.
 // ----------------------------------------------------------------------------
 
 func TestConformance_DeadLetterIntoFullTarget(t *testing.T) {
@@ -308,13 +306,59 @@ func TestConformance_DeadLetterIntoFullTarget(t *testing.T) {
 
 	got := drainBodies(t, ch, dlq)
 	lockLog(t, "dead-letter-into-full-target surviving bodies", got)
-	// RabbitMQ drop-head evicts old, keeps newest (respects the cap); StrangeQ
-	// overshoots the cap and retains BOTH (no target-overflow on the DLX path).
+	// PARITY: both brokers apply the target's drop-head — evict "old", keep the
+	// newest "new" — so the target stays AT its cap (depth 1).
 	wantBodies := expectByTarget(t, "dead-letter-into-full-target",
-		[][]byte{[]byte("new")},                // rabbit: target drop-head → newest only
-		[][]byte{[]byte("old"), []byte("new")}, // strangeq: overshoots cap → both retained
+		[][]byte{[]byte("new")}, // rabbit: target drop-head → newest only
+		[][]byte{[]byte("new")}, // strangeq (Bug#3): honors target drop-head → newest only
 	)
 	assert.Equal(t, wantBodies, got, "target=%s: dead-letter into a full DLX target", confTarget())
+}
+
+// ----------------------------------------------------------------------------
+// SQ-10/SQ-11 — dead-letter into a reject-publish DLX target that is at its cap.
+// Both brokers refuse the dead-letter (a system dead-letter cannot be nacked back
+// to a publisher, so it is dropped): the target keeps only what it already holds.
+// Companion to TestConformance_DeadLetterIntoFullTarget's drop-head case; locked
+// against real RabbitMQ 4.x. Part of the Bug#3 target-overflow fix.
+// ----------------------------------------------------------------------------
+
+func TestConformance_DeadLetterIntoRejectPublishTarget(t *testing.T) {
+	b := newConfBroker(t)
+	defer b.cleanup()
+	_, ch := b.dial(t)
+
+	dlx := uniqueName("dlx")
+	dlq := uniqueName("dlq")
+	dlrk := "dead"
+	require.NoError(t, ch.ExchangeDeclare(dlx, "direct", true, false, false, false, nil))
+	t.Cleanup(func() { _ = ch.ExchangeDelete(dlx, false, false) })
+	declareDurable(t, ch, dlq, amqp.Table{"x-max-length": int32(1), "x-overflow": "reject-publish"})
+	require.NoError(t, ch.QueueBind(dlq, dlrk, dlx, false, nil))
+
+	src := uniqueName("src")
+	declareDurable(t, ch, src, amqp.Table{"x-dead-letter-exchange": dlx, "x-dead-letter-routing-key": dlrk})
+
+	// Dead-letter "keep" into the empty target — accepted, target now at cap.
+	require.NoError(t, ch.PublishWithContext(t.Context(), "", src, false, false, amqp.Publishing{Body: []byte("keep")}))
+	require.NoError(t, consumeOne(t, ch, src, 8*time.Second).Reject(false))
+	require.Eventually(t, func() bool { return queueDepth(t, ch, dlq) == 1 }, 8*time.Second, 100*time.Millisecond,
+		"first dead-letter must land in the DLX target")
+
+	// Dead-letter "dropped" into the now-full reject-publish target.
+	require.NoError(t, ch.PublishWithContext(t.Context(), "", src, false, false, amqp.Publishing{Body: []byte("dropped")}))
+	require.NoError(t, consumeOne(t, ch, src, 8*time.Second).Reject(false))
+	time.Sleep(500 * time.Millisecond) // settle the overflow decision
+
+	got := drainBodies(t, ch, dlq)
+	lockLog(t, "dead-letter-into-reject-publish-target surviving bodies", got)
+	// PARITY: the reject-publish target refuses the second dead-letter; the target
+	// keeps only the first message.
+	wantBodies := expectByTarget(t, "dead-letter-into-reject-publish-target",
+		[][]byte{[]byte("keep")}, // rabbit: refuses the dead-letter, keeps what it holds
+		[][]byte{[]byte("keep")}, // strangeq (Bug#3): honors target reject-publish → drops incoming
+	)
+	assert.Equal(t, wantBodies, got, "target=%s: dead-letter into a full reject-publish DLX target", confTarget())
 }
 
 // ----------------------------------------------------------------------------
