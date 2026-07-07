@@ -46,6 +46,17 @@ type QueueState struct {
 	// paths that already hold the QueueState (publish, delivery, reject).
 	// nil means "no policy". Lockless by design.
 	policy atomic.Pointer[QueuePolicy]
+
+	// reaperStarted guards single-start of the per-queue SQ-9 TTL/x-expires
+	// reaper goroutine (started at declare/recovery when the policy needs it,
+	// stopped when the queue's stopCh closes). Redeclare must not spawn a second.
+	reaperStarted atomic.Bool
+
+	// lastActivityMilli is the Unix-milli timestamp of the most recent queue
+	// "use" for x-expires (SQ-9): consumer register, basic.get, and (re)declare
+	// reset it. The reaper deletes the queue after QueueExpires ms of no use with
+	// no consumers. Only meaningful when the policy has HasQueueExpires.
+	lastActivityMilli atomic.Int64
 }
 
 // Policy returns the queue's resolved policy, or nil if the queue has no
@@ -293,6 +304,45 @@ func (qs *QueueState) AckAdvance(tag uint64) {
 		qs.minAckCursor.CompareAndSwap(tag, tag+1)
 	}
 	qs.NotifyNewMessage()
+}
+
+// ReapDrop accounts a READY (never-delivered) message removed by the SQ-9 TTL
+// reaper or the delivery-time head-check: it decrements the ready count only. It
+// never touches the inflight counter (a reaped message was never delivered) and
+// is invoked ONLY by the winner of the ring Delete (deleteIfPresent==true), so
+// across {reaper drop, consumer head-check} at most one caller decrements depth
+// per tag. minAckCursor is intentionally left to the storage-synced ack path;
+// it is not read for any depth/backpressure decision (Depth uses waiting +
+// inflight). waiting is clamped at zero defensively.
+func (qs *QueueState) ReapDrop() {
+	if qs.waiting.Add(-1) < 0 {
+		for {
+			cur := qs.waiting.Load()
+			if cur >= 0 {
+				break
+			}
+			if qs.waiting.CompareAndSwap(cur, 0) {
+				break
+			}
+		}
+	}
+	qs.NotifyNewMessage()
+}
+
+// StartReaperOnce reports true exactly once per queue lifetime, gating the
+// single-start of the per-queue reaper goroutine against redeclare.
+func (qs *QueueState) StartReaperOnce() bool {
+	return qs.reaperStarted.CompareAndSwap(false, true)
+}
+
+// MarkActivity records queue use for the x-expires idle clock (SQ-9).
+func (qs *QueueState) MarkActivity(nowMillis int64) {
+	qs.lastActivityMilli.Store(nowMillis)
+}
+
+// LastActivityMilli returns the last recorded x-expires activity timestamp.
+func (qs *QueueState) LastActivityMilli() int64 {
+	return qs.lastActivityMilli.Load()
 }
 
 func (qs *QueueState) GapSkipAdvance(tag uint64) {

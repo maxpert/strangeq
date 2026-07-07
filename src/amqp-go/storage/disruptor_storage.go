@@ -349,6 +349,41 @@ func (ds *DisruptorStorage) DeleteMessage(queueName string, deliveryTag uint64) 
 	return nil
 }
 
+// DeleteMessageIfPresent removes a message and reports whether THIS call won the
+// ring removal — AtomicRing.Delete's CAS result. It underpins the SQ-9 TTL
+// reaper / delivery head-check linearization: for a ring-resident tag exactly
+// one of many concurrent callers observes true, so queue depth is decremented
+// exactly once even when the reaper and a consumer race the same waiting
+// message. WAL/segment acknowledgement mirrors DeleteMessage.
+//
+// A tag that is NOT ring-resident (a rare spilled/WAL-only message) reports
+// false: there is no ring CAS to arbitrate. Callers gate their depth decrement
+// on true, so such a message is removed from durable storage but its depth is
+// reconciled by the storage-synced min-ack path rather than the reaper — a
+// bounded divergence documented for the >64K-unacked spill edge in W4.
+func (ds *DisruptorStorage) DeleteMessageIfPresent(queueName string, deliveryTag uint64) (bool, error) {
+	ring := ds.getQueueRing(queueName)
+	if ring == nil {
+		return false, interfaces.ErrQueueNotFound
+	}
+
+	msg, foundInRing := ring.ring.LoadByTag(deliveryTag)
+	isDurable := foundInRing && msg.DeliveryMode == 2
+
+	removed := ring.ring.Delete(deliveryTag)
+
+	if !foundInRing || isDurable {
+		if ds.wal != nil {
+			ds.wal.Acknowledge(queueName, deliveryTag)
+		}
+		if ds.segments != nil {
+			ds.segments.Acknowledge(queueName, deliveryTag)
+		}
+	}
+
+	return removed, nil
+}
+
 func (ds *DisruptorStorage) RegisterConsumerCursor(queueName string, consumerTag string) {
 	ring := ds.getOrCreateQueueRing(queueName)
 	ring.ack.OnConsumerRegister(consumerTag)

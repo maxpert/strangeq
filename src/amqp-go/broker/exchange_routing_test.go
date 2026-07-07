@@ -28,6 +28,11 @@ func createTestBroker(t testing.TB) (*StorageBroker, func()) {
 	broker := NewStorageBroker(store, engineConfig)
 
 	cleanup := func() {
+		// Stop per-queue background goroutines (the SQ-9 TTL/x-expires reaper)
+		// and WAIT for them to exit BEFORE closing storage, so a reaper mid-sweep
+		// never touches a torn-down store (a data race under -race). No-op for
+		// tests that declare no TTL/x-expires queues.
+		broker.Close()
 		// Close the storage (rings, metadata store, offset store, WAL,
 		// segments) so tests and benchmarks don't leak the storage goroutine
 		// sets. Benchmark N-escalation used to leak one full WAL+segment
