@@ -54,10 +54,11 @@ const (
 	// connection.blocked reason shortstrs. RabbitMQ builds these from the active
 	// alarm set; the disk string is what a `set_disk_free_limit` alarm produces.
 	// Locked against RabbitMQ 4.3.2 (rabbitmq:4-management) on 2026-07-07 — see
-	// w7-report.md §7. The combined string is "low on disk & memory" (RabbitMQ
-	// lists:usort's the alarmed-by resources → sorted atom order, disk before
-	// memory, independent of trip order), NOT "low on memory & low on disk".
-	// StrangeQ's alarmReason() was FIXED in W7 to match, so the two are equal.
+	// w7-report.md §7. The combined string "low on disk & memory" is an
+	// EMPIRICALLY captured byte value (RabbitMQ joins over the active alarm SET;
+	// the element order is an internal representation detail, not a guaranteed
+	// sort), NOT "low on memory & low on disk". StrangeQ's alarmReason() was FIXED
+	// in W7 to match, so the two are equal.
 	lockedRMQReasonMem      = "low on memory"
 	lockedRMQReasonDisk     = "low on disk"
 	lockedRMQReasonMemDisk  = "low on disk & memory"

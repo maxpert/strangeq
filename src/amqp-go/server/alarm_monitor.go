@@ -219,11 +219,14 @@ func (s *Server) applyAlarmBits(next uint32) {
 // alarmReason maps the active alarm bits to the human-readable connection.blocked
 // reason shortstr. Locked against real RabbitMQ 4.3.2 in W7 (forced via
 // rabbitmqctl; see conformance_blocked_test.go): RabbitMQ builds the reason as
-// "low on " + the active resources joined with " & ", and — because it stores the
-// alarmed-by set with lists:usort — the resources are ALWAYS in sorted atom order
-// (disk before memory), independent of which alarm tripped first. So the combined
-// string is "low on disk & memory", NOT "low on memory & low on disk". RabbitMQ
-// does not re-emit connection.blocked when the set changes while already blocked.
+// "low on " + the active resources joined with " & ". The combined value
+// "low on disk & memory" (disk first) is an EMPIRICALLY captured byte lock, not
+// a derived ordering: RabbitMQ joins over the active alarm SET
+// (rabbit_reader blocked_by_message/1 over sets:to_list/1), whose element order
+// is an internal set-representation detail — do not assume it is sorted or
+// trip-order stable. Re-confirm the bytes with `make conformance-rabbitmq` if the
+// RabbitMQ version changes. RabbitMQ does not re-emit connection.blocked when the
+// active set changes while already blocked.
 func alarmReason(bits uint32) string {
 	switch {
 	case bits&AlarmMemory != 0 && bits&AlarmDisk != 0:

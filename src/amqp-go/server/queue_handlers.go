@@ -152,14 +152,15 @@ func (s *Server) handleQueueDeclare(conn *protocol.Connection, channelID uint16,
 		return nil
 	}
 
-	// message-count must reflect the real ready depth (RabbitMQ returns it on
-	// every declare, passive or not). The protocol.Queue.MessageCount runtime
-	// counter is never maintained, so query the broker's storage-backed count
-	// (the same source basic.get uses); fall back to 0 for a non-storage broker.
+	// message-count must reflect the real READY depth — RabbitMQ returns the
+	// count of messages available for delivery (excluding delivered-but-unacked)
+	// on every declare, passive or not. The protocol.Queue.MessageCount runtime
+	// counter is never maintained, so query the broker's ready count; fall back
+	// to 0 for a non-storage broker.
 	msgCount := uint32(0)
 	consumerCount := uint32(0)
 	if sb, ok := s.Broker.(*StorageBrokerAdapter); ok {
-		msgCount = sb.broker.GetQueueMessageCount(queue.Name)
+		msgCount = sb.broker.GetQueueReadyCount(queue.Name)
 		consumerCount = uint32(sb.broker.GetQueueConsumerCount(queue.Name))
 	}
 	return s.sendQueueDeclareOK(conn, channelID, queue.Name, msgCount, consumerCount)

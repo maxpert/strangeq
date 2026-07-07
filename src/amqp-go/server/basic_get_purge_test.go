@@ -533,22 +533,11 @@ func TestBasicGetMessageCount(t *testing.T) {
 	drainFrame(t, frameCh) // body
 }
 
-// TestQueueDeclareReportsMessageCount guards the W7 fix: queue.declare(-ok) must
-// report the queue's real ready-message count (RabbitMQ returns it on every
-// declare). Before the fix the count came from protocol.Queue.MessageCount, a
-// runtime counter that is never maintained, so it was always 0.
-func TestQueueDeclareReportsMessageCount(t *testing.T) {
-	srv := newGetPurgeTestServer(t)
-	conn, frameCh := newPipeConnWithFrames(t)
-
-	setupQueueAndChannel(t, srv, conn, frameCh, "test-declare-count")
-	publishMessageToQueue(t, srv, "test-declare-count", "m1")
-	publishMessageToQueue(t, srv, "test-declare-count", "m2")
-	publishMessageToQueue(t, srv, "test-declare-count", "m3")
-
-	// Re-declare (idempotent): declare-ok must carry the current ready count.
-	declareMethod := &protocol.QueueDeclareMethod{Queue: "test-declare-count"}
-	payload, err := declareMethod.Serialize()
+// declareOKMessageCount re-declares queueName and returns the message-count from
+// the resulting queue.declare-ok frame.
+func declareOKMessageCount(t *testing.T, srv *Server, conn *protocol.Connection, frameCh chan *protocol.Frame, queueName string) uint32 {
+	t.Helper()
+	payload, err := (&protocol.QueueDeclareMethod{Queue: queueName}).Serialize()
 	require.NoError(t, err)
 	require.NoError(t, srv.handleQueueDeclare(conn, 1, payload))
 
@@ -558,8 +547,37 @@ func TestQueueDeclareReportsMessageCount(t *testing.T) {
 	// Args: queue(shortstr) + message-count(uint32) + consumer-count(uint32).
 	nameLen := int(methodPayload[0])
 	require.GreaterOrEqual(t, len(methodPayload), 1+nameLen+4)
-	msgCount := binary.BigEndian.Uint32(methodPayload[1+nameLen : 1+nameLen+4])
-	assert.Equal(t, uint32(3), msgCount, "queue.declare-ok must report the real ready count")
+	return binary.BigEndian.Uint32(methodPayload[1+nameLen : 1+nameLen+4])
+}
+
+// TestQueueDeclareReportsMessageCount guards the W7 fix: queue.declare(-ok) must
+// report the queue's real READY-message count (RabbitMQ returns it on every
+// declare). Before the fix the count came from protocol.Queue.MessageCount, a
+// runtime counter that is never maintained, so it was always 0. It must also
+// EXCLUDE delivered-but-unacked messages (ready-only, matching RabbitMQ) — not
+// the storage ring count, which retains unacked messages until ack.
+func TestQueueDeclareReportsMessageCount(t *testing.T) {
+	srv := newGetPurgeTestServer(t)
+	conn, frameCh := newPipeConnWithFrames(t)
+
+	setupQueueAndChannel(t, srv, conn, frameCh, "test-declare-count")
+	publishMessageToQueue(t, srv, "test-declare-count", "m1")
+	publishMessageToQueue(t, srv, "test-declare-count", "m2")
+	publishMessageToQueue(t, srv, "test-declare-count", "m3")
+
+	// All 3 ready: declare-ok reports 3.
+	assert.Equal(t, uint32(3), declareOKMessageCount(t, srv, conn, frameCh, "test-declare-count"),
+		"queue.declare-ok must report the real ready count")
+
+	// basic.get with no_ack=false delivers one message and leaves it UNACKED
+	// (inflight). The ready count must drop to 2 — unacked is excluded.
+	require.NoError(t, srv.handleBasicGet(conn, 1, encodeBasicGet(t, "test-declare-count", false)))
+	nextMethodFrame(t, frameCh) // get-ok
+	drainFrame(t, frameCh)      // header
+	drainFrame(t, frameCh)      // body
+
+	assert.Equal(t, uint32(2), declareOKMessageCount(t, srv, conn, frameCh, "test-declare-count"),
+		"queue.declare-ok must exclude delivered-but-unacked messages (ready-only)")
 }
 
 func TestBasicGetConsumesInFILOrder(t *testing.T) {

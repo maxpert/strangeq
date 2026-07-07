@@ -158,6 +158,23 @@ func TestConformance_NegativeCapabilityNoBlockedFrame(t *testing.T) {
 	forceDiskAlarm(t, b)
 	defer clearDiskAlarm(t, b)
 
+	// CONTROL: a capability-advertising client (amqp091 always advertises
+	// connection.blocked) that publishes under the same active alarm MUST be
+	// blocked. This proves the alarm is genuinely active in this window, so the
+	// negative assertion below is meaningful rather than trivially true.
+	ctlConn, ctlCh := b.dial(t)
+	ctlBlocked := ctlConn.NotifyBlocked(make(chan amqp.Blocking, 4))
+	ctlQ := uniqueName("negcap-control")
+	declareDurable(t, ctlCh, ctlQ, nil)
+	_ = ctlCh.PublishWithContext(t.Context(), "", ctlQ, false, false, amqp.Publishing{Body: []byte("p")})
+	select {
+	case bl := <-ctlBlocked:
+		require.True(t, bl.Active, "control (capability-advertising) client must be BLOCKED under the active alarm")
+		t.Logf("target=%s: control client correctly received connection.blocked (alarm is active)", confTarget())
+	case <-time.After(6 * time.Second):
+		t.Fatalf("target=%s: alarm not active — control client received no connection.blocked, so the negative case would be vacuous", confTarget())
+	}
+
 	u, err := url.Parse(b.uri)
 	require.NoError(t, err)
 	conn, err := net.DialTimeout("tcp", u.Host, 5*time.Second)

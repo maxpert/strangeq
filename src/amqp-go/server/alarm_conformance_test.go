@@ -17,9 +17,9 @@ import (
 // to RabbitMQ here, at the wire, via the real emission path.
 //
 // These are the RabbitMQ-locked reason strings (captured against RabbitMQ 4.3.2
-// in W7). The combined string is "low on disk & memory": RabbitMQ stores the
-// alarmed-by resources with lists:usort, so they always render in sorted atom
-// order (disk before memory), regardless of which alarm tripped first.
+// in W7). The combined string is "low on disk & memory" — an empirically captured
+// byte value (RabbitMQ joins over the active alarm SET; the element order is an
+// internal set-representation detail, not a guaranteed sort), not a derived order.
 const (
 	rmqReasonMemory     = "low on memory"
 	rmqReasonDisk       = "low on disk"
