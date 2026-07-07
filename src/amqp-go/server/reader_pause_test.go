@@ -27,9 +27,62 @@ func registerPauseConn(t *testing.T, srv *Server) (*protocol.Connection, net.Con
 	return conn, clientConn
 }
 
-// TestReaderPause_PausesWhileAlarmedResumesOnClear is the baseline: while a
-// resource alarm is active the reader must not consume socket frames; on clear
-// it must resume and consume them.
+// ackFrameBytes builds the wire bytes of a basic.ack method frame (class 60,
+// method 80) on channel 1. readFrames diverts these straight to AckQueue, so a
+// consumer-only connection whose reader keeps running will surface them there.
+func ackFrameBytes(t testing.TB) []byte {
+	t.Helper()
+	// basic.ack payload: delivery-tag (uint64) + flags (octet). Content is
+	// irrelevant here — only the class/method header matters for the divert.
+	frame := protocol.EncodeMethodFrameForChannel(1, 60, protocol.BasicAck, make([]byte, 9))
+	data, err := frame.MarshalBinary()
+	if err != nil {
+		t.Fatalf("MarshalBinary: %v", err)
+	}
+	return data
+}
+
+// TestReaderPause_ConsumerOnlyNotThrottled is the C1 proving test: a
+// consumer-only connection (never published) must NOT have its reader paused
+// while a resource alarm is active — its acks keep flowing so queues can drain
+// and a memory alarm can clear. This fails against the old block-everyone
+// full-reader-pause behavior.
+func TestReaderPause_ConsumerOnlyNotThrottled(t *testing.T) {
+	srv := makeTestServer()
+	srv.Connections = map[string]*protocol.Connection{}
+	srv.alarmParkProbe = 30 * time.Second
+	conn, clientConn := registerPauseConn(t, srv)
+	defer clientConn.Close()
+	conn.HeartbeatSec.Store(0)
+	// conn.HasPublished stays false — this is a pure consumer.
+
+	srv.applyAlarmBits(AlarmMemory) // alarm active for the whole test
+
+	readerDone := make(chan struct{})
+	go srv.readFrames(conn, readerDone)
+
+	go func() { _, _ = clientConn.Write(ackFrameBytes(t)) }()
+
+	select {
+	case f := <-conn.AckQueue:
+		if f == nil {
+			t.Fatal("AckQueue closed instead of delivering the ack")
+		}
+		// correct: the consumer-only reader kept reading despite the alarm
+	case <-readerDone:
+		t.Fatal("reader exited unexpectedly")
+	case <-time.After(1500 * time.Millisecond):
+		t.Fatal("consumer-only reader was throttled during an alarm — ack never read (queue can never drain)")
+	}
+
+	srv.applyAlarmBits(0)
+	clientConn.Close()
+	<-readerDone
+}
+
+// TestReaderPause_PausesWhileAlarmedResumesOnClear is the baseline for a
+// PUBLISHING connection: while a resource alarm is active the reader must not
+// consume socket frames; on clear it must resume and consume them.
 func TestReaderPause_PausesWhileAlarmedResumesOnClear(t *testing.T) {
 	srv := makeTestServer()
 	srv.Connections = map[string]*protocol.Connection{}
@@ -37,6 +90,7 @@ func TestReaderPause_PausesWhileAlarmedResumesOnClear(t *testing.T) {
 	conn, clientConn := registerPauseConn(t, srv)
 	defer clientConn.Close()
 	conn.HeartbeatSec.Store(0)
+	conn.HasPublished.Store(true) // a publisher — subject to reader-pause
 
 	// Arm before the reader starts so its first loop iteration parks.
 	srv.applyAlarmBits(AlarmMemory)
@@ -89,7 +143,8 @@ func TestReaderPause_LongParkDoesNotTripHeartbeatClose(t *testing.T) {
 	srv.alarmParkProbe = 30 * time.Second
 	conn, clientConn := registerPauseConn(t, srv)
 	defer clientConn.Close()
-	conn.HeartbeatSec.Store(1) // 2*hb = 2s heartbeat-missed window
+	conn.HeartbeatSec.Store(1)    // 2*hb = 2s heartbeat-missed window
+	conn.HasPublished.Store(true) // a publisher — subject to reader-pause
 
 	srv.applyAlarmBits(AlarmMemory)
 	readerDone := make(chan struct{})
@@ -135,6 +190,7 @@ func TestReaderPause_LostWakeupFree(t *testing.T) {
 	conn, clientConn := registerPauseConn(t, srv)
 	defer clientConn.Close()
 	conn.HeartbeatSec.Store(0)
+	conn.HasPublished.Store(true) // a publisher — subject to reader-pause
 
 	srv.applyAlarmBits(AlarmMemory) // arm; reader parks on start
 	readerDone := make(chan struct{})
@@ -169,7 +225,8 @@ func TestReaderPause_HeartbeatsDisabledLiveness(t *testing.T) {
 	srv.Connections = map[string]*protocol.Connection{}
 	srv.alarmParkProbe = 100 * time.Millisecond // fast liveness re-arm
 	conn, clientConn := registerPauseConn(t, srv)
-	conn.HeartbeatSec.Store(0) // heartbeats disabled
+	conn.HeartbeatSec.Store(0)    // heartbeats disabled
+	conn.HasPublished.Store(true) // a publisher — subject to reader-pause
 
 	srv.applyAlarmBits(AlarmMemory) // arm and never clear
 	readerDone := make(chan struct{})

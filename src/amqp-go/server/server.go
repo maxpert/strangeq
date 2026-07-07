@@ -553,14 +553,11 @@ func (s *Server) processConnectionFrames(conn *protocol.Connection) {
 	confirmFlusherDone := make(chan struct{})
 	go s.confirmFlusher(conn, confirmFlusherDone)
 
-	// SQ-12: a connection that completes its handshake while a resource alarm is
-	// already active must be told it is blocked (its reader also parks on the
-	// global alarmState on the first loop iteration). Idempotent with the
-	// monitor's broadcast via AlarmNotified; a no-op if the client did not
-	// advertise the capability.
-	if bits := s.alarmState.Load(); bits != 0 {
-		s.notifyConnectionBlocked(conn, alarmReason(bits))
-	}
+	// SQ-12: a freshly handshaked connection has not published yet, so it is
+	// consumer-only and must NOT be blocked (RabbitMQ blocks publishers, not
+	// consumers) — no emission here and its reader is never paused. It becomes
+	// blocked, with the handshake/clear race reconciled, at its first publish
+	// under an active alarm (blockPublisherConnection in processCompleteMessage).
 
 	// Wait for any goroutine to finish (connection close or error)
 	select {
@@ -720,8 +717,14 @@ func (s *Server) readFrames(conn *protocol.Connection, done chan struct{}) {
 		// stop pulling application frames so TCP backpressure throttles the
 		// publisher. Frames already read (in FrameQueue / pending) still drain and
 		// their publishes complete — only subsequent unread publishes are deferred.
+		//
+		// Only PUBLISHING connections are paused (RabbitMQ parity): a consumer-only
+		// connection (HasPublished false) is never parked, so its acks/consumes/
+		// control frames keep flowing and a memory alarm can clear as queues drain.
+		// The HasPublished load is short-circuited behind alarmState, so it adds no
+		// cost on the unset hot path.
 		probing := false
-		if s.alarmState.Load() != 0 {
+		if s.alarmState.Load() != 0 && conn.HasPublished.Load() {
 			probing = s.parkReaderWhileAlarmed(conn)
 			// The connection may have torn down while we were parked.
 			select {

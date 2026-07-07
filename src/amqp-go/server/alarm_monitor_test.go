@@ -267,6 +267,8 @@ func TestApplyAlarmBits_EmitsBlockedOnlyToOptedInClients(t *testing.T) {
 	optOut, optOutClient := makeCapabilityConn("opt-out", false)
 	defer optInClient.Close()
 	defer optOutClient.Close()
+	optIn.HasPublished.Store(true)  // a publisher: eligible for the edge broadcast
+	optOut.HasPublished.Store(true) // publisher too, but did not advertise the capability
 	s.Connections[optIn.ID] = optIn
 	s.Connections[optOut.ID] = optOut
 
@@ -310,6 +312,7 @@ func TestApplyAlarmBits_EmitsUnblockedOnClear(t *testing.T) {
 	s := newAlarmServer()
 	optIn, optInClient := makeCapabilityConn("opt-in", true)
 	defer optInClient.Close()
+	optIn.HasPublished.Store(true)
 	s.Connections[optIn.ID] = optIn
 
 	// Drain the blocked frame first.
@@ -342,6 +345,7 @@ func TestApplyAlarmBits_NoReEmitWhenSetChangesWhileBlocked(t *testing.T) {
 	s := newAlarmServer()
 	optIn, optInClient := makeCapabilityConn("opt-in", true)
 	defer optInClient.Close()
+	optIn.HasPublished.Store(true)
 	s.Connections[optIn.ID] = optIn
 
 	// Read exactly one blocked frame, then assert nothing else arrives while the
@@ -374,4 +378,127 @@ func TestApplyAlarmBits_NoReEmitWhenSetChangesWhileBlocked(t *testing.T) {
 	case <-time.After(3 * time.Second):
 		t.Fatal("expected an unblocked frame after the churn")
 	}
+}
+
+// TestApplyAlarmBits_DoesNotBlockConsumerOnlyConnections is the emission side of
+// C1: the 0->nonzero edge broadcast must reach opted-in PUBLISHERS but not
+// opted-in consumer-only connections (which are never blocked).
+func TestApplyAlarmBits_DoesNotBlockConsumerOnlyConnections(t *testing.T) {
+	s := newAlarmServer()
+
+	publisher, publisherClient := makeCapabilityConn("publisher", true)
+	consumer, consumerClient := makeCapabilityConn("consumer", true)
+	defer publisherClient.Close()
+	defer consumerClient.Close()
+	publisher.HasPublished.Store(true) // eligible to be blocked
+	// consumer.HasPublished stays false — consumer-only, must not be blocked
+	s.Connections[publisher.ID] = publisher
+	s.Connections[consumer.ID] = consumer
+
+	blocked := make(chan [2]uint16, 1)
+	go func() {
+		c, m, _ := readMethod(t, publisherClient)
+		blocked <- [2]uint16{c, m}
+	}()
+	noFrame := make(chan struct{})
+	go func() {
+		expectNoClientFrame(t, consumerClient)
+		close(noFrame)
+	}()
+
+	s.applyAlarmBits(AlarmMemory)
+
+	select {
+	case f := <-blocked:
+		if f[0] != 10 || f[1] != protocol.ConnectionBlocked {
+			t.Fatalf("publisher got class %d method %d, want connection.blocked", f[0], f[1])
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("publisher did not receive connection.blocked")
+	}
+	<-noFrame
+
+	if consumer.AlarmNotified.Load() {
+		t.Error("consumer-only connection must never be marked AlarmNotified")
+	}
+}
+
+// TestBlockPublisherConnection_ReconcilesWhenAlarmClears proves the I1 fix: if
+// the alarm clears in the window after the publish gate sampled it (so the
+// monitor's unblocked broadcast no-op'd on a not-yet-notified connection),
+// blockPublisherConnection re-checks alarmState==0 and sends the matching
+// connection.unblocked itself, so the client is never left dangling "blocked".
+func TestBlockPublisherConnection_ReconcilesWhenAlarmClears(t *testing.T) {
+	s := newAlarmServer()
+	conn, client := makeCapabilityConn("publisher", true)
+	defer client.Close()
+	conn.HasPublished.Store(true)
+	s.Connections[conn.ID] = conn
+
+	// Simulate the race: the gate observed AlarmMemory, but by the time we emit
+	// the alarm has already cleared (monitor stored 0 and broadcast unblocked to
+	// a connection whose AlarmNotified was still false — a no-op).
+	s.alarmState.Store(0)
+
+	got := make(chan [2]uint16, 2)
+	go func() {
+		for i := 0; i < 2; i++ {
+			c, m, _ := readMethod(t, client)
+			got <- [2]uint16{c, m}
+		}
+	}()
+
+	s.blockPublisherConnection(conn, AlarmMemory) // sampledBits = AlarmMemory (what the gate saw)
+
+	var frames [][2]uint16
+	for i := 0; i < 2; i++ {
+		select {
+		case f := <-got:
+			frames = append(frames, f)
+		case <-time.After(3 * time.Second):
+			t.Fatalf("expected 2 frames (blocked then unblocked), got %d", len(frames))
+		}
+	}
+	if frames[0][1] != protocol.ConnectionBlocked {
+		t.Errorf("first frame method = %d, want connection.blocked", frames[0][1])
+	}
+	if frames[1][1] != protocol.ConnectionUnblocked {
+		t.Errorf("second frame method = %d, want reconciled connection.unblocked", frames[1][1])
+	}
+	if conn.AlarmNotified.Load() {
+		t.Error("AlarmNotified must be false after the reconciled unblocked")
+	}
+}
+
+// TestBlockPublisherConnection_NoReconcileWhileAlarmActive verifies the reconcile
+// does NOT fire (no spurious unblocked) while the alarm is still active.
+func TestBlockPublisherConnection_NoReconcileWhileAlarmActive(t *testing.T) {
+	s := newAlarmServer()
+	conn, client := makeCapabilityConn("publisher", true)
+	defer client.Close()
+	conn.HasPublished.Store(true)
+	s.Connections[conn.ID] = conn
+	s.alarmState.Store(AlarmMemory) // alarm genuinely active
+
+	got := make(chan [2]uint16, 1)
+	go func() {
+		c, m, _ := readMethod(t, client)
+		got <- [2]uint16{c, m}
+	}()
+
+	s.blockPublisherConnection(conn, AlarmMemory)
+
+	select {
+	case f := <-got:
+		if f[1] != protocol.ConnectionBlocked {
+			t.Fatalf("first frame method = %d, want connection.blocked", f[1])
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("publisher did not receive connection.blocked")
+	}
+	if !conn.AlarmNotified.Load() {
+		t.Error("AlarmNotified must remain true while the alarm is active")
+	}
+	// No second (unblocked) frame should arrive.
+	expectNoClientFrame(t, client)
 }

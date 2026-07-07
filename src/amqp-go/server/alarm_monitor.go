@@ -246,9 +246,31 @@ func (s *Server) snapshotConnections() []*protocol.Connection {
 	return conns
 }
 
+// broadcastConnectionBlocked emits connection.blocked on the 0->nonzero edge,
+// but only to connections that have actually published (RabbitMQ blocks
+// publishers, not consumer-only connections). A connection that publishes later,
+// while the alarm is active, is blocked at its publish site via
+// blockPublisherConnection.
 func (s *Server) broadcastConnectionBlocked(reason string) {
 	for _, conn := range s.snapshotConnections() {
-		s.notifyConnectionBlocked(conn, reason)
+		if conn.HasPublished.Load() {
+			s.notifyConnectionBlocked(conn, reason)
+		}
+	}
+}
+
+// blockPublisherConnection tells an opted-in publishing connection it is now
+// blocked, then reconciles the handshake/publish-vs-clear race: if the monitor
+// cleared the alarm in the window after the caller sampled alarmState, the
+// monitor's unblocked broadcast may have no-op'd (AlarmNotified was still
+// false), which would leave the client blocked with no matching unblocked. The
+// monitor stores alarmState=0 before it broadcasts unblocked, so re-reading a
+// zero here means we must send the unblocked ourselves. sampledBits is the
+// alarm state observed at the gate, used only for the reason string.
+func (s *Server) blockPublisherConnection(conn *protocol.Connection, sampledBits uint32) {
+	s.notifyConnectionBlocked(conn, alarmReason(sampledBits))
+	if s.alarmState.Load() == 0 {
+		s.notifyConnectionUnblocked(conn)
 	}
 }
 

@@ -312,15 +312,25 @@ func (s *Server) processBodyFrame(conn *protocol.Connection, frame *protocol.Fra
 
 // processCompleteMessage processes a message that has been fully received (method + header + body)
 func (s *Server) processCompleteMessage(conn *protocol.Connection, channelID uint16, pendingMsg *protocol.PendingMessage) error {
+	// SQ-12: mark this connection as a publisher so the reader-pause applies to
+	// it (consumer-only connections are never paused). Load-guarded so it is a
+	// single relaxed load per publish in steady state, storing only once.
+	if !conn.HasPublished.Load() {
+		conn.HasPublished.Store(true)
+	}
+
 	// SQ-12 publish gate: a single atomic load with a not-taken branch when no
 	// resource alarm is active (the common case), preserving the unset zero-cost
 	// contract. When an alarm IS active this publish still completes and (in
 	// confirm mode) is confirmed — the reader-pause defers only the *subsequent*
 	// unread publishes (the one-publish-plus-in-flight slack of the
 	// readFrames/processFrames goroutine split). We count it as a
-	// published-while-blocked observation but never withhold its ack.
-	if s.alarmState.Load() != 0 {
+	// published-while-blocked observation but never withhold its ack, and tell an
+	// opted-in client it is now blocked (this is the point a connection becomes
+	// blocked in RabbitMQ — when it publishes under an active alarm).
+	if bits := s.alarmState.Load(); bits != 0 {
 		s.publishedWhileBlocked.Add(1)
+		s.blockPublisherConnection(conn, bits)
 	}
 
 	if ce := s.Log.Check(zapcore.DebugLevel, "Processing complete message"); ce != nil {

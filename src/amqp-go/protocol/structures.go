@@ -70,6 +70,15 @@ type Connection struct {
 	// connection.blocked capability.
 	AlarmNotified atomic.Bool
 
+	// HasPublished is set the first time this connection completes a basic.publish
+	// and never cleared. SQ-12 blocks only PUBLISHING connections (RabbitMQ
+	// parity): a consumer-only connection (HasPublished false) is never
+	// reader-paused, so its acks/consumes/control frames keep flowing and a
+	// memory alarm can clear as queues drain. Read on the reader-pause path only
+	// while an alarm is active (short-circuited behind alarmState), so it adds no
+	// hot-path cost when no alarm is set.
+	HasPublished atomic.Bool
+
 	// AlarmWake is a capacity-1 poke channel that unparks this connection's
 	// reader when a resource alarm clears (SQ-12). The monitor pokes it
 	// (non-blocking) after storing alarmState=0; the parked reader re-checks the
