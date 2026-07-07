@@ -1,6 +1,7 @@
 package broker
 
 import (
+	"log"
 	"time"
 
 	"github.com/maxpert/amqp-go/protocol"
@@ -24,6 +25,13 @@ const (
 	// x-max-length-bytes limit (drop-head overflow).
 	DeadLetterMaxLen DeadLetterReason = "maxlen"
 )
+
+// deadLetterFanoutLimit bounds how many dead-letter republishes run concurrently
+// on the batched multi-nack/reject cold path (discardNackedBatch). It caps the
+// goroutine + storage-I/O fan-out for a large unacked set (e.g. a prefetch-0
+// consumer's window) while still letting enough durable writes overlap to
+// coalesce into shared WAL group commits.
+const deadLetterFanoutLimit = 64
 
 // x-death / x-first-death-* header keys (RabbitMQ dead-letter extension).
 const (
@@ -222,14 +230,215 @@ func asInt64(v interface{}) int64 {
 //     from the clone ONLY when reason==expired (recording original-expiration);
 //     preserves it for rejected/maxlen.
 //
-// W1 ships this as a documented stub returning nil; SQ-10 (W3) fills the body.
+// SQ-10 (W3) fills the body. It is best-effort: every path that cannot deliver
+// (no/absent DLX, zero routed queues, all targets cyclic, a target at capacity,
+// a storage error on republish) returns nil and lets the caller delete the
+// source. The only durable state it mutates is the DLX target queues.
 func (b *StorageBroker) deadLetter(policy *QueuePolicy, srcQueueName string, msg *protocol.Message, reason DeadLetterReason) error {
-	// STUB (SQ-10/W3): the body — clone, annotate x-death, reason-conditional
-	// cycle filter, non-blocking republish through routeMessage — is filled by
-	// W3. Returning nil is the correct drop behavior until then.
-	_ = policy
-	_ = srcQueueName
-	_ = msg
-	_ = reason
+	// Defensive no-op: the caller guards with (p != nil && p.HasDeadLetterExchange),
+	// but the seam must never deref a nil policy or route without a DLX.
+	if policy == nil || !policy.HasDeadLetterExchange {
+		return nil
+	}
+
+	// Resolve the DLX. An absent or otherwise unreadable DLX is a silent drop
+	// (RabbitMQ drops the message; the caller still deletes the source).
+	exchange, err := b.storage.GetExchange(policy.DeadLetterExchange)
+	if err != nil || exchange == nil {
+		return nil
+	}
+
+	// Routing key: the configured x-dead-letter-routing-key when set, else the
+	// message's CURRENT routing key (RabbitMQ preserves the original RK).
+	routingKey := msg.RoutingKey
+	if policy.HasDeadLetterRoutingKey {
+		routingKey = policy.DeadLetterRoutingKey
+	}
+
+	// Clone the message (deep-copy Headers, reset DeliveryTag) and annotate
+	// x-death on the CLONE — never the live pointer. The original routing key
+	// is captured for the x-death routing-keys field BEFORE any rewrite.
+	clone := cloneForDeadLetter(msg)
+
+	originalExpiration := ""
+	if reason == DeadLetterExpired {
+		// Strip Expiration only for expired deaths, recording the original so a
+		// consumer can see the TTL that fired. Rejected/maxlen preserve it.
+		originalExpiration = clone.Expiration
+		clone.Expiration = ""
+	}
+
+	clone.Headers = annotateXDeath(clone.Headers, xDeathEvent{
+		queue:              srcQueueName,
+		reason:             reason,
+		exchange:           msg.Exchange,
+		routingKeys:        []string{msg.RoutingKey},
+		deathTime:          time.Now(),
+		originalExpiration: originalExpiration,
+	})
+
+	// Re-enter routing ONLY through routeMessage (never a second router). The
+	// scratch is pooled and owned by this goroutine until releaseRouteScratch;
+	// republish happens before that release, so iterating rs.queues is safe.
+	rs := acquireRouteScratch()
+	defer releaseRouteScratch(rs)
+	if err := b.routeMessage(exchange, routingKey, clone, rs); err != nil {
+		return nil
+	}
+	if len(rs.queues) == 0 {
+		return nil
+	}
+
+	// Reason-conditional cycle detection (spec §3 item 2), applied as
+	// post-routeMessage PER-TARGET filtering:
+	//   - rejected: skip entirely. RabbitMQ's detect_cycles returns all targets
+	//     for a reject, so an A<->B reject loop cycles forever and must NOT drop.
+	//   - expired/maxlen: drop any target whose queue NAME already appears in the
+	//     message's x-death (which now includes srcQueueName). A fanout DLX with
+	//     one cyclic and one non-cyclic bound queue delivers to the non-cyclic and
+	//     drops only the cyclic one.
+	var cyclic map[string]struct{}
+	if reason != DeadLetterRejected {
+		cyclic = xDeathQueueSet(clone.Headers)
+	}
+
+	// RabbitMQ rewrites the dead-lettered message's exchange to the DLX and its
+	// routing key to the resolved key (dead-letter-routing-key when set, else the
+	// original). A DLQ consumer must see the rewritten values. This runs AFTER
+	// annotateXDeath (which recorded the ORIGINAL exchange + routing key from msg,
+	// not the clone) and AFTER routeMessage (which routed on the resolved key
+	// argument, not clone.RoutingKey), so on a chained A→B→C dead-letter each
+	// x-death entry records that hop's own exchange (the intermediate DLX), not
+	// the original exchange forever.
+	clone.Exchange = policy.DeadLetterExchange
+	clone.RoutingKey = routingKey
+
+	b.republishToTargets(srcQueueName, rs.queues, clone, cyclic)
 	return nil
+}
+
+// republishToTargets enqueues the dead-letter clone into each (non-cyclic)
+// target queue using a NON-BLOCKING enqueue path — the frozen seam requirement
+// so all three Wave 2 consumers (SQ-9 TTL, SQ-10 reject/nack, SQ-11 max-length)
+// inherit it. Unlike the publish hot path (PublishMessage), it MUST NOT call
+// QueueState.WaitForCapacity: a consumer-less dead-letter queue sitting at its
+// high-water mark would otherwise stall basic.reject/nack on the connection's
+// frame goroutine.
+//
+// Baseline overflow behavior is drop-on-full (documented divergence to lock
+// against RabbitMQ in W7, which applies the TARGET queue's own x-overflow).
+// SQ-11 (W5) hooks in at the AtHighWaterMark check below to consult the target's
+// x-overflow policy (drop-head vs reject) instead of the unconditional drop.
+//
+// The per-target copy mirrors the PublishMessage fanout invariant: the first
+// successfully-enqueued target reuses the clone directly; subsequent targets
+// deep-copy Headers so queue copies never share a map pointer.
+func (b *StorageBroker) republishToTargets(srcQueueName string, targets []string, clone *protocol.Message, cyclic map[string]struct{}) {
+	first := true
+	for _, target := range targets {
+		if cyclic != nil {
+			if _, isCyclic := cyclic[target]; isCyclic {
+				continue // per-target cycle drop (expired/maxlen only)
+			}
+		}
+
+		qs := b.getOrCreateQueueState(target)
+
+		// Non-blocking overflow gate (SQ-11 hook). Baseline: drop-on-full.
+		if qs.AtHighWaterMark() {
+			continue
+		}
+
+		msgID := b.globalDeliveryTag.Add(1)
+
+		var storeMsg *protocol.Message
+		if first {
+			clone.DeliveryTag = msgID
+			storeMsg = clone
+		} else {
+			c := *clone
+			c.DeliveryTag = msgID
+			if clone.Headers != nil {
+				h := make(map[string]interface{}, len(clone.Headers))
+				for k, v := range clone.Headers {
+					h[k] = v
+				}
+				c.Headers = h
+			}
+			storeMsg = &c
+		}
+
+		// At-least-once: StoreMessage (durable persistence for a persistent
+		// message) happens here, BEFORE the caller removes the source. A store
+		// failure is a genuine message LOSS (the caller still deletes the source),
+		// so it is made observable — logged and counted via the optional metrics
+		// hook — rather than dropped silently. Behavior is unchanged: drop and
+		// continue.
+		if err := b.storage.StoreMessage(target, storeMsg); err != nil {
+			b.recordDeadLetterDrop(srcQueueName, target, err)
+			continue
+		}
+		qs.Publish(msgID)
+		first = false
+	}
+}
+
+// deadLetterDropRecorder is an OPTIONAL metrics hook. A MetricsCollector may
+// additionally implement it to count dead-letter republishes dropped because the
+// target store failed (a genuine message loss). It is discovered via a type
+// assertion, so existing collectors need not implement it.
+type deadLetterDropRecorder interface {
+	RecordDeadLetterDropped()
+}
+
+// recordDeadLetterDrop surfaces a store-failure drop: a warning log (this cold
+// path is the only logging in the otherwise silent broker package, and a lost
+// message warrants it) plus the optional metrics counter when the configured
+// collector supports it.
+func (b *StorageBroker) recordDeadLetterDrop(srcQueueName, target string, cause error) {
+	log.Printf("WARN: dead-letter republish dropped a message from queue %q to target %q: store failed: %v",
+		srcQueueName, target, cause)
+	if rec, ok := b.metricsCollector.(deadLetterDropRecorder); ok {
+		rec.RecordDeadLetterDropped()
+	}
+}
+
+// cloneForDeadLetter produces a dead-letter copy of msg: a shallow struct copy
+// with a deep-copied Headers map and DeliveryTag reset to 0. Annotation and any
+// Expiration strip happen on this copy so the caller's live message is never
+// mutated. Allocation here is acceptable — this is the cold dead-letter path.
+func cloneForDeadLetter(msg *protocol.Message) *protocol.Message {
+	clone := *msg
+	clone.DeliveryTag = 0
+	if msg.Headers != nil {
+		h := make(map[string]interface{}, len(msg.Headers))
+		for k, v := range msg.Headers {
+			h[k] = v
+		}
+		clone.Headers = h
+	}
+	return &clone
+}
+
+// xDeathQueueSet returns the set of queue names recorded in the message's
+// x-death header. It is the queue-name-only cycle key for expired/maxlen deaths
+// (spec §3 item 2): a target queue is cyclic iff its name appears here. Because
+// annotateXDeath runs before this, the set includes the current source queue, so
+// a DLX routing straight back to the source is correctly detected.
+func xDeathQueueSet(headers map[string]interface{}) map[string]struct{} {
+	set := make(map[string]struct{})
+	arr, ok := headers[xDeathHeader].([]interface{})
+	if !ok {
+		return set
+	}
+	for _, e := range arr {
+		tbl, ok := e.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		if q, ok := tbl[xDeathQueue].(string); ok {
+			set[q] = struct{}{}
+		}
+	}
+	return set
 }
