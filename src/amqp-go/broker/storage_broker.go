@@ -526,9 +526,102 @@ func (b *StorageBroker) finishNack(queueState *QueueState, queueName, consumerTa
 	b.storage.DeletePendingAck(queueName, deliveryTag)
 	if requeue {
 		queueState.Requeue(deliveryTag)
-	} else {
-		b.storage.DeleteMessage(queueName, deliveryTag)
-		queueState.AckAdvance(deliveryTag)
+		return
+	}
+	// requeue==false discard. Dead-letter (reason=rejected) BEFORE deleting the
+	// source: republish StoreMessage precedes DeleteMessage so a crash between
+	// them re-dead-letters on recovery (at-least-once; duplicates OK, matches
+	// RabbitMQ). qs.Policy() is loaded STRICTLY here, inside the requeue==false
+	// branch, so the requeue==true redelivery hot path (and ack, and publish)
+	// pays zero: no load, no map lookup, one not-taken branch.
+	b.deadLetterOnDiscard(queueState, queueName, deliveryTag)
+	b.storage.DeleteMessage(queueName, deliveryTag)
+	queueState.AckAdvance(deliveryTag)
+}
+
+// deadLetterOnDiscard dead-letters a single about-to-be-discarded message with
+// reason=rejected when the queue has a dead-letter exchange configured. It is
+// the shared reject/nack/basic.get-reject hook, invoked only on the cold
+// requeue==false path. The Policy() guard short-circuits before any storage
+// read when no DLX is set, so a queue without dead-lettering pays only one
+// atomic load plus a not-taken branch.
+func (b *StorageBroker) deadLetterOnDiscard(queueState *QueueState, queueName string, deliveryTag uint64) {
+	p := queueState.Policy()
+	if p == nil || !p.HasDeadLetterExchange {
+		return
+	}
+	msg, err := b.storage.GetMessage(queueName, deliveryTag)
+	if err != nil || msg == nil {
+		return
+	}
+	_ = b.deadLetter(p, queueName, msg, DeadLetterRejected)
+}
+
+// discardNackedBatch settles and discards every unacked tag <= upTo for a
+// multi-nack/reject with requeue=false. When the queue has a dead-letter
+// exchange, the per-message DLX republishes are FANNED OUT concurrently and
+// awaited before ANY source message is deleted. This:
+//   - avoids serializing N synchronous WAL group-commit fsyncs on the
+//     connection's frame goroutine — the concurrent StoreMessages coalesce into
+//     shared group commits instead of N sequential fsync latencies; and
+//   - preserves the at-least-once ordering: every republish is durably stored
+//     before its source message is removed, so a crash re-dead-letters on
+//     recovery (duplicates OK, matches RabbitMQ).
+//
+// A single Policy() load is hoisted before the loop (the hot-path zero-cost
+// contract for multi-nack). The gate-credit release still funnels through
+// settle() exactly once per tag.
+func (b *StorageBroker) discardNackedBatch(queueState *QueueState, queueName, consumerTag string, tags []uint64, upTo uint64) {
+	p := queueState.Policy()
+	if p == nil || !p.HasDeadLetterExchange {
+		// No dead-lettering: discard inline in a single pass — no fan-out, no
+		// scratch slice — so a multi-nack on a queue without a DLX pays only the
+		// one hoisted Policy() load (the unset-feature zero-cost contract).
+		for _, tag := range tags {
+			if tag > upTo {
+				continue
+			}
+			if _, won := b.settle(tag); !won {
+				continue
+			}
+			b.storage.NackFromConsumer(queueName, consumerTag, tag)
+			b.storage.DeletePendingAck(queueName, tag)
+			b.storage.DeleteMessage(queueName, tag)
+			queueState.AckAdvance(tag)
+		}
+		return
+	}
+
+	// DLX configured: fan the per-message republishes out concurrently and await
+	// them before deleting any source, so we neither serialize N synchronous WAL
+	// fsyncs nor violate at-least-once ordering.
+	settled := make([]uint64, 0, len(tags))
+	var wg sync.WaitGroup
+	for _, tag := range tags {
+		if tag > upTo {
+			continue
+		}
+		if _, won := b.settle(tag); !won {
+			continue
+		}
+		b.storage.NackFromConsumer(queueName, consumerTag, tag)
+		b.storage.DeletePendingAck(queueName, tag)
+		if msg, err := b.storage.GetMessage(queueName, tag); err == nil && msg != nil {
+			wg.Add(1)
+			go func(m *protocol.Message) {
+				defer wg.Done()
+				_ = b.deadLetter(p, queueName, m, DeadLetterRejected)
+			}(msg)
+		}
+		settled = append(settled, tag)
+	}
+
+	// Ordering barrier: all DLX republishes are durably stored before any source
+	// message is deleted.
+	wg.Wait()
+	for _, tag := range settled {
+		b.storage.DeleteMessage(queueName, tag)
+		queueState.AckAdvance(tag)
 	}
 }
 
@@ -1879,14 +1972,24 @@ func (b *StorageBroker) NacknowledgeMessage(consumerTag string, deliveryTag uint
 		// via settle() (its LoadAndDelete win is the one gate-credit release),
 		// then requeued or discarded. No separately-computed release count.
 		tags, _ := b.storage.GetUnackedTags(state.queueName, consumerTag)
-		for _, tag := range tags {
-			if tag > deliveryTag {
-				continue
+		if requeue {
+			// Requeue is in-memory and DLX-free; the per-tag finishNack path is
+			// cheap. (Its requeue==false branch, and its Policy() load, are never
+			// reached here.)
+			for _, tag := range tags {
+				if tag > deliveryTag {
+					continue
+				}
+				if _, won := b.settle(tag); !won {
+					continue
+				}
+				b.finishNack(queueState, state.queueName, consumerTag, tag, true)
 			}
-			if _, won := b.settle(tag); !won {
-				continue
-			}
-			b.finishNack(queueState, state.queueName, consumerTag, tag, requeue)
+		} else {
+			// requeue==false discard: batch the DLX republishes so we do not
+			// serialize N synchronous WAL group-commit fsyncs on this frame
+			// goroutine (a real latency cliff). One Policy() load is hoisted.
+			b.discardNackedBatch(queueState, state.queueName, consumerTag, tags, deliveryTag)
 		}
 		queueState.SetMinAckCursor(b.storage.GetMinAckCursor(state.queueName))
 	} else {
@@ -2095,6 +2198,10 @@ func (b *StorageBroker) RejectGetDelivery(deliveryTag uint64, requeue bool) erro
 	if requeue {
 		queueState.Requeue(deliveryTag)
 	} else {
+		// Dead-letter (reason=rejected) before discarding, mirroring finishNack:
+		// republish precedes DeleteMessage (at-least-once); Policy() loaded only
+		// on this requeue==false path.
+		b.deadLetterOnDiscard(queueState, queueName, deliveryTag)
 		b.storage.DeleteMessage(queueName, deliveryTag)
 		queueState.AckAdvance(deliveryTag)
 	}

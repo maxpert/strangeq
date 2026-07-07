@@ -22,20 +22,24 @@ func TestDeadLetterReasonConstants(t *testing.T) {
 	}
 }
 
-// TestDeadLetterStub_ReturnsNil pins the frozen DLX-seam signature and its W1
-// stub behavior: dropping (returning nil) is normal, not an error. SQ-10/W3
-// fills the body. The stub must not touch broker state, so a zero-value broker
-// is a valid receiver here.
-func TestDeadLetterStub_ReturnsNil(t *testing.T) {
+// TestDeadLetterNilPolicy_ReturnsNilWithoutTouchingStorage pins the frozen
+// DLX-seam contract for the no-DLX cases: a nil (or DLX-less) policy is a silent
+// no-op that returns nil and never touches broker storage — so a zero-value
+// broker is a valid receiver. The full-body behavior (republish, cycle filter,
+// expiration strip) is covered in dead_letter_body_test.go against a real
+// broker. See also TestDeadLetter_NilPolicyIsNoop.
+func TestDeadLetterNilPolicy_ReturnsNilWithoutTouchingStorage(t *testing.T) {
 	b := &StorageBroker{}
 	msg := &protocol.Message{Exchange: "ex", RoutingKey: "rk", Body: []byte("x")}
 
 	if err := b.deadLetter(nil, "src", msg, DeadLetterRejected); err != nil {
 		t.Errorf("deadLetter(nil policy) = %v, want nil", err)
 	}
-	policy := &QueuePolicy{HasDeadLetterExchange: true, DeadLetterExchange: "dlx"}
-	if err := b.deadLetter(policy, "src", msg, DeadLetterExpired); err != nil {
-		t.Errorf("deadLetter(with policy) = %v, want nil (stub)", err)
+	// A policy with no dead-letter-exchange configured is likewise a no-op: the
+	// caller guard (p != nil && p.HasDeadLetterExchange) would normally prevent
+	// this call, but the seam must be defensive and must not deref nil storage.
+	if err := b.deadLetter(&QueuePolicy{}, "src", msg, DeadLetterExpired); err != nil {
+		t.Errorf("deadLetter(DLX-less policy) = %v, want nil", err)
 	}
 }
 
