@@ -163,6 +163,20 @@ type StorageBroker struct {
 	getDeliveryQueues sync.Map
 	globalDeliveryTag atomic.Uint64
 	metricsCollector  MetricsCollector
+
+	// ttlNow is the wall clock (Unix milliseconds) used by every SQ-9 TTL time
+	// read — publish stamping, the delivery head-check, the reaper, x-expires,
+	// and recovery replay. It is a field (not a package global) so parallel tests
+	// each get an isolated, overridable clock and BenchmarkDeliver_NoTTL_ZeroCost
+	// can install a counting clock to assert the no-TTL delivery path performs
+	// zero clock reads.
+	ttlNow func() int64
+
+	// reaperWG tracks the live per-queue SQ-9 reaper goroutines so Close() can
+	// wait for them to exit before the caller tears down storage. Without the
+	// wait, a reaper mid-sweep could touch a closed store (a data race under
+	// -race and the reaper/claim tests run there).
+	reaperWG sync.WaitGroup
 }
 
 // NewStorageBroker creates a new storage-backed broker instance
@@ -171,11 +185,66 @@ func NewStorageBroker(storage interfaces.Storage, engineConfig interfaces.Engine
 	broker := &StorageBroker{
 		storage:      storage,
 		engineConfig: engineConfig,
+		ttlNow:       func() int64 { return time.Now().UnixMilli() },
 	}
 
 	broker.initializeDefaultExchanges()
 
 	return broker
+}
+
+// ttlNowMillis returns the current wall clock in Unix milliseconds through the
+// broker's (test-overridable) SQ-9 clock.
+func (b *StorageBroker) ttlNowMillis() int64 { return b.ttlNow() }
+
+// SetTTLClock overrides the SQ-9 wall clock. TEST/RECOVERY-simulation use only —
+// it lets a test advance time to expire messages or simulate downtime without
+// real sleeps. Not safe to call concurrently with TTL activity.
+func (b *StorageBroker) SetTTLClock(now func() int64) { b.ttlNow = now }
+
+// Close stops all per-queue background goroutines (the SQ-9 TTL/x-expires
+// reaper) by closing every queue state, then WAITS for every reaper goroutine
+// to exit. It is idempotent and does NOT close the underlying storage — the
+// caller owns that. Production servers should call this on shutdown for a clean
+// stop; tests call it before closing storage so a reaper never touches a closed
+// store (the synchronous wait is what makes that guarantee hold under -race).
+func (b *StorageBroker) Close() {
+	b.queueStates.Range(func(_, v interface{}) bool {
+		v.(*QueueState).Close()
+		return true
+	})
+	b.reaperWG.Wait()
+}
+
+// ringDeleter is the optional storage capability the SQ-9 TTL reaper and
+// delivery head-check use to atomically claim a message removal (the
+// linearization token). DisruptorStorage implements it; a backend that does not
+// falls back to the unconditional DeleteMessage (treated as a win), which is
+// safe because such a backend is used single-writer in the paths that need it.
+type ringDeleter interface {
+	DeleteMessageIfPresent(queueName string, deliveryTag uint64) (bool, error)
+}
+
+// deleteIfPresent removes a message from storage and reports whether THIS call
+// won the removal (the ring CAS). Depth is decremented only by the winner, so at
+// most one of {reaper drop, consumer head-check} decrements depth per tag.
+func (b *StorageBroker) deleteIfPresent(queueName string, tag uint64) bool {
+	if rd, ok := b.storage.(ringDeleter); ok {
+		removed, _ := rd.DeleteMessageIfPresent(queueName, tag)
+		return removed
+	}
+	_ = b.storage.DeleteMessage(queueName, tag)
+	return true
+}
+
+// queueHasConsumers reports whether the queue currently has any registered
+// consumer. Lock-free: queueConsumers stores an immutable slice replaced
+// atomically on register/unregister, so reading its length never races.
+func (b *StorageBroker) queueHasConsumers(queueName string) bool {
+	if val, ok := b.queueConsumers.Load(queueName); ok {
+		return len(val.([]*ConsumerState)) > 0
+	}
+	return false
 }
 
 func (b *StorageBroker) SetMetricsCollector(mc MetricsCollector) {
@@ -433,6 +502,18 @@ func (b *StorageBroker) deliverMessage(queueState *QueueState, state *ConsumerSt
 		return
 	}
 
+	// W4 SQ-9 delivery-time TTL head-check. The single shared Policy() load is
+	// reused by TTL (here) and dead-lettering. Zero-cost when no TTL applies: the
+	// EnqueueUnixMilli==0 gate (an anchor is stamped at publish iff a TTL applied)
+	// short-circuits before any wall-clock read — asserted by
+	// BenchmarkDeliver_NoTTL_ZeroCost. An expired message is dead-lettered
+	// (reason=expired) or dropped instead of delivered.
+	p := queueState.Policy()
+	if message.EnqueueUnixMilli != 0 && messageExpired(message, p, b.ttlNowMillis()) {
+		b.dropExpiredOnDelivery(queueState, state, message, msgID, p)
+		return
+	}
+
 	delivery := &protocol.Delivery{
 		Message:     message,
 		DeliveryTag: msgID,
@@ -482,6 +563,53 @@ func (b *StorageBroker) deliverMessage(queueState *QueueState, state *ConsumerSt
 		if _, won := b.settle(msgID); won {
 			b.finishNack(queueState, state.queueName, state.consumer.Tag, msgID, true)
 		}
+	}
+}
+
+// dropExpiredOnDelivery removes a message that failed the delivery-time TTL
+// head-check instead of delivering it: it dead-letters the message
+// (reason=expired) through the frozen W3 seam when a DLX is configured, then
+// removes it and accounts queue depth. It runs BEFORE deliver()/ClaimInflight,
+// so the message is still counted in `waiting`.
+//
+// Depth accounting is gated on winning the ring removal (deleteIfPresent==true),
+// so it reconciles with the reaper: at most one of {reaper drop, this
+// head-check} decrements depth per tag. On a win it does ReapDrop (waiting-1) —
+// the tag was claimed off the tail but never marked inflight, so only the ready
+// count moves. On a loss (the reaper already reaped this tag), it mirrors the gap
+// path (release the reserved gate credit + GapSkipAdvance) and touches no depth
+// counter — the reaper owns the decrement.
+//
+// Dead-lettering precedes removal (at-least-once, matching finishNack): a rare
+// duplicate dead-letter is possible only in the consumer-registration transition
+// where the reaper and head-check both act on the same queue, which RabbitMQ's
+// at-least-once dead-letter semantics permit.
+func (b *StorageBroker) dropExpiredOnDelivery(qs *QueueState, state *ConsumerState, msg *protocol.Message, tag uint64, p *QueuePolicy) {
+	if p != nil && p.HasDeadLetterExchange {
+		_ = b.deadLetter(p, state.queueName, msg, DeadLetterExpired)
+	}
+	won := b.deleteIfPresent(state.queueName, tag)
+	state.releaseGate(1)
+	if won {
+		qs.ReapDrop()
+	} else {
+		qs.GapSkipAdvance(tag)
+	}
+}
+
+// dropExpiredOnGet is the basic.get sibling of dropExpiredOnDelivery: it
+// dead-letters (reason=expired) or drops a message that failed the TTL
+// head-check during GetMessageForGet, gating the depth decrement on winning the
+// ring removal so it reconciles with the reaper. basic.get holds no prefetch
+// gate, so there is nothing to release.
+func (b *StorageBroker) dropExpiredOnGet(qs *QueueState, queueName string, msg *protocol.Message, tag uint64, p *QueuePolicy) {
+	if p != nil && p.HasDeadLetterExchange {
+		_ = b.deadLetter(p, queueName, msg, DeadLetterExpired)
+	}
+	if b.deleteIfPresent(queueName, tag) {
+		qs.ReapDrop()
+	} else {
+		qs.GapSkipAdvance(tag)
 	}
 }
 
@@ -790,6 +918,11 @@ func (b *StorageBroker) DeclareQueue(name string, durable, autoDelete, exclusive
 		if policy, perr := ResolveQueuePolicy(existing.Arguments); perr == nil {
 			qs.SetPolicy(policy)
 		}
+		// W4 SQ-9: a (re)declare is queue "use" (resets the x-expires idle clock)
+		// and must ensure the reaper is running (e.g. on durable recovery, whose
+		// queues re-enter through this branch).
+		qs.MarkActivity(b.ttlNowMillis())
+		b.maybeStartReaper(name, qs)
 
 		return existing, nil
 	}
@@ -819,7 +952,11 @@ func (b *StorageBroker) DeclareQueue(name string, durable, autoDelete, exclusive
 
 	// Ensure queue state exists and attach the resolved policy (nil when no
 	// known x-arguments were supplied).
-	b.getOrCreateQueueState(name).SetPolicy(policy)
+	qs := b.getOrCreateQueueState(name)
+	qs.SetPolicy(policy)
+	// W4 SQ-9: start the per-queue TTL/x-expires reaper (no-op unless the policy
+	// needs it) and seed the x-expires idle clock from declare time.
+	b.maybeStartReaper(name, qs)
 
 	// Update durable entity metadata if this is a durable queue
 	if queue.Durable {
@@ -1085,6 +1222,14 @@ func (b *StorageBroker) RegisterConsumer(queueName, consumerTag string, consumer
 
 	queueState := b.getOrCreateQueueState(queueName)
 
+	// W4 SQ-9: registering a consumer is queue "use" — it resets the x-expires
+	// idle clock so an about-to-expire queue is kept alive the instant a consumer
+	// attaches, without waiting for the reaper's next periodic re-check. Guarded
+	// by HasQueueExpires so a queue without x-expires pays only one atomic load.
+	if p := queueState.Policy(); p != nil && p.HasQueueExpires {
+		queueState.MarkActivity(b.ttlNowMillis())
+	}
+
 	// A no-ack consumer ignores prefetch entirely (per AMQP 0.9.1) and bypasses
 	// the gate. For an explicit prefetch-count we gate at that limit. For
 	// prefetch-count 0 the spec says "no limit"; we apply a large finite cap
@@ -1296,6 +1441,18 @@ func (b *StorageBroker) PublishMessage(exchangeName, routingKey string, message 
 		return err
 	}
 
+	// W4 SQ-9: stamp the durable TTL anchor (enqueue instant) up front for a
+	// VALID per-message expiration, shared by every fanout copy. Localized here
+	// to keep the W5 (max-length) merge surface minimal; the queue-level
+	// x-message-ttl anchor is stamped per copy in the enqueue loop below (it
+	// needs the target queue's policy). A malformed/negative expiration is NOT
+	// stamped — it has no usable deadline, so stamping an anchor would only make
+	// the delivery head-check recompute a never-expiring deadline forever. No
+	// clock read when no per-message TTL.
+	if _, ok := parsePerMessageTTLMillis(message.Expiration); ok && message.EnqueueUnixMilli == 0 {
+		message.EnqueueUnixMilli = b.ttlNowMillis()
+	}
+
 	// Find target queues based on exchange type and routing. The pooled
 	// scratch keeps this allocation-free; it is owned by this goroutine for
 	// the duration of the call and nothing below retains rs.queues.
@@ -1345,6 +1502,16 @@ func (b *StorageBroker) PublishMessage(exchangeName, routingKey string, message 
 				msgCopy.Headers = h
 			}
 			storeMsg = &msgCopy
+		}
+
+		// W4 SQ-9: stamp the TTL anchor for a queue-level x-message-ttl target
+		// that carried no per-message expiration (that case was stamped up
+		// front). Guarded by the anchor being unset, so a queue without TTL pays
+		// only one atomic Policy() load; no clock read when no TTL applies.
+		if storeMsg.EnqueueUnixMilli == 0 {
+			if p := queueState.Policy(); p != nil && p.HasMessageTTL {
+				storeMsg.EnqueueUnixMilli = b.ttlNowMillis()
+			}
 		}
 
 		// Store to persistent storage
@@ -1403,6 +1570,19 @@ func (b *StorageBroker) PublishMessageTx(txnStore interfaces.Storage, exchangeNa
 		return nil, nil
 	}
 
+	// W4 SQ-9: stamp the durable TTL anchor for a VALID per-message expiration
+	// HERE, in PublishMessageTx, which the tx manager runs at COMMIT time (it
+	// buffers publish operations and executes them inside ExecuteAtomic). Stamping
+	// before txnStore.StoreMessage — NOT in the post-commit visibility closure —
+	// means the anchor is part of the durable WAL write, so a durable tx+TTL
+	// message recovers with its deadline intact and still expires. The stamp
+	// instant is the commit instant (PublishMessageTx runs at commit), so a
+	// tx-published TTL counts from commit. Malformed/negative expiration is not
+	// stamped (see PublishMessage).
+	if _, ok := parsePerMessageTTLMillis(message.Expiration); ok && message.EnqueueUnixMilli == 0 {
+		message.EnqueueUnixMilli = b.ttlNowMillis()
+	}
+
 	deferred := make([]func(), 0, len(targetQueues))
 
 	for i, queueName := range targetQueues {
@@ -1433,12 +1613,24 @@ func (b *StorageBroker) PublishMessageTx(txnStore interfaces.Storage, exchangeNa
 			storeMsg = &msgCopy
 		}
 
+		// W4 SQ-9: stamp the TTL anchor for a queue-level x-message-ttl target that
+		// carried no per-message expiration, per copy (it needs the target queue's
+		// policy). Like the top-of-function stamp this runs at commit time and
+		// BEFORE the durable stage below, so the anchor is persisted.
+		if storeMsg.EnqueueUnixMilli == 0 {
+			if p := queueState.Policy(); p != nil && p.HasMessageTTL {
+				storeMsg.EnqueueUnixMilli = b.ttlNowMillis()
+			}
+		}
+
 		// Stage the store into the transactional view (buffered until commit).
 		if err := txnStore.StoreMessage(queueName, storeMsg); err != nil {
 			return nil, fmt.Errorf("failed to stage message to queue '%s': %w", queueName, err)
 		}
 
-		// Defer visibility until after the atomic commit succeeds.
+		// Defer ONLY consumer visibility until after the atomic commit succeeds.
+		// The TTL anchor is already stamped above (part of the durable write), so
+		// the closure does no TTL work.
 		qs := queueState
 		id := msgID
 		deferred = append(deferred, func() { qs.Publish(id) })
@@ -2079,6 +2271,14 @@ func (b *StorageBroker) GetMessageForGet(queueName string, noAck bool) (*protoco
 
 	queueState := b.getOrCreateQueueState(queueName)
 
+	// W4 SQ-9: load the policy once (shared by the x-expires idle-clock reset and
+	// the TTL head-check below). A basic.get is queue "use", so it resets the
+	// x-expires idle timer.
+	p := queueState.Policy()
+	if p != nil && p.HasQueueExpires {
+		queueState.MarkActivity(b.ttlNowMillis())
+	}
+
 	// Non-blocking claim loop: try requeue ring first, then walk the
 	// tail→head cursor. basic.get is synchronous and must return immediately
 	// if no message is available. Gap tags (from recovered/acked messages)
@@ -2090,7 +2290,15 @@ func (b *StorageBroker) GetMessageForGet(queueName string, noAck bool) (*protoco
 		tag = t
 		message, _ = b.storage.GetMessage(queueName, tag)
 		if message != nil {
-			message.Redelivered = r
+			// W4 SQ-9: drop an expired requeued message instead of returning it;
+			// fall through to the tail cursor for the next candidate.
+			if message.EnqueueUnixMilli != 0 && messageExpired(message, p, b.ttlNowMillis()) {
+				b.dropExpiredOnGet(queueState, queueName, message, tag, p)
+				message = nil
+			}
+			if message != nil {
+				message.Redelivered = r
+			}
 		}
 	}
 
@@ -2108,6 +2316,14 @@ func (b *StorageBroker) GetMessageForGet(queueName string, noAck bool) (*protoco
 			msg, err := b.storage.GetMessage(queueName, tag)
 			if err != nil {
 				queueState.GapSkipAdvance(tag)
+				continue
+			}
+			// W4 SQ-9 delivery-time (basic.get) TTL head-check: dead-letter
+			// (reason=expired) or drop an expired message rather than returning
+			// it, then keep walking the cursor. Depth accounting is gated on the
+			// ring-delete win (see dropExpiredOnGet), reconciling with the reaper.
+			if msg.EnqueueUnixMilli != 0 && messageExpired(msg, p, b.ttlNowMillis()) {
+				b.dropExpiredOnGet(queueState, queueName, msg, tag, p)
 				continue
 			}
 			message = msg
