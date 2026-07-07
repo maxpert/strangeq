@@ -1,6 +1,7 @@
 package broker
 
 import (
+	"log"
 	"time"
 
 	"github.com/maxpert/amqp-go/protocol"
@@ -24,6 +25,13 @@ const (
 	// x-max-length-bytes limit (drop-head overflow).
 	DeadLetterMaxLen DeadLetterReason = "maxlen"
 )
+
+// deadLetterFanoutLimit bounds how many dead-letter republishes run concurrently
+// on the batched multi-nack/reject cold path (discardNackedBatch). It caps the
+// goroutine + storage-I/O fan-out for a large unacked set (e.g. a prefetch-0
+// consumer's window) while still letting enough durable writes overlap to
+// coalesce into shared WAL group commits.
+const deadLetterFanoutLimit = 64
 
 // x-death / x-first-death-* header keys (RabbitMQ dead-letter extension).
 const (
@@ -294,7 +302,18 @@ func (b *StorageBroker) deadLetter(policy *QueuePolicy, srcQueueName string, msg
 		cyclic = xDeathQueueSet(clone.Headers)
 	}
 
-	b.republishToTargets(rs.queues, clone, cyclic)
+	// RabbitMQ rewrites the dead-lettered message's exchange to the DLX and its
+	// routing key to the resolved key (dead-letter-routing-key when set, else the
+	// original). A DLQ consumer must see the rewritten values. This runs AFTER
+	// annotateXDeath (which recorded the ORIGINAL exchange + routing key from msg,
+	// not the clone) and AFTER routeMessage (which routed on the resolved key
+	// argument, not clone.RoutingKey), so on a chained A→B→C dead-letter each
+	// x-death entry records that hop's own exchange (the intermediate DLX), not
+	// the original exchange forever.
+	clone.Exchange = policy.DeadLetterExchange
+	clone.RoutingKey = routingKey
+
+	b.republishToTargets(srcQueueName, rs.queues, clone, cyclic)
 	return nil
 }
 
@@ -314,7 +333,7 @@ func (b *StorageBroker) deadLetter(policy *QueuePolicy, srcQueueName string, msg
 // The per-target copy mirrors the PublishMessage fanout invariant: the first
 // successfully-enqueued target reuses the clone directly; subsequent targets
 // deep-copy Headers so queue copies never share a map pointer.
-func (b *StorageBroker) republishToTargets(targets []string, clone *protocol.Message, cyclic map[string]struct{}) {
+func (b *StorageBroker) republishToTargets(srcQueueName string, targets []string, clone *protocol.Message, cyclic map[string]struct{}) {
 	first := true
 	for _, target := range targets {
 		if cyclic != nil {
@@ -351,13 +370,36 @@ func (b *StorageBroker) republishToTargets(targets []string, clone *protocol.Mes
 
 		// At-least-once: StoreMessage (durable persistence for a persistent
 		// message) happens here, BEFORE the caller removes the source. A store
-		// failure is best-effort dropped (the target may be misconfigured, e.g.
-		// durable message with no WAL); the caller still deletes the source.
+		// failure is a genuine message LOSS (the caller still deletes the source),
+		// so it is made observable — logged and counted via the optional metrics
+		// hook — rather than dropped silently. Behavior is unchanged: drop and
+		// continue.
 		if err := b.storage.StoreMessage(target, storeMsg); err != nil {
+			b.recordDeadLetterDrop(srcQueueName, target, err)
 			continue
 		}
 		qs.Publish(msgID)
 		first = false
+	}
+}
+
+// deadLetterDropRecorder is an OPTIONAL metrics hook. A MetricsCollector may
+// additionally implement it to count dead-letter republishes dropped because the
+// target store failed (a genuine message loss). It is discovered via a type
+// assertion, so existing collectors need not implement it.
+type deadLetterDropRecorder interface {
+	RecordDeadLetterDropped()
+}
+
+// recordDeadLetterDrop surfaces a store-failure drop: a warning log (this cold
+// path is the only logging in the otherwise silent broker package, and a lost
+// message warrants it) plus the optional metrics counter when the configured
+// collector supports it.
+func (b *StorageBroker) recordDeadLetterDrop(srcQueueName, target string, cause error) {
+	log.Printf("WARN: dead-letter republish dropped a message from queue %q to target %q: store failed: %v",
+		srcQueueName, target, cause)
+	if rec, ok := b.metricsCollector.(deadLetterDropRecorder); ok {
+		rec.RecordDeadLetterDropped()
 	}
 }
 

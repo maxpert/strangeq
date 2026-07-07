@@ -594,8 +594,12 @@ func (b *StorageBroker) discardNackedBatch(queueState *QueueState, queueName, co
 
 	// DLX configured: fan the per-message republishes out concurrently and await
 	// them before deleting any source, so we neither serialize N synchronous WAL
-	// fsyncs nor violate at-least-once ordering.
+	// fsyncs nor violate at-least-once ordering. The fan-out is BOUNDED by a
+	// semaphore so a large unacked set (e.g. prefetch-0) cannot spawn thousands of
+	// concurrent storage-I/O goroutines; the cap still lets enough writes overlap
+	// to coalesce into shared WAL group commits.
 	settled := make([]uint64, 0, len(tags))
+	sem := make(chan struct{}, deadLetterFanoutLimit)
 	var wg sync.WaitGroup
 	for _, tag := range tags {
 		if tag > upTo {
@@ -608,8 +612,10 @@ func (b *StorageBroker) discardNackedBatch(queueState *QueueState, queueName, co
 		b.storage.DeletePendingAck(queueName, tag)
 		if msg, err := b.storage.GetMessage(queueName, tag); err == nil && msg != nil {
 			wg.Add(1)
+			sem <- struct{}{} // bounds in-flight republish goroutines
 			go func(m *protocol.Message) {
 				defer wg.Done()
+				defer func() { <-sem }()
 				_ = b.deadLetter(p, queueName, m, DeadLetterRejected)
 			}(msg)
 		}

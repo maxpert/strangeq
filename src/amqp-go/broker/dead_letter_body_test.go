@@ -97,8 +97,9 @@ func TestDeadLetter_DoesNotMutateLiveMessage(t *testing.T) {
 }
 
 // TestDeadLetter_RoutingKeyRewrite verifies x-dead-letter-routing-key overrides
-// the routing key used to route into the DLX, while x-death routing-keys still
-// records the message's ORIGINAL routing key.
+// the routing key used to route into the DLX. RabbitMQ rewrites the DELIVERED
+// message's exchange to the DLX and its routing key to the resolved key, while
+// the x-death entry preserves the message's ORIGINAL exchange + routing key.
 func TestDeadLetter_RoutingKeyRewrite(t *testing.T) {
 	b, cleanup := createTestBroker(t)
 	defer cleanup()
@@ -117,11 +118,98 @@ func TestDeadLetter_RoutingKeyRewrite(t *testing.T) {
 	got := drainOne(t, b, "dlq")
 	require.NotNil(t, got, "message must route via the configured dead-letter-routing-key")
 
+	// Delivered message carries the rewritten exchange + routing key.
+	require.Equal(t, "dead-key", got.RoutingKey,
+		"delivered message RoutingKey must be rewritten to the dead-letter-routing-key")
+	require.Equal(t, "dlx", got.Exchange,
+		"delivered message Exchange must be rewritten to the dead-letter exchange")
+	// Live message untouched.
+	require.Equal(t, "orders.original", msg.RoutingKey)
+	require.Equal(t, "orders-ex", msg.Exchange)
+
 	entries := xDeathEntries(t, got.Headers)
 	require.Len(t, entries, 1)
 	rks := entries[0]["routing-keys"].([]interface{})
 	require.Equal(t, []interface{}{"orders.original"}, rks,
 		"x-death routing-keys must record the message's original routing key, not the DLX rewrite")
+	require.Equal(t, "orders-ex", entries[0]["exchange"],
+		"x-death exchange must record the original exchange, not the DLX")
+}
+
+// TestDeadLetter_RoutingKeyRewrite_DLRKAbsent verifies that with NO
+// x-dead-letter-routing-key the delivered routing key stays the original, but the
+// delivered exchange is still rewritten to the DLX.
+func TestDeadLetter_RoutingKeyRewrite_DLRKAbsent(t *testing.T) {
+	b, cleanup := createTestBroker(t)
+	defer cleanup()
+
+	p := setupDLX(t, b, dlxOpts{
+		exchange: "dlx", exchangeKind: "direct", targets: []string{"dlq"}, bindKey: "orders.original",
+		sourceArgs: map[string]interface{}{"x-dead-letter-exchange": "dlx"},
+	})
+
+	msg := &protocol.Message{Exchange: "orders-ex", RoutingKey: "orders.original", Body: []byte("x")}
+	require.NoError(t, b.deadLetter(p, "src", msg, DeadLetterRejected))
+
+	got := drainOne(t, b, "dlq")
+	require.NotNil(t, got)
+	require.Equal(t, "orders.original", got.RoutingKey,
+		"with no DLRK the delivered routing key stays the original")
+	require.Equal(t, "dlx", got.Exchange,
+		"delivered exchange is always rewritten to the DLX")
+}
+
+// TestDeadLetter_Chained_XDeathRecordsEachHopExchange verifies a chained
+// A->B->C dead-letter: each x-death entry records the exchange the message
+// carried AT THAT HOP (the intermediate DLX), not the original exchange forever.
+// This depends on the delivered message's Exchange being rewritten to the DLX on
+// each hop.
+func TestDeadLetter_Chained_XDeathRecordsEachHopExchange(t *testing.T) {
+	b, cleanup := createTestBroker(t)
+	defer cleanup()
+
+	// ex-b -> qb (qb dead-letters to ex-c); ex-c -> qc.
+	require.NoError(t, b.DeclareExchange("ex-b", "direct", false, false, false, nil))
+	require.NoError(t, b.DeclareExchange("ex-c", "direct", false, false, false, nil))
+	_, err := b.DeclareQueue("qb", false, false, false, map[string]interface{}{
+		"x-dead-letter-exchange": "ex-c",
+	})
+	require.NoError(t, err)
+	require.NoError(t, b.BindQueue("qb", "ex-b", "k", nil))
+	_, err = b.DeclareQueue("qc", false, false, false, nil)
+	require.NoError(t, err)
+	require.NoError(t, b.BindQueue("qc", "ex-c", "k", nil))
+	// qa dead-letters to ex-b.
+	_, err = b.DeclareQueue("qa", false, false, false, map[string]interface{}{
+		"x-dead-letter-exchange": "ex-b",
+	})
+	require.NoError(t, err)
+	pa := b.GetQueuePolicy("qa")
+	pb := b.GetQueuePolicy("qb")
+
+	// Hop 1: dead-letter from qa. Original publish exchange = orders-ex.
+	msg := &protocol.Message{Exchange: "orders-ex", RoutingKey: "k", Body: []byte("x")}
+	require.NoError(t, b.deadLetter(pa, "qa", msg, DeadLetterRejected))
+
+	msgB := drainOne(t, b, "qb")
+	require.NotNil(t, msgB)
+	require.Equal(t, "ex-b", msgB.Exchange, "message in qb carries the intermediate DLX as its exchange")
+	eb := xDeathEntries(t, msgB.Headers)
+	require.Len(t, eb, 1)
+	require.Equal(t, "orders-ex", eb[0]["exchange"], "qa hop records the original exchange")
+
+	// Hop 2: dead-letter the qb copy onward to ex-c.
+	require.NoError(t, b.deadLetter(pb, "qb", msgB, DeadLetterRejected))
+
+	msgC := drainOne(t, b, "qc")
+	require.NotNil(t, msgC)
+	require.Equal(t, "ex-c", msgC.Exchange)
+	ec := xDeathEntries(t, msgC.Headers)
+	require.Len(t, ec, 2)
+	require.Equal(t, "qb", ec[0]["queue"], "most recent death first")
+	require.Equal(t, "ex-b", ec[0]["exchange"], "qb hop records the intermediate DLX (ex-b), not orders-ex")
+	require.Equal(t, "qa", ec[1]["queue"])
+	require.Equal(t, "orders-ex", ec[1]["exchange"], "qa hop still records the original exchange")
 }
 
 // TestDeadLetter_AbsentDLXDrops verifies a policy referencing a non-existent DLX
