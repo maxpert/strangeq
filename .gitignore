@@ -74,3 +74,6 @@ Thumbs.db
 # Planning docs (kept local, not tracked in git)
 docs/plan.md
 issues.md
+
+# SDD orchestration scratch (local only)
+.superpowers/
