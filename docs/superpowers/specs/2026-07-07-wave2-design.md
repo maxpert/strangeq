@@ -32,7 +32,7 @@ different-args 406 fix (all deferred to a later pass).
 | No-regression gate | **Automated benchstat gate + RabbitMQ conformance suite** | Objective per-PR perf gate + provable wire parity. |
 | SQ-12 memory metric | **Process RSS / cgroup** (not Go heap) | A `HeapInuse`-only alarm misses off-heap WAL mmap and never fires before real OOM. |
 | SQ-9 TTL reclaim | **Delivery-time head-check + bounded coarse sweep** | Contract-identical to RabbitMQ, internally better (no unbounded head-of-line retention). |
-| SQ-12 backpressure | **Full per-connection reader-pause** (true TCP backpressure) | Faithful to RabbitMQ; no messages dropped. Carries three correctness bugs that MUST be handled (see W6). |
+| SQ-12 backpressure | **Block only publishing connections** (reader-pause gated on `HasPublished`; consumer/ack/control traffic stays live) | REVISED during W6 review: the original "full per-connection reader-pause" was found *not* RabbitMQ-faithful and could livelock a memory alarm (throttled acks can't drain the queue that would relieve memory). RabbitMQ blocks only publishers and keeps consumers/acks flowing. Still handles the three reader-pause correctness bugs (see W6). |
 | Fidelity extras | **Deferred** | `x-last-death-*` + redeclare-406 held for a later pass. |
 
 **Standing performance gate (non-negotiable):** every feature **unset** must cost at
@@ -304,7 +304,10 @@ Fully independent of the DLX seam (disjoint files except the `basic_handlers.go`
 `connection_handlers.go` capability, both coordinated in W1). Add an `AlarmMonitor` (global
 `atomic.Uint32` bitmask: bit0 memory, bit1 disk) on a dedicated faster ticker; emit
 blocked/unblocked on edges to opted-in clients; gate publishes at the top of
-`processCompleteMessage`; pause the per-connection reader as TCP backpressure while alarmed.
+`processCompleteMessage`; pause the per-connection reader as TCP backpressure while alarmed —
+**but only for connections that have published** (`Connection.HasPublished`), so consumer-only
+connections keep acking and a memory alarm can drain and clear (RabbitMQ blocks only publishers;
+revised from the original "full reader-pause" during W6 review — see the decisions table).
 
 Acceptance criteria:
 - **All emission gated on the CLIENT's advertised `connection.blocked` capability** (stored
