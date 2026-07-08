@@ -225,6 +225,7 @@ func (b *ServerBuilder) Build() (*Server, error) {
 		// Create storage-backed broker using the storage we just created
 		// Phase 6G: Pass engine config for tunable parameters
 		storageBroker := broker.NewStorageBroker(storageImpl, b.config.GetEngine())
+		storageBroker.SetLogger(logger)
 		unifiedBroker = NewStorageBrokerAdapter(storageBroker)
 	}
 

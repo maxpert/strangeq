@@ -33,6 +33,10 @@ RabbitMQ is the gold standard for AMQP 0.9.1, but it runs on the Erlang VM — a
 - `basic.recover` for redelivering unacknowledged messages
 - `queue.purge` for removing all messages from a queue
 - `channel.flow` / `channel.flow-ok` for start/stop of content frames
+- Message & queue TTL — `x-message-ttl`, per-message `expiration`, and `x-expires` idle-queue expiry
+- Dead-letter exchanges — `x-dead-letter-exchange` / `x-dead-letter-routing-key` with full `x-death` / `x-first-death-*` headers
+- Queue length limits — `x-max-length` / `x-max-length-bytes` with `x-overflow` (`drop-head`, `reject-publish`)
+- Resource alarms — `connection.blocked` / `connection.unblocked` driven by memory (RSS) and free-disk watermarks
 - 1.27–1.39x faster throughput than RabbitMQ 4.3 on same hardware (see benchmarks below)
 - Prometheus metrics and pprof profiling
 - Lock-free per-queue ring buffer with per-slot CAS
@@ -296,6 +300,7 @@ AMQP_TARGET=rabbitmq go test . -run='^$' -bench="BenchmarkVersus" -benchmem -ben
 | `connection.tune` / `tune-ok` | Yes | Yes |
 | `connection.open` / `open-ok` | Yes | Yes |
 | `connection.close` / `close-ok` | Yes | Yes |
+| `connection.blocked` / `unblocked` | Yes (memory/disk alarms) | Yes |
 | `connection.secure` / `secure-ok` | No | Yes |
 | `channel.open` / `open-ok` | Yes | Yes |
 | `channel.close` / `close-ok` | Yes | Yes |
@@ -356,16 +361,40 @@ AMQP_TARGET=rabbitmq go test . -run='^$' -bench="BenchmarkVersus" -benchmem -ben
 | Crash recovery | Yes | Yes |
 | Bindings persistence | Yes | Yes |
 
+### RabbitMQ Extensions (queue `x-arguments`)
+
+| Extension | StrangeQ | Notes |
+|-----------|----------|-------|
+| `x-message-ttl` (per-queue) | Yes | Message expires after N ms in the queue |
+| Per-message `expiration` | Yes | Effective TTL = min(per-message, per-queue) |
+| `x-expires` (queue TTL) | Yes | Idle queue auto-deletes after N ms with no consumers/get/redeclare |
+| `x-dead-letter-exchange` | Yes | Rejected / expired / evicted messages re-routed through the normal router |
+| `x-dead-letter-routing-key` | Yes | Overrides the routing key on dead-letter (else the original key is kept) |
+| `x-death` / `x-first-death-*` headers | Yes | Full array-of-tables with `count`/`reason`/`queue`/`time`/`exchange`/`routing-keys` aggregation |
+| `x-max-length` | Yes | Cap on ready message count |
+| `x-max-length-bytes` | Yes | Cap on ready message bytes |
+| `x-overflow` | Yes | `drop-head` (evict oldest → DLX) or `reject-publish` (nack/return/drop the incoming message) |
+| `x-last-death-*` headers | No | Deferred; only `x-first-death-*` + the `x-death` array are emitted |
+| `x-max-priority` (priority queues) | No | See Not Yet Supported |
+
+Dead-letter `reason` values match RabbitMQ: `rejected` (nack/reject with requeue=false), `expired` (TTL), `maxlen` (drop-head eviction). Cycle detection matches RabbitMQ too — a `rejected` loop is not broken (it cycles), while `expired`/`maxlen` are dropped on a queue-name match.
+
+### Behavioral Divergences from RabbitMQ
+
+StrangeQ is wire-compatible, but a few observable behaviors intentionally differ. All are verified against RabbitMQ 4.3 by the conformance suite (`make conformance-rabbitmq`):
+
+- **`mandatory` + full `reject-publish` queue**: StrangeQ returns the message via `basic.return` (reply code 312); RabbitMQ does not return a routable-but-full message.
+- **`x-message-ttl: 0` / `expiration: 0` with no ready consumer**: the message is dropped. StrangeQ has no publish-time direct hand-off to a waiting consumer, so a zero-TTL message cannot be delivered-before-expiry.
+- **Malformed / non-numeric per-message `expiration`**: treated as "no TTL" (lenient) rather than a channel error.
+- **`reject-publish` inside a transaction**: not enforced (a tx-published message to a full reject-publish queue is accepted); `drop-head` inside a transaction *is* enforced.
+
 ### Not Yet Supported
 
 The following RabbitMQ features are not implemented:
 
 - Clustering and high availability
-- Dead-letter exchange (DLX)
-- Message TTL and queue TTL (`x-expires`)
 - Priority queues (`x-max-priority`)
 - Lazy queues (`x-queue-mode`)
-- Max length / max length bytes (`x-max-length`, `x-max-length-bytes`)
 - Consumer priorities (`x-priority`)
 - `connection.secure` / `secure-ok` (multi-step challenge-response auth)
 - SASL EXTERNAL

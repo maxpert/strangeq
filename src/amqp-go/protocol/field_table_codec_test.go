@@ -288,3 +288,48 @@ func TestDecodeFieldTableEmpty(t *testing.T) {
 		t.Errorf("expected empty table, got %v", decoded)
 	}
 }
+
+// TestDecimalRoundTrip pins the AMQP decimal-value 'D' encode path. Before it
+// existed, DecodeFieldTable could PRODUCE a Decimal (from an inbound header) but
+// writeFieldValue had no encode case, so persisting such a header errored — and
+// appendMessageExtensions turned that error into an EMPTY table, silently
+// dropping EVERY header (including x-death) on that message. This asserts the
+// Decimal itself round-trips AND that sibling headers survive alongside it.
+func TestDecimalRoundTrip(t *testing.T) {
+	original := map[string]interface{}{
+		"price": Decimal{Scale: 2, Value: 12345}, // 123.45
+		"neg":   Decimal{Scale: 4, Value: -67890},
+		"note":  "kept",
+		"count": int64(7),
+		"x-death-ish": []interface{}{
+			map[string]interface{}{"queue": "q1", "count": int64(1)},
+		},
+	}
+
+	encoded, err := EncodeFieldTable(original)
+	if err != nil {
+		t.Fatalf("EncodeFieldTable failed (Decimal must be encodable): %v", err)
+	}
+	decoded, err := DecodeFieldTable(encoded)
+	if err != nil {
+		t.Fatalf("DecodeFieldTable failed: %v", err)
+	}
+
+	if d, ok := decoded["price"].(Decimal); !ok || d.Scale != 2 || d.Value != 12345 {
+		t.Fatalf("price Decimal did not round-trip: got %#v", decoded["price"])
+	}
+	if d, ok := decoded["neg"].(Decimal); !ok || d.Scale != 4 || d.Value != -67890 {
+		t.Fatalf("neg Decimal did not round-trip: got %#v", decoded["neg"])
+	}
+	// The regression guard: sibling headers must NOT be lost because a Decimal
+	// shares the table.
+	if decoded["note"] != "kept" {
+		t.Fatalf("sibling string header lost: got %#v", decoded["note"])
+	}
+	if decoded["count"] != int64(7) {
+		t.Fatalf("sibling int64 header lost: got %#v", decoded["count"])
+	}
+	if _, ok := decoded["x-death-ish"].([]interface{}); !ok {
+		t.Fatalf("sibling array header lost: got %#v", decoded["x-death-ish"])
+	}
+}

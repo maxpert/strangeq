@@ -1,9 +1,9 @@
 package broker
 
 import (
-	"log"
 	"time"
 
+	"github.com/maxpert/amqp-go/interfaces"
 	"github.com/maxpert/amqp-go/protocol"
 )
 
@@ -455,8 +455,12 @@ type deadLetterDropRecorder interface {
 // message warrants it) plus the optional metrics counter when the configured
 // collector supports it.
 func (b *StorageBroker) recordDeadLetterDrop(srcQueueName, target string, cause error) {
-	log.Printf("WARN: dead-letter republish dropped a message from queue %q to target %q: store failed: %v",
-		srcQueueName, target, cause)
+	if b.logger != nil {
+		b.logger.Warn("dead-letter republish dropped a message: store failed",
+			interfaces.LogField{Key: "source_queue", Value: srcQueueName},
+			interfaces.LogField{Key: "target_exchange", Value: target},
+			interfaces.LogField{Key: "error", Value: cause})
+	}
 	if rec, ok := b.metricsCollector.(deadLetterDropRecorder); ok {
 		rec.RecordDeadLetterDropped()
 	}
@@ -470,8 +474,11 @@ func (b *StorageBroker) recordDeadLetterDrop(srcQueueName, target string, cause 
 // vanishing dead-letter is still worth surfacing — a WARN plus the shared optional
 // metrics counter.
 func (b *StorageBroker) recordDeadLetterOverflow(srcQueueName, target string) {
-	log.Printf("WARN: dead-letter from queue %q dropped: target %q is at its x-max-length with x-overflow=reject-publish",
-		srcQueueName, target)
+	if b.logger != nil {
+		b.logger.Warn("dead-letter dropped: target is at x-max-length with x-overflow=reject-publish",
+			interfaces.LogField{Key: "source_queue", Value: srcQueueName},
+			interfaces.LogField{Key: "target_exchange", Value: target})
+	}
 	if rec, ok := b.metricsCollector.(deadLetterDropRecorder); ok {
 		rec.RecordDeadLetterDropped()
 	}

@@ -843,6 +843,17 @@ func writeFieldValue(value interface{}) ([]byte, error) {
 		binary.BigEndian.PutUint32(buf[1:5], uint32(len(v)))
 		copy(buf[5:], v)
 		return buf, nil
+	case Decimal:
+		// AMQP decimal-value: type 'D', one scale octet, then a 4-byte signed
+		// integer. This is the encode counterpart of the decode at the 'D' case
+		// below; without it a message header of this type failed to encode and
+		// (via appendMessageExtensions' error handling) dropped the ENTIRE header
+		// table — including x-death — on persist.
+		buf := make([]byte, 6)
+		buf[0] = 'D'
+		buf[1] = v.Scale
+		binary.BigEndian.PutUint32(buf[2:6], uint32(v.Value))
+		return buf, nil
 	case nil:
 		return []byte{'V'}, nil
 	default:

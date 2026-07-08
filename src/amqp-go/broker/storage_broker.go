@@ -163,6 +163,10 @@ type StorageBroker struct {
 	getDeliveryQueues sync.Map
 	globalDeliveryTag atomic.Uint64
 	metricsCollector  MetricsCollector
+	// logger is used only on cold paths (e.g. a dropped dead-letter). nil is
+	// treated as "no logging" so callers that never wire one pay nothing; the
+	// server builder injects its interfaces.Logger via SetLogger.
+	logger interfaces.Logger
 
 	// ttlNow is the wall clock (Unix milliseconds) used by every SQ-9 TTL time
 	// read — publish stamping, the delivery head-check, the reaper, x-expires,
@@ -249,6 +253,13 @@ func (b *StorageBroker) queueHasConsumers(queueName string) bool {
 
 func (b *StorageBroker) SetMetricsCollector(mc MetricsCollector) {
 	b.metricsCollector = mc
+}
+
+// SetLogger wires a structured logger for the broker's cold-path warnings
+// (e.g. a dead-letter dropped because its target is full or its store failed).
+// nil disables broker logging. Not called on any hot path.
+func (b *StorageBroker) SetLogger(l interfaces.Logger) {
+	b.logger = l
 }
 
 func (b *StorageBroker) UpdateConsumerPrefetch(consumerTag string, prefetchCount uint16) {

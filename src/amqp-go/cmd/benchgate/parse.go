@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"fmt"
+	"os"
 	"strconv"
 	"strings"
 )
@@ -118,7 +119,16 @@ func parseBenchstatCSV(csvOutput []byte) ([]benchResult, error) {
 		vsBase := fields[len(fields)-2]
 		r := benchResult{metric: metric, name: name, status: statusCompared}
 		switch vsBase {
-		case "~", "", "?":
+		case "~", "":
+			// benchstat's own two-sample test called this non-significant noise.
+			results = append(results, r)
+			continue
+		case "?":
+			// "?" means benchstat could not compute significance — usually too
+			// few samples on one side (a truncated / under-sampled run). It never
+			// gates, but swallowing it silently could turn a broken run green, so
+			// surface it as a warning rather than treating it as clean "~".
+			fmt.Fprintf(os.Stderr, "benchgate: WARNING: %s %s has no significance (\"?\" — likely too few samples); not gated, but the run may be unreliable\n", name, metric)
 			results = append(results, r)
 			continue
 		}
