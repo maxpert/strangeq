@@ -73,6 +73,18 @@ type NetworkConfig struct {
 	// growing memory without bound. Must exceed ReaderOverflowFlowBytes.
 	// Default: 64 MiB. 0 disables the cap (unbounded — not recommended).
 	ReaderOverflowHardCapBytes int64
+
+	// ReaderBackpressureProbeMS bounds how long the reader blocks handing a
+	// buffered frame to a full FrameQueue before it breaks out to read exactly
+	// one more frame off the socket (SQ-13). While backlogged the reader blocks
+	// on the FrameQueue hand-off rather than reading more publishes — not reading
+	// IS the TCP backpressure that paces the producer to the consumer's drain
+	// rate. The probe interval keeps acks and control frames trapped behind a
+	// flood on a shared connection flowing (read within one interval), preventing
+	// the ack-starvation / consume-staleness deadlocks. Smaller = more responsive
+	// ack draining under sustained backpressure at the cost of more wakeups.
+	// Default: 5 ms. <=0 falls back to the default.
+	ReaderBackpressureProbeMS int64
 }
 
 // StorageConfig holds storage-related configuration

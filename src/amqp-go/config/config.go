@@ -30,6 +30,7 @@ func DefaultConfig() *AMQPConfig {
 
 			ReaderOverflowFlowBytes:    8 << 20,  // 8 MiB: assert channel.flow(false)
 			ReaderOverflowHardCapBytes: 64 << 20, // 64 MiB: close the connection
+			ReaderBackpressureProbeMS:  5,        // 5 ms reader-backpressure probe (SQ-13)
 		},
 		Storage: interfaces.StorageConfig{
 			Path:                 "./data",
@@ -159,6 +160,10 @@ func (c *AMQPConfig) Validate() error {
 
 	if c.Network.MaxConnections <= 0 {
 		return fmt.Errorf("max connections must be positive: %d", c.Network.MaxConnections)
+	}
+
+	if c.Network.ReaderBackpressureProbeMS < 0 {
+		return fmt.Errorf("reader backpressure probe interval must be non-negative: %d ms", c.Network.ReaderBackpressureProbeMS)
 	}
 
 	// Validate storage configuration
