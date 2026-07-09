@@ -82,6 +82,12 @@ type Server struct {
 	// leaves it at the default.
 	alarmParkProbe time.Duration
 
+	// readerBackpressureProbe overrides the reader-backpressure hand-off probe
+	// interval (SQ-13). Zero falls back to Config.Network.ReaderBackpressureProbeMS
+	// (and then to defaultReaderBackpressureProbe). Tests set it small; production
+	// leaves it unset and drives it from config.
+	readerBackpressureProbe time.Duration
+
 	// alarmCancel stops the alarm monitor goroutine on shutdown; nil when the
 	// monitor was never started.
 	alarmCancel context.CancelFunc
@@ -594,6 +600,26 @@ func (s *Server) processConnectionFrames(conn *protocol.Connection) {
 	<-confirmFlusherDone
 }
 
+// defaultReaderBackpressureProbe bounds how long the reader blocks handing a
+// buffered frame to a full FrameQueue before it breaks out to read exactly one
+// more frame off the socket (SQ-13), when neither the Server test-override nor
+// Config.Network.ReaderBackpressureProbeMS is set.
+const defaultReaderBackpressureProbe = 5 * time.Millisecond
+
+// readerBackpressureProbeInterval is the reader-backpressure hand-off probe
+// interval (SQ-13). The Server test-override wins; otherwise it is driven from
+// Config.Network.ReaderBackpressureProbeMS, falling back to
+// defaultReaderBackpressureProbe when that is unset. Mirrors alarmParkProbe.
+func (s *Server) readerBackpressureProbeInterval() time.Duration {
+	if s.readerBackpressureProbe > 0 {
+		return s.readerBackpressureProbe
+	}
+	if ms := s.Config.Network.ReaderBackpressureProbeMS; ms > 0 {
+		return time.Duration(ms) * time.Millisecond
+	}
+	return defaultReaderBackpressureProbe
+}
+
 // readFrames reads frames from TCP connection and enqueues them for processing
 // This goroutine NEVER blocks on frame processing - it only reads and enqueues
 func (s *Server) readFrames(conn *protocol.Connection, done chan struct{}) {
@@ -628,6 +654,17 @@ func (s *Server) readFrames(conn *protocol.Connection, done chan struct{}) {
 	flowPaused := false
 	flowLimit := s.Config.Network.ReaderOverflowFlowBytes
 	hardCap := s.Config.Network.ReaderOverflowHardCapBytes
+
+	// backpressureProbe bounds the reader-backpressure hand-off block (SQ-13):
+	// while a backlog persists the reader blocks on the FrameQueue hand-off (not
+	// reading the socket IS the backpressure) but breaks out every probe interval
+	// to read exactly one frame, keeping acks + control frames flowing. Created
+	// stopped and armed via Reset only while backlogged. Go 1.23+ timer semantics
+	// guarantee Stop/Reset never leave a stale tick, so no manual channel drain is
+	// needed.
+	backpressureProbe := time.NewTimer(time.Hour)
+	backpressureProbe.Stop()
+	defer backpressureProbe.Stop()
 
 	// The channel.flow writes are issued from a dedicated sender goroutine, NOT
 	// from the reader. The reader must never block — not even on the connection
@@ -712,6 +749,49 @@ func (s *Server) readFrames(conn *protocol.Connection, done chan struct{}) {
 			}
 		}
 
+		// SQ-13 reader TCP backpressure: a surviving backlog means the FrameQueue
+		// is full and processFrames is parked (typically in
+		// QueueState.WaitForCapacity). Rather than keep reading publishes off the
+		// socket into unbounded memory (the old buffer-until-hard-cap-close
+		// behaviour), BLOCK on the FrameQueue hand-off. Not reading the socket IS
+		// the backpressure: the kernel RX window fills, the producer's write()
+		// blocks, and the producer is paced to processFrames' drain rate — which,
+		// on a shared publish+consume connection, is the consumer's drain rate.
+		//
+		// The block is bounded by a probe timer. On timeout the reader breaks out
+		// to read EXACTLY ONE frame (with a read deadline armed below) so an ack or
+		// control frame trapped behind the flood is still read within one probe
+		// interval: acks divert to AckQueue (never blocked on broker backpressure)
+		// releasing the prefetch gate, and control frames (esp. basic.consume) are
+		// buffered and eventually processed. This is what keeps the
+		// backpressure-relief path live and avoids the ack-starvation and
+		// consume-staleness deadlocks. The reader still never blocks on a socket
+		// write or the WriteMutex — only on this one channel send.
+		backpressureProbed := false
+		if len(pending) > 0 {
+			// Capture Size before the send: processFrames may pool the frame the
+			// instant it receives it (mirrors the opportunistic drain above).
+			head := pending[0]
+			headSize := int64(head.Size)
+			backpressureProbe.Reset(s.readerBackpressureProbeInterval())
+			select {
+			case conn.FrameQueue <- head:
+				backpressureProbe.Stop()
+				pendingBytes -= headSize
+				pending[0] = nil
+				pending = pending[1:]
+				continue
+			case <-conn.Done:
+				backpressureProbe.Stop()
+				return
+			case <-backpressureProbe.C:
+				// Probe fired: fall through to read EXACTLY ONE frame (bounded by
+				// the read deadline armed below), then loop back and re-park. This
+				// keeps acks + control frames flowing while backlogged.
+				backpressureProbed = true
+			}
+		}
+
 		// SQ-12 reader-pause backpressure: one atomic load per iteration (the hot
 		// per-frame gate; zero-cost when unset). While a resource alarm is active
 		// stop pulling application frames so TCP backpressure throttles the
@@ -749,6 +829,16 @@ func (s *Server) readFrames(conn *protocol.Connection, done chan struct{}) {
 			// peer surfaces as a read error (heartbeat-disabled liveness bug).
 			conn.Conn.SetReadDeadline(time.Now().Add(s.alarmParkProbeInterval()))
 			deadlineActive = true
+		case backpressureProbed:
+			// Heartbeats disabled but we broke out of the backpressure hand-off to
+			// read one frame (SQ-13): bound the read so a quiet-but-alive backlogged
+			// peer times out and re-parks (re-attempting the hand-off, which now
+			// succeeds if the consumer has drained) instead of blocking here while
+			// pending frames wait — and so a wedged peer with conn.Done still open
+			// is not read indefinitely. A dead/half-closed peer surfaces via EOF or
+			// a TCP-keepalive error (both non-timeout) and closes below.
+			conn.Conn.SetReadDeadline(time.Now().Add(s.readerBackpressureProbeInterval()))
+			deadlineActive = true
 		case deadlineActive:
 			// hb==0 and not probing: clear the stale probe deadline exactly once
 			// so a normal blocking read resumes.
@@ -769,6 +859,14 @@ func (s *Server) readFrames(conn *protocol.Connection, done chan struct{}) {
 				} else if probing && s.alarmState.Load() != 0 {
 					// Liveness probe timed out on a quiet, still-blocked peer with
 					// heartbeats disabled — not a death. Re-park instead of closing.
+					continue
+				} else if backpressureProbed {
+					// SQ-13: the bounded backpressure-probe read timed out on a
+					// quiet-but-alive backlogged peer (hb==0) — not a death. Re-park
+					// on the FrameQueue hand-off; the loop re-drains pending first, so
+					// a slot freed by the consumer meanwhile is used immediately. A
+					// genuinely dead peer surfaces as EOF / a keepalive error (handled
+					// below), not a timeout.
 					continue
 				}
 			} else if err.Error() == "EOF" {

@@ -11,19 +11,25 @@ import (
 )
 
 // ============================================================================
-// SQ-0 step 6: reader-overflow backpressure (design §6.1)
+// SQ-0 step 6 reader-overflow backstops, re-scoped for SQ-13 reader
+// backpressure.
 //
-// The reader buffers non-ack frames it cannot hand to a publish-stalled
-// processFrames, so it keeps draining the socket and diverting acks. That buffer
-// is bounded by TWO per-connection mechanisms:
-//   - a soft threshold that asserts channel.flow(active=false) to the client
+// Under SQ-13 the reader BLOCKS on the FrameQueue hand-off while backlogged
+// (blocking IS the backpressure), so on a healthy connection the backlog is
+// paced to the consumer's drain rate and never accumulates. The two SQ-0
+// backstops therefore now fire ONLY for a GENUINELY WEDGED flooder: a client
+// that floods publishes AND never lets its own FrameQueue drain. In that state
+// the reader's probe breaks the hand-off block every probe interval to read one
+// more frame, so the backlog still grows one frame per probe interval into:
+//   - the soft threshold that asserts channel.flow(active=false) to the client
 //     (best-effort ask to pause publishing), and
-//   - a hard cap that closes the connection (a client that ignores flow, or a
-//     pure-publish flood, must not grow reader memory without bound).
+//   - the hard cap that closes the connection (memory must not grow without
+//     bound even for a peer that ignores flow and never drains).
 //
-// These tests drive readFrames directly with a synchronous net.Pipe and no
-// processFrames goroutine, so FrameQueue never drains and the reader is forced
-// down the overflow path.
+// These tests drive readFrames directly over a synchronous net.Pipe with NO
+// drainer on FrameQueue — modelling exactly that wedged flooder — and set a
+// small backpressure probe so the probe reads advance to the cap/threshold
+// promptly and deterministically.
 // ============================================================================
 
 // nonAckPublishFrameBytes builds the wire bytes of a basic.publish method frame
@@ -56,9 +62,11 @@ func newOverflowTestConn(serverConn net.Conn) *protocol.Connection {
 	}
 }
 
-// TestReaderOverflowHardCapClosesConnection verifies the hard cap: when the
-// buffered inbound-frame bytes exceed ReaderOverflowHardCapBytes, the reader
-// closes the connection instead of buffering without bound.
+// TestReaderOverflowHardCapClosesConnection verifies the hard cap for a wedged
+// flooder: with FrameQueue never drained the reader blocks on the hand-off, but
+// its probe reads one more frame per interval, so the backlog still crosses
+// ReaderOverflowHardCapBytes and the reader closes the connection instead of
+// buffering without bound.
 func TestReaderOverflowHardCapClosesConnection(t *testing.T) {
 	clientConn, serverConn := net.Pipe()
 	defer clientConn.Close()
@@ -66,14 +74,16 @@ func TestReaderOverflowHardCapClosesConnection(t *testing.T) {
 	srv := makeTestServer()
 	srv.Config.Network.ReaderOverflowFlowBytes = 0 // isolate the hard cap
 	srv.Config.Network.ReaderOverflowHardCapBytes = 200
+	srv.readerBackpressureProbe = time.Millisecond // advance the wedged backlog promptly
 
 	conn := newOverflowTestConn(serverConn)
 
 	readerDone := make(chan struct{})
 	go srv.readFrames(conn, readerDone)
 
-	// Flood ~104-byte publish frames. FrameQueue(1) swallows the first; the rest
-	// pile into pending and cross the 200-byte hard cap within a few frames.
+	// Flood ~104-byte publish frames. FrameQueue(1) swallows the first, the next
+	// parks the reader on the hand-off, and each probe read piles one more frame
+	// into pending — crossing the 200-byte hard cap within a couple of probes.
 	go func() {
 		data := nonAckPublishFrameBytes(t, 100)
 		for i := 0; i < 100; i++ {
@@ -94,8 +104,9 @@ func TestReaderOverflowHardCapClosesConnection(t *testing.T) {
 	}
 }
 
-// TestReaderOverflowAssertsChannelFlow verifies the soft threshold: crossing
-// ReaderOverflowFlowBytes makes the reader send channel.flow(active=false) to
+// TestReaderOverflowAssertsChannelFlow verifies the soft threshold for a wedged
+// flooder: with FrameQueue never drained the probe reads grow the backlog past
+// ReaderOverflowFlowBytes, making the reader send channel.flow(active=false) to
 // the client, without closing the connection.
 func TestReaderOverflowAssertsChannelFlow(t *testing.T) {
 	clientConn, serverConn := net.Pipe()
@@ -104,6 +115,7 @@ func TestReaderOverflowAssertsChannelFlow(t *testing.T) {
 	srv := makeTestServer()
 	srv.Config.Network.ReaderOverflowFlowBytes = 200
 	srv.Config.Network.ReaderOverflowHardCapBytes = 1 << 30 // effectively disabled
+	srv.readerBackpressureProbe = time.Millisecond          // advance the wedged backlog promptly
 
 	conn := newOverflowTestConn(serverConn)
 	conn.Channels.Store(uint16(1), protocol.NewChannel(1, conn))
