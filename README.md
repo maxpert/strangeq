@@ -37,7 +37,8 @@ RabbitMQ is the gold standard for AMQP 0.9.1, but it runs on the Erlang VM — a
 - Dead-letter exchanges — `x-dead-letter-exchange` / `x-dead-letter-routing-key` with full `x-death` / `x-first-death-*` headers
 - Queue length limits — `x-max-length` / `x-max-length-bytes` with `x-overflow` (`drop-head`, `reject-publish`)
 - Resource alarms — `connection.blocked` / `connection.unblocked` driven by memory (RSS) and free-disk watermarks
-- 1.27–1.39x faster throughput than RabbitMQ 4.3 on same hardware (see benchmarks below)
+- Exclusive and auto-delete queues with automatic cleanup (exclusive queues deleted on owning-connection close; auto-delete queues deleted when the last consumer leaves)
+- Measured ahead of RabbitMQ 4.3 on durable end-to-end throughput across every tested workload — from 1.1x (64 KB bodies) to 3.7x (durable + publisher confirms) in a Docker ARM64-native head-to-head (see [Performance](#performance))
 - Prometheus metrics and pprof profiling
 - Lock-free per-queue ring buffer with per-slot CAS
 - Batch TCP writes and ACK offloading
@@ -264,31 +265,60 @@ Key engine tuning parameters:
 
 ## Performance
 
-### Head-to-Head vs RabbitMQ 4.3
+All numbers below are **end-to-end consumed msg/s** — every published message is also delivered and acknowledged, so the figures reflect full round-trip delivery, not publish acceptance. Both brokers are driven by the same client ([`cmd/perftest`](src/amqp-go/cmd/perftest), built on [amqp091-go](https://github.com/rabbitmq/amqp091-go)) under identical settings.
 
-Same machine, same Go client ([amqp091-go](https://github.com/rabbitmq/amqp091-go)), 12-byte messages, durable queue, transient messages, 1 publisher + 1 consumer. StrangeQ numbers are medians of 5 runs at `-benchtime=2s`; the benchmarks fail unless every published message is also consumed, so throughput includes full end-to-end delivery, not just publish acceptance.
+**Methodology**
+- Single machine: Apple Silicon, 16 cores.
+- Both brokers run in [OrbStack](https://orbstack.dev/) **ARM64-native containers** (not emulated), with **in-container storage** (no host bind mount) so disk behavior is comparable.
+- RabbitMQ 4.3 vs StrangeQ, 20-second runs, 1 KB message bodies unless noted, consumer prefetch 100, manual acks.
+- **Durable queues** (see the caveat below). Measured 2026-07-10.
 
-| Benchmark | Broker | Median (ns/op) | msg/s | B/op | allocs/op | Ratio |
-|-----------|--------|----------------|-------|------|-----------|-------|
-| Auto-ack | StrangeQ | 2,911 | 343K | 3,261 | 66 | 1.35x |
-| Auto-ack | RabbitMQ | 3,931 | 254K | | | |
-| Manual ack | StrangeQ | 3,342 | 299K | 1,364 | 33 | 1.39x |
-| Manual ack | RabbitMQ | 4,641 | 215K | | | |
-| Multi-ack 1000 | StrangeQ | 3,216 | 311K | 3,893 | 78 | 1.27x |
-| Multi-ack 1000 | RabbitMQ | 4,099 | 244K | | | |
+### Head-to-Head vs RabbitMQ 4.3 (durable)
 
-### Running the Benchmarks
+> **Why durable-only?** RabbitMQ 4.3 rejects transient (non-durable) non-exclusive queues by default (`541 transient_nonexcl_queues is deprecated`). The only apples-to-apples comparison is therefore on durable queues, and that is what is reported here.
+
+| Workload (durable, 1 KB body unless noted) | RabbitMQ 4.3 | StrangeQ | StrangeQ advantage |
+|---|--:|--:|--:|
+| Durable + publisher confirms, 10 pub / 10 con | 28,616 msg/s | 104,986 msg/s | 3.67x |
+| Durable, 1 pub / 1 con | 85,353 msg/s | 127,711 msg/s | 1.50x |
+| Durable, 30 pub / 30 con | ~31,000 msg/s | ~109,000 msg/s | ~3.5x |
+| Durable, 64 KB body, 1 pub / 1 con | 22,027 msg/s | 25,177 msg/s | 1.14x |
+
+The 64 KB figure is a median of 3 runs (individual runs ranged from 0.99x to 1.15x). All other figures are steady-state medians of a 20-second run.
+
+### Crash safety
+
+Confirmed durable messages survive `kill -9` and are recovered on restart. The invariant is **confirm ⇒ fsynced ⇒ recoverable**: a publish is confirmed only after its WAL batch is fsynced, so every confirmed message is present after a crash.
+
+### Transient (non-durable) throughput — reported standalone
+
+StrangeQ also serves transient queues at high throughput. Because RabbitMQ 4.3 refuses transient non-exclusive queues, this is **not** a head-to-head figure and is reported on its own: roughly **140K msg/s** for 1 pub / 1 con, 1 KB bodies, host-native (no container).
+
+### Reproducing
 
 ```bash
 cd src/amqp-go
 
-# Benchmark StrangeQ (embedded server starts automatically)
-go test . -run='^$' -bench="BenchmarkVersus" -benchmem -benchtime=50000x -count=20
+# Durable + publisher confirms, 10 producers / 10 consumers, 1 KB, 20s
+go run ./cmd/perftest -url amqp://guest:guest@localhost:5672/ \
+  -durable -confirm -producers 10 -consumers 10 -size 1024 -duration 20s
 
-# Benchmark RabbitMQ (must be running on localhost:5672)
-docker run -d -p 5672:5672 --name rabbitmq-bench rabbitmq:4.3-management
-AMQP_TARGET=rabbitmq go test . -run='^$' -bench="BenchmarkVersus" -benchmem -benchtime=50000x -count=5
+# Durable, single producer / single consumer
+go run ./cmd/perftest -url amqp://guest:guest@localhost:5672/ \
+  -durable -producers 1 -consumers 1 -size 1024 -duration 20s
+
+# Durable, 64 KB bodies
+go run ./cmd/perftest -url amqp://guest:guest@localhost:5672/ \
+  -durable -producers 1 -consumers 1 -size 65536 -duration 20s
 ```
+
+Point `-url` at either broker (both speak AMQP 0.9.1). To run RabbitMQ 4.3 the same way:
+
+```bash
+docker run -d --name rabbitmq-bench -p 5672:5672 rabbitmq:4.3-management
+```
+
+A Go microbenchmark (`BenchmarkVersus`) also exists for allocation/latency profiling of the hot path.
 
 ## Feature Comparison vs RabbitMQ
 
@@ -344,7 +374,7 @@ AMQP_TARGET=rabbitmq go test . -run='^$' -bench="BenchmarkVersus" -benchmem -ben
 | TLS | Yes | Yes |
 | Mutual TLS (mTLS) | Yes | Yes |
 | SASL PLAIN | Yes | Yes |
-| SASL ANONYMOUS | Yes | Yes |
+| SASL ANONYMOUS | Yes (opt-in; disabled by default) | Yes |
 | SASL EXTERNAL | No | Yes |
 | File-based authentication | Yes (bcrypt) | Yes |
 | Per-vhost authorization | Yes (RabbitMQ-style regex) | Yes |
@@ -398,10 +428,8 @@ The following RabbitMQ features are not implemented:
 - Consumer priorities (`x-priority`)
 - `connection.secure` / `secure-ok` (multi-step challenge-response auth)
 - SASL EXTERNAL
-- Exclusive queue enforcement on connection close
-- Auto-delete queue enforcement on last consumer leave
-- Global prefetch (`basic.qos` with `global=true`)
-- Prefetch size enforcement (`basic.qos` with `prefetch_size > 0`)
+- Global prefetch (`basic.qos` with `global=true`) — accepted but applied per-consumer, not enforced globally
+- Prefetch size (`basic.qos` with `prefetch_size > 0`) — rejected with a `540 not implemented` channel error rather than silently ignored
 - Management UI and CLI management tools
 
 ## Architecture
