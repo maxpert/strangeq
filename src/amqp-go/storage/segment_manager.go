@@ -1024,6 +1024,15 @@ func (qs *QueueSegments) close() {
 // contains a shortstr property longer than 255 bytes; the caller must not write a
 // partial record.
 func serializeSegmentMessage(message *protocol.Message, offset uint64) ([]byte, error) {
+	// ITER5 §3.6: segments are ALWAYS inline. A message that still carries a body
+	// REFERENCE would serialize a bodyKindReference arm into a segment, where no
+	// BodyBlock exists — a permanently dangling reference. Recovery/checkpoint
+	// resolves and clears BodyRef before a message ever reaches here; this guard is
+	// defense-in-depth: fail the checkpoint batch rather than persist a dangling
+	// reference (mirrors the shortstr overflow guard).
+	if len(message.BodyRef) > 0 {
+		return nil, fmt.Errorf("refusing to serialize a body reference into a segment (offset %d): segments must be inline", offset)
+	}
 	totalSize := 8 + len(message.Exchange) + len(message.RoutingKey) + len(message.Body) + 256
 	buf := make([]byte, 0, totalSize)
 
@@ -1080,6 +1089,12 @@ func readSegmentMessageAt(file *os.File, position int64) (*protocol.Message, err
 	_, _, msg, ok := parseMessagePayload(data)
 	if !ok {
 		return nil, fmt.Errorf("invalid segment data: malformed message record")
+	}
+	// ITER5 §3.6: a segment must never carry a body reference (the companion of
+	// the serializeSegmentMessage guard). Reject a 0x01 arm so a corrupt/foreign
+	// segment can never yield a message with an unresolvable BodyRef.
+	if len(msg.BodyRef) > 0 {
+		return nil, fmt.Errorf("segment record carries a body reference (unsupported): segments must be inline")
 	}
 	return msg, nil
 }

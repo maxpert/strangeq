@@ -73,6 +73,18 @@ const (
 	//   v4: [CRC][len][1-byte recordType][<message payload v4>]
 	WALRecordTypeMessage    = uint8(0) // a message record
 	WALRecordTypeTxBoundary = uint8(1) // transaction-boundary marker (SQ-8)
+	// WALRecordTypeBodyBlock (ITER5) carries a large message body ONCE for a
+	// durable fan-out to N>=2 queues; the N per-queue message records each carry a
+	// body REFERENCE (bodyKindReference) to this block's file-relative offset
+	// instead of an inline copy. Block and refs are written in ONE group-commit
+	// batch / ONE fsync / ONE file, so they are inseparable (co-location invariant,
+	// §3). The block is NOT a deliverable message: its offset is never added to the
+	// offset index or a file's offset set, so it never participates in the ack /
+	// file-delete predicate — it rides its file's fate. Payload:
+	//   [fanoutHint u32][bodyLen u32][body bodyLen bytes]
+	// fanoutHint is the N at write time — advisory only (metrics/assertions);
+	// correctness never reads it (the authoritative refcount is |unacked refs|).
+	WALRecordTypeBodyBlock = uint8(2)
 
 	// Transaction-boundary marker kinds. A committed transaction is written as
 	// one contiguous, single-fsync unit: Begin, the transaction's message
@@ -151,6 +163,16 @@ type WALConfig struct {
 	CleanupInterval    time.Duration
 	RetentionPeriod    time.Duration // for time-based retention
 	CheckpointInterval time.Duration // how often WAL checkpoints old files to segments
+
+	// SharedBodyMaxPinAge (ITER5 cold-tail hardening, §2) bounds how long a rolled
+	// WAL file that carries a shared BodyBlock may be kept out of checkpoint before
+	// it is force-re-inlined (N copies) and deleted. 0 disables the age backstop
+	// and relies on RetentionPeriod (which, if also 0, imposes no age bound — a
+	// permanently-unacked reference then pins its BodyBlock file, holding exactly
+	// ONE body copy, never the N-copy blowup). When >0, performCheckpoint stops
+	// skipping a shared-body file once it is older than this and re-inlines it via
+	// the normal checkpoint path.
+	SharedBodyMaxPinAge time.Duration
 }
 
 // DefaultWALConfig returns a WALConfig with production defaults
@@ -212,6 +234,15 @@ type QueueWAL struct {
 	currentFileOffsets      *roaring64.Bitmap
 	currentFileOffsetsMutex sync.Mutex
 
+	// currentFileHasSharedBody (ITER5 §2) records that the active file carries at
+	// least one BodyBlock record. It is set under fileMutex by flushBatch when a
+	// fused shared unit is serialized and captured into walFileInfo.hasSharedBody
+	// (then reset) by rollFile. performCheckpoint skips a rolled file with this set
+	// so a shared body survives as ONE copy across arbitrarily many checkpoints
+	// (until all refs ack -> whole-file reclaim, or the SharedBodyMaxPinAge backstop
+	// fires). Guarded by fileMutex (always held in flushBatch and rollFile).
+	currentFileHasSharedBody bool
+
 	// Old inactive files
 	oldFiles      map[uint64]*walFileInfo
 	oldFilesMutex sync.RWMutex
@@ -248,6 +279,14 @@ type offsetLocation struct {
 	filePosition int64
 }
 
+// sharedIndexEntry records where a fused shared unit's reference record landed,
+// so flushBatch can populate the offset index for it post-fsync (the BodyBlock
+// record itself is never indexed). See flushBatch.
+type sharedIndexEntry struct {
+	offset       uint64
+	filePosition int64
+}
+
 type writeRequest struct {
 	queueName string
 	message   *protocol.Message
@@ -264,6 +303,34 @@ type writeRequest struct {
 	//     per-connection fsync stall this design removes.
 	done   chan error
 	onDone func(error)
+
+	// unit, when non-nil, makes this ONE writeChan item a fused shared-body unit
+	// (ITER5, §3): flushBatch serializes it as one BodyBlock record followed by N
+	// reference records, all within this single request so they land in ONE file /
+	// ONE fsync (co-location invariant). unit is mutually exclusive with
+	// queueName/message/offset/done/onDone above (those describe an ordinary
+	// single-record write; a unit carries its own per-sub fields). A nil unit is
+	// the byte-for-byte-unchanged ordinary write path.
+	unit *sharedUnit
+}
+
+// sharedSub is one fan-out target of a fused shared-body write: a per-queue
+// message record that will carry a body REFERENCE to the unit's shared block.
+// Exactly one of onDone/done is set (same contract as writeRequest).
+type sharedSub struct {
+	queueName string
+	offset    uint64            // delivery tag for this target
+	message   *protocol.Message // shares Body with its siblings; Headers already per-target
+	onDone    func(error)       // per-copy completion (async path)
+	done      chan error        // per-copy completion (sync path)
+}
+
+// sharedUnit is the indivisible write unit for a durable fan-out with a large,
+// shared body: ONE BodyBlock (body written once) + one reference record per sub.
+type sharedUnit struct {
+	body       []byte
+	fanoutHint uint32
+	subs       []sharedSub
 }
 
 type ackRequest struct {
@@ -275,6 +342,10 @@ type walFileInfo struct {
 	path      string
 	offsets   *roaring64.Bitmap // actual message offsets in this file
 	createdAt time.Time         // when this file was rolled (for retention)
+	// hasSharedBody (ITER5 §2) is true iff this rolled file carries at least one
+	// BodyBlock record. performCheckpoint skips such files (keeping the body as
+	// ONE copy) unless the SharedBodyMaxPinAge backstop forces re-inline.
+	hasSharedBody bool
 }
 
 // NewWALManager creates a new WAL manager with shared WAL using default config
@@ -420,6 +491,34 @@ func (wm *WALManager) WriteAsync(queueName string, message *protocol.Message, of
 	}
 }
 
+// WriteSharedAsync enqueues a fused shared-body durable write (ITER5, §3): ONE
+// BodyBlock record carrying body a single time, plus one reference record per
+// sub, as a SINGLE writeChan item. Because a single request is never split across
+// batches (batchWriterLoop) and a batch never rolls mid-flush (flushBatch rolls
+// only AFTER the whole-batch Write+fsync), the block and all N refs are provably
+// in ONE file and made durable by ONE fdatasync (co-location invariant + A1).
+// Each sub's onDone/done fires — in sub order — only AFTER the unit is durable
+// AND indexed, exactly like WriteAsync. All-or-nothing: a serialize error rolls
+// the whole unit back and nacks every sub. body must be the shared body every
+// sub references (the caller keeps each sub.message.Body pointing at it for
+// in-memory delivery; the on-disk record for each sub is a reference).
+func (wm *WALManager) WriteSharedAsync(subs []sharedSub, body []byte, fanoutHint uint32) error {
+	if wm.sharedWAL == nil {
+		return fmt.Errorf("shared WAL not initialized")
+	}
+	if len(subs) == 0 {
+		return nil
+	}
+	wm.sharedWAL.writeChan <- &writeRequest{
+		unit: &sharedUnit{
+			body:       body,
+			fanoutHint: fanoutHint,
+			subs:       subs,
+		},
+	}
+	return nil
+}
+
 // walGroupCommitFsync is the fsync applied by the group-commit batch writer
 // (flushBatch). It is swappable via an atomic pointer so tests can gate the
 // durability barrier or inject a write/fsync error deterministically; the
@@ -448,6 +547,98 @@ func SetWALGroupCommitFsyncForTest(fn func(*os.File) error) (restore func()) {
 	f := walFsyncFn(fn)
 	walGroupCommitFsyncHook.Store(&f)
 	return func() { walGroupCommitFsyncHook.Store(prev) }
+}
+
+// WALRecordCounts tallies the record types found in the shared WAL. See
+// WALRecordCountsForTest.
+type WALRecordCounts struct {
+	Messages     int // total message records (inline + reference)
+	InlineBodies int // message records with an inline body (bodyKind 0x00)
+	RefBodies    int // message records with a body reference (bodyKind 0x01)
+	TxBoundary   int // transaction-boundary markers
+	BodyBlocks   int // ITER5 shared BodyBlock records
+}
+
+// WALRecordCountsForTest scans every .wal file under dataDir/wal/shared and
+// tallies record types. TEST-ONLY (used by cross-package tests to assert the
+// shared-body fan-out writes exactly one BodyBlock plus one reference record per
+// fan-out target, and that the N==1 hot path stays inline). Never used by
+// production code.
+func WALRecordCountsForTest(dataDir string) (WALRecordCounts, error) {
+	var total WALRecordCounts
+	sharedDir := filepath.Join(dataDir, "wal", "shared")
+	entries, err := os.ReadDir(sharedDir)
+	if err != nil {
+		return total, err
+	}
+	for _, e := range entries {
+		if filepath.Ext(e.Name()) != WALFileExtension {
+			continue
+		}
+		c, cerr := scanWALFileRecordCounts(filepath.Join(sharedDir, e.Name()))
+		if cerr != nil {
+			return total, cerr
+		}
+		total.Messages += c.Messages
+		total.InlineBodies += c.InlineBodies
+		total.RefBodies += c.RefBodies
+		total.TxBoundary += c.TxBoundary
+		total.BodyBlocks += c.BodyBlocks
+	}
+	return total, nil
+}
+
+// scanWALFileRecordCounts tallies record types in one WAL file (see
+// WALRecordCountsForTest).
+func scanWALFileRecordCounts(filePath string) (WALRecordCounts, error) {
+	var c WALRecordCounts
+	f, err := os.Open(filePath)
+	if err != nil {
+		return c, err
+	}
+	defer f.Close()
+
+	dataStart, err := walFileDataStart(f)
+	if err != nil {
+		return c, err
+	}
+	if _, err := f.Seek(dataStart, io.SeekStart); err != nil {
+		return c, err
+	}
+	for {
+		hdr := make([]byte, 8)
+		if _, err := io.ReadFull(f, hdr); err != nil {
+			break
+		}
+		dataLen := binary.BigEndian.Uint32(hdr[4:8])
+		data := make([]byte, dataLen)
+		if _, err := io.ReadFull(f, data); err != nil {
+			break
+		}
+		crcCheck := make([]byte, 4+dataLen)
+		copy(crcCheck[0:4], hdr[4:8])
+		copy(crcCheck[4:], data)
+		if binary.BigEndian.Uint32(hdr[0:4]) != crc32.ChecksumIEEE(crcCheck) {
+			continue
+		}
+		recType, payload := recordTypeAndPayload(data)
+		switch recType {
+		case WALRecordTypeBodyBlock:
+			c.BodyBlocks++
+		case WALRecordTypeTxBoundary:
+			c.TxBoundary++
+		default:
+			c.Messages++
+			if rm, ok := deserializeMessagePayload(payload); ok {
+				if len(rm.Message.BodyRef) > 0 {
+					c.RefBodies++
+				} else {
+					c.InlineBodies++
+				}
+			}
+		}
+	}
+	return c, nil
 }
 
 // WriteTxAtomic durably writes a set of message records as one all-or-nothing
@@ -676,39 +867,43 @@ func (qw *QueueWAL) scanWALFile(filePath string) ([]*RecoveryMessage, error) {
 	var txEpoch uint64
 	var txBuf []*RecoveryMessage
 
+	// ITER5 shared-body recovery (§4). bodyByOffset maps a BodyBlock record's
+	// file-relative start offset to its body bytes. Because the co-location
+	// invariant writes the block FIRST in its unit, a reference record is always
+	// scanned AFTER its block, so the map is populated by the time a ref resolves —
+	// no forward references, no second pass. recStart tracks the file-relative
+	// start of the current record, which is exactly the value a reference locator
+	// carries.
+	bodyByOffset := map[uint64][]byte{}
+	recStart := dataStart
+
 	for {
-		// Read CRC field (4 bytes)
-		crcBytes := make([]byte, 4)
-		_, err := file.Read(crcBytes)
-		if err != nil {
-			// End of file or read error
+		// Read CRC (4) + length (4) + data (dataLen). io.ReadFull makes the byte
+		// accounting exact so recStart stays synchronized with the record grammar
+		// (a large BodyBlock body cannot be under-read into a false torn tail); any
+		// short read at the tail (a crash mid-write) breaks out, dropping the
+		// partial trailing record — CRC would reject it anyway.
+		hdr := make([]byte, 8)
+		if _, err := io.ReadFull(file, hdr); err != nil {
 			break
 		}
-		crc := binary.BigEndian.Uint32(crcBytes)
+		crc := binary.BigEndian.Uint32(hdr[0:4])
+		dataLen := binary.BigEndian.Uint32(hdr[4:8])
 
-		// Read length field (4 bytes)
-		lengthBytes := make([]byte, 4)
-		_, err = file.Read(lengthBytes)
-		if err != nil {
-			break
-		}
-		dataLen := binary.BigEndian.Uint32(lengthBytes)
-
-		// Read remaining data
 		data := make([]byte, dataLen)
-		_, err = file.Read(data)
-		if err != nil {
+		if _, err := io.ReadFull(file, data); err != nil {
 			break
 		}
 
-		// Verify CRC
-		crcCheckData := make([]byte, 4+dataLen)
-		copy(crcCheckData[0:4], lengthBytes)
-		copy(crcCheckData[4:], data)
-		calculatedCRC := crc32.ChecksumIEEE(crcCheckData)
+		curRecStart := recStart
+		recStart += 8 + int64(dataLen)
 
-		if crc != calculatedCRC {
-			// CRC mismatch - skip this entry
+		// Verify CRC over [length][data].
+		crcCheckData := make([]byte, 4+dataLen)
+		copy(crcCheckData[0:4], hdr[4:8])
+		copy(crcCheckData[4:], data)
+		if crc != crc32.ChecksumIEEE(crcCheckData) {
+			// CRC mismatch - skip this entry (recStart already advanced).
 			continue
 		}
 
@@ -736,10 +931,41 @@ func (qw *QueueWAL) scanWALFile(filePath string) ([]*RecoveryMessage, error) {
 				txBuf = txBuf[:0]
 			}
 
+		case WALRecordTypeBodyBlock:
+			// [fanoutHint u32][bodyLen u32][body]. Store the body keyed by this
+			// record's start offset so a later reference record resolves it. The
+			// block is NOT a deliverable message and is never emitted.
+			if len(payload) < 8 {
+				continue
+			}
+			bodyLen := binary.BigEndian.Uint32(payload[4:8])
+			if 8+int(bodyLen) > len(payload) {
+				continue
+			}
+			body := make([]byte, bodyLen) // copy out of the reused scan buffer
+			copy(body, payload[8:8+int(bodyLen)])
+			bodyByOffset[uint64(curRecStart)] = body
+
 		default: // WALRecordTypeMessage
 			recoveryMsg, ok := deserializeMessagePayload(payload)
 			if !ok {
 				continue
+			}
+			// Resolve a body reference against the per-file block map. On a hit,
+			// materialize Body and clear BodyRef so the recovered message is a
+			// self-contained inline message (checkpoint re-inlines it; segments
+			// never carry a reference). On a miss (a torn unit whose block was lost)
+			// skip the record defensively — at-least-once still holds because a
+			// torn-tail unit's fsync never completed, so the publisher never got a
+			// confirm and re-publish recreates it.
+			if len(recoveryMsg.Message.BodyRef) == 8 {
+				loc := binary.BigEndian.Uint64(recoveryMsg.Message.BodyRef)
+				body, found := bodyByOffset[loc]
+				if !found {
+					continue
+				}
+				recoveryMsg.Message.Body = body
+				recoveryMsg.Message.BodyRef = nil
 			}
 			if inTx {
 				txBuf = append(txBuf, recoveryMsg)
@@ -902,19 +1128,79 @@ func (qw *QueueWAL) flushBatch(batch []*writeRequest, bufp *[]byte, positionsp *
 	// zero-alloc batch serialization; it is lazily allocated only when a record
 	// actually fails, which the wire decoder's 255-byte bound makes near-unreachable.
 	var serErr []error
+	// sharedIdx collects (offset, filePosition) for the reference records of any
+	// fused shared unit(s) in this batch, to be indexed post-fsync alongside the
+	// ordinary records. It stays nil on the common no-unit path (the N==1 durable
+	// hot path), so that path adds ZERO allocations vs today.
+	var sharedIdx []sharedIndexEntry
 	for i, req := range batch {
-		recStart := len(buf)
-		positions[i] = currentFilePos + int64(recStart) // Position in file
-		var e error
-		buf, e = appendMessageRecord(buf, req.queueName, req.message, req.offset)
-		if e != nil {
-			buf = buf[:recStart] // discard the failed record's partial bytes
-			positions[i] = -1
+		if req.unit == nil {
+			recStart := len(buf)
+			positions[i] = currentFilePos + int64(recStart) // Position in file
+			var e error
+			buf, e = appendMessageRecord(buf, req.queueName, req.message, req.offset)
+			if e != nil {
+				buf = buf[:recStart] // discard the failed record's partial bytes
+				positions[i] = -1
+				if serErr == nil {
+					serErr = make([]error, len(batch))
+				}
+				serErr[i] = e
+			}
+			continue
+		}
+
+		// FUSED SHARED UNIT (ITER5, §3.3): emit the BodyBlock first (capturing its
+		// file-relative start = the reference locator), then each sub as a message
+		// record carrying that locator via the existing bodyKindReference arm. The
+		// block's offset is NOT indexed (it is not a deliverable message); each
+		// sub's (offset, position) is recorded for post-fsync index population.
+		// This req occupies ONE batch index, so positions[i] is marked -1 (skipped
+		// by the ordinary index loop below); its subs are indexed via sharedIdx.
+		positions[i] = -1
+		u := req.unit
+		unitStart := len(buf)
+		blockStart := currentFilePos + int64(unitStart)
+		buf = appendBodyBlockRecord(buf, u.fanoutHint, u.body)
+
+		var locator [8]byte
+		binary.BigEndian.PutUint64(locator[:], uint64(blockStart))
+
+		savedSharedLen := len(sharedIdx)
+		var unitErr error
+		for si := range u.subs {
+			sub := &u.subs[si]
+			subPos := currentFilePos + int64(len(buf))
+			// Drive the existing bodyKindReference writer arm by setting BodyRef to
+			// the 8-byte locator, then CLEAR it immediately so the caller's in-memory
+			// message stays a clean inline message (a later dead-letter/requeue
+			// re-store must NOT emit a dangling reference into another file). Safe:
+			// the sub message is not consumer-visible until its completion fires
+			// (after this fsync), so nothing reads BodyRef concurrently here.
+			sub.message.BodyRef = locator[:]
+			var e error
+			buf, e = appendMessageRecord(buf, sub.queueName, sub.message, sub.offset)
+			sub.message.BodyRef = nil
+			if e != nil {
+				unitErr = e
+				break
+			}
+			sharedIdx = append(sharedIdx, sharedIndexEntry{offset: sub.offset, filePosition: subPos})
+		}
+		if unitErr != nil {
+			// All-or-nothing per unit: discard the block + every already-written
+			// sub record, drop the partial index entries, and nack every sub.
+			buf = buf[:unitStart]
+			sharedIdx = sharedIdx[:savedSharedLen]
 			if serErr == nil {
 				serErr = make([]error, len(batch))
 			}
-			serErr[i] = e
+			serErr[i] = unitErr
+			continue
 		}
+		// A shared body is now on the active file: mark it so rollFile can pin the
+		// file out of checkpoint (§2). fileMutex is held for the whole flushBatch.
+		qw.currentFileHasSharedBody = true
 	}
 	// Publish the (possibly reallocated) buffer back so the next flush reuses
 	// its grown capacity. A rare oversized batch is released rather than pinned.
@@ -987,6 +1273,14 @@ func (qw *QueueWAL) flushBatch(batch []*writeRequest, bufp *[]byte, positionsp *
 			filePosition: positions[i],
 		}
 	}
+	// Fused shared-unit reference records (never the BodyBlock itself). Empty on
+	// the no-unit hot path, so this loop is a zero-cost no-op there.
+	for _, e := range sharedIdx {
+		qw.offsetIndex[e.offset] = &offsetLocation{
+			fileNum:      currentFileNum,
+			filePosition: e.filePosition,
+		}
+	}
 	qw.offsetIndexMutex.Unlock()
 
 	// Track offsets written to current file
@@ -996,6 +1290,9 @@ func (qw *QueueWAL) flushBatch(batch []*writeRequest, bufp *[]byte, positionsp *
 			continue
 		}
 		qw.currentFileOffsets.Add(req.offset)
+	}
+	for _, e := range sharedIdx {
+		qw.currentFileOffsets.Add(e.offset)
 	}
 	qw.currentFileOffsetsMutex.Unlock()
 
@@ -1036,6 +1333,20 @@ func (qw *QueueWAL) deliverCompletions(batch []*writeRequest, serErr []error, ba
 		err := batchErr
 		if serErr != nil && serErr[i] != nil {
 			err = serErr[i]
+		}
+		// A fused shared unit (ITER5): fire every sub's completion in sub order.
+		// The unit is all-or-nothing, so every sub gets the same outcome (the
+		// unit's serErr override if it failed to serialize, else the batch error).
+		if req.unit != nil {
+			for si := range req.unit.subs {
+				sub := &req.unit.subs[si]
+				if sub.onDone != nil {
+					sub.onDone(err)
+				} else if sub.done != nil {
+					sub.done <- err
+				}
+			}
+			continue
 		}
 		if req.onDone != nil {
 			req.onDone(err)
@@ -1322,6 +1633,33 @@ func serializeTxMarker(kind uint8, epoch uint64) []byte {
 	return buf
 }
 
+// appendBodyBlockRecord serializes ONE ITER5 BodyBlock record onto the TAIL of
+// buf (grow in place) and returns the grown buffer:
+//
+//	[CRC32][length][recordType=BodyBlock][fanoutHint u32][bodyLen u32][body]
+//
+// The CRC and length are backpatched record-relative (recStart is an index, so it
+// survives any growslice reallocation), exactly like appendMessageRecord, so many
+// records — a block and its refs — pack contiguously into one batch buffer. The
+// body is copied exactly once. This helper never fails (a body's length is a u32;
+// callers cap body size well below 4 GiB).
+func appendBodyBlockRecord(buf []byte, fanoutHint uint32, body []byte) []byte {
+	recStart := len(buf)
+
+	buf = append(buf, 0, 0, 0, 0) // CRC32 placeholder
+	buf = append(buf, 0, 0, 0, 0) // Length placeholder
+	buf = append(buf, WALRecordTypeBodyBlock)
+	buf = binary.BigEndian.AppendUint32(buf, fanoutHint)
+	buf = binary.BigEndian.AppendUint32(buf, uint32(len(body)))
+	buf = append(buf, body...)
+
+	dataLen := len(buf) - recStart - 8
+	binary.BigEndian.PutUint32(buf[recStart+4:recStart+8], uint32(dataLen))
+	crc := crc32.ChecksumIEEE(buf[recStart+4:])
+	binary.BigEndian.PutUint32(buf[recStart:recStart+4], crc)
+	return buf
+}
+
 // recordTypeAndPayload splits a CRC-verified v4 record's data region into its
 // 1-byte record type and the type-specific payload. Every v4 record carries the
 // type tag as data[0]; a zero-length data region defaults to a message record.
@@ -1419,9 +1757,14 @@ func parseMessagePayload(payload []byte) (queueName string, offset uint64, m *pr
 		msg.Body = payload[pos : pos+int(bodyLen)] // zero-copy alias into CRC-checked payload
 		pos += int(bodyLen)
 	case bodyKindReference:
-		// ITER5 seam. Length-skip the opaque locator structurally so recovery of
-		// an ITER5-written file never panics; ITER4 has no resolver for a body
-		// reference, so the record is skipped cleanly (no ITER4 writer emits 0x01).
+		// ITER5 seam. Read the opaque locator into msg.BodyRef and FALL THROUGH to
+		// parse the optional fields exactly like the inline arm, returning ok=true
+		// (msg carries BodyRef, Body==nil). Resolving the reference to actual body
+		// bytes is the caller's job: crash recovery (scanWALFile) resolves it from
+		// the per-file bodyByOffset map; the live positional read (readMessageAt*)
+		// resolves it with a second ReadAt against the co-located BodyBlock. This is
+		// forward-only and safe — no shipped build emits a 0x01 arm, so the ok=true
+		// behavior is observable only for ITER5-written files.
 		if pos+2 > len(payload) {
 			return "", 0, nil, false
 		}
@@ -1431,7 +1774,7 @@ func parseMessagePayload(payload []byte) (queueName string, offset uint64, m *pr
 			return "", 0, nil, false
 		}
 		msg.BodyRef = payload[pos : pos+int(refLen)]
-		return "", 0, nil, false
+		pos += int(refLen)
 	default:
 		return "", 0, nil, false // unknown body kind
 	}
@@ -1553,6 +1896,13 @@ func (qw *QueueWAL) rollFile() {
 	qw.currentFileOffsets = roaring64.New()
 	qw.currentFileOffsetsMutex.Unlock()
 
+	// ITER5 §2: capture whether the file being rolled carries a shared BodyBlock,
+	// then reset for the fresh file. rollFile is only ever invoked from flushBatch
+	// (and WriteTxAtomic) while fileMutex is held, so this read+reset is race-free
+	// against the flushBatch writer that sets the flag.
+	sharedBody := qw.currentFileHasSharedBody
+	qw.currentFileHasSharedBody = false
+
 	// Close current write file
 	_ = qw.currentFile.Close()
 
@@ -1570,9 +1920,10 @@ func (qw *QueueWAL) rollFile() {
 	// Move to old files map
 	qw.oldFilesMutex.Lock()
 	qw.oldFiles[currentFileNum] = &walFileInfo{
-		path:      currentPath,
-		offsets:   fileOffsets,
-		createdAt: time.Now(),
+		path:          currentPath,
+		offsets:       fileOffsets,
+		createdAt:     time.Now(),
+		hasSharedBody: sharedBody,
 	}
 	qw.oldFilesMutex.Unlock()
 
@@ -1916,11 +2267,68 @@ func (qw *QueueWAL) readMessageAtPosition(queueName string, fileNum uint64, file
 		return nil, fmt.Errorf("offset mismatch: expected %d, got %d", expectedOffset, rm.Offset)
 	}
 
+	// ITER5: a shared-body record carries a body REFERENCE. Resolve it with a
+	// SECOND ReadAt for the co-located BodyBlock on the SAME open handle, still
+	// under the handle-lifetime protection this function holds (current file: the
+	// held currentReadFile; old file: the cache RLock / kept handle), so a
+	// concurrent close cannot race the block read (§5.3). The block is in the same
+	// file as the reference by the co-location invariant, so `file` is correct.
+	if len(rm.Message.BodyRef) == 8 {
+		blockOffset := int64(binary.BigEndian.Uint64(rm.Message.BodyRef))
+		body, berr := readBodyBlockAt(file, blockOffset)
+		if berr != nil {
+			return nil, fmt.Errorf("failed to resolve shared body for offset %d: %w", expectedOffset, berr)
+		}
+		rm.Message.Body = body
+		rm.Message.BodyRef = nil
+	}
+
 	// This is a positional re-read, not a post-restart redelivery, so the
 	// message is not marked redelivered (deserializeMessagePayload defaults it
 	// to true for the crash-recovery path).
 	rm.Message.Redelivered = false
 	return rm.Message, nil
+}
+
+// readBodyBlockAt reads the ITER5 BodyBlock record at file offset `position` and
+// returns a COPY of its body bytes. It verifies the record framing (CRC) and the
+// record type, so a corrupt or misdirected locator surfaces as an error rather
+// than delivering wrong bytes. Used to resolve a body reference on the live
+// positional read path (readMessageAtPosition) and the sequential fallback.
+func readBodyBlockAt(file *os.File, position int64) ([]byte, error) {
+	header := make([]byte, 8)
+	if _, err := file.ReadAt(header, position); err != nil {
+		return nil, err
+	}
+	crc := binary.BigEndian.Uint32(header[0:4])
+	dataLen := binary.BigEndian.Uint32(header[4:8])
+
+	data := make([]byte, dataLen)
+	if _, err := file.ReadAt(data, position+8); err != nil {
+		return nil, err
+	}
+
+	crcCheck := make([]byte, 4+dataLen)
+	copy(crcCheck[0:4], header[4:8])
+	copy(crcCheck[4:], data)
+	if crc != crc32.ChecksumIEEE(crcCheck) {
+		return nil, fmt.Errorf("CRC mismatch for body block at %d", position)
+	}
+
+	recType, payload := recordTypeAndPayload(data)
+	if recType != WALRecordTypeBodyBlock {
+		return nil, fmt.Errorf("record at %d is type %d, not a body block", position, recType)
+	}
+	if len(payload) < 8 {
+		return nil, fmt.Errorf("truncated body block at %d", position)
+	}
+	bodyLen := binary.BigEndian.Uint32(payload[4:8])
+	if 8+int(bodyLen) > len(payload) {
+		return nil, fmt.Errorf("body block at %d claims %d body bytes, has %d", position, bodyLen, len(payload)-8)
+	}
+	body := make([]byte, bodyLen)
+	copy(body, payload[8:8+int(bodyLen)])
+	return body, nil
 }
 
 // readMessageSequential does sequential scan fallback (slow, only for unindexed messages)
@@ -1987,42 +2395,48 @@ func (qw *QueueWAL) readMessageFromFile(queueName string, filePath string, offse
 		return nil, err
 	}
 
-	// Sequential scan through shared WAL entries
+	// Sequential scan through shared WAL entries. ITER5: accumulate BodyBlock
+	// bodies keyed by their record start offset (a block always precedes any
+	// record that references it, per the co-location invariant), so a matched
+	// reference record resolves its body from the map in this same pass.
+	bodyByOffset := map[uint64][]byte{}
+	recStart := dataStart
 	for {
-		// Read CRC field (4 bytes)
-		crcBytes := make([]byte, 4)
-		_, err := file.Read(crcBytes)
-		if err != nil {
+		hdr := make([]byte, 8)
+		if _, err := io.ReadFull(file, hdr); err != nil {
 			return nil, err
 		}
-		crc := binary.BigEndian.Uint32(crcBytes)
+		crc := binary.BigEndian.Uint32(hdr[0:4])
+		dataLen := binary.BigEndian.Uint32(hdr[4:8])
 
-		// Read length field (4 bytes)
-		lengthBytes := make([]byte, 4)
-		_, err = file.Read(lengthBytes)
-		if err != nil {
-			return nil, err
-		}
-		dataLen := binary.BigEndian.Uint32(lengthBytes)
-
-		// Read remaining data (queue + offset + message)
 		data := make([]byte, dataLen)
-		_, err = file.Read(data)
-		if err != nil {
+		if _, err := io.ReadFull(file, data); err != nil {
 			return nil, err
 		}
+
+		curRecStart := recStart
+		recStart += 8 + int64(dataLen)
 
 		// Verify CRC (calculated over [length_bytes][data])
 		crcCheckData := make([]byte, 4+dataLen)
-		copy(crcCheckData[0:4], lengthBytes)
+		copy(crcCheckData[0:4], hdr[4:8])
 		copy(crcCheckData[4:], data)
-		calculatedCRC := crc32.ChecksumIEEE(crcCheckData)
-
-		if crc != calculatedCRC {
+		if crc != crc32.ChecksumIEEE(crcCheckData) {
 			return nil, fmt.Errorf("CRC mismatch in sequential scan")
 		}
 
 		recType, payload := recordTypeAndPayload(data)
+		if recType == WALRecordTypeBodyBlock {
+			if len(payload) >= 8 {
+				bodyLen := binary.BigEndian.Uint32(payload[4:8])
+				if 8+int(bodyLen) <= len(payload) {
+					body := make([]byte, bodyLen)
+					copy(body, payload[8:8+int(bodyLen)])
+					bodyByOffset[uint64(curRecStart)] = body
+				}
+			}
+			continue
+		}
 		if recType != WALRecordTypeMessage {
 			// Transaction-boundary marker (or any non-message record): skip.
 			continue
@@ -2035,6 +2449,15 @@ func (qw *QueueWAL) readMessageFromFile(queueName string, filePath string, offse
 
 		// Check if this is the message we're looking for
 		if rm.Offset == offset && rm.QueueName == queueName {
+			if len(rm.Message.BodyRef) == 8 {
+				loc := binary.BigEndian.Uint64(rm.Message.BodyRef)
+				body, found := bodyByOffset[loc]
+				if !found {
+					return nil, fmt.Errorf("shared body block not found for offset %d", offset)
+				}
+				rm.Message.Body = body
+				rm.Message.BodyRef = nil
+			}
 			rm.Message.Redelivered = false
 			return rm.Message, nil
 		}
@@ -2065,6 +2488,17 @@ func (qw *QueueWAL) checkpointLoop() {
 	}
 }
 
+// sharedBodyBackstopFired reports whether a skipped shared-body file has aged
+// past SharedBodyMaxPinAge and must now be re-inlined + deleted (§2). When the
+// knob is 0 the backstop is disabled and reclaim relies on all-ack (whole-file)
+// or RetentionPeriod (tryDeleteOldFiles). A permanently-unacked reference then
+// pins its file — holding exactly ONE body copy, never the N-copy blowup.
+func (qw *QueueWAL) sharedBodyBackstopFired(info *walFileInfo) bool {
+	return qw.cfg.SharedBodyMaxPinAge > 0 &&
+		!info.createdAt.IsZero() &&
+		time.Since(info.createdAt) > qw.cfg.SharedBodyMaxPinAge
+}
+
 // performCheckpoint moves messages from old WAL files to segments.
 // Only operates on old/rolled files — never touches the current active file.
 // For each old file: scan messages, filter out ACKed ones, write unACKed
@@ -2088,6 +2522,18 @@ func (qw *QueueWAL) performCheckpoint() {
 	}
 
 	for fileNum, info := range filesToCheckpoint {
+		// ITER5 cold-tail hardening (§2): a rolled file that carries a shared
+		// BodyBlock is SKIPPED (left in oldFiles), so the shared body survives as
+		// ONE copy across arbitrarily many checkpoints — reclaimed whole by
+		// tryDeleteOldFiles once all its refs ack, instead of re-inlining into N
+		// segment copies now. The SharedBodyMaxPinAge backstop overrides the skip
+		// once the file is old enough, re-inlining via the path below (severing all
+		// external refs before delete — no premature free). tryDeleteOldFiles is
+		// unaffected: whole-file reclaim on all-ack still applies.
+		if info.hasSharedBody && !qw.sharedBodyBackstopFired(info) {
+			continue
+		}
+
 		// Scan the WAL file
 		messages, err := qw.scanWALFile(info.path)
 		if err != nil {

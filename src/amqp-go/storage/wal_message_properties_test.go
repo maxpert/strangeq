@@ -460,31 +460,40 @@ func TestWAL_BodyUnion_Seam(t *testing.T) {
 		assert.Equal(t, bodyKindInline, payload[bodyKindPos], "a normal message must emit bodyKind 0x00 (inline)")
 	})
 
-	t.Run("reference-arm-parsed-structurally-without-panic", func(t *testing.T) {
-		// Hand-craft a bodyKind==0x01 (reference) record as an ITER5 file would:
-		// structural prefix, then [bodyKind 0x01][refLen u16][locator], then some
-		// trailing bytes. ITER4 has no resolver, so parse must length-skip the
-		// locator structurally and return ok=false WITHOUT panicking.
-		locator := []byte("shared-body-locator-opaque")
+	t.Run("reference-arm-parsed-to-BodyRef-and-optional-fields", func(t *testing.T) {
+		// Hand-craft a bodyKind==0x01 (reference) record as an ITER5 file writes it:
+		// structural prefix, then [bodyKind 0x01][refLen u16][locator], then the
+		// optional fields in flag order. The ITER5 decoder change (§1.3) reads the
+		// locator into BodyRef and FALLS THROUGH to parse the optional fields,
+		// returning ok=true (Body==nil; body resolution is the caller's job). This
+		// is forward-only: no shipped build emits a 0x01 arm, so the ok=true
+		// behavior is observable only for ITER5-written files.
+		locator := make([]byte, 8) // ITER5 locator is an 8-byte file offset
+		binary.BigEndian.PutUint64(locator, 4096)
 		var p []byte
-		p = binary.BigEndian.AppendUint16(p, 0x0000) // flags: none
-		p = append(p, 0x00)                          // queue u8-len 0
-		p = binary.BigEndian.AppendUint64(p, 99)     // offset
-		p = append(p, 0x00)                          // exchange u8-len 0
-		p = append(p, 0x00)                          // routingKey u8-len 0
-		p = append(p, 0x02)                          // deliveryMode
-		p = append(p, bodyKindReference)             // bodyKind 0x01
+		p = binary.BigEndian.AppendUint16(p, msgFlagContentType) // one optional field present
+		p = append(p, 0x00)                                      // queue u8-len 0
+		p = binary.BigEndian.AppendUint64(p, 99)                 // offset
+		p = append(p, 0x00)                                      // exchange u8-len 0
+		p = append(p, 0x00)                                      // routingKey u8-len 0
+		p = append(p, 0x02)                                      // deliveryMode
+		p = append(p, bodyKindReference)                         // bodyKind 0x01
 		p = binary.BigEndian.AppendUint16(p, uint16(len(locator)))
 		p = append(p, locator...)
-		p = append(p, []byte("trailing")...) // extra bytes past the locator
+		p = append(p, byte(len("text/plain"))) // ContentType shortstr
+		p = append(p, []byte("text/plain")...)
 
 		require.NotPanics(t, func() {
-			_, _, _, ok := parseMessagePayload(p)
-			assert.False(t, ok, "ITER4 must skip a body-reference record (no resolver)")
+			_, off, msg, ok := parseMessagePayload(p)
+			require.True(t, ok, "ITER5 parses a body-reference record (carrying BodyRef)")
+			assert.Equal(t, uint64(99), off)
+			assert.Equal(t, locator, msg.BodyRef, "the opaque locator is carried on BodyRef")
+			assert.Nil(t, msg.Body, "a reference record carries no inline body")
+			assert.Equal(t, "text/plain", msg.ContentType, "optional fields after the locator are parsed")
 		})
 
-		// A reference record whose refLen claims more bytes than present must also
-		// be rejected cleanly (bounds-checked length-skip), never OOB-panic.
+		// A reference record whose refLen claims more bytes than present must be
+		// rejected cleanly (bounds-checked), never OOB-panic.
 		var bad []byte
 		bad = binary.BigEndian.AppendUint16(bad, 0x0000)
 		bad = append(bad, 0x00)
