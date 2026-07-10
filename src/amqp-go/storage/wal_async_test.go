@@ -216,6 +216,189 @@ func TestStoreMessageAsync_NotRetrievableBeforeFsync(t *testing.T) {
 	assert.Equal(t, msg.Body, got.Body)
 }
 
+// TestAppendMessageRecord_ReuseBufferZeroAlloc is STAGE A test A3 (allocation
+// half). It proves the batch accumulator is allocation-free in steady state: once
+// a shared buffer has grown to its working size, resetting it (buf[:0]) and
+// re-serializing a batch of records IN PLACE allocates nothing — no fresh nil
+// accumulator, no per-record serialize buffer, no geometric growslice. This is
+// the perf win the whole stage rests on (flushBatch was the single biggest
+// allocator, ~66% of all alloc_space at 64KB). Uses a no-headers 64KB message so
+// the v3 extension block takes its zero-alloc empty-field-table fast path
+// (the 64KB durable target cell has no headers).
+func TestAppendMessageRecord_ReuseBufferZeroAlloc(t *testing.T) {
+	body := make([]byte, 65536)
+	for i := range body {
+		body[i] = byte(i & 0xff)
+	}
+	msg := &protocol.Message{Body: body, RoutingKey: "q", Exchange: "ex", DeliveryMode: 2}
+
+	const perBatch = 8
+	var buf []byte
+	serialize := func() {
+		buf = buf[:0]
+		for j := 0; j < perBatch; j++ {
+			buf = appendMessageRecord(buf, WALFormatVersion, "q", msg, uint64(j))
+		}
+	}
+	// Warm up so the buffer reaches steady-state capacity (grow-once).
+	for i := 0; i < 4; i++ {
+		serialize()
+	}
+
+	allocs := testing.AllocsPerRun(100, serialize)
+	assert.Zero(t, allocs,
+		"reusing the grown batch buffer must serialize %d records with zero heap allocations (got %.1f)", perBatch, allocs)
+}
+
+// TestWriteAsync_ReuseBufferRaceClean is STAGE A test A3 (race half). It drives
+// the real group-commit writer with many concurrent WriteAsync of 64KB bodies
+// across several producer goroutines, then verifies every record read back has a
+// bit-identical body. Run under `go test -race`, it pins the single-owner
+// guarantee: only batchWriterLoop touches the persistent batch buffer, so buffer
+// reuse never races the producers or the completions. A regression that aliased
+// the shared buffer to message.Body or shared it across goroutines would trip the
+// race detector or corrupt a body.
+func TestWriteAsync_ReuseBufferRaceClean(t *testing.T) {
+	wm, err := NewWALManagerWithConfig(t.TempDir(), DefaultWALConfig())
+	require.NoError(t, err)
+	defer wm.Close()
+
+	const producers = 8
+	const perProducer = 64
+	const total = producers * perProducer
+
+	makeBody := func(off uint64) []byte {
+		b := make([]byte, 65536)
+		for j := range b {
+			b[j] = byte((int(off)*131 + j) & 0xff)
+		}
+		return b
+	}
+
+	var wg sync.WaitGroup
+	done := make(chan uint64, total)
+	for p := 0; p < producers; p++ {
+		wg.Add(1)
+		go func(base int) {
+			defer wg.Done()
+			for k := 0; k < perProducer; k++ {
+				off := uint64(base*perProducer + k + 1)
+				msg := &protocol.Message{Body: makeBody(off), RoutingKey: "q", DeliveryMode: 2, DeliveryTag: off}
+				wm.WriteAsync("q", msg, off, func(cerr error) {
+					if cerr == nil {
+						done <- off
+					} else {
+						done <- 0
+					}
+				})
+			}
+		}(p)
+	}
+	wg.Wait()
+
+	deadline := time.After(30 * time.Second)
+	for i := 0; i < total; i++ {
+		select {
+		case off := <-done:
+			require.NotZero(t, off, "no completion may report an error")
+		case <-deadline:
+			t.Fatalf("only %d/%d completions fired", i, total)
+		}
+	}
+
+	for off := uint64(1); off <= total; off++ {
+		got, rerr := wm.Read("q", off)
+		require.NoError(t, rerr, "record %d must be readable", off)
+		assert.True(t, bytesEqual(got.Body, makeBody(off)), "record %d body must be bit-identical after concurrent reuse", off)
+	}
+}
+
+// bytesEqual is a tiny helper kept local to avoid importing bytes in this file.
+func bytesEqual(a, b []byte) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// TestWriteAsync_FsyncErrorNoIndexUpdate is STAGE A test A6. On an fsync error the
+// record must NOT be indexed (not readable) and the error must reach onDone; and
+// critically, the writer must then reuse its persistent batch buffer CORRECTLY
+// for the next (good) batch, producing a durable, bit-identical record. The good
+// record's bytes are validated via a fresh manager's physical CRC recovery scan
+// (independent of the in-memory offset index), proving buffer reuse across the
+// error boundary did not corrupt the serialization.
+func TestWriteAsync_FsyncErrorNoIndexUpdate(t *testing.T) {
+	dir := t.TempDir()
+
+	errRestore := SetWALGroupCommitFsyncForTest(func(f *os.File) error {
+		return fmt.Errorf("injected fsync failure")
+	})
+
+	wm, err := NewWALManagerWithConfig(dir, DefaultWALConfig())
+	require.NoError(t, err)
+
+	const bad = uint64(1)
+	badBody := make([]byte, 65536)
+	for i := range badBody {
+		badBody[i] = 0xAA
+	}
+	badDone := make(chan error, 1)
+	wm.WriteAsync("q", &protocol.Message{Body: badBody, RoutingKey: "q", DeliveryMode: 2, DeliveryTag: bad}, bad,
+		func(e error) { badDone <- e })
+
+	select {
+	case e := <-badDone:
+		require.Error(t, e, "an fsync error must be delivered to onDone")
+	case <-time.After(5 * time.Second):
+		t.Fatal("errored completion never fired")
+	}
+	_, rerr := wm.Read("q", bad)
+	assert.Error(t, rerr, "an fsync-errored record must not be readable (index not updated)")
+
+	// Restore a real fsync; the next batch must reuse the buffer correctly.
+	errRestore()
+	goodRestore := SetWALGroupCommitFsyncForTest(func(f *os.File) error { return f.Sync() })
+	defer goodRestore()
+
+	const good = uint64(2)
+	goodBody := make([]byte, 65536)
+	for i := range goodBody {
+		goodBody[i] = byte((i*3 + 7) & 0xff)
+	}
+	goodDone := make(chan error, 1)
+	wm.WriteAsync("q", &protocol.Message{Body: goodBody, RoutingKey: "q", DeliveryMode: 2, DeliveryTag: good}, good,
+		func(e error) { goodDone <- e })
+	select {
+	case e := <-goodDone:
+		require.NoError(t, e, "the good batch after an fsync error must succeed (buffer reused correctly)")
+	case <-time.After(5 * time.Second):
+		t.Fatal("good completion never fired")
+	}
+	require.NoError(t, wm.Close())
+
+	wm2, err := NewWALManager(dir)
+	require.NoError(t, err)
+	defer wm2.Close()
+	recovered, err := wm2.RecoverFromWAL()
+	require.NoError(t, err)
+
+	var goodRec *protocol.Message
+	for _, rm := range recovered {
+		if rm.Offset == good {
+			goodRec = rm.Message
+		}
+	}
+	require.NotNil(t, goodRec, "the good record must be physically durable and recoverable")
+	assert.True(t, bytesEqual(goodRec.Body, goodBody),
+		"the good record's body must be bit-identical (buffer reuse after error did not corrupt bytes)")
+}
+
 // TestStoreMessageAsync_FsyncErrorNoRingStore (TDD test 8 part 2): on an fsync
 // error the durable message must NEVER become ring-resident, so a frontier that
 // advances past the errored tag finds nothing to deliver (no stale-slot delivery

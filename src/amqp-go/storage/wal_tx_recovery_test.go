@@ -1,15 +1,103 @@
 package storage
 
 import (
+	"bytes"
 	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/maxpert/amqp-go/protocol"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+// TestWALRecovery_LargeBodyCrashBitIdentity is STAGE A test A4, the HEADLINE
+// durability guard for the in-place / reused-buffer serializer. It writes 500
+// distinct 64KB durable messages through the real async group-commit writer,
+// waits for every completion (⇒ each is fsynced), then simulates a CRASH: it
+// opens a SECOND WAL manager over the same directory and recovers WITHOUT ever
+// running the first manager's clean-shutdown path (no Close-time flush). Every
+// recovered body must be BIT-IDENTICAL to what was written.
+//
+// This is the end-to-end proof that grow-in-place serialization onto a single
+// reused batch buffer — with record-relative CRC/length backpatch and buf[:0]
+// reset between flushes — writes exactly the same durable bytes as the legacy
+// per-record single-allocation path. A backpatch-offset bug, a stale-capacity
+// reuse bug, or a body-copy bug would surface here as a mismatched body.
+func TestWALRecovery_LargeBodyCrashBitIdentity(t *testing.T) {
+	dir := t.TempDir()
+
+	wm, err := NewWALManager(dir)
+	require.NoError(t, err)
+	// Cleanup only; the "crash" is that recovery runs against a manager that
+	// never executed this shutdown path.
+	defer wm.Close()
+
+	const n = 500
+	const bodySize = 65536
+
+	// Deterministic, per-message-distinct body so a swap/overwrite between
+	// records is detectable.
+	makeBody := func(off uint64) []byte {
+		b := make([]byte, bodySize)
+		seed := byte(off * 197)
+		for j := range b {
+			b[j] = seed ^ byte((j*31+int(off))&0xff)
+		}
+		return b
+	}
+
+	done := make(chan error, n)
+	for i := 1; i <= n; i++ {
+		off := uint64(i)
+		msg := &protocol.Message{
+			Body:         makeBody(off),
+			Exchange:     "ex",
+			RoutingKey:   "big-q",
+			DeliveryMode: 2,
+			DeliveryTag:  off,
+		}
+		wm.WriteAsync("big-q", msg, off, func(e error) { done <- e })
+	}
+
+	deadline := time.After(60 * time.Second)
+	for i := 0; i < n; i++ {
+		select {
+		case e := <-done:
+			require.NoError(t, e, "every durable write must complete successfully (fsynced)")
+		case <-deadline:
+			t.Fatalf("only %d/%d durable writes completed", i, n)
+		}
+	}
+
+	// Simulate crash: a fresh manager reads the on-disk WAL. wm is intentionally
+	// NOT closed first (no clean shutdown flush was relied upon; the data is
+	// durable purely from the per-batch group-commit fsync above).
+	wm2, err := NewWALManager(dir)
+	require.NoError(t, err)
+	defer wm2.Close()
+
+	recovered, err := wm2.RecoverFromWAL()
+	require.NoError(t, err)
+
+	byOffset := make(map[uint64]*protocol.Message, n)
+	for _, rm := range recovered {
+		if rm.QueueName == "big-q" {
+			byOffset[rm.Offset] = rm.Message
+		}
+	}
+	require.Len(t, byOffset, n, "every durable message must recover after the simulated crash")
+
+	for i := 1; i <= n; i++ {
+		off := uint64(i)
+		got := byOffset[off]
+		require.NotNil(t, got, "message at offset %d must recover", off)
+		assert.True(t, bytes.Equal(got.Body, makeBody(off)),
+			"recovered body at offset %d must be bit-identical to what was written", off)
+	}
+}
 
 // TestWALRecovery_IgnoresUncommittedTransaction is the SQ-8 recovery-atomicity
 // test. It crafts a WAL file that contains one fully-committed transaction

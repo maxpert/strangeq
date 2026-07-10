@@ -23,6 +23,16 @@ const (
 	DefaultWALFileSize     = 512 * 1024 * 1024     // 512 MB per WAL file
 	WALFileExtension       = ".wal"
 
+	// maxRetainedWALBatchBytes bounds how large the batch writer's persistent,
+	// reused serialization buffer may grow before it is released back to the GC
+	// after a flush. The buffer is normally retained across flushes (grow-once)
+	// to avoid re-allocating the batch accumulator every group commit; this cap
+	// guards against a rare, unusually large batch permanently pinning a very
+	// large buffer. It is comfortably above the steady-state batch size of the
+	// worst benchmarked cell (64KB body × ~1000-record batch ≈ 64 MB) so the
+	// common case keeps its reuse win, while an outlier batch is not retained.
+	maxRetainedWALBatchBytes = 128 * 1024 * 1024 // 128 MB
+
 	// Shared WAL message (record) format:
 	// [4 bytes CRC32][4 bytes length][4 bytes queueNameLen][queueName][8 bytes offset]
 	// [4 bytes exchangeLen][exchange][4 bytes routingKeyLen][routingKey][1 byte deliveryMode][4 bytes bodyLen][body]
@@ -750,6 +760,15 @@ func (qw *QueueWAL) batchWriterLoop() {
 
 	batch := make([]*writeRequest, 0, qw.cfg.BatchSize)
 
+	// Persistent, single-owner scratch owned exclusively by this goroutine and
+	// passed to flushBatch by pointer. buf is the serialization accumulator
+	// (reset to buf[:0] and re-filled in place each flush — no fresh nil
+	// accumulator, no geometric regrowth); positions is the per-record file
+	// position scratch. Neither ever escapes this goroutine or is aliased to a
+	// message body, which is what makes the reuse race-free (invariant A1 §4).
+	var buf []byte
+	var positions []int64
+
 	for {
 		select {
 		case req := <-qw.writeChan:
@@ -764,7 +783,7 @@ func (qw *QueueWAL) batchWriterLoop() {
 					break drain
 				}
 			}
-			qw.flushBatch(batch)
+			qw.flushBatch(batch, &buf, &positions)
 			batch = batch[:0]
 
 		case <-qw.stopChan:
@@ -776,7 +795,7 @@ func (qw *QueueWAL) batchWriterLoop() {
 					batch = append(batch, r)
 				default:
 					if len(batch) > 0 {
-						qw.flushBatch(batch)
+						qw.flushBatch(batch, &buf, &positions)
 					}
 					return
 				}
@@ -785,8 +804,27 @@ func (qw *QueueWAL) batchWriterLoop() {
 	}
 }
 
-// flushBatch writes a batch of messages to the current WAL file
-func (qw *QueueWAL) flushBatch(batch []*writeRequest) {
+// flushBatch writes a batch of messages to the current WAL file.
+//
+// bufp and positionsp point to the batch writer's persistent, single-owner
+// scratch (see batchWriterLoop). The serialization accumulator is reset with
+// (*bufp)[:0] and re-filled IN PLACE — each record is serialized directly onto
+// the shared buffer's tail via appendMessageRecord — instead of allocating a
+// fresh nil accumulator per batch and a per-message serialize buffer that is then
+// re-copied in. This removes the two biggest allocators on the durable path (the
+// former flushBatch re-append + serializeMessageVersioned per-message buffer) and
+// the geometric regrowth of the accumulator.
+//
+// A1 SAFETY: the reused buffer's lifetime ends at qw.currentFile.Write()'s
+// RETURN — write(2) copies the bytes into the kernel page cache, and the
+// subsequent fsync flushes KERNEL state, never this Go slice. So resetting/reusing
+// *bufp on the NEXT flush cannot race, corrupt, or invalidate the previous batch's
+// fsync, CRC (computed during serialization, before Write), any confirm, or any
+// delivery. Everything after Write — metrics, fsync, the fsync-error early return
+// that leaves the index un-updated, offset-index population, offset/roll, unlock,
+// and completions — is byte-for-byte unchanged, so the write→fsync→index→completion
+// ordering and durability barrier are preserved.
+func (qw *QueueWAL) flushBatch(batch []*writeRequest, bufp *[]byte, positionsp *[]int64) {
 	if len(batch) == 0 {
 		return
 	}
@@ -797,15 +835,24 @@ func (qw *QueueWAL) flushBatch(batch []*writeRequest) {
 	currentFileNum := qw.fileNum.Load()
 	currentFilePos := qw.fileOffset.Load()
 
-	// Track positions for index (Phase 6D)
-	positions := make([]int64, len(batch))
-	var buf []byte
+	// Reuse the persistent serialization buffer (grow-once) and position scratch.
+	buf := (*bufp)[:0]
+	if cap(*positionsp) < len(batch) {
+		*positionsp = make([]int64, len(batch))
+	}
+	positions := (*positionsp)[:len(batch)]
 
-	// Serialize all messages in batch and track their positions
+	// Serialize all messages in batch IN PLACE and track their positions.
 	for i, req := range batch {
 		positions[i] = currentFilePos + int64(len(buf)) // Position in file
-		msgBytes := qw.serializeMessage(req.queueName, req.message, req.offset)
-		buf = append(buf, msgBytes...)
+		buf = appendMessageRecord(buf, WALFormatVersion, req.queueName, req.message, req.offset)
+	}
+	// Publish the (possibly reallocated) buffer back so the next flush reuses
+	// its grown capacity. A rare oversized batch is released rather than pinned.
+	if cap(buf) > maxRetainedWALBatchBytes {
+		*bufp = nil
+	} else {
+		*bufp = buf
 	}
 
 	// Single write (O_APPEND makes this atomic across processes)
@@ -910,11 +957,6 @@ func (qw *QueueWAL) deliverCompletions(batch []*writeRequest, err error) {
 	}
 }
 
-// serializeMessage serializes a message record in the current WAL format.
-func (qw *QueueWAL) serializeMessage(queueName string, message *protocol.Message, offset uint64) []byte {
-	return qw.serializeMessageVersioned(WALFormatVersion, queueName, message, offset)
-}
-
 // serializeMessageVersioned serializes a message with CRC, length, and (for v2+)
 // a record-type tag, followed by queue name and offset.
 //
@@ -927,8 +969,27 @@ func (qw *QueueWAL) serializeMessage(queueName string, message *protocol.Message
 // production write path always uses WALFormatVersion. Single allocation.
 func (qw *QueueWAL) serializeMessageVersioned(version uint8, queueName string, message *protocol.Message, offset uint64) []byte {
 	buf := make([]byte, 0, len(message.Body)+len(message.Exchange)+len(message.RoutingKey)+len(queueName)+256)
+	return appendMessageRecord(buf, version, queueName, message, offset)
+}
 
-	// Reserve space for CRC and length
+// appendMessageRecord serializes ONE message record onto the TAIL of buf (grow
+// in place) and returns the grown buffer. It is the shared serializer for both
+// the single-allocation serializeMessageVersioned wrapper (fresh buf, recStart
+// == 0) and the group-commit batch writer (one persistent buf, many records
+// packed back-to-back). The emitted bytes are byte-for-byte identical to the
+// former in-line serializeMessageVersioned implementation — see the A1
+// byte-identity golden test.
+//
+// Correctness of packing many records into one buffer rests on RECORD-RELATIVE
+// backpatch: the CRC and length placeholders are patched at buf[recStart:] and
+// the CRC is computed over buf[recStart+4:] (the record's own [length][data]
+// span, which is at the tail because this record was just appended). recStart is
+// an index, not a pointer, so it survives any growslice reallocation during the
+// appends. The body is copied exactly once (the single inherent store-path copy).
+func appendMessageRecord(buf []byte, version uint8, queueName string, message *protocol.Message, offset uint64) []byte {
+	recStart := len(buf)
+
+	// Reserve space for CRC and length (patched below, record-relative).
 	buf = append(buf, 0, 0, 0, 0) // CRC32 placeholder
 	buf = append(buf, 0, 0, 0, 0) // Length placeholder
 
@@ -955,7 +1016,7 @@ func (qw *QueueWAL) serializeMessageVersioned(version uint8, queueName string, m
 	// Write delivery mode (1 byte)
 	buf = append(buf, message.DeliveryMode)
 
-	// Write body
+	// Write body (the ONE inherent store-path body copy)
 	buf = binary.BigEndian.AppendUint32(buf, uint32(len(message.Body)))
 	buf = append(buf, message.Body...)
 
@@ -967,13 +1028,13 @@ func (qw *QueueWAL) serializeMessageVersioned(version uint8, queueName string, m
 		buf = appendMessageExtensions(buf, message)
 	}
 
-	// Calculate actual length (excluding CRC and length fields)
-	dataLen := len(buf) - 8
-	binary.BigEndian.PutUint32(buf[4:8], uint32(dataLen))
+	// Calculate actual length (excluding CRC and length fields), record-relative.
+	dataLen := len(buf) - recStart - 8
+	binary.BigEndian.PutUint32(buf[recStart+4:recStart+8], uint32(dataLen))
 
-	// Calculate CRC over everything after CRC field
-	crc := crc32.ChecksumIEEE(buf[4:])
-	binary.BigEndian.PutUint32(buf[0:4], crc)
+	// Calculate CRC over everything after this record's CRC field.
+	crc := crc32.ChecksumIEEE(buf[recStart+4:])
+	binary.BigEndian.PutUint32(buf[recStart:recStart+4], crc)
 
 	return buf
 }

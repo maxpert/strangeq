@@ -1,6 +1,7 @@
 package storage
 
 import (
+	"bytes"
 	"encoding/binary"
 	"fmt"
 	"hash/crc32"
@@ -13,6 +14,132 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+// TestAppendMessageRecord_ByteIdenticalToLegacy is the STAGE A A1 byte-identity
+// golden. It proves the in-place record serializer (appendMessageRecord, which
+// writes each record onto the tail of a SHARED batch buffer with record-relative
+// CRC/length backpatch) emits the EXACT same on-disk bytes as the legacy
+// single-allocation serializeMessageVersioned — for every version, body size and
+// field combination the production path can produce.
+//
+// Byte identity is the load-bearing durability invariant (A1): if the bytes are
+// identical, every existing recovery/versioning test and the whole on-disk format
+// contract continue to hold unchanged after the buffer-reuse refactor. The test
+// deliberately appends records into a NON-EMPTY shared buffer so a bug that used
+// absolute offsets (buf[0:4]/buf[4:]) instead of record-relative offsets
+// (buf[recStart:...]) would corrupt the CRC/length of every record but the first
+// and fail here.
+func TestAppendMessageRecord_ByteIdenticalToLegacy(t *testing.T) {
+	wm, err := NewWALManager(t.TempDir())
+	require.NoError(t, err)
+	defer wm.Close()
+	qw := wm.sharedWAL
+
+	bodySizes := []int{0, 1, 4096, 65536}
+	versions := []uint8{WALVersion1, WALVersion2, WALVersion3}
+
+	type fieldSet struct {
+		name       string
+		queue      string
+		exchange   string
+		routingKey string
+		headers    map[string]interface{}
+		expiration string
+		enqueue    int64
+	}
+	fieldSets := []fieldSet{
+		{name: "bare", queue: "q", exchange: "", routingKey: "", headers: nil},
+		{name: "named", queue: "orders", exchange: "ex", routingKey: "rk.a", headers: nil},
+		{
+			// A single-key header keeps EncodeFieldTable's output deterministic so
+			// two independent serializations are byte-comparable. (A multi-key map
+			// encodes in Go's non-deterministic map-iteration order, which differs
+			// per call regardless of serializer — its round-trip is covered
+			// semantically by TestWAL_MessageExtensions_RoundTrip.) This still
+			// exercises the full v3 extension path: Expiration, EnqueueUnixMilli,
+			// and a non-empty Headers field table, plus the CRC over that block.
+			name: "with-extensions", queue: "orders", exchange: "amq.topic", routingKey: "rk.b",
+			headers: map[string]interface{}{"x-attempt": int64(7)}, expiration: "60000", enqueue: 1720000000123,
+		},
+	}
+
+	for _, version := range versions {
+		for _, fs := range fieldSets {
+			for _, bs := range bodySizes {
+				name := fmt.Sprintf("v%d/%s/body=%d", version, fs.name, bs)
+				t.Run(name, func(t *testing.T) {
+					body := make([]byte, bs)
+					for i := range body {
+						body[i] = byte((i*7 + bs) & 0xff)
+					}
+					msg := &protocol.Message{
+						Exchange:         fs.exchange,
+						RoutingKey:       fs.routingKey,
+						Body:             body,
+						DeliveryMode:     2,
+						Headers:          fs.headers,
+						Expiration:       fs.expiration,
+						EnqueueUnixMilli: fs.enqueue,
+					}
+					const offset = uint64(0xABCDEF12)
+
+					legacy := qw.serializeMessageVersioned(version, fs.queue, msg, offset)
+
+					// (a) fresh buffer (recStart == 0): must equal legacy exactly.
+					fresh := appendMessageRecord(nil, version, fs.queue, msg, offset)
+					assert.True(t, bytes.Equal(legacy, fresh),
+						"fresh-buffer record must be byte-identical to legacy\nlegacy=%x\nfresh =%x", legacy, fresh)
+
+					// (b) appended onto a non-empty shared buffer (recStart != 0):
+					// the record slice carved out at recStart must equal legacy.
+					prefix := []byte("PRECEDING-RECORD-BYTES-XYZ")
+					shared := append([]byte(nil), prefix...)
+					recStart := len(shared)
+					shared = appendMessageRecord(shared, version, fs.queue, msg, offset)
+					record := shared[recStart:]
+					assert.True(t, bytes.Equal(legacy, record),
+						"shared-buffer record must be byte-identical to legacy\nlegacy=%x\nshared=%x", legacy, record)
+					// prefix must be untouched.
+					assert.True(t, bytes.Equal(prefix, shared[:recStart]), "preceding buffer bytes must not be mutated")
+				})
+			}
+		}
+	}
+}
+
+// TestAppendMessageRecord_MultiRecordSharedBuffer proves several records packed
+// back-to-back into ONE shared buffer each recover independently: every record's
+// carved slice re-parses to its own CRC-valid, correctly-lengthed image, matching
+// the legacy per-record serialization. This mirrors exactly what flushBatch does.
+func TestAppendMessageRecord_MultiRecordSharedBuffer(t *testing.T) {
+	wm, err := NewWALManager(t.TempDir())
+	require.NoError(t, err)
+	defer wm.Close()
+	qw := wm.sharedWAL
+
+	msgs := []*protocol.Message{
+		{RoutingKey: "a", Body: []byte("first"), DeliveryMode: 2},
+		{RoutingKey: "bb", Exchange: "ex", Body: bytes.Repeat([]byte{0x5a}, 65536), DeliveryMode: 2},
+		{RoutingKey: "ccc", Body: []byte{}, DeliveryMode: 2},
+	}
+
+	var buf []byte
+	starts := make([]int, len(msgs))
+	for i, m := range msgs {
+		starts[i] = len(buf)
+		buf = appendMessageRecord(buf, WALFormatVersion, "q", m, uint64(i+1))
+	}
+
+	for i, m := range msgs {
+		legacy := qw.serializeMessageVersioned(WALFormatVersion, "q", m, uint64(i+1))
+		end := len(buf)
+		if i+1 < len(starts) {
+			end = starts[i+1]
+		}
+		record := buf[starts[i]:end]
+		assert.True(t, bytes.Equal(legacy, record), "record %d must be byte-identical to legacy", i)
+	}
+}
 
 // sampleXDeathHeaders builds a Headers map containing an x-death field array
 // with the exact field types RabbitMQ (and W1's annotateXDeath) emits: an
