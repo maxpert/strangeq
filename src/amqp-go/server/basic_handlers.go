@@ -204,11 +204,11 @@ func (s *Server) processHeaderFrame(conn *protocol.Connection, frame *protocol.F
 		return fmt.Errorf("message body size %d exceeds MaxMessageSize %d", contentHeader.BodySize, s.Config.Server.MaxMessageSize)
 	}
 
-	// Pre-allocate body slice to BodySize capacity to eliminate reallocations
-	// during body frame append (saves ~4.6GB allocations at high throughput)
-	if contentHeader.BodySize > 0 && cap(pendingMsg.Body) < int(contentHeader.BodySize) {
-		pendingMsg.Body = make([]byte, 0, contentHeader.BodySize)
-	}
+	// Leave pendingMsg.Body nil here. The allocation decision is deferred to the
+	// FIRST body frame (processBodyFrame): a body that arrives in a single frame
+	// is donated (zero-copy) from the frame payload, and only a multi-frame body
+	// pre-allocates a BodySize-capacity buffer to assemble into. Pre-allocating
+	// here would force a copy even for the common single-frame case.
 
 	if ce := s.Log.Check(zapcore.DebugLevel, "Content header received for pending message"); ce != nil {
 		ce.Write(
@@ -261,8 +261,35 @@ func (s *Server) processBodyFrame(conn *protocol.Connection, frame *protocol.Fra
 		return fmt.Errorf("body frame received before header frame")
 	}
 
-	// Append the body content to the pending message
-	pendingMsg.Body = append(pendingMsg.Body, frame.Payload...)
+	// Assemble the body. On the FIRST body frame, if this single frame already
+	// carries the entire declared body, DONATE the frame payload directly to
+	// message.Body (zero copy) instead of copying it into a fresh buffer — this
+	// is the common case for a body that fits in one frame (e.g. a 64KB body
+	// under the default 128KB frame-max). A multi-frame body falls back to the
+	// make+append assemble path.
+	//
+	// OWNERSHIP CONTRACT for the donated buffer: after donation, message.Body is
+	// the SOLE owner of the (former) frame.Payload backing array. This is safe
+	// because (a) the frame reader make()s a FRESH payload per frame
+	// (protocol.ReadFrameOptimizedWithLimit) and never reuses that array for a
+	// later read, and (b) PutFrame / PutPendingMessage only NIL their references
+	// to it — they never recycle the backing []byte (see the ALIASING INVARIANT
+	// in processCompleteMessage and PutPendingMessage). So when the frame is
+	// pooled right after processFrame returns, it nils a reference the message no
+	// longer needs; the array lives, owned solely by the *Message, through the
+	// async WAL read, ring residency, and delivery, and is freed by GC only after
+	// the message is fully done. The donated payload is therefore NEVER returned
+	// to any pool.
+	if pendingMsg.Body == nil {
+		if uint64(len(frame.Payload)) == pendingMsg.Header.BodySize {
+			pendingMsg.Body = frame.Payload // DONATE: single-frame body, zero copy
+		} else {
+			pendingMsg.Body = make([]byte, 0, pendingMsg.Header.BodySize)
+			pendingMsg.Body = append(pendingMsg.Body, frame.Payload...) // multi-frame: assemble
+		}
+	} else {
+		pendingMsg.Body = append(pendingMsg.Body, frame.Payload...) // subsequent frames
+	}
 	pendingMsg.Received += uint64(len(frame.Payload))
 
 	if ce := s.Log.Check(zapcore.DebugLevel, "Body frame received for pending message"); ce != nil {
