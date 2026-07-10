@@ -61,7 +61,7 @@ func TestWAL_NewFileHasVersionHeader(t *testing.T) {
 	assert.Equal(t, WALFormatVersion, hdr[len(WALMagic)], "version byte must be current format version")
 }
 
-// TestWAL_VersionedRoundTrip writes messages through a versioned (v1) WAL,
+// TestWAL_VersionedRoundTrip writes messages through the default (v4) WAL path,
 // closes, reopens, and recovers them — proving the header path round-trips.
 func TestWAL_VersionedRoundTrip(t *testing.T) {
 	tmpDir := t.TempDir()

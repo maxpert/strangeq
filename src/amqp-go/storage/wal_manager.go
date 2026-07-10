@@ -1413,7 +1413,7 @@ func parseMessagePayload(payload []byte) (queueName string, offset uint64, m *pr
 		}
 		bodyLen := binary.BigEndian.Uint32(payload[pos : pos+4])
 		pos += 4
-		if pos+int(bodyLen) > len(payload) {
+		if int(bodyLen) < 0 || pos+int(bodyLen) > len(payload) {
 			return "", 0, nil, false
 		}
 		msg.Body = payload[pos : pos+int(bodyLen)] // zero-copy alias into CRC-checked payload
