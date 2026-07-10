@@ -23,6 +23,19 @@ type Storage interface {
 	AtomicStorage
 }
 
+// SharedDurableSub is one fan-out target of an ITER5 fused shared-body durable
+// write: a per-queue message copy that will carry a body REFERENCE to the single
+// shared body (Message.Body of every sub points at the same slice). OnDurable
+// fires after THIS copy's WAL record is durable (fsync completed), so the broker
+// can advance that queue's consumer-visibility exactly as StoreMessageAsync's
+// completion does. It is the neutral broker<->storage boundary type for the
+// optional shared-write capability (see the broker's sharedDurableWriter).
+type SharedDurableSub struct {
+	QueueName string
+	Message   *protocol.Message
+	OnDurable func(error)
+}
+
 // MessageStore defines the interface for message durability operations
 type MessageStore interface {
 	// StoreMessage persists a message

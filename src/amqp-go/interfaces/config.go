@@ -252,6 +252,24 @@ type EngineConfig struct {
 	// Default: 10,000
 	WALChannelBuffer int `json:"wal_channel_buffer"`
 
+	// SharedBodyThreshold (ITER5) is the minimum body size, in bytes, at which a
+	// DURABLE fan-out to >=2 queues writes the body ONCE as a shared WAL BodyBlock
+	// plus one tiny reference record per target, instead of one full-body copy per
+	// target. Below it (and for single-queue or transient publishes) every copy is
+	// inline, byte-for-byte as before. 0 => the default (4096). Set very large to
+	// effectively disable the feature.
+	// Default: 4096
+	SharedBodyThreshold int `json:"shared_body_threshold"`
+
+	// SharedBodyMaxPinAgeMS (ITER5 cold-tail hardening) bounds, in milliseconds,
+	// how long a rolled WAL file carrying a shared BodyBlock may be kept out of
+	// checkpoint before it is force-re-inlined (N copies) and deleted. 0 disables
+	// the age backstop and relies on WALCleanupCheckIntervalMS/retention: a
+	// permanently-unacked reference then pins its file holding exactly ONE body
+	// copy (never the N-copy blowup).
+	// Default: 0 (disabled)
+	SharedBodyMaxPinAgeMS int64 `json:"shared_body_max_pin_age_ms"`
+
 	// ========================================
 	// Segment Storage (Cold Path)
 	// ========================================

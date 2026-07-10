@@ -45,7 +45,17 @@ func (r *AtomicRing) Store(deliveryTag uint64, msg *protocol.Message) (seq uint6
 		return 0, false, fmt.Errorf("ring is closed")
 	}
 	seq = r.publishSeq.Add(1) - 1
-	msg.DeliveryTag = deliveryTag
+	// Every caller passes deliveryTag == msg.DeliveryTag (the tag is minted and
+	// stamped on the message before it is stored), so this is normally a no-op.
+	// Guard it: an UNCONDITIONAL write here races a concurrent reader of the SAME
+	// message object during a durable fan-out — the publish loop hands the i==0
+	// copy to the async store, then reads `*message` again to build the i>=1 tail
+	// copies, while this completion (on the WAL batch-writer goroutine) would
+	// re-stamp the tag. The values are identical, so the guarded write never fires
+	// in practice and the (benign) data race is removed without changing behavior.
+	if msg.DeliveryTag != deliveryTag {
+		msg.DeliveryTag = deliveryTag
+	}
 	if r.slots[seq&r.mask].CompareAndSwap(nil, msg) {
 		r.tagMu.Lock()
 		r.tagToSeq[deliveryTag] = seq

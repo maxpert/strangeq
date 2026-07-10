@@ -278,6 +278,36 @@ func BenchmarkSharedWAL_Throughput(b *testing.B) {
 }
 
 // BenchmarkSharedWAL_QueueScaling benchmarks scaling with different queue counts
+// BenchmarkPublishDurable1P1C (spec test #11) is the no-regression guard for the
+// N==1 durable hot path: a single-queue durable write MUST hit the ITER5 gate's
+// false branch and emit the exact same bytes as before the feature. It measures
+// ns/op + allocs/op for the plain single-queue durable WAL write (the path a 1P/1C
+// durable publisher exercises). A shared-body regression here — an added record,
+// lock, or allocation on the non-shared path — shows up as more allocs/op.
+func BenchmarkPublishDurable1P1C(b *testing.B) {
+	tmpDir := b.TempDir()
+	wm, err := NewWALManager(tmpDir)
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer wm.Close()
+
+	msg := &protocol.Message{
+		Exchange:     "bench.exchange",
+		RoutingKey:   "bench.key",
+		Body:         make([]byte, 4096),
+		DeliveryMode: 2,
+	}
+
+	b.ResetTimer()
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		if err := writeWithRetry(wm, "bench_queue", msg, uint64(i+1)); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
 func BenchmarkSharedWAL_QueueScaling(b *testing.B) {
 	queueCounts := []int{1, 10, 100, 1000}
 

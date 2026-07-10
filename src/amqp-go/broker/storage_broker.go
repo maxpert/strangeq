@@ -323,6 +323,32 @@ type asyncDurableWriter interface {
 	StoreMessageAsync(queueName string, message *protocol.Message, onDurable func(error)) error
 }
 
+// DefaultSharedBodyThreshold is the body size (bytes) at/above which a durable
+// fan-out to >=2 queues writes the body once (shared) instead of per queue, when
+// EngineConfig.SharedBodyThreshold is unset (0). Matches the WAL default.
+const DefaultSharedBodyThreshold = 4096
+
+// sharedDurableWriter is the optional ITER5 storage capability that fuses a
+// durable fan-out of one large body to N>=2 queues into a single group-commit
+// unit (one shared BodyBlock + N reference records, one fsync) — writing the body
+// ONCE instead of N times. Each sub's OnDurable fires after that copy is durable,
+// exactly like StoreMessageAsync's completion, so per-queue visibility/confirm is
+// unchanged. DisruptorStorage implements it; a backend that does not simply keeps
+// the per-queue StoreMessageAsync loop (correct, just N body copies on disk).
+type sharedDurableWriter interface {
+	StoreSharedAsync(subs []interfaces.SharedDurableSub) error
+}
+
+// sharedBodyThreshold returns the configured shared-body size gate, defaulting to
+// DefaultSharedBodyThreshold when unset. A publish shares its body only for a
+// durable fan-out to >=2 queues whose body is at least this large.
+func (b *StorageBroker) sharedBodyThreshold() int {
+	if b.engineConfig.SharedBodyThreshold > 0 {
+		return b.engineConfig.SharedBodyThreshold
+	}
+	return DefaultSharedBodyThreshold
+}
+
 // deleteIfPresent removes a message from storage and reports whether THIS call
 // won the removal (the ring CAS). Depth is decremented only by the winner, so at
 // most one of {reaper drop, consumer head-check} decrements depth per tag.
@@ -1599,6 +1625,17 @@ func (b *StorageBroker) PublishMessage(exchangeName, routingKey string, message 
 		return nil
 	}
 
+	// ITER5 shared-body gate (synchronous path). DeliveryMode==2 is checked FIRST
+	// so the transient hot path evaluates one comparison and stops (no regression).
+	// The server routes every durable publish through PublishMessageAsyncConfirm,
+	// so this synchronous durable-fanout branch is reached only by non-async
+	// callers/tests; it keeps the feature consistent regardless of entry point.
+	if message.DeliveryMode == 2 && len(targetQueues) >= 2 && len(message.Body) >= b.sharedBodyThreshold() {
+		if sdw, ok := b.storage.(sharedDurableWriter); ok {
+			return b.fanoutSharedSync(sdw, message, targetQueues)
+		}
+	}
+
 	// Enqueue to all target queues (lock-free, no consumer iteration)
 	rejected := false
 	for i, queueName := range targetQueues {
@@ -1837,6 +1874,18 @@ func (b *StorageBroker) PublishMessageAsyncConfirm(exchangeName, routingKey stri
 	agg := newPublishConfirmAgg(onDurable)
 	rejected := false
 
+	// ITER5 shared-body gate: a durable fan-out to >=2 queues with a large body
+	// routes its N durable writes through ONE fused BodyBlock+refs unit (body on
+	// disk once) when the backend supports it. Evaluated with values in hand — no
+	// hash, no lock, no alloc. Every winning single-queue durable cell has
+	// len(targetQueues)==1, so this is false there and the loop below runs
+	// byte-for-byte as today.
+	if len(targetQueues) >= 2 && len(message.Body) >= b.sharedBodyThreshold() {
+		if sdw, ok := b.storage.(sharedDurableWriter); ok {
+			return b.fanoutSharedAsyncConfirm(sdw, agg, message, targetQueues)
+		}
+	}
+
 	for i, queueName := range targetQueues {
 		queueState := b.getOrCreateQueueState(queueName)
 
@@ -1966,6 +2015,285 @@ func (b *StorageBroker) PublishMessageAsyncConfirm(exchangeName, routingKey stri
 	// fires synchronously here.
 	agg.report(nil)
 	return true, backpressure, nil
+}
+
+// fanoutSharedAsyncConfirm is the ITER5 fused fan-out for PublishMessageAsyncConfirm:
+// it performs the SAME per-queue in-memory bookkeeping as the per-queue loop (tag
+// mint via FrontierReserve, Headers deep-copy for tail copies, TTL stamp,
+// reject-publish admission, HWM backpressure) but collects the N copies and routes
+// their durable writes through ONE StoreSharedAsync (one shared BodyBlock + N
+// reference records, one fsync). Each copy's completion advances THAT queue's
+// frontier + max-length accounting exactly like the per-queue completion, so
+// consumer-visibility/confirm semantics are identical; only the durable byte
+// layout differs. The publishConfirmAgg fans the N completions into one confirm.
+func (b *StorageBroker) fanoutSharedAsyncConfirm(sdw sharedDurableWriter, agg *publishConfirmAgg, message *protocol.Message, targetQueues []string) (bool, protocol.DepthGate, error) {
+	var backpressure protocol.DepthGate
+	rejected := false
+
+	// reserved tracks (queueState, tag) for every copy whose frontier slot we
+	// reserved, so a StoreSharedAsync enqueue failure can release them all (the
+	// completions will not fire) — mirroring the per-queue enqueue-error path.
+	type reservedSlot struct {
+		qs  *QueueState
+		tag uint64
+	}
+	reserved := make([]reservedSlot, 0, len(targetQueues))
+	subs := make([]interfaces.SharedDurableSub, 0, len(targetQueues))
+
+	for i, queueName := range targetQueues {
+		queueState := b.getOrCreateQueueState(queueName)
+
+		select {
+		case <-queueState.StopCh():
+			// Release any slots reserved so far before bailing.
+			for _, r := range reserved {
+				r.qs.FrontierComplete(r.tag, false)
+			}
+			return false, nil, fmt.Errorf("queue '%s' closed", queueName)
+		default:
+		}
+		if queueState.AtHighWaterMark() {
+			backpressure = queueState
+		}
+
+		p := queueState.Policy()
+		rejectPublish := p != nil && p.Overflow == OverflowRejectPublish &&
+			(p.HasMaxLength || p.HasMaxLengthBytes)
+		if rejectPublish {
+			queueState.maxLenMu.Lock()
+			if maxLenRejectsPublish(queueState, p) {
+				queueState.maxLenMu.Unlock()
+				rejected = true
+				continue
+			}
+		}
+
+		msgID := queueState.FrontierReserve(func() uint64 { return b.globalDeliveryTag.Add(1) })
+
+		var storeMsg *protocol.Message
+		if i == 0 {
+			message.DeliveryTag = msgID
+			storeMsg = message
+		} else {
+			// FANOUT INVARIANT (see PublishMessage): deep-copy the Headers map for
+			// tail copies so queue copies never share a map pointer. Body IS shared
+			// (immutable after publish) — it is the single body the BodyBlock holds.
+			msgCopy := *message
+			msgCopy.DeliveryTag = msgID
+			if message.Headers != nil {
+				h := make(map[string]interface{}, len(message.Headers))
+				for k, v := range message.Headers {
+					h[k] = v
+				}
+				msgCopy.Headers = h
+			}
+			storeMsg = &msgCopy
+		}
+
+		if storeMsg.EnqueueUnixMilli == 0 && p != nil && p.HasMessageTTL {
+			storeMsg.EnqueueUnixMilli = b.ttlNowMillis()
+		}
+
+		// Per-copy deferred completion, identical to the per-queue path (§3.5):
+		// visibility + max-length accounting run ONLY after THIS copy is durable.
+		qs := queueState
+		id := msgID
+		qn := queueName
+		pol := p
+		bodyLen := len(storeMsg.Body)
+		completion := func(cerr error) {
+			qs.FrontierComplete(id, cerr == nil)
+			if cerr == nil && pol != nil {
+				addReadyBytesOnEnqueue(qs, pol, bodyLen)
+				if pol.Overflow == OverflowDropHead && (pol.HasMaxLength || pol.HasMaxLengthBytes) {
+					// Runs on the WAL batch-writer goroutine — hand drop-head trim to
+					// the worker (never inline; C1/A4 deadlock), as the per-queue path.
+					b.enqueueMaxLenTrim(qs, qn, pol)
+				}
+			}
+			agg.report(cerr)
+		}
+
+		agg.addCopy() // count BEFORE enqueue so an immediate completion can't underflow
+		reserved = append(reserved, reservedSlot{qs: queueState, tag: msgID})
+		subs = append(subs, interfaces.SharedDurableSub{
+			QueueName: queueName,
+			Message:   storeMsg,
+			OnDurable: completion,
+		})
+
+		if rejectPublish {
+			queueState.maxLenMu.Unlock()
+		}
+	}
+
+	if len(subs) > 0 {
+		if serr := sdw.StoreSharedAsync(subs); serr != nil {
+			// Enqueue failed: no completion will fire, so release every reserved
+			// frontier slot (else the per-queue frontiers wedge, M1). The aggregator
+			// is abandoned (guard never dropped => onDurable never fires).
+			for _, r := range reserved {
+				r.qs.FrontierComplete(r.tag, false)
+			}
+			return false, nil, fmt.Errorf("failed to store shared durable message: %w", serr)
+		}
+	}
+
+	if rejected {
+		// A reject-publish target refused the message. Accepted copies are enqueued
+		// and will become visible on their fsync, but the confirm is nacked by the
+		// caller. The setup guard is deliberately NOT dropped (onDurable never fires).
+		return false, nil, ErrMaxLengthExceeded
+	}
+
+	// Drop the setup guard: onDurable fires once the last copy's fsync completes.
+	agg.report(nil)
+	return true, backpressure, nil
+}
+
+// fanoutSharedSync is the ITER5 fused fan-out for the synchronous PublishMessage:
+// it mirrors PublishMessage's per-queue bookkeeping (WaitForCapacity, tag mint via
+// the FrontierActive branch, Headers deep-copy, TTL stamp, reject-publish
+// admission) but routes the N durable writes through ONE StoreSharedAsync and
+// BLOCKS until every copy is durable (preserving PublishMessage's synchronous
+// "durable + visible on return" contract). Each copy's visibility (frontier/Publish
+// + max-length accounting) runs in its own durable completion, exactly after that
+// copy is durable, so a consumer can never observe a message before it is durable.
+func (b *StorageBroker) fanoutSharedSync(sdw sharedDurableWriter, message *protocol.Message, targetQueues []string) error {
+	type reservedSlot struct {
+		qs       *QueueState
+		tag      uint64
+		frontier bool
+	}
+	reserved := make([]reservedSlot, 0, len(targetQueues))
+	subs := make([]interfaces.SharedDurableSub, 0, len(targetQueues))
+
+	var wg sync.WaitGroup
+	var errOnce sync.Once
+	var firstErr error
+
+	rejected := false
+	for i, queueName := range targetQueues {
+		queueState := b.getOrCreateQueueState(queueName)
+
+		if !queueState.WaitForCapacity(queueState.StopCh()) {
+			for _, r := range reserved {
+				if r.frontier {
+					r.qs.FrontierComplete(r.tag, false)
+				}
+			}
+			return fmt.Errorf("queue '%s' closed during backpressure wait", queueName)
+		}
+
+		p := queueState.Policy()
+		rejectPublish := p != nil && p.Overflow == OverflowRejectPublish &&
+			(p.HasMaxLength || p.HasMaxLengthBytes)
+		if rejectPublish {
+			queueState.maxLenMu.Lock()
+			if maxLenRejectsPublish(queueState, p) {
+				queueState.maxLenMu.Unlock()
+				rejected = true
+				continue
+			}
+		}
+
+		var msgID uint64
+		frontierTransient := false
+		if queueState.FrontierActive() {
+			msgID = queueState.FrontierReserve(func() uint64 { return b.globalDeliveryTag.Add(1) })
+			frontierTransient = true
+		} else {
+			msgID = b.globalDeliveryTag.Add(1)
+		}
+
+		var storeMsg *protocol.Message
+		if i == 0 {
+			message.DeliveryTag = msgID
+			storeMsg = message
+		} else {
+			msgCopy := *message
+			msgCopy.DeliveryTag = msgID
+			if message.Headers != nil {
+				h := make(map[string]interface{}, len(message.Headers))
+				for k, v := range message.Headers {
+					h[k] = v
+				}
+				msgCopy.Headers = h
+			}
+			storeMsg = &msgCopy
+		}
+
+		if storeMsg.EnqueueUnixMilli == 0 && p != nil && p.HasMessageTTL {
+			storeMsg.EnqueueUnixMilli = b.ttlNowMillis()
+		}
+
+		qs := queueState
+		id := msgID
+		qn := queueName
+		pol := p
+		ft := frontierTransient
+		bodyLen := len(storeMsg.Body)
+		wg.Add(1)
+		completion := func(cerr error) {
+			defer wg.Done()
+			if cerr != nil {
+				errOnce.Do(func() { firstErr = cerr })
+				if ft {
+					qs.FrontierComplete(id, false)
+				}
+				return
+			}
+			// Durable: make visible exactly as PublishMessage does post-store.
+			if ft {
+				qs.FrontierComplete(id, true)
+			} else {
+				qs.Publish(id)
+			}
+			if pol != nil {
+				addReadyBytesOnEnqueue(qs, pol, bodyLen)
+				if pol.Overflow == OverflowDropHead && (pol.HasMaxLength || pol.HasMaxLengthBytes) {
+					// Completion runs on the WAL batch-writer goroutine — hand drop-head
+					// trim to the worker (never inline; C1/A4 deadlock).
+					b.enqueueMaxLenTrim(qs, qn, pol)
+				}
+			}
+		}
+
+		reserved = append(reserved, reservedSlot{qs: queueState, tag: msgID, frontier: frontierTransient})
+		subs = append(subs, interfaces.SharedDurableSub{
+			QueueName: queueName,
+			Message:   storeMsg,
+			OnDurable: completion,
+		})
+
+		if rejectPublish {
+			queueState.maxLenMu.Unlock()
+		}
+	}
+
+	if len(subs) > 0 {
+		if serr := sdw.StoreSharedAsync(subs); serr != nil {
+			// No completion fires: undo the WaitGroup adds and release frontier slots.
+			for range subs {
+				wg.Done()
+			}
+			for _, r := range reserved {
+				if r.frontier {
+					r.qs.FrontierComplete(r.tag, false)
+				}
+			}
+			return fmt.Errorf("failed to store shared durable message: %w", serr)
+		}
+		wg.Wait()
+	}
+
+	if firstErr != nil {
+		return firstErr
+	}
+	if rejected {
+		return ErrMaxLengthExceeded
+	}
+	return nil
 }
 
 // PublishMessageTx is the transactional (SQ-8) sibling of PublishMessage. It

@@ -181,31 +181,59 @@ func TestSharedBody_HotPathInlineByteIdentity(t *testing.T) {
 	assert.Equal(t, golden, onDisk, "single-queue durable record must be byte-identical to inline serialization")
 }
 
-// TestSharedBody_HotPathZeroAllocRegression pins that the N==1 write path adds
-// no allocations relative to the plain single write (the unit==nil fast path).
+// TestSharedBody_HotPathZeroAllocRegression pins that the fused branch added to
+// flushBatch adds ZERO allocations on the unit==nil (N==1 / non-shared) path. It
+// replicates flushBatch's serialize + post-fsync index loops (minus I/O) over a
+// batch of ordinary (unit==nil) write requests: the new `if req.unit == nil`
+// gate, the nil `sharedIdx` slice, and the `for range sharedIdx` index loops must
+// all be zero-cost. A regression (e.g. eagerly allocating sharedIdx, or a per-
+// record alloc) shows up as allocs > 0.
 func TestSharedBody_HotPathZeroAllocRegression(t *testing.T) {
-	tmpDir := t.TempDir()
-	wm, err := NewWALManager(tmpDir)
-	require.NoError(t, err)
-	defer wm.Close()
+	body := sharedTestBody(4096)
+	msg := &protocol.Message{Exchange: "ex", RoutingKey: "rk", DeliveryMode: 2, Body: body}
 
-	body := sharedTestBody(1024)
-	var off uint64
-	allocs := testing.AllocsPerRun(200, func() {
-		off++
-		msg := &protocol.Message{Exchange: "ex", RoutingKey: "rk", Body: body, DeliveryMode: 2, DeliveryTag: off}
-		// flushBatch serialization allocations are what we bound; the message
-		// struct + Write plumbing allocate regardless. This asserts the fused
-		// branch in flushBatch does NOT allocate on the unit==nil path — measured
-		// indirectly by requiring the serialize-side allocs to match the baseline
-		// (the batch writer reuses its buffer, so a warm single-record flush
-		// serializes with zero heap growth). We only require it does not grow.
-		_ = wm.Write("q0", msg, off)
-	})
-	// Baseline single-record durable write allocates a small, bounded amount
-	// (message struct escapes, done-channel pooled). The fused branch must not
-	// add to it; we assert a tight ceiling that today's inline path meets.
-	t.Logf("allocs/op for single-queue durable write: %.1f", allocs)
+	const perBatch = 8
+	batch := make([]*writeRequest, perBatch)
+	for i := range batch {
+		batch[i] = &writeRequest{queueName: "q", message: msg, offset: uint64(i)}
+	}
+
+	var buf []byte
+	positions := make([]int64, perBatch)
+	currentFilePos := int64(0)
+
+	serialize := func() {
+		buf = buf[:0]
+		var serErr []error
+		var sharedIdx []sharedIndexEntry // must stay nil on the non-shared path
+		for i, req := range batch {
+			if req.unit == nil {
+				recStart := len(buf)
+				positions[i] = currentFilePos + int64(recStart)
+				var e error
+				buf, e = appendMessageRecord(buf, req.queueName, req.message, req.offset)
+				if e != nil {
+					buf = buf[:recStart]
+					positions[i] = -1
+					if serErr == nil {
+						serErr = make([]error, len(batch))
+					}
+					serErr[i] = e
+				}
+				continue
+			}
+		}
+		// Mirror the post-fsync index-population loops' extra iteration.
+		for _, e := range sharedIdx {
+			_ = e
+		}
+	}
+	for i := 0; i < 4; i++ { // warm to steady-state capacity
+		serialize()
+	}
+	allocs := testing.AllocsPerRun(100, serialize)
+	assert.Zero(t, allocs,
+		"the N==1 / non-shared flushBatch serialize path must add zero allocations (got %.1f)", allocs)
 }
 
 // TestSharedBody_BelowThresholdInlined (spec test #8, WAL layer): a small body

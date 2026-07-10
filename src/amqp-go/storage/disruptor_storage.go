@@ -123,6 +123,9 @@ func WALConfigFromEngine(ec interfaces.EngineConfig) WALConfig {
 	if ec.WALCleanupCheckIntervalMS > 0 {
 		cfg.CleanupInterval = time.Duration(ec.WALCleanupCheckIntervalMS) * time.Millisecond
 	}
+	if ec.SharedBodyMaxPinAgeMS > 0 {
+		cfg.SharedBodyMaxPinAge = time.Duration(ec.SharedBodyMaxPinAgeMS) * time.Millisecond
+	}
 	return cfg
 }
 
@@ -336,6 +339,55 @@ func (ds *DisruptorStorage) StoreMessageAsync(queueName string, message *protoco
 		onDurable(err)
 	})
 	return nil
+}
+
+// StoreSharedAsync is the ITER5 fused sibling of StoreMessageAsync for a durable
+// fan-out of one large body to N>=2 queues. It routes the N durable writes
+// through a SINGLE WAL group-commit unit (one BodyBlock carrying the body once +
+// N reference records, one fsync), instead of N full-body StoreMessageAsync
+// writes. Each sub's per-copy completion performs THAT queue's ring-residency +
+// spill decision exactly as StoreMessageAsync's completion does, then invokes the
+// sub's OnDurable (the broker's per-copy visibility/confirm step) — so a fan-out
+// of N copies drives N ordinary completions, and correctness/visibility are
+// identical to the per-queue path; only the durable byte layout differs.
+//
+// The shared body is every sub's Message.Body (the broker shares one Body slice
+// across fan-out copies), taken from the first sub. Completions run on the shared
+// WAL batch-writer goroutine and must be non-blocking (invariant A4), which the
+// broker's completions honor.
+func (ds *DisruptorStorage) StoreSharedAsync(subs []interfaces.SharedDurableSub) error {
+	if ds.wal == nil {
+		return fmt.Errorf("cannot persist durable message: WAL unavailable")
+	}
+	if len(subs) == 0 {
+		return nil
+	}
+
+	body := subs[0].Message.Body
+	walSubs := make([]sharedSub, len(subs))
+	for i := range subs {
+		ring := ds.getOrCreateQueueRing(subs[i].QueueName)
+		msg := subs[i].Message
+		onDurable := subs[i].OnDurable
+		walSubs[i] = sharedSub{
+			queueName: subs[i].QueueName,
+			offset:    msg.DeliveryTag,
+			message:   msg,
+			onDone: func(err error) {
+				if err == nil {
+					// Ring-residency BEFORE the broker advances this queue's
+					// visibility, mirroring StoreMessageAsync exactly.
+					if ring.ring.Count() <= ds.spillThreshold {
+						if _, spilled, serr := ring.ring.Store(msg.DeliveryTag, msg); serr == nil && !spilled {
+							ring.ack.OnPublish(msg.DeliveryTag)
+						}
+					}
+				}
+				onDurable(err)
+			},
+		}
+	}
+	return ds.wal.WriteSharedAsync(walSubs, body, uint32(len(walSubs)))
 }
 
 func (ds *DisruptorStorage) GetMessage(queueName string, deliveryTag uint64) (*protocol.Message, error) {
