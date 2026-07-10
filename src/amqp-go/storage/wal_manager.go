@@ -1672,9 +1672,12 @@ func recordTypeAndPayload(data []byte) (recType uint8, payload []byte) {
 
 // deserializeMessagePayload parses a v4 message record's payload (everything
 // after the record-type tag) into a RecoveryMessage for the crash-recovery path.
-// Returns ok=false on a truncated/malformed payload (or an unsupported body
-// reference) so callers can skip it. The recovered message is marked Redelivered
-// (a redelivery after a restart); the live positional read path clears that flag.
+// Returns ok=false on a truncated/malformed payload so callers can skip it. An
+// ITER5 body-reference record (bodyKind 0x01) returns ok=true carrying BodyRef
+// (Body==nil); the caller resolves it to the co-located BodyBlock's bytes (the
+// scanWALFile recovery map / a second positional ReadAt). The recovered message is
+// marked Redelivered (a redelivery after a restart); the live positional read path
+// clears that flag.
 func deserializeMessagePayload(payload []byte) (*RecoveryMessage, bool) {
 	queueName, offset, msg, ok := parseMessagePayload(payload)
 	if !ok {

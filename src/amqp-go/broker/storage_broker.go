@@ -2152,18 +2152,26 @@ func (b *StorageBroker) fanoutSharedAsyncConfirm(sdw sharedDurableWriter, agg *p
 }
 
 // fanoutSharedSync is the ITER5 fused fan-out for the synchronous PublishMessage:
-// it mirrors PublishMessage's per-queue bookkeeping (WaitForCapacity, tag mint via
-// the FrontierActive branch, Headers deep-copy, TTL stamp, reject-publish
-// admission) but routes the N durable writes through ONE StoreSharedAsync and
-// BLOCKS until every copy is durable (preserving PublishMessage's synchronous
-// "durable + visible on return" contract). Each copy's visibility (frontier/Publish
-// + max-length accounting) runs in its own durable completion, exactly after that
-// copy is durable, so a consumer can never observe a message before it is durable.
+// it mirrors PublishMessage's per-queue bookkeeping (WaitForCapacity, tag mint,
+// Headers deep-copy, TTL stamp, reject-publish admission) but routes the N durable
+// writes through ONE StoreSharedAsync and BLOCKS until every copy is durable
+// (preserving PublishMessage's synchronous "durable + visible on return"
+// contract). Each copy's visibility (frontier head advance + max-length
+// accounting) runs in its own durable completion, exactly after that copy is
+// durable, so a consumer can never observe a message before it is durable.
+//
+// I1-safety: the tag is minted with FrontierReserve (reserve-at-mint) on EVERY
+// target — identical to the async path fanoutSharedAsyncConfirm — rather than
+// raw-minting a tag on a not-yet-frontier-active queue and deferring a CAS-max
+// Publish. Reserving pending on the contiguous frontier UNDER the frontier lock at
+// mint time closes the I1 window: a concurrent durable-confirm publish on the same
+// queue that FrontierReserves a higher tag can never advance head PAST our
+// lower, still-pending tag before it is stored (publish-order FIFO, A3). Keeping
+// the sync and async fan-out paths symmetric in their frontier/tag handling.
 func (b *StorageBroker) fanoutSharedSync(sdw sharedDurableWriter, message *protocol.Message, targetQueues []string) error {
 	type reservedSlot struct {
-		qs       *QueueState
-		tag      uint64
-		frontier bool
+		qs  *QueueState
+		tag uint64
 	}
 	reserved := make([]reservedSlot, 0, len(targetQueues))
 	subs := make([]interfaces.SharedDurableSub, 0, len(targetQueues))
@@ -2178,9 +2186,7 @@ func (b *StorageBroker) fanoutSharedSync(sdw sharedDurableWriter, message *proto
 
 		if !queueState.WaitForCapacity(queueState.StopCh()) {
 			for _, r := range reserved {
-				if r.frontier {
-					r.qs.FrontierComplete(r.tag, false)
-				}
+				r.qs.FrontierComplete(r.tag, false)
 			}
 			return fmt.Errorf("queue '%s' closed during backpressure wait", queueName)
 		}
@@ -2197,14 +2203,12 @@ func (b *StorageBroker) fanoutSharedSync(sdw sharedDurableWriter, message *proto
 			}
 		}
 
-		var msgID uint64
-		frontierTransient := false
-		if queueState.FrontierActive() {
-			msgID = queueState.FrontierReserve(func() uint64 { return b.globalDeliveryTag.Add(1) })
-			frontierTransient = true
-		} else {
-			msgID = b.globalDeliveryTag.Add(1)
-		}
+		// Reserve-at-mint on every target (I1-safe, symmetric with the async path):
+		// the tag registers pending on the contiguous durable frontier under the
+		// frontier lock, so a concurrent durable publisher minting a higher tag
+		// observes the queue frontier-active and can never advance head past this
+		// still-pending lower tag before its completion below marks it done.
+		msgID := queueState.FrontierReserve(func() uint64 { return b.globalDeliveryTag.Add(1) })
 
 		var storeMsg *protocol.Message
 		if i == 0 {
@@ -2231,23 +2235,18 @@ func (b *StorageBroker) fanoutSharedSync(sdw sharedDurableWriter, message *proto
 		id := msgID
 		qn := queueName
 		pol := p
-		ft := frontierTransient
 		bodyLen := len(storeMsg.Body)
 		wg.Add(1)
 		completion := func(cerr error) {
 			defer wg.Done()
+			// Advance the reserved frontier slot: on success head advances across the
+			// contiguous done-prefix (making the tag visible only now that it is
+			// durable); on error real=false advances head past it without counting it
+			// ready. Identical to the async path's per-copy completion.
+			qs.FrontierComplete(id, cerr == nil)
 			if cerr != nil {
 				errOnce.Do(func() { firstErr = cerr })
-				if ft {
-					qs.FrontierComplete(id, false)
-				}
 				return
-			}
-			// Durable: make visible exactly as PublishMessage does post-store.
-			if ft {
-				qs.FrontierComplete(id, true)
-			} else {
-				qs.Publish(id)
 			}
 			if pol != nil {
 				addReadyBytesOnEnqueue(qs, pol, bodyLen)
@@ -2259,7 +2258,7 @@ func (b *StorageBroker) fanoutSharedSync(sdw sharedDurableWriter, message *proto
 			}
 		}
 
-		reserved = append(reserved, reservedSlot{qs: queueState, tag: msgID, frontier: frontierTransient})
+		reserved = append(reserved, reservedSlot{qs: queueState, tag: msgID})
 		subs = append(subs, interfaces.SharedDurableSub{
 			QueueName: queueName,
 			Message:   storeMsg,
@@ -2273,14 +2272,13 @@ func (b *StorageBroker) fanoutSharedSync(sdw sharedDurableWriter, message *proto
 
 	if len(subs) > 0 {
 		if serr := sdw.StoreSharedAsync(subs); serr != nil {
-			// No completion fires: undo the WaitGroup adds and release frontier slots.
+			// No completion fires: undo the WaitGroup adds and release the reserved
+			// frontier slots (else the per-queue frontiers wedge, M1).
 			for range subs {
 				wg.Done()
 			}
 			for _, r := range reserved {
-				if r.frontier {
-					r.qs.FrontierComplete(r.tag, false)
-				}
+				r.qs.FrontierComplete(r.tag, false)
 			}
 			return fmt.Errorf("failed to store shared durable message: %w", serr)
 		}
