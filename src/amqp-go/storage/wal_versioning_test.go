@@ -100,9 +100,10 @@ func TestWAL_VersionedRoundTrip(t *testing.T) {
 	}
 }
 
-// TestWAL_LegacyHeaderlessRecovery crafts a v0 (headerless) WAL file with valid
-// records and proves it recovers correctly — existing data dirs keep working.
-func TestWAL_LegacyHeaderlessRecovery(t *testing.T) {
+// TestWAL_HeaderlessFileRejected proves the ITER4 clean break: a pre-v4
+// headerless (v0) WAL file — one with no SQWAL magic — is rejected loudly with
+// ErrUnsupportedWALVersion rather than being silently mis-parsed from offset 0.
+func TestWAL_HeaderlessFileRejected(t *testing.T) {
 	tmpDir := t.TempDir()
 
 	wm, err := NewWALManager(tmpDir)
@@ -110,78 +111,54 @@ func TestWAL_LegacyHeaderlessRecovery(t *testing.T) {
 	defer wm.Close()
 	qw := wm.sharedWAL
 
-	// Build legacy records (no file header) using the same record serialization
-	// the WAL itself uses.
-	var buf []byte
-	const n = 4
-	for i := 1; i <= n; i++ {
-		msg := &protocol.Message{
-			Exchange:     "legacy-ex",
-			RoutingKey:   "legacy-rk",
-			Body:         []byte(fmt.Sprintf("legacy-%d", i)),
-			DeliveryMode: 2,
-		}
-		// Build genuine legacy (v1/v0) records with NO per-record type tag. The
-		// canonical serializer now emits v2 (SQ-8), so a legacy fixture must ask
-		// for the older format explicitly.
-		buf = append(buf, qw.serializeMessageVersioned(WALVersion1, "legacy_q", msg, uint64(100+i))...)
-	}
+	// Bytes with NO SQWAL header, mimicking a pre-v4 file (record-shaped garbage
+	// that must never be parsed). Long enough to exceed WALHeaderSize.
+	headerless := []byte("this-is-not-a-versioned-wal-file-header-bytes")
+	headerlessPath := filepath.Join(sharedWALDir(tmpDir), fmt.Sprintf("%020d%s", uint64(999999), WALFileExtension))
+	require.NoError(t, os.WriteFile(headerlessPath, headerless, 0644))
 
-	// Write it directly with NO SQWAL header, mimicking a pre-SQ-4 file. Use a
-	// large file number so directory-order recovery hits the auto-created v1
-	// file (empty) and then this legacy file.
-	legacyPath := filepath.Join(sharedWALDir(tmpDir), fmt.Sprintf("%020d%s", uint64(999999), WALFileExtension))
-	require.NoError(t, os.WriteFile(legacyPath, buf, 0644))
-
-	// Direct scan must parse it as legacy from offset 0.
-	msgs, err := qw.scanWALFile(legacyPath)
-	require.NoError(t, err)
-	require.Len(t, msgs, n, "legacy file must parse all records from offset 0")
-	for _, m := range msgs {
-		assert.Equal(t, "legacy_q", m.QueueName)
-		assert.Contains(t, string(m.Message.Body), "legacy-")
-	}
-
-	// Full recovery path must also include the legacy records.
-	recovered, err := wm.RecoverFromWAL()
-	require.NoError(t, err)
-	legacyCount := 0
-	for _, rm := range recovered {
-		if rm.QueueName == "legacy_q" {
-			legacyCount++
-		}
-	}
-	assert.Equal(t, n, legacyCount, "RecoverFromWAL must recover legacy headerless records")
-}
-
-// TestWAL_UnknownVersionErrors verifies a file whose header carries an unknown
-// version produces a clear error (not a silent skip) on both the direct scan
-// and the full recovery path.
-func TestWAL_UnknownVersionErrors(t *testing.T) {
-	tmpDir := t.TempDir()
-
-	wm, err := NewWALManager(tmpDir)
-	require.NoError(t, err)
-	defer wm.Close()
-	qw := wm.sharedWAL
-
-	// Craft a file: SQWAL magic + a bogus future version + some record-shaped
-	// bytes we must never reach.
-	bad := make([]byte, 0, 32)
-	bad = append(bad, WALMagic...)
-	bad = append(bad, byte(99)) // unknown version
-	bad = append(bad, []byte("garbage-payload-bytes")...)
-
-	badPath := filepath.Join(sharedWALDir(tmpDir), fmt.Sprintf("%020d%s", uint64(888888), WALFileExtension))
-	require.NoError(t, os.WriteFile(badPath, bad, 0644))
-
-	_, err = qw.scanWALFile(badPath)
-	require.Error(t, err)
-	assert.True(t, errors.Is(err, ErrUnsupportedWALVersion), "scan must surface ErrUnsupportedWALVersion, got %v", err)
+	_, serr := qw.scanWALFile(headerlessPath)
+	require.Error(t, serr)
+	assert.True(t, errors.Is(serr, ErrUnsupportedWALVersion),
+		"a headerless file must be rejected with ErrUnsupportedWALVersion, got %v", serr)
 
 	_, rerr := wm.RecoverFromWAL()
 	require.Error(t, rerr)
-	assert.True(t, errors.Is(rerr, ErrUnsupportedWALVersion), "recovery must surface ErrUnsupportedWALVersion, got %v", rerr)
+	assert.True(t, errors.Is(rerr, ErrUnsupportedWALVersion),
+		"recovery must surface ErrUnsupportedWALVersion for a headerless file, got %v", rerr)
+}
+
+// TestWAL_UnsupportedVersionsRejected verifies the clean break rejects every
+// pre-v4 format version (v1/v2/v3) AND any unknown future version, on both the
+// direct scan and the full recovery path — never a silent skip.
+func TestWAL_UnsupportedVersionsRejected(t *testing.T) {
+	badVersions := []uint8{WALVersion1, WALVersion2, WALVersion3, 99}
+	for _, v := range badVersions {
+		t.Run(fmt.Sprintf("v%d", v), func(t *testing.T) {
+			tmpDir := t.TempDir()
+			wm, err := NewWALManager(tmpDir)
+			require.NoError(t, err)
+			defer wm.Close()
+			qw := wm.sharedWAL
+
+			// SQWAL magic + a non-v4 version + record-shaped bytes we must never reach.
+			bad := append([]byte(WALMagic), v)
+			bad = append(bad, []byte("garbage-payload-bytes")...)
+
+			badPath := filepath.Join(sharedWALDir(tmpDir), fmt.Sprintf("%020d%s", uint64(888888), WALFileExtension))
+			require.NoError(t, os.WriteFile(badPath, bad, 0644))
+
+			_, serr := qw.scanWALFile(badPath)
+			require.Error(t, serr)
+			assert.True(t, errors.Is(serr, ErrUnsupportedWALVersion),
+				"scan must surface ErrUnsupportedWALVersion for v%d, got %v", v, serr)
+
+			_, rerr := wm.RecoverFromWAL()
+			require.Error(t, rerr)
+			assert.True(t, errors.Is(rerr, ErrUnsupportedWALVersion),
+				"recovery must surface ErrUnsupportedWALVersion for v%d, got %v", v, rerr)
+		})
+	}
 }
 
 // TestWAL_ReservedRecordTypeConstants documents that the reserved record-type

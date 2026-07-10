@@ -135,12 +135,17 @@ func TestWALRecovery_IgnoresUncommittedTransaction(t *testing.T) {
 	const epochUncommitted = uint64(2)
 
 	// Craft: [header] [Begin][msg][Commit] [Begin][msg]  (second tx never commits)
+	committedBytes, err := qw.serializeMessageVersioned("committed-q", committed, 100)
+	require.NoError(t, err)
+	uncommittedBytes, err := qw.serializeMessageVersioned("uncommitted-q", uncommitted, 200)
+	require.NoError(t, err)
+
 	buf := append([]byte(WALMagic), WALFormatVersion)
 	buf = append(buf, serializeTxMarker(WALTxMarkerBegin, epochCommitted)...)
-	buf = append(buf, qw.serializeMessageVersioned(WALFormatVersion, "committed-q", committed, 100)...)
+	buf = append(buf, committedBytes...)
 	buf = append(buf, serializeTxMarker(WALTxMarkerCommit, epochCommitted)...)
 	buf = append(buf, serializeTxMarker(WALTxMarkerBegin, epochUncommitted)...)
-	buf = append(buf, qw.serializeMessageVersioned(WALFormatVersion, "uncommitted-q", uncommitted, 200)...)
+	buf = append(buf, uncommittedBytes...)
 
 	// Use a high file number so it does not collide with the empty file the WAL
 	// manager auto-creates; RecoverFromWAL scans every .wal file in the dir.
@@ -174,9 +179,12 @@ func TestWALRecovery_TornCommitMarkerDiscardsTransaction(t *testing.T) {
 
 	msg := &protocol.Message{Exchange: "e", RoutingKey: "torn-q", Body: []byte("torn"), DeliveryMode: 2}
 
+	msgBytes, err := qw.serializeMessageVersioned("torn-q", msg, 300)
+	require.NoError(t, err)
+
 	buf := append([]byte(WALMagic), WALFormatVersion)
 	buf = append(buf, serializeTxMarker(WALTxMarkerBegin, 7)...)
-	buf = append(buf, qw.serializeMessageVersioned(WALFormatVersion, "torn-q", msg, 300)...)
+	buf = append(buf, msgBytes...)
 	commit := serializeTxMarker(WALTxMarkerCommit, 7)
 	// Truncate the commit marker to simulate a crash mid-write of the tail.
 	buf = append(buf, commit[:len(commit)-3]...)

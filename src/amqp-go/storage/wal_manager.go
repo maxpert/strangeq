@@ -33,48 +33,46 @@ const (
 	// common case keeps its reuse win, while an outlier batch is not retained.
 	maxRetainedWALBatchBytes = 128 * 1024 * 1024 // 128 MB
 
-	// Shared WAL message (record) format:
-	// [4 bytes CRC32][4 bytes length][4 bytes queueNameLen][queueName][8 bytes offset]
-	// [4 bytes exchangeLen][exchange][4 bytes routingKeyLen][routingKey][1 byte deliveryMode][4 bytes bodyLen][body]
-	// Note: The record is variable-length (depends on queue name, exchange, and routing key lengths)
+	// Shared WAL message (record) format (v4, ITER4). The framing envelope is
+	// unchanged from earlier versions; the message payload is the presence-bitmap
+	// record that persists the ENTIRE protocol.Message (all 14 optional
+	// properties, not the pre-v4 subset). The identical payload is produced by the
+	// shared appendMessagePayload/parseMessagePayload codec and carried by both
+	// the WAL and the per-queue segments. See the v4 layout comment on
+	// appendMessagePayload for the byte-level detail.
+	//
+	//   record: [4 CRC32][4 length][1 recordType][<message payload v4>]
+	//   payload: [2 flags][queue u8-len][8 offset][exch u8-len][rk u8-len]
+	//            [1 deliveryMode][1 bodyKind][body|ref][optional fields in flag order]
 
 	// WAL file-level header (SQ-4): written once at the start of every NEW WAL
 	// file. It lets recovery detect the on-disk format version before parsing
 	// records. The magic is deliberately not a valid start of a record (a real
 	// record begins with a 4-byte CRC then a 4-byte length); a first-byte
 	// collision with an actual CRC value is astronomically unlikely, so a byte
-	// prefix compare is a safe way to sniff versioned vs. legacy files.
-	WALMagic         = "SQWAL"           // 5-byte file magic
-	WALHeaderSize    = len(WALMagic) + 1 // magic + 1 version byte = 6 bytes
-	WALLegacyVersion = uint8(0)          // headerless files predating SQ-4
-	WALVersion1      = uint8(1)          // SQ-4 versioned files, no per-record type tag
-	WALVersion2      = uint8(2)          // SQ-8 files: per-record type tag, no message extensions
-	WALVersion3      = uint8(3)          // W2 files: per-record type tag + persisted message extensions (Headers/Expiration/EnqueueUnixMilli)
-	WALFormatVersion = WALVersion3       // current file format version
+	// prefix compare is a safe way to sniff the version / reject a foreign file.
+	WALMagic      = "SQWAL"           // 5-byte file magic
+	WALHeaderSize = len(WALMagic) + 1 // magic + 1 version byte = 6 bytes
+	// Pre-v4 format versions. ITER4 is a deliberate CLEAN BREAK: these versions
+	// (and headerless v0 files) are no longer parseable and are rejected loudly
+	// with ErrUnsupportedWALVersion (see walFileDataStart). They are retained as
+	// named constants so the rejection is self-documenting and testable.
+	WALVersion1 = uint8(1) // SQ-4: versioned files, no per-record type tag
+	WALVersion2 = uint8(2) // SQ-8: per-record type tag, no message extensions
+	WALVersion3 = uint8(3) // W2: per-record type tag + Headers/Expiration/EnqueueUnixMilli extension block
+	// WALVersion4 (ITER4): per-record type tag + presence-bitmap message payload
+	// that persists the full basic.properties set. This build reads and writes
+	// ONLY v4; there is no backwards compatibility with v0/v1/v2/v3.
+	WALVersion4      = uint8(4)
+	WALFormatVersion = WALVersion4 // current file format version
 
-	// Per-record type mechanism (SQ-4 reserved, SQ-8 implemented) and message
-	// extensions (W2).
-	//
-	// v0/v1 files have no per-record type tag on disk: every record is
-	// implicitly a message record (WALRecordTypeMessage). v2 adds a 1-byte
-	// record-type tag immediately after the [CRC][length] framing, so that
-	// non-message records (transaction-boundary markers) can be interleaved
-	// with message records in the same file. v3 additionally persists a message
-	// record's Headers/Expiration/EnqueueUnixMilli as an extension block after
-	// the body (see serializeMessageVersioned). Two independent, version-gated
-	// aspects therefore exist:
-	//   - the per-record type tag is present iff version >= WALVersion2;
-	//   - message extensions are present iff version >= WALVersion3 on the WRITE
-	//     path, but on the READ path their presence is detected structurally
-	//     (trailing bytes after the body) rather than by version, so a single
-	//     physical file that mixes older-version records with v3 records — which
-	//     happens when a pre-W2 file is reopened and appended to on restart — is
-	//     recovered correctly regardless of the file-level header version.
-	//   v0/v1: [CRC][len][<message payload, no extensions>]
-	//   v2:    [CRC][len][1-byte recordType][<message payload, no extensions>]
-	//   v3:    [CRC][len][1-byte recordType][<message payload>[extensions]]
-	WALRecordTypeMessage    = uint8(0) // implicit type of every v0/v1 record
-	WALRecordTypeTxBoundary = uint8(1) // v2 transaction-boundary marker (SQ-8)
+	// Per-record type tag. Every v4 record carries a 1-byte record-type tag
+	// immediately after the [CRC][length] framing, so non-message records
+	// (transaction-boundary markers) can be interleaved with message records in
+	// the same file:
+	//   v4: [CRC][len][1-byte recordType][<message payload v4>]
+	WALRecordTypeMessage    = uint8(0) // a message record
+	WALRecordTypeTxBoundary = uint8(1) // transaction-boundary marker (SQ-8)
 
 	// Transaction-boundary marker kinds. A committed transaction is written as
 	// one contiguous, single-fsync unit: Begin, the transaction's message
@@ -88,11 +86,57 @@ const (
 	walTxMarkerPayloadLen = 9 // kind(1) + epoch(8)
 )
 
-// ErrUnsupportedWALVersion indicates a WAL file begins with the SQWAL magic but
-// carries a format version this build cannot parse. Recovery surfaces this as a
-// hard error rather than silently skipping the file, since silently ignoring an
-// unknown-version file could drop durable messages.
+// ErrUnsupportedWALVersion indicates a WAL file this build cannot parse: either
+// it begins with the SQWAL magic but carries a non-v4 format version, or it is a
+// pre-v4 headerless file (no magic). ITER4 is a clean break — recovery surfaces
+// this as a hard error rather than silently skipping the file, since silently
+// ignoring an unreadable file could drop durable messages.
 var ErrUnsupportedWALVersion = errors.New("unsupported WAL file format version")
+
+// ErrShortStringOverflow indicates a shortstr field (AMQP basic-property string)
+// exceeds the 255-byte maximum encodable in the v4 record's 1-byte length prefix.
+// The encoder returns this rather than truncating a length into a u8 (which would
+// silently corrupt the record); the batch writer nacks the offending record. This
+// should be unreachable in practice because the wire decoder already bounds every
+// basic-property string to 255 bytes — it is a defense-in-depth guard.
+var ErrShortStringOverflow = errors.New("shortstr field exceeds 255 bytes")
+
+// v4 message-payload presence bitmap (u16, big-endian). Each optional field owns
+// one bit; a set bit means the field is present (differs from its Go zero) and its
+// value follows, in canonical order, in the record. The bit VALUES mirror AMQP's
+// own basic-properties property-flags word (protocol/content.go:32-45) so the
+// storage record reuses the exact mental model the wire codec already implements;
+// they are defined here as storage-local constants to avoid coupling the storage
+// layer to the wire constants. 0x1000 (AMQP FlagDeliveryMode) is intentionally
+// unused: deliveryMode is a structural field, not an optional one. 0x0001 is a
+// reserved continuation bit (MUST be 0 in v4); if a future version needs more than
+// 14 optional fields it sets 0x0001 and appends a second u16 flags word, keeping
+// the common case at a flat 2 bytes.
+const (
+	msgFlagContentType     = uint16(0x8000)
+	msgFlagContentEncoding = uint16(0x4000)
+	msgFlagHeaders         = uint16(0x2000)
+	msgFlagPriority        = uint16(0x0800)
+	msgFlagCorrelationID   = uint16(0x0400)
+	msgFlagReplyTo         = uint16(0x0200)
+	msgFlagExpiration      = uint16(0x0100)
+	msgFlagMessageID       = uint16(0x0080)
+	msgFlagTimestamp       = uint16(0x0040)
+	msgFlagType            = uint16(0x0020)
+	msgFlagUserID          = uint16(0x0010)
+	msgFlagAppID           = uint16(0x0008)
+	msgFlagClusterID       = uint16(0x0004)
+	msgFlagEnqueue         = uint16(0x0002) // EnqueueUnixMilli (WAL-local, no AMQP wire analogue)
+	msgFlagContinuation    = uint16(0x0001) // reserved; MUST be 0 in v4
+
+	// bodyKind discriminator (1 byte) — the ITER4 body inline|reference union
+	// seam. ITER4 always writes/reads bodyKindInline; bodyKindReference is fully
+	// specified (u16-length-prefixed opaque locator) so ITER5's shared-body store
+	// plugs in with no format change, and the ITER4 decoder length-skips the
+	// reference arm structurally so an ITER5-written file never panics recovery.
+	bodyKindInline    = uint8(0x00)
+	bodyKindReference = uint8(0x01)
+)
 
 // WALConfig holds configurable parameters for the WAL manager
 type WALConfig struct {
@@ -442,7 +486,14 @@ func (qw *QueueWAL) writeTxAtomic(records []*RecoveryMessage) error {
 	positions := make([]int64, len(records))
 	for i, rec := range records {
 		positions[i] = startPos + int64(len(buf))
-		buf = append(buf, qw.serializeMessageVersioned(WALFormatVersion, rec.QueueName, rec.Message, rec.Offset)...)
+		recBytes, serErr := qw.serializeMessageVersioned(rec.QueueName, rec.Message, rec.Offset)
+		if serErr != nil {
+			// A record that cannot be encoded (e.g. a shortstr property >255
+			// bytes) fails the WHOLE transaction before anything is written, so
+			// the all-or-nothing guarantee holds and no corrupt record is emitted.
+			return fmt.Errorf("WAL transaction serialize failed: %w", serErr)
+		}
+		buf = append(buf, recBytes...)
 	}
 	buf = append(buf, serializeTxMarker(WALTxMarkerCommit, epoch)...)
 
@@ -603,11 +654,10 @@ func (qw *QueueWAL) scanWALFile(filePath string) ([]*RecoveryMessage, error) {
 	}
 	defer file.Close()
 
-	// Detect the file-level header (SQ-4) and start parsing records after it.
-	// Legacy (v0) files have no header and parse from offset 0. An
-	// unknown-version header returns a hard error rather than skipping. The
-	// version drives whether records carry a per-record type tag (v2, SQ-8).
-	dataStart, version, err := walFileDataStart(file)
+	// Detect the file-level header and start parsing records after it. ITER4 is a
+	// clean break: only v4 files are accepted; a non-v4 or headerless (pre-v4)
+	// file returns ErrUnsupportedWALVersion rather than being silently mis-parsed.
+	dataStart, err := walFileDataStart(file)
 	if err != nil {
 		return nil, err
 	}
@@ -662,7 +712,7 @@ func (qw *QueueWAL) scanWALFile(filePath string) ([]*RecoveryMessage, error) {
 			continue
 		}
 
-		recType, payload := recordTypeAndPayload(version, data)
+		recType, payload := recordTypeAndPayload(data)
 
 		switch recType {
 		case WALRecordTypeTxBoundary:
@@ -843,9 +893,28 @@ func (qw *QueueWAL) flushBatch(batch []*writeRequest, bufp *[]byte, positionsp *
 	positions := (*positionsp)[:len(batch)]
 
 	// Serialize all messages in batch IN PLACE and track their positions.
+	//
+	// A record that fails to encode (e.g. a shortstr property >255 bytes) is
+	// rolled back to its start so no partial/corrupt bytes are written, its
+	// position is marked -1 (skip index + offset-set below), and its own error is
+	// delivered to that caller — the rest of the batch is unaffected. serErr stays
+	// nil (no allocation) on the common all-success path, preserving Stage A's
+	// zero-alloc batch serialization; it is lazily allocated only when a record
+	// actually fails, which the wire decoder's 255-byte bound makes near-unreachable.
+	var serErr []error
 	for i, req := range batch {
-		positions[i] = currentFilePos + int64(len(buf)) // Position in file
-		buf = appendMessageRecord(buf, WALFormatVersion, req.queueName, req.message, req.offset)
+		recStart := len(buf)
+		positions[i] = currentFilePos + int64(recStart) // Position in file
+		var e error
+		buf, e = appendMessageRecord(buf, req.queueName, req.message, req.offset)
+		if e != nil {
+			buf = buf[:recStart] // discard the failed record's partial bytes
+			positions[i] = -1
+			if serErr == nil {
+				serErr = make([]error, len(batch))
+			}
+			serErr[i] = e
+		}
 	}
 	// Publish the (possibly reallocated) buffer back so the next flush reuses
 	// its grown capacity. A rare oversized batch is released rather than pinned.
@@ -866,14 +935,16 @@ func (qw *QueueWAL) flushBatch(batch []*writeRequest, bufp *[]byte, positionsp *
 		// before delivering completions (async callbacks must not run under
 		// fileMutex; see deliverCompletions).
 		qw.fileMutex.Unlock()
-		qw.deliverCompletions(batch, fmt.Errorf("WAL write failed: %w", err))
+		qw.deliverCompletions(batch, serErr, fmt.Errorf("WAL write failed: %w", err))
 		return
 	}
 
-	// Record successful WAL writes
+	// Record successful WAL writes (only records that were actually serialized).
 	if qw.metrics != nil {
-		for range batch {
-			qw.metrics.RecordWALWrite()
+		for i := range batch {
+			if positions[i] >= 0 {
+				qw.metrics.RecordWALWrite()
+			}
 		}
 	}
 
@@ -897,16 +968,20 @@ func (qw *QueueWAL) flushBatch(batch []*writeRequest, bufp *[]byte, positionsp *
 	// advances visibility), and deliver the error to every caller.
 	if fsyncErr != nil {
 		qw.fileMutex.Unlock()
-		qw.deliverCompletions(batch, fsyncErr)
+		qw.deliverCompletions(batch, serErr, fsyncErr)
 		return
 	}
 
 	// Durable. Update the offset index / current-file offset set / file offset
 	// and roll BEFORE releasing the lock and BEFORE firing completions, so that
 	// when a completion advances a message's visibility (async path), a woken
-	// consumer's wal.Read finds the record.
+	// consumer's wal.Read finds the record. Records that failed to serialize
+	// (positions[i] < 0) were never written, so they are not indexed.
 	qw.offsetIndexMutex.Lock()
 	for i, req := range batch {
+		if positions[i] < 0 {
+			continue
+		}
 		qw.offsetIndex[req.offset] = &offsetLocation{
 			fileNum:      currentFileNum,
 			filePosition: positions[i],
@@ -916,7 +991,10 @@ func (qw *QueueWAL) flushBatch(batch []*writeRequest, bufp *[]byte, positionsp *
 
 	// Track offsets written to current file
 	qw.currentFileOffsetsMutex.Lock()
-	for _, req := range batch {
+	for i, req := range batch {
+		if positions[i] < 0 {
+			continue
+		}
 		qw.currentFileOffsets.Add(req.offset)
 	}
 	qw.currentFileOffsetsMutex.Unlock()
@@ -936,19 +1014,29 @@ func (qw *QueueWAL) flushBatch(batch []*writeRequest, bufp *[]byte, positionsp *
 	// (consumers reading via readMessageAtPosition contend on fileMutex) and
 	// honors the "no lock held across the callback" spirit of invariant A4.
 	qw.fileMutex.Unlock()
-	qw.deliverCompletions(batch, nil)
+	qw.deliverCompletions(batch, serErr, nil)
 }
 
-// deliverCompletions signals every request in the batch with err, iterating in
-// enqueue order. A sync request's done is a cap-1 pooled channel (the send
-// never blocks). An async request's onDone runs inline on the batch-writer
-// goroutine; its contract is non-blocking (atomics + non-blocking pokes only),
-// so it never stalls the shared writer. Exactly one of done/onDone is set per
-// request. Enqueue-order iteration gives, for any single channel, non-
-// decreasing confirm-tag completion order for single-target publishes — the
-// property the per-channel confirm fold relies on.
-func (qw *QueueWAL) deliverCompletions(batch []*writeRequest, err error) {
-	for _, req := range batch {
+// deliverCompletions signals every request in the batch, iterating in enqueue
+// order. batchErr is the shared write/fsync outcome for the batch (nil on
+// success). serErr, when non-nil, carries a per-record serialization error
+// (index i) that OVERRIDES batchErr for that record — a record that failed to
+// encode is nacked with its own error even when the rest of the batch was
+// durable. serErr is nil on the common all-success path (no allocation).
+//
+// A sync request's done is a cap-1 pooled channel (the send never blocks). An
+// async request's onDone runs inline on the batch-writer goroutine; its contract
+// is non-blocking (atomics + non-blocking pokes only), so it never stalls the
+// shared writer. Exactly one of done/onDone is set per request. Enqueue-order
+// iteration gives, for any single channel, non-decreasing confirm-tag completion
+// order for single-target publishes — the property the per-channel confirm fold
+// relies on.
+func (qw *QueueWAL) deliverCompletions(batch []*writeRequest, serErr []error, batchErr error) {
+	for i, req := range batch {
+		err := batchErr
+		if serErr != nil && serErr[i] != nil {
+			err = serErr[i]
+		}
 		if req.onDone != nil {
 			req.onDone(err)
 		} else if req.done != nil {
@@ -957,75 +1045,49 @@ func (qw *QueueWAL) deliverCompletions(batch []*writeRequest, err error) {
 	}
 }
 
-// serializeMessageVersioned serializes a message with CRC, length, and (for v2+)
-// a record-type tag, followed by queue name and offset.
-//
-// Framing:
-//
-//	v0/v1: [CRC][length][queue_len][queue][offset][exchange_len][exchange][routing_key_len][routing_key][delivery_mode][body_len][body]
-//	v2:    [CRC][length][type=Message][queue_len]...[body]
-//
-// The version parameter exists so tests can craft legacy (v0/v1) records; the
-// production write path always uses WALFormatVersion. Single allocation.
-func (qw *QueueWAL) serializeMessageVersioned(version uint8, queueName string, message *protocol.Message, offset uint64) []byte {
+// serializeMessageVersioned serializes ONE v4 message record into a fresh
+// single-allocation buffer: [CRC][length][recordType=Message][<message payload
+// v4>]. Used by the transaction slow path (WriteTxAtomic); the group-commit batch
+// writer instead calls appendMessageRecord directly onto its persistent buffer.
+// Returns an error (and a partial buffer the caller must discard) if the message
+// contains a shortstr property longer than 255 bytes.
+func (qw *QueueWAL) serializeMessageVersioned(queueName string, message *protocol.Message, offset uint64) ([]byte, error) {
 	buf := make([]byte, 0, len(message.Body)+len(message.Exchange)+len(message.RoutingKey)+len(queueName)+256)
-	return appendMessageRecord(buf, version, queueName, message, offset)
+	return appendMessageRecord(buf, queueName, message, offset)
 }
 
-// appendMessageRecord serializes ONE message record onto the TAIL of buf (grow
+// appendMessageRecord serializes ONE v4 message record onto the TAIL of buf (grow
 // in place) and returns the grown buffer. It is the shared serializer for both
 // the single-allocation serializeMessageVersioned wrapper (fresh buf, recStart
 // == 0) and the group-commit batch writer (one persistent buf, many records
-// packed back-to-back). The emitted bytes are byte-for-byte identical to the
-// former in-line serializeMessageVersioned implementation — see the A1
-// byte-identity golden test.
+// packed back-to-back).
 //
-// Correctness of packing many records into one buffer rests on RECORD-RELATIVE
-// backpatch: the CRC and length placeholders are patched at buf[recStart:] and
-// the CRC is computed over buf[recStart+4:] (the record's own [length][data]
-// span, which is at the tail because this record was just appended). recStart is
-// an index, not a pointer, so it survives any growslice reallocation during the
-// appends. The body is copied exactly once (the single inherent store-path copy).
-func appendMessageRecord(buf []byte, version uint8, queueName string, message *protocol.Message, offset uint64) []byte {
+// STAGE A: the record is written single-pass with only the record's own CRC+len
+// backpatched — never a second write pass over field bodies. Correctness of
+// packing many records into one buffer rests on RECORD-RELATIVE backpatch: the
+// CRC and length placeholders are patched at buf[recStart:] and the CRC is
+// computed over buf[recStart+4:] (the record's own [length][data] span, which is
+// at the tail because this record was just appended). recStart is an index, not a
+// pointer, so it survives any growslice reallocation during the appends. The body
+// is copied exactly once (the single inherent store-path copy, inside
+// appendMessagePayload).
+//
+// On a shortstr overflow (a property >255 bytes) it returns the error together
+// with the partially-grown buffer; the caller MUST roll back to recStart (the
+// batch writer does) so no partial/corrupt record is ever written.
+func appendMessageRecord(buf []byte, queueName string, message *protocol.Message, offset uint64) ([]byte, error) {
 	recStart := len(buf)
 
 	// Reserve space for CRC and length (patched below, record-relative).
 	buf = append(buf, 0, 0, 0, 0) // CRC32 placeholder
 	buf = append(buf, 0, 0, 0, 0) // Length placeholder
 
-	// v2+: per-record type tag immediately after the framing.
-	if version >= WALVersion2 {
-		buf = append(buf, WALRecordTypeMessage)
-	}
+	// Per-record type tag immediately after the framing (v4 always writes it).
+	buf = append(buf, WALRecordTypeMessage)
 
-	// Write queue name
-	buf = binary.BigEndian.AppendUint32(buf, uint32(len(queueName)))
-	buf = append(buf, queueName...)
-
-	// Write offset
-	buf = binary.BigEndian.AppendUint64(buf, offset)
-
-	// Write exchange
-	buf = binary.BigEndian.AppendUint32(buf, uint32(len(message.Exchange)))
-	buf = append(buf, message.Exchange...)
-
-	// Write routing key
-	buf = binary.BigEndian.AppendUint32(buf, uint32(len(message.RoutingKey)))
-	buf = append(buf, message.RoutingKey...)
-
-	// Write delivery mode (1 byte)
-	buf = append(buf, message.DeliveryMode)
-
-	// Write body (the ONE inherent store-path body copy)
-	buf = binary.BigEndian.AppendUint32(buf, uint32(len(message.Body)))
-	buf = append(buf, message.Body...)
-
-	// v3+: persist the message extension block (Headers/Expiration/
-	// EnqueueUnixMilli) after the body. Older versions stop at the body; on the
-	// read path the block's presence is detected structurally (trailing bytes),
-	// so an old record and a v3 record can coexist in one physical file.
-	if version >= WALVersion3 {
-		buf = appendMessageExtensions(buf, message)
+	buf, err := appendMessagePayload(buf, queueName, message, offset)
+	if err != nil {
+		return buf, err // caller discards buf[recStart:]
 	}
 
 	// Calculate actual length (excluding CRC and length fields), record-relative.
@@ -1036,7 +1098,211 @@ func appendMessageRecord(buf []byte, version uint8, queueName string, message *p
 	crc := crc32.ChecksumIEEE(buf[recStart+4:])
 	binary.BigEndian.PutUint32(buf[recStart:recStart+4], crc)
 
-	return buf
+	return buf, nil
+}
+
+// appendMessagePayload writes the v4 message payload onto the tail of buf and
+// returns the grown buffer. It is the SINGLE shared codec used by BOTH the WAL
+// (via appendMessageRecord) and the per-queue segments (via
+// serializeSegmentMessage), so the two on-disk payloads are byte-identical by
+// construction. Layout (big-endian throughout):
+//
+//	[flags u16]                      presence bitmap (§ msgFlag* constants)
+//	[queue u8-len + bytes]           WAL: queue name; segments write ""
+//	[offset u64]
+//	[exchange u8-len + bytes]
+//	[routingKey u8-len + bytes]
+//	[deliveryMode u8]
+//	[bodyKind u8]  0x00 inline: [bodyLen u32][body]  | 0x01 ref: [refLen u16][locator]
+//	--- optional fields, present iff their flag bit is set, in this canonical order:
+//	ContentType, ContentEncoding, Headers(field-table), Priority(u8),
+//	CorrelationID, ReplyTo, Expiration, MessageID, Timestamp(u64), Type, UserID,
+//	AppID, ClusterID, EnqueueUnixMilli(i64) ---
+//
+// STAGE A: every write is an append onto the caller's buffer; messagePresenceFlags
+// allocates nothing; the no-properties/no-headers hot path writes only the
+// structural prefix + inline body and takes NO allocation (the Headers bit is
+// clear, so EncodeFieldTable is never invoked). The single body copy is preserved.
+// Returns ErrShortStringOverflow (wrapped) if any shortstr property exceeds 255
+// bytes — the record is then nacked rather than silently truncated.
+func appendMessagePayload(buf []byte, queueName string, message *protocol.Message, offset uint64) ([]byte, error) {
+	flags := messagePresenceFlags(message)
+	buf = binary.BigEndian.AppendUint16(buf, flags)
+
+	var err error
+	if buf, err = appendShort(buf, queueName); err != nil {
+		return buf, err
+	}
+	buf = binary.BigEndian.AppendUint64(buf, offset)
+	if buf, err = appendShort(buf, message.Exchange); err != nil {
+		return buf, err
+	}
+	if buf, err = appendShort(buf, message.RoutingKey); err != nil {
+		return buf, err
+	}
+	buf = append(buf, message.DeliveryMode)
+
+	// Body union. ITER4 always emits the inline arm (bodyKind 0x00); the reference
+	// arm (0x01) is the ITER5 seam and is only produced when BodyRef is set.
+	if len(message.BodyRef) > 0 {
+		if len(message.BodyRef) > 0xFFFF {
+			return buf, fmt.Errorf("%w: body reference locator %d bytes exceeds 65535", ErrShortStringOverflow, len(message.BodyRef))
+		}
+		buf = append(buf, bodyKindReference)
+		buf = binary.BigEndian.AppendUint16(buf, uint16(len(message.BodyRef)))
+		buf = append(buf, message.BodyRef...)
+	} else {
+		buf = append(buf, bodyKindInline)
+		buf = binary.BigEndian.AppendUint32(buf, uint32(len(message.Body)))
+		buf = append(buf, message.Body...) // the ONE store-path body copy
+	}
+
+	// Optional fields in canonical (descending flag-value) order, each gated by
+	// its presence bit so an absent field costs nothing beyond its bit.
+	if flags&msgFlagContentType != 0 {
+		if buf, err = appendShort(buf, message.ContentType); err != nil {
+			return buf, err
+		}
+	}
+	if flags&msgFlagContentEncoding != 0 {
+		if buf, err = appendShort(buf, message.ContentEncoding); err != nil {
+			return buf, err
+		}
+	}
+	if flags&msgFlagHeaders != 0 {
+		buf = appendHeaders(buf, message.Headers)
+	}
+	if flags&msgFlagPriority != 0 {
+		buf = append(buf, message.Priority)
+	}
+	if flags&msgFlagCorrelationID != 0 {
+		if buf, err = appendShort(buf, message.CorrelationID); err != nil {
+			return buf, err
+		}
+	}
+	if flags&msgFlagReplyTo != 0 {
+		if buf, err = appendShort(buf, message.ReplyTo); err != nil {
+			return buf, err
+		}
+	}
+	if flags&msgFlagExpiration != 0 {
+		if buf, err = appendShort(buf, message.Expiration); err != nil {
+			return buf, err
+		}
+	}
+	if flags&msgFlagMessageID != 0 {
+		if buf, err = appendShort(buf, message.MessageID); err != nil {
+			return buf, err
+		}
+	}
+	if flags&msgFlagTimestamp != 0 {
+		buf = binary.BigEndian.AppendUint64(buf, message.Timestamp)
+	}
+	if flags&msgFlagType != 0 {
+		if buf, err = appendShort(buf, message.Type); err != nil {
+			return buf, err
+		}
+	}
+	if flags&msgFlagUserID != 0 {
+		if buf, err = appendShort(buf, message.UserID); err != nil {
+			return buf, err
+		}
+	}
+	if flags&msgFlagAppID != 0 {
+		if buf, err = appendShort(buf, message.AppID); err != nil {
+			return buf, err
+		}
+	}
+	if flags&msgFlagClusterID != 0 {
+		if buf, err = appendShort(buf, message.ClusterID); err != nil {
+			return buf, err
+		}
+	}
+	if flags&msgFlagEnqueue != 0 {
+		buf = binary.BigEndian.AppendUint64(buf, uint64(message.EnqueueUnixMilli))
+	}
+	return buf, nil
+}
+
+// messagePresenceFlags computes the v4 presence bitmap for message. A bit is set
+// iff its field differs from its Go zero value ("" for strings, 0 for numbers,
+// empty for Headers) — which exactly matches the wire re-encode gates
+// (server/frame_helpers.go), so an unset property and a present-empty property
+// are indistinguishable AND equal, the correct AMQP unset-property semantic.
+// Allocation-free (a dozen comparisons), so the durable hot path stays zero-alloc.
+func messagePresenceFlags(m *protocol.Message) uint16 {
+	var flags uint16
+	if m.ContentType != "" {
+		flags |= msgFlagContentType
+	}
+	if m.ContentEncoding != "" {
+		flags |= msgFlagContentEncoding
+	}
+	if len(m.Headers) > 0 {
+		flags |= msgFlagHeaders
+	}
+	if m.Priority != 0 {
+		flags |= msgFlagPriority
+	}
+	if m.CorrelationID != "" {
+		flags |= msgFlagCorrelationID
+	}
+	if m.ReplyTo != "" {
+		flags |= msgFlagReplyTo
+	}
+	if m.Expiration != "" {
+		flags |= msgFlagExpiration
+	}
+	if m.MessageID != "" {
+		flags |= msgFlagMessageID
+	}
+	if m.Timestamp != 0 {
+		flags |= msgFlagTimestamp
+	}
+	if m.Type != "" {
+		flags |= msgFlagType
+	}
+	if m.UserID != "" {
+		flags |= msgFlagUserID
+	}
+	if m.AppID != "" {
+		flags |= msgFlagAppID
+	}
+	if m.ClusterID != "" {
+		flags |= msgFlagClusterID
+	}
+	if m.EnqueueUnixMilli != 0 {
+		flags |= msgFlagEnqueue
+	}
+	return flags
+}
+
+// appendShort appends a shortstr (u8 length prefix + bytes) onto buf. It returns
+// ErrShortStringOverflow (wrapped) if s exceeds 255 bytes rather than truncating
+// the length into the u8 (which would silently corrupt the record). Zero-alloc.
+func appendShort(buf []byte, s string) ([]byte, error) {
+	if len(s) > 255 {
+		return buf, fmt.Errorf("%w: length %d", ErrShortStringOverflow, len(s))
+	}
+	buf = append(buf, byte(len(s)))
+	buf = append(buf, s...)
+	return buf, nil
+}
+
+// appendHeaders appends a self-length'd AMQP field table (its own u32 length
+// prefix, as produced by protocol.EncodeFieldTable) onto buf. Only called when
+// the Headers presence bit is set (len(headers) > 0), so the no-headers hot path
+// never reaches EncodeFieldTable and stays allocation-free. A Headers map holding
+// a value the field-table encoder cannot emit (e.g. a Decimal, which the wire
+// codec decodes but does not re-encode) is persisted as an empty table rather
+// than corrupting the record or losing the message — a bounded, pre-existing
+// encoder limitation (not introduced here).
+func appendHeaders(buf []byte, headers map[string]interface{}) []byte {
+	headerBytes, err := protocol.EncodeFieldTable(headers)
+	if err != nil {
+		return binary.BigEndian.AppendUint32(buf, 0) // empty field table
+	}
+	return append(buf, headerBytes...)
 }
 
 // serializeTxMarker serializes a transaction-boundary marker record (SQ-8, v2
@@ -1056,93 +1322,27 @@ func serializeTxMarker(kind uint8, epoch uint64) []byte {
 	return buf
 }
 
-// recordTypeAndPayload splits a CRC-verified record's data region into its
-// record type and the type-specific payload, honoring the file format version.
-// The per-record type tag is present iff version >= WALVersion2; for v0/v1 (no
-// on-disk type tag) every record is implicitly a message.
-func recordTypeAndPayload(version uint8, data []byte) (recType uint8, payload []byte) {
-	if version >= WALVersion2 {
-		if len(data) < 1 {
-			return WALRecordTypeMessage, data
-		}
-		return data[0], data[1:]
+// recordTypeAndPayload splits a CRC-verified v4 record's data region into its
+// 1-byte record type and the type-specific payload. Every v4 record carries the
+// type tag as data[0]; a zero-length data region defaults to a message record.
+func recordTypeAndPayload(data []byte) (recType uint8, payload []byte) {
+	if len(data) < 1 {
+		return WALRecordTypeMessage, data
 	}
-	return WALRecordTypeMessage, data
+	return data[0], data[1:]
 }
 
-// deserializeMessagePayload parses a message record's payload (everything after
-// the record-type tag) into a RecoveryMessage. Returns ok=false on a truncated
-// or malformed payload so callers can skip it.
+// deserializeMessagePayload parses a v4 message record's payload (everything
+// after the record-type tag) into a RecoveryMessage for the crash-recovery path.
+// Returns ok=false on a truncated/malformed payload (or an unsupported body
+// reference) so callers can skip it. The recovered message is marked Redelivered
+// (a redelivery after a restart); the live positional read path clears that flag.
 func deserializeMessagePayload(payload []byte) (*RecoveryMessage, bool) {
-	pos := 0
-	if pos+4 > len(payload) {
+	queueName, offset, msg, ok := parseMessagePayload(payload)
+	if !ok {
 		return nil, false
 	}
-	queueLen := binary.BigEndian.Uint32(payload[pos : pos+4])
-	pos += 4
-	if pos+int(queueLen) > len(payload) {
-		return nil, false
-	}
-	queueName := string(payload[pos : pos+int(queueLen)])
-	pos += int(queueLen)
-
-	if pos+8 > len(payload) {
-		return nil, false
-	}
-	offset := binary.BigEndian.Uint64(payload[pos : pos+8])
-	pos += 8
-
-	if pos+4 > len(payload) {
-		return nil, false
-	}
-	exchangeLen := binary.BigEndian.Uint32(payload[pos : pos+4])
-	pos += 4
-	if pos+int(exchangeLen) > len(payload) {
-		return nil, false
-	}
-	exchange := string(payload[pos : pos+int(exchangeLen)])
-	pos += int(exchangeLen)
-
-	if pos+4 > len(payload) {
-		return nil, false
-	}
-	routingKeyLen := binary.BigEndian.Uint32(payload[pos : pos+4])
-	pos += 4
-	if pos+int(routingKeyLen) > len(payload) {
-		return nil, false
-	}
-	routingKey := string(payload[pos : pos+int(routingKeyLen)])
-	pos += int(routingKeyLen)
-
-	if pos+1 > len(payload) {
-		return nil, false
-	}
-	deliveryMode := payload[pos]
-	pos++
-
-	if pos+4 > len(payload) {
-		return nil, false
-	}
-	bodyLen := binary.BigEndian.Uint32(payload[pos : pos+4])
-	pos += 4
-	if pos+int(bodyLen) > len(payload) {
-		return nil, false
-	}
-	body := payload[pos : pos+int(bodyLen)]
-	pos += int(bodyLen)
-
-	msg := &protocol.Message{
-		Exchange:     exchange,
-		RoutingKey:   routingKey,
-		DeliveryMode: deliveryMode,
-		Body:         body,
-		DeliveryTag:  offset,
-		Redelivered:  true,
-	}
-	// v3+ records carry a Headers/Expiration/EnqueueUnixMilli extension block
-	// after the body; older records stop here and default those fields.
-	readMessageExtensions(payload, pos, msg)
-
+	msg.Redelivered = true
 	return &RecoveryMessage{
 		QueueName: queueName,
 		Offset:    offset,
@@ -1150,78 +1350,197 @@ func deserializeMessagePayload(payload []byte) (*RecoveryMessage, bool) {
 	}, true
 }
 
-// appendMessageExtensions appends the W2 message extension block — Expiration,
-// EnqueueUnixMilli, and Headers — to buf, in that order:
-//
-//	[expiration_len:4][expiration][enqueue_unix_milli:8][headers_field_table]
-//
-// The headers field table is self-describing (its own uint32 length prefix, as
-// produced by protocol.EncodeFieldTable), so an empty/nil Headers costs 4
-// bytes. Shared by the WAL (v3+) and segment serializers so both persist an
-// identical block. A Headers map holding a value the AMQP field-table encoder
-// cannot emit (e.g. a Decimal, which the wire codec decodes but does not
-// re-encode) is persisted as an empty table rather than corrupting the record
-// or losing the message body — a bounded, pre-existing encoder limitation, not
-// one W2 introduces.
-func appendMessageExtensions(buf []byte, message *protocol.Message) []byte {
-	buf = binary.BigEndian.AppendUint32(buf, uint32(len(message.Expiration)))
-	buf = append(buf, message.Expiration...)
-	buf = binary.BigEndian.AppendUint64(buf, uint64(message.EnqueueUnixMilli))
-	if len(message.Headers) == 0 {
-		// Fast path for the common no-headers message: append an empty field
-		// table (uint32 length 0) directly, avoiding the EncodeFieldTable
-		// allocation on the durable write.
-		return binary.BigEndian.AppendUint32(buf, 0)
+// parseMessagePayload is the SINGLE shared decoder for the v4 message payload,
+// used by both the WAL (via deserializeMessagePayload / the positional live-read
+// path) and the per-queue segments (via readSegmentMessageAt). It mirrors
+// appendMessagePayload exactly. Every read is bounds-checked against len(payload);
+// on ANY short read it returns ok=false rather than panicking or slicing out of
+// bounds, so a torn tail (the record already passed CRC, so this is defensive) is
+// skipped cleanly. The body is aliased zero-copy into the CRC-checked payload, as
+// before. It does NOT set Redelivered (the caller decides).
+func parseMessagePayload(payload []byte) (queueName string, offset uint64, m *protocol.Message, ok bool) {
+	pos := 0
+	if pos+2 > len(payload) {
+		return "", 0, nil, false
 	}
-	headerBytes, err := protocol.EncodeFieldTable(message.Headers)
-	if err != nil {
-		return binary.BigEndian.AppendUint32(buf, 0) // empty field table
+	flags := binary.BigEndian.Uint16(payload[pos : pos+2])
+	pos += 2
+	// A set continuation bit means a future format wrote a second flags word this
+	// build does not understand — refuse rather than misparse.
+	if flags&msgFlagContinuation != 0 {
+		return "", 0, nil, false
 	}
-	return append(buf, headerBytes...)
+
+	qn, pos, ok := readShort(payload, pos)
+	if !ok {
+		return "", 0, nil, false
+	}
+	if pos+8 > len(payload) {
+		return "", 0, nil, false
+	}
+	off := binary.BigEndian.Uint64(payload[pos : pos+8])
+	pos += 8
+	exchange, pos, ok := readShort(payload, pos)
+	if !ok {
+		return "", 0, nil, false
+	}
+	routingKey, pos, ok := readShort(payload, pos)
+	if !ok {
+		return "", 0, nil, false
+	}
+	if pos+1 > len(payload) {
+		return "", 0, nil, false
+	}
+	deliveryMode := payload[pos]
+	pos++
+	if pos+1 > len(payload) {
+		return "", 0, nil, false
+	}
+	bodyKind := payload[pos]
+	pos++
+
+	msg := &protocol.Message{
+		Exchange:     exchange,
+		RoutingKey:   routingKey,
+		DeliveryMode: deliveryMode,
+		DeliveryTag:  off,
+	}
+
+	switch bodyKind {
+	case bodyKindInline:
+		if pos+4 > len(payload) {
+			return "", 0, nil, false
+		}
+		bodyLen := binary.BigEndian.Uint32(payload[pos : pos+4])
+		pos += 4
+		if pos+int(bodyLen) > len(payload) {
+			return "", 0, nil, false
+		}
+		msg.Body = payload[pos : pos+int(bodyLen)] // zero-copy alias into CRC-checked payload
+		pos += int(bodyLen)
+	case bodyKindReference:
+		// ITER5 seam. Length-skip the opaque locator structurally so recovery of
+		// an ITER5-written file never panics; ITER4 has no resolver for a body
+		// reference, so the record is skipped cleanly (no ITER4 writer emits 0x01).
+		if pos+2 > len(payload) {
+			return "", 0, nil, false
+		}
+		refLen := binary.BigEndian.Uint16(payload[pos : pos+2])
+		pos += 2
+		if pos+int(refLen) > len(payload) {
+			return "", 0, nil, false
+		}
+		msg.BodyRef = payload[pos : pos+int(refLen)]
+		return "", 0, nil, false
+	default:
+		return "", 0, nil, false // unknown body kind
+	}
+
+	// Optional fields in the same canonical order appendMessagePayload writes them.
+	if flags&msgFlagContentType != 0 {
+		if msg.ContentType, pos, ok = readShort(payload, pos); !ok {
+			return "", 0, nil, false
+		}
+	}
+	if flags&msgFlagContentEncoding != 0 {
+		if msg.ContentEncoding, pos, ok = readShort(payload, pos); !ok {
+			return "", 0, nil, false
+		}
+	}
+	if flags&msgFlagHeaders != 0 {
+		if pos+4 > len(payload) {
+			return "", 0, nil, false
+		}
+		tblLen := int(binary.BigEndian.Uint32(payload[pos : pos+4]))
+		end := pos + 4 + tblLen
+		if tblLen < 0 || end > len(payload) {
+			return "", 0, nil, false
+		}
+		// An empty decoded table normalizes to nil Headers so a headers-less
+		// message reconstructs identically regardless of how it was written.
+		if headers, err := protocol.DecodeFieldTable(payload[pos:end]); err == nil && len(headers) > 0 {
+			msg.Headers = headers
+		}
+		pos = end
+	}
+	if flags&msgFlagPriority != 0 {
+		if pos+1 > len(payload) {
+			return "", 0, nil, false
+		}
+		msg.Priority = payload[pos]
+		pos++
+	}
+	if flags&msgFlagCorrelationID != 0 {
+		if msg.CorrelationID, pos, ok = readShort(payload, pos); !ok {
+			return "", 0, nil, false
+		}
+	}
+	if flags&msgFlagReplyTo != 0 {
+		if msg.ReplyTo, pos, ok = readShort(payload, pos); !ok {
+			return "", 0, nil, false
+		}
+	}
+	if flags&msgFlagExpiration != 0 {
+		if msg.Expiration, pos, ok = readShort(payload, pos); !ok {
+			return "", 0, nil, false
+		}
+	}
+	if flags&msgFlagMessageID != 0 {
+		if msg.MessageID, pos, ok = readShort(payload, pos); !ok {
+			return "", 0, nil, false
+		}
+	}
+	if flags&msgFlagTimestamp != 0 {
+		if pos+8 > len(payload) {
+			return "", 0, nil, false
+		}
+		msg.Timestamp = binary.BigEndian.Uint64(payload[pos : pos+8])
+		pos += 8
+	}
+	if flags&msgFlagType != 0 {
+		if msg.Type, pos, ok = readShort(payload, pos); !ok {
+			return "", 0, nil, false
+		}
+	}
+	if flags&msgFlagUserID != 0 {
+		if msg.UserID, pos, ok = readShort(payload, pos); !ok {
+			return "", 0, nil, false
+		}
+	}
+	if flags&msgFlagAppID != 0 {
+		if msg.AppID, pos, ok = readShort(payload, pos); !ok {
+			return "", 0, nil, false
+		}
+	}
+	if flags&msgFlagClusterID != 0 {
+		if msg.ClusterID, pos, ok = readShort(payload, pos); !ok {
+			return "", 0, nil, false
+		}
+	}
+	if flags&msgFlagEnqueue != 0 {
+		if pos+8 > len(payload) {
+			return "", 0, nil, false
+		}
+		msg.EnqueueUnixMilli = int64(binary.BigEndian.Uint64(payload[pos : pos+8]))
+		pos += 8
+	}
+
+	return qn, off, msg, true
 }
 
-// readMessageExtensions reconstructs the W2 extension block (Expiration,
-// EnqueueUnixMilli, Headers) from payload starting at pos and populates them on
-// message. It is best-effort and never fails the surrounding record: pos at the
-// end of payload means an old-format record with no extension block (the fields
-// stay at their zero values), and any malformed/truncated extension bytes stop
-// parsing with whatever was reconstructed so far — a durable message is never
-// dropped for the sake of its extension metadata (the record already passed a
-// CRC check, so this is defensive). An empty decoded headers table is
-// normalized to nil so a message with no headers reconstructs identically
-// whether it was written before or after W2.
-func readMessageExtensions(payload []byte, pos int, message *protocol.Message) {
-	if pos >= len(payload) {
-		return // old-format record: no extension block
+// readShort reads a shortstr (u8 length prefix + bytes) from payload at pos,
+// returning the value, the new position, and ok=false on a short read (never
+// slices out of bounds).
+func readShort(payload []byte, pos int) (s string, newPos int, ok bool) {
+	if pos+1 > len(payload) {
+		return "", pos, false
 	}
-	if pos+4 > len(payload) {
-		return
+	n := int(payload[pos])
+	pos++
+	if pos+n > len(payload) {
+		return "", pos, false
 	}
-	expLen := int(binary.BigEndian.Uint32(payload[pos : pos+4]))
-	pos += 4
-	if expLen < 0 || pos+expLen > len(payload) {
-		return
-	}
-	message.Expiration = string(payload[pos : pos+expLen])
-	pos += expLen
-
-	if pos+8 > len(payload) {
-		return
-	}
-	message.EnqueueUnixMilli = int64(binary.BigEndian.Uint64(payload[pos : pos+8]))
-	pos += 8
-
-	if pos+4 > len(payload) {
-		return
-	}
-	tblLen := int(binary.BigEndian.Uint32(payload[pos : pos+4]))
-	end := pos + 4 + tblLen
-	if tblLen < 0 || end > len(payload) {
-		return
-	}
-	if headers, err := protocol.DecodeFieldTable(payload[pos:end]); err == nil && len(headers) > 0 {
-		message.Headers = headers
-	}
+	return string(payload[pos : pos+n]), pos + n, true
 }
 
 // rollFile rolls to a new WAL file when size limit reached
@@ -1320,41 +1639,35 @@ func (qw *QueueWAL) openNextFile() error {
 }
 
 // walFileDataStart inspects the beginning of an open WAL file and reports the
-// byte offset at which record data begins, plus the detected format version.
-//
-// Detection (SQ-4):
-//   - If the first WALHeaderSize bytes start with WALMagic, the file is
-//     versioned. The trailing byte is the version; if it is not a version this
-//     build understands, ErrUnsupportedWALVersion is returned (a clear error,
-//     never a silent skip). Records begin at WALHeaderSize.
-//   - Otherwise the file is a legacy (v0) headerless file written before SQ-4;
-//     records begin at offset 0 so existing data dirs keep working.
-//   - A file too short to hold a header is treated as legacy/empty (start 0).
-func walFileDataStart(f *os.File) (dataStart int64, version uint8, err error) {
+// byte offset at which record data begins. ITER4 is a CLEAN BREAK — this build
+// reads ONLY v4 files:
+//   - A file that starts with WALMagic and whose version byte is WALVersion4:
+//     records begin at WALHeaderSize.
+//   - A file that starts with WALMagic but carries any other version (v1/v2/v3 or
+//     a future version): ErrUnsupportedWALVersion (loud, never a silent skip —
+//     silently ignoring it could drop durable messages).
+//   - A file with no WALMagic (a pre-v4 headerless v0 file, or foreign bytes):
+//     ErrUnsupportedWALVersion. Pre-v4 records are NOT structurally back-parsed.
+//   - A file too short to hold a header (0 bytes, or a crash between file
+//     creation and the header write): treated as empty (start 0, no records).
+func walFileDataStart(f *os.File) (dataStart int64, err error) {
 	hdr := make([]byte, WALHeaderSize)
 	n, rerr := f.ReadAt(hdr, 0)
 	if n < WALHeaderSize {
-		// Too short to contain a header (possibly empty). Non-EOF read errors
-		// are surfaced; short/empty files parse from offset 0 as legacy.
+		// Too short to contain a v4 header. A genuinely empty file has no records
+		// to recover; parse it as empty. Non-EOF read errors are surfaced.
 		if rerr != nil && rerr != io.EOF {
-			return 0, WALLegacyVersion, rerr
+			return 0, rerr
 		}
-		return 0, WALLegacyVersion, nil
+		return 0, nil
 	}
 	if string(hdr[:len(WALMagic)]) != WALMagic {
-		// No magic → legacy headerless file.
-		return 0, WALLegacyVersion, nil
+		return 0, fmt.Errorf("%w: missing SQWAL magic (pre-v4 headerless file)", ErrUnsupportedWALVersion)
 	}
-	v := hdr[len(WALMagic)]
-	// This build understands v1 (SQ-4, no per-record type tag), v2 (SQ-8,
-	// per-record type tag), and v3 (W2, per-record type tag + message
-	// extensions). Any other version is a hard error, never a silent skip. The
-	// returned version drives record parsing (type tag present iff >= v2;
-	// message extensions are detected structurally, not by version).
-	if v != WALVersion1 && v != WALVersion2 && v != WALVersion3 {
-		return 0, v, fmt.Errorf("%w: got %d, want %d", ErrUnsupportedWALVersion, v, WALFormatVersion)
+	if v := hdr[len(WALMagic)]; v != WALVersion4 {
+		return 0, fmt.Errorf("%w: got %d, want %d", ErrUnsupportedWALVersion, v, WALFormatVersion)
 	}
-	return int64(WALHeaderSize), v, nil
+	return int64(WALHeaderSize), nil
 }
 
 // cleanupLoop processes ACKs and deletes old WAL files
@@ -1581,11 +1894,11 @@ func (qw *QueueWAL) readMessageAtPosition(queueName string, fileNum uint64, file
 	}
 
 	// The offset index is populated only by writes made in the current process,
-	// which always use the current WAL format (v3). Strip the per-record type
-	// tag, confirm it is a message record, and reconstruct via the shared
-	// payload parser so the live read path recovers the message extensions
-	// (Headers/Expiration/EnqueueUnixMilli) exactly like crash recovery does.
-	recType, payload := recordTypeAndPayload(WALFormatVersion, data)
+	// which always use the current v4 format. Strip the per-record type tag,
+	// confirm it is a message record, and reconstruct via the shared payload
+	// parser so the live read path recovers the full basic.properties set exactly
+	// like crash recovery does.
+	recType, payload := recordTypeAndPayload(data)
 	if recType != WALRecordTypeMessage {
 		return nil, fmt.Errorf("unexpected WAL record type %d for offset %d", recType, expectedOffset)
 	}
@@ -1664,9 +1977,9 @@ func (qw *QueueWAL) readMessageFromFile(queueName string, filePath string, offse
 	}
 	defer file.Close()
 
-	// Skip the file-level header (SQ-4) before scanning records. Legacy files
-	// parse from offset 0. The version drives per-record type-tag parsing (v2).
-	dataStart, version, err := walFileDataStart(file)
+	// Skip the file-level header before scanning records. Only v4 files are
+	// accepted; a non-v4/headerless file returns ErrUnsupportedWALVersion.
+	dataStart, err := walFileDataStart(file)
 	if err != nil {
 		return nil, err
 	}
@@ -1709,7 +2022,7 @@ func (qw *QueueWAL) readMessageFromFile(queueName string, filePath string, offse
 			return nil, fmt.Errorf("CRC mismatch in sequential scan")
 		}
 
-		recType, payload := recordTypeAndPayload(version, data)
+		recType, payload := recordTypeAndPayload(data)
 		if recType != WALRecordTypeMessage {
 			// Transaction-boundary marker (or any non-message record): skip.
 			continue

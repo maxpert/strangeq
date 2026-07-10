@@ -35,7 +35,9 @@ func TestAppendMessageRecord_BackpatchOffsets(t *testing.T) {
 	starts := make([]int, len(msgs))
 	for i, m := range msgs {
 		starts[i] = len(buf)
-		buf = appendMessageRecord(buf, WALFormatVersion, "q", m, uint64(i+1))
+		var err error
+		buf, err = appendMessageRecord(buf, "q", m, uint64(i+1))
+		require.NoError(t, err)
 	}
 
 	// Validate every record, but the middle one is the point of the test.

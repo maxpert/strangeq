@@ -756,6 +756,14 @@ type Message struct {
 	// anchor recorded), so the field costs nothing on the non-durable/no-TTL
 	// hot path where it is never written.
 	EnqueueUnixMilli int64
+	// BodyRef is the ITER4 durable-record body-union seam (see the v4 WAL/segment
+	// record format). It is an opaque body-reference locator: when set (non-nil),
+	// the durable record encodes the body as a reference (bodyKind 0x01) carrying
+	// these bytes instead of an inline copy, so ITER5's shared-body store can plug
+	// in with no on-disk format change. ITER4 never populates it (the body is
+	// always inline, bodyKind 0x00) and leaves it nil; only ITER5 will
+	// produce/consume it. The WAL and segment layers treat its contents as opaque.
+	BodyRef []byte
 }
 
 // Delivery represents a message delivery to a consumer

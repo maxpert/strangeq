@@ -24,7 +24,10 @@ const (
 	SegmentFileExtension       = ".seg"
 	SegmentIndexFileExtension  = ".idx"
 
-	// Segment message format: [4 bytes CRC32][4 bytes length][8 bytes offset][N bytes message]
+	// Segment record framing: [4 bytes CRC32][4 bytes length][<message payload v4>]
+	// where the payload is the shared presence-bitmap record produced by
+	// appendMessagePayload (identical to the WAL message payload, but with an
+	// empty queue name and no per-record type tag). See serializeSegmentMessage.
 	SegmentHeaderSize = 16
 
 	// SQ-4 NOTE: segment files intentionally do NOT carry a file-level format
@@ -32,9 +35,9 @@ const (
 	// symmetric with the WAL change: segment index positions are absolute file
 	// offsets, and compaction (compactSegment) rewrites a segment in place via
 	// serializeSegmentMessage + rename, which would need to re-emit and re-skip
-	// a header on every rewrite. Versioning segments is deferred until there is
-	// a concrete format change that requires it; the WAL header alone satisfies
-	// the Wave 0 durability requirement.
+	// a header on every rewrite. Because ITER4 requires a fresh data dir (clean
+	// break), no pre-v4 segment records exist, so segments unconditionally carry
+	// the v4 payload and no structural version detection is needed on read.
 )
 
 // SegmentConfig holds configurable parameters for the segment manager
@@ -336,7 +339,13 @@ func (qs *QueueSegments) writeMessageBatch(messages []*RecoveryMessage) error {
 
 	for _, rm := range messages {
 		position := qs.currentSegment.fileSize.Load() + int64(len(buf))
-		msgBytes := serializeSegmentMessage(rm.Message, rm.Offset)
+		msgBytes, err := serializeSegmentMessage(rm.Message, rm.Offset)
+		if err != nil {
+			// A record that cannot be encoded (shortstr property >255 bytes) fails
+			// the whole checkpoint batch rather than writing a corrupt segment;
+			// the source WAL file is not deleted, so the messages stay durable.
+			return fmt.Errorf("failed to serialize segment message at offset %d: %w", rm.Offset, err)
+		}
 		buf = append(buf, msgBytes...)
 		updates = append(updates, indexUpdate{offset: rm.Offset, position: position})
 	}
@@ -459,7 +468,10 @@ func (qs *QueueSegments) writeMessage(message *protocol.Message, offset uint64) 
 	}
 
 	// Serialize message
-	msgBytes := serializeSegmentMessage(message, offset)
+	msgBytes, err := serializeSegmentMessage(message, offset)
+	if err != nil {
+		return fmt.Errorf("failed to serialize segment message at offset %d: %w", offset, err)
+	}
 
 	// Get current file position
 	position := qs.currentSegment.fileSize.Load()
@@ -697,15 +709,24 @@ func (qs *QueueSegments) compactSegment(segment *SegmentFile) {
 	newIndex := make(map[uint64]int64)
 	var newPosition int64
 
+	serializeFailed := false
 	qs.bitmapMutex.RLock()
 	for offset, oldPosition := range oldIndex {
 		if !qs.ackBitmap.Contains(offset) {
 			// Message not ACKed - copy to new segment
 			msg, err := readSegmentMessageAt(segment.file, oldPosition)
 			if err == nil {
-				msgBytes := serializeSegmentMessage(msg, offset)
-				n, err := tempFile.Write(msgBytes)
-				if err == nil {
+				msgBytes, serErr := serializeSegmentMessage(msg, offset)
+				if serErr != nil {
+					// Re-serializing an already-persisted message should never fail
+					// (it was ≤255-byte-bounded when first written); if it somehow
+					// does, abort the compaction so no unACKed message is dropped —
+					// the old segment stays intact.
+					serializeFailed = true
+					break
+				}
+				n, werr := tempFile.Write(msgBytes)
+				if werr == nil {
 					newIndex[offset] = newPosition
 					newPosition += int64(n)
 				}
@@ -713,6 +734,12 @@ func (qs *QueueSegments) compactSegment(segment *SegmentFile) {
 		}
 	}
 	qs.bitmapMutex.RUnlock()
+
+	if serializeFailed {
+		// Abort: leave the original segment and its file untouched.
+		_ = os.Remove(tempPath)
+		return
+	}
 
 	// Sync new file
 	_ = tempFile.Sync()
@@ -838,11 +865,14 @@ func (qs *QueueSegments) loadSegmentFile(segmentNum uint64, segPath string) erro
 			break
 		}
 
-		if len(data) < 4 {
+		// Extract the offset from the v4 payload to index the record: the payload
+		// begins with [flags u16][queue u8-len][queue][offset u64], and segments
+		// write an empty queue name.
+		if len(data) < 3 {
 			break
 		}
-		queueLen := binary.BigEndian.Uint32(data[0:4])
-		offStart := 4 + int(queueLen)
+		queueLen := int(data[2]) // data[0:2] = flags, data[2] = queue u8-len
+		offStart := 3 + queueLen
 		if offStart+8 > len(data) {
 			break
 		}
@@ -981,64 +1011,41 @@ func (qs *QueueSegments) close() {
 
 // Helper functions
 
-// serializeSegmentMessage serializes a message with full AMQP metadata.
-// Format: [CRC][length][queue_len][queue][offset][exchange_len][exchange][routing_key_len][routing_key][delivery_mode][body_len][body][extensions]
-// This matches the WAL serialization format to preserve Exchange, RoutingKey,
-// DeliveryMode, and the W2 extension block (Headers/Expiration/EnqueueUnixMilli).
+// serializeSegmentMessage serializes a message into a segment record:
+// [CRC][length][<message payload v4>]. The payload is produced by the SAME shared
+// codec (appendMessagePayload) the WAL uses, so a segment record and a WAL message
+// record carry byte-identical payloads and preserve the ENTIRE protocol.Message
+// (all 14 optional basic.properties, not the pre-v4 subset), including x-death
+// headers across compaction. Segments differ from the WAL only in the framing:
+// no per-record type tag, and the payload's queue-name field is empty (the queue
+// is known by the segment's directory).
 //
-// Segment files carry no file-level format version (see the note at the top of
-// this file), so unlike the WAL there is no version byte to gate on: every new
-// segment record carries the extension block, and readSegmentMessageAt detects
-// a pre-W2 record structurally (no trailing bytes after the body). This keeps
-// checkpointed segment-resident messages byte-compatible with recovery and
-// preserves x-death across compaction (compactSegment round-trips through this
-// serializer).
-func serializeSegmentMessage(message *protocol.Message, offset uint64) []byte {
-	bodySize := len(message.Body)
-	totalSize := 8 + 4 + len(message.Exchange) + 4 + len(message.RoutingKey) + 1 + 4 + bodySize + 256
-
+// Returns an error (and a partial buffer the caller must discard) if the message
+// contains a shortstr property longer than 255 bytes; the caller must not write a
+// partial record.
+func serializeSegmentMessage(message *protocol.Message, offset uint64) ([]byte, error) {
+	totalSize := 8 + len(message.Exchange) + len(message.RoutingKey) + len(message.Body) + 256
 	buf := make([]byte, 0, totalSize)
 
-	// Reserve space for CRC and length
+	// Reserve space for CRC and length.
 	buf = append(buf, 0, 0, 0, 0) // CRC32 placeholder
 	buf = append(buf, 0, 0, 0, 0) // Length placeholder
 
-	// Write queue name (empty for segment messages — queue is known by the segment's queue)
-	queueName := ""
-	buf = binary.BigEndian.AppendUint32(buf, uint32(len(queueName)))
-	buf = append(buf, []byte(queueName)...)
+	// Shared v4 payload with an empty queue name (segments key by queue dir).
+	buf, err := appendMessagePayload(buf, "", message, offset)
+	if err != nil {
+		return buf, err
+	}
 
-	// Write offset
-	buf = binary.BigEndian.AppendUint64(buf, offset)
-
-	// Write exchange
-	buf = binary.BigEndian.AppendUint32(buf, uint32(len(message.Exchange)))
-	buf = append(buf, []byte(message.Exchange)...)
-
-	// Write routing key
-	buf = binary.BigEndian.AppendUint32(buf, uint32(len(message.RoutingKey)))
-	buf = append(buf, []byte(message.RoutingKey)...)
-
-	// Write delivery mode (1 byte)
-	buf = append(buf, message.DeliveryMode)
-
-	// Write body
-	buf = binary.BigEndian.AppendUint32(buf, uint32(bodySize))
-	buf = append(buf, message.Body...)
-
-	// Persist the W2 message extension block (Headers/Expiration/
-	// EnqueueUnixMilli) after the body, identical to the WAL v3 layout.
-	buf = appendMessageExtensions(buf, message)
-
-	// Calculate actual length (excluding CRC and length fields)
+	// Calculate actual length (excluding CRC and length fields).
 	dataLen := len(buf) - 8
 	binary.BigEndian.PutUint32(buf[4:8], uint32(dataLen))
 
-	// Calculate CRC over everything after CRC field
+	// Calculate CRC over everything after the CRC field.
 	crc := crc32.ChecksumIEEE(buf[4:])
 	binary.BigEndian.PutUint32(buf[0:4], crc)
 
-	return buf
+	return buf, nil
 }
 
 func readSegmentMessageAt(file *os.File, position int64) (*protocol.Message, error) {
@@ -1053,7 +1060,7 @@ func readSegmentMessageAt(file *os.File, position int64) (*protocol.Message, err
 	storedCRC := binary.BigEndian.Uint32(header[0:4])
 	dataLen := binary.BigEndian.Uint32(header[4:8])
 
-	// Read data portion: [length][queue_len][queue][offset][exchange_len][exchange][routing_key_len][routing_key][delivery_mode][body_len][body]
+	// Read data portion: [length][<message payload v4>]
 	crcData := make([]byte, 4+dataLen)
 	copy(crcData[0:4], header[4:8]) // length field
 	_, err = file.ReadAt(crcData[4:], position+8)
@@ -1067,81 +1074,12 @@ func readSegmentMessageAt(file *os.File, position int64) (*protocol.Message, err
 		return nil, fmt.Errorf("CRC mismatch")
 	}
 
-	// Parse data: skip length field, then [queue_len][queue][offset][exchange_len][exchange][routing_key_len][routing_key][delivery_mode][body_len][body]
+	// Parse the shared v4 payload (queue name is empty and ignored; the offset is
+	// carried on the reconstructed message's DeliveryTag).
 	data := crcData[4:] // skip length field
-	pos := 0
-
-	// Read queue name (ignored — queue is known by the segment's queue)
-	if len(data) < pos+4 {
-		return nil, fmt.Errorf("invalid segment data: too short for queue length")
+	_, _, msg, ok := parseMessagePayload(data)
+	if !ok {
+		return nil, fmt.Errorf("invalid segment data: malformed message record")
 	}
-	queueLen := binary.BigEndian.Uint32(data[pos : pos+4])
-	pos += 4
-	if len(data) < pos+int(queueLen) {
-		return nil, fmt.Errorf("invalid segment data: too short for queue name")
-	}
-	pos += int(queueLen) // skip queue name
-
-	// Read offset
-	if len(data) < pos+8 {
-		return nil, fmt.Errorf("invalid segment data: too short for offset")
-	}
-	offset := binary.BigEndian.Uint64(data[pos : pos+8])
-	pos += 8
-
-	// Read exchange
-	if len(data) < pos+4 {
-		return nil, fmt.Errorf("invalid segment data: too short for exchange length")
-	}
-	exchangeLen := binary.BigEndian.Uint32(data[pos : pos+4])
-	pos += 4
-	if len(data) < pos+int(exchangeLen) {
-		return nil, fmt.Errorf("invalid segment data: too short for exchange")
-	}
-	exchange := string(data[pos : pos+int(exchangeLen)])
-	pos += int(exchangeLen)
-
-	// Read routing key
-	if len(data) < pos+4 {
-		return nil, fmt.Errorf("invalid segment data: too short for routing key length")
-	}
-	routingKeyLen := binary.BigEndian.Uint32(data[pos : pos+4])
-	pos += 4
-	if len(data) < pos+int(routingKeyLen) {
-		return nil, fmt.Errorf("invalid segment data: too short for routing key")
-	}
-	routingKey := string(data[pos : pos+int(routingKeyLen)])
-	pos += int(routingKeyLen)
-
-	// Read delivery mode
-	if len(data) < pos+1 {
-		return nil, fmt.Errorf("invalid segment data: too short for delivery mode")
-	}
-	deliveryMode := data[pos]
-	pos += 1
-
-	// Read body
-	if len(data) < pos+4 {
-		return nil, fmt.Errorf("invalid segment data: too short for body length")
-	}
-	bodyLen := binary.BigEndian.Uint32(data[pos : pos+4])
-	pos += 4
-	if len(data) < pos+int(bodyLen) {
-		return nil, fmt.Errorf("invalid segment data: too short for body")
-	}
-	body := data[pos : pos+int(bodyLen)]
-	pos += int(bodyLen)
-
-	msg := &protocol.Message{
-		DeliveryTag:  offset,
-		Body:         body,
-		Exchange:     exchange,
-		RoutingKey:   routingKey,
-		DeliveryMode: deliveryMode,
-	}
-	// W2 records carry a Headers/Expiration/EnqueueUnixMilli extension block
-	// after the body; pre-W2 records stop at the body and default those fields.
-	readMessageExtensions(data, pos, msg)
-
 	return msg, nil
 }

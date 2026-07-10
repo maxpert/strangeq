@@ -2,9 +2,7 @@ package storage
 
 import (
 	"bytes"
-	"encoding/binary"
 	"fmt"
-	"hash/crc32"
 	"os"
 	"path/filepath"
 	"testing"
@@ -15,94 +13,94 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// TestAppendMessageRecord_ByteIdenticalToLegacy is the STAGE A A1 byte-identity
-// golden. It proves the in-place record serializer (appendMessageRecord, which
-// writes each record onto the tail of a SHARED batch buffer with record-relative
-// CRC/length backpatch) emits the EXACT same on-disk bytes as the legacy
-// single-allocation serializeMessageVersioned — for every version, body size and
-// field combination the production path can produce.
+// TestAppendMessageRecord_SharedBufferByteIdentical is the STAGE A A1 byte-
+// identity golden for the v4 record. It proves the in-place record serializer
+// (appendMessageRecord, which writes each record onto the tail of a SHARED batch
+// buffer with record-relative CRC/length backpatch) emits the EXACT same on-disk
+// bytes whether it starts from a fresh buffer or is appended onto a non-empty
+// one — for every body size and field combination the production path produces,
+// including a full basic.properties set.
 //
-// Byte identity is the load-bearing durability invariant (A1): if the bytes are
-// identical, every existing recovery/versioning test and the whole on-disk format
-// contract continue to hold unchanged after the buffer-reuse refactor. The test
+// Byte identity is the load-bearing durability invariant (A1). The test
 // deliberately appends records into a NON-EMPTY shared buffer so a bug that used
 // absolute offsets (buf[0:4]/buf[4:]) instead of record-relative offsets
 // (buf[recStart:...]) would corrupt the CRC/length of every record but the first
 // and fail here.
-func TestAppendMessageRecord_ByteIdenticalToLegacy(t *testing.T) {
+func TestAppendMessageRecord_SharedBufferByteIdentical(t *testing.T) {
 	wm, err := NewWALManager(t.TempDir())
 	require.NoError(t, err)
 	defer wm.Close()
 	qw := wm.sharedWAL
 
 	bodySizes := []int{0, 1, 4096, 65536}
-	versions := []uint8{WALVersion1, WALVersion2, WALVersion3}
 
 	type fieldSet struct {
-		name       string
-		queue      string
-		exchange   string
-		routingKey string
-		headers    map[string]interface{}
-		expiration string
-		enqueue    int64
+		name string
+		msg  *protocol.Message
 	}
 	fieldSets := []fieldSet{
-		{name: "bare", queue: "q", exchange: "", routingKey: "", headers: nil},
-		{name: "named", queue: "orders", exchange: "ex", routingKey: "rk.a", headers: nil},
+		{name: "bare", msg: &protocol.Message{DeliveryMode: 2}},
+		{name: "named", msg: &protocol.Message{Exchange: "ex", RoutingKey: "rk.a", DeliveryMode: 2}},
 		{
-			// A single-key header keeps EncodeFieldTable's output deterministic so
-			// two independent serializations are byte-comparable. (A multi-key map
-			// encodes in Go's non-deterministic map-iteration order, which differs
-			// per call regardless of serializer — its round-trip is covered
-			// semantically by TestWAL_MessageExtensions_RoundTrip.) This still
-			// exercises the full v3 extension path: Expiration, EnqueueUnixMilli,
-			// and a non-empty Headers field table, plus the CRC over that block.
-			name: "with-extensions", queue: "orders", exchange: "amq.topic", routingKey: "rk.b",
-			headers: map[string]interface{}{"x-attempt": int64(7)}, expiration: "60000", enqueue: 1720000000123,
+			// Single-key header keeps EncodeFieldTable's output deterministic so
+			// two independent serializations are byte-comparable, while still
+			// exercising the Headers field-table + Expiration + EnqueueUnixMilli
+			// optional fields and the CRC over them.
+			name: "with-extensions",
+			msg: &protocol.Message{
+				Exchange: "amq.topic", RoutingKey: "rk.b", DeliveryMode: 2,
+				Headers: map[string]interface{}{"x-attempt": int64(7)}, Expiration: "60000", EnqueueUnixMilli: 1720000000123,
+			},
+		},
+		{
+			// A property-rich message with distinct single-valued scalar/string
+			// fields (deterministic encoding) across the whole basic.properties set.
+			name: "all-props",
+			msg: &protocol.Message{
+				Exchange: "amq.topic", RoutingKey: "rk.c", DeliveryMode: 2,
+				ContentType: "application/json", ContentEncoding: "gzip", Priority: 5,
+				CorrelationID: "corr", ReplyTo: "reply", Expiration: "1000", MessageID: "mid",
+				Timestamp: 42, Type: "T", UserID: "u", AppID: "a", ClusterID: "c",
+				EnqueueUnixMilli: 7,
+			},
 		},
 	}
 
-	for _, version := range versions {
-		for _, fs := range fieldSets {
-			for _, bs := range bodySizes {
-				name := fmt.Sprintf("v%d/%s/body=%d", version, fs.name, bs)
-				t.Run(name, func(t *testing.T) {
-					body := make([]byte, bs)
-					for i := range body {
-						body[i] = byte((i*7 + bs) & 0xff)
-					}
-					msg := &protocol.Message{
-						Exchange:         fs.exchange,
-						RoutingKey:       fs.routingKey,
-						Body:             body,
-						DeliveryMode:     2,
-						Headers:          fs.headers,
-						Expiration:       fs.expiration,
-						EnqueueUnixMilli: fs.enqueue,
-					}
-					const offset = uint64(0xABCDEF12)
+	for _, fs := range fieldSets {
+		for _, bs := range bodySizes {
+			name := fmt.Sprintf("%s/body=%d", fs.name, bs)
+			t.Run(name, func(t *testing.T) {
+				body := make([]byte, bs)
+				for i := range body {
+					body[i] = byte((i*7 + bs) & 0xff)
+				}
+				msg := *fs.msg
+				msg.Body = body
+				const offset = uint64(0xABCDEF12)
+				const queue = "orders"
 
-					legacy := qw.serializeMessageVersioned(version, fs.queue, msg, offset)
+				// Fresh single-allocation serialization is the reference image.
+				ref, err := qw.serializeMessageVersioned(queue, &msg, offset)
+				require.NoError(t, err)
 
-					// (a) fresh buffer (recStart == 0): must equal legacy exactly.
-					fresh := appendMessageRecord(nil, version, fs.queue, msg, offset)
-					assert.True(t, bytes.Equal(legacy, fresh),
-						"fresh-buffer record must be byte-identical to legacy\nlegacy=%x\nfresh =%x", legacy, fresh)
+				// (a) fresh buffer (recStart == 0): must equal the reference exactly.
+				fresh, err := appendMessageRecord(nil, queue, &msg, offset)
+				require.NoError(t, err)
+				assert.True(t, bytes.Equal(ref, fresh),
+					"fresh-buffer record must match reference\nref  =%x\nfresh=%x", ref, fresh)
 
-					// (b) appended onto a non-empty shared buffer (recStart != 0):
-					// the record slice carved out at recStart must equal legacy.
-					prefix := []byte("PRECEDING-RECORD-BYTES-XYZ")
-					shared := append([]byte(nil), prefix...)
-					recStart := len(shared)
-					shared = appendMessageRecord(shared, version, fs.queue, msg, offset)
-					record := shared[recStart:]
-					assert.True(t, bytes.Equal(legacy, record),
-						"shared-buffer record must be byte-identical to legacy\nlegacy=%x\nshared=%x", legacy, record)
-					// prefix must be untouched.
-					assert.True(t, bytes.Equal(prefix, shared[:recStart]), "preceding buffer bytes must not be mutated")
-				})
-			}
+				// (b) appended onto a non-empty shared buffer (recStart != 0): the
+				// record slice carved out at recStart must equal the reference.
+				prefix := []byte("PRECEDING-RECORD-BYTES-XYZ")
+				shared := append([]byte(nil), prefix...)
+				recStart := len(shared)
+				shared, err = appendMessageRecord(shared, queue, &msg, offset)
+				require.NoError(t, err)
+				record := shared[recStart:]
+				assert.True(t, bytes.Equal(ref, record),
+					"shared-buffer record must match reference\nref   =%x\nshared=%x", ref, record)
+				assert.True(t, bytes.Equal(prefix, shared[:recStart]), "preceding buffer bytes must not be mutated")
+			})
 		}
 	}
 }
@@ -127,17 +125,20 @@ func TestAppendMessageRecord_MultiRecordSharedBuffer(t *testing.T) {
 	starts := make([]int, len(msgs))
 	for i, m := range msgs {
 		starts[i] = len(buf)
-		buf = appendMessageRecord(buf, WALFormatVersion, "q", m, uint64(i+1))
+		var err error
+		buf, err = appendMessageRecord(buf, "q", m, uint64(i+1))
+		require.NoError(t, err)
 	}
 
 	for i, m := range msgs {
-		legacy := qw.serializeMessageVersioned(WALFormatVersion, "q", m, uint64(i+1))
+		ref, err := qw.serializeMessageVersioned("q", m, uint64(i+1))
+		require.NoError(t, err)
 		end := len(buf)
 		if i+1 < len(starts) {
 			end = starts[i+1]
 		}
 		record := buf[starts[i]:end]
-		assert.True(t, bytes.Equal(legacy, record), "record %d must be byte-identical to legacy", i)
+		assert.True(t, bytes.Equal(ref, record), "record %d must match its fresh serialization", i)
 	}
 }
 
@@ -233,64 +234,6 @@ func TestWAL_MessageExtensions_RoundTrip(t *testing.T) {
 	assertXDeathIntact(t, got.Headers, deathTime)
 }
 
-// TestWAL_BackwardCompat_OldAndNewRecords proves an existing durable store
-// recovers without rewrite: a single physical WAL file whose header predates
-// W2 (v2) and that contains BOTH an old v2 record (no extensions) AND a v3
-// record appended after the upgrade must recover both — the old one defaulting
-// to nil Headers / "" Expiration / 0 EnqueueUnixMilli and the new one carrying
-// its extensions. This is the append-on-restart mixed-version file case.
-func TestWAL_BackwardCompat_OldAndNewRecords(t *testing.T) {
-	tmpDir := t.TempDir()
-
-	wm, err := NewWALManager(tmpDir)
-	require.NoError(t, err)
-	defer wm.Close()
-	qw := wm.sharedWAL
-
-	oldMsg := &protocol.Message{
-		Exchange: "ex", RoutingKey: "old-rk", Body: []byte("old-body"), DeliveryMode: 2,
-	}
-	newMsg := &protocol.Message{
-		Exchange: "ex", RoutingKey: "new-rk", Body: []byte("new-body"), DeliveryMode: 2,
-		Expiration: "30000", EnqueueUnixMilli: 999,
-		Headers: map[string]interface{}{"k": "v"},
-	}
-
-	// A v2-header file (a store written before W2) that also has a v3 record
-	// appended after restart. The v2 record has no extension bytes; the v3
-	// record does. Recovery must parse both correctly.
-	buf := append([]byte(WALMagic), WALVersion2)
-	buf = append(buf, qw.serializeMessageVersioned(WALVersion2, "q", oldMsg, 1)...)
-	buf = append(buf, qw.serializeMessageVersioned(WALVersion3, "q", newMsg, 2)...)
-
-	path := filepath.Join(sharedWALDir(tmpDir), fmt.Sprintf("%020d%s", uint64(555555), WALFileExtension))
-	require.NoError(t, os.WriteFile(path, buf, 0644))
-
-	msgs, err := qw.scanWALFile(path)
-	require.NoError(t, err)
-	require.Len(t, msgs, 2, "both the old and new records must recover")
-
-	byRK := map[string]*protocol.Message{}
-	for _, m := range msgs {
-		byRK[m.Message.RoutingKey] = m.Message
-	}
-
-	old := byRK["old-rk"]
-	require.NotNil(t, old, "old record must recover")
-	assert.Equal(t, "old-body", string(old.Body))
-	assert.Nil(t, old.Headers, "old record must default to nil Headers")
-	assert.Equal(t, "", old.Expiration, "old record must default to empty Expiration")
-	assert.Equal(t, int64(0), old.EnqueueUnixMilli, "old record must default to 0 EnqueueUnixMilli")
-
-	nw := byRK["new-rk"]
-	require.NotNil(t, nw, "new record must recover")
-	assert.Equal(t, "new-body", string(nw.Body))
-	assert.Equal(t, "30000", nw.Expiration)
-	assert.Equal(t, int64(999), nw.EnqueueUnixMilli)
-	require.NotNil(t, nw.Headers)
-	assert.Equal(t, "v", nw.Headers["k"])
-}
-
 // TestWAL_LiveReadPreservesExtensions proves the in-process offset-index read
 // path (readMessageAtPosition, used for redelivery of a persisted message)
 // also reconstructs the extension fields, not just the crash-recovery scan.
@@ -363,52 +306,25 @@ func TestSegment_MessageExtensions_RoundTrip(t *testing.T) {
 	assertXDeathIntact(t, rec.Headers, deathTime)
 }
 
-// serializeSegmentMessageLegacy reproduces the pre-W2 segment record format
-// (no extension block after the body) so the backward-compat test can craft a
-// genuine old record next to a new one in the same file.
-func serializeSegmentMessageLegacy(message *protocol.Message, offset uint64) []byte {
-	var buf []byte
-	buf = append(buf, 0, 0, 0, 0) // CRC placeholder
-	buf = append(buf, 0, 0, 0, 0) // length placeholder
-
-	buf = binary.BigEndian.AppendUint32(buf, 0) // empty queue name (segments key by queue dir)
-
-	buf = binary.BigEndian.AppendUint64(buf, offset)
-
-	buf = binary.BigEndian.AppendUint32(buf, uint32(len(message.Exchange)))
-	buf = append(buf, message.Exchange...)
-
-	buf = binary.BigEndian.AppendUint32(buf, uint32(len(message.RoutingKey)))
-	buf = append(buf, message.RoutingKey...)
-
-	buf = append(buf, message.DeliveryMode)
-
-	buf = binary.BigEndian.AppendUint32(buf, uint32(len(message.Body)))
-	buf = append(buf, message.Body...)
-
-	// Framing: length excludes CRC+length; CRC covers everything after itself.
-	binary.BigEndian.PutUint32(buf[4:8], uint32(len(buf)-8))
-	binary.BigEndian.PutUint32(buf[0:4], crc32.ChecksumIEEE(buf[4:]))
-	return buf
-}
-
-// TestSegment_BackwardCompat_OldAndNewRecords proves readSegmentMessageAt reads
-// both a pre-W2 record (no extensions -> defaults) and a W2 record (with
-// extensions) laid out back-to-back in one segment file, distinguishing them
-// structurally by the presence of trailing bytes after the body.
-func TestSegment_BackwardCompat_OldAndNewRecords(t *testing.T) {
+// TestSegment_TwoRecords_BackToBack proves readSegmentMessageAt reads two v4
+// segment records laid out back-to-back in one file — the layout compaction and
+// batch checkpoint produce — reconstructing each record's fields and preserving
+// the position boundary between them.
+func TestSegment_TwoRecords_BackToBack(t *testing.T) {
 	dir := t.TempDir()
-	path := filepath.Join(dir, "mixed.seg")
+	path := filepath.Join(dir, "two.seg")
 
-	oldBuf := serializeSegmentMessageLegacy(
-		&protocol.Message{Exchange: "ex", RoutingKey: "old", Body: []byte("old-seg"), DeliveryMode: 2}, 5)
-	newBuf := serializeSegmentMessage(
+	buf1, err := serializeSegmentMessage(
+		&protocol.Message{Exchange: "ex", RoutingKey: "first", Body: []byte("first-seg"), DeliveryMode: 2}, 5)
+	require.NoError(t, err)
+	buf2, err := serializeSegmentMessage(
 		&protocol.Message{
-			Exchange: "ex", RoutingKey: "new", Body: []byte("new-seg"), DeliveryMode: 2,
+			Exchange: "ex", RoutingKey: "second", Body: []byte("second-seg"), DeliveryMode: 2,
 			Expiration: "10000", EnqueueUnixMilli: 5, Headers: map[string]interface{}{"a": "b"},
 		}, 6)
+	require.NoError(t, err)
 
-	require.NoError(t, os.WriteFile(path, append(oldBuf, newBuf...), 0644))
+	require.NoError(t, os.WriteFile(path, append(buf1, buf2...), 0644))
 
 	f, err := os.Open(path)
 	require.NoError(t, err)
@@ -416,14 +332,16 @@ func TestSegment_BackwardCompat_OldAndNewRecords(t *testing.T) {
 
 	m1, err := readSegmentMessageAt(f, 0)
 	require.NoError(t, err)
-	assert.Equal(t, "old-seg", string(m1.Body))
-	assert.Nil(t, m1.Headers, "pre-W2 segment record must default to nil Headers")
+	assert.Equal(t, "first-seg", string(m1.Body))
+	assert.Equal(t, "first", m1.RoutingKey)
+	assert.Nil(t, m1.Headers, "a headers-less record must reconstruct nil Headers")
 	assert.Equal(t, "", m1.Expiration)
 	assert.Equal(t, int64(0), m1.EnqueueUnixMilli)
 
-	m2, err := readSegmentMessageAt(f, int64(len(oldBuf)))
+	m2, err := readSegmentMessageAt(f, int64(len(buf1)))
 	require.NoError(t, err)
-	assert.Equal(t, "new-seg", string(m2.Body))
+	assert.Equal(t, "second-seg", string(m2.Body))
+	assert.Equal(t, "second", m2.RoutingKey)
 	assert.Equal(t, "10000", m2.Expiration)
 	assert.Equal(t, int64(5), m2.EnqueueUnixMilli)
 	require.NotNil(t, m2.Headers)
