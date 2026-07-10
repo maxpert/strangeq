@@ -120,6 +120,13 @@ func (b *ackTestBroker) PublishMessage(exchangeName, routingKey string, message 
 	return nil
 }
 
+// PublishMessageAsyncConfirm is unused by the ack tests (they never publish on a
+// confirm/durable path); mirror PublishMessage's blocking behavior and settle
+// the confirm synchronously so the interface is satisfied.
+func (b *ackTestBroker) PublishMessageAsyncConfirm(exchangeName, routingKey string, message *protocol.Message, onDurable func(error)) (bool, protocol.DepthGate, error) {
+	return false, nil, b.PublishMessage(exchangeName, routingKey, message)
+}
+
 func (b *ackTestBroker) RegisterConsumer(queueName, consumerTag string, consumer *protocol.Consumer) error {
 	return nil
 }

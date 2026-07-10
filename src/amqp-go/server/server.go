@@ -42,11 +42,6 @@ type Server struct {
 	StartTime          time.Time
 	metricsCancel      context.CancelFunc
 
-	// ConfirmBarrier decides when a publish on a confirm-mode channel becomes
-	// confirmable (SQ-5). Nil falls back to Broker.PublishMessage directly,
-	// which is also what the default barrier does.
-	ConfirmBarrier DurabilityBarrier
-
 	messagesPublished atomic.Int64
 	messagesDelivered atomic.Int64
 	bytesReceived     atomic.Int64
@@ -87,6 +82,11 @@ type Server struct {
 	// (and then to defaultReaderBackpressureProbe). Tests set it small; production
 	// leaves it unset and drives it from config.
 	readerBackpressureProbe time.Duration
+
+	// depthLivenessProbe overrides the queue-depth reader-park liveness interval
+	// (iteration 2, option A). Zero falls back to depthBackpressureLivenessInterval.
+	// Tests set it small; production leaves it at the default.
+	depthLivenessProbe time.Duration
 
 	// alarmCancel stops the alarm monitor goroutine on shutdown; nil when the
 	// monitor was never started.
@@ -579,6 +579,18 @@ func (s *Server) processConnectionFrames(conn *protocol.Connection) {
 		s.Log.Info("ACK processor completed", zap.String("connection_id", conn.ID))
 	}
 
+	// Belt-and-suspenders confirm drain (repro D — teardown ordering): the socket
+	// is closed just below to unblock the reader/processor, and only afterwards is
+	// conn.Done signaled to stop the confirm flusher. A durability completion that
+	// advances a channel's confirm watermark in that window would otherwise be lost
+	// (the flusher's write hits the already-closed socket). Flush any advanced-but-
+	// unemitted confirms + pending nacks NOW, while the socket is still open. This
+	// runs on the teardown goroutine, concurrently with the still-live flusher, but
+	// is safe and idempotent — per-channel FlushConfirms is serialized under
+	// confirmFlushMu. Errors are ignored: the connection is closing regardless.
+	_ = s.drainConfirmNacks(conn)
+	_ = s.flushAllChannelConfirms(conn)
+
 	// Close the connection to unblock reader and processor
 	conn.Conn.Close()
 	// Signal all goroutines that the connection is shutting down.
@@ -620,6 +632,68 @@ func (s *Server) readerBackpressureProbeInterval() time.Duration {
 	return defaultReaderBackpressureProbe
 }
 
+// depthBackpressureLivenessInterval bounds how long the queue-depth reader park
+// stays purely in the depth-poll (no socket read) before it breaks out to
+// burst-drain currently-available RX and probe socket liveness. It only elapses
+// when the queue stays pinned at/over HWM with no drain (all consumers gone — the
+// teardown case, or severe overload), so the reader can still detect a client
+// close (EOF) AND flush the producer's buffered-but-unread final window (which
+// would otherwise strand its confirms). During healthy operation the queue drains
+// within a poll interval and the reader resumes long before this fires.
+const depthBackpressureLivenessInterval = 1 * time.Second
+
+// depthLivenessInterval is the effective queue-depth reader-park liveness
+// interval: the test override wins, else the default const.
+func (s *Server) depthLivenessInterval() time.Duration {
+	if s.depthLivenessProbe > 0 {
+		return s.depthLivenessProbe
+	}
+	return depthBackpressureLivenessInterval
+}
+
+// parkReaderWhileDepthBackpressured parks the connection's reader while its
+// queue-depth gate reports the target queue at/over HWM (iteration 2, option A).
+// Not reading the socket IS the backpressure: the client's TCP window fills and
+// its Publish blocks, pacing a producer-only connection to the consumer's drain
+// rate so the durable queue stays small and ring-resident (which keeps consume
+// throughput high) WITHOUT parking the frame processor mid-publish (which would
+// strand an already-minted confirm tag at teardown).
+//
+// It POLLS the depth on a bounded re-check interval rather than blocking in a
+// socket read, so it resumes the instant a consumer drains the queue below HWM
+// even while the (blocked) client is silent — a read-blocking park would miss
+// that drain and stall. It returns probing=true only when it broke out on the
+// slow liveness timer (still pinned at HWM) so the caller burst-drains the
+// producer's buffered-but-unread final window (teardown strand fix) and probes
+// socket liveness; false when the queue drained (normal resume, gate cleared),
+// the connection acquired a consumer (mixed conn — must keep reading its own
+// acks), or the connection is tearing down.
+func (s *Server) parkReaderWhileDepthBackpressured(conn *protocol.Connection) (probing bool) {
+	gate := conn.DepthGateValue()
+	if gate == nil || conn.HasActiveConsumer() {
+		conn.SetDepthGate(nil)
+		return false
+	}
+	recheck := time.NewTimer(s.readerBackpressureProbeInterval())
+	defer recheck.Stop()
+	liveness := time.NewTimer(s.depthLivenessInterval())
+	defer liveness.Stop()
+	for {
+		if !gate.AtHighWaterMark() {
+			conn.SetDepthGate(nil) // drained — resume full-speed reads
+			return false
+		}
+		select {
+		case <-conn.Done:
+			return false
+		case <-recheck.C:
+			recheck.Reset(s.readerBackpressureProbeInterval())
+		case <-liveness.C:
+			return true // break out to burst-drain available RX + probe socket liveness
+		}
+	}
+}
+
 // readFrames reads frames from TCP connection and enqueues them for processing
 // This goroutine NEVER blocks on frame processing - it only reads and enqueues
 func (s *Server) readFrames(conn *protocol.Connection, done chan struct{}) {
@@ -651,6 +725,15 @@ func (s *Server) readFrames(conn *protocol.Connection, done chan struct{}) {
 	// matters on hb==0 connections, where it lets us clear a stale SQ-12
 	// liveness-probe deadline exactly once instead of on every frame.
 	deadlineActive := false
+	// depthDraining is the queue-depth backpressure teardown burst-drain state
+	// (iteration 2, option A). When the depth-park's liveness timer fires (the
+	// queue is pinned >= HWM with no drain — teardown or overload), the reader
+	// enters this mode: it reads all currently-available RX at full speed (short
+	// deadline) instead of re-parking, so the producer's buffered-but-unread final
+	// window is admitted + confirmed within the confirm grace even though the queue
+	// is at HWM. It exits (re-parks) the moment a read finds RX empty. The producer
+	// has stopped by teardown, so the window is bounded (~one TCP RX buffer/conn).
+	depthDraining := false
 	flowPaused := false
 	flowLimit := s.Config.Network.ReaderOverflowFlowBytes
 	hardCap := s.Config.Network.ReaderOverflowHardCapBytes
@@ -814,12 +897,39 @@ func (s *Server) readFrames(conn *protocol.Connection, done chan struct{}) {
 			}
 		}
 
+		// Iteration 2 (option A): queue-depth reader backpressure. When a
+		// producer-only connection has published to a queue at/over its HWM, stop
+		// pulling NEW publishes off the socket (TCP backpressure) until a consumer
+		// drains it — pacing the producer to the consumer's drain rate so the durable
+		// queue stays small and ring-resident (fast consume), and never stranding a
+		// confirm tag by parking the processor mid-publish. One atomic load per
+		// iteration when unset (the common case). Skipped while burst-draining (the
+		// liveness teardown drain runs full-speed until RX empties, then re-parks).
+		if !depthDraining && conn.DepthBackpressure.Load() {
+			if s.parkReaderWhileDepthBackpressured(conn) {
+				depthDraining = true // liveness fired: burst-drain the buffered window
+			}
+			select {
+			case <-conn.Done:
+				return
+			default:
+			}
+		}
+
 		// Compute the read deadline AFTER any park so a long park never counts
 		// toward the heartbeat-missed window (heartbeat false-close bug). hb is
 		// fixed for the connection's lifetime, so the deadlineActive bookkeeping
 		// only ever clears a stale liveness-probe deadline on an hb==0 connection.
 		hb := conn.HeartbeatSec.Load()
 		switch {
+		case depthDraining:
+			// Option A teardown burst-drain: read available RX with a SHORT deadline
+			// (highest precedence — overrides the long hb>0 deadline) so a read that
+			// would block because RX is empty times out quickly and we re-park,
+			// instead of blocking here for up to 2*hb. Each successful read admits a
+			// buffered publish (→ confirmed); the timeout below exits the drain.
+			conn.Conn.SetReadDeadline(time.Now().Add(s.readerBackpressureProbeInterval()))
+			deadlineActive = true
 		case hb > 0:
 			conn.Conn.SetReadDeadline(time.Now().Add(time.Duration(2*hb) * time.Second))
 			deadlineActive = true
@@ -853,6 +963,15 @@ func (s *Server) readFrames(conn *protocol.Connection, done chan struct{}) {
 		frame, err := protocol.ReadFrameOptimizedWithLimit(conn.Reader, maxSize)
 		if err != nil {
 			if ne, ok := err.(net.Error); ok && ne.Timeout() {
+				if depthDraining {
+					// Option A burst-drain: the short-deadline read found RX empty —
+					// the producer's buffered window is fully drained (all confirmed).
+					// Exit drain mode; the next iteration re-parks on depth if still
+					// >= HWM. This is NOT a heartbeat miss (it takes precedence over the
+					// hb>0 close below): a depth-drain timeout is expected, not a death.
+					depthDraining = false
+					continue
+				}
 				if hb > 0 {
 					s.Log.Info("heartbeat missed, closing dead connection",
 						zap.String("connection_id", conn.ID))

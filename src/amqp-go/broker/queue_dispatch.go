@@ -67,6 +67,34 @@ type QueueState struct {
 	// reset it. The reaper deletes the queue after QueueExpires ms of no use with
 	// no consumers. Only meaningful when the policy has HasQueueExpires.
 	lastActivityMilli atomic.Int64
+
+	// Contiguous durable-visibility frontier (iteration 2). A durable publish's
+	// consumer-visibility (head advance) is DEFERRED to its WAL fsync completion,
+	// which can complete out of tag order across connections on a shared queue.
+	// A naive per-tag CAS-max head advance would then jump head PAST a still-
+	// pending lower tag, exposing it before its own fsync (delivery-before-
+	// durable, A3 violation). The frontier fixes this: head advances only to the
+	// LOWEST still-pending routed tag (or frontierMax+1 if none pending), so a
+	// tag is never claimable before its own fsync.
+	//
+	// frontierActive is set (permanently) BEFORE a durable publish assigns its
+	// global delivery tag, so a concurrent transient publisher that assigns a
+	// higher tag observes it (sequentially-consistent atomics) and routes through
+	// the frontier instead of the lock-free fast path — closing the 0→1 race.
+	// A pure-transient queue never sets it: one atomic load selects today's
+	// lock-free CAS-max Publish (zero regression). frontierMu guards the frontier
+	// structures and is held ONLY for O(1)-amortized bookkeeping, never across
+	// I/O, so a durable completion can drive it from the WAL batch-writer goroutine
+	// (A4). frontierPending holds durable tags awaiting fsync in increasing
+	// (registration) order; frontierDone maps a completed tag to whether it is a
+	// REAL (delivered) message (true) or a dropped fsync-error tag (false, never
+	// delivered — gap-skipped). frontierMax is the highest tag registered.
+	frontierActive  atomic.Bool
+	frontierMu      sync.Mutex
+	frontierPending []uint64
+	frontierPHead   int
+	frontierDone    map[uint64]bool
+	frontierMax     uint64
 }
 
 // Policy returns the queue's resolved policy, or nil if the queue has no
@@ -147,6 +175,135 @@ func (qs *QueueState) Publish(tag uint64) {
 	}
 	qs.waiting.Add(1)
 	qs.NotifyNewMessage()
+}
+
+// FrontierActive reports whether this queue uses the contiguous durable
+// frontier for visibility. A single sequentially-consistent atomic load; false
+// (a pure-transient queue) selects the lock-free CAS-max Publish fast path.
+func (qs *QueueState) FrontierActive() bool { return qs.frontierActive.Load() }
+
+// FrontierReserve is the atomic {activate + assign tag + register pending} step
+// for a publish routed to this queue that must be ordered through the contiguous
+// durable frontier — a durable publish, OR a transient publish on an already
+// frontier-active queue (mixed queue). assign is called to mint the global
+// delivery tag WHILE frontierMu is held, so this queue's frontier tags are
+// registered strictly in tag order (the frontier ring stays increasing) and no
+// completion can advance head past this tag before it is registered. It
+// activates the frontier BEFORE calling assign, so any concurrent transient
+// publisher that mints a HIGHER tag observes frontierActive==true and routes
+// through the frontier rather than the fast path (closing the 0→1 race). The tag
+// is recorded pending (not yet visible — head is not advanced); the caller marks
+// it ready via FrontierComplete(tag, true) after the message is stored, or
+// releases it via FrontierComplete(tag, false) if the store fails. Returns the
+// assigned tag.
+func (qs *QueueState) FrontierReserve(assign func() uint64) uint64 {
+	qs.frontierMu.Lock()
+	qs.frontierActive.Store(true) // BEFORE assign (see field doc)
+	tag := assign()
+	qs.frontierPending = append(qs.frontierPending, tag)
+	if tag > qs.frontierMax {
+		qs.frontierMax = tag
+	}
+	qs.frontierMu.Unlock()
+	return tag
+}
+
+// FrontierComplete records that a frontier-reserved tag's store completed:
+// real=true makes it a delivered message (durable fsync succeeded, or a
+// transient message was stored); real=false (fsync/write/store error) releases
+// it — it was never made ring-resident, so head is advanced PAST it but it is
+// never delivered (gap-skipped) and never counted ready. Releasing on error is
+// also what keeps a per-queue frontier from wedging when a reserved tag's store
+// fails (M1). It advances head across the newly contiguous done-prefix (never
+// past a still-pending lower tag), increments the ready count for each real
+// message exposed, and wakes consumers. Runs on the WAL batch-writer goroutine
+// (durable) or the frame processor (transient): O(1)-amortized under frontierMu,
+// no I/O (A4).
+func (qs *QueueState) FrontierComplete(tag uint64, real bool) {
+	qs.frontierMu.Lock()
+	if qs.frontierDone == nil {
+		qs.frontierDone = make(map[uint64]bool)
+	}
+	qs.frontierDone[tag] = real
+	newHead, newlyReal := qs.frontierAdvanceLocked()
+	qs.frontierMu.Unlock()
+
+	qs.casMaxHead(newHead)
+	if newlyReal > 0 {
+		qs.waiting.Add(int64(newlyReal))
+	}
+	qs.NotifyNewMessage()
+}
+
+// FrontierPublishTransient records an already-stored tag on a frontier-active
+// queue at COMPLETE time (not reserved at mint). It bumps frontierMax so the tag
+// is exposed once the contiguous frontier reaches it, and advances head if no
+// lower still-pending durable tag blocks it (publish-order FIFO). The caller
+// MUST have stored the message first.
+//
+// The ordinary transient publish path (PublishMessage) does NOT use this — it
+// reserves at mint via FrontierReserve + FrontierComplete so a durable
+// completion can never advance head past an unstored transient (I1). This
+// method remains only for the transactional deferred-visibility closure
+// (PublishMessageTx), where the tag is minted at stage time and made visible
+// after commit; a tx publish racing a concurrent async durable-confirm on the
+// SAME queue carries the same (exotic, out-of-scope) reserve-at-mint gap that
+// I1 fixed for the non-tx path — tracked as a follow-up.
+func (qs *QueueState) FrontierPublishTransient(tag uint64) {
+	qs.frontierMu.Lock()
+	if tag > qs.frontierMax {
+		qs.frontierMax = tag
+	}
+	newHead, _ := qs.frontierAdvanceLocked()
+	qs.frontierMu.Unlock()
+
+	qs.casMaxHead(newHead)
+	qs.waiting.Add(1) // a transient publish is immediately a ready message
+	qs.NotifyNewMessage()
+}
+
+// frontierAdvanceLocked pops the contiguous done-prefix off the pending ring and
+// returns the new head target (lowest still-pending tag, or frontierMax+1 when
+// none pending) plus the count of REAL messages the pop newly exposes. Caller
+// holds frontierMu.
+func (qs *QueueState) frontierAdvanceLocked() (newHead uint64, newlyReal int) {
+	for qs.frontierPHead < len(qs.frontierPending) {
+		front := qs.frontierPending[qs.frontierPHead]
+		real, done := qs.frontierDone[front]
+		if !done {
+			break
+		}
+		delete(qs.frontierDone, front)
+		qs.frontierPHead++
+		if real {
+			newlyReal++
+		}
+	}
+	// Compact the ring when the consumed prefix dominates, bounding memory.
+	if qs.frontierPHead > 1024 && qs.frontierPHead*2 > len(qs.frontierPending) {
+		live := qs.frontierPending[qs.frontierPHead:]
+		n := copy(qs.frontierPending, live)
+		qs.frontierPending = qs.frontierPending[:n]
+		qs.frontierPHead = 0
+	}
+	if qs.frontierPHead < len(qs.frontierPending) {
+		return qs.frontierPending[qs.frontierPHead], newlyReal
+	}
+	return qs.frontierMax + 1, newlyReal
+}
+
+// casMaxHead advances head to newHead via CAS-max (never regresses), then wakes
+// parked consumers if it moved.
+func (qs *QueueState) casMaxHead(newHead uint64) {
+	for {
+		cur := qs.head.Load()
+		if newHead <= cur {
+			return
+		}
+		if qs.head.CompareAndSwap(cur, newHead) {
+			return
+		}
+	}
 }
 
 func (qs *QueueState) NotifyNewMessage() {

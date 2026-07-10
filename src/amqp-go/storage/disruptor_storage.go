@@ -297,6 +297,47 @@ func (ds *DisruptorStorage) StoreMessage(queueName string, message *protocol.Mes
 	return nil
 }
 
+// StoreMessageAsync is the async-completion sibling of StoreMessage for the
+// durable publish path (DeliveryMode==2). It enqueues the durable WAL write via
+// WriteAsync (never blocking the caller on the fsync) and reports the fsync
+// completion through onDurable.
+//
+// ring.Store is DEFERRED into the WAL completion (iteration 2, frontier design):
+// on fsync SUCCESS the message is made ring-resident just before onDurable runs
+// — and the broker advances consumer-visibility (its per-queue frontier) only
+// from onDurable, AFTER this ring store, so a consumer that claims the tag the
+// instant it becomes visible always finds it (no stranding). On fsync ERROR the
+// ring store is skipped, so a non-durable tag is NEVER ring-resident: when the
+// frontier advances past it, its claim GetMessage-misses and it is gap-skipped,
+// never delivered (no stale-slot delivery of a nacked message). Deferral is safe
+// precisely because the frontier never exposes a tag before its own completion,
+// which is why the earlier "ring.Store synchronous" condition is no longer
+// needed. Over the spill threshold a durable message is WAL-only, as in
+// StoreMessage. onDurable fires exactly once, after the fsync.
+func (ds *DisruptorStorage) StoreMessageAsync(queueName string, message *protocol.Message, onDurable func(error)) error {
+	if ds.wal == nil {
+		return fmt.Errorf("cannot persist durable message: WAL unavailable for queue %s", queueName)
+	}
+
+	ring := ds.getOrCreateQueueRing(queueName)
+
+	ds.wal.WriteAsync(queueName, message, message.DeliveryTag, func(err error) {
+		if err == nil {
+			// Durable: make the message ring-resident BEFORE onDurable advances
+			// the frontier. Spill decision as in StoreMessage (over the threshold
+			// the durable message is WAL-only and read back via wal.Read). ring
+			// ops are lock-free CAS — safe on the WAL batch-writer goroutine.
+			if ring.ring.Count() <= ds.spillThreshold {
+				if _, spilled, serr := ring.ring.Store(message.DeliveryTag, message); serr == nil && !spilled {
+					ring.ack.OnPublish(message.DeliveryTag)
+				}
+			}
+		}
+		onDurable(err)
+	})
+	return nil
+}
+
 func (ds *DisruptorStorage) GetMessage(queueName string, deliveryTag uint64) (*protocol.Message, error) {
 	ring := ds.getQueueRing(queueName)
 	if ring == nil {

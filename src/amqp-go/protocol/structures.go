@@ -25,6 +25,18 @@ func fallbackID(prefix string) string {
 	return fmt.Sprintf("%s.%d.%d", prefix, time.Now().UnixNano(), n)
 }
 
+// DepthGate is the minimal queue-capacity view the reader consults to apply
+// queue-depth reader backpressure (iteration 2, option A) WITHOUT importing the
+// broker package (which would create an import cycle). It is implemented by
+// *broker.QueueState. The frame processor records the gate on the connection
+// after a producer-only publish reaches the high-water mark; the reader loads
+// AtHighWaterMark to decide whether to keep the socket paused (pacing the
+// producer to the consumer's drain rate so the durable queue stays small and
+// ring-resident — which is what keeps consume throughput high).
+type DepthGate interface {
+	AtHighWaterMark() bool
+}
+
 // Connection represents an AMQP connection
 type Connection struct {
 	ID   string
@@ -47,20 +59,41 @@ type Connection struct {
 	ClientProperties map[string]interface{}
 	PendingMessages  map[uint16]*PendingMessage // Track messages being published on each channel.
 	// SINGLE-WRITER: accessed only by the processFrames goroutine. No mutex needed.
-	FrameQueue     chan *Frame   // Buffer frames between reader and processor goroutines
-	AckQueue       chan *Frame   // Buffer ACK/NACK/Reject frames for the ack worker goroutine
-	Done           chan struct{} // Closed during connection teardown to unblock goroutines waiting on AckQueue
-	ConfirmWake    chan struct{} // SQ-5: capacity-1 poke channel for the publisher-confirm flusher goroutine
-	WriteMutex     sync.Mutex    // Protects socket writes (heartbeat sender + frame processor both write)
-	Closed         atomic.Bool   // Atomic flag for connection closure
-	ConsumersDirty atomic.Bool   // Set when consumers are added/removed; delivery loop re-scans only when true
+	FrameQueue  chan *Frame   // Buffer frames between reader and processor goroutines
+	AckQueue    chan *Frame   // Buffer ACK/NACK/Reject frames for the ack worker goroutine
+	Done        chan struct{} // Closed during connection teardown to unblock goroutines waiting on AckQueue
+	ConfirmWake chan struct{} // SQ-5: capacity-1 poke channel for the publisher-confirm flusher goroutine
+	// ConfirmActive is set once any channel on this connection enters confirm
+	// mode (one-way; stays set for the connection's lifetime). The confirm
+	// flusher arms a bounded safety re-check ONLY on connections that use
+	// publisher confirms, so a durable completion whose ConfirmWake poke is
+	// missed/coalesced at teardown can never strand an advanced confirm
+	// watermark; connections that never use confirms block indefinitely (no
+	// periodic wakeups, zero cost).
+	ConfirmActive  atomic.Bool
+	WriteMutex     sync.Mutex  // Protects socket writes (heartbeat sender + frame processor both write)
+	Closed         atomic.Bool // Atomic flag for connection closure
+	ConsumersDirty atomic.Bool // Set when consumers are added/removed; delivery loop re-scans only when true
 
-	// DepthBackpressure is a reserved per-connection queue-depth backpressure
-	// flag (true when queue usage is high). It is currently written nowhere;
-	// SQ-12 resource-alarm backpressure is driven by the server's global
-	// alarmState, not this field. Renamed from Blocked for clarity — the
-	// resource-alarm state a client is told about lives in AlarmNotified below.
+	// DepthBackpressure is the lock-free fast-path gate for queue-depth reader
+	// backpressure (iteration 2, option A). Set true when a producer-only
+	// connection publishes to a queue at/over its high-water mark; readFrames
+	// loads it once per iteration and, when set, STOPS reading the socket (TCP
+	// backpressure) until the consumer drains the queue below HWM. This paces the
+	// producer to the consumer's drain rate, keeping the durable queue small and
+	// ring-resident so consume stays fast. The authoritative depth is re-checked
+	// through depthGate; this flag keeps the reader's hot loop branch-free when no
+	// backpressure is active. SQ-12 resource-alarm backpressure is separate (server
+	// global alarmState + AlarmNotified below).
 	DepthBackpressure atomic.Bool
+
+	// depthGate holds the QueueState (as a DepthGate) this connection is currently
+	// depth-backpressured on, or nil. Written only on high-water-mark transitions
+	// by the frame processor (off the hot path) and cleared by the reader once the
+	// queue drains; guarded by depthGateMu. The reader reads it only when
+	// DepthBackpressure is set. See SetDepthGate / DepthGateValue.
+	depthGateMu sync.Mutex
+	depthGate   DepthGate
 
 	// AlarmNotified tracks whether SQ-12 has told this (opted-in) client it is
 	// blocked: true after connection.blocked was sent, false after
@@ -95,6 +128,23 @@ type Connection struct {
 	// Connection metadata for stats/reporting
 	ConnectedAt  time.Time    // When the connection was established
 	LastActivity atomic.Int64 // UnixNano of last activity (updated on frame read/write)
+
+	// pendingConfirmNacks holds confirm tags whose durability barrier FAILED (WAL
+	// write/fsync error) and must be settled as basic.nack(requeue=false) by the
+	// per-connection confirm flusher (iteration 2). Populated from the WAL
+	// batch-writer goroutine on the rare, catastrophic error path and drained by
+	// the flusher on its own goroutine (socket I/O is safe there). The mutex is
+	// touched ONLY on the error path — never on the success hot path — so it adds
+	// zero cost to normal confirmed publishing (and cannot stall the WAL writer).
+	pendingNackMu sync.Mutex
+	pendingNacks  []PendingConfirmNack
+}
+
+// PendingConfirmNack is a confirm tag on a channel that must be settled as a
+// basic.nack because its durability barrier failed (iteration 2).
+type PendingConfirmNack struct {
+	Ch  *Channel
+	Tag uint64
 }
 
 // NewConnection creates a new AMQP connection with the default read-buffer size.
@@ -145,6 +195,50 @@ func (c *Connection) ClientSupportsBlocked() bool {
 	return ok && v
 }
 
+// SetDepthGate records (g != nil) or clears (g == nil) the queue-depth
+// backpressure gate for this connection and flips the lock-free
+// DepthBackpressure flag the reader polls. Called from the frame processor only
+// on high-water-mark transitions (off the publish hot path) and from the reader
+// to clear once the queue drains. Callers MUST pass a literal nil to clear (a
+// typed-nil DepthGate would read as non-nil). Safe for concurrent use.
+func (c *Connection) SetDepthGate(g DepthGate) {
+	c.depthGateMu.Lock()
+	c.depthGate = g
+	c.depthGateMu.Unlock()
+	c.DepthBackpressure.Store(g != nil)
+}
+
+// DepthGateValue returns the connection's current queue-depth backpressure gate,
+// or nil. Read by the reader only when DepthBackpressure is set.
+func (c *Connection) DepthGateValue() DepthGate {
+	c.depthGateMu.Lock()
+	defer c.depthGateMu.Unlock()
+	return c.depthGate
+}
+
+// HasActiveConsumer reports whether any channel on this connection currently has
+// a registered consumer. Queue-depth reader backpressure is gated to
+// producer-only connections (this returns false): a connection with a consumer
+// must keep reading the socket to deliver its own basic.ack frames — which drain
+// the very queue the reader would be waiting on — so pausing its reader could
+// deadlock. Ranges channels under each channel's read lock; called only when a
+// publish reaches the high-water mark, never on the publish hot path.
+func (c *Connection) HasActiveConsumer() bool {
+	found := false
+	c.Channels.Range(func(_, v interface{}) bool {
+		ch := v.(*Channel)
+		ch.Mutex.RLock()
+		n := len(ch.Consumers)
+		ch.Mutex.RUnlock()
+		if n > 0 {
+			found = true
+			return false // stop iterating
+		}
+		return true
+	})
+	return found
+}
+
 // TouchActivity updates the last-activity timestamp to now.
 func (c *Connection) TouchActivity() {
 	c.LastActivity.Store(time.Now().UnixNano())
@@ -167,6 +261,40 @@ func (c *Connection) WakeConfirmFlusher() {
 	case c.ConfirmWake <- struct{}{}:
 	default:
 	}
+}
+
+// AddPendingConfirmNack records a confirm tag whose durability barrier failed so
+// the confirm flusher can settle it as a basic.nack (iteration 2). Appends in
+// enqueue order (WAL batches complete in order); called from the WAL batch-
+// writer goroutine on the error path only. O(1) amortized; the lock is never
+// held across I/O. Safe on a zero-value Connection.
+func (c *Connection) AddPendingConfirmNack(ch *Channel, tag uint64) {
+	c.pendingNackMu.Lock()
+	c.pendingNacks = append(c.pendingNacks, PendingConfirmNack{Ch: ch, Tag: tag})
+	c.pendingNackMu.Unlock()
+}
+
+// DrainPendingConfirmNacks removes and returns all pending confirm nacks in
+// enqueue (ascending-tag, per channel) order. Called by the confirm flusher.
+func (c *Connection) DrainPendingConfirmNacks() []PendingConfirmNack {
+	c.pendingNackMu.Lock()
+	if len(c.pendingNacks) == 0 {
+		c.pendingNackMu.Unlock()
+		return nil
+	}
+	drained := c.pendingNacks
+	c.pendingNacks = nil
+	c.pendingNackMu.Unlock()
+	return drained
+}
+
+// HasPendingConfirmNacks reports whether any confirm nack is awaiting the
+// flusher. Lock-free-ish peek used to keep the flusher's fast path cheap.
+func (c *Connection) HasPendingConfirmNacks() bool {
+	c.pendingNackMu.Lock()
+	n := len(c.pendingNacks)
+	c.pendingNackMu.Unlock()
+	return n > 0
 }
 
 // Channel represents an AMQP channel
@@ -196,6 +324,23 @@ type Channel struct {
 	confirmAcked   atomic.Uint64 // highest tag already acked to the client
 	confirmFlushMu sync.Mutex    // serializes confirm flushes and channel-close suppression
 	confirmClosed  bool          // set on channel close; suppresses further confirm acks
+
+	// Async-barrier contiguous confirm fold (iteration 2). AdvanceConfirmDurable
+	// is a CAS-max that acks cumulatively (multiple=true), so an ASYNC durability
+	// barrier that completes tags out of order (fanout copies, cross-batch fsync)
+	// must never advance the watermark past a lower tag that is not yet durable.
+	// The fold buffers out-of-order durable tags in confirmAhead and advances
+	// confirmContig only across a fully-durable prefix; MarkConfirmTagDurable
+	// returns that prefix to feed AdvanceConfirmDurable a provably-contiguous
+	// value. A tag settled as a nack (fsync/write error) is folded via
+	// ResolveConfirmContigNack so the watermark advances past the hole without
+	// re-confirming it. confirmOrderMu is a dedicated lock held ONLY for these
+	// O(1)+amortized state updates and NEVER across I/O, so it is safe to drive
+	// from the WAL batch-writer goroutine (async durable) and the frame processor
+	// (sync no-route / transient / nack settlements) concurrently.
+	confirmOrderMu sync.Mutex
+	confirmContig  uint64              // highest tag with all tags <= it resolved (durable or nacked)
+	confirmAhead   map[uint64]struct{} // out-of-order durable tags > confirmContig+1
 
 	// SQ-18: per-channel wire delivery-tag remapping.
 	//
@@ -268,11 +413,78 @@ func (c *Channel) AdvanceConfirmDurable(tag uint64) {
 	}
 }
 
+// MarkConfirmTagDurable folds one DURABLE-settled confirm tag into the
+// per-channel contiguous watermark and returns the new contiguous value to feed
+// AdvanceConfirmDurable. If tag extends the contiguous frontier it advances
+// confirmContig and pulls in any higher tags already buffered in confirmAhead;
+// a tag that arrives out of order (a fanout copy or a later batch completing
+// before an earlier one) is buffered until the gap below it fills. A tag <=
+// confirmContig is a duplicate and ignored. See the confirmOrderMu field doc.
+func (c *Channel) MarkConfirmTagDurable(tag uint64) uint64 {
+	c.confirmOrderMu.Lock()
+	defer c.confirmOrderMu.Unlock()
+	if tag == c.confirmContig+1 {
+		c.confirmContig = tag
+		for {
+			next := c.confirmContig + 1
+			if _, ok := c.confirmAhead[next]; !ok {
+				break
+			}
+			delete(c.confirmAhead, next)
+			c.confirmContig = next
+		}
+	} else if tag > c.confirmContig+1 {
+		if c.confirmAhead == nil {
+			c.confirmAhead = make(map[uint64]struct{})
+		}
+		c.confirmAhead[tag] = struct{}{}
+	}
+	return c.confirmContig
+}
+
+// ResolveConfirmContigNack folds a NACK-settled confirm tag (WAL write/fsync
+// error) into the contiguous watermark so it advances past the hole without the
+// tag ever being acked, and returns the new contiguous value. The nack itself
+// is emitted separately (SettleConfirmNack), which also advances confirmAcked
+// past the tag; feeding the returned watermark to AdvanceConfirmDurable AFTER
+// that nack therefore never re-confirms the nacked tag. By construction (WAL
+// batches fsync in order) a nack always sits at the contiguous frontier — all
+// lower tags for the channel are already resolved — so advancing across it can
+// never skip an unresolved durable tag. Any higher durable tags buffered out of
+// order while the nack was pending are pulled in.
+func (c *Channel) ResolveConfirmContigNack(tag uint64) uint64 {
+	c.confirmOrderMu.Lock()
+	defer c.confirmOrderMu.Unlock()
+	if tag == c.confirmContig+1 {
+		c.confirmContig = tag
+		for {
+			next := c.confirmContig + 1
+			if _, ok := c.confirmAhead[next]; !ok {
+				break
+			}
+			delete(c.confirmAhead, next)
+			c.confirmContig = next
+		}
+	}
+	return c.confirmContig
+}
+
 // HasUnflushedConfirms reports whether this channel has durable publisher
 // confirms not yet acked to the client. Lock-free; used by the confirm flusher
 // to skip idle channels without taking the flush lock.
 func (c *Channel) HasUnflushedConfirms() bool {
 	return c.confirmDurable.Load() > c.confirmAcked.Load()
+}
+
+// ConfirmContig returns the current contiguous-resolved confirm frontier — the
+// highest tag with every tag <= it durable (or already nack-resolved). The
+// confirm flusher uses it to gate a deferred nack: a nacked tag N is emitted
+// only once ConfirmContig() >= N-1, so all of N's durable predecessors are
+// acked before N is nacked (mixed transient/durable channel ordering).
+func (c *Channel) ConfirmContig() uint64 {
+	c.confirmOrderMu.Lock()
+	defer c.confirmOrderMu.Unlock()
+	return c.confirmContig
 }
 
 // FlushConfirms sends at most ONE basic.ack covering every durable-but-unacked

@@ -49,6 +49,10 @@ func (s *Server) handleConfirmSelect(conn *protocol.Connection, channelID uint16
 	}
 
 	channel.ConfirmMode.Store(true)
+	// Arm the confirm flusher's bounded safety re-check for this connection (see
+	// Connection.ConfirmActive): now that a channel emits publisher confirms, the
+	// flusher must never rely solely on a ConfirmWake poke.
+	conn.ConfirmActive.Store(true)
 
 	s.Log.Info("Confirm mode enabled",
 		zap.Uint16("channel_id", channelID),

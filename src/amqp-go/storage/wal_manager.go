@@ -198,7 +198,18 @@ type writeRequest struct {
 	queueName string
 	message   *protocol.Message
 	offset    uint64
-	done      chan error // Caller blocks on this until batch is fsynced (Option 2: Batch Synchronous)
+	// Exactly one of done / onDone is set:
+	//   - done  : the synchronous caller (Write, tx staging, transient spill,
+	//     tests) blocks on this cap-1 pooled channel until its batch is fsynced.
+	//   - onDone : the ASYNC caller (WriteAsync) supplies a completion callback
+	//     that flushBatch invokes, in enqueue order, AFTER the batch is durable
+	//     (fdatasync returned) AND the offset index is populated. The callback
+	//     runs on the shared batch-writer goroutine and MUST be non-blocking
+	//     (atomics + non-blocking pokes only) — it must never do socket I/O,
+	//     fsync, or hold a lock across I/O (invariant A4), or it re-creates the
+	//     per-connection fsync stall this design removes.
+	done   chan error
+	onDone func(error)
 }
 
 type ackRequest struct {
@@ -324,6 +335,65 @@ func (wm *WALManager) Write(queueName string, message *protocol.Message, offset 
 	// Block waiting for batch to be fsynced
 	// This provides proper durability guarantee before returning
 	return <-doneChan
+}
+
+// WriteAsync enqueues a message for durable group-commit exactly like Write,
+// but returns as soon as the request is queued instead of blocking the caller
+// until the fsync completes. The supplied onDone is invoked by flushBatch after
+// the batch containing this message is fsynced to disk AND the offset index is
+// populated (success => onDone(nil)), or with the write/fsync error on failure
+// (index NOT updated). Completions for a batch fire in enqueue order.
+//
+// This decouples the durable publish path from the per-connection frame
+// processor: pipelined publishes fill writeChan so one F_FULLFSYNC amortises
+// over the whole drained batch (see the design in the async-WAL proposal).
+// onDone runs on the shared batch-writer goroutine and MUST be non-blocking
+// (see writeRequest.onDone). The blocking writeChan send is preserved, so
+// writeChan's capacity remains the durable in-flight memory bound.
+func (wm *WALManager) WriteAsync(queueName string, message *protocol.Message, offset uint64, onDone func(error)) {
+	if wm.sharedWAL == nil {
+		if onDone != nil {
+			onDone(fmt.Errorf("shared WAL not initialized"))
+		}
+		return
+	}
+
+	wm.sharedWAL.writeChan <- &writeRequest{
+		queueName: queueName,
+		message:   message,
+		offset:    offset,
+		onDone:    onDone,
+	}
+}
+
+// walGroupCommitFsync is the fsync applied by the group-commit batch writer
+// (flushBatch). It is swappable via an atomic pointer so tests can gate the
+// durability barrier or inject a write/fsync error deterministically; the
+// production path always uses fdatasyncFile. Only the group-commit path is
+// affected — WriteTxAtomic keeps calling fdatasyncFile directly, so the
+// transaction slow path is byte-for-byte unchanged.
+type walFsyncFn func(*os.File) error
+
+var walGroupCommitFsyncHook atomic.Pointer[walFsyncFn]
+
+func walGroupCommitFsync(f *os.File) error {
+	if p := walGroupCommitFsyncHook.Load(); p != nil {
+		return (*p)(f)
+	}
+	return fdatasyncFile(f)
+}
+
+// SetWALGroupCommitFsyncForTest installs fn as the fsync used by the shared-WAL
+// group-commit writer and returns a restore function. TEST-ONLY: it lets tests
+// hold the durability barrier open (to prove no confirm/visibility precedes the
+// fsync) or force an fsync error (to prove the nack path). Never called by
+// production code. Not safe to call concurrently with an active writer that is
+// mid-fsync; tests set it before publishing and restore it after.
+func SetWALGroupCommitFsyncForTest(fn func(*os.File) error) (restore func()) {
+	prev := walGroupCommitFsyncHook.Load()
+	f := walFsyncFn(fn)
+	walGroupCommitFsyncHook.Store(&f)
+	return func() { walGroupCommitFsyncHook.Store(prev) }
 }
 
 // WriteTxAtomic durably writes a set of message records as one all-or-nothing
@@ -722,7 +792,6 @@ func (qw *QueueWAL) flushBatch(batch []*writeRequest) {
 	}
 
 	qw.fileMutex.Lock()
-	defer qw.fileMutex.Unlock()
 
 	// Get current file number and position BEFORE write
 	currentFileNum := qw.fileNum.Load()
@@ -746,12 +815,11 @@ func (qw *QueueWAL) flushBatch(batch []*writeRequest) {
 		if qw.metrics != nil {
 			qw.metrics.RecordWALWriteError()
 		}
-		// Write failed - signal all callers with error
-		for _, req := range batch {
-			if req.done != nil {
-				req.done <- fmt.Errorf("WAL write failed: %w", err)
-			}
-		}
+		// Write failed - not durable, index NOT updated. Release the file lock
+		// before delivering completions (async callbacks must not run under
+		// fileMutex; see deliverCompletions).
+		qw.fileMutex.Unlock()
+		qw.deliverCompletions(batch, fmt.Errorf("WAL write failed: %w", err))
 		return
 	}
 
@@ -766,7 +834,7 @@ func (qw *QueueWAL) flushBatch(batch []*writeRequest) {
 	// Uses fdatasync on Linux (skips metadata sync for ~2-5x speedup vs fsync).
 	// This is the critical durability guarantee - messages are only durable after this completes.
 	fsyncStart := time.Now()
-	fsyncErr := fdatasyncFile(qw.currentFile)
+	fsyncErr := walGroupCommitFsync(qw.currentFile)
 	fsyncDuration := time.Since(fsyncStart).Seconds()
 
 	// Record fsync metrics
@@ -777,20 +845,19 @@ func (qw *QueueWAL) flushBatch(batch []*writeRequest) {
 		}
 	}
 
-	// Signal ALL callers in this batch with the fsync result
-	// This unblocks all Write() calls waiting for this batch
-	for _, req := range batch {
-		if req.done != nil {
-			req.done <- fsyncErr
-		}
-	}
-
-	// If fsync failed, don't update index (messages not durable)
+	// If fsync failed, messages are NOT durable: do NOT update the index (so a
+	// reader can never observe a non-durable record and no async caller ever
+	// advances visibility), and deliver the error to every caller.
 	if fsyncErr != nil {
+		qw.fileMutex.Unlock()
+		qw.deliverCompletions(batch, fsyncErr)
 		return
 	}
 
-	// Update offset index (Phase 6D: O(1) reads!)
+	// Durable. Update the offset index / current-file offset set / file offset
+	// and roll BEFORE releasing the lock and BEFORE firing completions, so that
+	// when a completion advances a message's visibility (async path), a woken
+	// consumer's wal.Read finds the record.
 	qw.offsetIndexMutex.Lock()
 	for i, req := range batch {
 		qw.offsetIndex[req.offset] = &offsetLocation{
@@ -813,6 +880,33 @@ func (qw *QueueWAL) flushBatch(batch []*writeRequest) {
 	// Check if we need to roll to new file
 	if newOffset >= qw.cfg.FileSize {
 		qw.rollFile()
+	}
+
+	// Release the file lock, THEN deliver completions. Completions fire LAST,
+	// after the record is durable and indexed, so both the sync done-channel
+	// send and the async onDone callback observe the true durability barrier.
+	// Doing it outside fileMutex keeps the shared-writer critical section short
+	// (consumers reading via readMessageAtPosition contend on fileMutex) and
+	// honors the "no lock held across the callback" spirit of invariant A4.
+	qw.fileMutex.Unlock()
+	qw.deliverCompletions(batch, nil)
+}
+
+// deliverCompletions signals every request in the batch with err, iterating in
+// enqueue order. A sync request's done is a cap-1 pooled channel (the send
+// never blocks). An async request's onDone runs inline on the batch-writer
+// goroutine; its contract is non-blocking (atomics + non-blocking pokes only),
+// so it never stalls the shared writer. Exactly one of done/onDone is set per
+// request. Enqueue-order iteration gives, for any single channel, non-
+// decreasing confirm-tag completion order for single-target publishes — the
+// property the per-channel confirm fold relies on.
+func (qw *QueueWAL) deliverCompletions(batch []*writeRequest, err error) {
+	for _, req := range batch {
+		if req.onDone != nil {
+			req.onDone(err)
+		} else if req.done != nil {
+			req.done <- err
+		}
 	}
 }
 
@@ -1468,7 +1562,25 @@ func (qw *QueueWAL) readMessageSequential(queueName string, offset uint64) (*pro
 		}
 	}
 
-	// Not in old files, try current file
+	// Not in old files, try the current file — but ONLY for an offset that has
+	// been durably written (recorded in currentFileOffsets, which flushBatch
+	// populates only AFTER a successful fsync). This gates out a record whose
+	// bytes reached the file but whose fsync FAILED: its offset is not in
+	// currentFileOffsets and it is not indexed, so it must not be returned. That
+	// closes the async durable path's fsync-error exposure — the frontier
+	// advances head past such a tag, so its cursor is claimed, and without this
+	// gate a raw scan would find the un-fsynced bytes and deliver a message that
+	// was nacked (never durable). A successfully-written offset is always in the
+	// offset index by the time it is claimable, so it takes the O(1) fast path
+	// and never reaches this scan; the gate therefore only excludes the
+	// non-durable case.
+	qw.currentFileOffsetsMutex.Lock()
+	durableInCurrent := qw.currentFileOffsets.Contains(offset)
+	qw.currentFileOffsetsMutex.Unlock()
+	if !durableInCurrent {
+		return nil, fmt.Errorf("message not in WAL")
+	}
+
 	qw.fileMutex.Lock()
 	currentPath := ""
 	if qw.currentFile != nil {

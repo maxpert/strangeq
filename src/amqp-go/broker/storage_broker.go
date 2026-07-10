@@ -181,6 +181,29 @@ type StorageBroker struct {
 	// wait, a reaper mid-sweep could touch a closed store (a data race under
 	// -race and the reaper/claim tests run there).
 	reaperWG sync.WaitGroup
+
+	// Deferred drop-head max-length trim worker (C1). A durable async publish's
+	// completion runs on the shared WAL batch-writer goroutine; drop-head
+	// eviction can dead-letter/spill via a SYNCHRONOUS StoreMessage -> wal.Write
+	// -> <-doneChan, and that doneChan is only signalled by the batch-writer
+	// goroutine — so calling it FROM a completion deadlocks the durable pipeline
+	// (A4). Completions therefore hand eviction to this worker, which may block
+	// freely. Started lazily on first use; Close stops it. The worker is only
+	// ever engaged by queues with a drop-head max-length policy — a plain queue
+	// (the throughput benchmark) never touches it.
+	maxLenTrimMu     sync.Mutex
+	maxLenTrimCh     chan maxLenTrimReq
+	maxLenTrimStop   chan struct{}
+	maxLenTrimWG     sync.WaitGroup
+	maxLenTrimClosed bool
+}
+
+// maxLenTrimReq is a deferred drop-head trim handed from an async publish
+// completion (on the WAL batch-writer goroutine) to the max-length trim worker.
+type maxLenTrimReq struct {
+	qs        *QueueState
+	queueName string
+	policy    *QueuePolicy
 }
 
 // NewStorageBroker creates a new storage-backed broker instance
@@ -218,6 +241,68 @@ func (b *StorageBroker) Close() {
 		return true
 	})
 	b.reaperWG.Wait()
+
+	// Stop the deferred max-length trim worker (if it was started) and wait for
+	// it to drain, so no trim touches storage after the caller closes it.
+	b.maxLenTrimMu.Lock()
+	b.maxLenTrimClosed = true
+	stop := b.maxLenTrimStop
+	b.maxLenTrimMu.Unlock()
+	if stop != nil {
+		close(stop)
+		b.maxLenTrimWG.Wait()
+	}
+}
+
+// enqueueMaxLenTrim hands a drop-head max-length trim to the trim worker instead
+// of running it inline. It is called from an async publish completion (which runs
+// on the shared WAL batch-writer goroutine), where a blocking eviction would
+// deadlock the durable pipeline (C1/A4). Non-blocking: lazily starts the worker,
+// then does a non-blocking send — if the worker is behind, the trim is skipped
+// (drop-head tolerates bounded transient overshoot; the next completion's trim
+// re-converges the queue under its limit).
+func (b *StorageBroker) enqueueMaxLenTrim(qs *QueueState, queueName string, policy *QueuePolicy) {
+	b.maxLenTrimMu.Lock()
+	if b.maxLenTrimClosed {
+		b.maxLenTrimMu.Unlock()
+		return
+	}
+	if b.maxLenTrimCh == nil {
+		b.maxLenTrimCh = make(chan maxLenTrimReq, 4096)
+		b.maxLenTrimStop = make(chan struct{})
+		b.maxLenTrimWG.Add(1)
+		go b.maxLenTrimLoop(b.maxLenTrimCh, b.maxLenTrimStop)
+	}
+	ch := b.maxLenTrimCh
+	b.maxLenTrimMu.Unlock()
+
+	select {
+	case ch <- maxLenTrimReq{qs: qs, queueName: queueName, policy: policy}:
+	default:
+	}
+}
+
+// maxLenTrimLoop runs deferred drop-head trims off the WAL batch-writer
+// goroutine, so an eviction's synchronous dead-letter/spill StoreMessage can
+// block here without wedging the durable pipeline. On stop it best-effort drains
+// queued trims so the final queue state is converged before storage is closed.
+func (b *StorageBroker) maxLenTrimLoop(ch chan maxLenTrimReq, stop chan struct{}) {
+	defer b.maxLenTrimWG.Done()
+	for {
+		select {
+		case req := <-ch:
+			b.dropHeadTrim(req.qs, req.queueName, req.policy)
+		case <-stop:
+			for {
+				select {
+				case req := <-ch:
+					b.dropHeadTrim(req.qs, req.queueName, req.policy)
+				default:
+					return
+				}
+			}
+		}
+	}
 }
 
 // ringDeleter is the optional storage capability the SQ-9 TTL reaper and
@@ -227,6 +312,15 @@ func (b *StorageBroker) Close() {
 // safe because such a backend is used single-writer in the paths that need it.
 type ringDeleter interface {
 	DeleteMessageIfPresent(queueName string, deliveryTag uint64) (bool, error)
+}
+
+// asyncDurableWriter is the optional storage capability that decouples a durable
+// publish's fsync from the caller: the message is ring-stored synchronously and
+// its WAL write is enqueued for group commit, with the fsync completion reported
+// via onDurable. DisruptorStorage implements it; PublishMessageAsyncConfirm
+// falls back to the synchronous PublishMessage for any backend that does not.
+type asyncDurableWriter interface {
+	StoreMessageAsync(queueName string, message *protocol.Message, onDurable func(error)) error
 }
 
 // deleteIfPresent removes a message from storage and reports whether THIS call
@@ -1536,7 +1630,22 @@ func (b *StorageBroker) PublishMessage(exchangeName, routingKey string, message 
 			}
 		}
 
-		msgID := b.globalDeliveryTag.Add(1)
+		// Assign the delivery tag. On a frontier-active queue (a mixed queue that
+		// currently has durable-confirm publishes in flight) RESERVE the tag as
+		// pending on the contiguous frontier UNDER the frontier lock AT MINT TIME,
+		// mirroring the durable path, so a concurrent durable completion can never
+		// advance head PAST this transient before it is stored — which would
+		// gap-skip and strand it and leak its Depth() count (I1). A pure-transient
+		// queue takes the lock-free fast path (one atomic FrontierActive() load;
+		// A6 zero regression).
+		var msgID uint64
+		frontierTransient := false
+		if queueState.FrontierActive() {
+			msgID = queueState.FrontierReserve(func() uint64 { return b.globalDeliveryTag.Add(1) })
+			frontierTransient = true
+		} else {
+			msgID = b.globalDeliveryTag.Add(1)
+		}
 
 		var storeMsg *protocol.Message
 		if i == 0 {
@@ -1574,15 +1683,27 @@ func (b *StorageBroker) PublishMessage(exchangeName, routingKey string, message 
 		// Store to persistent storage
 		err := b.storage.StoreMessage(queueName, storeMsg)
 		if err != nil {
+			// Release the reserved frontier slot (if any) so a store failure does
+			// not wedge the per-queue frontier (mirrors M1 for the transient path).
+			if frontierTransient {
+				queueState.FrontierComplete(msgID, false)
+			}
 			if rejectPublish {
 				queueState.maxLenMu.Unlock()
 			}
 			return fmt.Errorf("failed to store message to queue '%s': %w", queueName, err)
 		}
 
-		// Advance the per-queue head cursor and wake parked consumers.
-		// Replaces the old `available <- msgID` channel send.
-		queueState.Publish(msgID)
+		// Make the message visible. On a pure-transient queue this is the lock-free
+		// CAS-max fast path (zero regression). On a frontier-active (mixed) queue
+		// the tag was reserved pending at mint above; mark it ready now that it is
+		// stored — the frontier advances head across the contiguous done-prefix and
+		// never past an earlier still-pending durable tag (publish-order FIFO, A3).
+		if frontierTransient {
+			queueState.FrontierComplete(msgID, true)
+		} else {
+			queueState.Publish(msgID)
+		}
 
 		// SQ-11 max-length: byte accounting + drop-head eviction AFTER the
 		// enqueue, so the just-published newest message is retained and the
@@ -1608,6 +1729,243 @@ func (b *StorageBroker) PublishMessage(exchangeName, routingKey string, message 
 		return ErrMaxLengthExceeded
 	}
 	return nil
+}
+
+// publishConfirmAgg is the per-publish fan-in that fires onDurable EXACTLY ONCE,
+// after every durable copy of a message has crossed the WAL group-commit fsync
+// barrier. remaining starts at 1 (a setup guard dropped after the routing loop)
+// plus 1 per enqueued durable copy; the transition-to-zero fires onDurable with
+// the first error seen (nil on full success). The guard prevents a premature
+// fire if an early copy's fsync completes before later copies are enqueued.
+type publishConfirmAgg struct {
+	remaining atomic.Int32
+	onDurable func(error)
+	errOnce   sync.Once
+	err       error
+}
+
+func newPublishConfirmAgg(onDurable func(error)) *publishConfirmAgg {
+	a := &publishConfirmAgg{onDurable: onDurable}
+	a.remaining.Store(1) // setup guard
+	return a
+}
+
+// addCopy registers one durable copy. MUST be called BEFORE that copy's WAL
+// write is enqueued, so a completion that fires immediately can never drive
+// remaining to zero before every copy has been counted.
+func (a *publishConfirmAgg) addCopy() { a.remaining.Add(1) }
+
+// report records one settled copy (or the setup-guard drop). The first non-nil
+// error wins. When the last outstanding count clears, onDurable fires once (if
+// non-nil). errOnce provides the happens-before for reading a.err on the
+// transition-to-zero decrement (the atomic total order links each report's
+// error write to the final decrement).
+func (a *publishConfirmAgg) report(err error) {
+	if err != nil {
+		a.errOnce.Do(func() { a.err = err })
+	}
+	if a.remaining.Add(-1) == 0 && a.onDurable != nil {
+		a.onDurable(a.err)
+	}
+}
+
+// PublishMessageAsyncConfirm is the async-completion publish path for durable
+// and/or publisher-confirm messages. It mirrors PublishMessage's routing,
+// delivery-tag assignment, no-route, and SQ-11 reject-publish admission — all
+// SYNCHRONOUS, so ErrNoRoute / ErrMaxLengthExceeded are returned inline — but
+// for a durable (DeliveryMode==2) message it enqueues each copy's WAL write via
+// StoreMessageAsync and DEFERS that copy's consumer-visibility (queueState.
+// Publish + max-length accounting) into the copy's fsync completion, exactly as
+// PublishMessageTx defers visibility until after the atomic commit. A per-publish
+// fan-in aggregator fires onDurable once every durable copy is fsynced.
+//
+// It returns durableInflight=true iff at least one durable copy was enqueued and
+// onDurable will fire from the async completion (the caller must NOT settle the
+// confirm itself — the completion drives it). It returns durableInflight=false
+// for: a transient publish (identical to PublishMessage, visible synchronously),
+// and a no-route non-mandatory success — in both cases onDurable is NOT invoked
+// here and the caller settles the confirm synchronously. On ErrNoRoute /
+// ErrMaxLengthExceeded, onDurable is never invoked (the caller settles via its
+// existing error handling); durable copies already enqueued to accepted targets
+// still become visible on their fsync, but the confirm is nacked.
+func (b *StorageBroker) PublishMessageAsyncConfirm(exchangeName, routingKey string, message *protocol.Message, onDurable func(error)) (durableInflight bool, backpressure protocol.DepthGate, err error) {
+	// Transient publishes take the byte-for-byte-unchanged synchronous path.
+	// There is no durability barrier, so the confirm (if any) is settled
+	// synchronously by the caller (durableInflight=false).
+	if message.DeliveryMode != 2 {
+		return false, nil, b.PublishMessage(exchangeName, routingKey, message)
+	}
+
+	// A backend without async durable support falls back to the synchronous
+	// publish (blocking fsync + immediate visibility); the caller settles the
+	// confirm synchronously. Only the storage backend that decouples the fsync
+	// gets the pipelined async path below.
+	adw, ok := b.storage.(asyncDurableWriter)
+	if !ok {
+		return false, nil, b.PublishMessage(exchangeName, routingKey, message)
+	}
+
+	exchange, err := b.storage.GetExchange(exchangeName)
+	if err != nil {
+		if errors.Is(err, interfaces.ErrExchangeNotFound) {
+			return false, nil, fmt.Errorf("exchange '%s' not found", exchangeName)
+		}
+		return false, nil, err
+	}
+
+	// W4 SQ-9: stamp the durable TTL anchor for a valid per-message expiration
+	// up front (shared by every fanout copy), exactly as PublishMessage.
+	if _, ok := parsePerMessageTTLMillis(message.Expiration); ok && message.EnqueueUnixMilli == 0 {
+		message.EnqueueUnixMilli = b.ttlNowMillis()
+	}
+
+	rs := acquireRouteScratch()
+	defer releaseRouteScratch(rs)
+	if err := b.routeMessage(exchange, routingKey, message, rs); err != nil {
+		return false, nil, err
+	}
+	targetQueues := rs.queues
+
+	if len(targetQueues) == 0 {
+		if message.Mandatory {
+			return false, nil, ErrNoRoute
+		}
+		// No route, non-mandatory: the caller confirms synchronously.
+		return false, nil, nil
+	}
+
+	agg := newPublishConfirmAgg(onDurable)
+	rejected := false
+
+	for i, queueName := range targetQueues {
+		queueState := b.getOrCreateQueueState(queueName)
+
+		// Iteration 2 (option A): the durable+confirm admission path does NOT park
+		// the frame PROCESSOR on queue depth. The confirm tag was already minted
+		// (server side) before this call, so parking here until a consumer drains —
+		// as WaitForCapacity did — would STRAND that tag whenever the consumer stops
+		// (benchmark-teardown deadlock). Instead the publish is admitted →
+		// persisted(WAL) → confirmed, and depth backpressure is applied UPSTREAM at
+		// the READER: if a routed target is at/over its high-water mark we report it
+		// as `backpressure` so the caller pauses this producer-only connection's
+		// reader (TCP backpressure), pacing the producer to the consumer's drain rate
+		// and keeping the queue small + ring-resident (high consume throughput)
+		// WITHOUT ever stranding a tag on the processor side. Still bail if the queue
+		// was deleted out from under us.
+		select {
+		case <-queueState.StopCh():
+			return false, nil, fmt.Errorf("queue '%s' closed", queueName)
+		default:
+		}
+		if queueState.AtHighWaterMark() {
+			backpressure = queueState
+		}
+
+		// SQ-11 reject-publish admission (synchronous), identical to PublishMessage.
+		p := queueState.Policy()
+		rejectPublish := p != nil && p.Overflow == OverflowRejectPublish &&
+			(p.HasMaxLength || p.HasMaxLengthBytes)
+		if rejectPublish {
+			queueState.maxLenMu.Lock()
+			if maxLenRejectsPublish(queueState, p) {
+				queueState.maxLenMu.Unlock()
+				rejected = true
+				continue
+			}
+		}
+
+		// Assign the delivery tag AND register it pending on this queue's
+		// contiguous durable frontier atomically, holding the queue's frontier
+		// lock across the global-counter Add so the queue's durable tags register
+		// in tag order and any concurrent transient publisher that mints a higher
+		// tag observes the queue frontier-active and routes through it (A3
+		// race-safety — see QueueState.FrontierReserve).
+		msgID := queueState.FrontierReserve(func() uint64 { return b.globalDeliveryTag.Add(1) })
+
+		var storeMsg *protocol.Message
+		if i == 0 {
+			message.DeliveryTag = msgID
+			storeMsg = message
+		} else {
+			// FANOUT INVARIANT (see PublishMessage): deep-copy the Headers map for
+			// tail deliveries so queue copies never share a map pointer.
+			msgCopy := *message
+			msgCopy.DeliveryTag = msgID
+			if message.Headers != nil {
+				h := make(map[string]interface{}, len(message.Headers))
+				for k, v := range message.Headers {
+					h[k] = v
+				}
+				msgCopy.Headers = h
+			}
+			storeMsg = &msgCopy
+		}
+
+		if storeMsg.EnqueueUnixMilli == 0 && p != nil && p.HasMessageTTL {
+			storeMsg.EnqueueUnixMilli = b.ttlNowMillis()
+		}
+
+		// Deferred per-copy completion: consumer-visibility (the frontier head
+		// advance) and max-length accounting run ONLY after THIS copy's WAL record
+		// is fsynced, so no consumer can claim the message before it is durable
+		// (A3). The frontier advances head to the lowest still-pending routed tag,
+		// never past this tag before it is done, even under out-of-order
+		// cross-connection completion. On fsync error the copy is advanced past
+		// (real=false) but never made ring-resident, so it is gap-skipped, never
+		// delivered. Runs on the shared WAL batch-writer goroutine — non-blocking
+		// (frontier ops are O(1) under a per-queue lock, no I/O; A4).
+		qs := queueState
+		id := msgID
+		qn := queueName
+		pol := p
+		bodyLen := len(storeMsg.Body)
+		completion := func(cerr error) {
+			qs.FrontierComplete(id, cerr == nil)
+			if cerr == nil && pol != nil {
+				addReadyBytesOnEnqueue(qs, pol, bodyLen)
+				if pol.Overflow == OverflowDropHead && (pol.HasMaxLength || pol.HasMaxLengthBytes) {
+					// Runs on the WAL batch-writer goroutine — eviction can block on
+					// a synchronous dead-letter/spill StoreMessage, so it MUST be
+					// handed to the trim worker, never run inline (C1/A4 deadlock).
+					b.enqueueMaxLenTrim(qs, qn, pol)
+				}
+			}
+			agg.report(cerr)
+		}
+
+		agg.addCopy() // count BEFORE enqueue so an immediate completion can't underflow
+		if serr := adw.StoreMessageAsync(queueName, storeMsg, completion); serr != nil {
+			// Enqueue failed (e.g. WAL unavailable): the completion will NOT fire,
+			// so RELEASE the frontier slot we reserved for this tag — otherwise it
+			// stays pending forever and wedges the per-queue frontier, blocking all
+			// later publishes to this queue (M1). real=false advances head past it
+			// without counting it ready. The aggregator is abandoned (guard never
+			// dropped => onDurable never fires). Propagate the failure synchronously.
+			queueState.FrontierComplete(msgID, false)
+			if rejectPublish {
+				queueState.maxLenMu.Unlock()
+			}
+			return false, nil, fmt.Errorf("failed to store durable message to queue '%s': %w", queueName, serr)
+		}
+
+		if rejectPublish {
+			queueState.maxLenMu.Unlock()
+		}
+	}
+
+	if rejected {
+		// A reject-publish target refused the message. Any durable copies to
+		// accepted targets are enqueued and will become visible on their fsync,
+		// but the publisher confirm is nacked by the caller. The setup guard is
+		// deliberately NOT dropped, so onDurable never fires for a nacked publish.
+		return false, nil, ErrMaxLengthExceeded
+	}
+
+	// Drop the setup guard. remaining is now (#durable copies) >= 1, so onDurable
+	// fires only once the last copy's fsync completes (asynchronously). Never
+	// fires synchronously here.
+	agg.report(nil)
+	return true, backpressure, nil
 }
 
 // PublishMessageTx is the transactional (SQ-8) sibling of PublishMessage. It
@@ -1718,7 +2076,16 @@ func (b *StorageBroker) PublishMessageTx(txnStore interfaces.Storage, exchangeNa
 		qn := queueName
 		bodyLen := len(storeMsg.Body)
 		deferred = append(deferred, func() {
-			qs.Publish(id)
+			// The tx message is durably committed by the time this runs. If the
+			// target queue has async durable-confirm publishes in flight
+			// (frontier-active), route the visibility through the frontier so this
+			// committed tag cannot jump head past an earlier still-pending durable
+			// tag (A3 FIFO); otherwise the lock-free fast path (unchanged).
+			if qs.FrontierActive() {
+				qs.FrontierPublishTransient(id)
+			} else {
+				qs.Publish(id)
+			}
 			// SQ-11 max-length for transactional publishes: byte accounting +
 			// drop-head eviction run AFTER the post-commit visibility. Since the
 			// message is already durably committed, reject-publish is NOT

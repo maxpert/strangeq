@@ -22,6 +22,24 @@ type UnifiedBroker interface {
 	// Message operations
 	PublishMessage(exchangeName, routingKey string, message *protocol.Message) error
 
+	// PublishMessageAsyncConfirm is the async-completion publish path for durable
+	// and/or publisher-confirm messages: it routes synchronously (returning
+	// ErrNoRoute / ErrMaxLengthExceeded inline) but enqueues a durable copy's WAL
+	// write for group commit and defers the copy's visibility to the fsync
+	// completion, firing onDurable once every durable copy is fsynced. Returns
+	// durableInflight=true iff onDurable will fire asynchronously (the caller must
+	// not settle the confirm itself); false for transient / no-route-non-mandatory
+	// success (the caller settles the confirm synchronously).
+	//
+	// backpressure is non-nil iff a routed target queue is at/over its high-water
+	// mark: the caller (a producer-only connection) records it so the reader stops
+	// pulling new publishes off the socket until the consumer drains the queue
+	// (iteration 2, option A — reader-level depth backpressure that paces the
+	// producer, keeping the durable queue small + ring-resident). The publish is
+	// still admitted (it always durablizes + confirms); the processor is never
+	// parked, so the confirm tag is never stranded. nil means capacity headroom.
+	PublishMessageAsyncConfirm(exchangeName, routingKey string, message *protocol.Message, onDurable func(error)) (durableInflight bool, backpressure protocol.DepthGate, err error)
+
 	// Consumer operations
 	RegisterConsumer(queueName, consumerTag string, consumer *protocol.Consumer) error
 	UnregisterConsumer(consumerTag string) error

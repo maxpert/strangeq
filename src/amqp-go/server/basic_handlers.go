@@ -407,15 +407,47 @@ func (s *Server) processCompleteMessage(conn *protocol.Connection, channelID uin
 		publishStart = time.Now()
 	}
 
-	// SQ-5: on the confirm path, publish through the durability barrier — its
-	// return is the event that makes confirmTag safe to ack. The default
-	// barrier is Broker.PublishMessage itself, so the non-confirm hot path
-	// below stays exactly as before (zero new work when confirm mode is off).
+	// Iteration 2: durable and/or publisher-confirm publishes take the async
+	// completion path — the durable WAL write is enqueued for group commit and
+	// the confirm fires from the fsync completion, so this frame processor is
+	// never blocked on an fsync. The transient, non-confirm hot path is
+	// byte-for-byte unchanged (plain synchronous Broker.PublishMessage).
 	var err error
-	if confirmTag > 0 && s.ConfirmBarrier != nil {
-		err = s.ConfirmBarrier.PublishAndAwaitDurable(message.Exchange, message.RoutingKey, message)
+	var durableInflight bool
+	var backpressure protocol.DepthGate
+	if confirmTag > 0 || message.DeliveryMode == 2 {
+		var onDurable func(error)
+		if confirmTag > 0 {
+			cc := confirmCh
+			ct := confirmTag
+			onDurable = func(derr error) {
+				// Runs on the WAL batch-writer goroutine (durable copies) — folds
+				// the tag and pokes the flusher; never blocks / never does I/O.
+				if derr != nil {
+					s.failConfirmDurable(conn, cc, ct)
+				} else {
+					s.markConfirmDurable(conn, cc, ct)
+				}
+			}
+		}
+		durableInflight, backpressure, err = s.Broker.PublishMessageAsyncConfirm(message.Exchange, message.RoutingKey, message, onDurable)
 	} else {
 		err = s.Broker.PublishMessage(message.Exchange, message.RoutingKey, message)
+	}
+
+	// Iteration 2 (option A): arm queue-depth reader backpressure. The async
+	// durable path admits every publish (it never parks the processor — that would
+	// strand the already-minted confirm tag at teardown), so pacing happens
+	// UPSTREAM at the reader: when a routed target queue is at/over its high-water
+	// mark, stop pulling NEW publishes off the socket (TCP backpressure) until a
+	// consumer drains it. This paces the producer to the consumer's drain rate, so
+	// the durable queue stays small and ring-resident (fast consume). Gated to the
+	// rising edge and to PRODUCER-ONLY connections — a connection with a consumer
+	// must keep reading to deliver its own acks (which drain the very queue), so
+	// pausing its reader could deadlock. The reader clears the gate once the queue
+	// drains below HWM.
+	if backpressure != nil && !conn.DepthBackpressure.Load() && !conn.HasActiveConsumer() {
+		conn.SetDepthGate(backpressure)
 	}
 
 	if s.MetricsCollector != nil {
@@ -431,9 +463,9 @@ func (s *Server) processCompleteMessage(conn *protocol.Connection, channelID uin
 				return retErr
 			}
 			if confirmTag > 0 {
-				// The basic.return frames are already written; advancing the
-				// watermark only now guarantees no batched ack covering this
-				// tag can precede the return on the wire.
+				// The basic.return frames are already written; folding the tag
+				// only now guarantees no batched ack covering this tag can precede
+				// the return on the wire.
 				return s.confirmPublishDurable(conn, confirmCh, confirmTag)
 			}
 			return nil
@@ -444,14 +476,14 @@ func (s *Server) processCompleteMessage(conn *protocol.Connection, channelID uin
 			// limit. The broker neither stored nor dead-lettered it. Signal the
 			// publisher, in priority order:
 			//   - confirm mode: settle the confirm tag as a basic.nack the
-			//     contiguous ack watermark can never re-confirm (the definitive,
-			//     RabbitMQ-faithful signal; supersedes a mandatory return),
+			//     contiguous ack watermark can never re-confirm (deferred behind
+			//     any still-pipelined durable predecessor; see settleRejectConfirm),
 			//   - else mandatory: return the refused message so a non-confirm
 			//     publisher gets feedback (StrangeQ extension — RabbitMQ does not
 			//     return a routable-but-full message; see W7 divergence notes),
 			//   - else: silently drop (RabbitMQ parity).
 			if confirmTag > 0 {
-				return s.settleConfirmNack(conn, confirmCh, confirmTag)
+				return s.settleRejectConfirm(conn, confirmCh, confirmTag)
 			}
 			if message.Mandatory {
 				return s.sendBasicReturn(conn, channelID, 312, "NO_ROUTE", message.Exchange, message.RoutingKey, message)
@@ -462,6 +494,16 @@ func (s *Server) processCompleteMessage(conn *protocol.Connection, channelID uin
 			zap.Error(err),
 			zap.String("exchange", message.Exchange),
 			zap.String("routing_key", message.RoutingKey))
+		// A confirm tag was assigned for this publish; a generic routing/store
+		// error would otherwise leave it un-settled, STALLING the per-channel
+		// contiguous confirm fold (confirmContig never crosses this tag, so every
+		// later confirm on the channel buffers in confirmAhead forever). Settle it
+		// as a nack so the fold advances and the publisher learns the publish
+		// failed. Best-effort: the connection is likely torn down on the returned
+		// error, but the settle keeps the fold consistent if it is not.
+		if confirmTag > 0 {
+			_ = s.settleRejectConfirm(conn, confirmCh, confirmTag)
+		}
 		return err
 	}
 
@@ -476,10 +518,11 @@ func (s *Server) processCompleteMessage(conn *protocol.Connection, channelID uin
 		ce.Write(zap.String("exchange", message.Exchange), zap.String("routing_key", message.RoutingKey))
 	}
 
-	if confirmTag > 0 {
-		// SQ-5: batched publisher confirms — advance the per-channel watermark
-		// and flush inline (idle) or via the connection's confirm flusher
-		// (pipelined), instead of one basic.ack write per publish.
+	if confirmTag > 0 && !durableInflight {
+		// Transient-confirm (or unroutable-non-mandatory) success settled
+		// synchronously: fold the tag and flush inline (idle) or via the
+		// connection's confirm flusher (pipelined). A durableInflight publish
+		// instead fires its confirm from the async fsync completion (onDurable).
 		return s.confirmPublishDurable(conn, confirmCh, confirmTag)
 	}
 
