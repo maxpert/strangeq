@@ -75,12 +75,59 @@ func newStats() *stats {
 	}
 }
 
+// benchConfig is the fully-resolved configuration for one benchmark run. main()
+// builds it from flags; tests build it directly so they can drive runBenchmark
+// against an embedded server without going through main()/os.Exit.
+type benchConfig struct {
+	url, queue, exchange                              string
+	producers, consumers, size, prefetch, outstanding int
+	duration, confirmGrace, drainTimeout              time.Duration
+	durable, confirm                                  bool
+
+	// consumerDelay throttles each consumer by sleeping after every ack. It is
+	// a test-only pacing knob (0 in production, no CLI flag) used to force a
+	// guaranteed backlog at the publish-window cutoff so the drain path is
+	// exercised deterministically.
+	consumerDelay time.Duration
+
+	// maxMessages caps the aggregate number of messages the producers publish
+	// (0 = unbounded, the production default; no CLI flag). It is a test-only
+	// knob: capping the count makes `target` hardware-independent so a fast
+	// machine cannot build a backlog larger than the bounded drain can clear
+	// within drainTimeout, which would otherwise flake TestDrainRecoversBacklog.
+	maxMessages int
+}
+
+// benchResult is the outcome of a run. Throughput fields are measured over the
+// timed publish window only; completeness fields (target/delivered/lost) are
+// measured after the drain phase. It carries everything printSummary needs, so
+// printSummary stays a pure formatter.
+type benchResult struct {
+	windowElapsed time.Duration
+
+	published        int64 // socket writes (PublishWithContext returned nil)
+	confirmed        int64 // broker-acknowledged (confirm mode)
+	consumedInWindow int64 // consumed at window close, for consumer throughput
+
+	// Completeness, computed after the drain:
+	//   target    = broker-accepted count (confirmed in confirm mode, else published)
+	//   delivered = messages actually consumed by end of the bounded drain
+	//   lost      = max(0, target-delivered): a genuine, un-drainable strand
+	target    int64
+	delivered int64
+	lost      int64
+
+	unconfirmed int64 // confirm mode: publishes never confirmed within grace
+	nacked      int64 // confirm mode: basic.nack count
+}
+
 func main() {
 	var (
 		url          = flag.String("url", "amqp://guest:guest@localhost:5672/", "AMQP server URL")
 		producers    = flag.Int("producers", 1, "Number of producer goroutines")
 		consumers    = flag.Int("consumers", 1, "Number of consumer goroutines")
 		duration     = flag.Duration("duration", 30*time.Second, "Test run duration")
+		drainTimeout = flag.Duration("drain-timeout", 30*time.Second, "Max time to drain the consumer backlog after the publish window before counting the remainder as lost")
 		size         = flag.Int("size", 1024, "Message body size in bytes")
 		confirm      = flag.Bool("confirm", false, "Enable publisher confirms and track confirmed msgs/s; the run FAILS if any publish is never confirmed")
 		confirmGrace = flag.Duration("confirm-grace", 15*time.Second, "How long to wait after the run for outstanding confirms to drain (confirm mode)")
@@ -94,52 +141,150 @@ func main() {
 
 	st := newStats()
 
-	ctx, cancel := context.WithTimeout(context.Background(), *duration)
-	defer cancel()
+	// runCtx spans the whole run. A signal cancels it so a manual Ctrl-C aborts
+	// the publish window AND any in-progress drain (drainToTarget bails on it),
+	// rather than hanging for the full drain timeout against dead consumers.
+	runCtx, runCancel := context.WithCancel(context.Background())
+	defer runCancel()
 
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
 	go func() {
 		<-sigChan
-		cancel()
+		runCancel()
 	}()
 
-	startTime := time.Now()
-
-	var wg sync.WaitGroup
-
-	for i := 0; i < *producers; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			runProducer(ctx, *url, *queue, *exchange, *size, *durable, *confirm, *confirmGrace, *outstanding, st)
-		}()
+	cfg := benchConfig{
+		url:          *url,
+		queue:        *queue,
+		exchange:     *exchange,
+		producers:    *producers,
+		consumers:    *consumers,
+		size:         *size,
+		prefetch:     *prefetch,
+		outstanding:  *outstanding,
+		duration:     *duration,
+		confirmGrace: *confirmGrace,
+		drainTimeout: *drainTimeout,
+		durable:      *durable,
+		confirm:      *confirm,
+		// consumerDelay stays 0 and maxMessages stays 0: production runs never
+		// throttle the consumer and never cap the publish count.
 	}
 
-	for i := 0; i < *consumers; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			runConsumer(ctx, *url, *queue, *prefetch, *durable, st)
-		}()
-	}
-
-	// Per-second stats printer
-	go printPerSecondStats(ctx, st)
-
-	wg.Wait()
-
-	elapsed := time.Since(startTime)
-	printSummary(elapsed, *confirm, st)
+	result := runBenchmark(runCtx, cfg, st)
+	printSummary(result, *confirm, st)
 
 	// Confirm mode is a correctness gate, not just a benchmark: a publish that
 	// is never confirmed (or is nacked) fails the whole run.
 	if *confirm {
-		if unconfirmed, nacked := st.unconfirmed.Load(), st.nacked.Load(); unconfirmed > 0 || nacked > 0 {
-			fmt.Printf("\nFAIL: %d publish(es) never confirmed, %d nacked\n", unconfirmed, nacked)
+		if result.unconfirmed > 0 || result.nacked > 0 {
+			fmt.Printf("\nFAIL: %d publish(es) never confirmed, %d nacked\n", result.unconfirmed, result.nacked)
 			os.Exit(1)
 		}
 	}
+}
+
+// runBenchmark spawns producers and consumers, runs the timed publish window,
+// drains the in-flight backlog, and returns the measured result. It never
+// prints or exits, so tests can drive it directly.
+//
+// The core of the iter7 fix lives here: producers and consumers have SEPARATE
+// lifecycles. Producers stop at cfg.duration (the throughput window).
+// Consumers keep running through a bounded drain phase so the backlog that was
+// in flight at the cutoff (broker queue + amqp091-go client prefetch buffers)
+// is consumed and counted, instead of being frozen and miscounted as loss.
+func runBenchmark(runCtx context.Context, cfg benchConfig, st *stats) benchResult {
+	// pubCtx bounds the producers to the throughput window.
+	pubCtx, pubCancel := context.WithTimeout(runCtx, cfg.duration)
+	defer pubCancel()
+	// consumeCtx keeps consumers alive; it is cancelled only AFTER the drain.
+	consumeCtx, consumeCancel := context.WithCancel(runCtx)
+	defer consumeCancel()
+
+	startTime := time.Now()
+
+	var producerWg, consumerWg sync.WaitGroup
+
+	for i := 0; i < cfg.producers; i++ {
+		producerWg.Add(1)
+		go func() {
+			defer producerWg.Done()
+			runProducer(pubCtx, cfg.url, cfg.queue, cfg.exchange, cfg.size, cfg.durable, cfg.confirm, cfg.confirmGrace, cfg.outstanding, cfg.maxMessages, st)
+		}()
+	}
+
+	for i := 0; i < cfg.consumers; i++ {
+		consumerWg.Add(1)
+		go func() {
+			defer consumerWg.Done()
+			runConsumer(consumeCtx, cfg.url, cfg.queue, cfg.prefetch, cfg.durable, cfg.consumerDelay, st)
+		}()
+	}
+
+	// Per-second printer runs across the window and the drain phase, stopping
+	// when consumeCtx is cancelled below.
+	go printPerSecondStats(consumeCtx, st)
+
+	// 1. Producers finish the throughput window. In confirm mode drainConfirms
+	//    has run inside runProducer, so confirmed/unconfirmed/nacked are final.
+	producerWg.Wait()
+	windowElapsed := time.Since(startTime)
+
+	// 2. Snapshot consumer throughput BEFORE the (idle) drain phase, so the
+	//    round-trip rate is measured over the window only and not diluted.
+	consumedInWindow := st.consumed.Load()
+
+	// 3. Completeness target = what the broker accepted. In confirm mode that is
+	//    the confirmed count (broker-acknowledged), NOT published: published
+	//    counts socket writes, which can include not-yet-confirmed or nacked
+	//    publishes in flight, so subtracting from it would report those as loss
+	//    even after a perfect drain.
+	published := st.published.Load()
+	confirmed := st.confirmed.Load()
+	target := published
+	if cfg.confirm {
+		target = confirmed
+	}
+
+	// 4. Drain the in-flight backlog, bounded by drainTimeout.
+	delivered := drainToTarget(runCtx, target, cfg.drainTimeout, st)
+
+	// 5. Drain is done (or timed out); stop the consumers.
+	consumeCancel()
+	consumerWg.Wait()
+
+	lost := target - delivered
+	if lost < 0 {
+		lost = 0
+	}
+
+	return benchResult{
+		windowElapsed:    windowElapsed,
+		published:        published,
+		confirmed:        confirmed,
+		consumedInWindow: consumedInWindow,
+		target:           target,
+		delivered:        delivered,
+		lost:             lost,
+		unconfirmed:      st.unconfirmed.Load(),
+		nacked:           st.nacked.Load(),
+	}
+}
+
+// drainToTarget polls until the consumer has consumed `target` messages, the
+// `timeout` deadline passes, or runCtx is cancelled (manual abort). Whatever is
+// still un-consumed once it returns is genuine loss, so a real strand is never
+// masked and the drain never blocks indefinitely.
+func drainToTarget(runCtx context.Context, target int64, timeout time.Duration, st *stats) int64 {
+	deadline := time.Now().Add(timeout)
+	for st.consumed.Load() < target && time.Now().Before(deadline) {
+		if runCtx.Err() != nil {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	return st.consumed.Load()
 }
 
 func printPerSecondStats(ctx context.Context, st *stats) {
@@ -179,27 +324,24 @@ func printPerSecondStats(ctx context.Context, st *stats) {
 	}
 }
 
-func printSummary(elapsed time.Duration, withConfirm bool, st *stats) {
-	pub := st.published.Load()
-	con := st.consumed.Load()
-	lost := pub - con
-	if lost < 0 {
-		lost = 0
-	}
+// printSummary is a pure formatter fed from benchResult (counts) plus st (the
+// latency histograms). Throughput is reported over the timed publish window;
+// completeness (delivered/lost) is reported after the bounded drain.
+func printSummary(r benchResult, withConfirm bool, st *stats) {
+	secs := r.windowElapsed.Seconds()
 	lostPct := 0.0
-	if pub > 0 {
-		lostPct = float64(lost) / float64(pub) * 100
+	if r.target > 0 {
+		lostPct = float64(r.lost) / float64(r.target) * 100
 	}
 
-	secs := elapsed.Seconds()
 	fmt.Printf("\n=== SUMMARY (%.0fs) ===\n", secs)
-	fmt.Printf("Published : %d total  |  %.0f avg/s\n", pub, float64(pub)/secs)
-	fmt.Printf("Consumed  : %d total  |  %.0f avg/s\n", con, float64(con)/secs)
-	fmt.Printf("Lost      : %d (%.2f%%)\n", lost, lostPct)
+	fmt.Printf("Published : %d total  |  %.0f avg/s\n", r.published, float64(r.published)/secs)
+	fmt.Printf("Consumed  : %d in window  |  %.0f avg/s\n", r.consumedInWindow, float64(r.consumedInWindow)/secs)
+	fmt.Printf("Delivered : %d total  (after drain)\n", r.delivered)
+	fmt.Printf("Lost      : %d (%.2f%%)\n", r.lost, lostPct)
 	if withConfirm {
-		confirmed := st.confirmed.Load()
 		fmt.Printf("Confirmed : %d total  |  %.0f avg/s  (unconfirmed: %d, nacked: %d)\n",
-			confirmed, float64(confirmed)/secs, st.unconfirmed.Load(), st.nacked.Load())
+			r.confirmed, float64(r.confirmed)/secs, r.unconfirmed, r.nacked)
 	}
 
 	if st.consumerLatency.totalCount() > 0 {
@@ -233,7 +375,7 @@ func formatDuration(d time.Duration) string {
 	return fmt.Sprintf("%.0fµs", float64(d)/float64(time.Microsecond))
 }
 
-func runProducer(ctx context.Context, url, queueName, exchange string, size int, durable, useConfirm bool, confirmGrace time.Duration, outstanding int, st *stats) {
+func runProducer(ctx context.Context, url, queueName, exchange string, size int, durable, useConfirm bool, confirmGrace time.Duration, outstanding, maxMessages int, st *stats) {
 	conn, err := amqp.Dial(url)
 	if err != nil {
 		log.Printf("producer: connect failed: %v", err)
@@ -368,6 +510,13 @@ func runProducer(ctx context.Context, url, queueName, exchange string, size int,
 					continue
 				}
 				st.published.Add(1)
+				// Test-only cap: once the aggregate published count reaches the
+				// bound, stop publishing but still drain confirms exactly like a
+				// ctx-cancel, so confirmed/unconfirmed/nacked stay correct.
+				if maxMessages > 0 && st.published.Load() >= int64(maxMessages) {
+					drainConfirms()
+					return
+				}
 			}
 		}
 	}
@@ -398,11 +547,15 @@ func runProducer(ctx context.Context, url, queueName, exchange string, size int,
 				continue
 			}
 			st.published.Add(1)
+			// Test-only cap (see confirm path); no-confirm has nothing to drain.
+			if maxMessages > 0 && st.published.Load() >= int64(maxMessages) {
+				return
+			}
 		}
 	}
 }
 
-func runConsumer(ctx context.Context, url, queueName string, prefetch int, durable bool, st *stats) {
+func runConsumer(ctx context.Context, url, queueName string, prefetch int, durable bool, consumerDelay time.Duration, st *stats) {
 	conn, err := amqp.Dial(url)
 	if err != nil {
 		log.Printf("consumer: connect failed: %v", err)
@@ -447,6 +600,11 @@ func runConsumer(ctx context.Context, url, queueName string, prefetch int, durab
 			st.consumed.Add(1)
 			if err := msg.Ack(false); err != nil && ctx.Err() == nil {
 				log.Printf("consumer: ack error: %v", err)
+			}
+			// Test-only pacing knob (0 in production): throttling the consumer
+			// forces a deterministic backlog so the drain path is exercised.
+			if consumerDelay > 0 {
+				time.Sleep(consumerDelay)
 			}
 		}
 	}
