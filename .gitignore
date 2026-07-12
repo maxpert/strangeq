@@ -71,6 +71,9 @@ Thumbs.db
 .env.local
 .claude/
 
+# Agent instructions (kept local, not tracked in git)
+/CLAUDE.md
+
 # Planning docs (kept local, not tracked in git)
 docs/plan.md
 issues.md
