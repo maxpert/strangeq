@@ -66,7 +66,7 @@ network:
   tcpkeepaliveintervalms: 30000
 storage:
   path: $STORAGE_PATH
-  fsync: false
+  fsync: true
   cachemb: 64
   maxfiles: 100
   retentionms: 86400000

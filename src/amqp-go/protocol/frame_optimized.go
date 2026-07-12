@@ -64,6 +64,20 @@ func ReadFrameOptimized(reader io.Reader) (*Frame, error) {
 	return ReadFrameOptimizedWithLimit(reader, MaxInboundFrameSize)
 }
 
+// frameEndSlice is a shared, read-only one-octet slice holding the AMQP
+// frame-end marker (0xCE). The vectored delivery path emits it as its own
+// iovec after each zero-copy body chunk, so a body never has to be copied into
+// a contiguous buffer merely to append its trailing 0xCE. It MUST NEVER be
+// written through: writev only reads iovecs, so aliasing this single backing
+// array across every frame and every connection is safe.
+var frameEndSlice = []byte{FrameEnd}
+
+// FrameEndSlice returns the shared read-only frame-end octet ([]byte{0xCE}) for
+// vectored (net.Buffers) writers. The returned slice MUST NOT be modified.
+func FrameEndSlice() []byte {
+	return frameEndSlice
+}
+
 // AppendFrame appends a complete AMQP frame (type + channel + size + payload
 // + end marker) directly into buf, avoiding *Frame allocation. This is the
 // zero-alloc frame writer for hot paths.

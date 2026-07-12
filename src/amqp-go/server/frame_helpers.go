@@ -247,7 +247,13 @@ func buildPropertyFlags(msg *protocol.Message) uint16 {
 	return flags
 }
 
-func (s *Server) appendHeaderAndBodyFrames(buf *[]byte, channelID uint16, message *protocol.Message) error {
+// buildContentHeaderPayload serializes the AMQP content-header payload (class
+// 60 basic properties) for message. It is shared by the contiguous delivery
+// encoder (appendHeaderAndBodyFrames) and the vectored delivery encoder
+// (appendHeaderAndBodyFramesVec) so the two paths can never diverge on which
+// message properties are emitted or in what order. The bytes returned are
+// exactly what the contiguous path appended inline before this extraction.
+func buildContentHeaderPayload(message *protocol.Message) ([]byte, error) {
 	propertyFlags := buildPropertyFlags(message)
 	var hdrPayload []byte
 	hdrPayload, err := (&protocol.ContentHeader{
@@ -271,7 +277,15 @@ func (s *Server) appendHeaderAndBodyFrames(buf *[]byte, channelID uint16, messag
 		ClusterID:       message.ClusterID,
 	}).SerializeInto(hdrPayload)
 	if err != nil {
-		return fmt.Errorf("error serializing content header: %v", err)
+		return nil, fmt.Errorf("error serializing content header: %v", err)
+	}
+	return hdrPayload, nil
+}
+
+func (s *Server) appendHeaderAndBodyFrames(buf *[]byte, channelID uint16, message *protocol.Message) error {
+	hdrPayload, err := buildContentHeaderPayload(message)
+	if err != nil {
+		return err
 	}
 	*buf = protocol.AppendFrame(*buf, protocol.FrameHeader, channelID, hdrPayload)
 

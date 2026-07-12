@@ -164,6 +164,14 @@ type WALConfig struct {
 	RetentionPeriod    time.Duration // for time-based retention
 	CheckpointInterval time.Duration // how often WAL checkpoints old files to segments
 
+	// SyncDisabled, when true, skips the group-commit fdatasync in flushBatch
+	// (the async publish durability barrier). Zero value (false) = fsync ON, the
+	// durable default, so DefaultWALConfig() and zero-value WALConfig{} stay
+	// durable. Set only via WALConfigFromEngine from the user's Storage.Fsync
+	// flag. It does NOT relax WriteTxAtomic, which always fdatasyncs directly —
+	// transactions remain durable even when this is set.
+	SyncDisabled bool
+
 	// SharedBodyMaxPinAge (ITER5 cold-tail hardening, §2) bounds how long a rolled
 	// WAL file that carries a shared BodyBlock may be kept out of checkpoint before
 	// it is force-re-inlined (N copies) and deleted. 0 disables the age backstop
@@ -1237,15 +1245,26 @@ func (qw *QueueWAL) flushBatch(batch []*writeRequest, bufp *[]byte, positionsp *
 	// Fdatasync for durability (one sync per batch!)
 	// Uses fdatasync on Linux (skips metadata sync for ~2-5x speedup vs fsync).
 	// This is the critical durability guarantee - messages are only durable after this completes.
-	fsyncStart := time.Now()
-	fsyncErr := walGroupCommitFsync(qw.currentFile)
-	fsyncDuration := time.Since(fsyncStart).Seconds()
+	//
+	// When fsync is explicitly disabled (Storage.Fsync=false =>
+	// WALConfig.SyncDisabled), the barrier is skipped: the write(2) above is
+	// still page-cache-visible for same-process reads, so the index update and
+	// completions below proceed exactly as on the durable path, but the batch is
+	// not crash-durable. The fsync is NOT recorded when skipped, so
+	// wal_fsync_total stays a truthful count of real syncs. WriteTxAtomic is
+	// unaffected — it always fdatasyncs directly.
+	var fsyncErr error
+	if !qw.cfg.SyncDisabled {
+		fsyncStart := time.Now()
+		fsyncErr = walGroupCommitFsync(qw.currentFile)
+		fsyncDuration := time.Since(fsyncStart).Seconds()
 
-	// Record fsync metrics
-	if qw.metrics != nil {
-		qw.metrics.RecordWALFsync(fsyncDuration)
-		if fsyncErr != nil {
-			qw.metrics.RecordWALWriteError()
+		// Record fsync metrics
+		if qw.metrics != nil {
+			qw.metrics.RecordWALFsync(fsyncDuration)
+			if fsyncErr != nil {
+				qw.metrics.RecordWALWriteError()
+			}
 		}
 	}
 

@@ -24,8 +24,9 @@ network:
 
 storage:
   path: ./data
-  # Disable fsync for better performance (less durable)
-  fsync: false
+  # Fsync after each WAL batch write (the durable default; matches RabbitMQ
+  # persistent-message semantics). Set false only to trade durability for speed.
+  fsync: true
   cachemb: 64                      # 64 MB metadata cache
   maxfiles: 100                    # Max open file handles
   retentionms: 86400000            # 24 hours

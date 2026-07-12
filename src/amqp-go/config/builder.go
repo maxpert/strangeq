@@ -72,9 +72,11 @@ func (b *ConfigBuilder) WithStoragePath(path string) *ConfigBuilder {
 	return b
 }
 
-// WithFsync enables/disables fsync for writes
+// WithFsync enables/disables fsync for writes. It sets the tri-state flag to an
+// explicit value (never nil), so building via the fluent API always expresses a
+// concrete durability choice.
 func (b *ConfigBuilder) WithFsync(enabled bool) *ConfigBuilder {
-	b.config.Storage.Fsync = enabled
+	b.config.Storage.Fsync = &enabled
 	return b
 }
 

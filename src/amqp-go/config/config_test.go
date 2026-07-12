@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/maxpert/amqp-go/interfaces"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -165,7 +166,7 @@ func TestConfigSaveLoad(t *testing.T) {
 	originalConfig.Network.Address = ":8080"
 	originalConfig.Network.MaxConnections = 500
 	originalConfig.Storage.Path = "/tmp/amqp-data"
-	originalConfig.Storage.Fsync = true
+	originalConfig.Storage.Fsync = boolPtr(true)
 	originalConfig.Server.LogLevel = "debug"
 
 	// Save the config
@@ -184,7 +185,8 @@ func TestConfigSaveLoad(t *testing.T) {
 	assert.Equal(t, ":8080", loadedConfig.Network.Address)
 	assert.Equal(t, 500, loadedConfig.Network.MaxConnections)
 	assert.Equal(t, "/tmp/amqp-data", loadedConfig.Storage.Path)
-	assert.Equal(t, true, loadedConfig.Storage.Fsync)
+	require.NotNil(t, loadedConfig.Storage.Fsync)
+	assert.Equal(t, true, *loadedConfig.Storage.Fsync)
 	assert.Equal(t, "debug", loadedConfig.Server.LogLevel)
 }
 
@@ -255,7 +257,8 @@ engine:
 	assert.NoError(t, err)
 	assert.Equal(t, ":8080", config.Network.Address)
 	assert.Equal(t, "debug", config.Server.LogLevel)
-	assert.Equal(t, false, config.Storage.Fsync)
+	require.NotNil(t, config.Storage.Fsync)
+	assert.Equal(t, false, *config.Storage.Fsync)
 }
 
 func TestConfigBuilder(t *testing.T) {
@@ -275,7 +278,8 @@ func TestConfigBuilder(t *testing.T) {
 	assert.Equal(t, 9090, config.Network.Port)
 	assert.Equal(t, 2000, config.Network.MaxConnections)
 	assert.Equal(t, "/tmp/test-storage", config.Storage.Path)
-	assert.Equal(t, true, config.Storage.Fsync)
+	require.NotNil(t, config.Storage.Fsync)
+	assert.Equal(t, true, *config.Storage.Fsync)
 	assert.Equal(t, "debug", config.Server.LogLevel)
 	assert.Equal(t, "/var/log/amqp.log", config.Server.LogFile)
 	assert.Equal(t, "test-server", config.Server.Name)
@@ -338,4 +342,106 @@ func TestConfigBuilderBuildUnsafe(t *testing.T) {
 	// But validation should fail
 	err := config.Validate()
 	assert.Error(t, err)
+}
+
+// validYAMLWithFsync builds a full, Validate()-passing config YAML whose
+// storage.fsync line is fsyncLine (pass "" to omit the key entirely).
+func validYAMLWithFsync(fsyncLine string) string {
+	return `
+network:
+  address: ":8080"
+  port: 8080
+  maxconnections: 1000
+  heartbeatintervalms: 60000
+  tcpkeepalive: true
+  tcpkeepaliveintervalms: 30000
+storage:
+  path: ./test-data
+` + fsyncLine + `  cachemb: 64
+  maxfiles: 100
+  retentionms: 86400000
+  checkpointintervalms: 5000
+server:
+  loglevel: debug
+  maxchannelsperconnection: 2047
+  maxframesize: 131072
+  maxmessagesize: 16777216
+  cleanupintervalms: 300000
+engine:
+  ringbuffersize: 65536
+  spillthresholdpercent: 80
+  walbatchsize: 1000
+  walbatchtimeoutms: 10
+  walfilesize: 536870912
+  walchannelbuffer: 10000
+  segmentsize: 1073741824
+  segmentcheckpointintervalms: 300000
+  compactionthreshold: 0.5
+  compactionintervalms: 1800000
+  consumerselecttimeoutms: 1
+  consumermaxbatchsize: 100
+  walcleanupcheckintervalms: 300000
+`
+}
+
+func loadYAML(t *testing.T, content string) *AMQPConfig {
+	t.Helper()
+	dir := t.TempDir()
+	f := filepath.Join(dir, "cfg.yaml")
+	require.NoError(t, os.WriteFile(f, []byte(content), 0644))
+	// The file-load path in cmd/amqp-server seeds a ZERO-VALUE AMQPConfig{}
+	// before Load (not DefaultConfig), so the tri-state must be exercised from
+	// the zero value: an omitted fsync key stays nil there.
+	c := &AMQPConfig{}
+	require.NoError(t, c.Load(f))
+	return c
+}
+
+// TestFsyncTriState_LoadPaths pins the tri-state user flag semantics and the
+// loader trap: on a zero-value AMQPConfig{} (the --config path) an OMITTED
+// fsync key must default to ON (durable), so honoring the flag can never
+// silently make an upgraded broker non-durable. Only an explicit fsync:false
+// disables it.
+func TestFsyncTriState_LoadPaths(t *testing.T) {
+	// Default flip: DefaultConfig is explicitly durable (non-nil true).
+	def := DefaultConfig()
+	require.NotNil(t, def.Storage.Fsync, "DefaultConfig must set an explicit fsync")
+	assert.True(t, *def.Storage.Fsync)
+	assert.True(t, def.FsyncEnabled())
+
+	// (i) omitted key on a zero-value config => nil => ON.
+	cOmit := loadYAML(t, validYAMLWithFsync(""))
+	assert.Nil(t, cOmit.Storage.Fsync, "omitted fsync must stay nil on a zero-value load")
+	assert.True(t, cOmit.FsyncEnabled(), "omitted fsync must default to ON (durable)")
+
+	// (ii) explicit false => opt out.
+	cFalse := loadYAML(t, validYAMLWithFsync("  fsync: false\n"))
+	require.NotNil(t, cFalse.Storage.Fsync)
+	assert.False(t, *cFalse.Storage.Fsync)
+	assert.False(t, cFalse.FsyncEnabled())
+
+	// (iii) explicit true => ON.
+	cTrue := loadYAML(t, validYAMLWithFsync("  fsync: true\n"))
+	require.NotNil(t, cTrue.Storage.Fsync)
+	assert.True(t, *cTrue.Storage.Fsync)
+	assert.True(t, cTrue.FsyncEnabled())
+}
+
+// TestFsyncTriState_EngineOverlay pins that the user flag threads to the engine
+// view as the INVERTED WALSyncDisabled, and that every zero value means ON.
+func TestFsyncTriState_EngineOverlay(t *testing.T) {
+	// (iv) EngineConfig zero value => sync ON.
+	assert.False(t, interfaces.EngineConfig{}.WALSyncDisabled, "zero-value EngineConfig must fsync")
+
+	// Default config's engine view fsyncs.
+	assert.False(t, DefaultConfig().GetEngine().WALSyncDisabled)
+
+	// nil user flag (zero-value config) => engine view fsyncs.
+	assert.False(t, (&AMQPConfig{}).GetEngine().WALSyncDisabled)
+
+	// Explicit opt-out threads through GetEngine as WALSyncDisabled=true.
+	c := DefaultConfig()
+	dis := false
+	c.Storage.Fsync = &dis
+	assert.True(t, c.GetEngine().WALSyncDisabled, "fsync:false must set WALSyncDisabled=true")
 }

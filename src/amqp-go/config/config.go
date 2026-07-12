@@ -14,6 +14,10 @@ import (
 	yamlv3 "gopkg.in/yaml.v3"
 )
 
+// boolPtr returns a pointer to b. Used for tri-state config flags (see
+// StorageConfig.Fsync) where a non-nil pointer expresses an explicit choice.
+func boolPtr(b bool) *bool { return &b }
+
 // DefaultConfig creates a configuration with sensible defaults
 func DefaultConfig() *AMQPConfig {
 	return &AMQPConfig{
@@ -33,8 +37,11 @@ func DefaultConfig() *AMQPConfig {
 			ReaderBackpressureProbeMS:  5,        // 5 ms reader-backpressure probe (SQ-13)
 		},
 		Storage: interfaces.StorageConfig{
-			Path:                 "./data",
-			Fsync:                false,
+			Path: "./data",
+			// Durable by default: an explicit non-nil true so --generate-config
+			// emits `fsync: true` (not `fsync: null`) and the no-config path is
+			// unambiguously durable. Set fsync:false to opt out of the barrier.
+			Fsync:                boolPtr(true),
 			CacheMB:              64,       // 64 MB metadata cache
 			MaxFiles:             100,      // Max open file handles
 			RetentionMS:          86400000, // 24 hours
@@ -141,9 +148,20 @@ func (c *AMQPConfig) GetServer() interfaces.ServerConfig {
 	return c.Server
 }
 
-// GetEngine returns engine tuning configuration
+// FsyncEnabled reports whether the WAL group-commit fsync durability barrier is
+// active. The tri-state Storage.Fsync defaults to ON: nil (omitted) or an
+// explicit true both enable it; only an explicit false disables it.
+func (c *AMQPConfig) FsyncEnabled() bool {
+	return c.Storage.Fsync == nil || *c.Storage.Fsync
+}
+
+// GetEngine returns engine tuning configuration. It overlays the single user
+// fsync knob onto the internal (inverted) WALSyncDisabled transport so the
+// storage layer honors it while every zero-value path stays durable.
 func (c *AMQPConfig) GetEngine() interfaces.EngineConfig {
-	return c.Engine
+	e := c.Engine
+	e.WALSyncDisabled = !c.FsyncEnabled()
+	return e
 }
 
 // GetResourceAlarms returns the resource-alarm configuration (SQ-12).

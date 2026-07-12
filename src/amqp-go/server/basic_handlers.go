@@ -888,6 +888,41 @@ func (s *Server) sendBasicDeliver(conn *protocol.Connection, channelID uint16, c
 		}
 	}()
 
+	// Large bodies take the zero-copy vectored path (same gate as the batched
+	// consumer path): the body is referenced in place via net.Buffers rather
+	// than memmoved into a contiguous frame buffer. See
+	// sendBatchedDeliveriesVectored for the buffer-lifetime invariant (BL) — the
+	// body iovec aliases message.Body, which is immutable and never pool-recycled.
+	if len(message.Body) >= writevBodyThreshold {
+		scratch := protocol.GetFrameSerializationBuffer()
+		defer protocol.PutFrameSerializationBuffer(scratch)
+		vec := &deliveryVec{scratch: scratch}
+		if err := s.serializeDeliveryIntoVec(vec, channelID, consumerTag, deliveryTag, redelivered, exchange, routingKey, message); err != nil {
+			s.Log.Error("Failed to serialize delivery",
+				zap.Error(err),
+				zap.String("consumer_tag", consumerTag),
+				zap.Uint16("channel_id", channelID))
+			return err
+		}
+		bufs := vec.build()
+		conn.WriteMutex.Lock()
+		_, werr := bufs.WriteTo(conn.Conn)
+		conn.WriteMutex.Unlock()
+		if werr != nil {
+			s.Log.Error("Error sending delivery frames",
+				zap.Error(werr),
+				zap.String("consumer_tag", consumerTag),
+				zap.Uint16("channel_id", channelID))
+			return fmt.Errorf("error sending frames: %v", werr)
+		}
+		if s.MetricsCollector != nil {
+			s.MetricsCollector.RecordMessageDelivered(len(message.Body))
+		}
+		s.messagesDelivered.Add(1)
+		s.bytesSent.Add(int64(len(message.Body)))
+		return nil
+	}
+
 	const maxPoolSize = 131 * 1024
 	estimatedSize := deliveryOverheadEstimate + len(message.Body)
 	var buf *[]byte

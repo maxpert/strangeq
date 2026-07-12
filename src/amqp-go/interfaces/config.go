@@ -92,10 +92,18 @@ type StorageConfig struct {
 	// Path is the directory where all persistent data is stored
 	Path string
 
-	// Fsync forces disk sync after each WAL batch write
-	// true = safer but slower (fsync after each batch)
-	// false = faster but less durable (relies on OS page cache)
-	Fsync bool
+	// Fsync controls the WAL group-commit durability barrier. It is a TRI-STATE
+	// pointer so an omitted config key is distinguishable from an explicit false:
+	//   nil   = default (fsync ON, durable) — the safe default
+	//   true  = fsync after each WAL batch (safer but slower)
+	//   false = skip the group-commit fsync (faster, relies on OS page cache;
+	//           NOT crash-durable). Only an EXPLICIT false disables durability.
+	// The tri-state matters because the --config load path seeds a zero-value
+	// AMQPConfig{} before Load, so an omitted key MUST mean "default ON" rather
+	// than Go's zero false — otherwise honoring the flag would silently make any
+	// fsync-omitting config non-durable. Transactions (WriteTxAtomic) always
+	// fdatasync regardless of this flag.
+	Fsync *bool
 
 	// Message settings
 	MessageTTL int64 // Message TTL in seconds (0 = no TTL)
@@ -251,6 +259,15 @@ type EngineConfig struct {
 	// Smaller = less memory, potential blocking under load
 	// Default: 10,000
 	WALChannelBuffer int `json:"wal_channel_buffer"`
+
+	// WALSyncDisabled is the internal (inverted-sense) transport for the user
+	// Storage.Fsync flag. Zero value (false) = fsync ON (the durable default),
+	// so every zero-value EngineConfig{} — used by many constructors and tests —
+	// stays durable. Only the config layer sets it, from GetEngine():
+	// WALSyncDisabled = !FsyncEnabled(). When true, the WAL group-commit
+	// fdatasync is skipped (Storage.Fsync=false). It never disables the
+	// transaction fsync (WriteTxAtomic is always durable).
+	WALSyncDisabled bool `json:"wal_sync_disabled"`
 
 	// SharedBodyThreshold (ITER5) is the minimum body size, in bytes, at which a
 	// DURABLE fan-out to >=2 queues writes the body ONCE as a shared WAL BodyBlock

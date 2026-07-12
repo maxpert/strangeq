@@ -74,9 +74,10 @@ storage:
   path: ./data
 
   # Enable synchronous writes (fsync after each WAL batch write)
-  # true = safer but slower (fsync after each batch)
-  # false = faster but less durable (relies on OS page cache)
-  fsync: false
+  # true = safer but slower (fsync after each batch) — the durable default
+  # false = faster but less durable (relies on OS page cache; opt-in only)
+  # Omitting this key defaults to fsync ON (durable). Transactions always fsync.
+  fsync: true
 
   # Message TTL in seconds (0 = no expiration)
   messagettl: 0
