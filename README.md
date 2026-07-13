@@ -38,7 +38,7 @@ RabbitMQ is the gold standard for AMQP 0.9.1, but it runs on the Erlang VM — a
 - Queue length limits — `x-max-length` / `x-max-length-bytes` with `x-overflow` (`drop-head`, `reject-publish`)
 - Resource alarms — `connection.blocked` / `connection.unblocked` driven by memory (RSS) and free-disk watermarks
 - Exclusive and auto-delete queues with automatic cleanup (exclusive queues deleted on owning-connection close; auto-delete queues deleted when the last consumer leaves)
-- Measured ahead of RabbitMQ 4.3 on durable end-to-end throughput across every tested workload — from 1.1x (64 KB bodies) to 3.7x (durable + publisher confirms) in a Docker ARM64-native head-to-head (see [Performance](#performance))
+- Higher durable end-to-end throughput than RabbitMQ 4.3 on every tested workload — 1.07x to 3.99x in a Docker ARM64-native head-to-head (see [Performance](#performance))
 - Prometheus metrics and pprof profiling
 - Lock-free per-queue ring buffer with per-slot CAS
 - Batch TCP writes and ACK offloading
@@ -269,53 +269,52 @@ All numbers below are **end-to-end consumed msg/s** — every published message 
 
 **Methodology**
 - Single machine: Apple Silicon, 16 cores.
-- Both brokers run in [OrbStack](https://orbstack.dev/) **ARM64-native containers** (not emulated), with **in-container storage** (no host bind mount) so disk behavior is comparable.
-- RabbitMQ 4.3 vs StrangeQ, 20-second runs, 1 KB message bodies unless noted, consumer prefetch 100, manual acks.
-- **Durable queues** (see the caveat below). Measured 2026-07-10.
+- Both brokers run in [OrbStack](https://orbstack.dev/) ARM64-native containers (not emulated), with in-container storage (no host bind mount) so disk behavior is comparable.
+- RabbitMQ 4.3 vs StrangeQ, 20-second runs, 1 KB message bodies unless noted.
+- Durable queues, publisher confirms, fsync enabled on both, consumer prefetch 100, manual acks.
+- Figures are steady-state medians of the per-second consumed rate. Zero message loss and zero unconfirmed publishes on every run. Measured 2026-07-11.
 
-### Head-to-Head vs RabbitMQ 4.3 (durable)
+### Head-to-Head vs RabbitMQ 4.3 (durable + publisher confirms)
 
-> **Why durable-only?** RabbitMQ 4.3 rejects transient (non-durable) non-exclusive queues by default (`541 transient_nonexcl_queues is deprecated`). The only apples-to-apples comparison is therefore on durable queues, and that is what is reported here.
-
-| Workload (durable, 1 KB body unless noted) | RabbitMQ 4.3 | StrangeQ | StrangeQ advantage |
+| Workload (1 KB body unless noted) | RabbitMQ 4.3 | StrangeQ | StrangeQ advantage |
 |---|--:|--:|--:|
-| Durable + publisher confirms, 10 pub / 10 con | 28,616 msg/s | 104,986 msg/s | 3.67x |
-| Durable, 1 pub / 1 con | 85,353 msg/s | 127,711 msg/s | 1.50x |
-| Durable, 30 pub / 30 con | ~31,000 msg/s | ~109,000 msg/s | ~3.5x |
-| Durable, 64 KB body, 1 pub / 1 con | 22,027 msg/s | 25,177 msg/s | 1.14x |
+| 1 pub / 1 con | 59,554 msg/s | 105,790 msg/s | 1.78x |
+| 10 pub / 10 con | 28,942 msg/s | 104,039 msg/s | 3.59x |
+| 30 pub / 30 con | 24,979 msg/s | 99,586 msg/s | 3.99x |
+| 64 KB body, 1 pub / 1 con | 19,428 msg/s | 20,868 msg/s | 1.07x |
 
-The 64 KB figure is a median of 3 runs (individual runs ranged from 0.99x to 1.15x). All other figures are steady-state medians of a 20-second run.
+RabbitMQ 4.3 rejects transient non-exclusive queues by default, so the head-to-head is run on durable queues with publisher confirms. Non-durable queues on StrangeQ reach roughly 140K msg/s (1 pub / 1 con, 1 KB, host-native).
 
 ### Crash safety
 
 Confirmed durable messages survive `kill -9` and are recovered on restart. The invariant is **confirm ⇒ fsynced ⇒ recoverable**: a publish is confirmed only after its WAL batch is fsynced, so every confirmed message is present after a crash.
-
-### Transient (non-durable) throughput — reported standalone
-
-StrangeQ also serves transient queues at high throughput. Because RabbitMQ 4.3 refuses transient non-exclusive queues, this is **not** a head-to-head figure and is reported on its own: roughly **140K msg/s** for 1 pub / 1 con, 1 KB bodies, host-native (no container).
 
 ### Reproducing
 
 ```bash
 cd src/amqp-go
 
-# Durable + publisher confirms, 10 producers / 10 consumers, 1 KB, 20s
+# 1 producer / 1 consumer, 1 KB, 20s
+go run ./cmd/perftest -url amqp://guest:guest@localhost:5672/ \
+  -durable -confirm -producers 1 -consumers 1 -size 1024 -duration 20s
+
+# 10 producers / 10 consumers, 1 KB
 go run ./cmd/perftest -url amqp://guest:guest@localhost:5672/ \
   -durable -confirm -producers 10 -consumers 10 -size 1024 -duration 20s
 
-# Durable, single producer / single consumer
+# 30 producers / 30 consumers, 1 KB
 go run ./cmd/perftest -url amqp://guest:guest@localhost:5672/ \
-  -durable -producers 1 -consumers 1 -size 1024 -duration 20s
+  -durable -confirm -producers 30 -consumers 30 -size 1024 -duration 20s
 
-# Durable, 64 KB bodies
+# 64 KB bodies, 1 producer / 1 consumer
 go run ./cmd/perftest -url amqp://guest:guest@localhost:5672/ \
-  -durable -producers 1 -consumers 1 -size 65536 -duration 20s
+  -durable -confirm -producers 1 -consumers 1 -size 65536 -duration 20s
 ```
 
 Point `-url` at either broker (both speak AMQP 0.9.1). To run RabbitMQ 4.3 the same way:
 
 ```bash
-docker run -d --name rabbitmq-bench -p 5672:5672 rabbitmq:4.3-management
+docker run -d --name rabbitmq-bench --platform linux/arm64 -p 5672:5672 rabbitmq:4.3-management
 ```
 
 A Go microbenchmark (`BenchmarkVersus`) also exists for allocation/latency profiling of the hot path.
@@ -447,6 +446,7 @@ The following RabbitMQ features are not implemented:
 - **ACK Offloading**: A dedicated goroutine handles ACK/NACK/reject frames — eliminates head-of-line blocking on the frame processor
 - **Batched TCP Writes**: Deliveries in a batch are serialized into a single buffer and sent with one write — reduces syscalls and lock acquisitions
 - **Direct-Write Serialization**: Frame bytes are written directly into the batch buffer — eliminates intermediate object allocations
+- **Vectored Delivery**: Message bodies of 32 KB or larger are delivered with scatter-gather I/O (`writev`) — the body is sent directly from its buffer with no intermediate copy
 - **Object Pooling**: Frames, publish methods, pending messages, and content headers are pooled via `sync.Pool`
 - **Flow Control**: `channel.flow` gates delivery forwarding with a single atomic load — zero overhead when flow is active
 
