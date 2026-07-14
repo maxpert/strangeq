@@ -339,6 +339,11 @@ func (qs *QueueState) WakeAll() {
 }
 
 func (qs *QueueState) Claim(stop <-chan struct{}, timer *time.Timer) (uint64, bool, bool) {
+	select {
+	case <-stop:
+		return 0, false, false
+	default:
+	}
 	if t, r, ok := qs.tryPopRequeue(); ok {
 		return t, r, true
 	}
@@ -350,6 +355,11 @@ func (qs *QueueState) Claim(stop <-chan struct{}, timer *time.Timer) (uint64, bo
 				return t, false, true
 			}
 			continue
+		}
+		select {
+		case <-stop:
+			return 0, false, false
+		default:
 		}
 		if t2, r, ok := qs.tryPopRequeue(); ok {
 			return t2, r, true
