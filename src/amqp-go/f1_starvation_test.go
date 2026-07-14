@@ -335,3 +335,81 @@ func TestF1_Starvation_fsyncOff_AutoAck_SameConnection(t *testing.T) {
 		}
 	}()
 }
+
+// ============================================================================
+// Secondary finding: teardown hang in UnregisterConsumer when the poll loop
+// is mid-delivery with messages in the queue.
+//
+// Claim() checks tryPopRequeue() BEFORE checking stop. When stopCh is closed
+// during UnregisterConsumer, the poll loop's deliverMessage stopCh case
+// requeues the current tag. Claim() then pops it from the requeue ring
+// (before checking stop), deliverMessage requeues it again, and the loop
+// never exits. UnregisterConsumer hangs forever on <-state.done.
+// ============================================================================
+
+// TestF1_TeardownHang_CancelWhileBusy publishes messages, starts a consumer,
+// lets it receive some, then cancels it while messages are still in the queue.
+// Asserts the cancel (UnregisterConsumer) completes within 10 seconds.
+func TestF1_TeardownHang_CancelWhileBusy(t *testing.T) {
+	uri, cleanup := f1Server(t, false)
+	defer cleanup()
+
+	queueName := fmt.Sprintf("f1-teardown-%d", f1PortCounter.Load())
+
+	conn, err := amqp.Dial(uri)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	ch, err := conn.Channel()
+	if err != nil {
+		t.Fatalf("channel: %v", err)
+	}
+	if _, err := ch.QueueDeclare(queueName, true, false, false, false, nil); err != nil {
+		t.Fatalf("queue declare: %v", err)
+	}
+
+	// Publish 2000 durable messages BEFORE starting a consumer, so the queue
+	// is deep when the consumer attaches and the poll loop is always busy.
+	body := make([]byte, 1024)
+	for i := 0; i < 2000; i++ {
+		if err := ch.PublishWithContext(context.Background(), "", queueName, false, false, amqp.Publishing{
+			DeliveryMode: amqp.Persistent,
+			Body:         body,
+		}); err != nil {
+			t.Fatalf("publish %d: %v", i, err)
+		}
+	}
+
+	// Start an auto-ack consumer.
+	msgs, err := ch.Consume(queueName, "f1-teardown-consumer", true, false, false, false, nil)
+	if err != nil {
+		t.Fatalf("consume: %v", err)
+	}
+
+	// Wait for the consumer to receive at least 1 message (proves it works).
+	select {
+	case <-msgs:
+	case <-time.After(5 * time.Second):
+		f1GoroutineDump(t, "no-delivery")
+		t.Fatal("consumer never received any messages within 5s")
+	}
+
+	// Cancel the consumer while the queue still has ~1999 messages. The poll
+	// loop is almost certainly mid-delivery. If the Claim/stopCh requeue loop
+	// bug is present, this cancel hangs forever.
+	cancelDone := make(chan error, 1)
+	go func() {
+		cancelDone <- ch.Cancel("f1-teardown-consumer", false)
+	}()
+
+	select {
+	case err := <-cancelDone:
+		if err != nil {
+			t.Fatalf("cancel failed: %v", err)
+		}
+		t.Log("PASS: consumer cancel completed promptly (no teardown hang)")
+	case <-time.After(10 * time.Second):
+		f1GoroutineDump(t, "cancel-hang")
+		t.Fatal("TEARDOWN HANG: basic.cancel did not complete within 10s — UnregisterConsumer stuck on <-state.done (infinite requeue loop in poll loop)")
+	}
+}
