@@ -80,6 +80,14 @@ func (b *ConfigBuilder) WithFsync(enabled bool) *ConfigBuilder {
 	return b
 }
 
+// WithCRCCheck enables/disables CRC32 integrity checks for WAL/segment records.
+// It sets the tri-state flag to an explicit value (never nil), so building via
+// the fluent API always expresses a concrete integrity choice.
+func (b *ConfigBuilder) WithCRCCheck(enabled bool) *ConfigBuilder {
+	b.config.Storage.CRCCheck = &enabled
+	return b
+}
+
 // WithCacheSize sets the storage cache size in megabytes
 func (b *ConfigBuilder) WithCacheSize(sizeMB int64) *ConfigBuilder {
 	b.config.Storage.CacheMB = sizeMB

@@ -175,7 +175,7 @@ func TestSharedBody_HotPathInlineByteIdentity(t *testing.T) {
 	assert.Equal(t, 0, counts.RefBodies, "single-queue write carries no reference")
 
 	// Byte-identity: the on-disk record equals a freshly serialized inline record.
-	golden, gerr := appendMessageRecord(nil, "q0", msg, 1)
+	golden, gerr := appendMessageRecord(nil, "q0", msg, 1, false)
 	require.NoError(t, gerr)
 	onDisk := readFirstRecordBytes(t, tmpDir)
 	assert.Equal(t, golden, onDisk, "single-queue durable record must be byte-identical to inline serialization")
@@ -211,7 +211,7 @@ func TestSharedBody_HotPathZeroAllocRegression(t *testing.T) {
 				recStart := len(buf)
 				positions[i] = currentFilePos + int64(recStart)
 				var e error
-				buf, e = appendMessageRecord(buf, req.queueName, req.message, req.offset)
+				buf, e = appendMessageRecord(buf, req.queueName, req.message, req.offset, false)
 				if e != nil {
 					buf = buf[:recStart]
 					positions[i] = -1
@@ -379,6 +379,6 @@ func TestSharedBody_SegmentRejectsDanglingRef(t *testing.T) {
 		DeliveryMode: 2,
 		BodyRef:      []byte{0, 0, 0, 0, 0, 0, 0, 8},
 	}
-	_, err := serializeSegmentMessage(msg, 1)
+	_, err := serializeSegmentMessage(msg, 1, false)
 	require.Error(t, err, "serializing a body reference into a segment must fail")
 }

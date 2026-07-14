@@ -172,6 +172,15 @@ type WALConfig struct {
 	// transactions remain durable even when this is set.
 	SyncDisabled bool
 
+	// CRCDisabled, when true, skips CRC32 computation on the write path (writes
+	// zero in the CRC field) and skips verification on the read path (when the
+	// stored CRC is zero). Zero value (false) = CRC ON, the safe default, so
+	// DefaultWALConfig() and zero-value WALConfig{} keep integrity checks. Set
+	// via WALConfigFromEngine from the user's Storage.CRCCheck flag. The record
+	// format is unchanged: the CRC field is always present. The read path
+	// handles mixed files by verifying non-zero CRCs and skipping zero ones.
+	CRCDisabled bool
+
 	// SharedBodyMaxPinAge (ITER5 cold-tail hardening, §2) bounds how long a rolled
 	// WAL file that carries a shared BodyBlock may be kept out of checkpoint before
 	// it is force-re-inlined (N copies) and deleted. 0 disables the age backstop
@@ -648,11 +657,14 @@ func scanWALFileRecordCounts(filePath string) (WALRecordCounts, error) {
 		if _, err := io.ReadFull(f, data); err != nil {
 			break
 		}
-		crcCheck := make([]byte, 4+dataLen)
-		copy(crcCheck[0:4], hdr[4:8])
-		copy(crcCheck[4:], data)
-		if binary.BigEndian.Uint32(hdr[0:4]) != crc32.ChecksumIEEE(crcCheck) {
-			continue
+		storedCRC := binary.BigEndian.Uint32(hdr[0:4])
+		if storedCRC != 0 {
+			h := crc32.NewIEEE()
+			h.Write(hdr[4:8])
+			h.Write(data)
+			if storedCRC != h.Sum32() {
+				continue
+			}
 		}
 		recType, payload := recordTypeAndPayload(data)
 		switch recType {
@@ -709,7 +721,7 @@ func (qw *QueueWAL) writeTxAtomic(records []*RecoveryMessage) error {
 
 	// Serialize [Begin][record...][Commit] into a single contiguous buffer and
 	// record each message record's start position for the offset index.
-	buf := serializeTxMarker(WALTxMarkerBegin, epoch)
+	buf := serializeTxMarker(WALTxMarkerBegin, epoch, qw.cfg.CRCDisabled)
 	positions := make([]int64, len(records))
 	for i, rec := range records {
 		positions[i] = startPos + int64(len(buf))
@@ -722,7 +734,7 @@ func (qw *QueueWAL) writeTxAtomic(records []*RecoveryMessage) error {
 		}
 		buf = append(buf, recBytes...)
 	}
-	buf = append(buf, serializeTxMarker(WALTxMarkerCommit, epoch)...)
+	buf = append(buf, serializeTxMarker(WALTxMarkerCommit, epoch, qw.cfg.CRCDisabled)...)
 
 	n, err := qw.currentFile.Write(buf)
 	if err != nil {
@@ -940,13 +952,15 @@ func (qw *QueueWAL) scanWALFile(filePath string) ([]*RecoveryMessage, error) {
 		curRecStart := recStart
 		recStart += 8 + int64(dataLen)
 
-		// Verify CRC over [length][data].
-		crcCheckData := make([]byte, 4+dataLen)
-		copy(crcCheckData[0:4], hdr[4:8])
-		copy(crcCheckData[4:], data)
-		if crc != crc32.ChecksumIEEE(crcCheckData) {
-			// CRC mismatch - skip this entry (recStart already advanced).
-			continue
+		// Verify CRC over [length][data]. A zero stored CRC means CRC was
+		// disabled at write time — skip verification (mixed-file safe).
+		if crc != 0 {
+			h := crc32.NewIEEE()
+			h.Write(hdr[4:8])
+			h.Write(data)
+			if crc != h.Sum32() {
+				continue
+			}
 		}
 
 		recType, payload := recordTypeAndPayload(data)
@@ -1180,7 +1194,7 @@ func (qw *QueueWAL) flushBatch(batch []*writeRequest, bufp *[]byte, positionsp *
 			recStart := len(buf)
 			positions[i] = currentFilePos + int64(recStart) // Position in file
 			var e error
-			buf, e = appendMessageRecord(buf, req.queueName, req.message, req.offset)
+			buf, e = appendMessageRecord(buf, req.queueName, req.message, req.offset, qw.cfg.CRCDisabled)
 			if e != nil {
 				buf = buf[:recStart] // discard the failed record's partial bytes
 				positions[i] = -1
@@ -1203,7 +1217,7 @@ func (qw *QueueWAL) flushBatch(batch []*writeRequest, bufp *[]byte, positionsp *
 		u := req.unit
 		unitStart := len(buf)
 		blockStart := currentFilePos + int64(unitStart)
-		buf = appendBodyBlockRecord(buf, u.fanoutHint, u.body)
+		buf = appendBodyBlockRecord(buf, u.fanoutHint, u.body, qw.cfg.CRCDisabled)
 
 		var locator [8]byte
 		binary.BigEndian.PutUint64(locator[:], uint64(blockStart))
@@ -1221,7 +1235,7 @@ func (qw *QueueWAL) flushBatch(batch []*writeRequest, bufp *[]byte, positionsp *
 			// (after this fsync), so nothing reads BodyRef concurrently here.
 			sub.message.BodyRef = locator[:]
 			var e error
-			buf, e = appendMessageRecord(buf, sub.queueName, sub.message, sub.offset)
+			buf, e = appendMessageRecord(buf, sub.queueName, sub.message, sub.offset, qw.cfg.CRCDisabled)
 			sub.message.BodyRef = nil
 			if e != nil {
 				unitErr = e
@@ -1417,7 +1431,7 @@ func (qw *QueueWAL) deliverCompletions(batch []*writeRequest, serErr []error, ba
 // contains a shortstr property longer than 255 bytes.
 func (qw *QueueWAL) serializeMessageVersioned(queueName string, message *protocol.Message, offset uint64) ([]byte, error) {
 	buf := make([]byte, 0, len(message.Body)+len(message.Exchange)+len(message.RoutingKey)+len(queueName)+256)
-	return appendMessageRecord(buf, queueName, message, offset)
+	return appendMessageRecord(buf, queueName, message, offset, qw.cfg.CRCDisabled)
 }
 
 // appendMessageRecord serializes ONE v4 message record onto the TAIL of buf (grow
@@ -1439,7 +1453,7 @@ func (qw *QueueWAL) serializeMessageVersioned(queueName string, message *protoco
 // On a shortstr overflow (a property >255 bytes) it returns the error together
 // with the partially-grown buffer; the caller MUST roll back to recStart (the
 // batch writer does) so no partial/corrupt record is ever written.
-func appendMessageRecord(buf []byte, queueName string, message *protocol.Message, offset uint64) ([]byte, error) {
+func appendMessageRecord(buf []byte, queueName string, message *protocol.Message, offset uint64, crcDisabled bool) ([]byte, error) {
 	recStart := len(buf)
 
 	// Reserve space for CRC and length (patched below, record-relative).
@@ -1458,9 +1472,10 @@ func appendMessageRecord(buf []byte, queueName string, message *protocol.Message
 	dataLen := len(buf) - recStart - 8
 	binary.BigEndian.PutUint32(buf[recStart+4:recStart+8], uint32(dataLen))
 
-	// Calculate CRC over everything after this record's CRC field.
-	crc := crc32.ChecksumIEEE(buf[recStart+4:])
-	binary.BigEndian.PutUint32(buf[recStart:recStart+4], crc)
+	if !crcDisabled {
+		crc := crc32.ChecksumIEEE(buf[recStart+4:])
+		binary.BigEndian.PutUint32(buf[recStart:recStart+4], crc)
+	}
 
 	return buf, nil
 }
@@ -1671,7 +1686,7 @@ func appendHeaders(buf []byte, headers map[string]interface{}) []byte {
 
 // serializeTxMarker serializes a transaction-boundary marker record (SQ-8, v2
 // only): [CRC][length][type=TxBoundary][kind][epoch]. kind is Begin or Commit.
-func serializeTxMarker(kind uint8, epoch uint64) []byte {
+func serializeTxMarker(kind uint8, epoch uint64, crcDisabled bool) []byte {
 	buf := make([]byte, 0, 8+1+walTxMarkerPayloadLen)
 	buf = append(buf, 0, 0, 0, 0) // CRC placeholder
 	buf = append(buf, 0, 0, 0, 0) // length placeholder
@@ -1681,8 +1696,10 @@ func serializeTxMarker(kind uint8, epoch uint64) []byte {
 
 	dataLen := len(buf) - 8
 	binary.BigEndian.PutUint32(buf[4:8], uint32(dataLen))
-	crc := crc32.ChecksumIEEE(buf[4:])
-	binary.BigEndian.PutUint32(buf[0:4], crc)
+	if !crcDisabled {
+		crc := crc32.ChecksumIEEE(buf[4:])
+		binary.BigEndian.PutUint32(buf[0:4], crc)
+	}
 	return buf
 }
 
@@ -1696,7 +1713,7 @@ func serializeTxMarker(kind uint8, epoch uint64) []byte {
 // records — a block and its refs — pack contiguously into one batch buffer. The
 // body is copied exactly once. This helper never fails (a body's length is a u32;
 // callers cap body size well below 4 GiB).
-func appendBodyBlockRecord(buf []byte, fanoutHint uint32, body []byte) []byte {
+func appendBodyBlockRecord(buf []byte, fanoutHint uint32, body []byte, crcDisabled bool) []byte {
 	recStart := len(buf)
 
 	buf = append(buf, 0, 0, 0, 0) // CRC32 placeholder
@@ -1708,8 +1725,10 @@ func appendBodyBlockRecord(buf []byte, fanoutHint uint32, body []byte) []byte {
 
 	dataLen := len(buf) - recStart - 8
 	binary.BigEndian.PutUint32(buf[recStart+4:recStart+8], uint32(dataLen))
-	crc := crc32.ChecksumIEEE(buf[recStart+4:])
-	binary.BigEndian.PutUint32(buf[recStart:recStart+4], crc)
+	if !crcDisabled {
+		crc := crc32.ChecksumIEEE(buf[recStart+4:])
+		binary.BigEndian.PutUint32(buf[recStart:recStart+4], crc)
+	}
 	return buf
 }
 
@@ -2290,14 +2309,15 @@ func (qw *QueueWAL) readMessageAtPosition(queueName string, fileNum uint64, file
 		return nil, err
 	}
 
-	// Verify CRC (calculated over [length_bytes][data])
-	crcCheckData := make([]byte, 4+dataLen)
-	copy(crcCheckData[0:4], header[4:8])
-	copy(crcCheckData[4:], data)
-	calculatedCRC := crc32.ChecksumIEEE(crcCheckData)
-
-	if crc != calculatedCRC {
-		return nil, fmt.Errorf("CRC mismatch for offset %d (expected %d, got %d)", expectedOffset, crc, calculatedCRC)
+	// Verify CRC (calculated over [length_bytes][data]). A zero stored CRC
+	// means CRC was disabled at write time — skip verification.
+	if crc != 0 {
+		h := crc32.NewIEEE()
+		h.Write(header[4:8])
+		h.Write(data)
+		if crc != h.Sum32() {
+			return nil, fmt.Errorf("CRC mismatch for offset %d (expected %d, got %d)", expectedOffset, crc, h.Sum32())
+		}
 	}
 
 	// The offset index is populated only by writes made in the current process,
@@ -2364,11 +2384,13 @@ func readBodyBlockAt(file *os.File, position int64) ([]byte, error) {
 		return nil, err
 	}
 
-	crcCheck := make([]byte, 4+dataLen)
-	copy(crcCheck[0:4], header[4:8])
-	copy(crcCheck[4:], data)
-	if crc != crc32.ChecksumIEEE(crcCheck) {
-		return nil, fmt.Errorf("CRC mismatch for body block at %d", position)
+	if crc != 0 {
+		h := crc32.NewIEEE()
+		h.Write(header[4:8])
+		h.Write(data)
+		if crc != h.Sum32() {
+			return nil, fmt.Errorf("CRC mismatch for body block at %d", position)
+		}
 	}
 
 	recType, payload := recordTypeAndPayload(data)
@@ -2473,12 +2495,15 @@ func (qw *QueueWAL) readMessageFromFile(queueName string, filePath string, offse
 		curRecStart := recStart
 		recStart += 8 + int64(dataLen)
 
-		// Verify CRC (calculated over [length_bytes][data])
-		crcCheckData := make([]byte, 4+dataLen)
-		copy(crcCheckData[0:4], hdr[4:8])
-		copy(crcCheckData[4:], data)
-		if crc != crc32.ChecksumIEEE(crcCheckData) {
-			return nil, fmt.Errorf("CRC mismatch in sequential scan")
+		// Verify CRC (calculated over [length_bytes][data]). A zero stored CRC
+		// means CRC was disabled at write time — skip verification.
+		if crc != 0 {
+			h := crc32.NewIEEE()
+			h.Write(hdr[4:8])
+			h.Write(data)
+			if crc != h.Sum32() {
+				return nil, fmt.Errorf("CRC mismatch in sequential scan")
+			}
 		}
 
 		recType, payload := recordTypeAndPayload(data)

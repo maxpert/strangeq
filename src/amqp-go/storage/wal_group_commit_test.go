@@ -36,7 +36,7 @@ func TestAppendMessageRecord_BackpatchOffsets(t *testing.T) {
 	for i, m := range msgs {
 		starts[i] = len(buf)
 		var err error
-		buf, err = appendMessageRecord(buf, "q", m, uint64(i+1))
+		buf, err = appendMessageRecord(buf, "q", m, uint64(i+1), false)
 		require.NoError(t, err)
 	}
 

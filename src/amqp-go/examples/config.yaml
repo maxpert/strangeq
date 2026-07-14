@@ -27,6 +27,9 @@ storage:
   # Fsync after each WAL batch write (the durable default; matches RabbitMQ
   # persistent-message semantics). Set false only to trade durability for speed.
   fsync: true
+  # CRC32 integrity checks for WAL/segment records (the safe default).
+  # Set false to trade integrity checking for speed (~8% CPU savings).
+  crccheck: true
   cachemb: 64                      # 64 MB metadata cache
   maxfiles: 100                    # Max open file handles
   retentionms: 86400000            # 24 hours

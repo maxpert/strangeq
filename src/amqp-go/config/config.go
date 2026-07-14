@@ -42,6 +42,7 @@ func DefaultConfig() *AMQPConfig {
 			// emits `fsync: true` (not `fsync: null`) and the no-config path is
 			// unambiguously durable. Set fsync:false to opt out of the barrier.
 			Fsync:                boolPtr(true),
+			CRCCheck:             boolPtr(true),
 			CacheMB:              64,       // 64 MB metadata cache
 			MaxFiles:             100,      // Max open file handles
 			RetentionMS:          86400000, // 24 hours
@@ -155,12 +156,21 @@ func (c *AMQPConfig) FsyncEnabled() bool {
 	return c.Storage.Fsync == nil || *c.Storage.Fsync
 }
 
+// CRCEnabled reports whether WAL/segment record CRC32 integrity checks are
+// active. The tri-state Storage.CRCCheck defaults to ON: nil (omitted) or an
+// explicit true both enable it; only an explicit false disables it.
+func (c *AMQPConfig) CRCEnabled() bool {
+	return c.Storage.CRCCheck == nil || *c.Storage.CRCCheck
+}
+
 // GetEngine returns engine tuning configuration. It overlays the single user
-// fsync knob onto the internal (inverted) WALSyncDisabled transport so the
-// storage layer honors it while every zero-value path stays durable.
+// fsync knob onto the internal (inverted) WALSyncDisabled transport and the
+// CRC knob onto WALCRCDisabled so the storage layer honors both while every
+// zero-value path stays durable and integrity-checked.
 func (c *AMQPConfig) GetEngine() interfaces.EngineConfig {
 	e := c.Engine
 	e.WALSyncDisabled = !c.FsyncEnabled()
+	e.WALCRCDisabled = !c.CRCEnabled()
 	return e
 }
 

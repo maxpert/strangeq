@@ -46,6 +46,12 @@ type SegmentConfig struct {
 	CompactionThreshold float64
 	CompactionInterval  time.Duration
 	CheckpointInterval  time.Duration
+
+	// CRCDisabled, when true, skips CRC32 computation on segment writes (writes
+	// zero in the CRC field) and skips verification on reads (when stored CRC
+	// is zero). Zero value (false) = CRC ON, the safe default. Set via
+	// SegmentConfigFromEngine from the user's Storage.CRCCheck flag.
+	CRCDisabled bool
 }
 
 // DefaultSegmentConfig returns a SegmentConfig with production defaults
@@ -339,7 +345,7 @@ func (qs *QueueSegments) writeMessageBatch(messages []*RecoveryMessage) error {
 
 	for _, rm := range messages {
 		position := qs.currentSegment.fileSize.Load() + int64(len(buf))
-		msgBytes, err := serializeSegmentMessage(rm.Message, rm.Offset)
+		msgBytes, err := serializeSegmentMessage(rm.Message, rm.Offset, qs.cfg.CRCDisabled)
 		if err != nil {
 			// A record that cannot be encoded (shortstr property >255 bytes) fails
 			// the whole checkpoint batch rather than writing a corrupt segment;
@@ -468,7 +474,7 @@ func (qs *QueueSegments) writeMessage(message *protocol.Message, offset uint64) 
 	}
 
 	// Serialize message
-	msgBytes, err := serializeSegmentMessage(message, offset)
+	msgBytes, err := serializeSegmentMessage(message, offset, qs.cfg.CRCDisabled)
 	if err != nil {
 		return fmt.Errorf("failed to serialize segment message at offset %d: %w", offset, err)
 	}
@@ -716,7 +722,7 @@ func (qs *QueueSegments) compactSegment(segment *SegmentFile) {
 			// Message not ACKed - copy to new segment
 			msg, err := readSegmentMessageAt(segment.file, oldPosition)
 			if err == nil {
-				msgBytes, serErr := serializeSegmentMessage(msg, offset)
+				msgBytes, serErr := serializeSegmentMessage(msg, offset, qs.cfg.CRCDisabled)
 				if serErr != nil {
 					// Re-serializing an already-persisted message should never fail
 					// (it was ≤255-byte-bounded when first written); if it somehow
@@ -858,11 +864,13 @@ func (qs *QueueSegments) loadSegmentFile(segmentNum uint64, segPath string) erro
 			break
 		}
 
-		crcData := make([]byte, 4+dataLen)
-		copy(crcData[0:4], header[4:8])
-		copy(crcData[4:], data)
-		if crc32.ChecksumIEEE(crcData) != storedCRC {
-			break
+		if storedCRC != 0 {
+			h := crc32.NewIEEE()
+			h.Write(header[4:8])
+			h.Write(data)
+			if h.Sum32() != storedCRC {
+				break
+			}
 		}
 
 		// Extract the offset from the v4 payload to index the record: the payload
@@ -1023,7 +1031,7 @@ func (qs *QueueSegments) close() {
 // Returns an error (and a partial buffer the caller must discard) if the message
 // contains a shortstr property longer than 255 bytes; the caller must not write a
 // partial record.
-func serializeSegmentMessage(message *protocol.Message, offset uint64) ([]byte, error) {
+func serializeSegmentMessage(message *protocol.Message, offset uint64, crcDisabled bool) ([]byte, error) {
 	// ITER5 §3.6: segments are ALWAYS inline. A message that still carries a body
 	// REFERENCE would serialize a bodyKindReference arm into a segment, where no
 	// BodyBlock exists — a permanently dangling reference. Recovery/checkpoint
@@ -1050,9 +1058,10 @@ func serializeSegmentMessage(message *protocol.Message, offset uint64) ([]byte, 
 	dataLen := len(buf) - 8
 	binary.BigEndian.PutUint32(buf[4:8], uint32(dataLen))
 
-	// Calculate CRC over everything after the CRC field.
-	crc := crc32.ChecksumIEEE(buf[4:])
-	binary.BigEndian.PutUint32(buf[0:4], crc)
+	if !crcDisabled {
+		crc := crc32.ChecksumIEEE(buf[4:])
+		binary.BigEndian.PutUint32(buf[0:4], crc)
+	}
 
 	return buf, nil
 }
@@ -1069,23 +1078,26 @@ func readSegmentMessageAt(file *os.File, position int64) (*protocol.Message, err
 	storedCRC := binary.BigEndian.Uint32(header[0:4])
 	dataLen := binary.BigEndian.Uint32(header[4:8])
 
-	// Read data portion: [length][<message payload v4>]
-	crcData := make([]byte, 4+dataLen)
-	copy(crcData[0:4], header[4:8]) // length field
-	_, err = file.ReadAt(crcData[4:], position+8)
+	// Read data portion
+	data := make([]byte, dataLen)
+	_, err = file.ReadAt(data, position+8)
 	if err != nil {
 		return nil, err
 	}
 
-	// Verify CRC over [length][data...]
-	calculatedCRC := crc32.ChecksumIEEE(crcData)
-	if calculatedCRC != storedCRC {
-		return nil, fmt.Errorf("CRC mismatch")
+	// Verify CRC over [length][data]. A zero stored CRC means CRC was disabled
+	// at write time — skip verification.
+	if storedCRC != 0 {
+		h := crc32.NewIEEE()
+		h.Write(header[4:8])
+		h.Write(data)
+		if h.Sum32() != storedCRC {
+			return nil, fmt.Errorf("CRC mismatch")
+		}
 	}
 
 	// Parse the shared v4 payload (queue name is empty and ignored; the offset is
 	// carried on the reconstructed message's DeliveryTag).
-	data := crcData[4:] // skip length field
 	_, _, msg, ok := parseMessagePayload(data)
 	if !ok {
 		return nil, fmt.Errorf("invalid segment data: malformed message record")

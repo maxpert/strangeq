@@ -430,7 +430,7 @@ func TestWAL_V4_ByteGolden(t *testing.T) {
 	expectedRecord = append(expectedRecord, data...)
 	binary.BigEndian.PutUint32(expectedRecord[0:4], crc32.ChecksumIEEE(expectedRecord[4:]))
 
-	gotRecord, err := appendMessageRecord(nil, queue, msg, offset)
+	gotRecord, err := appendMessageRecord(nil, queue, msg, offset, false)
 	require.NoError(t, err)
 	assert.True(t, bytes.Equal(expectedRecord, gotRecord),
 		"v4 record framing drift\nwant=%x\ngot =%x", expectedRecord, gotRecord)
@@ -527,7 +527,7 @@ func TestWAL_HotPathZeroAlloc(t *testing.T) {
 		buf = buf[:0]
 		for j := 0; j < perBatch; j++ {
 			var err error
-			buf, err = appendMessageRecord(buf, "q", msg, uint64(j))
+			buf, err = appendMessageRecord(buf, "q", msg, uint64(j), false)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -552,7 +552,7 @@ func BenchmarkAppendMessageRecord_NoProps(b *testing.B) {
 	for i := 0; i < b.N; i++ {
 		buf = buf[:0]
 		var err error
-		buf, err = appendMessageRecord(buf, "q", msg, uint64(i))
+		buf, err = appendMessageRecord(buf, "q", msg, uint64(i), false)
 		if err != nil {
 			b.Fatal(err)
 		}

@@ -141,10 +141,10 @@ func TestWALRecovery_IgnoresUncommittedTransaction(t *testing.T) {
 	require.NoError(t, err)
 
 	buf := append([]byte(WALMagic), WALFormatVersion)
-	buf = append(buf, serializeTxMarker(WALTxMarkerBegin, epochCommitted)...)
+	buf = append(buf, serializeTxMarker(WALTxMarkerBegin, epochCommitted, false)...)
 	buf = append(buf, committedBytes...)
-	buf = append(buf, serializeTxMarker(WALTxMarkerCommit, epochCommitted)...)
-	buf = append(buf, serializeTxMarker(WALTxMarkerBegin, epochUncommitted)...)
+	buf = append(buf, serializeTxMarker(WALTxMarkerCommit, epochCommitted, false)...)
+	buf = append(buf, serializeTxMarker(WALTxMarkerBegin, epochUncommitted, false)...)
 	buf = append(buf, uncommittedBytes...)
 
 	// Use a high file number so it does not collide with the empty file the WAL
@@ -183,9 +183,9 @@ func TestWALRecovery_TornCommitMarkerDiscardsTransaction(t *testing.T) {
 	require.NoError(t, err)
 
 	buf := append([]byte(WALMagic), WALFormatVersion)
-	buf = append(buf, serializeTxMarker(WALTxMarkerBegin, 7)...)
+	buf = append(buf, serializeTxMarker(WALTxMarkerBegin, 7, false)...)
 	buf = append(buf, msgBytes...)
-	commit := serializeTxMarker(WALTxMarkerCommit, 7)
+	commit := serializeTxMarker(WALTxMarkerCommit, 7, false)
 	// Truncate the commit marker to simulate a crash mid-write of the tail.
 	buf = append(buf, commit[:len(commit)-3]...)
 
