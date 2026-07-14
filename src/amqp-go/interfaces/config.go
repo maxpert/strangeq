@@ -231,6 +231,13 @@ type EngineConfig struct {
 	// Default: 80 (start spilling at 80% full = 51,200 messages)
 	SpillThresholdPercent int `json:"spill_threshold_percent"`
 
+	// DepthHighWMOverride, when > 0, directly sets the per-queue backpressure
+	// high-water mark instead of deriving it from RingBufferSize ×
+	// SpillThresholdPercent. Lowering it trades throughput for latency: a
+	// shallower queue means messages spend less time waiting. 0 (default) keeps
+	// the computed HWM (zero behavior regression).
+	DepthHighWMOverride uint64 `json:"depth_high_wm_override"`
+
 	// ========================================
 	// Write-Ahead Log (WAL)
 	// ========================================

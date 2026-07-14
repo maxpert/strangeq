@@ -237,6 +237,12 @@ engine:
   # Default: 80 (start spilling at 80% full = 51,200 messages for 64K ring)
   spillthresholdpercent: 80
 
+  # Depth high-water-mark override (0 = compute from ring buffer size × spill %)
+  # When > 0, directly sets the per-queue backpressure high-water mark.
+  # Lowering it trades throughput for latency: a shallower queue means messages
+  # spend less time waiting. Default: 0 (computed, current behavior).
+  depthhighwmoverride: 0
+
   # ========================================
   # Write-Ahead Log (WAL)
   # ========================================
