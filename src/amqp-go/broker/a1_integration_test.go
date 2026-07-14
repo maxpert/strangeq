@@ -85,7 +85,6 @@ func TestA1Integration_FanoutMultipleQueues(t *testing.T) {
 		var ok bool
 		for {
 			tag, _, ok = qs.Claim(stop, testTimer(qs))
-			cancel()
 			if !ok {
 				t.Errorf("Claim for %s failed", queue)
 				break
@@ -101,6 +100,7 @@ func TestA1Integration_FanoutMultipleQueues(t *testing.T) {
 				break
 			}
 		}
+		cancel()
 	}
 }
 
