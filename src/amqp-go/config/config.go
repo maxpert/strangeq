@@ -94,6 +94,7 @@ func DefaultConfig() *AMQPConfig {
 			// Ring Buffer (Hot Path)
 			RingBufferSize:        65536, // 64K messages = ~6.5 MB per queue
 			SpillThresholdPercent: 80,    // Start spilling at 80% = 51,200 messages
+			DepthHighWMOverride:   0,     // 0 = compute HWM from ring size × spill % (default)
 
 			// Write-Ahead Log (WAL)
 			WALBatchSize:      1000,              // 1,000 messages per batch
