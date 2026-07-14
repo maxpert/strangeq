@@ -2281,16 +2281,24 @@ func (b *StorageBroker) fanoutSharedSync(sdw sharedDurableWriter, message *proto
 // to the supplied transactional storage view (txnStore) instead of the live
 // broker storage, and DEFERS making the message visible to consumers.
 //
-// The returned closures perform the "make visible" step (advance the per-queue
-// head cursor and wake consumers). The caller runs them only AFTER the atomic
-// storage commit has succeeded, so a transaction that aborts (a later operation
-// fails) leaves nothing durable AND nothing visible — no consumer can observe a
-// message from a transaction that never committed. This preserves the invariant
-// that a message becomes visible only after it is durable.
+// The tag is reserved on the per-queue contiguous frontier at STAGE TIME via
+// FrontierReserve (minting inside the callback, same as PublishMessage). This
+// closes the transient-vs-tx visibility race: a concurrent non-tx publish's
+// FrontierComplete can never advance head past this still-pending tag, so the
+// consumer can never claim (and gap-skip) a tx tag before its message is
+// committed to real storage. The deferred closure calls FrontierComplete(tag,
+// true) after the atomic commit (the message is durable/stored), or
+// FrontierComplete(tag, false) on abort (releasing the frontier slot so the tag
+// is gap-skipped, never stranded).
+//
+// The returned closures are run by the transaction manager: apply(true) after a
+// successful commit, apply(false) after a rollback. On a mid-fanout failure
+// inside this function, all already-reserved frontier slots are released before
+// returning the error, so no slot is stranded.
 //
 // This is the slow path; it deliberately duplicates PublishMessage rather than
 // refactoring it, to leave the non-transactional publish hot path untouched.
-func (b *StorageBroker) PublishMessageTx(txnStore interfaces.Storage, exchangeName, routingKey string, message *protocol.Message) ([]func(), error) {
+func (b *StorageBroker) PublishMessageTx(txnStore interfaces.Storage, exchangeName, routingKey string, message *protocol.Message) ([]func(bool), error) {
 	exchange, err := b.storage.GetExchange(exchangeName)
 	if err != nil {
 		if errors.Is(err, interfaces.ErrExchangeNotFound) {
@@ -2329,16 +2337,33 @@ func (b *StorageBroker) PublishMessageTx(txnStore interfaces.Storage, exchangeNa
 		message.EnqueueUnixMilli = b.ttlNowMillis()
 	}
 
-	deferred := make([]func(), 0, len(targetQueues))
+	deferred := make([]func(bool), 0, len(targetQueues))
+
+	type reservedSlot struct {
+		qs  *QueueState
+		tag uint64
+	}
+	reserved := make([]reservedSlot, 0, len(targetQueues))
+	releaseReserved := func() {
+		for _, r := range reserved {
+			r.qs.FrontierComplete(r.tag, false)
+		}
+	}
 
 	for i, queueName := range targetQueues {
 		queueState := b.getOrCreateQueueState(queueName)
 
 		if !queueState.WaitForCapacity(queueState.StopCh()) {
+			releaseReserved()
 			return nil, fmt.Errorf("queue '%s' closed during backpressure wait", queueName)
 		}
 
-		msgID := b.globalDeliveryTag.Add(1)
+		// Reserve the tag on the frontier at stage time, minting inside the
+		// callback so this queue's frontier tags register in tag order (same
+		// pattern as PublishMessage). The tag stays pending on the frontier
+		// until the deferred closure calls FrontierComplete after commit/abort.
+		msgID := queueState.FrontierReserve(func() uint64 { return b.globalDeliveryTag.Add(1) })
+		reserved = append(reserved, reservedSlot{queueState, msgID})
 
 		var storeMsg *protocol.Message
 		if i == 0 {
@@ -2373,37 +2398,26 @@ func (b *StorageBroker) PublishMessageTx(txnStore interfaces.Storage, exchangeNa
 
 		// Stage the store into the transactional view (buffered until commit).
 		if err := txnStore.StoreMessage(queueName, storeMsg); err != nil {
+			releaseReserved()
 			return nil, fmt.Errorf("failed to stage message to queue '%s': %w", queueName, err)
 		}
 
-		// Defer ONLY consumer visibility until after the atomic commit succeeds.
-		// The TTL anchor is already stamped above (part of the durable write), so
-		// the closure does no TTL work.
+		// Defer consumer visibility until after the atomic commit succeeds. On
+		// commit, FrontierComplete(tag, true) makes the message visible (head
+		// advances, waiting incremented). On abort, FrontierComplete(tag, false)
+		// releases the frontier slot (head advances past the tag, never counted
+		// ready) so the consumer gap-skips it — no strand, no leak.
 		qs := queueState
 		id := msgID
 		qn := queueName
+		pol := p
 		bodyLen := len(storeMsg.Body)
-		deferred = append(deferred, func() {
-			// The tx message is durably committed by the time this runs. If the
-			// target queue has async durable-confirm publishes in flight
-			// (frontier-active), route the visibility through the frontier so this
-			// committed tag cannot jump head past an earlier still-pending durable
-			// tag (A3 FIFO); otherwise the lock-free fast path (unchanged).
-			if qs.FrontierActive() {
-				qs.FrontierPublishTransient(id)
-			} else {
-				qs.Publish(id)
-			}
-			// SQ-11 max-length for transactional publishes: byte accounting +
-			// drop-head eviction run AFTER the post-commit visibility. Since the
-			// message is already durably committed, reject-publish is NOT
-			// enforced here (refusing it would strand a durable message) — a
-			// reject-publish queue accepts tx publishes (documented divergence;
-			// W7 locks the exact tx-vs-reject-publish semantics).
-			if p != nil {
-				addReadyBytesOnEnqueue(qs, p, bodyLen)
-				if p.Overflow == OverflowDropHead && (p.HasMaxLength || p.HasMaxLengthBytes) {
-					b.dropHeadTrim(qs, qn, p)
+		deferred = append(deferred, func(commit bool) {
+			qs.FrontierComplete(id, commit)
+			if commit && pol != nil {
+				addReadyBytesOnEnqueue(qs, pol, bodyLen)
+				if pol.Overflow == OverflowDropHead && (pol.HasMaxLength || pol.HasMaxLengthBytes) {
+					b.dropHeadTrim(qs, qn, pol)
 				}
 			}
 		})

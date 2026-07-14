@@ -139,7 +139,7 @@ func TestRecovery_DurableTxTTL_ExpiredWhileDown(t *testing.T) {
 	require.NoError(t, err)
 	require.NotEqual(t, int64(0), txMsg.EnqueueUnixMilli, "durable tx TTL message must be stamped at commit")
 	for _, fn := range deferred {
-		fn()
+		fn(true)
 	}
 
 	b1.Close()

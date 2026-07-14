@@ -16,7 +16,7 @@ var errTxStagingUnsupported = errors.New("broker does not support transactional 
 // txPublishBroker is implemented by brokers that can route a publish through an
 // atomic storage staging view, deferring consumer visibility until commit.
 type txPublishBroker interface {
-	PublishMessageTx(txnStore interfaces.Storage, exchange, routingKey string, message *protocol.Message) ([]func(), error)
+	PublishMessageTx(txnStore interfaces.Storage, exchange, routingKey string, message *protocol.Message) ([]func(bool), error)
 }
 
 // UnifiedBrokerExecutorInterface defines interface for unified brokers that can act as transaction executors
@@ -56,7 +56,7 @@ func (ube *UnifiedBrokerExecutor) ExecutePublish(exchange, routingKey string, me
 // actions that the transaction manager runs only after the atomic commit
 // succeeds. Brokers without staging support return errTxStagingUnsupported so
 // the caller can fall back to immediate (non-atomic) execution.
-func (ube *UnifiedBrokerExecutor) ExecutePublishStaged(txnStore interfaces.Storage, exchange, routingKey string, message *protocol.Message) ([]func(), error) {
+func (ube *UnifiedBrokerExecutor) ExecutePublishStaged(txnStore interfaces.Storage, exchange, routingKey string, message *protocol.Message) ([]func(bool), error) {
 	if ube.broker == nil {
 		return nil, fmt.Errorf("no unified broker available for executing publish")
 	}

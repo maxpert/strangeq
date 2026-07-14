@@ -373,7 +373,7 @@ func TestRequeuePath_OverCapOvershootsUntilNextPublish(t *testing.T) {
 // publishTxToLiveStore stages a transactional publish with the LIVE store as the
 // transactional view, so the returned deferred visibility closures observe the
 // same committed state they would post-commit. Returns the deferred closures.
-func publishTxToLiveStore(t *testing.T, b *StorageBroker, queue, body string) []func() {
+func publishTxToLiveStore(t *testing.T, b *StorageBroker, queue, body string) []func(bool) {
 	t.Helper()
 	d, err := b.PublishMessageTx(b.storage, "", queue, &protocol.Message{
 		Exchange: "", RoutingKey: queue, Body: []byte(body),
@@ -392,13 +392,13 @@ func TestTx_DropHeadEvictsOldestAfterCommit(t *testing.T) {
 
 	qs := declareMaxLen(t, b, "q", map[string]interface{}{"x-max-length": int64(2)})
 
-	var deferred []func()
+	var deferred []func(bool)
 	for i := 0; i < 4; i++ {
 		deferred = append(deferred, publishTxToLiveStore(t, b, "q", fmt.Sprintf("m%d", i))...)
 	}
 	// Post-commit visibility: run the deferred closures in commit order.
 	for _, d := range deferred {
-		d()
+		d(true)
 	}
 
 	require.Equal(t, int64(2), qs.WaitingCount())
@@ -419,12 +419,12 @@ func TestTx_RejectPublishAcceptedInsideTx(t *testing.T) {
 		"x-max-length": int64(1), "x-overflow": "reject-publish",
 	})
 
-	var deferred []func()
+	var deferred []func(bool)
 	for i := 0; i < 3; i++ {
 		deferred = append(deferred, publishTxToLiveStore(t, b, "q", fmt.Sprintf("m%d", i))...)
 	}
 	for _, d := range deferred {
-		d()
+		d(true)
 	}
 
 	require.Equal(t, int64(3), qs.WaitingCount(),
