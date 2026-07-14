@@ -105,6 +105,17 @@ type StorageConfig struct {
 	// fdatasync regardless of this flag.
 	Fsync *bool
 
+	// CRCCheck controls whether WAL/segment records carry a CRC32 integrity
+	// checksum. It is a TRI-STATE pointer mirroring Fsync:
+	//   nil   = default (CRC ON, safe) — the safe default
+	//   true  = compute and verify CRC32 per record (safe but costs ~8% CPU)
+	//   false = skip CRC computation (write zero, skip verification on read;
+	//           faster, no integrity check). Only an EXPLICIT false disables it.
+	// The record format is unchanged: the CRC field is always present, just zero
+	// when disabled. The read path skips verification when the stored CRC is
+	// zero, so mixed files (some with CRC, some without) are handled gracefully.
+	CRCCheck *bool
+
 	// Message settings
 	MessageTTL int64 // Message TTL in seconds (0 = no TTL)
 
@@ -266,6 +277,15 @@ type EngineConfig struct {
 	// Smaller = less memory, potential blocking under load
 	// Default: 10,000
 	WALChannelBuffer int `json:"wal_channel_buffer"`
+
+	// WALCRCDisabled is the internal (inverted-sense) transport for the user
+	// Storage.CRCCheck flag. Zero value (false) = CRC ON (the safe default),
+	// so every zero-value EngineConfig{} — used by many constructors and tests —
+	// keeps CRC verification. Only the config layer sets it, from GetEngine():
+	// WALCRCDisabled = !CRCEnabled(). When true, the WAL and segment write
+	// paths skip CRC32 computation (write zero in the CRC field) and the read
+	// path skips verification for zero-CRC records.
+	WALCRCDisabled bool `json:"wal_crc_disabled"`
 
 	// WALSyncDisabled is the internal (inverted-sense) transport for the user
 	// Storage.Fsync flag. Zero value (false) = fsync ON (the durable default),

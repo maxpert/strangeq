@@ -84,7 +84,7 @@ func TestAppendMessageRecord_SharedBufferByteIdentical(t *testing.T) {
 				require.NoError(t, err)
 
 				// (a) fresh buffer (recStart == 0): must equal the reference exactly.
-				fresh, err := appendMessageRecord(nil, queue, &msg, offset)
+				fresh, err := appendMessageRecord(nil, queue, &msg, offset, false)
 				require.NoError(t, err)
 				assert.True(t, bytes.Equal(ref, fresh),
 					"fresh-buffer record must match reference\nref  =%x\nfresh=%x", ref, fresh)
@@ -94,7 +94,7 @@ func TestAppendMessageRecord_SharedBufferByteIdentical(t *testing.T) {
 				prefix := []byte("PRECEDING-RECORD-BYTES-XYZ")
 				shared := append([]byte(nil), prefix...)
 				recStart := len(shared)
-				shared, err = appendMessageRecord(shared, queue, &msg, offset)
+				shared, err = appendMessageRecord(shared, queue, &msg, offset, false)
 				require.NoError(t, err)
 				record := shared[recStart:]
 				assert.True(t, bytes.Equal(ref, record),
@@ -126,7 +126,7 @@ func TestAppendMessageRecord_MultiRecordSharedBuffer(t *testing.T) {
 	for i, m := range msgs {
 		starts[i] = len(buf)
 		var err error
-		buf, err = appendMessageRecord(buf, "q", m, uint64(i+1))
+		buf, err = appendMessageRecord(buf, "q", m, uint64(i+1), false)
 		require.NoError(t, err)
 	}
 
@@ -315,13 +315,13 @@ func TestSegment_TwoRecords_BackToBack(t *testing.T) {
 	path := filepath.Join(dir, "two.seg")
 
 	buf1, err := serializeSegmentMessage(
-		&protocol.Message{Exchange: "ex", RoutingKey: "first", Body: []byte("first-seg"), DeliveryMode: 2}, 5)
+		&protocol.Message{Exchange: "ex", RoutingKey: "first", Body: []byte("first-seg"), DeliveryMode: 2}, 5, false)
 	require.NoError(t, err)
 	buf2, err := serializeSegmentMessage(
 		&protocol.Message{
 			Exchange: "ex", RoutingKey: "second", Body: []byte("second-seg"), DeliveryMode: 2,
 			Expiration: "10000", EnqueueUnixMilli: 5, Headers: map[string]interface{}{"a": "b"},
-		}, 6)
+		}, 6, false)
 	require.NoError(t, err)
 
 	require.NoError(t, os.WriteFile(path, append(buf1, buf2...), 0644))

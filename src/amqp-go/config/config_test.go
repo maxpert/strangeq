@@ -445,3 +445,40 @@ func TestFsyncTriState_EngineOverlay(t *testing.T) {
 	c.Storage.Fsync = &dis
 	assert.True(t, c.GetEngine().WALSyncDisabled, "fsync:false must set WALSyncDisabled=true")
 }
+
+// TestCRCTriState_LoadPaths pins the tri-state user flag semantics for CRC,
+// mirroring TestFsyncTriState_LoadPaths: an OMITTED crc_check key must default
+// to ON (safe), so honoring the flag can never silently disable integrity checks.
+func TestCRCTriState_LoadPaths(t *testing.T) {
+	def := DefaultConfig()
+	require.NotNil(t, def.Storage.CRCCheck, "DefaultConfig must set an explicit crc_check")
+	assert.True(t, *def.Storage.CRCCheck)
+	assert.True(t, def.CRCEnabled())
+
+	cOmit := loadYAML(t, validYAMLWithFsync(""))
+	assert.Nil(t, cOmit.Storage.CRCCheck, "omitted crc_check must stay nil on a zero-value load")
+	assert.True(t, cOmit.CRCEnabled(), "omitted crc_check must default to ON (safe)")
+
+	cFalse := loadYAML(t, validYAMLWithFsync("  crccheck: false\n"))
+	require.NotNil(t, cFalse.Storage.CRCCheck)
+	assert.False(t, *cFalse.Storage.CRCCheck)
+	assert.False(t, cFalse.CRCEnabled())
+
+	cTrue := loadYAML(t, validYAMLWithFsync("  crccheck: true\n"))
+	require.NotNil(t, cTrue.Storage.CRCCheck)
+	assert.True(t, *cTrue.Storage.CRCCheck)
+	assert.True(t, cTrue.CRCEnabled())
+}
+
+// TestCRCTriState_EngineOverlay pins that the user flag threads to the engine
+// view as the INVERTED WALCRCDisabled, and that every zero value means ON.
+func TestCRCTriState_EngineOverlay(t *testing.T) {
+	assert.False(t, interfaces.EngineConfig{}.WALCRCDisabled, "zero-value EngineConfig must have CRC on")
+	assert.False(t, DefaultConfig().GetEngine().WALCRCDisabled)
+	assert.False(t, (&AMQPConfig{}).GetEngine().WALCRCDisabled)
+
+	c := DefaultConfig()
+	dis := false
+	c.Storage.CRCCheck = &dis
+	assert.True(t, c.GetEngine().WALCRCDisabled, "crc_check:false must set WALCRCDisabled=true")
+}

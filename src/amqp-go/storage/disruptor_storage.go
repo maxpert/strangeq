@@ -108,8 +108,10 @@ func NewDisruptorStorageWithCheckpointInterval(dataDir string, checkpointInterva
 
 func WALConfigFromEngine(ec interfaces.EngineConfig) WALConfig {
 	cfg := DefaultWALConfig()
-	// Unconditional copy is safe: both zero values mean fsync ON (durable).
+	// Unconditional copy is safe: both zero values mean fsync ON (durable) and
+	// CRC ON (safe).
 	cfg.SyncDisabled = ec.WALSyncDisabled
+	cfg.CRCDisabled = ec.WALCRCDisabled
 	if ec.WALBatchSize > 0 {
 		cfg.BatchSize = ec.WALBatchSize
 	}
@@ -133,6 +135,7 @@ func WALConfigFromEngine(ec interfaces.EngineConfig) WALConfig {
 
 func SegmentConfigFromEngine(ec interfaces.EngineConfig) SegmentConfig {
 	cfg := DefaultSegmentConfig()
+	cfg.CRCDisabled = ec.WALCRCDisabled
 	if ec.SegmentSize > 0 {
 		cfg.SegmentSize = ec.SegmentSize
 	}

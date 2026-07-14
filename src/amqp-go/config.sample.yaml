@@ -79,6 +79,12 @@ storage:
   # Omitting this key defaults to fsync ON (durable). Transactions always fsync.
   fsync: true
 
+  # Enable CRC32 integrity checks for WAL/segment records
+  # true = compute and verify CRC32 per record (safe, costs ~8% CPU) — the default
+  # false = skip CRC computation (write zero, skip verification on read; faster)
+  # Omitting this key defaults to CRC ON (safe). Record format is unchanged.
+  crccheck: true
+
   # Message TTL in seconds (0 = no expiration)
   messagettl: 0
 

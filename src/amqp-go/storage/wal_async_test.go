@@ -237,7 +237,7 @@ func TestAppendMessageRecord_ReuseBufferZeroAlloc(t *testing.T) {
 	serialize := func() {
 		buf = buf[:0]
 		for j := 0; j < perBatch; j++ {
-			buf, _ = appendMessageRecord(buf, "q", msg, uint64(j))
+			buf, _ = appendMessageRecord(buf, "q", msg, uint64(j), false)
 		}
 	}
 	// Warm up so the buffer reaches steady-state capacity (grow-once).
