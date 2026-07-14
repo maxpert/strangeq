@@ -88,10 +88,11 @@ type DisruptorStorage struct {
 }
 
 type QueueRing struct {
-	name   string
-	ring   *AtomicRing
-	ack    *AckCursor
-	closed atomic.Bool
+	name      string
+	ring      *AtomicRing
+	ack       *AckCursor
+	readAhead *readAheadBuffer
+	closed    atomic.Bool
 }
 
 func NewDisruptorStorage() (*DisruptorStorage, error) {
@@ -231,9 +232,10 @@ func (ds *DisruptorStorage) getOrCreateQueueRing(queueName string) *QueueRing {
 	}
 
 	ring := &QueueRing{
-		name: queueName,
-		ring: NewAtomicRing(ds.ringBufferSize),
-		ack:  NewAckCursor(),
+		name:      queueName,
+		ring:      NewAtomicRing(ds.ringBufferSize),
+		ack:       NewAckCursor(),
+		readAhead: newReadAheadBuffer(),
 	}
 
 	ds.queues.Store(queueName, ring)
@@ -402,7 +404,21 @@ func (ds *DisruptorStorage) GetMessage(queueName string, deliveryTag uint64) (*p
 		return msg, nil
 	}
 
+	if ring.readAhead != nil {
+		if msg, ok := ring.readAhead.get(deliveryTag); ok {
+			return msg, nil
+		}
+	}
+
 	if ds.wal != nil {
+		if ring.readAhead != nil {
+			if batch, err := ds.wal.ReadBatch(queueName, deliveryTag); err == nil && len(batch) > 0 {
+				ring.readAhead.put(batch)
+				if msg, ok := batch[deliveryTag]; ok {
+					return msg, nil
+				}
+			}
+		}
 		if msg, err := ds.wal.Read(queueName, deliveryTag); err == nil {
 			return msg, nil
 		}
