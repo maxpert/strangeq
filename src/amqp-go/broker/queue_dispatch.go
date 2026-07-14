@@ -245,13 +245,9 @@ func (qs *QueueState) FrontierComplete(tag uint64, real bool) {
 // MUST have stored the message first — the store establishes the happens-before
 // that makes late registration strand-free.
 //
-// Caller: the transactional deferred-visibility closure (PublishMessageTx),
-// where the tag is minted at stage time, stored, and made visible after commit.
-//
-// The async durable-confirm path (PublishMessageAsyncConfirm) does NOT use this:
-// it reserves at mint via FrontierReserve + FrontierComplete because its ring
-// store is DEFERRED into the fsync completion (StoreMessageAsync), so the tag is
-// not yet claim-safe at publish time.
+// No production callers remain after the always-reserve-at-mint fix — both
+// PublishMessage and PublishMessageTx now use FrontierReserve + FrontierComplete.
+// Retained for the direct frontier FIFO test (publish_async_test.go).
 func (qs *QueueState) FrontierPublishTransient(tag uint64) {
 	qs.frontierMu.Lock()
 	if tag > qs.frontierMax {
