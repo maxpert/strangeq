@@ -248,35 +248,38 @@ func (tm *DefaultTransactionManager) ExecuteAtomic(channelID uint16, operations 
 // txStagingExecutor is implemented by executors that can route a publish through
 // a transactional storage staging view (SQ-8).
 type txStagingExecutor interface {
-	ExecutePublishStaged(txnStore interfaces.Storage, exchange, routingKey string, message *protocol.Message) (deferred []func(), err error)
+	ExecutePublishStaged(txnStore interfaces.Storage, exchange, routingKey string, message *protocol.Message) (deferred []func(bool), err error)
 }
 
 // executeAtomically executes all operations within a single all-or-nothing
 // transaction (SQ-8). Publishes are routed through the storage staging view so
 // their durable writes and ring inserts are committed atomically (bracketed by
 // WAL transaction-boundary markers); their consumer-visibility side effects are
-// deferred and applied only after the atomic commit succeeds. If any operation
+// deferred. On a successful commit, the deferred closures run with commit=true
+// (FrontierComplete(tag, true) makes each message visible). If any operation
 // fails, ExecuteAtomic rolls back the whole buffered unit and the deferred
-// visibility actions are never run — nothing published in the transaction
-// becomes durable or visible.
+// closures run with commit=false (FrontierComplete(tag, false) releases each
+// reserved frontier slot so the tag is gap-skipped, never stranded) — nothing
+// published in the transaction becomes durable or visible.
 //
 // Acks/nacks/rejects are applied inline within the atomic scope via the normal
 // executor; their storage settlement participates in the transaction, while the
 // broker's in-memory consumer bookkeeping is applied as it executes.
 func (tm *DefaultTransactionManager) executeAtomically(operations []*interfaces.TransactionOperation) error {
-	var deferred []func()
+	var deferred []func(bool)
 
 	err := tm.atomicStorage.ExecuteAtomic(func(txnStorage interfaces.Storage) error {
 		return tm.executeStaged(txnStorage, operations, &deferred)
 	})
 	if err != nil {
+		for _, apply := range deferred {
+			apply(false)
+		}
 		return err
 	}
 
-	// Commit succeeded and is durable: make the published messages visible to
-	// consumers.
 	for _, apply := range deferred {
-		apply()
+		apply(true)
 	}
 	return nil
 }
@@ -285,7 +288,7 @@ func (tm *DefaultTransactionManager) executeAtomically(operations []*interfaces.
 // Publishes use the staged path (deferred visibility) when the executor
 // supports it; if not, they fall back to immediate execution. Settlements run
 // inline.
-func (tm *DefaultTransactionManager) executeStaged(txnStorage interfaces.Storage, operations []*interfaces.TransactionOperation, deferred *[]func()) error {
+func (tm *DefaultTransactionManager) executeStaged(txnStorage interfaces.Storage, operations []*interfaces.TransactionOperation, deferred *[]func(bool)) error {
 	stager, canStage := tm.executor.(txStagingExecutor)
 
 	for _, op := range operations {

@@ -242,7 +242,7 @@ func TestPublishMessageTx_StampsDurableAnchorAtCommit(t *testing.T) {
 	require.Equal(t, commitTime, msg.EnqueueUnixMilli, "tx TTL anchor must be stamped at commit")
 
 	for _, fn := range deferred {
-		fn()
+		fn(true)
 	}
 
 	// And it is part of the durable store write (stamped BEFORE StoreMessage).

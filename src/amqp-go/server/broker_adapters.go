@@ -61,7 +61,7 @@ func (a *StorageBrokerAdapter) PublishMessageAsyncConfirm(exchangeName, routingK
 
 // PublishMessageTx routes a transactional publish through the atomic storage
 // staging view (SQ-8), returning deferred visibility actions to run post-commit.
-func (a *StorageBrokerAdapter) PublishMessageTx(txnStore interfaces.Storage, exchangeName, routingKey string, message *protocol.Message) ([]func(), error) {
+func (a *StorageBrokerAdapter) PublishMessageTx(txnStore interfaces.Storage, exchangeName, routingKey string, message *protocol.Message) ([]func(bool), error) {
 	return a.broker.PublishMessageTx(txnStore, exchangeName, routingKey, message)
 }
 
