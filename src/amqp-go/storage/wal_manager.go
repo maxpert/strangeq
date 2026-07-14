@@ -212,7 +212,7 @@ type WALMetrics interface {
 type WALManager struct {
 	dataDir   string
 	sharedWAL *QueueWAL // Single WAL for all queues
-	mu        sync.Mutex
+	mu        sync.RWMutex
 	metrics   WALMetrics
 	cfg       WALConfig
 }
@@ -449,7 +449,10 @@ func putDoneChannel(pool *sync.Pool, ch chan error) {
 // Blocks until the batch containing this message is fsynced to disk.
 // This ensures proper AMQP durability semantics (Option 2: Batch Synchronous).
 func (wm *WALManager) Write(queueName string, message *protocol.Message, offset uint64) error {
-	if wm.sharedWAL == nil {
+	wm.mu.RLock()
+	sw := wm.sharedWAL
+	wm.mu.RUnlock()
+	if sw == nil {
 		return fmt.Errorf("shared WAL not initialized")
 	}
 
@@ -457,12 +460,18 @@ func (wm *WALManager) Write(queueName string, message *protocol.Message, offset 
 	doneChan := getDoneChannel(&doneChannelPool)
 	defer putDoneChannel(&doneChannelPool, doneChan)
 
-	// Blocking send to channel - callers will wait if channel is full (true backpressure)
-	wm.sharedWAL.writeChan <- &writeRequest{
+	// Guard against send-on-closed-channel panic during concurrent Close:
+	// select on stopChan so a shutting-down WAL returns an error instead of
+	// blocking forever or panicking (mirrors Acknowledge's pattern).
+	select {
+	case sw.writeChan <- &writeRequest{
 		queueName: queueName,
 		message:   message,
 		offset:    offset,
 		done:      doneChan,
+	}:
+	case <-sw.stopChan:
+		return fmt.Errorf("WAL shutting down")
 	}
 
 	// Block waiting for batch to be fsynced
@@ -484,18 +493,27 @@ func (wm *WALManager) Write(queueName string, message *protocol.Message, offset 
 // (see writeRequest.onDone). The blocking writeChan send is preserved, so
 // writeChan's capacity remains the durable in-flight memory bound.
 func (wm *WALManager) WriteAsync(queueName string, message *protocol.Message, offset uint64, onDone func(error)) {
-	if wm.sharedWAL == nil {
+	wm.mu.RLock()
+	sw := wm.sharedWAL
+	wm.mu.RUnlock()
+	if sw == nil {
 		if onDone != nil {
 			onDone(fmt.Errorf("shared WAL not initialized"))
 		}
 		return
 	}
 
-	wm.sharedWAL.writeChan <- &writeRequest{
+	select {
+	case sw.writeChan <- &writeRequest{
 		queueName: queueName,
 		message:   message,
 		offset:    offset,
 		onDone:    onDone,
+	}:
+	case <-sw.stopChan:
+		if onDone != nil {
+			onDone(fmt.Errorf("WAL shutting down"))
+		}
 	}
 }
 
@@ -511,20 +529,27 @@ func (wm *WALManager) WriteAsync(queueName string, message *protocol.Message, of
 // sub references (the caller keeps each sub.message.Body pointing at it for
 // in-memory delivery; the on-disk record for each sub is a reference).
 func (wm *WALManager) WriteSharedAsync(subs []sharedSub, body []byte, fanoutHint uint32) error {
-	if wm.sharedWAL == nil {
+	wm.mu.RLock()
+	sw := wm.sharedWAL
+	wm.mu.RUnlock()
+	if sw == nil {
 		return fmt.Errorf("shared WAL not initialized")
 	}
 	if len(subs) == 0 {
 		return nil
 	}
-	wm.sharedWAL.writeChan <- &writeRequest{
+	select {
+	case sw.writeChan <- &writeRequest{
 		unit: &sharedUnit{
 			body:       body,
 			fanoutHint: fanoutHint,
 			subs:       subs,
 		},
+	}:
+		return nil
+	case <-sw.stopChan:
+		return fmt.Errorf("WAL shutting down")
 	}
-	return nil
 }
 
 // walGroupCommitFsync is the fsync applied by the group-commit batch writer
@@ -661,10 +686,13 @@ func scanWALFileRecordCounts(filePath string) (WALRecordCounts, error) {
 // unrelated messages, so the records are written directly under fileMutex
 // rather than through writeChan.
 func (wm *WALManager) WriteTxAtomic(records []*RecoveryMessage) error {
-	if wm.sharedWAL == nil {
+	wm.mu.RLock()
+	sw := wm.sharedWAL
+	wm.mu.RUnlock()
+	if sw == nil {
 		return fmt.Errorf("shared WAL not initialized")
 	}
-	return wm.sharedWAL.writeTxAtomic(records)
+	return sw.writeTxAtomic(records)
 }
 
 func (qw *QueueWAL) writeTxAtomic(records []*RecoveryMessage) error {
@@ -750,28 +778,34 @@ func (qw *QueueWAL) writeTxAtomic(records []*RecoveryMessage) error {
 
 // Acknowledge marks a message as ACKed
 func (wm *WALManager) Acknowledge(queueName string, offset uint64) {
-	if wm.sharedWAL == nil {
+	wm.mu.RLock()
+	sw := wm.sharedWAL
+	wm.mu.RUnlock()
+	if sw == nil {
 		return
 	}
 
 	// Send to ACK channel (blocking with stopChan to prevent silent drops)
 	select {
-	case wm.sharedWAL.ackChan <- &ackRequest{
+	case sw.ackChan <- &ackRequest{
 		queueName: queueName,
 		offset:    offset,
 	}:
-	case <-wm.sharedWAL.stopChan:
+	case <-sw.stopChan:
 		// WAL is shutting down, discard ACK
 	}
 }
 
 // Read reads a message from shared WAL by queue+offset
 func (wm *WALManager) Read(queueName string, offset uint64) (*protocol.Message, error) {
-	if wm.sharedWAL == nil {
+	wm.mu.RLock()
+	sw := wm.sharedWAL
+	wm.mu.RUnlock()
+	if sw == nil {
 		return nil, fmt.Errorf("shared WAL not initialized")
 	}
 
-	return wm.sharedWAL.readMessage(queueName, offset)
+	return sw.readMessage(queueName, offset)
 }
 
 // Close closes the shared WAL

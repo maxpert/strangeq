@@ -13,46 +13,30 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// frontier_flip_strand_test.go — the frontier-flip (iter6) harness.
+// frontier_flip_strand_test.go — the frontier visibility harness.
 //
-// THE FRONTIER-FLIP BUG (durable victim): PublishMessage decided the frontier
-// route with a FrontierActive() CHECK taken BEFORE minting the delivery tag, and
-// on a queue that read active==false it minted lock-free then made the tag visible
-// with a raw casMaxHead. A transient that read active==false but lost the 0->1
-// activation race to a concurrent first durable publish (whose FrontierReserve
-// set active=true and reserved a LOWER tag L before the transient minted its
-// HIGHER tag T) would casMaxHead(T+1), jumping head PAST the still-pending,
-// not-yet-ring-resident durable L. A live consumer then claims L, GetMessage-misses
-// it, and gap-skips it; when L's fsync completes, FrontierComplete(L,true) adds
-// waiting+1 for a tag the consumer's tail already passed → L is
-// confirmed-but-never-delivered and WaitingCount leaks +1. The identical mechanism
-// exists on the dead-letter republish seam (dead_letter.go).
+// HISTORY: iter6 fixed the durable-victim frontier-flip race (a transient's
+// raw casMaxHead jumping past a pending durable tag). iter6 kept a lock-free
+// fast path for queues not yet frontier-active, which left a pre-existing
+// transient-vs-transient visibility race (a neighbor's casMaxHead running over
+// a still-unstored lower transient on a pure-transient queue).
 //
-// THE FIX (hybrid): keep reserve-at-mint for a queue that is ALREADY frontier-active
-// (so a reserved transient holds the frontier floor and neither a durable completion
-// nor a neighbour transient can run head over it while unstored), AND add a
-// post-store FrontierActive() recheck on the lock-free (not-active-at-mint) branch
-// to catch the 0->1 flip window: on a detected flip the already-stored tag is routed
-// through FrontierPublishTransient instead of a raw Publish. This closes the
-// durable-victim window WITHOUT removing reserve-at-mint (which would widen the
-// pre-existing best-effort transient race for no benefit). The DETERMINISTIC
-// fail→pass guard for this fix lives in dead_letter_frontier_test.go.
+// CURRENT FIX (always-reserve-at-mint): every publish — transient or durable —
+// now goes through FrontierReserve at mint + FrontierComplete after store. This
+// closes both the durable-victim race AND the transient-vs-transient race. The
+// frontier is activated on the first publish to any queue (monotonically, never
+// reset), so pure-transient queues also go through the frontier after their
+// first publish.
 //
-// WHAT THIS FILE ASSERTS — and what it deliberately does NOT:
-// The ONLY reliable strand signal is a WaitingCount leak after full drain: a real
-// accepted-but-never-delivered message leaves waiting permanently +1. The
-// all-durable control asserts leakedWaiting==0 (the durable path is race-safe).
+// WHAT THIS FILE ASSERTS:
+// The reliable strand signal is a WaitingCount leak after full drain: a real
+// accepted-but-never-delivered message leaves waiting permanently +1. All three
+// modes (all-durable, mixed, pure-transient) now assert leakedWaiting==0 and
+// leakedInflight==0.
 //
-// It deliberately does NOT assert delivered==published: at high queue counts even
-// the all-durable control (which the fix does not touch) shows a FLAKY
-// delivered<published discrepancy with leakedWaiting==0 — a harness delivery-count
-// artifact in the consumer/shutdown race, NOT a strand. And the mixed/pure-transient
-// modes carry a PRE-EXISTING, out-of-scope lock-free transient-vs-transient race
-// (a higher transient's head advance runs over a lower still-unstored transient,
-// with NO durable frontier op involved — it reproduces with zero durables). Those
-// two effects would make delivered==published / transient-victim counts flaky, so
-// the mixed and pure-transient tests below are NON-ASSERTING diagnostics that only
-// LOG the split (durable vs transient leak) for investigation.
+// It deliberately does NOT assert delivered==published: at high queue counts a
+// FLAKY delivered<published discrepancy with leakedWaiting==0 can appear — a
+// harness delivery-count artifact in the consumer/shutdown race, NOT a strand.
 
 const (
 	flipDurableMsgs          = 3
@@ -275,31 +259,30 @@ func TestFrontierFlip_AllDurableControl(t *testing.T) {
 	require.Zero(t, res.leakedInflight, "all-durable path must not leak InflightCount")
 }
 
-// TestFrontierFlip_MixedDiagnostic is a NON-ASSERTING diagnostic (durable +
-// transient racing). It logs the durable/transient delivery split and the leaked
-// counters so the frontier-flip fix can be observed (durable deliveries stay whole;
-// durable never leaks). It does NOT assert, because this harness also carries the
-// PRE-EXISTING, OUT-OF-SCOPE lock-free transient-vs-transient race (leaks a few
-// transient waiting counts) and a high-scale delivered-count artifact — neither is
-// the iter6 durable-victim frontier flip. The deterministic guard for the fix is
-// dead_letter_frontier_test.go.
-func TestFrontierFlip_MixedDiagnostic(t *testing.T) {
+// TestFrontierFlip_MixedNoStrand asserts that mixed durable + transient
+// concurrent publishers leave no leaked counters after full drain. The
+// always-reserve-at-mint fix closes both the durable-victim frontier-flip race
+// and the transient-vs-transient visibility race, so leakedWaiting and
+// leakedInflight must both be zero.
+func TestFrontierFlip_MixedNoStrand(t *testing.T) {
 	const numQueues = 150
 	res := runFrontierFlipHarness(t, "mixed", numQueues)
-	t.Logf("MIXED DIAGNOSTIC q=%d durable=%d/%d transient=%d/%d leakedWaiting=%d leakedInflight=%d strandedQueues=%d (leaks here are the pre-existing transient race, OUT OF SCOPE)",
+	t.Logf("MIXED q=%d durable=%d/%d transient=%d/%d leakedWaiting=%d leakedInflight=%d strandedQueues=%d",
 		numQueues, res.deliveredDurable, res.publishedDurable, res.deliveredTransient, res.publishedTransient,
 		res.leakedWaiting, res.leakedInflight, res.strandedQueues)
+	require.Zero(t, res.leakedWaiting, "mixed durable+transient must not leak WaitingCount")
+	require.Zero(t, res.leakedInflight, "mixed durable+transient must not leak InflightCount")
 }
 
-// TestFrontierFlip_PureTransientDiagnostic is a NON-ASSERTING diagnostic with NO
-// durable publisher, so the frontier is never activated and no durable frontier op
-// runs. Any leak here is the pre-existing lock-free transient-vs-transient race (a
-// higher transient's head advance running over a lower still-unstored transient) —
-// a real but out-of-scope, fix-independent best-effort-path accounting gap. Logged
-// for documentation; not asserted.
-func TestFrontierFlip_PureTransientDiagnostic(t *testing.T) {
+// TestFrontierFlip_PureTransientNoStrand asserts that pure-transient concurrent
+// publishers (zero durables) leave no leaked counters after full drain. The
+// always-reserve-at-mint fix activates the frontier on the first publish and
+// closes the transient-vs-transient visibility race.
+func TestFrontierFlip_PureTransientNoStrand(t *testing.T) {
 	const numQueues = 100
 	res := runFrontierFlipHarness(t, "transient", numQueues)
-	t.Logf("PURE-TRANSIENT DIAGNOSTIC (frontier never active) q=%d transient=%d/%d leakedWaiting=%d leakedInflight=%d strandedQueues=%d — KNOWN pre-existing transient race, OUT OF SCOPE for iter6",
+	t.Logf("PURE-TRANSIENT q=%d transient=%d/%d leakedWaiting=%d leakedInflight=%d strandedQueues=%d",
 		numQueues, res.deliveredTransient, res.publishedTransient, res.leakedWaiting, res.leakedInflight, res.strandedQueues)
+	require.Zero(t, res.leakedWaiting, "pure-transient must not leak WaitingCount")
+	require.Zero(t, res.leakedInflight, "pure-transient must not leak InflightCount")
 }

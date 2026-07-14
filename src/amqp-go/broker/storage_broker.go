@@ -1667,27 +1667,17 @@ func (b *StorageBroker) PublishMessage(exchangeName, routingKey string, message 
 			}
 		}
 
-		// Assign the delivery tag. On a queue that is ALREADY frontier-active (a
-		// mixed queue with durable-confirm publishes in flight) RESERVE the tag as
-		// pending on the contiguous frontier UNDER the frontier lock AT MINT TIME,
-		// mirroring the durable path: a concurrent durable completion can then never
-		// advance head PAST this transient before it is stored (I1), AND — because
-		// the reserved tag holds the frontier floor — a concurrent neighbour
-		// transient can never run head over this still-unstored tag either (this is
-		// the incidental floor protection that keeps the pre-existing best-effort
-		// transient-vs-transient race from widening; removing reserve-at-mint here
-		// would regress that race for no benefit on the durable-victim bug). A queue
-		// that is NOT (yet) frontier-active takes the lock-free fast path (one atomic
-		// FrontierActive() load; A6 zero regression) and its visibility decision is
-		// deferred to AFTER the store — see the flip-window recheck below.
-		var msgID uint64
-		frontierTransient := false
-		if queueState.FrontierActive() {
-			msgID = queueState.FrontierReserve(func() uint64 { return b.globalDeliveryTag.Add(1) })
-			frontierTransient = true
-		} else {
-			msgID = b.globalDeliveryTag.Add(1)
-		}
+		// Assign the delivery tag. Every publish — transient or durable —
+		// reserves the tag as pending on the contiguous frontier UNDER the
+		// frontier lock AT MINT TIME. This closes the transient-vs-transient
+		// visibility race: a neighbor's FrontierComplete can never advance head
+		// past this still-pending tag, so the consumer can never claim (and
+		// gap-skip) a tag whose message is not yet ring-resident. The frontier
+		// is activated on the first publish to the queue (monotonically, never
+		// reset), so pure-transient queues also go through the frontier after
+		// their first publish. The lock is held for O(1) work (append + atomic
+		// store), never across I/O.
+		msgID := queueState.FrontierReserve(func() uint64 { return b.globalDeliveryTag.Add(1) })
 
 		var storeMsg *protocol.Message
 		if i == 0 {
@@ -1725,54 +1715,14 @@ func (b *StorageBroker) PublishMessage(exchangeName, routingKey string, message 
 		// Store to persistent storage
 		err := b.storage.StoreMessage(queueName, storeMsg)
 		if err != nil {
-			// Release the reserved frontier slot (if any) so a store failure does
-			// not wedge the per-queue frontier (mirrors M1 for the transient path).
-			// A tag taken via the lock-free fast path reserved nothing, so there is
-			// nothing to release and it is simply abandoned (inert: never stored =>
-			// never ring-resident => gap-skipped without touching the ready count).
-			if frontierTransient {
-				queueState.FrontierComplete(msgID, false)
-			}
+			queueState.FrontierComplete(msgID, false)
 			if rejectPublish {
 				queueState.maxLenMu.Unlock()
 			}
 			return fmt.Errorf("failed to store message to queue '%s': %w", queueName, err)
 		}
 
-		// Make the message visible.
-		//   - frontierTransient: the queue was ALREADY frontier-active at mint, so
-		//     the tag was reserved pending; mark it ready now that it is stored (the
-		//     frontier advances head across the contiguous done-prefix, never past an
-		//     earlier still-pending durable — publish-order FIFO, A3).
-		//   - else, FLIP-WINDOW RECHECK: the queue was not frontier-active at mint,
-		//     so we minted lock-free. Re-read FrontierActive() AFTER the store to
-		//     catch a 0->1 flip that a concurrent first durable performed while we
-		//     were minting/storing. If it flipped, route the ALREADY-STORED tag
-		//     through FrontierPublishTransient (which advances head only to the
-		//     lowest still-pending durable floor, so it can neither be run over while
-		//     unstored — it is stored — nor run over a pending durable). Otherwise
-		//     take the lock-free CAS-max fast path.
-		//
-		// CORRECTNESS PINNING — DO NOT HOIST THIS else-branch FrontierActive() RECHECK
-		// ABOVE THE StoreMessage CALL. It must be program-ordered strictly AFTER the
-		// store: the store makes msgID ring-resident, which is what makes the recheck
-		// safe. If the recheck reads FALSE, sequential consistency + the monotonic
-		// frontierActive flag (set true once in FrontierReserve at queue_dispatch.go,
-		// never reset) guarantee this store precedes every FrontierReserve.Store(true),
-		// hence msgID was minted before every active frontier tag (msgID < every
-		// pending durable L), so Publish(msgID)->casMaxHead(msgID+1) can never jump
-		// past a pending durable. If it reads TRUE, msgID is already stored so
-		// late-registering it via FrontierPublishTransient is strand-free. Because the
-		// 0->1 strand is a linearization/counter leak (NOT a memory data race),
-		// `go test -race` will NOT catch a regression from hoisting — the
-		// dead_letter_frontier_test.go deterministic guard (same mechanism) is what does.
-		if frontierTransient {
-			queueState.FrontierComplete(msgID, true)
-		} else if queueState.FrontierActive() {
-			queueState.FrontierPublishTransient(msgID)
-		} else {
-			queueState.Publish(msgID)
-		}
+		queueState.FrontierComplete(msgID, true)
 
 		// SQ-11 max-length: byte accounting + drop-head eviction AFTER the
 		// enqueue, so the just-published newest message is retained and the

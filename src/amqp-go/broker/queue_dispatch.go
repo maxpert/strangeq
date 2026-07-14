@@ -14,22 +14,23 @@ type requeueEntry struct {
 }
 
 type QueueState struct {
-	tail         atomic.Uint64
-	head         atomic.Uint64
-	minAckCursor atomic.Uint64
-	waiting      atomic.Int64
-	inflight     atomic.Int64
-	wake         chan struct{}
-	parkedCount  atomic.Int64
-	requeueMu    sync.Mutex
-	requeueBuf   []requeueEntry
-	requeueHead  int
-	requeueLen   int
-	requeueCount atomic.Int64
-	depthHighWM  atomic.Uint64
-	closed       atomic.Bool
-	stopCh       chan struct{}
-	parkTimeout  time.Duration
+	tail           atomic.Uint64
+	head           atomic.Uint64
+	minAckCursor   atomic.Uint64
+	waiting        atomic.Int64
+	inflight       atomic.Int64
+	wake           chan struct{}
+	parkedCount    atomic.Int64
+	producerParked atomic.Int64
+	requeueMu      sync.Mutex
+	requeueBuf     []requeueEntry
+	requeueHead    int
+	requeueLen     int
+	requeueCount   atomic.Int64
+	depthHighWM    atomic.Uint64
+	closed         atomic.Bool
+	stopCh         chan struct{}
+	parkTimeout    time.Duration
 
 	// readyBytes tracks the total body bytes of ready (not-yet-delivered)
 	// messages for x-max-length-bytes enforcement (SQ-11). It is left at zero
@@ -134,6 +135,8 @@ func (qs *QueueState) WaitForCapacity(stop <-chan struct{}) bool {
 	}
 	timer := time.NewTimer(10 * time.Millisecond)
 	defer timer.Stop()
+	qs.producerParked.Add(1)
+	defer qs.producerParked.Add(-1)
 	for qs.AtHighWaterMark() {
 		if qs.closed.Load() {
 			return false
@@ -242,17 +245,8 @@ func (qs *QueueState) FrontierComplete(tag uint64, real bool) {
 // MUST have stored the message first — the store establishes the happens-before
 // that makes late registration strand-free.
 //
-// Two callers, both of which store synchronously before calling in:
-//   - PublishMessage's flip-window recheck: a transient that minted lock-free
-//     (queue not frontier-active at mint) re-reads FrontierActive() AFTER its
-//     synchronous StoreMessage; if a concurrent first durable flipped the
-//     frontier 0->1 in that window, the already-stored tag is routed here rather
-//     than through a raw Publish. The store-then-recheck ordering is what closes
-//     the frontier-flip strand — see the pinning comment there. (A transient that
-//     was ALREADY frontier-active at mint instead reserves at mint via
-//     FrontierReserve + FrontierComplete, keeping the frontier floor.)
-//   - The transactional deferred-visibility closure (PublishMessageTx), where
-//     the tag is minted at stage time, stored, and made visible after commit.
+// Caller: the transactional deferred-visibility closure (PublishMessageTx),
+// where the tag is minted at stage time, stored, and made visible after commit.
 //
 // The async durable-confirm path (PublishMessageAsyncConfirm) does NOT use this:
 // it reserves at mint via FrontierReserve + FrontierComplete because its ring
@@ -316,7 +310,7 @@ func (qs *QueueState) casMaxHead(newHead uint64) {
 }
 
 func (qs *QueueState) NotifyNewMessage() {
-	if qs.parkedCount.Load() <= 0 {
+	if qs.parkedCount.Load() <= 0 && qs.producerParked.Load() <= 0 {
 		return
 	}
 	select {

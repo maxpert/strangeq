@@ -388,7 +388,7 @@ func (b *StorageBroker) republishToTargets(srcQueueName string, targets []string
 			}
 		}
 
-		msgID := b.globalDeliveryTag.Add(1)
+		msgID := qs.FrontierReserve(func() uint64 { return b.globalDeliveryTag.Add(1) })
 
 		var storeMsg *protocol.Message
 		if first {
@@ -414,26 +414,14 @@ func (b *StorageBroker) republishToTargets(srcQueueName string, targets []string
 		// hook — rather than dropped silently. Behavior is unchanged: drop and
 		// continue.
 		if err := b.storage.StoreMessage(target, storeMsg); err != nil {
+			qs.FrontierComplete(msgID, false)
 			if rejectPublish {
 				qs.maxLenMu.Unlock()
 			}
 			b.recordDeadLetterDrop(srcQueueName, target, err)
 			continue
 		}
-		// Make the dead-letter visible, deciding the frontier route AFTER the
-		// synchronous store above (store-then-recheck, mirroring PublishMessage).
-		// The store made msgID ring-resident, so this recheck must stay
-		// program-ordered AFTER StoreMessage — do NOT hoist it. On a frontier-active
-		// DLX target a raw Publish(msgID)->casMaxHead(msgID+1) could jump head PAST a
-		// concurrently-reserved-but-still-pending async-durable tag L < msgID,
-		// exposing L before its fsync makes it ring-resident (the durable-victim
-		// window). Routing an already-stored republish through FrontierPublishTransient
-		// advances head only to the lowest still-pending durable floor, never past L.
-		if qs.FrontierActive() {
-			qs.FrontierPublishTransient(msgID)
-		} else {
-			qs.Publish(msgID)
-		}
+		qs.FrontierComplete(msgID, true)
 		// SQ-11: keep the DLX target's ready-bytes counter consistent when the
 		// target itself enforces x-max-length-bytes.
 		addReadyBytesOnEnqueue(qs, p, len(storeMsg.Body))
