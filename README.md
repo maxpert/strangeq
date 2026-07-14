@@ -38,7 +38,7 @@ RabbitMQ is the gold standard for AMQP 0.9.1, but it runs on the Erlang VM — a
 - Queue length limits — `x-max-length` / `x-max-length-bytes` with `x-overflow` (`drop-head`, `reject-publish`)
 - Resource alarms — `connection.blocked` / `connection.unblocked` driven by memory (RSS) and free-disk watermarks
 - Exclusive and auto-delete queues with automatic cleanup (exclusive queues deleted on owning-connection close; auto-delete queues deleted when the last consumer leaves)
-- Higher durable end-to-end throughput than RabbitMQ 4.3 on every tested workload — 1.07x to 3.99x in a Docker ARM64-native head-to-head (see [Performance](#performance))
+- Higher durable end-to-end throughput than RabbitMQ 4.3 on every tested workload — 1.10x to 4.48x head-to-head (see [Performance](#performance))
 - Prometheus metrics and pprof profiling
 - Lock-free per-queue ring buffer with per-slot CAS
 - Batch TCP writes and ACK offloading
@@ -269,19 +269,19 @@ All numbers below are **end-to-end consumed msg/s** — every published message 
 
 **Methodology**
 - Single machine: Apple Silicon, 16 cores.
-- Both brokers run in [OrbStack](https://orbstack.dev/) ARM64-native containers (not emulated), with in-container storage (no host bind mount) so disk behavior is comparable.
-- RabbitMQ 4.3 vs StrangeQ, 20-second runs, 1 KB message bodies unless noted.
+- RabbitMQ 4.3 runs in an [OrbStack](https://orbstack.dev/) ARM64-native container (not emulated) with in-container storage. StrangeQ runs host-native. Both use local disk (no host bind mount).
+- 20-second runs, 1 KB message bodies unless noted.
 - Durable queues, publisher confirms, fsync enabled on both, consumer prefetch 100, manual acks.
-- Figures are steady-state medians of the per-second consumed rate. Zero message loss and zero unconfirmed publishes on every run. Measured 2026-07-11.
+- Figures are steady-state medians of the per-second consumed rate. Zero message loss and zero unconfirmed publishes on every run. Measured 2026-07-14.
 
 ### Head-to-Head vs RabbitMQ 4.3 (durable + publisher confirms)
 
 | Workload (1 KB body unless noted) | RabbitMQ 4.3 | StrangeQ | StrangeQ advantage |
 |---|--:|--:|--:|
-| 1 pub / 1 con | 59,554 msg/s | 105,790 msg/s | 1.78x |
-| 10 pub / 10 con | 28,942 msg/s | 104,039 msg/s | 3.59x |
-| 30 pub / 30 con | 24,979 msg/s | 99,586 msg/s | 3.99x |
-| 64 KB body, 1 pub / 1 con | 19,428 msg/s | 20,868 msg/s | 1.07x |
+| 1 pub / 1 con | 64,532 msg/s | 108,000 msg/s | 1.67x |
+| 10 pub / 10 con | 25,381 msg/s | 113,667 msg/s | 4.48x |
+| 30 pub / 30 con | 24,232 msg/s | 106,906 msg/s | 4.41x |
+| 64 KB body, 1 pub / 1 con | 21,157 msg/s | 23,217 msg/s | 1.10x |
 
 RabbitMQ 4.3 rejects transient non-exclusive queues by default, so the head-to-head is run on durable queues with publisher confirms. Non-durable queues on StrangeQ reach roughly 140K msg/s (1 pub / 1 con, 1 KB, host-native).
 
