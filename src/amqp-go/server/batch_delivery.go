@@ -279,6 +279,54 @@ func (s *Server) appendHeaderAndBodyFramesVec(vec *deliveryVec, channelID uint16
 	return nil
 }
 
+// writeVectored performs the write-tail of the vectored delivery path: it
+// acquires the connection WriteMutex, writes the pre-built net.Buffers via a
+// single WriteTo, then records per-message metrics and counters. Both
+// sendBasicDeliver (single large-body delivery) and sendBatchedDeliveriesVectored
+// (batch) build their net.Buffers separately and delegate the write + metrics
+// here so the duplicated write-tail logic lives in one place.
+//
+// BUFFER-LIFETIME SAFETY (invariant BL): the body iovecs in bufs alias each
+// message.Body DIRECTLY (zero-copy). This is safe only because a published
+// body's backing array is immutable and is NEVER returned to any pool — it is
+// GC-managed and kept alive for the entire WriteTo by the caller's live
+// delivery / Message references on the goroutine stack. Ring Delete/wrap,
+// consumer ack, requeue, channel close, and shared-body all only move
+// pointers; none mutate or recycle body bytes. This is exactly the lifetime
+// the contiguous path already relied on when AppendFrame memmoved the body
+// under the same mutex — writev only removes the copy, it does not extend the
+// required lifetime.
+//
+// WARNING: iter3's deferred "pool-return the receive body on ack" (B2) would
+// turn these aliases into a use-after-free (a Put on ack could hand the array
+// to a new publish while a slow consumer's WriteTo is still reading it). B2
+// MUST NOT land without a refcount that keeps the body pinned across this
+// in-flight write. The -race mixed-size publish/consume/ack stress test
+// guards this invariant.
+func (s *Server) writeVectored(conn *protocol.Connection, bufs *net.Buffers, bodySizes []int, consumerTag string, channelID uint16) error {
+	conn.WriteMutex.Lock()
+	_, err := bufs.WriteTo(conn.Conn)
+	conn.WriteMutex.Unlock()
+
+	if err != nil {
+		s.Log.Error("Error sending vectored delivery frames",
+			zap.Error(err),
+			zap.String("consumer_tag", consumerTag),
+			zap.Uint16("channel_id", channelID))
+		return err
+	}
+
+	for _, size := range bodySizes {
+		if s.MetricsCollector != nil {
+			s.MetricsCollector.RecordMessageDelivered(size)
+		}
+		s.messagesDelivered.Add(1)
+		s.bytesSent.Add(int64(size))
+	}
+
+	return nil
+}
+
 // sendBatchedDeliveriesVectored is the zero-copy counterpart to
 // sendBatchedDeliveries for batches carrying at least one large body. It builds
 // one net.Buffers spanning the whole batch and performs a single
@@ -321,45 +369,10 @@ func (s *Server) sendBatchedDeliveriesVectored(conn *protocol.Connection, channe
 
 	bufs := vec.build()
 
-	// BUFFER-LIFETIME SAFETY (invariant BL): the body iovecs in bufs alias each
-	// delivery.Message.Body DIRECTLY (zero-copy). This is safe only because a
-	// published body's backing array is immutable and is NEVER returned to any
-	// pool — it is GC-managed and kept alive for the entire WriteTo by the live
-	// deliveries / delivery.Message references on this goroutine's stack. Ring
-	// Delete/wrap, consumer ack, requeue, channel close, and iter5 shared-body
-	// all only move pointers; none mutate or recycle body bytes. This is exactly
-	// the lifetime the contiguous path already relied on when AppendFrame
-	// memmoved the body under the same mutex — writev only removes the copy, it
-	// does not extend the required lifetime.
-	//
-	// WARNING: iter3's deferred "pool-return the receive body on ack" (B2) would
-	// turn these aliases into a use-after-free (a Put on ack could hand the array
-	// to a new publish while a slow consumer's WriteTo is still reading it). B2
-	// MUST NOT land without a refcount that keeps the body pinned across this
-	// in-flight write. The -race mixed-size publish/consume/ack stress test
-	// guards this invariant.
-	conn.WriteMutex.Lock()
-	_, err := bufs.WriteTo(conn.Conn)
-	conn.WriteMutex.Unlock()
-
-	if err != nil {
-		s.Log.Error("Failed to write vectored batched deliveries",
-			zap.Error(err),
-			zap.String("consumer_tag", consumerTag),
-			zap.Int("batch_size", len(deliveries)))
-		return err
+	bodySizes := make([]int, len(deliveries))
+	for i, d := range deliveries {
+		bodySizes[i] = len(d.Message.Body)
 	}
 
-	if s.MetricsCollector != nil {
-		for _, delivery := range deliveries {
-			s.MetricsCollector.RecordMessageDelivered(len(delivery.Message.Body))
-		}
-	}
-
-	for _, delivery := range deliveries {
-		s.messagesDelivered.Add(1)
-		s.bytesSent.Add(int64(len(delivery.Message.Body)))
-	}
-
-	return nil
+	return s.writeVectored(conn, &bufs, bodySizes, consumerTag, channelID)
 }
