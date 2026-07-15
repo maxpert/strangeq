@@ -11,10 +11,10 @@ Launch everything (server + monitoring + load test) with one command:
 ```
 
 This will:
-1. ✅ Start Prometheus and Grafana in Docker containers
-2. ✅ Start the AMQP server with telemetry enabled
-3. ✅ Run a performance test with 10 publishers and 10 consumers at 1000 msg/s
-4. ✅ Display real-time progress and provide dashboard links
+1. Start Prometheus and Grafana in Docker containers
+2. Start the AMQP server with telemetry enabled
+3. Run a performance test with 10 publishers and 10 consumers at 1000 msg/s
+4. Display real-time progress and provide dashboard links
 
 ## Custom Configuration
 

@@ -960,4 +960,3 @@ func consumeFromTopic(bindingKeys []string) {
 
 - See [QUICKSTART.md](QUICKSTART.md) for server installation and configuration
 - Check [CONTRIBUTING.md](CONTRIBUTING.md) for development guidelines
-- Review [docs/plan.md](docs/plan.md) for implementation details

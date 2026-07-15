@@ -45,34 +45,26 @@ sudo chmod 755 /usr/local/bin/amqp-server
 ### 4. Create Configuration
 
 ```bash
-sudo cat > /etc/amqp/config.json << 'EOF'
-{
-  "network": {
-    "address": ":5672",
-    "port": 5672,
-    "max_connections": 1000,
-    "heartbeat_interval": "60s"
-  },
-  "storage": {
-    "backend": "badger",
-    "path": "/var/lib/amqp/data",
-    "sync_writes": true,
-    "cache_size": 67108864
-  },
-  "security": {
-    "tls_enabled": false,
-    "authentication_enabled": false
-  },
-  "server": {
-    "log_level": "info",
-    "log_file": "/var/log/amqp/server.log",
-    "pid_file": "/run/amqp/amqp-server.pid"
-  }
-}
+sudo cat > /etc/amqp/config.yaml << 'EOF'
+network:
+  address: ":5672"
+  port: 5672
+  maxconnections: 10000
+
+storage:
+  path: /var/lib/amqp/data
+
+security:
+  authenticationenabled: false
+
+server:
+  loglevel: info
+  logfile: /var/log/amqp/server.log
+  pidfile: /run/amqp/amqp-server.pid
 EOF
 
-sudo chown root:amqp /etc/amqp/config.json
-sudo chmod 640 /etc/amqp/config.json
+sudo chown root:amqp /etc/amqp/config.yaml
+sudo chmod 640 /etc/amqp/config.yaml
 ```
 
 ### 5. Install Service File
@@ -164,7 +156,7 @@ systemctl list-dependencies amqp-server
 systemctl show-environment
 
 # Run service in foreground (for debugging)
-sudo -u amqp /usr/local/bin/amqp-server --config /etc/amqp/config.json
+sudo -u amqp /usr/local/bin/amqp-server --config /etc/amqp/config.yaml
 ```
 
 ## Log Rotation

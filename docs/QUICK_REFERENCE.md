@@ -1,160 +1,65 @@
-# Quick Reference Card
+# Quick Reference
 
-## Release Workflow
+## Release
 
-### Create a Release (3 steps)
 ```bash
-# 1. Tag
+# Tag and push
 git tag -a v0.1.0 -m "Release v0.1.0"
 git push origin v0.1.0
 
-# 2. Create release on GitHub
-# Go to: https://github.com/YOUR-ORG/strangeq/releases/new
-
-# 3. Done! Binaries build automatically
-```
-
-### What Gets Built Automatically
-- macOS: arm64, amd64
-- Linux: amd64, arm64, 386
-
-## Make Commands
-
-```bash
-make help              # Show all commands
-make build             # Build binary
-make build-all         # Build all platforms
-make test              # Run tests
-make test-coverage     # Tests + coverage report
-make bench             # Run benchmarks
-make lint              # Run linters
-make fmt               # Format code
-make clean             # Clean builds
-make release-local     # Build release locally
+# Create release on GitHub: https://github.com/maxpert/strangeq/releases/new
+# Binaries build automatically for macOS (arm64, amd64) and Linux (amd64, arm64, 386)
 ```
 
 ## Development
 
 ```bash
-# Start server
-make run
-
-# Start with debug logs
-make dev
-
-# Run tests
-make test
-
-# Check code quality
-make check    # runs fmt, vet, lint, test
-```
-
-## Testing Builds
-
-```bash
-# Test single platform
 cd src/amqp-go
-GOOS=linux GOARCH=amd64 go build ./cmd/amqp-server
 
-# Test all platforms
-make build-all
+# Build
+go build -o amqp-server ./cmd/amqp-server
 
-# Results in build/ directory
-ls -lh build/
+# Run
+go run ./cmd/amqp-server
+
+# Test
+go test -race ./...
+
+# Benchmarks
+go test -bench=. -benchmem ./storage/
+
+# Format
+gofmt -w .
+
+# Vet
+go vet ./...
 ```
 
-## GitHub Actions
+## Cross-Compile
 
-### Manual Trigger
-1. Go to: Actions → Release Build
-2. Click "Run workflow"
-3. Enter version: v0.0.0-test
-4. Click "Run workflow"
-
-### Check Status
-- Repository → Actions
-- Click on workflow run
-- View logs for each platform
-
-## Files Overview
-
-```
-.github/
-├── workflows/
-│   ├── release.yml      # Multi-platform builds on release
-│   ├── build.yml        # CI on push/PR
-│   └── codeql.yml       # Security scanning
-├── ISSUE_TEMPLATE/      # Bug/feature templates
-└── dependabot.yml       # Dependency updates
-
-deployment/
-└── systemd/
-    ├── amqp-server.service   # systemd unit file
-    └── README.md             # Deployment guide
-
-CHANGELOG.md             # Version history
-CONTRIBUTING.md          # How to contribute
-LICENSE                  # MIT License
-RELEASE.md              # Release process details
-RELEASE_CHECKLIST.md    # Release checklist
-SECURITY.md             # Security policy
-QUICKSTART.md           # Getting started
-SETUP_SUMMARY.md        # This setup explained
-Makefile                # Build automation
-```
-
-## Common Tasks
-
-### Before Committing
 ```bash
-make fmt      # Format code
-make lint     # Check code quality
-make test     # Run tests
+cd src/amqp-go
+GOOS=linux GOARCH=amd64 go build -o amqp-server-linux ./cmd/amqp-server
 ```
 
-### Before Release
-```bash
-make clean
-make test-coverage
-make bench
-make build-all
-# Update CHANGELOG.md
-# Test binaries
+## Files
+
+```
+.github/workflows/     CI/CD (build.yml, release.yml, codeql.yml)
+deployment/systemd/    systemd service file
+src/amqp-go/           Go source
+CHANGELOG.md           Version history
+CONTRIBUTING.md        Contribution guidelines
+SECURITY.md            Security policy
 ```
 
-### After Release
-```bash
-# Verify release
-gh release view v0.1.0
+## Troubleshooting
 
-# Download and test
-wget https://github.com/.../amqp-server-linux-amd64
-chmod +x amqp-server-linux-amd64
-./amqp-server-linux-amd64 -version
-```
+### Build failing
+- Verify Go version: `go version` (needs 1.25.1+)
+- Run locally: `go build ./cmd/amqp-server`
+- Check logs in the Actions tab
 
-## Version Numbers
-
-- **Major** (1.0.0): Breaking changes
-- **Minor** (0.1.0): New features
-- **Patch** (0.0.1): Bug fixes
-
-## Quick Fixes
-
-### Workflow not running?
+### Workflow not running
 - Check tag was pushed: `git ls-remote --tags`
-- Verify release (not just tag) created on GitHub
-- Check Actions tab for errors
-
-### Build failing?
-- Run locally: `make build-all`
-- Check logs in Actions tab
-- Verify Go version matches (1.25.1)
-
-## Support Files
-
-- `SETUP_SUMMARY.md` - Complete setup explanation
-- `RELEASE_CHECKLIST.md` - Step-by-step release guide
-- `CONTRIBUTING.md` - Contribution guidelines
-- `.github/workflows/README.md` - Workflow documentation
-
+- Verify release (not just tag) was created on GitHub
