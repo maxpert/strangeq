@@ -45,186 +45,204 @@ const (
 	FlagClusterID       = 0x0004
 )
 
+// contentClassBasic is the only class StrangeQ serves content for.
+const contentClassBasic = 60
+
+// releaseHeaderOnError returns the pooled header and propagates the error.
+// Top-level (not a closure) so the hot path gains no allocation.
+func releaseHeaderOnError(h *ContentHeader, err error) (*ContentHeader, error) {
+	PutContentHeader(h)
+	return nil, err
+}
+
 // ReadContentHeader reads a content header frame
 func ReadContentHeader(frame *Frame) (*ContentHeader, error) {
 	if frame.Type != FrameHeader {
-		return nil, fmt.Errorf("expected header frame, got type %d", frame.Type)
+		return nil, fmt.Errorf("%w: expected header frame, got type %d", ErrInvalidContentHeader, frame.Type)
 	}
-
-	if len(frame.Payload) < 12 { // Minimum: class(2) + weight(2) + body-size(8)
-		return nil, fmt.Errorf("content header frame too short")
+	p := frame.Payload
+	if len(p) < 14 { // class(2) + weight(2) + body-size(8) + property-flags(2)
+		return nil, fmt.Errorf("%w: frame too short (%d bytes, need 14)", ErrInvalidContentHeader, len(p))
 	}
-
-	offset := 0
+	classID := binary.BigEndian.Uint16(p[0:2])
+	if classID != contentClassBasic {
+		return nil, fmt.Errorf("%w: %w: class-id %d, want %d (basic)", ErrInvalidContentHeader, ErrContentHeaderClassMismatch, classID, contentClassBasic)
+	}
+	weight := binary.BigEndian.Uint16(p[2:4])
+	if weight != 0 {
+		return nil, fmt.Errorf("%w: weight %d, must be 0", ErrInvalidContentHeader, weight)
+	}
+	flags := binary.BigEndian.Uint16(p[12:14])
+	if flags&0x0001 != 0 {
+		return nil, fmt.Errorf("%w: property-flags continuation bit set (basic has 14 properties)", ErrInvalidContentHeader)
+	}
+	// NOTE: property-flags bit 1 (0x0002) is unassigned for basic and stays
+	// ignored — tolerant, and it carries no data.
 
 	header := GetContentHeader()
-	header.ClassID = binary.BigEndian.Uint16(frame.Payload[offset : offset+2])
-	header.Weight = binary.BigEndian.Uint16(frame.Payload[offset+2 : offset+4])
-	header.BodySize = binary.BigEndian.Uint64(frame.Payload[offset+4 : offset+12])
-
-	offset += 12
-
-	if offset+2 > len(frame.Payload) {
-		return nil, fmt.Errorf("property flags not present")
-	}
-
-	header.PropertyFlags = binary.BigEndian.Uint16(frame.Payload[offset : offset+2])
-	offset += 2
+	header.ClassID, header.Weight = classID, weight
+	header.BodySize = binary.BigEndian.Uint64(p[4:12])
+	header.PropertyFlags = flags
+	offset := 14
 
 	// Decode properties based on flags
 	if header.PropertyFlags&FlagContentType != 0 {
-		if offset >= len(frame.Payload) {
-			return nil, fmt.Errorf("content type field missing")
+		if offset >= len(p) {
+			return releaseHeaderOnError(header, fmt.Errorf("%w: content type field missing", ErrInvalidContentHeader))
 		}
-		contentType, newOffset, err := decodeShortString(frame.Payload, offset)
+		contentType, newOffset, err := decodeShortString(p, offset)
 		if err != nil {
-			return nil, fmt.Errorf("failed to decode content type: %v", err)
+			return releaseHeaderOnError(header, fmt.Errorf("%w: failed to decode content type: %v", ErrInvalidContentHeader, err))
 		}
 		header.ContentType = contentType
 		offset = newOffset
 	}
 
 	if header.PropertyFlags&FlagContentEncoding != 0 {
-		if offset >= len(frame.Payload) {
-			return nil, fmt.Errorf("content encoding field missing")
+		if offset >= len(p) {
+			return releaseHeaderOnError(header, fmt.Errorf("%w: content encoding field missing", ErrInvalidContentHeader))
 		}
-		contentEncoding, newOffset, err := decodeShortString(frame.Payload, offset)
+		contentEncoding, newOffset, err := decodeShortString(p, offset)
 		if err != nil {
-			return nil, fmt.Errorf("failed to decode content encoding: %v", err)
+			return releaseHeaderOnError(header, fmt.Errorf("%w: failed to decode content encoding: %v", ErrInvalidContentHeader, err))
 		}
 		header.ContentEncoding = contentEncoding
 		offset = newOffset
 	}
 
 	if header.PropertyFlags&FlagHeaders != 0 {
-		if offset+4 > len(frame.Payload) {
-			return nil, fmt.Errorf("headers length field missing")
+		if offset+4 > len(p) {
+			return releaseHeaderOnError(header, fmt.Errorf("%w: headers length field missing", ErrInvalidContentHeader))
 		}
 		var err error
-		header.Headers, offset, err = decodeFieldTable(frame.Payload, offset)
+		header.Headers, offset, err = decodeFieldTable(p, offset)
 		if err != nil {
-			return nil, fmt.Errorf("failed to decode headers: %v", err)
+			return releaseHeaderOnError(header, fmt.Errorf("%w: failed to decode headers: %v", ErrInvalidContentHeader, err))
 		}
 	}
 
 	if header.PropertyFlags&FlagDeliveryMode != 0 {
-		if offset >= len(frame.Payload) {
-			return nil, fmt.Errorf("delivery mode field missing")
+		if offset >= len(p) {
+			return releaseHeaderOnError(header, fmt.Errorf("%w: delivery mode field missing", ErrInvalidContentHeader))
 		}
-		header.DeliveryMode = frame.Payload[offset]
+		header.DeliveryMode = p[offset]
 		offset++
 	}
 
 	if header.PropertyFlags&FlagPriority != 0 {
-		if offset >= len(frame.Payload) {
-			return nil, fmt.Errorf("priority field missing")
+		if offset >= len(p) {
+			return releaseHeaderOnError(header, fmt.Errorf("%w: priority field missing", ErrInvalidContentHeader))
 		}
-		header.Priority = frame.Payload[offset]
+		header.Priority = p[offset]
 		offset++
 	}
 
 	if header.PropertyFlags&FlagCorrelationID != 0 {
-		if offset >= len(frame.Payload) {
-			return nil, fmt.Errorf("correlation ID field missing")
+		if offset >= len(p) {
+			return releaseHeaderOnError(header, fmt.Errorf("%w: correlation ID field missing", ErrInvalidContentHeader))
 		}
-		correlationID, newOffset, err := decodeShortString(frame.Payload, offset)
+		correlationID, newOffset, err := decodeShortString(p, offset)
 		if err != nil {
-			return nil, fmt.Errorf("failed to decode correlation ID: %v", err)
+			return releaseHeaderOnError(header, fmt.Errorf("%w: failed to decode correlation ID: %v", ErrInvalidContentHeader, err))
 		}
 		header.CorrelationID = correlationID
 		offset = newOffset
 	}
 
 	if header.PropertyFlags&FlagReplyTo != 0 {
-		if offset >= len(frame.Payload) {
-			return nil, fmt.Errorf("reply-to field missing")
+		if offset >= len(p) {
+			return releaseHeaderOnError(header, fmt.Errorf("%w: reply-to field missing", ErrInvalidContentHeader))
 		}
-		replyTo, newOffset, err := decodeShortString(frame.Payload, offset)
+		replyTo, newOffset, err := decodeShortString(p, offset)
 		if err != nil {
-			return nil, fmt.Errorf("failed to decode reply-to: %v", err)
+			return releaseHeaderOnError(header, fmt.Errorf("%w: failed to decode reply-to: %v", ErrInvalidContentHeader, err))
 		}
 		header.ReplyTo = replyTo
 		offset = newOffset
 	}
 
 	if header.PropertyFlags&FlagExpiration != 0 {
-		if offset >= len(frame.Payload) {
-			return nil, fmt.Errorf("expiration field missing")
+		if offset >= len(p) {
+			return releaseHeaderOnError(header, fmt.Errorf("%w: expiration field missing", ErrInvalidContentHeader))
 		}
-		expiration, newOffset, err := decodeShortString(frame.Payload, offset)
+		expiration, newOffset, err := decodeShortString(p, offset)
 		if err != nil {
-			return nil, fmt.Errorf("failed to decode expiration: %v", err)
+			return releaseHeaderOnError(header, fmt.Errorf("%w: failed to decode expiration: %v", ErrInvalidContentHeader, err))
 		}
 		header.Expiration = expiration
 		offset = newOffset
 	}
 
 	if header.PropertyFlags&FlagMessageID != 0 {
-		if offset >= len(frame.Payload) {
-			return nil, fmt.Errorf("message ID field missing")
+		if offset >= len(p) {
+			return releaseHeaderOnError(header, fmt.Errorf("%w: message ID field missing", ErrInvalidContentHeader))
 		}
-		messageID, newOffset, err := decodeShortString(frame.Payload, offset)
+		messageID, newOffset, err := decodeShortString(p, offset)
 		if err != nil {
-			return nil, fmt.Errorf("failed to decode message ID: %v", err)
+			return releaseHeaderOnError(header, fmt.Errorf("%w: failed to decode message ID: %v", ErrInvalidContentHeader, err))
 		}
 		header.MessageID = messageID
 		offset = newOffset
 	}
 
 	if header.PropertyFlags&FlagTimestamp != 0 {
-		if offset+8 > len(frame.Payload) {
-			return nil, fmt.Errorf("timestamp field missing")
+		if offset+8 > len(p) {
+			return releaseHeaderOnError(header, fmt.Errorf("%w: timestamp field missing", ErrInvalidContentHeader))
 		}
-		header.Timestamp = binary.BigEndian.Uint64(frame.Payload[offset : offset+8])
+		header.Timestamp = binary.BigEndian.Uint64(p[offset : offset+8])
 		offset += 8
 	}
 
 	if header.PropertyFlags&FlagType != 0 {
-		if offset >= len(frame.Payload) {
-			return nil, fmt.Errorf("type field missing")
+		if offset >= len(p) {
+			return releaseHeaderOnError(header, fmt.Errorf("%w: type field missing", ErrInvalidContentHeader))
 		}
-		msgType, newOffset, err := decodeShortString(frame.Payload, offset)
+		msgType, newOffset, err := decodeShortString(p, offset)
 		if err != nil {
-			return nil, fmt.Errorf("failed to decode type: %v", err)
+			return releaseHeaderOnError(header, fmt.Errorf("%w: failed to decode type: %v", ErrInvalidContentHeader, err))
 		}
 		header.Type = msgType
 		offset = newOffset
 	}
 
 	if header.PropertyFlags&FlagUserID != 0 {
-		if offset >= len(frame.Payload) {
-			return nil, fmt.Errorf("user ID field missing")
+		if offset >= len(p) {
+			return releaseHeaderOnError(header, fmt.Errorf("%w: user ID field missing", ErrInvalidContentHeader))
 		}
-		userID, newOffset, err := decodeShortString(frame.Payload, offset)
+		userID, newOffset, err := decodeShortString(p, offset)
 		if err != nil {
-			return nil, fmt.Errorf("failed to decode user ID: %v", err)
+			return releaseHeaderOnError(header, fmt.Errorf("%w: failed to decode user ID: %v", ErrInvalidContentHeader, err))
 		}
 		header.UserID = userID
 		offset = newOffset
 	}
 
 	if header.PropertyFlags&FlagAppID != 0 {
-		if offset >= len(frame.Payload) {
-			return nil, fmt.Errorf("app ID field missing")
+		if offset >= len(p) {
+			return releaseHeaderOnError(header, fmt.Errorf("%w: app ID field missing", ErrInvalidContentHeader))
 		}
-		appID, newOffset, err := decodeShortString(frame.Payload, offset)
+		appID, newOffset, err := decodeShortString(p, offset)
 		if err != nil {
-			return nil, fmt.Errorf("failed to decode app ID: %v", err)
+			return releaseHeaderOnError(header, fmt.Errorf("%w: failed to decode app ID: %v", ErrInvalidContentHeader, err))
 		}
 		header.AppID = appID
 		offset = newOffset
 	}
 
 	if header.PropertyFlags&FlagClusterID != 0 {
-		if offset >= len(frame.Payload) {
-			return nil, fmt.Errorf("cluster ID field missing")
+		if offset >= len(p) {
+			return releaseHeaderOnError(header, fmt.Errorf("%w: cluster ID field missing", ErrInvalidContentHeader))
 		}
-		clusterID, newOffset, err := decodeShortString(frame.Payload, offset)
+		clusterID, newOffset, err := decodeShortString(p, offset)
 		if err != nil {
-			return nil, fmt.Errorf("failed to decode cluster ID: %v", err)
+			return releaseHeaderOnError(header, fmt.Errorf("%w: failed to decode cluster ID: %v", ErrInvalidContentHeader, err))
 		}
 		header.ClusterID = clusterID
 		offset = newOffset
+	}
+
+	if offset != len(p) {
+		return releaseHeaderOnError(header, fmt.Errorf("%w: %d trailing bytes after properties", ErrInvalidContentHeader, len(p)-offset))
 	}
 
 	return header, nil
