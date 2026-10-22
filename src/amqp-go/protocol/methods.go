@@ -47,7 +47,7 @@ const (
 	ExchangeBind      = 30 // 40.30 - class ID 40, method ID 30
 	ExchangeBindOK    = 31 // 40.31 - class ID 40, method ID 31
 	ExchangeUnbind    = 40 // 40.40 - class ID 40, method ID 40
-	ExchangeUnbindOK  = 41 // 40.41 - class ID 40, method ID 41
+	ExchangeUnbindOK  = 51 // 40.51 - class ID 40, method ID 51
 )
 
 // Method IDs for queue class

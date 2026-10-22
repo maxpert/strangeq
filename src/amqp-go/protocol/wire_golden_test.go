@@ -337,3 +337,33 @@ func TestBasicCancel_ServerInitiatedWire(t *testing.T) {
 		t.Fatalf("Serialize = % x, want % x", enc, want)
 	}
 }
+
+// TestMethodIDs_MatchAMQP091 pins the protocol constants to the AMQP 0-9-1
+// method ids (amqp0-9-1.xml; amqp091-go v1.10.0 spec091.go).
+func TestMethodIDs_MatchAMQP091(t *testing.T) {
+	cases := []struct {
+		name string
+		got  int
+		want int
+	}{
+		{"ExchangeBind", ExchangeBind, 30},
+		{"ExchangeBindOK", ExchangeBindOK, 31},
+		{"ExchangeUnbind", ExchangeUnbind, 40},
+		{"ExchangeUnbindOK", ExchangeUnbindOK, 51},
+		{"QueueBind", QueueBind, 20},
+		{"QueueBindOK", QueueBindOK, 21},
+		{"QueuePurge", QueuePurge, 30},
+		{"QueuePurgeOK", QueuePurgeOK, 31},
+		{"QueueDelete", QueueDelete, 40},
+		{"QueueDeleteOK", QueueDeleteOK, 41},
+		{"QueueUnbind", QueueUnbind, 50},
+		{"QueueUnbindOK", QueueUnbindOK, 51},
+		{"BasicCancel", BasicCancel, 30},
+		{"BasicCancelOK", BasicCancelOK, 31},
+	}
+	for _, tc := range cases {
+		if tc.got != tc.want {
+			t.Errorf("%s = %d, want %d (AMQP 0-9-1)", tc.name, tc.got, tc.want)
+		}
+	}
+}
