@@ -1,6 +1,9 @@
 package protocol
 
-import "testing"
+import (
+	"errors"
+	"testing"
+)
 
 // FuzzBindingMethodsDecode feeds arbitrary bytes to the binding-method family
 // decoders. Deserialize must never panic; if it accepts the input, Serialize
@@ -58,7 +61,7 @@ func FuzzBindingMethodsDecode(f *testing.F) {
 				continue
 			}
 			enc, err := m.Serialize()
-			if err != nil {
+			if err != nil && !errors.Is(err, ErrShortStringTooLong) {
 				t.Fatalf("Serialize after successful Deserialize(% x) failed for %T: %v", data, m, err)
 			}
 			_ = enc

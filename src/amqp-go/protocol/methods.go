@@ -711,6 +711,17 @@ func clampShortString(s string) string {
 	return s[:end]
 }
 
+// checkShortStr rejects a shortstr method field over 255 bytes. Client-
+// originated methods call it at the top of Serialize: silently truncating an
+// overlong queue/exchange/routing-key/consumer-tag would produce a frame that
+// names a DIFFERENT entity.
+func checkShortStr(field, s string) error {
+	if len(s) > 255 {
+		return fmt.Errorf("%w: %s is %d bytes", ErrShortStringTooLong, field, len(s))
+	}
+	return nil
+}
+
 func EncodeShortString(s string) []byte {
 	s = clampShortString(s)
 	result := make([]byte, 1+len(s))
@@ -1126,6 +1137,12 @@ type ExchangeDeclareMethod struct {
 
 // Serialize encodes the ExchangeDeclareMethod into a byte slice
 func (m *ExchangeDeclareMethod) Serialize() ([]byte, error) {
+	if err := checkShortStr("exchange", m.Exchange); err != nil {
+		return nil, err
+	}
+	if err := checkShortStr("type", m.Type); err != nil {
+		return nil, err
+	}
 	var result []byte
 
 	// Reserved1 (uint16)
@@ -1255,6 +1272,9 @@ type ExchangeDeleteMethod struct {
 // Wire order: reserved-1 short, exchange shortstr, ONE flag octet
 // (b0 if-unused, b1 no-wait).
 func (m *ExchangeDeleteMethod) Serialize() ([]byte, error) {
+	if err := checkShortStr("exchange", m.Exchange); err != nil {
+		return nil, err
+	}
 	result := make([]byte, 0, 2+1+len(m.Exchange)+1)
 	result = binary.BigEndian.AppendUint16(result, m.Reserved1)
 	result = AppendShortString(result, m.Exchange)
@@ -1328,6 +1348,9 @@ type QueueDeclareMethod struct {
 
 // Serialize encodes the QueueDeclareMethod into a byte slice
 func (m *QueueDeclareMethod) Serialize() ([]byte, error) {
+	if err := checkShortStr("queue", m.Queue); err != nil {
+		return nil, err
+	}
 	var result []byte
 
 	// Reserved1 (uint16)
@@ -1461,6 +1484,15 @@ type QueueBindMethod struct {
 // Wire order: reserved-1 short, queue shortstr, exchange shortstr,
 // routing-key shortstr, ONE flag octet (b0 no-wait), arguments table.
 func (m *QueueBindMethod) Serialize() ([]byte, error) {
+	if err := checkShortStr("queue", m.Queue); err != nil {
+		return nil, err
+	}
+	if err := checkShortStr("exchange", m.Exchange); err != nil {
+		return nil, err
+	}
+	if err := checkShortStr("routing-key", m.RoutingKey); err != nil {
+		return nil, err
+	}
 	argsBytes, err := encodeFieldTable(m.Arguments)
 	if err != nil {
 		return nil, err
@@ -1527,6 +1559,15 @@ type QueueUnbindMethod struct {
 
 // Serialize encodes the QueueUnbindMethod into a byte slice
 func (m *QueueUnbindMethod) Serialize() ([]byte, error) {
+	if err := checkShortStr("queue", m.Queue); err != nil {
+		return nil, err
+	}
+	if err := checkShortStr("exchange", m.Exchange); err != nil {
+		return nil, err
+	}
+	if err := checkShortStr("routing-key", m.RoutingKey); err != nil {
+		return nil, err
+	}
 	argsBytes, err := encodeFieldTable(m.Arguments)
 	if err != nil {
 		return nil, err
@@ -1581,6 +1622,9 @@ type QueueDeleteMethod struct {
 // Wire order: reserved-1 short, queue shortstr, ONE flag octet
 // (b0 if-unused, b1 if-empty, b2 no-wait).
 func (m *QueueDeleteMethod) Serialize() ([]byte, error) {
+	if err := checkShortStr("queue", m.Queue); err != nil {
+		return nil, err
+	}
 	result := make([]byte, 0, 2+1+len(m.Queue)+1)
 	result = binary.BigEndian.AppendUint16(result, m.Reserved1)
 	result = AppendShortString(result, m.Queue)
@@ -1642,6 +1686,9 @@ type QueuePurgeMethod struct {
 // Serialize encodes the QueuePurgeMethod into a byte slice.
 // Wire order: reserved-1 short, queue shortstr, ONE flag octet (b0 no-wait).
 func (m *QueuePurgeMethod) Serialize() ([]byte, error) {
+	if err := checkShortStr("queue", m.Queue); err != nil {
+		return nil, err
+	}
 	result := make([]byte, 0, 2+1+len(m.Queue)+1)
 	result = binary.BigEndian.AppendUint16(result, m.Reserved1)
 	result = AppendShortString(result, m.Queue)
@@ -1766,6 +1813,12 @@ type BasicPublishMethod struct {
 
 // Serialize encodes the BasicPublishMethod into a byte slice
 func (m *BasicPublishMethod) Serialize() ([]byte, error) {
+	if err := checkShortStr("exchange", m.Exchange); err != nil {
+		return nil, err
+	}
+	if err := checkShortStr("routing-key", m.RoutingKey); err != nil {
+		return nil, err
+	}
 	var result []byte
 
 	// Reserved1 (uint16)
@@ -1872,6 +1925,12 @@ type BasicConsumeMethod struct {
 
 // Serialize encodes the BasicConsumeMethod into a byte slice
 func (m *BasicConsumeMethod) Serialize() ([]byte, error) {
+	if err := checkShortStr("queue", m.Queue); err != nil {
+		return nil, err
+	}
+	if err := checkShortStr("consumer-tag", m.ConsumerTag); err != nil {
+		return nil, err
+	}
 	var result []byte
 
 	// Reserved1 (uint16)
@@ -2017,6 +2076,9 @@ type BasicCancelMethod struct {
 // Serialize encodes the BasicCancelMethod into a byte slice.
 // Wire order: consumer-tag shortstr, ONE flag octet (b0 no-wait).
 func (m *BasicCancelMethod) Serialize() ([]byte, error) {
+	if err := checkShortStr("consumer-tag", m.ConsumerTag); err != nil {
+		return nil, err
+	}
 	result := make([]byte, 0, 1+len(m.ConsumerTag)+1)
 	result = AppendShortString(result, m.ConsumerTag)
 	var flags byte
@@ -2066,6 +2128,9 @@ type BasicGetMethod struct {
 
 // Serialize encodes the BasicGetMethod into a byte slice
 func (m *BasicGetMethod) Serialize() ([]byte, error) {
+	if err := checkShortStr("queue", m.Queue); err != nil {
+		return nil, err
+	}
 	var result []byte
 
 	// Reserved1 (uint16)
@@ -2566,6 +2631,15 @@ type ExchangeUnbindMethod struct {
 // Wire order: reserved-1 short, destination shortstr, source shortstr,
 // routing-key shortstr, ONE flag octet (b0 no-wait), arguments table.
 func (m *ExchangeUnbindMethod) Serialize() ([]byte, error) {
+	if err := checkShortStr("destination", m.Destination); err != nil {
+		return nil, err
+	}
+	if err := checkShortStr("source", m.Source); err != nil {
+		return nil, err
+	}
+	if err := checkShortStr("routing-key", m.RoutingKey); err != nil {
+		return nil, err
+	}
 	argsBytes, err := encodeFieldTable(m.Arguments)
 	if err != nil {
 		return nil, err
@@ -2623,6 +2697,15 @@ type ExchangeBindMethod struct {
 // Wire order: reserved-1 short, destination shortstr, source shortstr,
 // routing-key shortstr, ONE flag octet (b0 no-wait), arguments table.
 func (m *ExchangeBindMethod) Serialize() ([]byte, error) {
+	if err := checkShortStr("destination", m.Destination); err != nil {
+		return nil, err
+	}
+	if err := checkShortStr("source", m.Source); err != nil {
+		return nil, err
+	}
+	if err := checkShortStr("routing-key", m.RoutingKey); err != nil {
+		return nil, err
+	}
 	argsBytes, err := encodeFieldTable(m.Arguments)
 	if err != nil {
 		return nil, err
