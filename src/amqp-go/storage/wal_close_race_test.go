@@ -40,9 +40,9 @@ func TestWAL_WriteAfterClose_NoHang(t *testing.T) {
 		wm, err := NewWALManagerWithConfig(t.TempDir(), cfg)
 		require.NoError(t, err)
 
-		var fired atomic.Int64    // total onDone callbacks that fired
+		var fired atomic.Int64      // total onDone callbacks that fired
 		var asyncCalls atomic.Int64 // total WriteAsync invocations (each fires exactly one onDone)
-		var sharedOK atomic.Int64  // total WriteSharedAsync nil (enqueued) returns, each firing one sub onDone
+		var sharedOK atomic.Int64   // total WriteSharedAsync nil (enqueued) returns, each firing one sub onDone
 
 		var wg sync.WaitGroup
 		closeNow := time.Duration(rng.Intn(3)) * time.Millisecond
