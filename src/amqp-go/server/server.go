@@ -30,7 +30,7 @@ type Server struct {
 	Listener           net.Listener
 	Connections        map[string]*protocol.Connection
 	Mutex              sync.RWMutex
-	Shutdown           bool
+	ShuttingDown       bool
 	Log                *zap.Logger
 	Broker             UnifiedBroker
 	Config             *config.AMQPConfig
@@ -120,6 +120,25 @@ type Server struct {
 	// checked. Per-server scoping removes the premise rather than documenting
 	// it. Appended at the end of the struct so no pre-existing field moves.
 	generateConsumerTag func() string
+
+	// --- WS-B (append-only; see specs/WS-B-server-safety.md) ---
+	pendingHandshakes            atomic.Int64       // sockets accepted but not yet past connection.open-ok
+	headerTimeoutOverride        time.Duration      // tests; 0 → protocolHeaderTimeout
+	handshakeTimeoutOverride     time.Duration      // tests; 0 → handshakeTimeout
+	pendingLimitOverride         int64              // tests; 0 → max(64, MaxConnections/4)
+	writeTimeoutOverride         time.Duration      // tests; 0 → defaultWriteTimeout
+	closeOKTimeoutOverride       time.Duration      // tests; 0 → connectionCloseOKTimeout
+	frameQueueByteBudgetOverride int64              // tests; 0 → defaultFrameQueueByteBudget
+	runtimes                     sync.Map           // *protocol.Connection → *connRuntime
+	panics                       atomic.Int64       // exposed via PanicCount()
+	storage                      interfaces.Storage // retained from Build (§11.4)
+	ownsStorage                  bool               // builder created it (not WithStorage)
+	ownsBroker                   bool               // builder created the StorageBroker (not WithUnifiedBroker)
+	connWG                       sync.WaitGroup     // one per handleConnection (dispatchAccepted Adds)
+	shutdownOnce                 sync.Once
+	shutdownErr                  error
+	storageClosed                atomic.Bool           // set after storage.Close returns (tests/health)
+	onConnTornDown               func(rt *connRuntime) // tests only; nil in production (cold path, §13)
 }
 
 // markUnsafeRecovery records that this process booted with --unsafe-recovery
@@ -265,7 +284,7 @@ func (s *Server) createListener() (net.Listener, error) {
 func (s *Server) IsListening() bool {
 	s.Mutex.RLock()
 	defer s.Mutex.RUnlock()
-	return s.Listener != nil && !s.Shutdown
+	return s.Listener != nil && !s.ShuttingDown
 }
 
 // acceptLoop accepts connections in a loop until shutdown.
@@ -274,7 +293,7 @@ func (s *Server) acceptLoop() error {
 		conn, err := s.Listener.Accept()
 		if err != nil {
 			s.Mutex.RLock()
-			shutdown := s.Shutdown
+			shutdown := s.ShuttingDown
 			s.Mutex.RUnlock()
 			if shutdown {
 				return nil
@@ -361,7 +380,7 @@ func (s *Server) handleConnection(conn net.Conn) {
 
 	// Add to server's connections, enforcing MaxConnections
 	s.Mutex.Lock()
-	if s.Shutdown {
+	if s.ShuttingDown {
 		s.Mutex.Unlock()
 		conn.Close()
 		return
@@ -1421,7 +1440,7 @@ func (s *Server) processChannelMethod(conn *protocol.Connection, frame *protocol
 // Stop stops the server gracefully
 func (s *Server) Stop() error {
 	s.Mutex.Lock()
-	s.Shutdown = true
+	s.ShuttingDown = true
 	ln := s.Listener
 	cancel := s.metricsCancel
 	alarmCancel := s.alarmCancel
@@ -1503,7 +1522,7 @@ func (s *Server) StartWithQuitChannel(quit <-chan struct{}) error {
 			err := <-errChan
 			if err != nil {
 				s.Mutex.RLock()
-				shutdown := s.Shutdown
+				shutdown := s.ShuttingDown
 				s.Mutex.RUnlock()
 				if shutdown {
 					return nil
@@ -1518,7 +1537,7 @@ func (s *Server) StartWithQuitChannel(quit <-chan struct{}) error {
 		case <-quit:
 			s.Log.Info("Server shutdown requested")
 			s.Mutex.Lock()
-			s.Shutdown = true
+			s.ShuttingDown = true
 			cancel := s.metricsCancel
 			alarmCancel := s.alarmCancel
 			s.Mutex.Unlock()

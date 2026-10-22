@@ -14,6 +14,11 @@ import (
 
 var errClientRequestedClose = errors.New("connection closed by client")
 
+// errCloseOKReceived signals that the client answered our connection.close
+// with connection.close-ok: the close handshake completed and the connection
+// can be torn down.
+var errCloseOKReceived = errors.New("connection.close-ok received")
+
 // parseConnectionTuneOK parses the connection.tune-ok payload (after the
 // 4-byte class/method ID) and extracts the negotiated parameters.
 // The payload layout is: ChannelMax (uint16), FrameMax (uint32), Heartbeat (uint16).

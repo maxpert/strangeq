@@ -273,7 +273,7 @@ func (lm *LifecycleManager) forceShutdown() error {
 
 	// Force close all connections
 	lm.server.Mutex.Lock()
-	lm.server.Shutdown = true
+	lm.server.ShuttingDown = true
 	for _, conn := range lm.server.Connections {
 		if conn.Conn != nil {
 			conn.Conn.Close()

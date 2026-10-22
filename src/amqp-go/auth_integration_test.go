@@ -118,7 +118,7 @@ func TestAuthenticationPLAIN(t *testing.T) {
 
 	// Stop server
 	srv.Mutex.Lock()
-	srv.Shutdown = true
+	srv.ShuttingDown = true
 	srv.Mutex.Unlock()
 	if srv.Listener != nil {
 		srv.Listener.Close()
@@ -182,7 +182,7 @@ func TestAuthenticationANONYMOUS(t *testing.T) {
 
 	// Stop server
 	srv.Mutex.Lock()
-	srv.Shutdown = true
+	srv.ShuttingDown = true
 	srv.Mutex.Unlock()
 	if srv.Listener != nil {
 		srv.Listener.Close()
@@ -223,7 +223,7 @@ func TestAuthenticationDisabled(t *testing.T) {
 
 	// Stop server
 	srv.Mutex.Lock()
-	srv.Shutdown = true
+	srv.ShuttingDown = true
 	srv.Mutex.Unlock()
 	if srv.Listener != nil {
 		srv.Listener.Close()
@@ -329,7 +329,7 @@ func TestAuthenticationWithMessaging(t *testing.T) {
 
 	// Stop server
 	srv.Mutex.Lock()
-	srv.Shutdown = true
+	srv.ShuttingDown = true
 	srv.Mutex.Unlock()
 	if srv.Listener != nil {
 		srv.Listener.Close()
