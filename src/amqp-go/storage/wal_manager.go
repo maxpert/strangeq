@@ -308,7 +308,55 @@ type QueueWAL struct {
 	// (SQ-8). It pairs a Begin marker with its Commit marker so recovery can
 	// detect a stray/torn commit whose begin is missing.
 	txEpoch atomic.Uint64
+
+	// --- WS-C: write-error repair / roll state. Guarded by fileMutex. ---
+	// Every field below is appended AFTER txEpoch: the layout test pins only
+	// the fields above, and all of these are cold-path.
+
+	// poisoned is non-nil when the current file's size != fileOffset and the
+	// divergence could not be repaired. While poisoned, no byte is written to
+	// the diverged file; ensureWritableLocked tries to roll it away first.
+	poisoned error
+	// consecutiveFailures counts failed batches/txs in a row; reset on success.
+	consecutiveFailures int
+	// degraded is set when consecutiveFailures >= walDegradedAfterFailures or
+	// the file is poisoned; errors then carry ErrWALUnavailable. Cleared by a
+	// successful roll (the WAL is writable again) or a successful batch.
+	degraded bool
+	// rollBackoff / nextRollAttempt bound roll retries: a failed roll is
+	// retried on a later flush once the backoff window expires, inline — no
+	// timer goroutine (acceptance rule 9).
+	rollBackoff     time.Duration
+	nextRollAttempt time.Time // zero = may attempt now
+	// rollFailures counts consecutive failed roll attempts, for log throttling.
+	rollFailures int
+	// fileClosed is set by close() under fileMutex; flushBatch and
+	// writeTxAtomic refuse with ErrWALClosed after it.
+	fileClosed bool
+
+	// --- WS-C: close race (C9) ---
+	// enqueueMu/closing make "Close has begun" visible to enqueuers. Every
+	// successful writeChan send happens-before closing = true (RWMutex), so
+	// after close(stopChan) the writer's final drain observes every enqueued
+	// request and no send can arrive after it.
+	enqueueMu sync.RWMutex
+	closing   bool // guarded by enqueueMu
+
+	// logger reports the WAL's cold-path durability failures (poison, roll
+	// backoff, degraded transitions). nil = silent. Wired by
+	// WALManager.SetLogger.
+	logger atomicLogger
 }
+
+// Package tunables for the WS-C roll/retry machinery. Unexported vars so
+// tests can shrink them; every test that mutates one restores it with
+// t.Cleanup and mutates it before the first write (the values are read under
+// fileMutex, so a mutation concurrent with a flush would be a data race).
+var (
+	walRollBackoffMin        = 10 * time.Millisecond
+	walRollBackoffMax        = 1 * time.Second
+	walDegradedAfterFailures = 8
+)
 
 // offsetLocation tracks where an offset lives in the WAL
 type offsetLocation struct {
@@ -383,6 +431,25 @@ type walFileInfo struct {
 	// BodyBlock record. performCheckpoint skips such files (keeping the body as
 	// ONE copy) unless the SharedBodyMaxPinAge backstop forces re-inline.
 	hasSharedBody bool
+
+	// --- WS-C (C1/C2/C5) durability bookkeeping, appended below the pinned
+	// fields. durableSize and damagedTail are written once, at roll time,
+	// before the entry is published under oldFilesMutex; checkpointed and
+	// retentionFailLogged are mutated only under oldFilesMutex. ---
+
+	// durableSize is the number of bytes known durable and intact. -1 (the
+	// inherited value set by rebuildBootState) means the whole file.
+	durableSize int64
+	// damagedTail is true when bytes beyond durableSize are a nacked partial
+	// batch that could not be truncated. The file is still checkpointed (up
+	// to durableSize) and unlinked once that succeeds.
+	damagedTail bool
+	// checkpointed is true once every unacked record in [0, durableSize) has
+	// been durably copied to a segment, so only the unlink remains.
+	checkpointed bool
+	// retentionFailLogged throttles the retention keep-ERROR to once per file
+	// per failure streak.
+	retentionFailLogged bool
 }
 
 // NewWALManager creates a new WAL manager with shared WAL using default config
@@ -759,7 +826,9 @@ func (qw *QueueWAL) writeTxAtomic(records []*RecoveryMessage) error {
 	}
 	buf = append(buf, serializeTxMarker(WALTxMarkerCommit, epoch, qw.cfg.CRCDisabled)...)
 
-	n, err := qw.currentFile.Write(buf)
+	// Single write; through the walWrite hook seam (TEST-ONLY faults;
+	// default is f.Write).
+	n, err := walWrite(qw.currentFile, buf)
 	if err != nil {
 		if qw.metrics != nil {
 			qw.metrics.RecordWALWriteError()
@@ -769,9 +838,10 @@ func (qw *QueueWAL) writeTxAtomic(records []*RecoveryMessage) error {
 
 	// Single fsync makes the whole bracketed unit durable. The Commit marker is
 	// the last thing written, so if this fsync does not complete the tail
-	// (Commit) is lost and recovery discards the transaction.
+	// (Commit) is lost and recovery discards the transaction. walTxFsync is a
+	// hook seam whose default is exactly the previous direct fdatasyncFile.
 	fsyncStart := time.Now()
-	fsyncErr := fdatasyncFile(qw.currentFile)
+	fsyncErr := walTxFsync(qw.currentFile)
 	if qw.metrics != nil {
 		qw.metrics.RecordWALFsync(time.Since(fsyncStart).Seconds())
 		if fsyncErr != nil {
@@ -1554,8 +1624,10 @@ func (qw *QueueWAL) flushBatch(batch []*writeRequest, bufp *[]byte, positionsp *
 		*bufp = buf
 	}
 
-	// Single write (O_APPEND makes this atomic across processes)
-	n, err := qw.currentFile.Write(buf)
+	// Single write (O_APPEND makes this atomic across processes). The write
+	// goes through the walWrite hook seam (TEST-ONLY faults; default is
+	// f.Write).
+	n, err := walWrite(qw.currentFile, buf)
 	if err != nil {
 		// Record WAL write error
 		if qw.metrics != nil {
@@ -2299,7 +2371,7 @@ func (qw *QueueWAL) openNextFile() error {
 	fileNum := qw.fileNum.Add(1)
 	filename := filepath.Join(qw.dataDir, fmt.Sprintf("%020d%s", fileNum, WALFileExtension))
 
-	file, err := os.OpenFile(filename, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+	file, err := walOpenFile(filename, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
 	if err != nil {
 		return fmt.Errorf("failed to open WAL file: %w", err)
 	}
@@ -2485,15 +2557,17 @@ func (qw *QueueWAL) tryDeleteOldFiles() {
 			time.Since(info.createdAt) > qw.cfg.RetentionPeriod
 
 		if allAcked {
-			_ = os.Remove(info.path)
-			qw.closeOldFileHandle(fileNum)
-			delete(qw.oldFiles, fileNum)
+			if err := walUnlink(info.path); err == nil || os.IsNotExist(err) {
+				qw.closeOldFileHandle(fileNum)
+				delete(qw.oldFiles, fileNum)
+			}
 		} else if expired {
 			// Force-checkpoint unACKed messages to segments before deletion
 			qw.forceCheckpointFile(info)
-			_ = os.Remove(info.path)
-			qw.closeOldFileHandle(fileNum)
-			delete(qw.oldFiles, fileNum)
+			if err := walUnlink(info.path); err == nil || os.IsNotExist(err) {
+				qw.closeOldFileHandle(fileNum)
+				delete(qw.oldFiles, fileNum)
+			}
 		}
 	}
 }
@@ -3115,8 +3189,9 @@ func (qw *QueueWAL) performCheckpoint() {
 			continue
 		}
 
-		// Checkpoint succeeded — delete WAL file and clean up
-		_ = os.Remove(info.path)
+		// Checkpoint succeeded — delete WAL file and clean up. walUnlink is the
+		// hook seam whose default is os.Remove (TEST-ONLY faults).
+		_ = walUnlink(info.path)
 		qw.closeOldFileHandle(fileNum)
 
 		// Remove from oldFiles map

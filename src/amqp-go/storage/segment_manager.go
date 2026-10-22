@@ -172,6 +172,18 @@ type QueueSegments struct {
 	// field above", which was false and is the same over-claim review-5 MAJOR-3
 	// found in the layout test's comment.
 	logger interfaces.Logger
+
+	// --- WS-C (C2): write-error repair state, appended after logger. ---
+
+	// segPoisoned is non-nil when the active segment could not be repaired
+	// after a failed write/fsync (truncate failed). While poisoned, no byte is
+	// written to the damaged segment; writeMessageBatchDurable retires it and
+	// opens a fresh one first.
+	segPoisoned error
+	// lastSegmentNum is the highest segment number loaded or created, making
+	// new numbers strictly monotone within an incarnation and across restarts
+	// even if the wall clock steps backwards. Guarded by qs.mutex.
+	lastSegmentNum uint64
 }
 
 // SegmentFile represents a single segment file
@@ -198,6 +210,12 @@ type SegmentFile struct {
 	// once a minute forever (review-4 B-4). Declared LAST so every field the
 	// cold-read tier touches keeps its offset.
 	compactionBlocked atomic.Bool
+
+	// damagedTail (WS-C C2) is true when this segment was retired after an
+	// unrepairable failed write: bytes beyond the indexed region are a failed
+	// batch's partial bytes. Tail damage is benign at load (nothing is ever
+	// appended after it), so the segment is still sealed and read.
+	damagedTail bool
 }
 
 // SegmentIndex provides fast offset -> file position lookups
@@ -1069,8 +1087,9 @@ func (qs *QueueSegments) writeMessageBatch(messages []*RecoveryMessage) error {
 		updates = append(updates, indexUpdate{offset: rm.Offset, position: position})
 	}
 
-	// Single write syscall for all messages
-	n, err := qs.currentSegment.file.Write(buf)
+	// Single write syscall for all messages; through the segmentWrite hook
+	// seam (TEST-ONLY faults; default is f.Write).
+	n, err := segmentWrite(qs.currentSegment.file, buf)
 	if err != nil {
 		return fmt.Errorf("failed to write batch to segment: %w", err)
 	}
@@ -1112,7 +1131,7 @@ func (qs *QueueSegments) sync() error {
 	qs.mutex.Lock()
 	defer qs.mutex.Unlock()
 	if qs.currentSegment != nil && qs.currentSegment.file != nil {
-		return fdatasyncFile(qs.currentSegment.file)
+		return segmentFsync(qs.currentSegment.file)
 	}
 	return nil
 }
@@ -1522,7 +1541,7 @@ func (qs *QueueSegments) openNextSegmentLocked() error {
 	segmentNum := uint64(time.Now().UnixNano())
 	filename := filepath.Join(qs.dataDir, fmt.Sprintf("%020d%s", segmentNum, SegmentFileExtension))
 
-	file, err := os.OpenFile(filename, os.O_CREATE|os.O_RDWR|os.O_APPEND, 0644)
+	file, err := segmentOpenFile(filename, os.O_CREATE|os.O_RDWR|os.O_APPEND, 0644)
 	if err != nil {
 		return fmt.Errorf("failed to open segment file: %w", err)
 	}
