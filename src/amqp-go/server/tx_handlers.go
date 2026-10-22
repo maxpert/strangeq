@@ -72,7 +72,7 @@ func (s *Server) handleTxSelect(conn *protocol.Connection, channelID uint16, pay
 
 	// Send tx.select-ok response
 	response := protocol.NewTxSelectOKFrame(channelID)
-	if err := protocol.WriteFrameToConnection(conn, response); err != nil {
+	if err := s.writeFrame(conn, response); err != nil {
 		return err
 	}
 	if s.MetricsCollector != nil {
@@ -141,7 +141,7 @@ func (s *Server) handleTxCommit(conn *protocol.Connection, channelID uint16, pay
 
 	// Send tx.commit-ok response
 	response := protocol.NewTxCommitOKFrame(channelID)
-	if err := protocol.WriteFrameToConnection(conn, response); err != nil {
+	if err := s.writeFrame(conn, response); err != nil {
 		return err
 	}
 	if s.MetricsCollector != nil {
@@ -181,7 +181,7 @@ func (s *Server) handleTxRollback(conn *protocol.Connection, channelID uint16, p
 
 	// Send tx.rollback-ok response
 	response := protocol.NewTxRollbackOKFrame(channelID)
-	if err := protocol.WriteFrameToConnection(conn, response); err != nil {
+	if err := s.writeFrame(conn, response); err != nil {
 		return err
 	}
 	if s.MetricsCollector != nil {

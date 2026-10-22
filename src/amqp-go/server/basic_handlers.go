@@ -933,15 +933,13 @@ func (s *Server) handleBasicGet(conn *protocol.Connection, channelID uint16, pay
 		return err
 	}
 
-	conn.WriteMutex.Lock()
-	_, err = conn.Conn.Write(*buf)
-	conn.WriteMutex.Unlock()
+	err = s.writeBytes(conn, *buf)
 
 	if err != nil {
 		s.Log.Error("Error sending basic.get-ok frames",
 			zap.Error(err),
 			zap.Uint16("channel_id", channelID))
-		return fmt.Errorf("error sending basic.get-ok frames: %v", err)
+		return fmt.Errorf("error sending basic.get-ok frames: %w", err)
 	}
 
 	if s.MetricsCollector != nil {
@@ -1056,16 +1054,14 @@ func (s *Server) sendBasicDeliver(conn *protocol.Connection, channelID uint16, c
 		return err
 	}
 
-	conn.WriteMutex.Lock()
-	_, err := conn.Conn.Write(*buf)
-	conn.WriteMutex.Unlock()
+	err := s.writeBytes(conn, *buf)
 
 	if err != nil {
 		s.Log.Error("Error sending delivery frames",
 			zap.Error(err),
 			zap.String("consumer_tag", consumerTag),
 			zap.Uint16("channel_id", channelID))
-		return fmt.Errorf("error sending frames: %v", err)
+		return fmt.Errorf("error sending frames: %w", err)
 	}
 
 	if s.MetricsCollector != nil {

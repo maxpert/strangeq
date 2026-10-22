@@ -54,7 +54,7 @@ func (s *Server) sendChannelClose(conn *protocol.Connection, channelID uint16, r
 
 	frame := protocol.EncodeMethodFrameForChannel(channelID, 20, 40, methodData) // 20.40 = channel.close
 
-	if err := protocol.WriteFrameToConnection(conn, frame); err != nil {
+	if err := s.writeFrame(conn, frame); err != nil {
 		s.Log.Error("Failed to send channel.close", zap.Error(err))
 	}
 

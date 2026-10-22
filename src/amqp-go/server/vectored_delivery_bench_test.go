@@ -3,6 +3,7 @@ package server
 import (
 	"net"
 	"testing"
+	"time"
 
 	"github.com/maxpert/amqp-go/protocol"
 )
@@ -24,7 +25,8 @@ import (
 // the correctness tests; redeclared here so the bench file is self-contained).
 type benchDiscardConn struct{ net.Conn }
 
-func (benchDiscardConn) Write(p []byte) (int, error) { return len(p), nil }
+func (benchDiscardConn) Write(p []byte) (int, error)      { return len(p), nil }
+func (benchDiscardConn) SetWriteDeadline(time.Time) error { return nil }
 
 func benchDelivery64KB() *protocol.Delivery {
 	return makeDelivery(1, seededBody(64*1024))

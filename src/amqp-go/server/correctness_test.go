@@ -83,7 +83,7 @@ func TestConsumerDeliveryLoopDoneChannel(t *testing.T) {
 	}
 
 	done := make(chan struct{})
-	go srv.consumerDeliveryLoop(conn, done)
+	go func() { srv.consumerDeliveryLoop(srv.runtimeFor(conn)); close(done) }()
 
 	select {
 	case <-done:

@@ -80,14 +80,14 @@ func (s *Server) sendConnectionStart(conn *protocol.Connection) error {
 
 	frame := protocol.EncodeMethodFrame(10, 10, methodData) // 10.10 = connection.start
 
-	return protocol.WriteFrameToConnection(conn, frame)
+	return s.writeFrame(conn, frame)
 }
 
 // sendConnectionTune sends the connection.tune method frame
 func (s *Server) sendConnectionTune(conn *protocol.Connection) error {
 	channelMax := uint16(s.Config.Server.MaxChannelsPerConnection)
 	frameMax := uint32(s.Config.Server.MaxFrameSize)
-	heartbeat := uint16(s.Config.Network.HeartbeatIntervalMS / 1000)
+	heartbeat := s.serverHeartbeatSeconds()
 
 	tuneMethod := &protocol.ConnectionTuneMethod{
 		ChannelMax: channelMax,
@@ -102,7 +102,7 @@ func (s *Server) sendConnectionTune(conn *protocol.Connection) error {
 
 	frame := protocol.EncodeMethodFrame(10, 30, methodData) // 10.30 = connection.tune
 
-	return protocol.WriteFrameToConnection(conn, frame)
+	return s.writeFrame(conn, frame)
 }
 
 // sendConnectionOpenOK sends the connection.open-ok method frame
@@ -118,7 +118,7 @@ func (s *Server) sendConnectionOpenOK(conn *protocol.Connection) error {
 
 	frame := protocol.EncodeMethodFrame(10, 41, methodData) // 10.41 = connection.open-ok
 
-	return protocol.WriteFrameToConnection(conn, frame)
+	return s.writeFrame(conn, frame)
 }
 
 // sendConnectionOpen sends the connection.open method frame
@@ -137,7 +137,7 @@ func (s *Server) sendConnectionOpen(conn *protocol.Connection) error {
 
 	frame := protocol.EncodeMethodFrame(10, 40, methodData) // 10.40 = connection.open
 
-	return protocol.WriteFrameToConnection(conn, frame)
+	return s.writeFrame(conn, frame)
 }
 
 // processConnectionOpen handles the connection.open method
@@ -394,7 +394,7 @@ func (s *Server) sendConnectionClose(conn *protocol.Connection, replyCode uint16
 
 	frame := protocol.EncodeMethodFrame(10, 50, methodData) // 10.50 = connection.close
 
-	if err := protocol.WriteFrameToConnection(conn, frame); err != nil {
+	if err := s.writeFrame(conn, frame); err != nil {
 		return err
 	}
 

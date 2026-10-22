@@ -198,7 +198,7 @@ func TestP0_AckProcessorSurvivesConsumerNotFound(t *testing.T) {
 	conn.AckQueue <- validAckFrame
 
 	done := make(chan struct{})
-	go srv.ackProcessor(conn, done)
+	go srv.ackProcessor(srv.runtimeFor(conn), done)
 
 	// Wait for the valid ack to be processed
 	select {
@@ -258,7 +258,7 @@ func TestP0_WriteErrorRequeuesDeliveries(t *testing.T) {
 	// Start the delivery loop
 	done := make(chan struct{})
 	conn.ConsumersDirty.Store(true)
-	go srv.consumerDeliveryLoop(conn, done)
+	go func() { srv.consumerDeliveryLoop(srv.runtimeFor(conn)); close(done) }()
 
 	// Wait for consumer discovery
 	time.Sleep(100 * time.Millisecond)

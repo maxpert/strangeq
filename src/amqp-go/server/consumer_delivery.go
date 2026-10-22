@@ -66,12 +66,13 @@ func forwardConsumerMessages(channel *protocol.Channel, msgChan chan *protocol.D
 // collapses them into one entry — one forwarder never started, one consumer's
 // deliveries written to the other's channel.
 func (s *Server) discoverConsumers(
-	conn *protocol.Connection,
+	rt *connRuntime,
 	consumerInfos map[string]*consumerInfo,
 	forwarders map[string]chan struct{},
 	activeIDs map[string]struct{},
 	fanIn chan<- *protocol.Delivery,
 ) {
+	conn := rt.conn
 	for k := range activeIDs {
 		delete(activeIDs, k)
 	}
@@ -85,7 +86,9 @@ func (s *Server) discoverConsumers(
 				consumerInfos[consumer.ID] = &consumerInfo{channel: channel, tag: consumer.Tag}
 				stop := make(chan struct{})
 				forwarders[consumer.ID] = stop
-				go forwardConsumerMessages(channel, consumer.Messages, fanIn, stop)
+				s.goConn(rt, "forwarder", func() {
+					forwardConsumerMessages(channel, consumer.Messages, fanIn, stop)
+				})
 				s.Log.Debug("Started forwarder for consumer",
 					zap.String("consumer_tag", consumer.Tag),
 					zap.String("consumer_id", consumer.ID),
@@ -116,8 +119,8 @@ func (s *Server) discoverConsumers(
 // (ConsumersDirty). The loop only re-scans channels when the flag is set,
 // avoiding O(channels × consumers) work every iteration. A periodic timeout
 // acts as a safety net to self-heal if a flag-set is missed.
-func (s *Server) consumerDeliveryLoop(conn *protocol.Connection, done chan struct{}) {
-	defer close(done)
+func (s *Server) consumerDeliveryLoop(rt *connRuntime) {
+	conn := rt.conn
 	s.Log.Debug("Starting consumer delivery loop", zap.String("connection_id", conn.ID))
 
 	consumerInfos := make(map[string]*consumerInfo)
@@ -155,9 +158,14 @@ func (s *Server) consumerDeliveryLoop(conn *protocol.Connection, done chan struc
 			s.Log.Debug("Connection closed, stopping consumer delivery loop", zap.String("connection_id", conn.ID))
 			return
 		}
+		select {
+		case <-conn.Done:
+			return
+		default:
+		}
 
 		if conn.ConsumersDirty.Swap(false) {
-			s.discoverConsumers(conn, consumerInfos, forwarders, activeIDs, fanIn)
+			s.discoverConsumers(rt, consumerInfos, forwarders, activeIDs, fanIn)
 		}
 
 		if len(consumerInfos) == 0 {

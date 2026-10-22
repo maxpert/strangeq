@@ -297,7 +297,7 @@ func TestMetricsConnectionErrorFiresOnFrameProcessingError(t *testing.T) {
 
 	done := make(chan struct{})
 	go func() {
-		srv.processFrames(conn, done)
+		srv.processFrames(srv.runtimeFor(conn), done)
 	}()
 
 	select {

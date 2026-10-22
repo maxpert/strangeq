@@ -156,7 +156,7 @@ func TestDepthPark_LivenessBurstDrainsBufferedWindow(t *testing.T) {
 	conn.SetDepthGate(g)
 
 	readerDone := make(chan struct{})
-	go srv.readFrames(conn, readerDone)
+	go srv.readFrames(srv.runtimeFor(conn), readerDone)
 
 	const n = 50
 	go func() {

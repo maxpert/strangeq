@@ -388,7 +388,7 @@ func TestA2_AckProcessorProcessesAck(t *testing.T) {
 	conn.AckQueue <- ackFrame
 
 	done := make(chan struct{})
-	go srv.ackProcessor(conn, done)
+	go srv.ackProcessor(srv.runtimeFor(conn), done)
 
 	select {
 	case <-broker.ackEntered:
@@ -427,7 +427,7 @@ func TestA2_AckProcessorProcessesNack(t *testing.T) {
 	conn.AckQueue <- nackFrame
 
 	done := make(chan struct{})
-	go srv.ackProcessor(conn, done)
+	go srv.ackProcessor(srv.runtimeFor(conn), done)
 
 	select {
 	case <-broker.nackEntered:
@@ -470,7 +470,7 @@ func TestA2_AckProcessorProcessesReject(t *testing.T) {
 	conn.AckQueue <- rejectFrame
 
 	done := make(chan struct{})
-	go srv.ackProcessor(conn, done)
+	go srv.ackProcessor(srv.runtimeFor(conn), done)
 
 	select {
 	case <-broker.rejectEntered:
@@ -513,7 +513,7 @@ func TestA2_AckProcessorDrainsOnClose(t *testing.T) {
 	}
 
 	done := make(chan struct{})
-	go srv.ackProcessor(conn, done)
+	go srv.ackProcessor(srv.runtimeFor(conn), done)
 
 	close(conn.AckQueue)
 
@@ -548,7 +548,7 @@ func TestA2_AckProcessorNoGoroutineLeak(t *testing.T) {
 	before := runtime.NumGoroutine()
 
 	done := make(chan struct{})
-	go srv.ackProcessor(conn, done)
+	go srv.ackProcessor(srv.runtimeFor(conn), done)
 
 	close(conn.AckQueue)
 
@@ -586,10 +586,10 @@ func TestA2_AckConcurrentWithPublish(t *testing.T) {
 	ch.TrackDelivery(99, 99, "test-consumer", false)
 
 	processorDone := make(chan struct{})
-	go srv.processFrames(conn, processorDone)
+	go srv.processFrames(srv.runtimeFor(conn), processorDone)
 
 	ackDone := make(chan struct{})
-	go srv.ackProcessor(conn, ackDone)
+	go srv.ackProcessor(srv.runtimeFor(conn), ackDone)
 
 	conn.FrameQueue <- encodeAckFrame(t, 1, 99, false)
 	conn.FrameQueue <- encodePublishFrame(t, 1, "", "test")

@@ -7,6 +7,7 @@ import (
 	"net"
 	"runtime"
 	"testing"
+	"time"
 
 	"github.com/maxpert/amqp-go/protocol"
 	"github.com/stretchr/testify/assert"
@@ -270,9 +271,12 @@ func TestWritev_GateBoundary(t *testing.T) {
 // discardConn discards all writes without blocking so allocation can be
 // measured without a reader goroutine. Only Write is exercised (WriteTo's
 // sequential fallback), so the embedded nil net.Conn is never touched.
+// SetWriteDeadline is exercised (writeLocked arms/clears it around every
+// write), so it is overridden too.
 type discardConn struct{ net.Conn }
 
-func (discardConn) Write(p []byte) (int, error) { return len(p), nil }
+func (discardConn) Write(p []byte) (int, error)          { return len(p), nil }
+func (discardConn) SetWriteDeadline(time.Time) error     { return nil }
 
 // bytesPerOp returns the average bytes allocated per call to f, using the
 // cumulative TotalAlloc counter (unaffected by GC), after one warmup call to

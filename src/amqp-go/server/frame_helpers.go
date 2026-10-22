@@ -28,7 +28,7 @@ func (s *Server) sendMethodResponse(conn *protocol.Connection, channelID uint16,
 		frame = protocol.EncodeMethodFrameForChannel(channelID, classID, methodID, methodData)
 	}
 
-	return protocol.WriteFrameToConnection(conn, frame)
+	return s.writeFrame(conn, frame)
 }
 
 // sendConnectionCloseOK sends the connection.close-ok method frame
@@ -342,12 +342,9 @@ func (s *Server) sendBasicReturn(conn *protocol.Connection, channelID uint16, re
 		return err
 	}
 
-	conn.WriteMutex.Lock()
-	_, err = conn.Conn.Write(*buf)
-	conn.WriteMutex.Unlock()
-
+	err = s.writeBytes(conn, *buf)
 	if err != nil {
-		return fmt.Errorf("error sending basic.return frames: %v", err)
+		return fmt.Errorf("error sending basic.return frames: %w", err)
 	}
 
 	return nil
