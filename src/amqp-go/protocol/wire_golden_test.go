@@ -174,6 +174,30 @@ func TestGolden_ExchangeUnbind(t *testing.T) {
 	})
 }
 
+func TestGolden_QueueUnbind(t *testing.T) {
+	// queue.unbind (50.50) has NO no-wait bit: the arguments table follows
+	// the routing key directly.
+	runGolden(t, []goldenCase{
+		{"empty-args", cat(qbPrefix, emptyTable),
+			&QueueUnbindMethod{Queue: "q", Exchange: "ex", RoutingKey: "rk", Arguments: emptyArgs()},
+			func() wireMethod { return &QueueUnbindMethod{} }},
+		{"x-match-args", cat(qbPrefix, xMatchAllTable),
+			&QueueUnbindMethod{Queue: "q", Exchange: "ex", RoutingKey: "rk", Arguments: xMatchAll},
+			func() wireMethod { return &QueueUnbindMethod{} }},
+	})
+}
+
+func TestQueueUnbind_HasNoNoWaitOctet(t *testing.T) {
+	enc, err := (&QueueUnbindMethod{Queue: "q", Exchange: "ex", RoutingKey: "rk", Arguments: emptyArgs()}).Serialize()
+	if err != nil {
+		t.Fatalf("Serialize: %v", err)
+	}
+	if len(enc) != len(qbPrefix)+4 {
+		t.Fatalf("Serialize length = %d, want %d (prefix %d + 4-byte empty table); a no-wait octet would make it %d",
+			len(enc), len(qbPrefix)+4, len(qbPrefix), len(qbPrefix)+5)
+	}
+}
+
 func TestGolden_BasicCancel(t *testing.T) {
 	runGolden(t, []goldenCase{
 		{"wait", []byte{0x04, 'c', 't', 'a', 'g', 0x00},
@@ -254,6 +278,8 @@ func TestWireDecode_MalformedTables(t *testing.T) {
 			func() wireMethod { return &ExchangeBindMethod{} }},
 		{"exchange.unbind table stub", cat(ebPrefix, []byte{0x00}, []byte{0x00}),
 			func() wireMethod { return &ExchangeUnbindMethod{} }},
+		{"queue.unbind table stub", cat(qbPrefix, []byte{0x00, 0x00, 0x00}),
+			func() wireMethod { return &QueueUnbindMethod{} }},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

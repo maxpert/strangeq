@@ -31,6 +31,9 @@ func FuzzBindingMethodsDecode(f *testing.F) {
 		cat(ebPrefix, []byte{0x00}, emptyTable),
 		cat(ebPrefix, []byte{0x00}, xMatchAllTable),
 		cat(ebPrefix, []byte{0x01}, emptyTable),
+		// queue.unbind (no flag octet)
+		cat(qbPrefix, emptyTable),
+		cat(qbPrefix, xMatchAllTable),
 		// basic.cancel
 		{0x04, 'c', 't', 'a', 'g', 0x00},
 		{0x02, 'c', '2', 0x01},
@@ -42,6 +45,7 @@ func FuzzBindingMethodsDecode(f *testing.F) {
 	f.Fuzz(func(t *testing.T, data []byte) {
 		methods := []wireMethod{
 			&QueueBindMethod{},
+			&QueueUnbindMethod{},
 			&ExchangeBindMethod{},
 			&ExchangeUnbindMethod{},
 			&QueueDeleteMethod{},

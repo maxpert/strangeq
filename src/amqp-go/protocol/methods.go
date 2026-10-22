@@ -1514,6 +1514,60 @@ func (m *QueueBindOKMethod) Serialize() ([]byte, error) {
 	return []byte{}, nil
 }
 
+// QueueUnbindMethod represents queue.unbind (class 50, method 50).
+// Fields: reserved-1 short, queue shortstr, exchange shortstr, routing-key
+// shortstr, arguments table. NOTE: queue.unbind has NO no-wait bit.
+type QueueUnbindMethod struct {
+	Reserved1  uint16
+	Queue      string
+	Exchange   string
+	RoutingKey string
+	Arguments  map[string]interface{}
+}
+
+// Serialize encodes the QueueUnbindMethod into a byte slice
+func (m *QueueUnbindMethod) Serialize() ([]byte, error) {
+	argsBytes, err := encodeFieldTable(m.Arguments)
+	if err != nil {
+		return nil, err
+	}
+	result := make([]byte, 0, 2+3+len(m.Queue)+len(m.Exchange)+len(m.RoutingKey)+len(argsBytes))
+	result = binary.BigEndian.AppendUint16(result, m.Reserved1)
+	result = AppendShortString(result, m.Queue)
+	result = AppendShortString(result, m.Exchange)
+	result = AppendShortString(result, m.RoutingKey)
+	return append(result, argsBytes...), nil
+}
+
+// Deserialize decodes the QueueUnbindMethod from a byte slice
+func (m *QueueUnbindMethod) Deserialize(data []byte) error {
+	if len(data) < 5 { // reserved(2) + three shortstr length octets
+		return fmt.Errorf("queue.unbind method data too short")
+	}
+	m.Reserved1 = binary.BigEndian.Uint16(data[0:2])
+	offset := 2
+	var err error
+	if m.Queue, offset, err = decodeShortString(data, offset); err != nil {
+		return fmt.Errorf("failed to decode queue name: %v", err)
+	}
+	if m.Exchange, offset, err = decodeShortString(data, offset); err != nil {
+		return fmt.Errorf("failed to decode exchange name: %v", err)
+	}
+	if m.RoutingKey, offset, err = decodeShortString(data, offset); err != nil {
+		return fmt.Errorf("failed to decode routing key: %v", err)
+	}
+	if m.Arguments, _, err = decodeTrailingTable(data, offset); err != nil {
+		return fmt.Errorf("failed to decode arguments: %w", err)
+	}
+	return nil
+}
+
+// QueueUnbindOKMethod represents queue.unbind-ok (class 50, method 51). Empty.
+type QueueUnbindOKMethod struct{}
+
+// Serialize encodes the QueueUnbindOKMethod into a byte slice
+func (m *QueueUnbindOKMethod) Serialize() ([]byte, error) { return []byte{}, nil }
+
 // QueueDeleteMethod represents the queue.delete method
 type QueueDeleteMethod struct {
 	Reserved1 uint16
