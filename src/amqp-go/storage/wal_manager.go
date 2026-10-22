@@ -893,7 +893,7 @@ func (qw *QueueWAL) writeTxAtomic(records []*RecoveryMessage) error {
 
 	newOffset := qw.fileOffset.Add(int64(n))
 	if newOffset >= qw.cfg.FileSize {
-		qw.rollFile()
+		qw.maybeRollLocked()
 	}
 	return nil
 }
@@ -1743,9 +1743,10 @@ func (qw *QueueWAL) flushBatch(batch []*writeRequest, bufp *[]byte, positionsp *
 	// Update offset
 	newOffset := qw.fileOffset.Add(int64(n))
 
-	// Check if we need to roll to new file
+	// Check if we need to roll to new file. A failed roll never fails this
+	// durable batch (C3); the next flush retries it with backoff.
 	if newOffset >= qw.cfg.FileSize {
-		qw.rollFile()
+		qw.maybeRollLocked()
 	}
 
 	// Release the file lock, THEN deliver completions. Completions fire LAST,
@@ -2338,9 +2339,31 @@ func readShort(payload []byte, pos int) (s string, newPos int, ok bool) {
 	return string(payload[pos : pos+n]), pos + n, true
 }
 
-// rollFile rolls to a new WAL file when size limit reached
-func (qw *QueueWAL) rollFile() {
-	currentFileNum := qw.fileNum.Load()
+// rollFile rolls to a new WAL file when the size limit is reached.
+//
+// C3: OPEN BEFORE CLOSE. The next file is opened first; only then is the
+// current file retired and the handles switched over, all in one critical
+// section under fileMutex. If the open fails, NOTHING changes — the current
+// file stays active and writable (oversized; FileSize is a soft limit), and
+// the roll is retried by tryRollLocked/maybeRollLocked with backoff. The
+// previous shape (close, then open, error discarded) wedged the WAL until
+// restart on any open failure.
+//
+// Precondition: caller holds fileMutex.
+func (qw *QueueWAL) rollFile() error {
+	curNum := qw.fileNum.Load()
+	num := curNum + 1
+
+	// 1. Open the next file FIRST; the current file is untouched.
+	w, r, size, err := qw.openWALFile(num)
+	if err != nil {
+		return fmt.Errorf("WAL roll: %w", err)
+	}
+
+	// 2. Retire the current file. oldFiles/oldFileCache are published BEFORE
+	// the fileNum switch, so a reader that sees the new fileNum and holds an
+	// index entry for the old file takes the old-file arm and finds the cached
+	// handle.
 	currentPath := qw.currentFile.Name()
 
 	qw.currentFileOffsetsMutex.Lock()
@@ -2355,42 +2378,144 @@ func (qw *QueueWAL) rollFile() {
 	sharedBody := qw.currentFileHasSharedBody
 	qw.currentFileHasSharedBody = false
 
-	// Close current write file
-	_ = qw.currentFile.Close()
-
 	// Move current read handle to old file cache (it's already open, no need to reopen)
 	if qw.currentReadFile != nil {
 		qw.oldFileCacheMutex.Lock()
 		if qw.oldFileCache == nil {
 			qw.oldFileCache = make(map[uint64]*os.File)
 		}
-		qw.oldFileCache[currentFileNum] = qw.currentReadFile
-		qw.currentReadFile = nil
+		qw.oldFileCache[curNum] = qw.currentReadFile
 		qw.oldFileCacheMutex.Unlock()
 	}
 
-	// Move to old files map
+	// Move to old files map. durableSize is the durable end (I4: fileOffset is
+	// advanced only after a successful fsync); damagedTail records that bytes
+	// beyond it are a nacked partial batch that could not be truncated (C1).
 	qw.oldFilesMutex.Lock()
-	qw.oldFiles[currentFileNum] = &walFileInfo{
+	qw.oldFiles[curNum] = &walFileInfo{
 		path:          currentPath,
 		offsets:       fileOffsets,
 		createdAt:     time.Now(),
 		hasSharedBody: sharedBody,
+		durableSize:   qw.fileOffset.Load(),
+		damagedTail:   qw.poisoned != nil,
 	}
 	qw.oldFilesMutex.Unlock()
 
-	// Open next file
-	_ = qw.openNextFile()
+	// Close current write file. The close error is ignored as before: the
+	// file's records were fdatasynced by their batches, and the read handle
+	// stays open in the cache.
+	_ = qw.currentFile.Close()
+
+	// 3. Switch over in one step (still under fileMutex). A successful roll
+	// clears poison and degradation: the diverged file was just retired above
+	// and the WAL is writable again, so Health() reports nil.
+	qw.fileNum.Store(num)
+	qw.currentFile = w
+	qw.currentReadFile = r
+	qw.fileOffset.Store(size)
+	qw.poisoned = nil
+	qw.degraded = false
+	qw.rollBackoff = 0
+	qw.nextRollAttempt = time.Time{}
+	qw.rollFailures = 0
+	qw.assertOffsetInvariantLocked()
+	return nil
 }
 
-// openNextFile opens the next WAL file
-func (qw *QueueWAL) openNextFile() error {
-	fileNum := qw.fileNum.Add(1)
-	filename := filepath.Join(qw.dataDir, fmt.Sprintf("%020d%s", fileNum, WALFileExtension))
+// errRollBackoff is returned by tryRollLocked when the next roll attempt is
+// still inside the backoff window. It is an internal pacing signal, never a
+// write outcome.
+var errRollBackoff = errors.New("WAL roll backoff")
+
+// clampDuration clamps d into [min, max].
+func clampDuration(d, min, max time.Duration) time.Duration {
+	if d < min {
+		return min
+	}
+	if d > max {
+		return max
+	}
+	return d
+}
+
+// tryRollLocked attempts a roll, honouring the backoff window.
+// Precondition: caller holds fileMutex. On failure the backoff grows
+// (doubled, clamped to [walRollBackoffMin, walRollBackoffMax]) and the error
+// is returned; nothing else changes — the current file stays active and
+// writes continue past it (FileSize is a soft limit). ignoreBackoff skips the
+// window so the first attempt after a poison is immediate.
+func (qw *QueueWAL) tryRollLocked(ignoreBackoff bool) error {
+	now := time.Now()
+	if !ignoreBackoff && now.Before(qw.nextRollAttempt) {
+		return errRollBackoff
+	}
+	err := qw.rollFile()
+	if err == nil {
+		return nil
+	}
+	qw.rollBackoff = clampDuration(2*qw.rollBackoff, walRollBackoffMin, walRollBackoffMax)
+	qw.nextRollAttempt = now.Add(qw.rollBackoff)
+	qw.rollFailures++
+	if qw.rollFailures == 1 || qw.rollFailures%10 == 0 {
+		qw.logError("WAL roll failed; the current file stays active and writes continue past the size limit; retrying with backoff",
+			interfaces.LogField{Key: "error", Value: err.Error()},
+			interfaces.LogField{Key: "backoff", Value: qw.rollBackoff.String()},
+			interfaces.LogField{Key: "attempt", Value: qw.rollFailures})
+	}
+	return err
+}
+
+// maybeRollLocked is called after a durable batch/tx pushed the file past
+// FileSize. A failed roll never fails the durable batch: the bytes are
+// already fdatasynced and indexed, and nacking them would misreport durable
+// data and mint duplicates on retry. fileOffset stays >= FileSize until a
+// roll succeeds, so every later flush past the backoff window retries
+// automatically — no timer goroutine (acceptance rule 9).
+func (qw *QueueWAL) maybeRollLocked() {
+	_ = qw.tryRollLocked(false)
+}
+
+// logError / logWarn report a cold-path WAL failure when a logger is wired
+// (C1 §3.8); a nil logger (the default for a bare WALManager) is silent.
+func (qw *QueueWAL) logError(msg string, fields ...interfaces.LogField) {
+	if l := qw.logger.Load(); l != nil {
+		l.Error(msg, fields...)
+	}
+}
+
+func (qw *QueueWAL) logWarn(msg string, fields ...interfaces.LogField) {
+	if l := qw.logger.Load(); l != nil {
+		l.Warn(msg, fields...)
+	}
+}
+
+// SetLogger wires a structured logger into the shared WAL's cold failure
+// paths (poison, roll backoff, degraded transitions). Also publishes it as
+// the package-level sink for the one-time "directory fsync unsupported" WARN
+// (syncdir.go). Safe to call after the goroutines have started: the logger is
+// read atomically and only on failure paths.
+func (wm *WALManager) SetLogger(l interfaces.Logger) {
+	wm.mu.Lock()
+	defer wm.mu.Unlock()
+	storageWarnLogger.Store(l)
+	if wm.sharedWAL != nil {
+		wm.sharedWAL.logger.Store(l)
+	}
+}
+
+// openWALFile opens (creating if needed) WAL file number num and returns its
+// write handle, read handle and data size. It does NOT touch QueueWAL state,
+// which is what lets rollFile open the next file before retiring the current
+// one. On any failure AFTER the file was created, the handles are closed and
+// the file is removed, so a failed roll leaves at most nothing behind — never
+// a 1–5 byte headerless stub that every later boot refuses to append to.
+func (qw *QueueWAL) openWALFile(num uint64) (w, r *os.File, size int64, err error) {
+	filename := filepath.Join(qw.dataDir, fmt.Sprintf("%020d%s", num, WALFileExtension))
 
 	file, err := walOpenFile(filename, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
 	if err != nil {
-		return fmt.Errorf("failed to open WAL file: %w", err)
+		return nil, nil, 0, fmt.Errorf("failed to open WAL file: %w", err)
 	}
 
 	// Determine the current size so we (a) only write the file-level header on a
@@ -2401,9 +2526,10 @@ func (qw *QueueWAL) openNextFile() error {
 	stat, err := file.Stat()
 	if err != nil {
 		_ = file.Close()
-		return fmt.Errorf("failed to stat WAL file: %w", err)
+		return nil, nil, 0, fmt.Errorf("failed to stat WAL file: %w", err)
 	}
-	size := stat.Size()
+	size = stat.Size()
+	created := size == 0
 
 	// Write the file-level header (magic + version) only on a brand-new file
 	// (SQ-4). The header is flushed to disk together with the first record
@@ -2422,33 +2548,38 @@ func (qw *QueueWAL) openNextFile() error {
 	// COLD PATH: once per WAL file, i.e. once per FileSize bytes written
 	// (512 MB by default). The probe handle is opened only when the file is
 	// non-empty, which for every file this process creates is never.
-	if size == 0 {
+	if created {
 		header := make([]byte, 0, WALHeaderSize)
 		header = append(header, WALMagic...)
 		header = append(header, WALFormatVersion)
 		n, werr := file.Write(header)
 		if werr != nil {
+			// Best-effort truncate first (a 1–5 byte partial header is refused
+			// by every later boot), then close and REMOVE the file: a retry
+			// reuses the same number and starts clean.
+			_ = file.Truncate(0)
 			_ = file.Close()
-			return fmt.Errorf("failed to write WAL file header: %w", werr)
+			_ = os.Remove(filename)
+			return nil, nil, 0, fmt.Errorf("failed to write WAL file header: %w", werr)
 		}
 		size = int64(n)
 	} else {
 		if size < int64(WALHeaderSize) {
 			_ = file.Close()
-			return fmt.Errorf("refusing to append to WAL file %s: %w: file is %d bytes, too short to carry a %d-byte header",
+			return nil, nil, 0, fmt.Errorf("refusing to append to WAL file %s: %w: file is %d bytes, too short to carry a %d-byte header",
 				filename, ErrUnsupportedWALVersion, size, WALHeaderSize)
 		}
 		// currentFile is O_WRONLY and cannot ReadAt; probe with its own handle.
 		probe, perr := os.Open(filename)
 		if perr != nil {
 			_ = file.Close()
-			return fmt.Errorf("failed to open WAL file %s for header validation: %w", filename, perr)
+			return nil, nil, 0, fmt.Errorf("failed to open WAL file %s for header validation: %w", filename, perr)
 		}
 		_, verr := walFileDataStart(probe)
 		_ = probe.Close()
 		if verr != nil {
 			_ = file.Close()
-			return fmt.Errorf("refusing to append to WAL file %s: %w", filename, verr)
+			return nil, nil, 0, fmt.Errorf("refusing to append to WAL file %s: %w", filename, verr)
 		}
 	}
 
@@ -2456,16 +2587,29 @@ func (qw *QueueWAL) openNextFile() error {
 	readFile, err := os.Open(filename)
 	if err != nil {
 		file.Close()
-		return fmt.Errorf("failed to open WAL read handle: %w", err)
+		if created {
+			// The file is ours and brand new; do not leave it behind.
+			_ = os.Remove(filename)
+		}
+		return nil, nil, 0, fmt.Errorf("failed to open WAL read handle: %w", err)
 	}
 
-	// Close previous read handle if any
-	if qw.currentReadFile != nil {
-		_ = qw.currentReadFile.Close()
-	}
+	return file, readFile, size, nil
+}
 
-	qw.currentFile = file
-	qw.currentReadFile = readFile
+// openNextFile opens the next WAL file and installs it. BOOT ONLY: it is
+// called from createSharedWAL before any background goroutine starts, which
+// is why it may install the new triple directly. Runtime rolls go through
+// rollFile, which retires the current file first.
+func (qw *QueueWAL) openNextFile() error {
+	num := qw.fileNum.Load() + 1
+	w, r, size, err := qw.openWALFile(num)
+	if err != nil {
+		return err
+	}
+	qw.fileNum.Store(num)
+	qw.currentFile = w
+	qw.currentReadFile = r
 	qw.fileOffset.Store(size)
 	return nil
 }
