@@ -161,7 +161,7 @@ func indexWALFile(path string) (entries []walRecordIndexEntry, hasSharedBody boo
 		// zero-length records — see walBlankRecordHeader. Walking it 8 bytes at
 		// a time would also make boot cost proportional to the zeroed tail.
 		if walBlankRecordHeader(crc, dataLen) {
-			if walNothingIntelligibleFollows(file, recStart) {
+			if walNothingIntelligibleFollows(file, recStart, -1) {
 				break
 			}
 			return nil, false, interfaces.FatalFault("wal-open", path,
@@ -183,7 +183,7 @@ func indexWALFile(path string) (entries []walRecordIndexEntry, hasSharedBody boo
 			h.Write(hdr[4:8])
 			h.Write(data)
 			if crc != h.Sum32() {
-				if walNothingIntelligibleFollows(file, recStart) {
+				if walNothingIntelligibleFollows(file, recStart, -1) {
 					break // torn tail: drop it and stop, nothing real follows
 				}
 				return nil, false, interfaces.FatalFault("wal-open", path,
@@ -286,7 +286,10 @@ func (qw *QueueWAL) rebuildBootState() error {
 
 	var faults []*interfaces.RecoveryFault
 	for _, f := range files {
-		info := &walFileInfo{path: f.path}
+		// durableSize -1 marks an inherited file: its whole content is
+		// presumed intact (it was not damaged by a handled write error in
+		// THIS incarnation), so checkpoints scan it whole (WS-C C1 §3.11).
+		info := &walFileInfo{path: f.path, durableSize: -1}
 		if st, serr := os.Stat(f.path); serr == nil {
 			info.createdAt = st.ModTime()
 		}

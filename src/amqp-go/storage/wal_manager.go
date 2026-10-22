@@ -787,7 +787,140 @@ func scanWALFileRecordCounts(filePath string) (WALRecordCounts, error) {
 	return c, nil
 }
 
-// WriteTxAtomic durably writes a set of message records as one all-or-nothing
+// repairAfterFailedWriteLocked repairs the WAL file after a failed batch/tx
+// write or fsync: truncate back to the pre-write offset (which is >= the
+// header and equals the durable end, I4), make the truncation durable, and
+// verify with Stat. Precondition: fileMutex is held and pre is the fileOffset
+// captured before the write.
+//
+// WHY TRUNCATE ON FSYNC FAILURE, DELETING BYTES THAT MAY BE ON DISK: on
+// Linux a failed fsync can leave dirty pages marked clean ("fsyncgate").
+// The batch has been nacked; leaving the bytes creates (a) a resurrected
+// nacked record at restart, (b) for a tx, a resurrected nacked commit, and
+// (c) once more data is appended after possibly-lost pages, a zero/stale
+// hole followed by data — exactly the interior pattern that refuses boot.
+// Truncating removes the region from the page cache and the file; the
+// publisher retries and at-least-once is preserved. The truncate happens
+// even when n == 0: one syscall that guards a kernel/FUSE layer reporting an
+// error after a partial append.
+//
+// If the repair itself fails, the file is POISONED (never written again; the
+// roll is attempted immediately) and the caller reports Repaired=false.
+func (qw *QueueWAL) repairAfterFailedWriteLocked(pre int64, op string, cause error) *WALWriteError {
+	werr := &WALWriteError{Op: op, Cause: cause}
+	err := walTruncate(qw.currentFile, pre, !qw.cfg.SyncDisabled)
+	if err == nil {
+		st, serr := qw.currentFile.Stat()
+		switch {
+		case serr != nil:
+			err = fmt.Errorf("stat after truncate: %w", serr)
+		case st.Size() != pre:
+			err = fmt.Errorf("size %d after truncate to %d", st.Size(), pre)
+		}
+	}
+	if err == nil {
+		// Belt-and-braces: fileOffset was never advanced past pre, but
+		// restoring it explicitly keeps I3 true by construction.
+		qw.fileOffset.Store(pre)
+		werr.Repaired = true
+		return werr
+	}
+	qw.poisonLocked(fmt.Errorf("WAL file %s diverged after failed %s and could not be truncated: %w",
+		qw.currentFile.Name(), op, err))
+	// First attempt is immediate (ignoreBackoff): if the roll works, the very
+	// next batch is served by a fresh file.
+	_ = qw.tryRollLocked(true)
+	return werr
+}
+
+// poisonLocked marks the current file as diverged. While poisoned, no byte is
+// written to it (ensureWritableLocked refuses or rolls first). The diverged
+// file STAYS OPEN FOR READS: every index entry for it points below the
+// pre-write offset, which is intact, and read-ahead is bounded at the durable
+// end (C7). On a successful roll it is retired with durableSize/damagedTail
+// and the poison clears.
+func (qw *QueueWAL) poisonLocked(cause error) {
+	qw.poisoned = cause
+	qw.degraded = true
+	qw.logError("WAL file diverged after a failed write and could not be repaired; rolling it away (the file stays readable and is checkpointed only up to its durable end)",
+		interfaces.LogField{Key: "error", Value: cause.Error()},
+		interfaces.LogField{Key: "file", Value: qw.currentFile.Name()})
+}
+
+// ensureWritableLocked refuses to write while the current file is poisoned
+// and tries to roll it away first. Precondition: fileMutex is held.
+func (qw *QueueWAL) ensureWritableLocked() error {
+	if qw.poisoned == nil {
+		return nil
+	}
+	if err := qw.tryRollLocked(false); err != nil {
+		// Fail fast, no disk I/O on the diverged file. The roll is retried on
+		// the next batch once the backoff window expires.
+		return fmt.Errorf("%w: %w", ErrWALUnavailable, qw.poisoned)
+	}
+	return nil // roll replaced the poisoned file; poisoned cleared inside
+}
+
+// failBatchLocked accounts one failed batch/tx, escalating to the typed
+// ErrWALUnavailable signal once the WAL is degraded (poisoned, or the
+// failure streak crossed walDegradedAfterFailures). While a writable file
+// exists there is NO request short-circuit: a cleared fault heals on the very
+// next batch. Short-circuiting happens only while poisoned (ensureWritableLocked).
+func (qw *QueueWAL) failBatchLocked(e *WALWriteError) error {
+	qw.consecutiveFailures++
+	if qw.consecutiveFailures == 1 || qw.consecutiveFailures%100 == 0 {
+		qw.logError("WAL batch failed; the batch was nacked and its partial bytes removed",
+			interfaces.LogField{Key: "op", Value: e.Op},
+			interfaces.LogField{Key: "repaired", Value: e.Repaired},
+			interfaces.LogField{Key: "error", Value: e.Cause.Error()},
+			interfaces.LogField{Key: "streak", Value: qw.consecutiveFailures})
+	}
+	if !qw.degraded && (qw.poisoned != nil || qw.consecutiveFailures >= walDegradedAfterFailures) {
+		qw.degraded = true
+		qw.logError("WAL DEGRADED: publishes are being nacked with ErrWALUnavailable-typed errors; the WAL self-heals on the next successful batch or roll",
+			interfaces.LogField{Key: "streak", Value: qw.consecutiveFailures})
+	}
+	if qw.degraded {
+		return fmt.Errorf("%w: %w", ErrWALUnavailable, e)
+	}
+	return e
+}
+
+// noteSuccessLocked records a durable success: the failure streak resets and
+// a degraded WAL recovers (logged once per transition). Precondition:
+// fileMutex is held.
+func (qw *QueueWAL) noteSuccessLocked() {
+	if qw.degraded {
+		qw.degraded = false
+		qw.logWarn("WAL recovered: a durable batch succeeded and publishes are confirmed again")
+	}
+	qw.consecutiveFailures = 0
+}
+
+// Health reports the WAL's write-path health: nil when healthy, or an error
+// wrapping ErrWALUnavailable when the WAL is degraded or poisoned. Cold path
+// (readiness wiring is a follow-up, spec §17). A closed manager reports nil:
+// it is not sick, it is gone.
+func (wm *WALManager) Health() error {
+	wm.mu.RLock()
+	sw := wm.sharedWAL
+	wm.mu.RUnlock()
+	if sw == nil {
+		return nil
+	}
+	sw.fileMutex.Lock()
+	defer sw.fileMutex.Unlock()
+	if sw.degraded || sw.poisoned != nil {
+		cause := sw.poisoned
+		if cause == nil {
+			cause = fmt.Errorf("%d consecutive write failures", sw.consecutiveFailures)
+		}
+		return fmt.Errorf("%w: %w", ErrWALUnavailable, cause)
+	}
+	return nil
+}
+
+// writeTxAtomic durably writes a set of message records as one all-or-nothing
 // transaction unit (SQ-8): a Begin marker, the records, then a Commit marker,
 // appended contiguously and fsynced exactly once. Recovery only applies the
 // records if the trailing Commit marker is present, so a crash before the fsync
@@ -821,6 +954,10 @@ func (qw *QueueWAL) writeTxAtomic(records []*RecoveryMessage) error {
 	if qw.fileClosed {
 		return ErrWALClosed
 	}
+	// C1: never write to a diverged (poisoned) file; roll it away first.
+	if err := qw.ensureWritableLocked(); err != nil {
+		return err
+	}
 
 	currentFileNum := qw.fileNum.Load()
 	startPos := qw.fileOffset.Load()
@@ -844,19 +981,34 @@ func (qw *QueueWAL) writeTxAtomic(records []*RecoveryMessage) error {
 	buf = append(buf, serializeTxMarker(WALTxMarkerCommit, epoch, qw.cfg.CRCDisabled)...)
 
 	// Single write; through the walWrite hook seam (TEST-ONLY faults;
-	// default is f.Write).
+	// default is f.Write). A short write (n < len(buf) with no error) is
+	// normalised to io.ErrShortWrite so the repair path is taken either way.
 	n, err := walWrite(qw.currentFile, buf)
+	if err == nil && n != len(buf) {
+		err = io.ErrShortWrite
+	}
 	if err != nil {
 		if qw.metrics != nil {
 			qw.metrics.RecordWALWriteError()
 		}
-		return fmt.Errorf("WAL transaction write failed: %w", err)
+		// C1: the whole contiguous tx unit is [startPos, EOF) — one truncate
+		// to startPos removes it and nothing else. Recovery never sees a
+		// half tx from a HANDLED error (a crash's torn Begin is already
+		// discarded by scanWALFile).
+		e := qw.failBatchLocked(qw.repairAfterFailedWriteLocked(startPos, "tx-write", err))
+		qw.assertOffsetInvariantLocked()
+		return e
 	}
 
 	// Single fsync makes the whole bracketed unit durable. The Commit marker is
 	// the last thing written, so if this fsync does not complete the tail
 	// (Commit) is lost and recovery discards the transaction. walTxFsync is a
 	// hook seam whose default is exactly the previous direct fdatasyncFile.
+	//
+	// C1: a FAILED fsync no longer leaves the unit on disk. The client was
+	// told the commit failed; keeping the bytes would resurrect a nacked
+	// commit after restart and seed interior corruption once more data
+	// follows possibly-lost pages (fsyncgate). Truncate to startPos instead.
 	fsyncStart := time.Now()
 	fsyncErr := walTxFsync(qw.currentFile)
 	if qw.metrics != nil {
@@ -866,7 +1018,9 @@ func (qw *QueueWAL) writeTxAtomic(records []*RecoveryMessage) error {
 		}
 	}
 	if fsyncErr != nil {
-		return fmt.Errorf("WAL transaction fsync failed: %w", fsyncErr)
+		e := qw.failBatchLocked(qw.repairAfterFailedWriteLocked(startPos, "tx-fsync", fsyncErr))
+		qw.assertOffsetInvariantLocked()
+		return e
 	}
 	if qw.metrics != nil {
 		for range records {
@@ -892,6 +1046,8 @@ func (qw *QueueWAL) writeTxAtomic(records []*RecoveryMessage) error {
 	qw.currentFileOffsetsMutex.Unlock()
 
 	newOffset := qw.fileOffset.Add(int64(n))
+	qw.noteSuccessLocked()
+	qw.assertOffsetInvariantLocked()
 	if newOffset >= qw.cfg.FileSize {
 		qw.maybeRollLocked()
 	}
@@ -1159,15 +1315,30 @@ func walBlankRecordHeader(crc, dataLen uint32) bool { return crc == 0 && dataLen
 // refused the boot, for damage entirely inside the last 2 KB of the file.
 //
 // Ra inspects the remaining bytes precisely because zeros are what a crash
-// leaves. So does this: everything from `from` to EOF must be zero. A read
+// leaves. So does this: everything from `from` to the end must be zero. A read
 // failure reports false — we cannot PROVE nothing follows, and the safe
 // direction for an unprovable tail is to treat it as interior corruption.
-func walNothingIntelligibleFollows(f *os.File, from int64) bool {
+//
+// limit bounds the "end": -1 means the file's real EOF. A bounded caller (a
+// damaged-tail WAL file scanned only up to its durable end, WS-C C1 §3.11)
+// treats bytes beyond the limit as ignorable, because it already knows they
+// are a nacked partial batch that will go away with the unlink.
+func walNothingIntelligibleFollows(f *os.File, from, limit int64) bool {
 	buf := make([]byte, 64*1024)
 	pos := from
 	for {
-		n, err := f.ReadAt(buf, pos)
-		for i := 0; i < n; i++ {
+		n := int64(len(buf))
+		if limit >= 0 {
+			remaining := limit - pos
+			if remaining <= 0 {
+				return true
+			}
+			if remaining < n {
+				n = remaining
+			}
+		}
+		nr, err := f.ReadAt(buf[:n], pos)
+		for i := 0; i < nr; i++ {
 			if buf[i] != 0 {
 				return false
 			}
@@ -1178,14 +1349,15 @@ func walNothingIntelligibleFollows(f *os.File, from int64) bool {
 		if err != nil {
 			return false
 		}
-		if n == 0 {
+		if nr == 0 {
 			return true
 		}
-		pos += int64(n)
+		pos += int64(nr)
 	}
 }
 
-// scanWALFile scans a single WAL file and returns all messages.
+// scanWALFile scans a single WAL file and returns all messages. It is
+// scanWALFileUpTo with no bound (the file's real EOF).
 //
 // CLASSIFICATION (Ra's three-way split, ref-rabbitmq.md §1.3 — RabbitMQ's own
 // answer for its own modern engine):
@@ -1212,6 +1384,17 @@ func walNothingIntelligibleFollows(f *os.File, from int64) bool {
 // It returns the messages it did parse ALONGSIDE any fault, so a degraded or
 // benign outcome keeps its partial data; only a fatal outcome discards it.
 func (qw *QueueWAL) scanWALFile(filePath string) ([]*RecoveryMessage, error) {
+	return qw.scanWALFileUpTo(filePath, -1)
+}
+
+// scanWALFileUpTo scans a single WAL file up to limit bytes (-1 = whole
+// file). WS-C C1 §3.11: a rolled file whose tail holds a nacked partial batch
+// that could not be truncated (damagedTail) is checkpointed by scanning ONLY
+// [0, durableSize) — the garbage is never read and goes away with the unlink.
+// The bound is the scan's EOF: a record that would cross it is a torn tail
+// (benign), and walNothingIntelligibleFollows treats bytes beyond it as
+// ignorable.
+func (qw *QueueWAL) scanWALFileUpTo(filePath string, limit int64) ([]*RecoveryMessage, error) {
 	file, err := os.Open(filePath)
 	if err != nil {
 		return nil, err
@@ -1219,12 +1402,17 @@ func (qw *QueueWAL) scanWALFile(filePath string) ([]*RecoveryMessage, error) {
 	defer file.Close()
 
 	// fileSize is what makes "is this the last record" a fact rather than a
-	// guess: a CRC failure is tolerable exactly when nothing follows it.
+	// guess: a CRC failure is tolerable exactly when nothing follows it. When
+	// a durable-end bound is given, bytes beyond it are known garbage and are
+	// excluded from both the scan and the nothing-follows test.
 	stat, serr := file.Stat()
 	if serr != nil {
 		return nil, serr
 	}
 	fileSize := stat.Size()
+	if limit >= 0 && fileSize > limit {
+		fileSize = limit
+	}
 	var scanFault error
 
 	// Detect the file-level header and start parsing records after it. ITER4 is a
@@ -1234,7 +1422,11 @@ func (qw *QueueWAL) scanWALFile(filePath string) ([]*RecoveryMessage, error) {
 	if err != nil {
 		return nil, err
 	}
-	if _, err := file.Seek(dataStart, io.SeekStart); err != nil {
+
+	// Read records through a section reader bounded at fileSize so a bounded
+	// scan cannot run past the durable end.
+	reader := io.NewSectionReader(file, 0, fileSize)
+	if _, err := reader.Seek(dataStart, io.SeekStart); err != nil {
 		return nil, err
 	}
 
@@ -1266,7 +1458,7 @@ func (qw *QueueWAL) scanWALFile(filePath string) ([]*RecoveryMessage, error) {
 		// short read at the tail (a crash mid-write) breaks out, dropping the
 		// partial trailing record — CRC would reject it anyway.
 		hdr := make([]byte, 8)
-		if _, err := io.ReadFull(file, hdr); err != nil {
+		if _, err := io.ReadFull(reader, hdr); err != nil {
 			if errors.Is(err, io.ErrUnexpectedEOF) {
 				scanFault = interfaces.BenignFault("wal-scan", filePath,
 					fmt.Sprintf("truncated record header at byte offset %d; the trailing partial record was never fsynced, so no publisher was confirmed for it", recStart))
@@ -1279,7 +1471,7 @@ func (qw *QueueWAL) scanWALFile(filePath string) ([]*RecoveryMessage, error) {
 		if walBlankRecordHeader(crc, dataLen) {
 			// A zero region starting exactly on a record boundary. See
 			// walBlankRecordHeader: the write path cannot produce this.
-			if walNothingIntelligibleFollows(file, recStart) {
+			if walNothingIntelligibleFollows(file, recStart, fileSize) {
 				scanFault = interfaces.BenignFault("wal-scan", filePath,
 					fmt.Sprintf("zero-filled tail from byte offset %d to end of file (%d bytes); those blocks never reached the platter, so nothing in them was ever fsynced or confirmed", recStart, fileSize-recStart))
 				break
@@ -1291,7 +1483,7 @@ func (qw *QueueWAL) scanWALFile(filePath string) ([]*RecoveryMessage, error) {
 		}
 
 		data := make([]byte, dataLen)
-		if _, err := io.ReadFull(file, data); err != nil {
+		if _, err := io.ReadFull(reader, data); err != nil {
 			if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
 				scanFault = interfaces.BenignFault("wal-scan", filePath,
 					fmt.Sprintf("truncated record body at byte offset %d; the trailing partial record was never fsynced, so no publisher was confirmed for it", recStart))
@@ -1309,7 +1501,7 @@ func (qw *QueueWAL) scanWALFile(filePath string) ([]*RecoveryMessage, error) {
 			h.Write(hdr[4:8])
 			h.Write(data)
 			if crc != h.Sum32() {
-				if !walNothingIntelligibleFollows(file, recStart) {
+				if !walNothingIntelligibleFollows(file, recStart, fileSize) {
 					// INTERIOR. Silently skipping it (what this line used to do,
 					// with no count and no log) drops a confirmed durable
 					// message and reports the boot successful.
@@ -1538,9 +1730,29 @@ func (qw *QueueWAL) flushBatch(batch []*writeRequest, bufp *[]byte, positionsp *
 
 	qw.fileMutex.Lock()
 
+	// C9 belt-and-braces: a batch cannot normally arrive after close()
+	// finished waiting (enqueue closed the window), but refuse it cleanly if
+	// one ever does.
+	if qw.fileClosed {
+		qw.fileMutex.Unlock()
+		qw.deliverCompletions(batch, nil, ErrWALClosed)
+		return
+	}
+	// C1: never write to a file whose size != fileOffset (poisoned); roll it
+	// away first or fail fast.
+	if err := qw.ensureWritableLocked(); err != nil {
+		qw.fileMutex.Unlock()
+		qw.deliverCompletions(batch, nil, err)
+		return
+	}
+
 	// Get current file number and position BEFORE write
 	currentFileNum := qw.fileNum.Load()
 	currentFilePos := qw.fileOffset.Load()
+	// C1: currentFileHasSharedBody is set during serialization below; a failed
+	// write/fsync restores it so a nacked shared unit cannot pin the file out
+	// of checkpoint forever.
+	prevShared := qw.currentFileHasSharedBody
 
 	// Reuse the persistent serialization buffer (grow-once) and position scratch.
 	buf := (*bufp)[:0]
@@ -1643,18 +1855,28 @@ func (qw *QueueWAL) flushBatch(batch []*writeRequest, bufp *[]byte, positionsp *
 
 	// Single write (O_APPEND makes this atomic across processes). The write
 	// goes through the walWrite hook seam (TEST-ONLY faults; default is
-	// f.Write).
+	// f.Write). A short write (n < len(buf), no error) is normalised to
+	// io.ErrShortWrite: Go's os.File.Write sets it itself, but a hook may not.
 	n, err := walWrite(qw.currentFile, buf)
+	if err == nil && n != len(buf) {
+		err = io.ErrShortWrite
+	}
 	if err != nil {
 		// Record WAL write error
 		if qw.metrics != nil {
 			qw.metrics.RecordWALWriteError()
 		}
-		// Write failed - not durable, index NOT updated. Release the file lock
-		// before delivering completions (async callbacks must not run under
-		// fileMutex; see deliverCompletions).
+		// C1: the kernel may have appended n bytes. Truncate back to the
+		// pre-write offset (repaired, or poisoned+rolled if that fails), so
+		// the next batch's positions match the file and no interior
+		// corruption is produced. Not durable, index NOT updated. Release the
+		// file lock before delivering completions (async callbacks must not
+		// run under fileMutex; see deliverCompletions).
+		qw.currentFileHasSharedBody = prevShared
+		e := qw.failBatchLocked(qw.repairAfterFailedWriteLocked(currentFilePos, "write", err))
+		qw.assertOffsetInvariantLocked()
 		qw.fileMutex.Unlock()
-		qw.deliverCompletions(batch, serErr, fmt.Errorf("WAL write failed: %w", err))
+		qw.deliverCompletions(batch, serErr, e)
 		return
 	}
 
@@ -1696,9 +1918,19 @@ func (qw *QueueWAL) flushBatch(batch []*writeRequest, bufp *[]byte, positionsp *
 	// If fsync failed, messages are NOT durable: do NOT update the index (so a
 	// reader can never observe a non-durable record and no async caller ever
 	// advances visibility), and deliver the error to every caller.
+	//
+	// C1: the bytes are also REMOVED. A failed fsync can leave dirty pages
+	// marked clean (fsyncgate); nobody knows whether they reached the media,
+	// and a later fsync can succeed without them. Keeping them would
+	// resurrect nacked records at restart and, once more data is appended
+	// after possibly-lost pages, create the zero-hole-then-data interior
+	// pattern that refuses boot. Truncate back to the pre-write offset.
 	if fsyncErr != nil {
+		qw.currentFileHasSharedBody = prevShared
+		e := qw.failBatchLocked(qw.repairAfterFailedWriteLocked(currentFilePos, "fsync", fsyncErr))
+		qw.assertOffsetInvariantLocked()
 		qw.fileMutex.Unlock()
-		qw.deliverCompletions(batch, serErr, fsyncErr)
+		qw.deliverCompletions(batch, serErr, e)
 		return
 	}
 
@@ -1742,6 +1974,10 @@ func (qw *QueueWAL) flushBatch(batch []*writeRequest, bufp *[]byte, positionsp *
 
 	// Update offset
 	newOffset := qw.fileOffset.Add(int64(n))
+
+	// Durable success: reset the failure streak (and recover from degraded).
+	qw.noteSuccessLocked()
+	qw.assertOffsetInvariantLocked()
 
 	// Check if we need to roll to new file. A failed roll never fails this
 	// durable batch (C3); the next flush retries it with backoff.
@@ -2747,8 +2983,8 @@ func (qw *QueueWAL) forceCheckpointFile(info *walFileInfo) {
 	// yields every intact record before the damage, and those records must
 	// still be checkpointed — bailing on any non-nil error would pin the file
 	// forever. Only a fatal fault, which means the file cannot be interpreted
-	// at all, aborts.
-	messages, err := qw.scanWALFile(info.path)
+	// at all, aborts. The scan is bounded at the durable end (C1 §3.11).
+	messages, err := qw.scanWALFileUpTo(info.path, info.durableSize)
 	if err != nil && interfaces.OutcomeOf(err) == interfaces.RecoveryFatal {
 		return
 	}
@@ -3321,8 +3557,11 @@ func (qw *QueueWAL) performCheckpoint() {
 
 		// Scan the WAL file. See forceCheckpointFile: only a FATAL scan fault
 		// aborts; a torn tail still has every earlier record intact and they
-		// must reach a segment or the file can never be reclaimed.
-		messages, err := qw.scanWALFile(info.path)
+		// must reach a segment or the file can never be reclaimed. The scan is
+		// bounded at the file's durable end (C1 §3.11): a damaged tail (a
+		// nacked partial batch that could not be truncated) is never read and
+		// goes away with the unlink.
+		messages, err := qw.scanWALFileUpTo(info.path, info.durableSize)
 		if err != nil && interfaces.OutcomeOf(err) == interfaces.RecoveryFatal {
 			continue
 		}

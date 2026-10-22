@@ -827,6 +827,9 @@ func (ds *DisruptorStorage) GetExchangeBindingsFrom(source string) ([]*interface
 // withdrawn from compaction (review-4 B-4), and a segment fault discovered on
 // the write path rather than at boot (review-4 N-7). nil disables logging.
 func (ds *DisruptorStorage) SetLogger(l interfaces.Logger) {
+	if ds.wal != nil {
+		ds.wal.SetLogger(l)
+	}
 	if ds.segments != nil {
 		ds.segments.SetLogger(l)
 	}

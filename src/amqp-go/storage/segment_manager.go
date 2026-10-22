@@ -1981,7 +1981,7 @@ func (qs *QueueSegments) loadSegmentFile(segmentNum uint64, segPath string) erro
 		// TestSegmentScan_TheWritePathNeverProducesAZeroLengthRecord), so this
 		// is never data.
 		if walBlankRecordHeader(storedCRC, dataLen) {
-			if walNothingIntelligibleFollows(file, pos) {
+			if walNothingIntelligibleFollows(file, pos, fileSize) {
 				scanFault = interfaces.BenignFault("segment-scan", segPath,
 					fmt.Sprintf("zero-filled tail from byte offset %d to end of file (%d bytes); those blocks never reached the platter, so nothing in them was ever fsynced or confirmed", pos, fileSize-pos))
 				break
@@ -2006,7 +2006,7 @@ func (qs *QueueSegments) loadSegmentFile(segmentNum uint64, segPath string) erro
 			h.Write(data)
 			if h.Sum32() != storedCRC {
 				next := pos + segmentRecordHeaderSize + int64(dataLen)
-				if !walNothingIntelligibleFollows(file, next) {
+				if !walNothingIntelligibleFollows(file, next, fileSize) {
 					return fatal(fmt.Sprintf("the record at byte offset %d failed its CRC32 check and is NOT the last record in the file — real data follows it (%d of %d bytes); this segment file cannot be interpreted",
 						pos, fileSize-next, fileSize))
 				}

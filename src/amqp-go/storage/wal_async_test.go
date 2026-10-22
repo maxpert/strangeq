@@ -397,6 +397,14 @@ func TestWriteAsync_FsyncErrorNoIndexUpdate(t *testing.T) {
 	require.NotNil(t, goodRec, "the good record must be physically durable and recoverable")
 	assert.True(t, bytesEqual(goodRec.Body, goodBody),
 		"the good record's body must be bit-identical (buffer reuse after error did not corrupt bytes)")
+
+	// WS-C C1 strengthening: the fsync-failed record was nacked, so its bytes
+	// must not be resurrected by the restart scan (previously they stayed on
+	// disk and came back). ADDED, nothing weakened.
+	for _, rm := range recovered {
+		assert.NotEqual(t, bad, rm.Offset,
+			"no recovered record may carry the nacked tag %d (fsync-failed bytes must be truncated away)", bad)
+	}
 }
 
 // TestStoreMessageAsync_FsyncErrorNoRingStore (TDD test 8 part 2): on an fsync
