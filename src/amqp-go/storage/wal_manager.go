@@ -541,6 +541,31 @@ func putDoneChannel(pool *sync.Pool, ch chan error) {
 	pool.Put(ch)
 }
 
+// enqueue hands req to the batch writer, refusing fast once Close has begun.
+//
+// C9 race fix: the entry points used to select between `writeChan <- req` and
+// `<-stopChan`; after close(stopChan) both cases could be ready, so a send
+// could win the select AFTER the writer's stop arm drained the channel and
+// returned — that request then sat in the buffer forever, hanging Write on
+// <-doneChan and losing an async onDone.
+//
+// closing is observed under enqueueMu: every successful send
+// happens-before closing = true (RWMutex), and close() closes stopChan only
+// after every in-flight sender has released the RLock. The writer's final
+// drain therefore observes every enqueued request, and no send can arrive
+// after it. A sender blocked on a full writeChan still makes progress: the
+// writer is guaranteed alive (stopChan is not yet closed) and never takes
+// enqueueMu, and completion callbacks are non-blocking by contract.
+func (qw *QueueWAL) enqueue(req *writeRequest) error {
+	qw.enqueueMu.RLock()
+	defer qw.enqueueMu.RUnlock()
+	if qw.closing {
+		return ErrWALClosed
+	}
+	qw.writeChan <- req
+	return nil
+}
+
 // Write writes a message to the shared WAL (synchronous batch write)
 // Blocks until the batch containing this message is fsynced to disk.
 // This ensures proper AMQP durability semantics (Option 2: Batch Synchronous).
@@ -549,25 +574,20 @@ func (wm *WALManager) Write(queueName string, message *protocol.Message, offset 
 	sw := wm.sharedWAL
 	wm.mu.RUnlock()
 	if sw == nil {
-		return fmt.Errorf("shared WAL not initialized")
+		return ErrWALClosed
 	}
 
 	// Get a response channel from the pool (avoids make(chan error, 1) per write)
 	doneChan := getDoneChannel(&doneChannelPool)
 	defer putDoneChannel(&doneChannelPool, doneChan)
 
-	// Guard against send-on-closed-channel panic during concurrent Close:
-	// select on stopChan so a shutting-down WAL returns an error instead of
-	// blocking forever or panicking (mirrors Acknowledge's pattern).
-	select {
-	case sw.writeChan <- &writeRequest{
+	if err := sw.enqueue(&writeRequest{
 		queueName: queueName,
 		message:   message,
 		offset:    offset,
 		done:      doneChan,
-	}:
-	case <-sw.stopChan:
-		return fmt.Errorf("WAL shutting down")
+	}); err != nil {
+		return err
 	}
 
 	// Block waiting for batch to be fsynced
@@ -594,22 +614,18 @@ func (wm *WALManager) WriteAsync(queueName string, message *protocol.Message, of
 	wm.mu.RUnlock()
 	if sw == nil {
 		if onDone != nil {
-			onDone(fmt.Errorf("shared WAL not initialized"))
+			onDone(ErrWALClosed)
 		}
 		return
 	}
 
-	select {
-	case sw.writeChan <- &writeRequest{
+	if err := sw.enqueue(&writeRequest{
 		queueName: queueName,
 		message:   message,
 		offset:    offset,
 		onDone:    onDone,
-	}:
-	case <-sw.stopChan:
-		if onDone != nil {
-			onDone(fmt.Errorf("WAL shutting down"))
-		}
+	}); err != nil && onDone != nil {
+		onDone(err)
 	}
 }
 
@@ -629,23 +645,18 @@ func (wm *WALManager) WriteSharedAsync(subs []sharedSub, body []byte, fanoutHint
 	sw := wm.sharedWAL
 	wm.mu.RUnlock()
 	if sw == nil {
-		return fmt.Errorf("shared WAL not initialized")
+		return ErrWALClosed
 	}
 	if len(subs) == 0 {
 		return nil
 	}
-	select {
-	case sw.writeChan <- &writeRequest{
+	return sw.enqueue(&writeRequest{
 		unit: &sharedUnit{
 			body:       body,
 			fanoutHint: fanoutHint,
 			subs:       subs,
 		},
-	}:
-		return nil
-	case <-sw.stopChan:
-		return fmt.Errorf("WAL shutting down")
-	}
+	})
 }
 
 // walGroupCommitFsync is the fsync applied by the group-commit batch writer
@@ -804,6 +815,12 @@ func (qw *QueueWAL) writeTxAtomic(records []*RecoveryMessage) error {
 
 	qw.fileMutex.Lock()
 	defer qw.fileMutex.Unlock()
+
+	// The transaction slow path bypasses writeChan, so the enqueue gate cannot
+	// protect it: refuse under fileMutex once Close has shut the file down.
+	if qw.fileClosed {
+		return ErrWALClosed
+	}
 
 	currentFileNum := qw.fileNum.Load()
 	startPos := qw.fileOffset.Load()
@@ -3224,8 +3241,18 @@ func (qw *QueueWAL) performCheckpoint() {
 	}
 }
 
-// close stops background goroutines and closes files
+// close stops background goroutines and closes files.
+//
+// C9 ORDERING: closing is published under enqueueMu BEFORE stopChan is
+// closed, so no writeChan send can race past the writer's final drain; and
+// fileClosed is set only after wg.Wait(), so the final drain's flushBatch
+// still runs normally and delivers exactly one completion per enqueued
+// request. See enqueue.
 func (qw *QueueWAL) close() {
+	qw.enqueueMu.Lock()
+	qw.closing = true
+	qw.enqueueMu.Unlock()
+
 	close(qw.stopChan)
 	qw.wg.Wait()
 
@@ -3238,6 +3265,7 @@ func (qw *QueueWAL) close() {
 	qw.oldFileCacheMutex.Unlock()
 
 	qw.fileMutex.Lock()
+	qw.fileClosed = true
 	defer qw.fileMutex.Unlock()
 
 	if qw.currentFile != nil {
