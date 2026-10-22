@@ -1,6 +1,7 @@
 package server
 
 import (
+	"errors"
 	"fmt"
 
 	amqperrors "github.com/maxpert/amqp-go/errors"
@@ -23,7 +24,8 @@ func (s *Server) processTransactionMethod(conn *protocol.Connection, channelID u
 			zap.Uint16("method_id", methodID),
 			zap.Uint16("channel_id", channelID),
 			zap.String("connection_id", conn.ID))
-		return fmt.Errorf("unknown transaction method ID: %d", methodID)
+		return s.connectionError(conn, amqperrors.FrameError,
+			fmt.Sprintf("FRAME_ERROR - unknown method 90.%d", methodID), 90, methodID)
 	}
 }
 
@@ -36,7 +38,7 @@ func (s *Server) handleTxSelect(conn *protocol.Connection, channelID uint16, pay
 			zap.Error(err),
 			zap.String("connection_id", conn.ID),
 			zap.Uint16("channel_id", channelID))
-		return err
+		return s.malformed(conn, err, 90, 10)
 	}
 
 	// Check if channel is in confirm mode — can't be in both
@@ -46,9 +48,8 @@ func (s *Server) handleTxSelect(conn *protocol.Connection, channelID uint16, pay
 			s.Log.Warn("Cannot enable transaction mode on confirm channel",
 				zap.Uint16("channel_id", channelID),
 				zap.String("connection_id", conn.ID))
-			s.sendChannelClose(conn, channelID, amqperrors.PreconditionFailed,
-				"channel cannot be in both confirm and transaction mode", 90, 10)
-			return fmt.Errorf("channel %d is in confirm mode, cannot enable transaction mode", channelID)
+			return s.channelError(conn, channelID, amqperrors.PreconditionFailed,
+				"PRECONDITION_FAILED - cannot switch from confirm to tx mode", 90, 10)
 		}
 	}
 
@@ -67,7 +68,7 @@ func (s *Server) handleTxSelect(conn *protocol.Connection, channelID uint16, pay
 		}
 	} else {
 		s.Log.Warn("No transaction manager available")
-		return fmt.Errorf("transactions not supported")
+		return s.connectionError(conn, amqperrors.NotImplemented, "NOT_IMPLEMENTED - transactions not supported", 90, 10)
 	}
 
 	// Send tx.select-ok response
@@ -90,7 +91,7 @@ func (s *Server) handleTxCommit(conn *protocol.Connection, channelID uint16, pay
 			zap.Error(err),
 			zap.String("connection_id", conn.ID),
 			zap.Uint16("channel_id", channelID))
-		return err
+		return s.malformed(conn, err, 90, 20)
 	}
 
 	s.Log.Info("Transaction commit requested",
@@ -116,12 +117,32 @@ func (s *Server) handleTxCommit(conn *protocol.Connection, channelID uint16, pay
 			s.Log.Error("Failed to commit transaction",
 				zap.Error(err),
 				zap.Uint16("channel_id", channelID))
-			s.sendChannelClose(conn, channelID, amqperrors.InternalError, "transaction commit failed", 90, 30)
-			return nil
+			if errors.Is(err, interfaces.ErrTransactionNotActive) || errors.Is(err, interfaces.ErrTransactionNotFound) {
+				return s.channelError(conn, channelID, amqperrors.PreconditionFailed,
+					"PRECONDITION_FAILED - channel is not transactional", 90, 20)
+			}
+			// Documented divergence (§3.6): a commit failure closes the CHANNEL
+			// with 541 (preserving the intent of i22_tx_teardown_test.go), not
+			// the connection, even though 541 is a hard code — build the
+			// ChannelError directly to bypass channelError's hard-code
+			// promotion. (Also fixes the class/method echo from 90.30
+			// (tx.rollback) to 90.20 (tx.commit).)
+			rt := s.runtimeFor(conn)
+			ce := &ChannelError{
+				Code:     amqperrors.InternalError,
+				Text:     "INTERNAL_ERROR - transaction commit failed",
+				ClassID:  90,
+				MethodID: 20,
+				Cause:    err,
+			}
+			if rt.markChannelClosing(channelID) {
+				s.sendChannelClose(conn, channelID, ce.Code, ce.Text, 90, 20)
+			}
+			ce.sent = true
+			return ce
 		}
 	} else {
-		s.sendChannelClose(conn, channelID, amqperrors.InternalError, "transactions not supported", 90, 30)
-		return nil
+		return s.connectionError(conn, amqperrors.NotImplemented, "NOT_IMPLEMENTED - transactions not supported", 90, 20)
 	}
 
 	// Send confirms for published messages after successful commit
@@ -159,7 +180,7 @@ func (s *Server) handleTxRollback(conn *protocol.Connection, channelID uint16, p
 			zap.Error(err),
 			zap.String("connection_id", conn.ID),
 			zap.Uint16("channel_id", channelID))
-		return err
+		return s.malformed(conn, err, 90, 30)
 	}
 
 	s.Log.Info("Transaction rollback requested",
@@ -176,7 +197,7 @@ func (s *Server) handleTxRollback(conn *protocol.Connection, channelID uint16, p
 			return err
 		}
 	} else {
-		return fmt.Errorf("transactions not supported")
+		return s.connectionError(conn, amqperrors.NotImplemented, "NOT_IMPLEMENTED - transactions not supported", 90, 30)
 	}
 
 	// Send tx.rollback-ok response

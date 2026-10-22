@@ -344,37 +344,63 @@ func (s *Server) handleConnectionStartOK(conn *protocol.Connection, payload []by
 	return nil
 }
 
-// processConnectionMethod processes connection-level methods
+// processConnectionMethod processes connection-level methods received AFTER
+// the handshake completed (the handshake state machine reads its own frames;
+// see processConnectionFrames). Anything handshake-scoped here is a hard
+// command-invalid (503), and start-ok is never re-accepted: a mid-connection
+// identity change is not permitted (P0-1).
 func (s *Server) processConnectionMethod(conn *protocol.Connection, methodID uint16, payload []byte) error {
 	switch methodID {
 	case protocol.ConnectionStartOK: // Method ID 11 for connection class
-		// Process connection.start-ok and authenticate
-		s.Log.Debug("Received connection.start-ok", zap.String("connection_id", conn.ID))
-		return s.handleConnectionStartOK(conn, payload)
+		s.Log.Warn("connection.start-ok after handshake",
+			zap.String("connection_id", conn.ID))
+		return s.connectionError(conn, amqperrors.CommandInvalid,
+			"COMMAND_INVALID - connection.start-ok after handshake", 10, 11)
 	case protocol.ConnectionTuneOK: // Method ID 31 for connection class
-		s.Log.Debug("Received connection.tune-ok", zap.String("connection_id", conn.ID))
-		return nil
+		s.Log.Warn("connection.tune-ok after handshake",
+			zap.String("connection_id", conn.ID))
+		return s.connectionError(conn, amqperrors.CommandInvalid,
+			"COMMAND_INVALID - connection.tune-ok after handshake", 10, 31)
 	case protocol.ConnectionSecureOK: // Method ID 21 — multi-step SASL not supported
 		s.Log.Warn("Received unexpected connection.secure-ok (multi-step SASL not supported)",
 			zap.String("connection_id", conn.ID))
-		return s.sendConnectionClose(conn, 503, "COMMAND_INVALID - multi-step SASL not supported", 10, 21)
-	case protocol.ConnectionOpenOK: // Method ID 41 for connection class
-		// Process connection.open-ok
-		s.Log.Debug("Received connection.open-ok", zap.String("connection_id", conn.ID))
-		return nil
+		return s.connectionError(conn, amqperrors.CommandInvalid,
+			"COMMAND_INVALID - multi-step SASL not supported", 10, 21)
+	case protocol.ConnectionOpen, protocol.ConnectionOpenOK: // 40 / 41
+		s.Log.Warn("connection.open/open-ok after handshake",
+			zap.Uint16("method_id", methodID),
+			zap.String("connection_id", conn.ID))
+		return s.connectionError(conn, amqperrors.CommandInvalid,
+			fmt.Sprintf("COMMAND_INVALID - unexpected connection method 10.%d after handshake", methodID), 10, methodID)
 	case protocol.ConnectionClose: // Method ID 50 for connection class
-		// Process connection.close
+		// Flush confirms BEFORE close-ok: after connection.close/close-ok
+		// nothing else may be written, and writing basic.acks after close-ok
+		// violates the protocol.
+		rt := s.runtimeFor(conn)
+		if rt.handshakeDone.Load() {
+			_ = s.drainConfirmNacks(conn)
+			_ = s.flushAllChannelConfirms(conn)
+		}
+		rt.closeHandshakeStarted.Store(true)
 		s.Log.Info("Received connection.close", zap.String("connection_id", conn.ID))
 		if err := s.sendConnectionCloseOK(conn); err != nil {
 			s.Log.Error("Failed to send connection.close-ok", zap.Error(err))
 		}
 		conn.Closed.Store(true)
 		return errClientRequestedClose
+	case protocol.ConnectionCloseOK: // Method ID 51 — client answers our close
+		rt := s.runtimeFor(conn)
+		if rt.connClosing.Load() {
+			return errCloseOKReceived
+		}
+		return s.connectionError(conn, amqperrors.CommandInvalid,
+			"COMMAND_INVALID - unexpected connection.close-ok", 10, 51)
 	default:
 		s.Log.Warn("Unknown connection method ID",
 			zap.Uint16("method_id", methodID),
 			zap.String("connection_id", conn.ID))
-		return fmt.Errorf("unknown connection method ID: %d", methodID)
+		return s.connectionError(conn, amqperrors.FrameError,
+			fmt.Sprintf("FRAME_ERROR - unknown connection method 10.%d", methodID), 10, methodID)
 	}
 }
 

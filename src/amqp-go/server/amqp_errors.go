@@ -241,6 +241,19 @@ func brokerErrorIsNotFound(msg string) bool {
 	return strings.Contains(msg, "not found") || strings.Contains(msg, "does not exist")
 }
 
+// discardWhileClosing implements AMQP 0-9-1 §2.3.5.2/§4.7: after sending
+// close, the sender discards everything except close / close-ok.
+func (s *Server) discardWhileClosing(rt *connRuntime, f *protocol.Frame) bool {
+	cls, mth, isMethod := methodIDs(f)
+	if rt.connClosing.Load() {
+		return !(isMethod && f.Channel == 0 && cls == 10 && (mth == 50 || mth == 51))
+	}
+	if f.Channel != 0 && rt.isChannelClosing(f.Channel) {
+		return !(isMethod && cls == 20 && (mth == 40 || mth == 41))
+	}
+	return false
+}
+
 // handleFrameError is the central error path for processFrames and
 // ackProcessor. It returns fatal=true when the calling loop must exit.
 // onProcessor=true only when called from processFrames (safe to tear a channel

@@ -2,6 +2,7 @@ package server
 
 import (
 	"encoding/binary"
+	"errors"
 	"testing"
 
 	"github.com/maxpert/amqp-go/interfaces"
@@ -133,6 +134,10 @@ func TestConfirmSelectOnTransactionalChannelReturnsError(t *testing.T) {
 
 	err = srv.handleConfirmSelect(conn, 1, payload)
 	require.Error(t, err)
+	// WS-B: the tx→confirm mode conflict is a *ChannelError 406.
+	var ce *ChannelError
+	require.True(t, errors.As(err, &ce), "want *ChannelError, got %T", err)
+	assert.Equal(t, uint16(406), ce.Code)
 
 	assert.False(t, ch.ConfirmMode.Load())
 

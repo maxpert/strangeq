@@ -3,7 +3,6 @@ package server
 import (
 	"context"
 	"crypto/tls"
-	"errors"
 	"fmt"
 	"math"
 	"net"
@@ -12,6 +11,7 @@ import (
 	"time"
 
 	"github.com/maxpert/amqp-go/config"
+	amqperrors "github.com/maxpert/amqp-go/errors"
 	"github.com/maxpert/amqp-go/interfaces"
 	"github.com/maxpert/amqp-go/protocol"
 	"go.uber.org/zap"
@@ -1243,33 +1243,48 @@ func (s *Server) processFrames(rt *connRuntime, done chan struct{}) {
 				continue
 			}
 
-			// Capture before processFrame: it may transfer frame ownership
-			// (AckQueue hand-off) or we pool it right after — either way the
-			// next owner can overwrite the frame while we still hold the ref.
-			frameChannel := frame.Channel
+			// Capture the error-classification context before processFrame: it
+			// may transfer frame ownership (AckQueue hand-off) or we pool it
+			// right after — either way the next owner can overwrite the frame
+			// while we still hold the ref.
+			fc := frameCtx{channel: frame.Channel}
+			if cls, mth, isMethod := methodIDs(frame); isMethod {
+				fc.classID, fc.methodID = cls, mth
+			} else if frame.Type == protocol.FrameHeader || frame.Type == protocol.FrameBody {
+				fc.classID, fc.methodID = 60, 40 // basic.publish content frames
+			}
+
+			// §6.3 per-frame channel-ID gate: a channel ID above the negotiated
+			// channel_max is a hard 530. conn.MaxChannels is written once during
+			// the handshake, before this goroutine starts, so this is a plain read.
+			if frame.Channel != 0 && conn.MaxChannels > 0 && frame.Channel > conn.MaxChannels {
+				err := s.connectionError(conn, amqperrors.NotAllowed,
+					fmt.Sprintf("NOT_ALLOWED - channel %d exceeds negotiated channel_max %d", frame.Channel, conn.MaxChannels),
+					fc.classID, fc.methodID)
+				if s.handleFrameError(rt, fc, err, true) {
+					return
+				}
+				protocol.PutFrame(frame)
+				continue
+			}
+
+			// §3.7 closing gate: after sending close, discard everything except
+			// close / close-ok (two atomic loads when nothing is closing).
+			if rt.connClosing.Load() || rt.closingCount.Load() != 0 {
+				if s.discardWhileClosing(rt, frame) {
+					protocol.PutFrame(frame)
+					continue
+				}
+			}
+
 			pooled, err := s.processFrame(conn, frame)
 			if pooled {
 				protocol.PutFrame(frame)
 			}
 			if err != nil {
-				if errors.Is(err, errClientRequestedClose) {
-					s.Log.Info("Connection closed by client",
-						zap.String("connection_id", conn.ID))
-					conn.Closed.Store(true)
+				if s.handleFrameError(rt, fc, err, true) {
 					return
 				}
-				s.Log.Error("Error processing frame",
-					zap.String("connection_id", conn.ID),
-					zap.Uint16("channel", frameChannel),
-					zap.Error(err))
-				if s.MetricsCollector != nil {
-					if frameChannel != 0 {
-						s.MetricsCollector.RecordChannelError("method_processing")
-					}
-					s.MetricsCollector.RecordConnectionError("frame_processing")
-				}
-				conn.Closed.Store(true)
-				return
 			}
 
 		case <-conn.Done:
@@ -1304,7 +1319,8 @@ func (s *Server) processFrame(conn *protocol.Connection, frame *protocol.Frame) 
 		s.Log.Warn("Unknown frame type",
 			zap.Int("type", int(frame.Type)),
 			zap.String("connection_id", conn.ID))
-		return true, nil
+		return true, s.connectionError(conn, amqperrors.FrameError,
+			fmt.Sprintf("FRAME_ERROR - unknown frame type %d", frame.Type), 0, 0)
 	}
 }
 
@@ -1327,7 +1343,7 @@ func isAckFrame(frame *protocol.Frame) bool {
 
 func (s *Server) processAckFrame(conn *protocol.Connection, frame *protocol.Frame) error {
 	if len(frame.Payload) < 4 {
-		return fmt.Errorf("ack frame payload too short")
+		return s.connectionError(conn, amqperrors.FrameError, "FRAME_ERROR - ack frame payload too short", 60, 0)
 	}
 	methodID := (uint16(frame.Payload[2]) << 8) | uint16(frame.Payload[3])
 	payload := frame.Payload[4:]
@@ -1339,7 +1355,8 @@ func (s *Server) processAckFrame(conn *protocol.Connection, frame *protocol.Fram
 	case protocol.BasicNack:
 		return s.handleBasicNack(conn, frame.Channel, payload)
 	default:
-		return fmt.Errorf("unexpected method %d in ack processor", methodID)
+		return s.connectionError(conn, amqperrors.FrameError,
+			fmt.Sprintf("FRAME_ERROR - unexpected method 60.%d in ack processor", methodID), 60, methodID)
 	}
 }
 
@@ -1347,21 +1364,24 @@ func (s *Server) ackProcessor(rt *connRuntime, done chan struct{}) {
 	conn := rt.conn
 	defer close(done)
 	for frame := range conn.AckQueue {
+		// §3.7: ack frames are never close frames, so for a closing channel or
+		// connection they are always discarded.
+		if rt.connClosing.Load() || (frame.Channel != 0 && rt.isChannelClosing(frame.Channel)) {
+			protocol.PutFrame(frame)
+			continue
+		}
 		// Capture before PutFrame: the pool may recycle the frame to another
 		// goroutine's GetFrame, which overwrites it while we still hold the ref.
-		frameChannel := frame.Channel
+		fc := frameCtx{channel: frame.Channel, classID: 60}
+		if len(frame.Payload) >= 4 {
+			fc.methodID = (uint16(frame.Payload[2]) << 8) | uint16(frame.Payload[3])
+		}
 		err := s.processAckFrame(conn, frame)
 		protocol.PutFrame(frame)
 		if err != nil {
-			s.Log.Error("Error processing ACK frame",
-				zap.String("connection_id", conn.ID),
-				zap.Uint16("channel", frameChannel),
-				zap.Error(err))
-			if s.MetricsCollector != nil {
-				s.MetricsCollector.RecordConnectionError("ack_processing")
+			if s.handleFrameError(rt, fc, err, false) {
+				return
 			}
-			conn.Closed.Store(true)
-			return
 		}
 	}
 }
@@ -1426,22 +1446,26 @@ func (s *Server) processMethodFrame(conn *protocol.Connection, frame *protocol.F
 		return s.processChannelMethod(conn, frame)
 	}
 
-	// For now, just check the class and method IDs in the payload
 	if len(frame.Payload) < 4 {
-		return fmt.Errorf("method frame payload too short")
+		return s.connectionError(conn, amqperrors.FrameError, "FRAME_ERROR - method frame payload too short", 0, 0)
 	}
 
 	classID := (uint16(frame.Payload[0]) << 8) | uint16(frame.Payload[1])
 	methodID := (uint16(frame.Payload[2]) << 8) | uint16(frame.Payload[3])
 
-	// Process based on class and method IDs
+	// Only the connection class is valid on channel 0 (AMQP 0-9-1 §4.1).
 	switch {
 	case classID == 10: // Connection class
 		return s.processConnectionMethod(conn, methodID, frame.Payload[4:])
-	case classID == 20: // Channel class
-		return s.processChannelMethod(conn, frame)
+	case classID == 20 && methodID == protocol.ChannelOpen:
+		return s.connectionError(conn, amqperrors.CommandInvalid,
+			"COMMAND_INVALID - channel.open on channel 0", 20, 10)
+	case classID == 20 || classID == 40 || classID == 50 || classID == 60 || classID == 85 || classID == 90:
+		return s.connectionError(conn, amqperrors.CommandInvalid,
+			fmt.Sprintf("COMMAND_INVALID - class %d on channel 0", classID), classID, methodID)
 	default:
-		return fmt.Errorf("unknown class ID: %d", classID)
+		return s.connectionError(conn, amqperrors.FrameError,
+			fmt.Sprintf("FRAME_ERROR - unknown method %d.%d", classID, methodID), classID, methodID)
 	}
 }
 
@@ -1451,14 +1475,33 @@ func (s *Server) processChannelMethod(conn *protocol.Connection, frame *protocol
 		s.Log.Warn("Method frame payload too short",
 			zap.Int("length", len(frame.Payload)),
 			zap.String("connection_id", conn.ID))
-		return fmt.Errorf("method frame payload too short")
+		return s.connectionError(conn, amqperrors.FrameError, "FRAME_ERROR - method frame payload too short", 0, 0)
 	}
 
 	classID := (uint16(frame.Payload[0]) << 8) | uint16(frame.Payload[1])
 	methodID := (uint16(frame.Payload[2]) << 8) | uint16(frame.Payload[3])
 
+	// §6.3 opened-channel gate: every method except channel.open requires a
+	// previously opened channel (AMQP 0-9-1 "expected 'channel.open'"). One
+	// sync.Map.Load per method frame — the read-mostly lock-free fast path.
+	if !(classID == 20 && methodID == protocol.ChannelOpen) {
+		if _, ok := conn.Channels.Load(frame.Channel); !ok {
+			// A channel in the closing set WAS opened and torn down at error
+			// time (D4); its close / close-ok must still complete the
+			// handshake (§3.7 lets only those through).
+			isCloseHandshake := classID == 20 && (methodID == protocol.ChannelClose || methodID == protocol.ChannelCloseOK)
+			if !(isCloseHandshake && s.runtimeFor(conn).isChannelClosing(frame.Channel)) {
+				return s.connectionError(conn, amqperrors.ChannelErrorCode,
+					fmt.Sprintf("CHANNEL_ERROR - expected 'channel.open' on channel %d", frame.Channel), classID, methodID)
+			}
+		}
+	}
+
 	// Process based on class and method IDs
 	switch classID {
+	case 10: // Connection class is invalid on a channel
+		return s.connectionError(conn, amqperrors.CommandInvalid,
+			fmt.Sprintf("COMMAND_INVALID - connection method on channel %d", frame.Channel), classID, methodID)
 	case 20: // Channel class
 		return s.processChannelSpecificMethod(conn, frame.Channel, methodID, frame.Payload[4:])
 	case 40: // Exchange class
@@ -1475,7 +1518,8 @@ func (s *Server) processChannelMethod(conn *protocol.Connection, frame *protocol
 		s.Log.Warn("Unknown class ID",
 			zap.Uint16("class_id", classID),
 			zap.String("connection_id", conn.ID))
-		return fmt.Errorf("unknown class ID: %d", classID)
+		return s.connectionError(conn, amqperrors.FrameError,
+			fmt.Sprintf("FRAME_ERROR - unknown method %d.%d", classID, methodID), classID, methodID)
 	}
 }
 

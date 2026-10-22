@@ -1,6 +1,7 @@
 package server
 
 import (
+	"errors"
 	"net"
 	"testing"
 	"time"
@@ -31,8 +32,12 @@ func TestP0_BodyOverflowNoDeadlock(t *testing.T) {
 		Config:           config.DefaultConfig(),
 		MetricsCollector: &NoOpMetricsCollector{},
 	}
-	_, serverConn := net.Pipe()
+	clientConn, serverConn := net.Pipe()
 	defer serverConn.Close()
+	// WS-B: the body-overrun path now sends connection.close 505; drain the
+	// client end so the write cannot block.
+	go drainAckConn(clientConn)
+	defer clientConn.Close()
 	conn := protocol.NewConnection(serverConn)
 
 	ch := protocol.NewChannel(1, conn)
@@ -107,25 +112,34 @@ func TestP0_BodyOverflowNoDeadlock(t *testing.T) {
 
 // --- ACK-9: Ack error closes connection on consumer unregister race ---
 
-// TestP0_AckConsumerNotFoundReturnsNil verifies that handleBasicAck returns nil
-// (not an error) when GetConsumerForDelivery returns !ok. This is the benign
-// race where a consumer was unregistered between delivery and ack.
-// Before the fix, this returned an error which caused ackProcessor to close
-// the entire TCP connection.
-func TestP0_AckConsumerNotFoundReturnsNil(t *testing.T) {
+// TestP0_AckUnknownTagIs406ChannelError verifies that handleBasicAck raises a
+// channel-level 406 (*ChannelError) for an unknown delivery tag (RabbitMQ
+// collect_acks parity), and the connection stays open. Before the WS-B error
+// refactor this returned nil (tolerant); the ackProcessor closing gate keeps
+// the connection alive while the channel closes.
+func TestP0_AckUnknownTagIs406ChannelError(t *testing.T) {
 	broker := newAckTestBroker()
-	// Deliberately do NOT set a delivery tag — GetConsumerForDelivery will return !ok
+	// Deliberately do NOT set a delivery tag — the wire-tag table stays empty.
 	srv := newAckTestServer(broker)
-	_, serverConn := net.Pipe()
+	clientConn, serverConn := net.Pipe()
 	defer serverConn.Close()
+	defer clientConn.Close()
+	go drainAckConn(clientConn)
 	conn := protocol.NewConnection(serverConn)
+	// Acks on a channel that was never opened are ignored (reorder hazard);
+	// register the channel so the unknown tag produces the 406.
+	conn.Channels.Store(uint16(1), protocol.NewChannel(1, conn))
 
 	ackFrame := encodeAckFrame(t, 1, 999, false)
 
 	// Call handleBasicAck directly (not processFrame which just enqueues to AckQueue)
 	err := srv.processAckFrame(conn, ackFrame)
-	if err != nil {
-		t.Fatalf("handleBasicAck should return nil for unknown delivery tag, got: %v (ACK-9)", err)
+	var ce *ChannelError
+	if !errors.As(err, &ce) {
+		t.Fatalf("handleBasicAck should return *ChannelError for unknown delivery tag, got: %v (%T)", err, err)
+	}
+	if ce.Code != 406 {
+		t.Fatalf("expected 406 PreconditionFailed, got %d", ce.Code)
 	}
 
 	// Verify connection was NOT closed
@@ -134,20 +148,27 @@ func TestP0_AckConsumerNotFoundReturnsNil(t *testing.T) {
 	}
 }
 
-// TestP0_RejectConsumerNotFoundReturnsNil verifies the same fix for basic.reject.
-func TestP0_RejectConsumerNotFoundReturnsNil(t *testing.T) {
+// TestP0_RejectUnknownTagIs406ChannelError verifies the same fix for basic.reject.
+func TestP0_RejectUnknownTagIs406ChannelError(t *testing.T) {
 	broker := newAckTestBroker()
 	srv := newAckTestServer(broker)
-	_, serverConn := net.Pipe()
+	clientConn, serverConn := net.Pipe()
 	defer serverConn.Close()
+	defer clientConn.Close()
+	go drainAckConn(clientConn)
 	conn := protocol.NewConnection(serverConn)
+	conn.Channels.Store(uint16(1), protocol.NewChannel(1, conn))
 
 	rejectFrame := encodeRejectFrame(t, 1, 999, true)
 
 	// Call processAckFrame directly to exercise handleBasicReject
 	err := srv.processAckFrame(conn, rejectFrame)
-	if err != nil {
-		t.Fatalf("handleBasicReject should return nil for unknown delivery tag, got: %v (ACK-9)", err)
+	var ce *ChannelError
+	if !errors.As(err, &ce) {
+		t.Fatalf("handleBasicReject should return *ChannelError for unknown delivery tag, got: %v (%T)", err, err)
+	}
+	if ce.Code != 406 {
+		t.Fatalf("expected 406 PreconditionFailed, got %d", ce.Code)
 	}
 
 	if conn.Closed.Load() {
@@ -155,20 +176,27 @@ func TestP0_RejectConsumerNotFoundReturnsNil(t *testing.T) {
 	}
 }
 
-// TestP0_NackConsumerNotFoundReturnsNil verifies the same fix for basic.nack.
-func TestP0_NackConsumerNotFoundReturnsNil(t *testing.T) {
+// TestP0_NackUnknownTagIs406ChannelError verifies the same fix for basic.nack.
+func TestP0_NackUnknownTagIs406ChannelError(t *testing.T) {
 	broker := newAckTestBroker()
 	srv := newAckTestServer(broker)
-	_, serverConn := net.Pipe()
+	clientConn, serverConn := net.Pipe()
 	defer serverConn.Close()
+	defer clientConn.Close()
+	go drainAckConn(clientConn)
 	conn := protocol.NewConnection(serverConn)
+	conn.Channels.Store(uint16(1), protocol.NewChannel(1, conn))
 
 	nackFrame := encodeNackFrame(t, 1, 999, false, true)
 
 	// Call processAckFrame directly to exercise handleBasicNack
 	err := srv.processAckFrame(conn, nackFrame)
-	if err != nil {
-		t.Fatalf("handleBasicNack should return nil for unknown delivery tag, got: %v (ACK-9)", err)
+	var ce *ChannelError
+	if !errors.As(err, &ce) {
+		t.Fatalf("handleBasicNack should return *ChannelError for unknown delivery tag, got: %v (%T)", err, err)
+	}
+	if ce.Code != 406 {
+		t.Fatalf("expected 406 PreconditionFailed, got %d", ce.Code)
 	}
 
 	if conn.Closed.Load() {
@@ -179,22 +207,28 @@ func TestP0_NackConsumerNotFoundReturnsNil(t *testing.T) {
 // TestP0_AckProcessorSurvivesConsumerNotFound verifies that the ackProcessor
 // goroutine continues running after processing an ack for an unregistered
 // consumer. Before the fix, the ackProcessor would set conn.Closed=true and exit.
+// WS-B: the unknown ack closes channel 1 (406); the valid ack goes out on
+// channel 2 because channel 1's later acks are discarded by the closing gate.
 func TestP0_AckProcessorSurvivesConsumerNotFound(t *testing.T) {
 	broker := newAckTestBroker()
 	srv := newAckTestServer(broker)
-	_, serverConn := net.Pipe()
+	clientConn, serverConn := net.Pipe()
 	defer serverConn.Close()
+	defer clientConn.Close()
+	go drainAckConn(clientConn)
 	conn := protocol.NewConnection(serverConn)
+	conn.Channels.Store(uint16(1), protocol.NewChannel(1, conn))
+	conn.Channels.Store(uint16(2), protocol.NewChannel(2, conn))
 
-	// First: send an ack for an unknown delivery tag
+	// First: send an ack for an unknown delivery tag on channel 1.
 	// No wire-tag tracking for 999: it is deliberately an unknown delivery.
 	unknownAckFrame := encodeAckFrame(t, 1, 999, false)
 	conn.AckQueue <- unknownAckFrame
 
-	// Then: set up a real delivery tag and send a valid ack
+	// Then: set up a real delivery tag on channel 2 and send a valid ack.
 	broker.setDeliveryTag(100, "test-consumer")
-	validWireTag := registerAckTestDelivery(conn, 1, 100, "test-consumer")
-	validAckFrame := encodeAckFrame(t, 1, validWireTag, false)
+	validWireTag := registerAckTestDelivery(conn, 2, 100, "test-consumer")
+	validAckFrame := encodeAckFrame(t, 2, validWireTag, false)
 	conn.AckQueue <- validAckFrame
 
 	done := make(chan struct{})

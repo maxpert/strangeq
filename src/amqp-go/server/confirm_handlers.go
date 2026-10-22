@@ -18,7 +18,8 @@ func (s *Server) processConfirmMethod(conn *protocol.Connection, channelID uint1
 			zap.Uint16("method_id", methodID),
 			zap.Uint16("channel_id", channelID),
 			zap.String("connection_id", conn.ID))
-		return fmt.Errorf("unknown confirm method ID: %d", methodID)
+		return s.connectionError(conn, amqperrors.FrameError,
+			fmt.Sprintf("FRAME_ERROR - unknown method 85.%d", methodID), 85, methodID)
 	}
 }
 
@@ -30,12 +31,12 @@ func (s *Server) handleConfirmSelect(conn *protocol.Connection, channelID uint16
 			zap.Error(err),
 			zap.String("connection_id", conn.ID),
 			zap.Uint16("channel_id", channelID))
-		return err
+		return s.malformed(conn, err, 85, 10)
 	}
 
 	value, exists := conn.Channels.Load(channelID)
 	if !exists {
-		return fmt.Errorf("channel %d does not exist", channelID)
+		return s.connectionError(conn, amqperrors.ChannelErrorCode, "CHANNEL_ERROR - expected 'channel.open'", 85, 10)
 	}
 	channel := value.(*protocol.Channel)
 
@@ -43,9 +44,8 @@ func (s *Server) handleConfirmSelect(conn *protocol.Connection, channelID uint16
 		s.Log.Warn("Cannot enable confirm mode on transactional channel",
 			zap.Uint16("channel_id", channelID),
 			zap.String("connection_id", conn.ID))
-		s.sendChannelClose(conn, channelID, amqperrors.PreconditionFailed,
-			"channel cannot be in both confirm and transaction mode", 85, 10)
-		return fmt.Errorf("channel %d is in transaction mode, cannot enable confirm mode", channelID)
+		return s.channelError(conn, channelID, amqperrors.PreconditionFailed,
+			"PRECONDITION_FAILED - cannot switch from tx to confirm mode", 85, 10)
 	}
 
 	channel.ConfirmMode.Store(true)

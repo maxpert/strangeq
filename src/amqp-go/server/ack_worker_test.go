@@ -423,7 +423,10 @@ func TestA2_AckProcessorProcessesNack(t *testing.T) {
 	defer serverConn.Close()
 	conn := protocol.NewConnection(serverConn)
 
-	nackFrame := encodeNackFrame(t, 1, 42, true, true)
+	// WS-B: acks on a channel that was never opened are ignored (§5.2), so
+	// register a real channel + delivery exactly as production has.
+	nackWireTag := registerAckTestDelivery(conn, 1, 42, "test-consumer")
+	nackFrame := encodeNackFrame(t, 1, nackWireTag, true, true)
 	conn.AckQueue <- nackFrame
 
 	done := make(chan struct{})
@@ -449,8 +452,11 @@ func TestA2_AckProcessorProcessesNack(t *testing.T) {
 	if nacks[0].deliveryTag != 42 {
 		t.Errorf("expected delivery tag 42, got %d", nacks[0].deliveryTag)
 	}
-	if nacks[0].multiple != true {
-		t.Error("expected multiple=true")
+	// A multiple=true wire nack settles through cumulativeSettle, which routes
+	// each tag via the broker's single-message path (multiple=false) so credit
+	// accounting stays exact — pre-existing cumulativeSettle behavior.
+	if nacks[0].multiple != false {
+		t.Error("expected multiple=false (cumulative settle uses the single-message path)")
 	}
 	if nacks[0].requeue != true {
 		t.Error("expected requeue=true")

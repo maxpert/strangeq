@@ -41,7 +41,8 @@ func (s *Server) processBasicMethod(conn *protocol.Connection, channelID uint16,
 			zap.Uint16("method_id", methodID),
 			zap.Uint16("channel_id", channelID),
 			zap.String("connection_id", conn.ID))
-		return fmt.Errorf("unknown basic method ID: %d", methodID)
+		return s.connectionError(conn, amqperrors.FrameError,
+			fmt.Sprintf("FRAME_ERROR - unknown method 60.%d", methodID), 60, methodID)
 	}
 }
 
@@ -55,7 +56,7 @@ func (s *Server) handleBasicQos(conn *protocol.Connection, channelID uint16, pay
 			zap.Error(err),
 			zap.String("connection_id", conn.ID),
 			zap.Uint16("channel_id", channelID))
-		return err
+		return s.malformed(conn, err, 60, 10)
 	}
 
 	s.Log.Debug("Basic QoS settings",
@@ -64,13 +65,16 @@ func (s *Server) handleBasicQos(conn *protocol.Connection, channelID uint16, pay
 		zap.Bool("global", qosMethod.Global))
 
 	if qosMethod.PrefetchSize != 0 {
-		s.sendChannelClose(conn, channelID, 540, "prefetch_size not implemented", 60, 10)
-		return fmt.Errorf("prefetch_size not implemented")
+		// RabbitMQ rabbit_channel raises protocol_error(not_implemented,
+		// "prefetch_size!=0"), and not_implemented (540) is a HARD error in the
+		// AMQP reply-code table: connection.close, never channel.close.
+		return s.connectionError(conn, amqperrors.NotImplemented,
+			fmt.Sprintf("NOT_IMPLEMENTED - prefetch_size!=0 (%d)", qosMethod.PrefetchSize), 60, 10)
 	}
 
 	value, exists := conn.Channels.Load(channelID)
 	if !exists {
-		return fmt.Errorf("channel %d does not exist", channelID)
+		return s.connectionError(conn, amqperrors.ChannelErrorCode, "CHANNEL_ERROR - expected 'channel.open'", 60, 10)
 	}
 	channel := value.(*protocol.Channel)
 
@@ -107,13 +111,12 @@ func (s *Server) handleBasicPublish(conn *protocol.Connection, channelID uint16,
 			zap.Error(err),
 			zap.String("connection_id", conn.ID),
 			zap.Uint16("channel_id", channelID))
-		return err
+		return s.malformed(conn, err, 60, 40)
 	}
 
 	if publishMethod.Immediate {
 		protocol.PutBasicPublishMethod(publishMethod)
-		s.sendConnectionClose(conn, 540, "NOT_IMPLEMENTED - immediate=true is not implemented", 60, 40)
-		return fmt.Errorf("basic.publish immediate=true is not implemented")
+		return s.connectionError(conn, amqperrors.NotImplemented, "NOT_IMPLEMENTED - immediate=true", 60, 40)
 	}
 
 	if ce := s.Log.Check(zapcore.DebugLevel, "Basic publish received"); ce != nil {
@@ -173,11 +176,11 @@ func (s *Server) processHeaderFrame(conn *protocol.Connection, frame *protocol.F
 	// Check if there's a pending message for this channel that needs a header
 	pendingMsg, exists := conn.PendingMessages[frame.Channel]
 	if !exists {
-		// This could be a valid scenario - maybe not every header frame is part of a publish
 		s.Log.Warn("Header frame received for channel with no pending message",
 			zap.Uint16("channel", frame.Channel),
 			zap.String("connection_id", conn.ID))
-		return nil
+		return s.connectionError(conn, amqperrors.UnexpectedFrame,
+			"UNEXPECTED_FRAME - content header without basic.publish", 60, 0)
 	}
 
 	// Parse the content header
@@ -187,7 +190,7 @@ func (s *Server) processHeaderFrame(conn *protocol.Connection, frame *protocol.F
 			zap.Error(err),
 			zap.String("connection_id", conn.ID),
 			zap.Uint16("channel", frame.Channel))
-		return err
+		return s.malformed(conn, err, 60, 0)
 	}
 
 	// Attach the header to the pending message
@@ -202,10 +205,12 @@ func (s *Server) processHeaderFrame(conn *protocol.Connection, frame *protocol.F
 			zap.Int64("max_message_size", s.Config.Server.MaxMessageSize),
 			zap.String("connection_id", conn.ID),
 			zap.Uint16("channel_id", frame.Channel))
-		s.sendChannelClose(conn, frame.Channel, amqperrors.ResourceError,
-			fmt.Sprintf("message body size %d exceeds max %d", contentHeader.BodySize, s.Config.Server.MaxMessageSize),
-			60, 0)
-		return fmt.Errorf("message body size %d exceeds MaxMessageSize %d", contentHeader.BodySize, s.Config.Server.MaxMessageSize)
+		// 406 precondition-failed is RabbitMQ ≥3.8 parity for body-too-large
+		// (506 resource-error is a hard code and would kill the connection).
+		// The pending publish is dropped by teardown.
+		return s.channelError(conn, frame.Channel, amqperrors.PreconditionFailed,
+			fmt.Sprintf("PRECONDITION_FAILED - message size %d is larger than configured max size %d", contentHeader.BodySize, s.Config.Server.MaxMessageSize),
+			60, 40)
 	}
 
 	// Leave pendingMsg.Body nil here. The allocation decision is deferred to the
@@ -254,7 +259,8 @@ func (s *Server) processBodyFrame(conn *protocol.Connection, frame *protocol.Fra
 		s.Log.Warn("Body frame received for channel with no pending message",
 			zap.Uint16("channel", frame.Channel),
 			zap.String("connection_id", conn.ID))
-		return nil
+		return s.connectionError(conn, amqperrors.UnexpectedFrame,
+			"UNEXPECTED_FRAME - content body without basic.publish", 60, 0)
 	}
 
 	// Check if we have a header for this message
@@ -262,7 +268,8 @@ func (s *Server) processBodyFrame(conn *protocol.Connection, frame *protocol.Fra
 		s.Log.Warn("Body frame received before header frame",
 			zap.Uint16("channel", frame.Channel),
 			zap.String("connection_id", conn.ID))
-		return fmt.Errorf("body frame received before header frame")
+		return s.connectionError(conn, amqperrors.UnexpectedFrame,
+			"UNEXPECTED_FRAME - content body before header", 60, 0)
 	}
 
 	// Assemble the body. On the FIRST body frame, if this single frame already
@@ -309,7 +316,8 @@ func (s *Server) processBodyFrame(conn *protocol.Connection, frame *protocol.Fra
 			s.Log.Error("Received more body data than expected",
 				zap.Uint64("received", pendingMsg.Received),
 				zap.Uint64("expected", pendingMsg.Header.BodySize))
-			return fmt.Errorf("received more body data than expected")
+			return s.connectionError(conn, amqperrors.UnexpectedFrame,
+				"UNEXPECTED_FRAME - content body exceeds declared size", 60, 0)
 		}
 
 		// Finalize the message by trimming any extra bytes
@@ -407,9 +415,8 @@ func (s *Server) processCompleteMessage(conn *protocol.Connection, channelID uin
 	}
 
 	if message.UserID != "" && message.UserID != conn.Username {
-		s.sendChannelClose(conn, channelID, amqperrors.PreconditionFailed,
-			fmt.Sprintf("user_id '%s' does not match authenticated user '%s'", message.UserID, conn.Username), 60, 40)
-		return fmt.Errorf("user-id mismatch")
+		return s.channelError(conn, channelID, amqperrors.PreconditionFailed,
+			fmt.Sprintf("PRECONDITION_FAILED - user_id property set to '%s' but authenticated user was '%s'", message.UserID, conn.Username), 60, 40)
 	}
 
 	// Assign confirm delivery tag if channel is in confirm mode (before
@@ -641,13 +648,13 @@ func (s *Server) handleBasicConsume(conn *protocol.Connection, channelID uint16,
 			zap.Error(err),
 			zap.String("connection_id", conn.ID),
 			zap.Uint16("channel_id", channelID))
-		return err
+		return s.malformed(conn, err, 60, 20)
 	}
 
 	// Get the channel
 	value, exists := conn.Channels.Load(channelID)
 	if !exists {
-		return fmt.Errorf("channel %d does not exist", channelID)
+		return s.connectionError(conn, amqperrors.ChannelErrorCode, "CHANNEL_ERROR - expected 'channel.open'", 60, 20)
 	}
 	channel := value.(*protocol.Channel)
 
@@ -723,10 +730,7 @@ func (s *Server) handleBasicConsume(conn *protocol.Connection, channelID uint16,
 			zap.String("consumer_tag", consumeMethod.ConsumerTag),
 			zap.String("connection_id", conn.ID),
 			zap.Uint16("channel_id", channelID))
-		if cerr := s.sendConnectionClose(conn, 530, replyText, 60, 20); cerr != nil {
-			s.Log.Error("Failed to send connection.close for duplicate consumer tag", zap.Error(cerr))
-		}
-		return errors.New(replyText)
+		return s.connectionError(conn, amqperrors.NotAllowed, replyText, 60, 20)
 	}
 	// consumer.Tag now holds the claimed tag (set inside claimConsumerTag, under
 	// the channel mutex and before publication). Stamping it here instead would
@@ -788,7 +792,7 @@ func (s *Server) handleBasicCancel(conn *protocol.Connection, channelID uint16, 
 			zap.Error(err),
 			zap.String("connection_id", conn.ID),
 			zap.Uint16("channel_id", channelID))
-		return err
+		return s.malformed(conn, err, 60, 30)
 	}
 
 	s.Log.Info("Basic cancel requested",
@@ -797,7 +801,7 @@ func (s *Server) handleBasicCancel(conn *protocol.Connection, channelID uint16, 
 	// Get the channel
 	value, exists := conn.Channels.Load(channelID)
 	if !exists {
-		return fmt.Errorf("channel %d does not exist", channelID)
+		return s.connectionError(conn, amqperrors.ChannelErrorCode, "CHANNEL_ERROR - expected 'channel.open'", 60, 30)
 	}
 	channel := value.(*protocol.Channel)
 
@@ -806,9 +810,14 @@ func (s *Server) handleBasicCancel(conn *protocol.Connection, channelID uint16, 
 	consumer, exists := channel.Consumers[cancelMethod.ConsumerTag]
 	if !exists {
 		channel.Mutex.Unlock()
-		// Consumer doesn't exist, but this might be OK depending on the spec
-		s.Log.Warn("Attempted to cancel non-existent consumer",
-			zap.String("consumer_tag", cancelMethod.ConsumerTag))
+		// RabbitMQ parity: basic.cancel for an unknown consumer tag replies
+		// with cancel-ok (unless nowait).
+		s.Log.Debug("basic.cancel for unknown consumer tag; replying cancel-ok",
+			zap.String("consumer_tag", cancelMethod.ConsumerTag),
+			zap.Uint16("channel_id", channelID))
+		if !cancelMethod.NoWait {
+			return s.sendBasicCancelOK(conn, channelID, cancelMethod.ConsumerTag)
+		}
 		return nil
 	}
 
@@ -860,7 +869,7 @@ func (s *Server) handleBasicGet(conn *protocol.Connection, channelID uint16, pay
 			zap.Error(err),
 			zap.String("connection_id", conn.ID),
 			zap.Uint16("channel_id", channelID))
-		return err
+		return s.malformed(conn, err, 60, 70)
 	}
 
 	if ce := s.Log.Check(zapcore.DebugLevel, "Basic get requested"); ce != nil {
@@ -1140,8 +1149,9 @@ func (s *Server) wireChannel(conn *protocol.Connection, channelID uint16) *proto
 // tags) are two independent tag spaces, so without a channel there is no way
 // to recover the msgID behind a wire tag. known=false means the tag is
 // unknown, already settled (duplicate/no-ack/stale), or there is no channel
-// to resolve it against, and the caller must no-op, matching AMQP's tolerant
-// handling of stale acks.
+// to resolve it against; handlers turn that into a 406 precondition-failed
+// (RabbitMQ collect_acks parity) via unknownDeliveryTag — EXCEPT the
+// nil-channel reorder case, which is ignored (see handleBasicAck).
 func (s *Server) resolveDeliveryTag(channel *protocol.Channel, wireTag uint64) (msgID uint64, consumerID string, isGet, known bool) {
 	if channel == nil {
 		return 0, "", false, false
@@ -1153,13 +1163,32 @@ func (s *Server) resolveDeliveryTag(channel *protocol.Channel, wireTag uint64) (
 	return ref.MsgID, ref.ConsumerID, ref.IsGet, true
 }
 
+// unknownDeliveryTag raises a channel-level 406 for an ack/nack/reject whose
+// delivery tag is not outstanding (RabbitMQ rabbit_channel:collect_acks
+// raises precondition_failed("unknown delivery tag ~w")).
+func (s *Server) unknownDeliveryTag(conn *protocol.Connection, ch uint16, tag uint64, methodID uint16) error {
+	return s.channelError(conn, ch, amqperrors.PreconditionFailed,
+		fmt.Sprintf("PRECONDITION_FAILED - unknown delivery tag %d", tag), 60, methodID)
+}
+
 // handleBasicAck handles the basic.ack method
 func (s *Server) handleBasicAck(conn *protocol.Connection, channelID uint16, payload []byte) error {
 	wireTag, multiple, err := parseBasicAckArgs(payload)
 	if err != nil {
-		return err
+		return s.malformed(conn, err, 60, protocol.BasicAck)
 	}
 	channel := s.wireChannel(conn, channelID)
+	if channel == nil {
+		// An ack on a missing channel is IGNORED, not an error: the reader
+		// diverts acks to AckQueue while channel.close goes through FrameQueue,
+		// so a client that acks and then closes can have its acks processed
+		// after the processor tore the channel down — a legitimate reordering.
+		s.Log.Debug("ack on missing channel ignored",
+			zap.Uint64("delivery_tag", wireTag),
+			zap.Uint16("channel_id", channelID),
+			zap.String("connection_id", conn.ID))
+		return nil
+	}
 	tx := s.TransactionManager != nil && s.TransactionManager.IsTransactional(channelID)
 
 	// Non-transactional cumulative ack spans every consumer on the channel
@@ -1167,6 +1196,15 @@ func (s *Server) handleBasicAck(conn *protocol.Connection, channelID uint16, pay
 	// different queues, so it cannot be routed to a single consumer's broker
 	// multi-ack. The per-channel wire-tag table is the channel-wide unacked set.
 	if multiple && !tx {
+		if wireTag != 0 {
+			// Peek first: an unknown top tag raises 406 BEFORE anything is
+			// settled (RabbitMQ collect_acks). tag=0 means "all outstanding"
+			// and never errors. Peeking then taking is race-free: only the
+			// ackProcessor goroutine removes wire-tag entries.
+			if _, ok := channel.ResolveWireTag(wireTag); !ok {
+				return s.unknownDeliveryTag(conn, channelID, wireTag, protocol.BasicAck)
+			}
+		}
 		s.cumulativeSettle(channel, wireTag, settleAck, false)
 		if s.MetricsCollector != nil {
 			s.MetricsCollector.RecordMessageAcknowledged()
@@ -1176,10 +1214,7 @@ func (s *Server) handleBasicAck(conn *protocol.Connection, channelID uint16, pay
 
 	msgID, consumerID, isGet, known := s.resolveDeliveryTag(channel, wireTag)
 	if !known {
-		s.Log.Debug("Delivery tag already processed (consumer cancelled?)",
-			zap.Uint64("delivery_tag", wireTag),
-			zap.Uint16("channel_id", channelID))
-		return nil
+		return s.unknownDeliveryTag(conn, channelID, wireTag, protocol.BasicAck)
 	}
 
 	if tx {
@@ -1210,16 +1245,20 @@ func (s *Server) handleBasicAck(conn *protocol.Connection, channelID uint16, pay
 func (s *Server) handleBasicReject(conn *protocol.Connection, channelID uint16, payload []byte) error {
 	wireTag, requeue, err := parseBasicRejectArgs(payload)
 	if err != nil {
-		return err
+		return s.malformed(conn, err, 60, protocol.BasicReject)
 	}
 	channel := s.wireChannel(conn, channelID)
+	if channel == nil {
+		s.Log.Debug("reject on missing channel ignored",
+			zap.Uint64("delivery_tag", wireTag),
+			zap.Uint16("channel_id", channelID),
+			zap.String("connection_id", conn.ID))
+		return nil
+	}
 
 	msgID, consumerID, isGet, known := s.resolveDeliveryTag(channel, wireTag)
 	if !known {
-		s.Log.Debug("Delivery tag already processed (consumer cancelled?)",
-			zap.Uint64("delivery_tag", wireTag),
-			zap.Uint16("channel_id", channelID))
-		return nil
+		return s.unknownDeliveryTag(conn, channelID, wireTag, protocol.BasicReject)
 	}
 
 	// Buffer into transaction if channel is in transactional mode
@@ -1252,14 +1291,26 @@ func (s *Server) handleBasicReject(conn *protocol.Connection, channelID uint16, 
 func (s *Server) handleBasicNack(conn *protocol.Connection, channelID uint16, payload []byte) error {
 	wireTag, multiple, requeue, err := parseBasicNackArgs(payload)
 	if err != nil {
-		return err
+		return s.malformed(conn, err, 60, protocol.BasicNack)
 	}
 	channel := s.wireChannel(conn, channelID)
+	if channel == nil {
+		s.Log.Debug("nack on missing channel ignored",
+			zap.Uint64("delivery_tag", wireTag),
+			zap.Uint16("channel_id", channelID),
+			zap.String("connection_id", conn.ID))
+		return nil
+	}
 	tx := s.TransactionManager != nil && s.TransactionManager.IsTransactional(channelID)
 
 	// Non-transactional cumulative nack spans every consumer on the channel
 	// (SQ-18), mirroring cumulative ack.
 	if multiple && !tx {
+		if wireTag != 0 {
+			if _, ok := channel.ResolveWireTag(wireTag); !ok {
+				return s.unknownDeliveryTag(conn, channelID, wireTag, protocol.BasicNack)
+			}
+		}
 		s.cumulativeSettle(channel, wireTag, settleNack, requeue)
 		if s.MetricsCollector != nil {
 			s.MetricsCollector.RecordMessageRejected()
@@ -1269,10 +1320,7 @@ func (s *Server) handleBasicNack(conn *protocol.Connection, channelID uint16, pa
 
 	msgID, consumerID, isGet, known := s.resolveDeliveryTag(channel, wireTag)
 	if !known {
-		s.Log.Debug("Delivery tag already processed (consumer cancelled?)",
-			zap.Uint64("delivery_tag", wireTag),
-			zap.Uint16("channel_id", channelID))
-		return nil
+		return s.unknownDeliveryTag(conn, channelID, wireTag, protocol.BasicNack)
 	}
 
 	if tx {
@@ -1362,7 +1410,7 @@ func (s *Server) handleBasicRecover(conn *protocol.Connection, channelID uint16,
 			zap.Error(err),
 			zap.String("connection_id", conn.ID),
 			zap.Uint16("channel_id", channelID))
-		return err
+		return s.malformed(conn, err, 60, 110)
 	}
 
 	// requeue field is deserialized for wire-format correctness but not
@@ -1372,7 +1420,7 @@ func (s *Server) handleBasicRecover(conn *protocol.Connection, channelID uint16,
 
 	value, exists := conn.Channels.Load(channelID)
 	if !exists {
-		return fmt.Errorf("channel %d does not exist", channelID)
+		return s.connectionError(conn, amqperrors.ChannelErrorCode, "CHANNEL_ERROR - expected 'channel.open'", 60, 110)
 	}
 	channel := value.(*protocol.Channel)
 

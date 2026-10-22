@@ -67,20 +67,22 @@ func (s *Server) sendChannelClose(conn *protocol.Connection, channelID uint16, r
 	}
 }
 
-// authzChannelError sends a channel.close with 403 (access-refused) for the
-// given authorization error and operation context. Returns the error so
-// the handler can return it to stop further processing.
+// authzChannelError raises a channel-level 403 (access-refused) for the given
+// authorization error: channel.close is sent (idempotently), the channel is
+// marked closing, and the returned *ChannelError flows to handleFrameError,
+// which keeps the connection alive.
 func (s *Server) authzChannelError(conn *protocol.Connection, channelID uint16, err error, classID, methodID uint16) error {
-	replyText := "Access refused"
+	text := "ACCESS_REFUSED - access refused"
 	if err != nil {
-		replyText = err.Error()
+		text = "ACCESS_REFUSED - " + err.Error()
 	}
 	s.Log.Warn("Authorization denied",
 		zap.String("connection_id", conn.ID),
 		zap.Uint16("channel_id", channelID),
 		zap.Error(err))
-	s.sendChannelClose(conn, channelID, amqperrors.AccessRefused, replyText, classID, methodID)
-	return err
+	ce := s.channelError(conn, channelID, amqperrors.AccessRefused, text, classID, methodID)
+	ce.Cause = err
+	return ce
 }
 
 // isReservedName checks if a resource name starts with "amq." — the AMQP 0.9.1

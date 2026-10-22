@@ -275,8 +275,8 @@ func TestWritev_GateBoundary(t *testing.T) {
 // write), so it is overridden too.
 type discardConn struct{ net.Conn }
 
-func (discardConn) Write(p []byte) (int, error)          { return len(p), nil }
-func (discardConn) SetWriteDeadline(time.Time) error     { return nil }
+func (discardConn) Write(p []byte) (int, error)      { return len(p), nil }
+func (discardConn) SetWriteDeadline(time.Time) error { return nil }
 
 // bytesPerOp returns the average bytes allocated per call to f, using the
 // cumulative TotalAlloc counter (unaffected by GC), after one warmup call to
