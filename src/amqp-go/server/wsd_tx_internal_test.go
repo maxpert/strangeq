@@ -29,10 +29,15 @@ func TestInternal_TxPublishRejectedAtPublishTime(t *testing.T) {
 	// tx.select.
 	txSelect(t, srv, conn, frameCh, 1)
 
-	// Publish to the internal exchange on the tx channel.
+	// Publish to the internal exchange on the tx channel. WS-B/S2 contract:
+	// the handler RETURNS the typed *ChannelError (the close is already on the
+	// wire, sent=true) instead of reporting it only via the socket.
 	pending := makePendingMessage("ix", "k", "payload")
 	err = srv.processCompleteMessage(conn, 1, pending)
-	require.NoError(t, err, "the handler reports the channel error, not a Go error")
+	require.Error(t, err, "the handler returns the typed channel error")
+	var chErr *ChannelError
+	require.ErrorAs(t, err, &chErr)
+	assert.Equal(t, uint16(403), chErr.Code)
 
 	// Expect channel.close with 403 ACCESS_REFUSED, class 60 method 40.
 	// ChannelCloseMethod has no Deserialize; the payload is reply-code (2) +

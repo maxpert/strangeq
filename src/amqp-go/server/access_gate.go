@@ -1,7 +1,6 @@
 package server
 
 import (
-	"fmt"
 	"net"
 	"net/netip"
 	"sync"
@@ -196,13 +195,13 @@ func (s *Server) refuseAccess(conn *protocol.Connection, reason, text, username 
 		s.Log.Warn("Connection refused by access policy", fields...)
 	}
 	s.recordAuthFailureMetric(reason)
-	if err := s.sendConnectionClose(conn, amqperrors.AccessRefused, text, 10, 11); err != nil {
-		if s.Log != nil {
-			s.Log.Warn("Failed to send connection.close for access refusal",
-				zap.String("connection_id", conn.ID), zap.Error(err))
-		}
-	}
-	return fmt.Errorf("access refused: %s", reason)
+	// S2/S4: the refusal goes through WS-B's typed *ConnectionError path —
+	// failConnection writes exactly one connection.close (CompareAndSwap) and
+	// arms the close-ok timer; the handshake loop then awaits close-ok, closes
+	// the socket, and the deferred slot release frees the pending-handshake
+	// slot. The return value is always non-nil: the handshake loop only aborts
+	// when the handler returns an error.
+	return s.connectionError(conn, amqperrors.AccessRefused, text, 10, 11)
 }
 
 // recordAuthFailureMetric feeds amqp_auth_failures_total without widening the

@@ -32,22 +32,21 @@ func brokerErrorReply(err error) (code uint16, text string, ok bool) {
 }
 
 // closeChannelWithBrokerError is the ONLY way WS-D handlers report a broker
-// semantic error. Pre-WS-B body below (send channel.close, keep the
-// connection: same pattern as today's ErrInvalidQueueArgument branch at
-// queue_handlers.go). When WS-B merges, WS-B replaces the body with
-// `return ChannelError{Code: code, Text: text, ClassID: classID, MethodID: methodID}`.
+// semantic error. S2 (single close path): it RETURNS WS-B's typed
+// *ChannelError, built from the M1-M11 brokerErrorReply mapping; WS-B's
+// channelError helper is the one place channel.close is written, and the
+// dispatcher sees the typed return (sent=true) and does not resend.
 func (s *Server) closeChannelWithBrokerError(conn *protocol.Connection, channelID uint16, err error, classID, methodID uint16) error {
 	code, text, ok := brokerErrorReply(err)
 	if !ok {
 		return err
 	}
-	s.sendChannelClose(conn, channelID, code, text, classID, methodID)
-	return nil
+	return s.channelError(conn, channelID, code, text, classID, methodID)
 }
 
-// closeChannelWith sends a channel error that originates in the server (e.g.
-// default-exchange 403s). Same pre-/post-WS-B rule as above.
+// closeChannelWith reports a channel error that originates in the server (e.g.
+// default-exchange 403s). Same S2 rule: RETURN the typed *ChannelError, never
+// write the close directly.
 func (s *Server) closeChannelWith(conn *protocol.Connection, channelID uint16, code uint16, text string, classID, methodID uint16) error {
-	s.sendChannelClose(conn, channelID, code, text, classID, methodID)
-	return nil
+	return s.channelError(conn, channelID, code, text, classID, methodID)
 }
