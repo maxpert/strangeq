@@ -103,14 +103,21 @@ func TestPurgeIncarnationAppliesOnlyToTheHandedIncarnation(t *testing.T) {
 		}
 	}
 
-	// (3) qsA's cursors WERE reset — the operation applied to the incarnation
-	// it was HANDED. Mandatory: without this, a fix that makes purge a no-op
-	// whenever the name/incarnation looks suspicious would also pass (1)+(2).
+	// (3) The operation applied to the incarnation it was HANDED, under the
+	// WS-D §4 claim-mechanics contract: qsA's ready tags were POPPED (tail
+	// advanced to head), but because storage is name-keyed the deletes were
+	// issued against "qB" and won NOTHING (count==0 above) — so qsA's depth
+	// counters move only per actual removal (none), exactly like a consumer's
+	// GetMessage-miss gap-skip. The pre-§4 contract reset waiting/inflight
+	// unconditionally, which is what lost unacked bodies (T4.1); that
+	// assertion is deliberately gone. A no-op purge would leave tail==tail0
+	// below head, so the tail assertion still forces the handed incarnation
+	// to have been operated on.
 	if got := qsA.tail.Load(); got != qsA.head.Load() {
-		t.Errorf("qsA.tail=%d, qsA.head=%d after purgeIncarnation(qB, qsA); want tail==head (reset)", got, qsA.head.Load())
+		t.Errorf("qsA.tail=%d, qsA.head=%d after purgeIncarnation(qB, qsA); want tail==head (ready cursor consumed)", got, qsA.head.Load())
 	}
-	if got := qsA.waiting.Load(); got != 0 {
-		t.Errorf("qsA.waiting=%d after purgeIncarnation(qB, qsA), want 0", got)
+	if got := qsA.waiting.Load(); got != int64(n) {
+		t.Errorf("qsA.waiting=%d after purgeIncarnation(qB, qsA), want %d (no name-keyed deletion won, so depth is untouched)", got, n)
 	}
 	if got := qsA.inflight.Load(); got != 0 {
 		t.Errorf("qsA.inflight=%d after purgeIncarnation(qB, qsA), want 0", got)

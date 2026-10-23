@@ -112,6 +112,16 @@ type QueueState struct {
 	frontierPHead   int
 	frontierDone    map[uint64]bool
 	frontierMax     uint64
+
+	// SQ-11 reject-publish reservations (WS-D §7): admitted-but-not-yet-counted
+	// copies. Incremented ONLY under maxLenMu (admission); transferred into
+	// waiting/readyBytes atomically with the frontier pop that makes the tag
+	// visible (FrontierComplete, under frontierMu), or released if the tag
+	// completes real=false. frontierResv (guarded by frontierMu, nil unless the
+	// queue has ever reserved) maps a reserved tag to its reserved body bytes.
+	pendingCount atomic.Int64
+	pendingBytes atomic.Int64
+	frontierResv map[uint64]int64
 }
 
 // Policy returns the queue's resolved policy, or nil if the queue has no

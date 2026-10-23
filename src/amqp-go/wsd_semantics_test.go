@@ -328,6 +328,155 @@ func TestExchangeDelete_Nonexistent_DeleteOk(t *testing.T) {
 	assert.False(t, conn.IsClosed())
 }
 
+// T4.1: queue.purge removes READY messages only; in-flight (unacked)
+// deliveries keep their bodies and requeue intact. Pre-fix mechanism: purge
+// wiped every ring slot (unacked included) and reset inflight, so the
+// requeued delivery came back as a gap (lost) and purge-ok over-counted.
+func TestPurge_PreservesUnacked(t *testing.T) {
+	b := newRestartableBroker(t, nil)
+
+	conn, err := amqp.Dial(b.uri)
+	require.NoError(t, err)
+	defer conn.Close()
+
+	ch, err := conn.Channel()
+	require.NoError(t, err)
+	q, err := ch.QueueDeclare("pq", false, false, false, false, nil)
+	require.NoError(t, err)
+	for i := 0; i < 5; i++ {
+		require.NoError(t, ch.Publish("", q.Name, false, false, amqp.Publishing{Body: []byte{byte('0' + i)}}))
+	}
+
+	require.NoError(t, ch.Qos(2, 0, false))
+	deliveries, err := ch.Consume(q.Name, "c1", false, false, false, false, nil)
+	require.NoError(t, err)
+
+	// Receive 2 (hold them unacked).
+	d1 := <-deliveries
+	d2 := <-deliveries
+
+	// Purge: exactly the 3 READY messages are removed.
+	purged, err := ch.QueuePurge(q.Name, false)
+	require.NoError(t, err)
+	assert.Equal(t, 3, purged, "purge-ok = ready messages only (was 5 pre-fix)")
+
+	// Ack #1: no channel error (the ack lands on the server's async ack queue,
+	// so no client-visible ordering exists; the channel must stay usable).
+	require.NoError(t, d1.Ack(false))
+	_, err = ch.QueueDeclarePassive(q.Name, false, false, false, false, nil)
+	require.NoError(t, err, "channel usable after acking a held delivery post-purge")
+
+	// Close the channel WITHOUT acking #2 → still-unacked deliveries requeue.
+	require.NoError(t, ch.Close())
+
+	// On a new channel, the held deliveries come back WITH THEIR BODIES,
+	// redelivered; the 3 purged readies ('2','3','4') never arrive. (The ack
+	// of #1 races the close through the server's ack worker, so #1 may or may
+	// not requeue — at-least-once — but #2 MUST arrive with its body.)
+	ch2, err := conn.Channel()
+	require.NoError(t, err)
+	deliveries2, err := ch2.Consume(q.Name, "c2", false, false, false, false, nil)
+	require.NoError(t, err)
+	got := map[byte]bool{}
+	deadline := time.After(5 * time.Second)
+	for !got[d2.Body[0]] {
+		select {
+		case d := <-deliveries2:
+			require.True(t, d.Redelivered, "requeued deliveries are redelivered")
+			require.Contains(t, []byte{d1.Body[0], d2.Body[0]}, d.Body[0],
+				"a purged READY message must never be redelivered")
+			got[d.Body[0]] = true
+			_ = d.Ack(false)
+		case <-deadline:
+			t.Fatalf("the requeued unacked message %q was lost by the purge (pre-fix mechanism)", d2.Body)
+		}
+	}
+	assert.LessOrEqual(t, len(got), 2)
+}
+
+// T4.3: purged SPILLED ready messages are removed (WAL-acked) so they are
+// never served again IN THIS INCARNATION — the D-NEW-3 fix. Pre-fix
+// mechanism: purge only deleted ring slots, so spilled ready messages kept
+// being served by the ack-gated cold read path (and were never counted in
+// purge-ok).
+//
+// RESTART LEG (spec-vs-reality deviation, documented): the spec's
+// "restart → Messages==0" assertion requires DURABLE acknowledgement, which
+// is the known-open, explicitly out-of-scope defect (spec §16 "Ack
+// persistence"; storage/wal_boot_state.go: "ackBitmap starts empty at every
+// boot"; the tag-keyed durable ack artifact was built and withdrawn after
+// three cycles). Per spec §5.2, a purged message is exactly as durable as a
+// normally-acked one, so this test asserts PARITY: after a restart, a purged
+// queue resurrects EXACTLY as much as a normally no-ack-drained queue does.
+// When ack persistence lands, both legs of this test become Messages==0
+// together.
+func TestPurge_SpilledReadyRemovedAndNotResurrected(t *testing.T) {
+	b := newRestartableBroker(t, func(cfg *config.AMQPConfig) {
+		cfg.Engine.RingBufferSize = 16
+		cfg.Engine.SpillThresholdPercent = 50
+		cfg.Engine.DepthHighWMOverride = 100000
+	})
+
+	conn, err := amqp.Dial(b.uri)
+	require.NoError(t, err)
+
+	ch, err := conn.Channel()
+	require.NoError(t, err)
+	q, err := ch.QueueDeclare("pq-spill", true, false, false, false, nil)
+	require.NoError(t, err)
+	qAck, err := ch.QueueDeclare("ack-spill", true, false, false, false, nil)
+	require.NoError(t, err)
+	require.NoError(t, ch.Confirm(false))
+
+	const n = 20
+	confirms := ch.NotifyPublish(make(chan amqp.Confirmation, 2*n))
+	for i := 0; i < n; i++ {
+		require.NoError(t, ch.Publish("", q.Name, false, false, amqp.Publishing{
+			DeliveryMode: 2, Body: []byte{byte('a' + i)},
+		}))
+		require.NoError(t, ch.Publish("", qAck.Name, false, false, amqp.Publishing{
+			DeliveryMode: 2, Body: []byte{byte('a' + i)},
+		}))
+	}
+	for i := 0; i < 2*n; i++ {
+		require.True(t, (<-confirms).Ack, "publish %d must be confirmed", i)
+	}
+
+	// Purge q; no-ack-drain qAck (the normal implicit-ack path).
+	purged, err := ch.QueuePurge(q.Name, false)
+	require.NoError(t, err)
+	assert.Equal(t, n, purged, "every ready message (ring + spilled) is purged — pre-fix this was ≤ the ring-resident count")
+	for i := 0; i < n; i++ {
+		_, ok, err := ch.Get(qAck.Name, true)
+		require.NoError(t, err)
+		require.True(t, ok)
+	}
+
+	// In-incarnation: nothing left to serve in EITHER queue.
+	qd, err := ch.QueueDeclarePassive(q.Name, true, false, false, false, nil)
+	require.NoError(t, err)
+	assert.Equal(t, 0, qd.Messages, "purged queue is empty in-incarnation")
+	qdAck, err := ch.QueueDeclarePassive(qAck.Name, true, false, false, false, nil)
+	require.NoError(t, err)
+	assert.Equal(t, 0, qdAck.Messages)
+	require.NoError(t, conn.Close())
+
+	// Restart: parity with the normal-ack path (both are the known-open
+	// ack-durability defect, whatever they return).
+	b.restart()
+	conn2, err := amqp.Dial(b.uri)
+	require.NoError(t, err)
+	defer conn2.Close()
+	ch2, err := conn2.Channel()
+	require.NoError(t, err)
+	afterPurge, err := ch2.QueueDeclarePassive(q.Name, true, false, false, false, nil)
+	require.NoError(t, err)
+	afterAck, err := ch2.QueueDeclarePassive(qAck.Name, true, false, false, false, nil)
+	require.NoError(t, err)
+	assert.Equal(t, afterAck.Messages, afterPurge.Messages,
+		"purge ≡ ack in durability terms (spec §5.2); both legs become 0 when ack persistence (§16) lands")
+}
+
 // T8.1: no-ack basic.get on spilled (WAL-only) messages decrements the
 // reported depth exactly once per message. Pre-fix mechanism:
 // DeleteMessageIfPresent returned the ring-CAS result, so a spilled removal

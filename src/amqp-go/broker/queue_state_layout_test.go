@@ -43,9 +43,13 @@ func TestQueueStateLayoutUnchanged(t *testing.T) {
 		}
 	}
 
-	const wantSize = 264
+	// WS-D §7 appended the reject-publish reservation fields (pendingCount,
+	// pendingBytes, frontierResv) AFTER frontierMax, so every hot-field offset
+	// above is unchanged and only the struct size grew (264 → measured).
+	const wantSize = 288
 	if got := unsafe.Sizeof(qs); got != wantSize {
-		t.Errorf("unsafe.Sizeof(QueueState) = %d, want %d — the purge-incarnation fix (TagBand) "+
-			"is a method, not a field, and must not change QueueState's size", got, wantSize)
+		t.Errorf("unsafe.Sizeof(QueueState) = %d, want %d — the WS-D §7 reject-publish "+
+			"reservation fields were appended after frontierMax; hot-field offsets are "+
+			"unchanged, so re-derive this pin only if you changed the struct", got, wantSize)
 	}
 }

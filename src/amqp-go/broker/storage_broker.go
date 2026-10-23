@@ -4158,54 +4158,102 @@ func (b *StorageBroker) PurgeQueue(name string) (int, error) {
 	return b.purgeIncarnation(name, b.getOrCreateQueueState(name))
 }
 
-// purgeIncarnation applies a purge to the ONE incarnation it is handed. Every
-// effect below derives from qs; `name` survives only because the storage layer
-// is name-addressed, and it is paired with qs's tag band so that resolving to a
-// successor's ring removes nothing rather than the wrong thing.
+// purgeIncarnation applies a purge to the ONE incarnation it is handed,
+// removing READY messages ONLY (WS-D §4, RabbitMQ parity). A message is ready
+// iff it is (a) in the requeue ring or (b) an unclaimed tag in [tail, head);
+// both sets are popped through the SAME claim mechanisms consumers use
+// (requeueMu snapshot / tail CAS), so an in-flight (delivered-unacked) tag is
+// never touched: its body survives for a later requeue, `inflight` stays
+// correct for AckAdvance, and spilled ready messages are WAL-acked through the
+// §8 cold path (they no longer resurrect on restart, D-NEW-3). purge-ok's
+// message-count is the number of READY messages removed.
 //
-// The closed check must precede TagBand: a dead QueueState (see
-// createQueueStateLocked) never had SetOrdinal called, so its band is ordinal
-// zero's — reserved, never allocated, and not this queue's.
+// Concurrency: consumers' Claim/tryPopRequeue and drop-head's PopOldestReady
+// arbitrate with purge on the same CAS and mutex, so each tag has exactly one
+// owner; the TTL reaper's deleteIfPresent and §8 arbitration ensure exactly
+// one of {reaper, purge} decrements depth per tag. No new lock is taken:
+// maxLenMu is not needed because purge only LOWERS waiting/readyBytes, which
+// can never cause a reject-publish overshoot. Cost is O(ready) per purge.
 //
-// DELIBERATE BEHAVIOUR CHANGE, and it is a regression in one respect. The
-// replaced AtomicRing.Purge() wiped every slot; this clears only the live
-// incarnation's band. A ring resident whose tag lies OUTSIDE that band — see
-// TagBand's doc for how one gets there, via B-2's deferred republish race —
-// was already unclaimable before this change, but it used to be cleaned up by
-// any queue.purge. Now nothing removes it: no purge this queue can ever issue
-// covers that band, and GetQueueMessageCount keeps counting it, so
-// queue.delete(if-empty) on that queue is refused PERMANENTLY and its reported
-// message_count never returns to zero.
-//
-// Accepted rather than fixed here, because the alternatives are worse in scope:
-// widening the band back reopens exactly the cross-incarnation wipe this fix
-// exists to prevent, and the clean fix is to stop out-of-band tags being
-// stored at all — B-2's republish half, which is a dead-letter-path change
-// with its own step. Tracked on the Step 6 backlog. If it needs closing sooner
-// than that, the shape is E-2's: take getQueueCreateMutex(name), revalidate
-// the incarnation under it, and then wipe the whole ring — correct, and it
-// costs queue.purge a lock it does not currently take.
+// DELIBERATE BEHAVIOUR CHANGE (documented, was :3977-4003): ring residents
+// that are neither ready nor in-flight (the B-2 out-of-band leak) are no
+// longer swept by purge. storage.PurgeQueue is still used by
+// deleteQueueIncarnation, unchanged.
 func (b *StorageBroker) purgeIncarnation(name string, qs *QueueState) (int, error) {
 	if qs.closed.Load() {
-		return 0, interfaces.ErrQueueNotFound
+		return 0, errNoQueue(name)
 	}
-	minTag, maxTag := qs.TagBand()
-	count, err := b.storage.PurgeQueue(name, minTag, maxTag)
-	if err != nil {
-		return 0, err
-	}
-	qs.tail.Store(qs.head.Load())
-	qs.waiting.Store(0)
-	qs.inflight.Store(0)
-	qs.readyBytes.Store(0) // SQ-11: purge clears the ready-bytes counter
+	p := qs.Policy()
+	purged := 0
+
+	// (a) Snapshot-and-empty the requeue ring under requeueMu. Requeue() after
+	// this point re-adds to the (now empty) ring; those are post-purge readies.
 	qs.requeueMu.Lock()
-	qs.requeueBuf = make([]requeueEntry, requeueInitialCap)
-	qs.requeueHead = 0
-	qs.requeueLen = 0
+	snap := make([]uint64, 0, qs.requeueLen)
+	bufCap := cap(qs.requeueBuf)
+	for i := 0; i < qs.requeueLen; i++ {
+		snap = append(snap, qs.requeueBuf[(qs.requeueHead+i)%bufCap].tag)
+	}
+	qs.requeueHead, qs.requeueLen = 0, 0
 	qs.requeueCount.Store(0)
 	qs.requeueMu.Unlock()
+	for _, tag := range snap {
+		if b.purgeOne(qs, name, tag, p) {
+			purged++
+		}
+	}
+
+	// (b) Pop [tail, h0) by CAS, exactly like PopOldestReady. h0 is captured
+	// once: messages that become visible after the purge started are retained.
+	h0 := qs.head.Load()
+	for {
+		t := qs.tail.Load()
+		if t >= h0 {
+			break
+		}
+		if !qs.tail.CompareAndSwap(t, t+1) {
+			continue
+		}
+		if b.purgeOne(qs, name, t, p) {
+			purged++
+		}
+	}
+	qs.SetMinAckCursor(b.storage.GetMinAckCursor(name))
 	qs.WakeAll()
-	return count, nil
+	return purged, nil
+}
+
+// purgeOne removes one popped ready tag. Mirrors dropHeadEvictOne
+// (max_length.go) minus dead-lettering (purge never dead-letters).
+func (b *StorageBroker) purgeOne(qs *QueueState, name string, tag uint64, p *QueuePolicy) bool {
+	var bodyLen int
+	if p != nil && p.HasMaxLengthBytes {
+		m, err := b.storage.GetMessage(name, tag)
+		if err != nil || m == nil {
+			qs.GapSkipAdvance(tag)
+			return false
+		}
+		bodyLen = len(m.Body)
+	}
+	if !b.deleteIfPresent(name, tag) { // §8 semantics: true iff THIS call removed a present message
+		qs.GapSkipAdvance(tag) // gap tag, or the reaper won the race
+		return false
+	}
+	qs.ClaimInflight(tag)
+	subReadyBytesOnClaim(qs, p, bodyLen)
+	qs.AckAdvance(tag)
+	return true
+}
+
+// QueueCounters reports (ready, inflight, pending) for name without creating
+// any state — a test-only hook (spec §17). pending is the §7 reject-publish
+// reservation count (0 until that lands).
+func (b *StorageBroker) QueueCounters(name string) (ready, inflight, pending int64) {
+	if qv, ok := b.queueStates.Load(name); ok {
+		qs := qv.(*QueueState)
+		return qs.WaitingCount(), qs.InflightCount(), qs.pendingCount.Load()
+	}
+	return 0, 0, 0
 }
 
 // AcknowledgeGetDelivery handles acknowledgment of a basic.get delivery
