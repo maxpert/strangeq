@@ -168,6 +168,10 @@ type StorageBroker struct {
 	queueOwners       sync.Map
 	deliveryIndex     sync.Map
 	getDeliveryQueues sync.Map
+	// getDeliveryOwners maps an outstanding manual-ack basic.get delivery tag to the
+	// server connection ID that received it, so connection close requeues only its
+	// own gets (WS-B). Absent for owner-less (legacy/test) gets.
+	getDeliveryOwners sync.Map // uint64 → string
 	metricsCollector  MetricsCollector
 
 	// queueCreateMuByName holds one *sync.Mutex per queue name (LoadOrStore,
@@ -3838,6 +3842,15 @@ func (b *StorageBroker) RecoverQueue(queueName string, minTag, maxTag, count uin
 // Returns the message, its delivery tag, the remaining message count, and any
 // error.
 func (b *StorageBroker) GetMessageForGet(queueName string, noAck bool) (*protocol.Message, uint64, uint32, error) {
+	return b.GetMessageForGetOwned(queueName, noAck, "")
+}
+
+// GetMessageForGetOwned is GetMessageForGet with an owning server connection
+// ID (WS-B): manual-ack get deliveries are tagged with their owner so
+// connection close requeues only its own gets (RequeueGetDeliveries), never
+// another connection's. An empty connID leaves the delivery owner-less
+// (legacy/test path — owner-less deliveries are never requeued on close).
+func (b *StorageBroker) GetMessageForGetOwned(queueName string, noAck bool, connID string) (*protocol.Message, uint64, uint32, error) {
 	_, err := b.storage.GetQueue(queueName)
 	if err != nil {
 		if errors.Is(err, interfaces.ErrQueueNotFound) {
@@ -3930,6 +3943,9 @@ func (b *StorageBroker) GetMessageForGet(queueName string, noAck bool) (*protoco
 		subReadyBytesOnClaim(queueState, p, len(message.Body))
 		b.deliveryIndex.Store(tag, "")
 		b.getDeliveryQueues.Store(tag, queueName)
+		if connID != "" {
+			b.getDeliveryOwners.Store(tag, connID)
+		}
 		b.storage.StorePendingAck(&protocol.PendingAck{
 			QueueName:   queueName,
 			DeliveryTag: tag,
@@ -4027,6 +4043,9 @@ func (b *StorageBroker) purgeIncarnation(name string, qs *QueueState) (int, erro
 // AcknowledgeGetDelivery handles acknowledgment of a basic.get delivery
 // (identified by an empty consumer identity in the deliveryIndex).
 func (b *StorageBroker) AcknowledgeGetDelivery(deliveryTag uint64) error {
+	// Unconditional first: tags are msgIDs and are reused across requeue, so a
+	// stale owner must never survive a settle attempt (WS-B §10.2).
+	b.getDeliveryOwners.Delete(deliveryTag)
 	if _, loaded := b.deliveryIndex.LoadAndDelete(deliveryTag); !loaded {
 		return nil
 	}
@@ -4048,6 +4067,9 @@ func (b *StorageBroker) AcknowledgeGetDelivery(deliveryTag uint64) error {
 
 // RejectGetDelivery handles rejection of a basic.get delivery.
 func (b *StorageBroker) RejectGetDelivery(deliveryTag uint64, requeue bool) error {
+	// Unconditional first: tags are msgIDs and are reused across requeue, so a
+	// stale owner must never survive a settle attempt (WS-B §10.2).
+	b.getDeliveryOwners.Delete(deliveryTag)
 	if _, loaded := b.deliveryIndex.LoadAndDelete(deliveryTag); !loaded {
 		return nil
 	}
@@ -4114,19 +4136,30 @@ func (b *StorageBroker) RequeueAllForConsumer(consumerID string) error {
 	return nil
 }
 
-// RequeueAllGetDeliveries requeues all in-flight basic.get deliveries
-// (identified by an empty consumer identity). Called during connection close
-// to prevent messages from being permanently orphaned when a client
-// disconnects without acking basic.get deliveries.
-func (b *StorageBroker) RequeueAllGetDeliveries() {
-	b.getDeliveryQueues.Range(func(key, value interface{}) bool {
-		deliveryTag := key.(uint64)
-		queueName := value.(string)
-
+// RequeueGetDeliveries requeues the in-flight basic.get deliveries owned by
+// connID (connection close). Owner-less deliveries are never touched (WS-B
+// §10: the old RequeueAllGetDeliveries requeued EVERY connection's gets, so
+// another client's later ack became a no-op and the message was delivered
+// twice).
+func (b *StorageBroker) RequeueGetDeliveries(connID string) {
+	if connID == "" {
+		return
+	}
+	b.getDeliveryOwners.Range(func(k, v interface{}) bool {
+		if v.(string) != connID {
+			return true
+		}
+		deliveryTag := k.(uint64)
+		b.getDeliveryOwners.Delete(deliveryTag)
+		qv, ok := b.getDeliveryQueues.Load(deliveryTag)
+		if !ok {
+			return true
+		}
 		if _, loaded := b.deliveryIndex.LoadAndDelete(deliveryTag); !loaded {
 			return true
 		}
 		b.getDeliveryQueues.Delete(deliveryTag)
+		queueName := qv.(string)
 
 		queueState := b.getOrCreateQueueState(queueName)
 		b.storage.DeletePendingAck(queueName, deliveryTag)

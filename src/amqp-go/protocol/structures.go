@@ -60,7 +60,7 @@ type Connection struct {
 	ClientProperties map[string]interface{}
 	PendingMessages  map[uint16]*PendingMessage // Track messages being published on each channel.
 	// SINGLE-WRITER: accessed only by the processFrames goroutine. No mutex needed.
-	FrameQueue  chan *Frame   // Buffer frames between reader and processor goroutines
+	FrameQueue chan *Frame // Buffer frames between reader and processor goroutines
 	// FrameQueueBytes is the payload bytes currently buffered in FrameQueue
 	// (reader adds on hand-off, processor subtracts after processing). Lock-free
 	// byte bound for per-connection memory; see server/frame_budget.go.
@@ -70,7 +70,7 @@ type Connection struct {
 	FrameBudgetWake chan struct{}
 	AckQueue        chan *Frame   // Buffer ACK/NACK/Reject frames for the ack worker goroutine
 	Done            chan struct{} // Closed during connection teardown to unblock goroutines waiting on AckQueue
-	ConfirmWake chan struct{} // SQ-5: capacity-1 poke channel for the publisher-confirm flusher goroutine
+	ConfirmWake     chan struct{} // SQ-5: capacity-1 poke channel for the publisher-confirm flusher goroutine
 	// ConfirmActive is set once any channel on this connection enters confirm
 	// mode (one-way; stays set for the connection's lifetime). The confirm
 	// flusher arms a bounded safety re-check ONLY on connections that use

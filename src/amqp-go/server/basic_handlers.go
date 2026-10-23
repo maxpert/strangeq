@@ -892,7 +892,7 @@ func (s *Server) handleBasicGet(conn *protocol.Connection, channelID uint16, pay
 		return s.authzChannelError(conn, channelID, err, 60, 70)
 	}
 
-	message, deliveryTag, messageCount, err := s.Broker.GetMessageForGet(queueName, getMethod.NoAck)
+	message, deliveryTag, messageCount, err := s.Broker.GetMessageForGetOwned(queueName, getMethod.NoAck, conn.ID)
 	if err != nil {
 		s.Log.Error("Failed to get message for basic.get",
 			zap.Error(err),

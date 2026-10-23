@@ -184,13 +184,16 @@ func (b *ackTestBroker) RebuildDeliveryIndex(deliveryTag uint64, consumerTag str
 func (b *ackTestBroker) GetMessageForGet(queueName string, noAck bool) (*protocol.Message, uint64, uint32, error) {
 	return nil, 0, 0, nil
 }
+func (b *ackTestBroker) GetMessageForGetOwned(queueName string, noAck bool, connID string) (*protocol.Message, uint64, uint32, error) {
+	return nil, 0, 0, nil
+}
 func (b *ackTestBroker) PurgeQueue(name string) (int, error)             { return 0, nil }
 func (b *ackTestBroker) AcknowledgeGetDelivery(deliveryTag uint64) error { return nil }
 func (b *ackTestBroker) RejectGetDelivery(deliveryTag uint64, requeue bool) error {
 	return nil
 }
 func (b *ackTestBroker) NackGetDelivery(deliveryTag uint64, requeue bool) error          { return nil }
-func (b *ackTestBroker) RequeueAllGetDeliveries()                                        {}
+func (b *ackTestBroker) RequeueGetDeliveries(connID string)                              {}
 func (b *ackTestBroker) GetQueues() map[string]*protocol.Queue                           { return nil }
 func (b *ackTestBroker) GetExchanges() map[string]*protocol.Exchange                     { return nil }
 func (b *ackTestBroker) GetConsumers() map[string]*protocol.Consumer                     { return nil }

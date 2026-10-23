@@ -470,9 +470,10 @@ func (s *Server) cleanupConnection(connection *protocol.Connection) {
 		return true // continue iteration
 	})
 
-	// Requeue any orphaned basic.get deliveries (no_ack=false, unacked)
+	// Requeue this connection's orphaned basic.get deliveries (no_ack=false,
+	// unacked) — scoped to the closing connection (WS-B §10).
 	if s.Broker != nil {
-		s.Broker.RequeueAllGetDeliveries()
+		s.Broker.RequeueGetDeliveries(connection.ID)
 	}
 
 	if s.Broker != nil {

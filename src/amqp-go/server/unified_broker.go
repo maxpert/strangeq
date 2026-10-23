@@ -62,6 +62,9 @@ type UnifiedBroker interface {
 
 	// Synchronous message retrieval (basic.get)
 	GetMessageForGet(queueName string, noAck bool) (*protocol.Message, uint64, uint32, error)
+	// GetMessageForGetOwned is GetMessageForGet with the owning server
+	// connection ID, so connection close requeues only its own gets (WS-B §10).
+	GetMessageForGetOwned(queueName string, noAck bool, connID string) (*protocol.Message, uint64, uint32, error)
 
 	// Queue purge (queue.purge)
 	PurgeQueue(name string) (int, error)
@@ -71,8 +74,9 @@ type UnifiedBroker interface {
 	RejectGetDelivery(deliveryTag uint64, requeue bool) error
 	NackGetDelivery(deliveryTag uint64, requeue bool) error
 
-	// Requeue all in-flight basic.get deliveries on connection close
-	RequeueAllGetDeliveries()
+	// Requeue the in-flight basic.get deliveries owned by connID on connection
+	// close (owner-less deliveries are never touched).
+	RequeueGetDeliveries(connID string)
 
 	// Recovery support — initializes a queue's dispatch cursor from the
 	// recovered message tag range [minTag, maxTag], making recovered
