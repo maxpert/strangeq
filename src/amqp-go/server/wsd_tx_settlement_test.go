@@ -78,7 +78,8 @@ func TestTx_Commit_AckAppliedOnce(t *testing.T) {
 
 	// No op was buffered (the channel is closing, but the txm state is
 	// queryable before the frame loop drives teardown).
-	ops, _ := srv.txm(conn).GetPendingOperations(1)
+	ops, err := srv.txm(conn).GetPendingOperations(1)
+	require.NoError(t, err)
 	assert.Empty(t, ops, "a duplicate ack of a consumed wire tag buffers nothing (R14 parity)")
 
 	// Exactly once: inflight is 0 (not negative / not re-settled).
@@ -109,7 +110,8 @@ func TestTx_DuplicateAckInSameTx_SecondUnknown(t *testing.T) {
 	assert.Equal(t, uint16(406), chErr.Code)
 
 	// Exactly one settlement op was buffered (the first ack).
-	ops, _ := srv.txm(conn).GetPendingOperations(1)
+	ops, err := srv.txm(conn).GetPendingOperations(1)
+	require.NoError(t, err)
 	assert.Len(t, ops, 1, "exactly one settlement op buffered (duplicate is unknown, R14 parity)")
 }
 
@@ -192,7 +194,8 @@ func TestTx_CumulativeAck_UnknownTopTag_406(t *testing.T) {
 	assert.True(t, ok2, "wire tag %d must still be resolvable", wt2)
 
 	// No op was buffered.
-	ops, _ := srv.txm(conn).GetPendingOperations(1)
+	ops, err := srv.txm(conn).GetPendingOperations(1)
+	require.NoError(t, err)
 	assert.Empty(t, ops, "no settlement ops buffered after 406 cumulative ack")
 }
 
