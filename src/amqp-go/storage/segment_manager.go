@@ -11,6 +11,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -2238,9 +2239,21 @@ func (qs *QueueSegments) loadSegmentFile(segmentNum uint64, segPath string) erro
 // with a classified fault if any of them could not be read. A read error used
 // to be dropped on the floor (`if err == nil`), which silently abandoned a
 // checkpointed durable message whose source WAL file is already unlinked.
+//
+// WS-C C8 — CROSS-SEGMENT DEDUP. Duplicates across segment files arise
+// legitimately (a partially-failed multi-queue checkpoint retries and rewrites
+// a queue that already succeeded; a crash between segment fsync and WAL unlink
+// leaves the copy plus a later re-checkpoint), so recovery collapses them by
+// (queue, )offset — the same key the in-file index and the WAL-vs-segment
+// dedup use. The NEWEST copy wins: sealed segments are visited in ascending
+// segmentNum order and the ACTIVE segment last, and a seen offset is
+// overwritten only on a successful read (a failed read of a newer copy must
+// not erase an older readable copy). The output is sorted by offset ascending
+// so it is deterministic (the sealed map's iteration order is not).
 func (qs *QueueSegments) collectAllMessages() ([]*RecoveryMessage, error) {
 	var messages []*RecoveryMessage
 	var faults []error
+	pos := map[uint64]int{} // offset -> index into messages
 
 	read := func(seg *SegmentFile, offset uint64, position int64) {
 		msg, err := readSegmentMessageAt(seg.file, position)
@@ -2251,6 +2264,15 @@ func (qs *QueueSegments) collectAllMessages() ([]*RecoveryMessage, error) {
 				err))
 			return
 		}
+		if i, seen := pos[offset]; seen {
+			messages[i] = &RecoveryMessage{ // newer wins (visited oldest first)
+				QueueName: qs.queueName,
+				Offset:    offset,
+				Message:   msg,
+			}
+			return
+		}
+		pos[offset] = len(messages)
 		messages = append(messages, &RecoveryMessage{
 			QueueName: qs.queueName,
 			Offset:    offset,
@@ -2258,15 +2280,24 @@ func (qs *QueueSegments) collectAllMessages() ([]*RecoveryMessage, error) {
 		})
 	}
 
+	// Sealed segments in ascending segmentNum order: within one incarnation
+	// (and across restarts, thanks to C2's monotone numbering seeded from the
+	// highest loaded number) a higher number is a newer file.
 	qs.sealedMutex.RLock()
+	sealed := make([]*SegmentFile, 0, len(qs.sealedSegments))
 	for _, seg := range qs.sealedSegments {
+		sealed = append(sealed, seg)
+	}
+	qs.sealedMutex.RUnlock()
+	sort.Slice(sealed, func(i, j int) bool { return sealed[i].segmentNum < sealed[j].segmentNum })
+
+	for _, seg := range sealed {
 		seg.mutex.RLock()
 		for offset, position := range seg.index {
 			read(seg, offset, position)
 		}
 		seg.mutex.RUnlock()
 	}
-	qs.sealedMutex.RUnlock()
 
 	qs.mutex.Lock()
 	currentSeg := qs.currentSegment
@@ -2284,6 +2315,7 @@ func (qs *QueueSegments) collectAllMessages() ([]*RecoveryMessage, error) {
 		// QueueSegments itself, so currentIdx.entries is empty and this loop has
 		// zero iterations. It is fixed anyway because "currently unreachable" is
 		// not a property of the code, and it costs one lock acquisition at boot.
+		// The active segment is visited LAST so it beats every sealed copy.
 		currentIdx.mutex.RLock()
 		currentSeg.mutex.RLock()
 		for offset, position := range currentIdx.entries {
@@ -2292,6 +2324,10 @@ func (qs *QueueSegments) collectAllMessages() ([]*RecoveryMessage, error) {
 		currentSeg.mutex.RUnlock()
 		currentIdx.mutex.RUnlock()
 	}
+
+	// Deterministic output: sort by offset ascending (today's order was random
+	// map order, which no consumer can depend on).
+	sort.Slice(messages, func(i, j int) bool { return messages[i].Offset < messages[j].Offset })
 
 	return messages, joinFaults(faults)
 }
