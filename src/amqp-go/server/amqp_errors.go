@@ -6,11 +6,9 @@ import (
 	"io"
 	"net"
 	"strconv"
-	"strings"
 	"syscall"
 	"time"
 
-	"github.com/maxpert/amqp-go/broker"
 	amqperrors "github.com/maxpert/amqp-go/errors"
 	"github.com/maxpert/amqp-go/interfaces"
 	"github.com/maxpert/amqp-go/protocol"
@@ -198,13 +196,12 @@ func (s *Server) classify(rt *connRuntime, fc frameCtx, err error) error {
 		return s.channelError(rt.conn, fc.channel, amqperrors.NotFound,
 			"NOT_FOUND - no previously declared queue", fc.classID, fc.methodID)
 	}
-	if errors.Is(err, interfaces.ErrQueueNotFound) || errors.Is(err, interfaces.ErrExchangeNotFound) {
-		return s.channelError(rt.conn, fc.channel, amqperrors.NotFound,
-			"NOT_FOUND - "+err.Error(), fc.classID, fc.methodID)
-	}
-	if errors.Is(err, broker.ErrInvalidQueueArgument) || errors.Is(err, broker.ErrExchangeTypeMismatch) {
-		return s.channelError(rt.conn, fc.channel, amqperrors.PreconditionFailed,
-			"PRECONDITION_FAILED - "+err.Error(), fc.classID, fc.methodID)
+	// WS-D §19.1 (M1-M11): every known broker semantic error maps to its AMQP
+	// reply code through the single shared typed table (S1 — replaces both the
+	// two hand-rolled errors.Is branches and the §16.2 transitional text
+	// match; the broker now returns typed sentinels for all of these).
+	if code, text, ok := brokerErrorReply(err); ok {
+		return s.channelError(rt.conn, fc.channel, code, text, fc.classID, fc.methodID)
 	}
 	if errors.Is(err, interfaces.ErrTransactionNotActive) || errors.Is(err, interfaces.ErrTransactionNotFound) {
 		return s.channelError(rt.conn, fc.channel, amqperrors.PreconditionFailed,
@@ -218,27 +215,10 @@ func (s *Server) classify(rt *connRuntime, fc frameCtx, err error) error {
 		}
 		return s.connectionError(rt.conn, code, ae.Message, fc.classID, fc.methodID)
 	}
-	// TRANSITIONAL (§16.2, delete once WS-D's brokerErrorReply seam lands):
-	// today's broker returns untyped string errors for missing queues and
-	// exchanges; mapping them to 404 turns what would be a 541 connection
-	// close into the channel close RabbitMQ sends.
-	msg := err.Error()
-	if brokerErrorIsNotFound(msg) {
-		return s.channelError(rt.conn, fc.channel, amqperrors.NotFound,
-			"NOT_FOUND - "+msg, fc.classID, fc.methodID)
-	}
 	// Default: internal_error is a hard (connection) error, matching RabbitMQ.
 	// Strictly better than the previous bare EOF.
 	return s.connectionError(rt.conn, amqperrors.InternalError,
-		"INTERNAL_ERROR - "+msg, fc.classID, fc.methodID)
-}
-
-// brokerErrorIsNotFound is the transitional broker-error text match (§16.2).
-// It is a standalone helper so the merge with WS-D can point classify at
-// brokerErrorReply by changing this one function (and deleting its callers'
-// reliance on text).
-func brokerErrorIsNotFound(msg string) bool {
-	return strings.Contains(msg, "not found") || strings.Contains(msg, "does not exist")
+		"INTERNAL_ERROR - "+err.Error(), fc.classID, fc.methodID)
 }
 
 // discardWhileClosing implements AMQP 0-9-1 §2.3.5.2/§4.7: after sending
