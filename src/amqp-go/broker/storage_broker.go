@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"reflect"
 	"slices"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -3404,52 +3403,6 @@ func (b *StorageBroker) collectTargetQueues(exchange *protocol.Exchange, routing
 }
 
 // Helper methods for routing
-
-func (b *StorageBroker) matchTopicPattern(pattern, routingKey string) bool {
-	if pattern == routingKey || pattern == "#" {
-		return true
-	}
-
-	pi := strings.IndexByte(pattern, '.')
-	var pWord, pRest string
-	if pi >= 0 {
-		pWord, pRest = pattern[:pi], pattern[pi+1:]
-	} else {
-		pWord = pattern
-	}
-
-	if pWord == "#" {
-		if b.matchTopicPattern(pRest, routingKey) {
-			return true
-		}
-		if routingKey != "" {
-			ki := strings.IndexByte(routingKey, '.')
-			var kRest string
-			if ki >= 0 {
-				kRest = routingKey[ki+1:]
-			}
-			return b.matchTopicPattern(pattern, kRest)
-		}
-		return false
-	}
-
-	if routingKey == "" {
-		return false
-	}
-
-	ki := strings.IndexByte(routingKey, '.')
-	var kWord, kRest string
-	if ki >= 0 {
-		kWord, kRest = routingKey[:ki], routingKey[ki+1:]
-	} else {
-		kWord = routingKey
-	}
-
-	if pWord == "*" || pWord == kWord {
-		return b.matchTopicPattern(pRest, kRest)
-	}
-	return false
-}
 
 func (b *StorageBroker) matchHeaders(bindingArgs map[string]interface{}, messageHeaders map[string]interface{}) bool {
 	if len(bindingArgs) == 0 {

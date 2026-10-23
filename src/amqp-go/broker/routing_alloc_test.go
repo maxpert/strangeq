@@ -98,3 +98,40 @@ func TestRouteMessage_FanoutGeneralPath_SteadyStateZeroAlloc(t *testing.T) {
 	})
 	require.Zero(t, allocs, "map-based routing path must be allocation-free in steady state with a reused scratch")
 }
+
+// TestRouteMessage_TopicGeneralPath_SteadyStateZeroAlloc (WS-D T9.4) pins the
+// topic general path: the iterative matcher (broker/topic_match.go) must stay
+// allocation-free per binding, so routing through 4 topic bindings with
+// '#' and '*' wildcards is zero-alloc in steady state.
+func TestRouteMessage_TopicGeneralPath_SteadyStateZeroAlloc(t *testing.T) {
+	broker, cleanup := createTestBroker(t)
+	defer cleanup()
+
+	require.NoError(t, broker.DeclareExchange("alloc.topic", "topic", false, false, false, nil))
+	patterns := []string{"a.#", "a.*.b", "#.b", "*.*.*"}
+	for i, p := range patterns {
+		q := fmt.Sprintf("alloc.topic.q%d", i)
+		mustDeclareQueue(t, broker, q)
+		require.NoError(t, broker.BindQueue(q, "alloc.topic", p, nil))
+	}
+
+	exchange, err := broker.storage.GetExchange("alloc.topic")
+	require.NoError(t, err)
+	msg := &protocol.Message{Body: []byte("x"), RoutingKey: "a.x.b"}
+
+	rs := acquireRouteScratch()
+	defer releaseRouteScratch(rs)
+
+	// Warm scratch maps, slice capacity, and binding caches.
+	require.NoError(t, broker.routeMessage(exchange, "a.x.b", msg, rs))
+
+	allocs := testing.AllocsPerRun(200, func() {
+		if err := broker.routeMessage(exchange, "a.x.b", msg, rs); err != nil {
+			t.Fatal(err)
+		}
+		if len(rs.queues) != 4 {
+			t.Fatalf("expected 4 target queues, got %d", len(rs.queues))
+		}
+	})
+	require.Zero(t, allocs, "topic general path must be allocation-free in steady state with a reused scratch")
+}

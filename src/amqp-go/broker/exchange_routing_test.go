@@ -476,77 +476,12 @@ func TestDefaultExchangeRouting(t *testing.T) {
 // TestMatchTopicPattern tests the topic exchange pattern matcher directly,
 // covering * (exactly one word) and # (zero or more words) wildcards per
 // AMQP 0.9.1.
+// TestMatchTopicPattern is kept as an alias: WS-D §9.4 superseded its table
+// with the 74-row golden semantics table (topicSemanticsRows), which includes
+// every row this test used to carry plus the trailing-dot defect class. The
+// iterative matcher (broker/topic_match.go) is what runs either way.
 func TestMatchTopicPattern(t *testing.T) {
-	broker, cleanup := createTestBroker(t)
-	defer cleanup()
-
-	tests := []struct {
-		name       string
-		pattern    string
-		routingKey string
-		want       bool
-	}{
-		{"exact match", "a.b.c", "a.b.c", true},
-		{"exact mismatch key shorter", "a.b.c", "a.b", false},
-		{"exact mismatch key longer", "a.b", "a.b.c", false},
-		{"empty pattern empty key", "", "", true},
-		{"empty pattern nonempty key", "", "a", false},
-		{"nonempty pattern empty key", "a", "", false},
-
-		{"hash matches everything", "#", "any.routing.key.value", true},
-		{"hash matches empty", "#", "", true},
-		{"hash matches single word", "#", "foo", true},
-		{"a.hash matches a", "a.#", "a", true},
-		{"a.hash matches a.b", "a.#", "a.b", true},
-		{"a.hash matches a.b.c.d", "a.#", "a.b.c.d", true},
-		{"a.hash not match b", "a.#", "b", false},
-		{"a.hash not match ab", "a.#", "ab", false},
-		{"hash.b matches b", "#.b", "b", true},
-		{"hash.b matches a.b", "#.b", "a.b", true},
-		{"hash.b matches a.x.b", "#.b", "a.x.b", true},
-		{"hash.b not match a.x.c", "#.b", "a.x.c", false},
-		{"a.hash.b matches a.b", "a.#.b", "a.b", true},
-		{"a.hash.b matches a.x.b", "a.#.b", "a.x.b", true},
-		{"a.hash.b matches a.x.y.b", "a.#.b", "a.x.y.b", true},
-		{"a.hash.b not match a.x.b.c", "a.#.b", "a.x.b.c", false},
-		{"a.hash.b not match b", "a.#.b", "b", false},
-
-		{"star matches single word", "*", "foo", true},
-		{"star not match empty", "*", "", false},
-		{"star not match two words", "*", "a.b", false},
-		{"a.star matches a.foo", "a.*", "a.foo", true},
-		{"a.star not match a.foo.bar", "a.*", "a.foo.bar", false},
-		{"a.star not match a", "a.*", "a", false},
-		{"star.b matches foo.b", "*.b", "foo.b", true},
-		{"star.b not match foo.bar.b", "*.b", "foo.bar.b", false},
-		{"star.b not match b", "*.b", "b", false},
-		{"a.star.b matches a.foo.b", "a.*.b", "a.foo.b", true},
-		{"a.star.b not match a.foo.bar.b", "a.*.b", "a.foo.bar.b", false},
-		{"a.star.b not match a.b", "a.*.b", "a.b", false},
-
-		{"star.orange.star matches quick.orange.rabbit", "*.orange.*", "quick.orange.rabbit", true},
-		{"star.orange.star matches lazy.orange.rabbit", "*.orange.*", "lazy.orange.rabbit", true},
-		{"star.orange.star not match quick.brown.rabbit", "*.orange.*", "quick.brown.rabbit", false},
-		{"lazy.hash matches lazy.orange.rabbit", "lazy.#", "lazy.orange.rabbit", true},
-		{"lazy.hash not match quick.orange.rabbit", "lazy.#", "quick.orange.rabbit", false},
-		{"star.star.rabbit matches quick.orange.rabbit", "*.*.rabbit", "quick.orange.rabbit", true},
-		{"star.star.rabbit not match quick.orange.fox", "*.*.rabbit", "quick.orange.fox", false},
-		{"hash.rabbit matches quick.orange.rabbit", "#.rabbit", "quick.orange.rabbit", true},
-
-		{"a.star.hash matches a.b.c.d", "a.*.#", "a.b.c.d", true},
-		{"a.star.hash matches a.b", "a.*.#", "a.b", true},
-		{"a.star.hash not match a", "a.*.#", "a", false},
-		{"hash.hash matches a.b", "#.#", "a.b", true},
-		{"hash.hash matches empty", "#.#", "", true},
-		{"hash.hash matches single", "#.#", "a", true},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got := broker.matchTopicPattern(tt.pattern, tt.routingKey)
-			assert.Equal(t, tt.want, got, "matchTopicPattern(%q, %q)", tt.pattern, tt.routingKey)
-		})
-	}
+	TestTopic_Matching_SemanticsTable(t)
 }
 
 // TestMatchHeaders tests the headers exchange matcher directly, covering
