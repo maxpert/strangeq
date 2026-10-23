@@ -173,7 +173,7 @@ func (s *Server) handleQueueDeclare(conn *protocol.Connection, channelID uint16,
 // handleQueueDeclarePassive implements WS-D §1.3: a strictly read-only
 // queue.declare (R1). It never generates a server name and never resolves the
 // empty-name "queue-known" shortcut (D1: queue.declare is not in RabbitMQ's
-// expand_shortcuts), so an empty name is a plain 404 for queue ''. Flags and
+// expand_shortcuts), so an empty name is a plain 404 for queue ”. Flags and
 // arguments in the frame are IGNORED: the passive clause never calls
 // assert_equivalence, so a passive declare matching an existing queue with
 // different flags/args still returns declare-ok with the real counts.
