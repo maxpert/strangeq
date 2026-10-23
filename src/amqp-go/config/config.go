@@ -2,12 +2,12 @@ package config
 
 import (
 	"fmt"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"strings"
 
 	"github.com/knadh/koanf/parsers/yaml"
-	"github.com/knadh/koanf/providers/env/v2"
 	"github.com/knadh/koanf/providers/file"
 	"github.com/knadh/koanf/v2"
 	"github.com/maxpert/amqp-go/interfaces"
@@ -22,7 +22,7 @@ func boolPtr(b bool) *bool { return &b }
 func DefaultConfig() *AMQPConfig {
 	return &AMQPConfig{
 		Network: interfaces.NetworkConfig{
-			Address:                ":5672",
+			Address:                "127.0.0.1:5672",
 			Port:                   5672,
 			MaxConnections:         1000,
 			HeartbeatIntervalMS:    60000, // 60 seconds
@@ -63,6 +63,8 @@ func DefaultConfig() *AMQPConfig {
 			BlockedUsers:           []string{},
 			AllowedHosts:           []string{},
 			BlockedHosts:           []string{},
+			AuthFailureLimit:       5,
+			AuthFailureWindowMS:    60000,
 		},
 		ResourceAlarms: interfaces.ResourceAlarmConfig{
 			// Dormant by default so the unset zero-cost contract holds under
@@ -75,9 +77,15 @@ func DefaultConfig() *AMQPConfig {
 			Hysteresis:          0.05,             // 5% set/clear margin to avoid flapping
 			CheckIntervalMS:     2000,             // 2s monitor cadence (faster than the 60s metrics ticker)
 		},
+		Telemetry: interfaces.TelemetryConfig{
+			Enabled:      false,
+			Address:      "127.0.0.1",
+			Port:         9419,
+			PprofEnabled: false,
+		},
 		Server: interfaces.ServerConfig{
 			Name:                     "amqp-go-server",
-			Version:                  "0.9.1",
+			Version:                  "0.1.0-dev",
 			Product:                  "AMQP-Go",
 			Platform:                 "Go",
 			Copyright:                "Maxpert AMQP-Go Server",
@@ -127,6 +135,7 @@ type AMQPConfig struct {
 	Server         interfaces.ServerConfig        `json:"server"`
 	Engine         interfaces.EngineConfig        `json:"engine"`
 	ResourceAlarms interfaces.ResourceAlarmConfig `json:"resource_alarms"`
+	Telemetry      interfaces.TelemetryConfig     `json:"telemetry"`
 }
 
 // GetNetwork returns network configuration
@@ -290,59 +299,130 @@ func (c *AMQPConfig) Validate() error {
 		return fmt.Errorf("WAL cleanup check interval must be positive: %d ms", c.Engine.WALCleanupCheckIntervalMS)
 	}
 
+	// Telemetry. The port is checked unconditionally because the default is
+	// valid; CLI overrides land in cfg before Validate.
+	if c.Telemetry.Port < 1 || c.Telemetry.Port > 65535 {
+		return fmt.Errorf("invalid telemetry port: %d", c.Telemetry.Port)
+	}
+	if c.Telemetry.Address != "" && !strings.EqualFold(c.Telemetry.Address, "localhost") {
+		if _, err := netip.ParseAddr(c.Telemetry.Address); err != nil {
+			return fmt.Errorf("telemetry address must be \"\", \"localhost\", or an IP literal: %q", c.Telemetry.Address)
+		}
+	}
+
+	// Log level. "" is accepted for zero-value Load callers (mapped to info);
+	// "silent" is accepted because benchmarks use it.
+	switch c.Server.LogLevel {
+	case "", "debug", "info", "warn", "error", "silent":
+	default:
+		return fmt.Errorf("invalid log level %q: allowed levels are debug, info, warn, error, silent (or empty for info)", c.Server.LogLevel)
+	}
+
+	// Access control lists. Host entries must be IPs/CIDRs/localhost: hostname
+	// matching is deliberately unsupported (see ParseHostList).
+	if _, err := ParseHostList("security.allowedhosts", c.Security.AllowedHosts); err != nil {
+		return err
+	}
+	if _, err := ParseHostList("security.blockedhosts", c.Security.BlockedHosts); err != nil {
+		return err
+	}
+	for _, field := range []struct {
+		name    string
+		entries []string
+	}{
+		{"security.allowedusers", c.Security.AllowedUsers},
+		{"security.blockedusers", c.Security.BlockedUsers},
+	} {
+		for _, user := range field.entries {
+			if strings.TrimSpace(user) == "" {
+				return fmt.Errorf("%s: user entries must be non-empty strings", field.name)
+			}
+		}
+	}
+	if c.Security.AuthFailureLimit < 0 {
+		return fmt.Errorf("security.authfailurelimit must be non-negative: %d", c.Security.AuthFailureLimit)
+	}
+	if c.Security.AuthFailureWindowMS < 0 {
+		return fmt.Errorf("security.authfailurewindowms must be non-negative: %d", c.Security.AuthFailureWindowMS)
+	}
+
 	return nil
 }
 
 // Load reads configuration from a file, then applies AMQP_-prefixed environment
-// variable overrides (e.g. AMQP_NETWORK_PORT=5673).
+// variable overrides, decoding onto the receiver (which existing callers pass
+// as a zero value). It still ends with Validate so the old contract holds.
 //
 // It ALWAYS parses with the YAML parser, whatever the file is named. YAML is a
-// superset of JSON, so a .json file happens to work; TOML does not parse at all.
-// The two lines this replaced advertised "YAML/JSON/TOML based on extension" —
-// three claims, one of them silently false, and neither line matched the code.
+// superset of JSON, so a .json file happens to work; TOML does not parse.
 //
-// Keys bind by CASE-INSENSITIVE FIELD NAME, not by the `json:` tags on these
-// structs. koanf's Unmarshal defaults its tag name to "koanf", no field here
-// carries one, so mapstructure falls back to matching field names. That is why
-// the shipped samples spell keys "retentionms" rather than "retention_ms": a
-// snake_case key matching a `json:` tag would NOT bind, and would fail silently.
-// Unknown keys are ignored — koanf leaves ErrorUnused false — so a stale key in
-// an operator's file produces no diagnostic either.
+// Keys are normalized before binding: every segment is lower-cased and
+// underscores are removed, so both the canonical concatenated spellings
+// ("authenticationenabled") and snake_case ("authentication_enabled") bind.
+// Unknown keys are ignored here; LoadConfig reports them so main can warn.
+// AMQP_<SECTION>_<KEY> env names are transformed the same way (KEY may use
+// underscores); names whose first segment is not a known section are ignored.
+//
+// The amqp-server --config path does not use this method: LoadConfig seeds
+// DefaultConfig() first so omitted keys keep their defaults.
 func (c *AMQPConfig) Load(source string) error {
-	k := koanf.New(".")
-
-	// Always the YAML parser, regardless of the file's extension. See the
-	// function comment: JSON survives because YAML is a superset of it.
-	if err := k.Load(file.Provider(source), yaml.Parser()); err != nil {
-		return fmt.Errorf("failed to load config file: %w", err)
+	raw := koanf.New(".")
+	if source != "" {
+		// Always the YAML parser, regardless of the file's extension.
+		if err := raw.Load(file.Provider(source), yaml.Parser()); err != nil {
+			return fmt.Errorf("failed to load config file: %w", err)
+		}
 	}
 
-	// Load environment variables with AMQP_ prefix
-	// Converts AMQP_NETWORK_PORT -> network.port
-	if err := k.Load(env.Provider(".", env.Opt{
-		Prefix: "AMQP_",
-		TransformFunc: func(k, v string) (string, interface{}) {
-			key := strings.Replace(strings.ToLower(
-				strings.TrimPrefix(k, "AMQP_")), "_", ".", -1)
-			return key, v
-		},
-	}), nil); err != nil {
-		return fmt.Errorf("failed to load environment variables: %w", err)
+	k, err := normalizedKoanf(raw)
+	if err != nil {
+		return err
 	}
-
-	// Unmarshal into config struct
-	if err := k.Unmarshal("", c); err != nil {
-		return fmt.Errorf("failed to unmarshal config: %w", err)
+	if err := loadEnv(k, nil); err != nil {
+		return err
 	}
-
+	if err := decodeInto(k, c, nil); err != nil {
+		return err
+	}
+	// Zero-value Load callers omit telemetry entirely; Validate checks the
+	// port unconditionally, so seed the documented default here. An explicit
+	// telemetry.port: 0 stays 0 and is rejected.
+	if c.Telemetry.Port == 0 && !k.Exists("telemetry.port") {
+		c.Telemetry.Port = DefaultConfig().Telemetry.Port
+	}
 	return c.Validate()
+}
+
+// ResolvePaths makes every filesystem path in cfg absolute relative to base
+// (normally the process's cwd). Daemonizing chdirs to /, so paths must be
+// resolved before that happens; applying it in non-daemon mode too keeps log
+// lines unambiguous. Empty strings stay empty, absolute paths are unchanged.
+func (c *AMQPConfig) ResolvePaths(base string) {
+	resolve := func(path string) string {
+		if path == "" || filepath.IsAbs(path) {
+			return path
+		}
+		return filepath.Join(base, path)
+	}
+	c.Storage.Path = resolve(c.Storage.Path)
+	c.Server.LogFile = resolve(c.Server.LogFile)
+	c.Server.PidFile = resolve(c.Server.PidFile)
+	c.Security.AuthenticationFilePath = resolve(c.Security.AuthenticationFilePath)
+	c.Security.TLSCertFile = resolve(c.Security.TLSCertFile)
+	c.Security.TLSKeyFile = resolve(c.Security.TLSKeyFile)
+	c.Security.TLSCAFile = resolve(c.Security.TLSCAFile)
+	if c.Security.AuthenticationConfig != nil {
+		if userFile, ok := c.Security.AuthenticationConfig["user_file"].(string); ok {
+			c.Security.AuthenticationConfig["user_file"] = resolve(userFile)
+		}
+	}
 }
 
 // Save saves configuration to a YAML file
 func (c *AMQPConfig) Save(destination string) error {
 	// Ensure destination directory exists
 	dir := filepath.Dir(destination)
-	if err := os.MkdirAll(dir, 0755); err != nil {
+	if err := os.MkdirAll(dir, 0750); err != nil {
 		return fmt.Errorf("failed to create configuration directory: %w", err)
 	}
 
@@ -351,7 +431,8 @@ func (c *AMQPConfig) Save(destination string) error {
 		return fmt.Errorf("failed to marshal configuration: %w", err)
 	}
 
-	if err := os.WriteFile(destination, data, 0644); err != nil {
+	// 0600: configs can name credential paths and may later hold secrets.
+	if err := os.WriteFile(destination, data, 0600); err != nil {
 		return fmt.Errorf("failed to write configuration file: %w", err)
 	}
 

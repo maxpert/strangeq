@@ -1,7 +1,7 @@
 # AMQP-Go Server Configuration
 # Complete configuration file with all available options and their defaults
 # Load with: amqp-server --config config.yaml
-# Override any setting with environment variables: AMQP_NETWORK_PORT=15672
+# Override any setting with environment variables, e.g. AMQP_NETWORK_ADDRESS=0.0.0.0:5672
 #
 # ============================================================================
 # Metadata Caching Architecture
@@ -39,17 +39,18 @@
 # Network Configuration
 # ============================================================================
 network:
-  # Server bind address (format: "host:port" or ":port")
-  address: :5672
+  # Server bind address (format: "host:port" or ":port").
+  # Loopback by default: remote clients need an explicit choice below.
+  # Binding 0.0.0.0 exposes the broker to the network; with authentication
+  # disabled (the default) anyone can publish/consume/purge, and startup logs
+  # a loud security warning.
+  address: "127.0.0.1:5672"
 
   # AMQP protocol port (standard: 5672, TLS: 5671)
   port: 5672
 
   # Maximum concurrent client connections
   maxconnections: 1000
-
-  # Connection timeout for initial handshake (milliseconds)
-  connectiontimeoutms: 30000  # 30 seconds
 
   # AMQP heartbeat interval (milliseconds, 0 = disabled)
   heartbeatintervalms: 60000  # 60 seconds
@@ -60,11 +61,11 @@ network:
   # TCP keep-alive probe interval (milliseconds)
   tcpkeepaliveintervalms: 30000  # 30 seconds
 
-  # TCP read buffer size (bytes)
-  readbuffersize: 8192
+  # TCP read buffer size (bytes), default 256 KiB
+  readbuffersize: 262144
 
-  # TCP write buffer size (bytes)
-  writebuffersize: 8192
+  # TCP write buffer size (bytes), default 256 KiB
+  writebuffersize: 262144
 
 # ============================================================================
 # Storage Configuration
@@ -139,17 +140,21 @@ security:
   # Default virtual host for connections
   defaultvhost: /
 
-  # Whitelist of allowed usernames (empty = all allowed)
+  # Allow/block lists are enforced per connection (403 access-refused).
+  # Empty list = no restriction; a blocked entry beats an allowed entry.
+  # Host entries: IP literal (10.0.0.5), CIDR (10.0.0.0/8), or "localhost".
+  # Hostnames are rejected at startup (matching them would need reverse DNS).
+  # There is no implicit loopback exemption: add "localhost" to allowedhosts.
+  # User lists apply only when authenticationenabled is true.
+  allowedhosts: []
+  blockedhosts: []
   allowedusers: []
-
-  # Blacklist of blocked usernames
   blockedusers: []
 
-  # Whitelist of allowed client hostnames/IPs (empty = all allowed)
-  allowedhosts: []
-
-  # Blacklist of blocked client hostnames/IPs
-  blockedhosts: []
+  # Per-peer failed-authentication limiter: 5 failures per 60s window.
+  # 0 disables it. Peers are keyed per IPv4 address / IPv6 /64.
+  authfailurelimit: 5
+  authfailurewindowms: 60000
 
 # ============================================================================
 # Server Configuration
@@ -157,9 +162,6 @@ security:
 server:
   # Server identification name
   name: amqp-go-server
-
-  # Server version string
-  version: 0.9.1
 
   # Product name
   product: AMQP-Go
@@ -191,21 +193,8 @@ server:
   # Maximum message size in bytes (default: 16 MB)
   maxmessagesize: 16777216
 
-  # Channel operation timeout (milliseconds)
-  channeltimeoutms: 60000  # 60 seconds
-
-  # Message delivery timeout (milliseconds)
-  messagetimeoutms: 30000  # 30 seconds
-
   # Interval for cleanup tasks (milliseconds)
   cleanupintervalms: 300000  # 5 minutes
-
-  # Memory limit as percentage of total RAM (0-100, 0 = use absolute)
-  # RabbitMQ default: 60% (triggers flow control when exceeded)
-  memorylimitpercent: 60
-
-  # Absolute memory limit in bytes (0 = use percentage)
-  memorylimitbytes: 0
 
 # ============================================================================
 # Engine Configuration (Performance Tuning)
@@ -215,13 +204,6 @@ engine:
   # ========================================
   # Queue State Management
   # ========================================
-
-  # Available channel buffer size - lock-free queue of available message IDs
-  # Optimized to 10M entries (80 MB per queue) for balanced memory usage
-  # Larger buffer = more memory, more headroom for bursts
-  # Smaller buffer = less memory, must be sized for throughput
-  # Default: 10,000,000 (10M entries = 80 MB per queue)
-  availablechannelbuffer: 10000000
 
   # ========================================
   # Ring Buffer (Hot Path)
@@ -255,10 +237,9 @@ engine:
   # Default: 1,000 messages
   walbatchsize: 1000
 
-  # Maximum time to wait before flushing partial WAL batch (milliseconds)
-  # Longer = better batching, higher latency
-  # Shorter = lower latency, less efficient batching
-  # Default: 10 (10ms)
+  # Retained for compatibility; not used (flushing is drain-then-flush, not
+  # timer-gated). Kept because existing configs spell it.
+  # Default: 5 (5ms)
   walbatchtimeoutms: 10
 
   # Maximum size of each WAL file before rotation (bytes)
@@ -280,8 +261,8 @@ engine:
   # Segment file size - max size of each segment file (bytes)
   # Larger = fewer files, longer compaction time
   # Smaller = more files, faster compaction, more file handles
-  # Default: 1,073,741,824 (1 GB)
-  segmentsize: 1073741824
+  # Default: 268435456 (256 MB)
+  segmentsize: 268435456
 
   # Segment checkpoint interval - how often to checkpoint metadata (milliseconds)
   # Longer = less I/O overhead, more replay on restart
@@ -321,26 +302,38 @@ engine:
   # Background Maintenance
   # ========================================
 
-  # Interval for checking and removing expired messages (milliseconds)
-  # Longer = less overhead, slower TTL enforcement
-  # Shorter = more overhead, stricter TTL enforcement
-  # Default: 60000 (60 seconds)
-  expiredmessagecheckintervalms: 60000
-
   # Interval for WAL cleanup - removing fully-processed WAL files (milliseconds)
   # Longer = slower cleanup, more disk usage
   # Shorter = faster cleanup, more overhead
   # Default: 300000 (5 minutes)
   walcleanupcheckintervalms: 300000
 
-  # Number of acknowledged offsets to delete per cleanup cycle
-  # Larger = faster cleanup, more I/O per cycle
-  # Smaller = slower cleanup, less I/O impact
-  # Default: 1,000
-  offsetcleanupbatchsize: 1000
+# ============================================================================
+# Resource Alarms (RabbitMQ-style memory/disk pressure)
+# ============================================================================
+resourcealarms:
+  # Dormant by default: no monitor goroutine and no sampling.
+  enabled: false
+  # Fraction of total RAM that trips the memory alarm (0 disables the arm)
+  memoryhighwatermark: 0.4
+  # Free disk floor in bytes (0 disables the arm)
+  diskfreelimitbytes: 52428800
+  # Fractional margin between set and clear thresholds
+  hysteresis: 0.05
+  # Sampling cadence (milliseconds)
+  checkintervalms: 2000
 
-  # Interval for cleaning up acknowledged message offsets (milliseconds)
-  # Longer = less overhead, more stale offsets in memory
-  # Shorter = more overhead, cleaner memory
-  # Default: 30000 (30 seconds)
-  offsetcleanupintervalms: 30000
+# ============================================================================
+# Telemetry (Prometheus /metrics and /health readiness)
+# ============================================================================
+telemetry:
+  # Enable the HTTP endpoint (also --enable-telemetry)
+  enabled: false
+  # Bind address. Loopback by default; 0.0.0.0 exposes unauthenticated
+  # metrics to the network.
+  address: 127.0.0.1
+  # HTTP port (9419)
+  port: 9419
+  # Register /debug/pprof/* and enable mutex/block profiling (also
+  # --enable-pprof). Heap/goroutine dumps are unauthenticated: loopback only.
+  pprofenabled: false

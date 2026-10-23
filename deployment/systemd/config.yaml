@@ -1,0 +1,22 @@
+# StrangeQ AMQP server configuration installed as /etc/amqp/config.yaml.
+#
+# The broker is exposed on all interfaces by design here; authentication is
+# enabled and points at the file installed in step 4 of the systemd guide.
+network:
+  address: "0.0.0.0:5672"
+  maxconnections: 10000
+
+storage:
+  path: /var/lib/amqp/data
+
+security:
+  authenticationenabled: true
+  authenticationfilepath: /etc/amqp/auth.json
+
+server:
+  loglevel: info
+
+telemetry:
+  enabled: true
+  address: 127.0.0.1
+  port: 9419

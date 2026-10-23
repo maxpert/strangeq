@@ -98,11 +98,10 @@ type StorageConfig struct {
 	//   true  = fsync after each WAL batch (safer but slower)
 	//   false = skip the group-commit fsync (faster, relies on OS page cache;
 	//           NOT crash-durable). Only an EXPLICIT false disables durability.
-	// The tri-state matters because the --config load path seeds a zero-value
-	// AMQPConfig{} before Load, so an omitted key MUST mean "default ON" rather
-	// than Go's zero false — otherwise honoring the flag would silently make any
-	// fsync-omitting config non-durable. Transactions (WriteTxAtomic) always
-	// fdatasync regardless of this flag.
+	// The tri-state still protects zero-value Load callers and EngineConfig{}
+	// literals: the amqp-server --config path now seeds DefaultConfig(), so an
+	// omitted key there means "default ON" with or without the pointer.
+	// Transactions (WriteTxAtomic) always fdatasync regardless of this flag.
 	Fsync *bool
 
 	// CRCCheck controls whether WAL/segment records carry a CRC32 integrity
@@ -165,6 +164,28 @@ type SecurityConfig struct {
 	BlockedUsers []string
 	AllowedHosts []string
 	BlockedHosts []string
+
+	// AuthFailureLimit is the per-peer failed-authentication budget (default
+	// 5). A peer that exhausts it is refused by access policy BEFORE bcrypt
+	// runs, so credential guessing costs the broker no CPU. 0 disables the
+	// limiter. Peers are keyed per IPv4 address and per IPv6 /64.
+	AuthFailureLimit int
+
+	// AuthFailureWindowMS is the refill window for AuthFailureLimit in
+	// milliseconds (default 60000). The bucket refills continuously: limit
+	// tokens per window.
+	AuthFailureWindowMS int64
+}
+
+// TelemetryConfig configures the optional Prometheus/health HTTP endpoint.
+type TelemetryConfig struct {
+	Enabled bool   // default false
+	Address string // default "127.0.0.1" (loopback only)
+	Port    int    // default 9419
+	// PprofEnabled registers /debug/pprof/* and enables mutex/block
+	// profiling. Off by default: heap and goroutine dumps are
+	// unauthenticated and can leak message metadata.
+	PprofEnabled bool
 }
 
 // ResourceAlarmConfig configures the RabbitMQ-style resource alarms (SQ-12):
