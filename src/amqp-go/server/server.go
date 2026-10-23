@@ -954,6 +954,12 @@ func (s *Server) readFrames(rt *connRuntime, done chan struct{}) {
 			// while we still hold the stale reference.
 			head := pending[0]
 			headSize := int64(head.Size)
+			headCost := frameCost(head)
+			// §9: "budget exhausted" behaves exactly like "channel full".
+			if !s.frameBudgetAllows(conn, headCost) {
+				break
+			}
+			conn.FrameQueueBytes.Add(headCost)
 			select {
 			case conn.FrameQueue <- head:
 				pendingBytes -= headSize
@@ -963,6 +969,7 @@ func (s *Server) readFrames(rt *connRuntime, done chan struct{}) {
 			case <-conn.Done:
 				return
 			default:
+				conn.FrameQueueBytes.Add(-headCost) // rollback: not handed off
 			}
 			break
 		}
@@ -1001,14 +1008,28 @@ func (s *Server) readFrames(rt *connRuntime, done chan struct{}) {
 			// instant it receives it (mirrors the opportunistic drain above).
 			head := pending[0]
 			headSize := int64(head.Size)
+			headCost := frameCost(head)
+			// §9: an exhausted byte budget makes the hand-off channel never-ready
+			// (nil chan), so the reader parks on FrameBudgetWake exactly as it
+			// would park on a full FrameQueue (TCP backpressure).
+			q := conn.FrameQueue
+			if !s.frameBudgetAllows(conn, headCost) {
+				q = nil
+			}
 			backpressureProbe.Reset(s.readerBackpressureProbeInterval())
 			select {
-			case conn.FrameQueue <- head:
+			case q <- head:
 				backpressureProbe.Stop()
+				// Add after the send: a transient negative is harmless
+				// (frameBudgetAllows always admits q <= 0).
+				conn.FrameQueueBytes.Add(headCost)
 				pendingBytes -= headSize
 				pending[0] = nil
 				pending = pending[1:]
 				continue
+			case <-conn.FrameBudgetWake:
+				backpressureProbe.Stop()
+				continue // re-evaluate budget
 			case <-conn.Done:
 				backpressureProbe.Stop()
 				return
@@ -1165,6 +1186,12 @@ func (s *Server) readFrames(rt *connRuntime, done chan struct{}) {
 		// were already handled on a separate goroutine, so this introduces
 		// no new reordering — it only moves the diversion point earlier.)
 		if isAckFrame(frame) {
+			// §9: an "ack" is classified by class/method only, so its size is
+			// bounded per frame — a malicious oversized ack payload hard-closes
+			// the connection (the reader must not write, so no close frame).
+			if !s.admitOversizedAckFrame(conn, frame) {
+				return
+			}
 			select {
 			case conn.AckQueue <- frame:
 			case <-conn.Done:
@@ -1179,15 +1206,19 @@ func (s *Server) readFrames(rt *connRuntime, done chan struct{}) {
 		// a publish's method, header and body frames must stay contiguous). When
 		// FrameQueue is full, buffer instead; the reader must never block here or
 		// acks stall behind it.
-		if len(pending) == 0 {
+		cost := frameCost(frame)
+		if len(pending) == 0 && s.frameBudgetAllows(conn, cost) {
+			conn.FrameQueueBytes.Add(cost)
 			select {
 			case conn.FrameQueue <- frame:
 				continue // queued directly
 			case <-conn.Done:
+				conn.FrameQueueBytes.Add(-cost)
 				protocol.PutFrame(frame)
 				return
 			default:
-				// FrameQueue full — fall through to bounded buffering.
+				// FrameQueue full — roll back and fall through to bounded buffering.
+				conn.FrameQueueBytes.Add(-cost)
 			}
 		}
 		pending = append(pending, frame)
@@ -1236,7 +1267,14 @@ func (s *Server) processFrames(rt *connRuntime, done chan struct{}) {
 				return
 			}
 
+			// §9: capture the budget cost immediately (before processFrame can
+			// pool the frame) and release it on EVERY path that finishes with
+			// the frame — heartbeat, gate discards, and after processFrame
+			// (whether the frame is pooled or handed to the AckQueue).
+			cost := frameCost(frame)
+
 			if frame.Type == protocol.FrameHeartbeat {
+				s.releaseFrameBudget(conn, cost)
 				protocol.PutFrame(frame)
 				continue
 			}
@@ -1259,10 +1297,11 @@ func (s *Server) processFrames(rt *connRuntime, done chan struct{}) {
 				err := s.connectionError(conn, amqperrors.NotAllowed,
 					fmt.Sprintf("NOT_ALLOWED - channel %d exceeds negotiated channel_max %d", frame.Channel, conn.MaxChannels),
 					fc.classID, fc.methodID)
+				s.releaseFrameBudget(conn, cost)
+				protocol.PutFrame(frame)
 				if s.handleFrameError(rt, fc, err, true) {
 					return
 				}
-				protocol.PutFrame(frame)
 				continue
 			}
 
@@ -1270,12 +1309,14 @@ func (s *Server) processFrames(rt *connRuntime, done chan struct{}) {
 			// close / close-ok (two atomic loads when nothing is closing).
 			if rt.connClosing.Load() || rt.closingCount.Load() != 0 {
 				if s.discardWhileClosing(rt, frame) {
+					s.releaseFrameBudget(conn, cost)
 					protocol.PutFrame(frame)
 					continue
 				}
 			}
 
 			pooled, err := s.processFrame(conn, frame)
+			s.releaseFrameBudget(conn, cost)
 			if pooled {
 				protocol.PutFrame(frame)
 			}
