@@ -98,10 +98,10 @@ check_dependencies() {
     fi
     
     # Check if perftest binary exists
-    if [ ! -f "$BENCHMARK_DIR/perftest" ]; then
+    if [ ! -f "$AMQP_DIR/bin/perftest" ]; then
         print_warn "perftest binary not found. Building..."
-        cd "$BENCHMARK_DIR"
-        go build -o perftest perftest.go
+        cd "$AMQP_DIR"
+        go build -o bin/perftest ./cmd/perftest
         print_info "✓ perftest built"
     else
         print_info "✓ perftest binary found"
@@ -170,7 +170,7 @@ start_amqp_server() {
     
     # Start AMQP server with telemetry
     print_info "Starting server on port $AMQP_PORT with telemetry on port $TELEMETRY_PORT..."
-    ./bin/amqp-server --enable-telemetry --telemetry-port $TELEMETRY_PORT > /tmp/amqp-server.log 2>&1 &
+    ./bin/amqp-server --enable-telemetry --telemetry-address 0.0.0.0 --telemetry-port $TELEMETRY_PORT > /tmp/amqp-server.log 2>&1 &
     AMQP_PID=$!
     
     # Wait for server to be ready
@@ -197,20 +197,19 @@ run_performance_test() {
     print_info "Configuration:"
     print_info "  Publishers: $PUBLISHERS"
     print_info "  Consumers:  $CONSUMERS"
-    print_info "  Rate:       $RATE msg/s"
+    print_info "  Rate:       unbounded (perftest has no -rate flag; $RATE is informational)"
     print_info "  Duration:   $DURATION"
     
-    cd "$BENCHMARK_DIR"
+    cd "$AMQP_DIR"
     
     print_info "Starting performance test..."
     print_info "Performance test logs: /tmp/perftest.log"
     
-    ./perftest \
-        -publishers $PUBLISHERS \
+    ./bin/perftest \
+        -producers $PUBLISHERS \
         -consumers $CONSUMERS \
-        -rate $RATE \
-        -duration $DURATION \
-        -host localhost:$AMQP_PORT \
+        -duration "$DURATION" \
+        -url "amqp://guest:guest@localhost:$AMQP_PORT/" \
         > /tmp/perftest.log 2>&1 &
     PERFTEST_PID=$!
     

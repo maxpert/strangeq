@@ -21,16 +21,14 @@ go build -o amqp-server ./cmd/amqp-server
 sudo mv amqp-server /usr/local/bin/
 ```
 
-### Go Install
-
-```bash
-go install github.com/maxpert/amqp-go/cmd/amqp-server@latest
-```
+The module path (`github.com/maxpert/amqp-go`) differs from the repository
+path, so `go install ...@latest` is not supported; build from source instead.
 
 ## Start Server
 
 ```bash
-# Defaults (persistent storage at ./data, port 5672)
+# Defaults: persistent storage at ./data, listening on 127.0.0.1:5672,
+# authentication off
 amqp-server
 
 # Generate example config
@@ -42,17 +40,21 @@ amqp-server --config config.yaml
 # With TLS
 amqp-server --tls --tls-cert cert.pem --tls-key key.pem
 
-# With telemetry (Prometheus + pprof)
-amqp-server --config config.yaml --enable-telemetry --telemetry-port 9419
+# With telemetry (Prometheus metrics and /health); pprof needs --enable-pprof
+amqp-server --config config.yaml --enable-telemetry
 ```
 
 ### Environment Variables
 
-Override any config setting with `AMQP_<section>_<key>`:
+Environment variables apply with or without `--config`, in the form
+`AMQP_<SECTION>_<KEY>` (keys may use underscores). Precedence is
+defaults → file → environment → explicitly set flags.
 
 ```bash
 AMQP_NETWORK_PORT=15672 amqp-server --config config.yaml
+AMQP_NETWORK_ADDRESS=0.0.0.0:5672 amqp-server
 AMQP_STORAGE_PATH=/var/lib/amqp amqp-server
+AMQP_SECURITY_AUTHENTICATION_ENABLED=true amqp-server
 AMQP_SERVER_LOGLEVEL=debug amqp-server
 ```
 
@@ -156,8 +158,7 @@ See `src/amqp-go/config.sample.yaml` for all options with documented defaults.
 
 ```yaml
 network:
-  address: :5672
-  port: 5672
+  address: 127.0.0.1:5672
 
 storage:
   path: ./data
@@ -165,6 +166,8 @@ storage:
 server:
   loglevel: info
 ```
+
+Omitted keys keep their defaults, so a short file is valid.
 
 ## Production Deployment
 

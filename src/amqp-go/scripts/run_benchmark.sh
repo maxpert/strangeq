@@ -57,10 +57,9 @@ echo "[3/8] Results directory: $PROFILE_DIR"
 echo "[4/8] Generating config and starting server..."
 cat > "$PROFILE_DIR/benchmark-config.yaml" <<EOF
 network:
-  address: :5672
+  address: 127.0.0.1:5672
   port: 5672
   maxconnections: 1000
-  connectiontimeoutms: 30000
   heartbeatintervalms: 60000
   tcpkeepalive: true
   tcpkeepaliveintervalms: 30000
@@ -70,17 +69,13 @@ storage:
   cachemb: 64
   maxfiles: 100
   retentionms: 86400000
-  checkpointintervalms: 5000
 server:
   loglevel: info
   maxchannelsperconnection: 2047
   maxframesize: 131072
   maxmessagesize: 16777216
-  channeltimeoutms: 60000
-  messagetimeoutms: 30000
   cleanupintervalms: 300000
 engine:
-  availablechannelbuffer: 10000000
   ringbuffersize: 65536
   spillthresholdpercent: 80
   walbatchsize: 1000
@@ -93,13 +88,10 @@ engine:
   compactionintervalms: 1800000
   consumerselecttimeoutms: 1
   consumermaxbatchsize: 100
-  expiredmessagecheckintervalms: 60000
   walcleanupcheckintervalms: 300000
-  offsetcleanupbatchsize: 1000
-  offsetcleanupintervalms: 30000
 EOF
 
-./amqp-server --config "$PROFILE_DIR/benchmark-config.yaml" --enable-telemetry --telemetry-port 9419 > "$PROFILE_DIR/server.log" 2>&1 &
+./amqp-server --config "$PROFILE_DIR/benchmark-config.yaml" --enable-telemetry --enable-pprof --telemetry-port 9419 > "$PROFILE_DIR/server.log" 2>&1 &
 SERVER_PID=$!
 echo "Server PID: $SERVER_PID"
 sleep 2

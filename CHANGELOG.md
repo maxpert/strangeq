@@ -2,6 +2,42 @@
 
 ## [Unreleased]
 
+### Changed
+- The default listener now binds `127.0.0.1:5672` instead of all interfaces. Use
+  `network.address` (or `AMQP_NETWORK_ADDRESS`) to expose the broker, and read
+  the startup security warnings before doing so.
+- `AMQP_*` environment variables always apply, with or without `--config`;
+  precedence is defaults → file → environment → explicitly set flags.
+- Config files are layered onto the defaults, so a minimal file (for example
+  only `storage.path`) no longer fails validation. Snake_case keys are accepted.
+- `network.port` is honoured: it rewrites the port in `network.address` and a
+  conflicting pair is rejected with an explicit error.
+- The `authmechanisms` list is authoritative. A list without `PLAIN` no longer
+  silently offers PLAIN; unknown names are reported at startup.
+- Telemetry defaults to loopback (`127.0.0.1`) and pprof is opt-in.
+
+### Added
+- Connection access control: `allowedhosts`/`blockedhosts` (IP, CIDR, or
+  `localhost`) and `allowedusers`/`blockedusers`, plus per-peer failed-auth
+  limiting (`authfailurelimit`, `authfailurewindowms`).
+- `--telemetry-address`, `--enable-pprof`, and `--healthcheck` flags.
+- `/health` is now a readiness probe (503 until recovery and listener bind,
+  503 during shutdown) and reports resource alarms without leaving rotation.
+- Version, commit, and build date are stamped through every build path and
+  shown by `--version`.
+- Prometheus metrics for auth failures, resource alarms, build info, and
+  queue ready depth.
+- systemd unit, environment example, shipped config, smoke script, Dockerfile,
+  and `.dockerignore`.
+
+### Fixed
+- `--telemetry-port` and `--tls-*` flags no longer override config with their
+  defaults when the operator did not pass them.
+- Unknown usernames no longer return measurably faster than wrong passwords.
+- Crash/stress scripts use real flags, free ports, and readiness checks, and
+  only stop the broker they started.
+- `--version` reports the stamped version instead of a hard-coded constant.
+
 ## [0.1.0] - TBD
 
 ### Added

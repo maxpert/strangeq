@@ -121,23 +121,77 @@ The old `permissions` field (resource/action/pattern) is automatically migrated 
 
 ## Configuration
 
-Enable authorization in the config file:
+Enable authorization in the config file (canonical concatenated keys):
 
 ```yaml
 security:
-  authentication_enabled: true
-  authorization_enabled: true
-  auth_mechanisms:
+  authenticationenabled: true
+  authorizationenabled: true
+  authmechanisms:
     - PLAIN
 ```
 
-Or via command-line / environment variables:
+Snake_case spellings (`authentication_enabled`, `authorization_enabled`,
+`auth_mechanisms`) are also accepted since v0.1.0; both bind to the same
+fields. Unknown keys are reported at startup rather than silently ignored.
+
+Environment variables apply with or without `--config`:
 
 ```bash
-amqp-server --config config.yaml
-# AMQP_SECURITY_AUTHENTICATION_ENABLED=true
-# AMQP_SECURITY_AUTHORIZATION_ENABLED=true
+AMQP_SECURITY_AUTHENTICATION_ENABLED=true \
+AMQP_SECURITY_AUTHORIZATION_ENABLED=true \
+  amqp-server --config config.yaml
 ```
+
+## Connection access control
+
+Four lists restrict who may connect. Empty lists mean "no restriction".
+
+```yaml
+security:
+  allowedhosts: ["10.0.0.0/8", "2001:db8::/32", "localhost"]
+  blockedhosts: ["10.9.9.9"]
+  allowedusers: ["app"]
+  blockedusers: ["mallory"]
+```
+
+- **Host entries** are IP literals, CIDR prefixes, or the literal `localhost`
+  (= `127.0.0.0/8` plus `::1/128`). Hostnames are rejected at startup:
+  matching them would require reverse DNS on the accept path.
+- **Precedence:** a blocked match wins; otherwise, when `allowedhosts` is
+  non-empty, the peer must match it. `allowedhosts` has no implicit loopback
+  exemption — add `localhost` or `127.0.0.0/8` if local clients should connect.
+- **IPv4-mapped IPv6** peers (`::ffff:10.0.0.5`) match IPv4 entries.
+- **Host lists apply even when authentication is disabled.** They are network
+  policy, not identity policy.
+- **User lists apply only when authentication is enabled**, because without it
+  every connection is the unverified `guest` identity. Usernames are matched
+  exactly (case-sensitive). A refusal sends the same `Authentication failed`
+  text as a wrong password, so it does not reveal whether the username exists.
+- A non-TCP peer (for example a test `net.Pipe`) is allowed only when both host
+  lists are empty; otherwise it is refused (fail closed).
+
+### Failed-authentication limiting
+
+After `security.authfailurelimit` failures in a window, further attempts from
+that peer are refused before any bcrypt work:
+
+```yaml
+security:
+  authfailurelimit: 5
+  authfailurewindowms: 60000
+```
+
+The budget is per IPv4 address, and per IPv6 `/64` prefix (a single host
+usually owns an entire /64, so per-address keys are easy to evade). Set
+`authfailurelimit: 0` to disable. Behind a TCP proxy every client appears as
+the proxy's address and shares one budget — raise the limit or disable it in
+that topology.
+
+Refusals are counted in `amqp_auth_failures_total{reason}` with one of
+`host_blocked`, `host_not_allowed`, `user_blocked`, `user_not_allowed`,
+`rate_limited`, `bad_credentials`, or `unsupported_mechanism`.
+
 
 ## Error Handling
 
