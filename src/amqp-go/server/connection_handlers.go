@@ -140,26 +140,26 @@ func (s *Server) sendConnectionOpen(conn *protocol.Connection) error {
 	return s.writeFrame(conn, frame)
 }
 
-// processConnectionOpen handles the connection.open method
-func (s *Server) processConnectionOpen(conn *protocol.Connection, frame *protocol.Frame) error {
-	if len(frame.Payload) < 4 {
-		return fmt.Errorf("method frame payload too short")
-	}
-
-	classID := (uint16(frame.Payload[0]) << 8) | uint16(frame.Payload[1])
-	methodID := (uint16(frame.Payload[2]) << 8) | uint16(frame.Payload[3])
-
-	// Verify this is the connection.open method (class 10, method 40)
-	if classID != 10 || methodID != 40 {
-		return fmt.Errorf("expected connection.open (10.40) but got %d.%d", classID, methodID)
-	}
-
+// processConnectionOpen handles the connection.open method. The caller (the
+// handshake state machine) has already verified this is 10.40; payload is the
+// method body after the 4-byte class/method prefix. Every failure sends
+// connection.close via connectionError (the caller then waits for close-ok).
+func (s *Server) processConnectionOpen(conn *protocol.Connection, payload []byte) error {
 	// Deserialize the connection.open method
 	openMethod := &protocol.ConnectionOpenMethod{}
-	err := openMethod.Deserialize(frame.Payload[4:])
+	err := openMethod.Deserialize(payload)
 	if err != nil {
 		s.Log.Error("Failed to deserialize connection.open", zap.Error(err))
-		return err
+		return s.connectionError(conn, amqperrors.SyntaxError, "SYNTAX_ERROR - malformed connection.open", 10, 40)
+	}
+
+	// Defence in depth (§1.3): with authentication enabled, connection.open on
+	// a connection whose start-ok produced no identity is refused. Unreachable
+	// once handleConnectionStartOK enforces the same invariant.
+	if s.Config != nil && s.Config.Security.AuthenticationEnabled && conn.Username == "" {
+		s.Log.Warn("connection.open without an authenticated identity",
+			zap.String("connection_id", conn.ID))
+		return s.connectionError(conn, amqperrors.AccessRefused, "ACCESS_REFUSED - not authenticated", 10, 40)
 	}
 
 	// Normalize empty vhost to "/"
@@ -176,17 +176,15 @@ func (s *Server) processConnectionOpen(conn *protocol.Connection, frame *protoco
 		if conn.User == nil {
 			s.Log.Warn("Authorization enabled but no authenticated user",
 				zap.String("connection_id", conn.ID))
-			s.sendConnectionClose(conn, amqperrors.AccessRefused,
+			return s.connectionError(conn, amqperrors.AccessRefused,
 				"authorization enabled but no authenticated user", 10, 40)
-			return fmt.Errorf("authorization enabled but no authenticated user")
 		}
 		user, ok := conn.User.(*interfaces.User)
 		if !ok {
 			s.Log.Warn("Unsupported user type for authorization",
 				zap.String("connection_id", conn.ID))
-			s.sendConnectionClose(conn, amqperrors.AccessRefused,
+			return s.connectionError(conn, amqperrors.AccessRefused,
 				"unsupported user type for authorization", 10, 40)
-			return fmt.Errorf("unsupported user type for authorization")
 		}
 
 		// Hold RLock for both vhost permission and loopback checks to prevent
@@ -207,9 +205,8 @@ func (s *Server) processConnectionOpen(conn *protocol.Connection, frame *protoco
 				zap.String("connection_id", conn.ID),
 				zap.String("username", user.Username),
 				zap.String("vhost", vhost))
-			s.sendConnectionClose(conn, amqperrors.InvalidPath,
+			return s.connectionError(conn, amqperrors.InvalidPath,
 				fmt.Sprintf("access to vhost %s refused for user %s", vhost, user.Username), 10, 40)
-			return fmt.Errorf("access to vhost %s refused for user %s", vhost, user.Username)
 		}
 
 		// RabbitMQ loopback restriction: users with LoopbackOnly=true may only
@@ -218,9 +215,8 @@ func (s *Server) processConnectionOpen(conn *protocol.Connection, frame *protoco
 			s.Log.Warn("Loopback restriction violated",
 				zap.String("connection_id", conn.ID),
 				zap.String("username", user.Username))
-			s.sendConnectionClose(conn, amqperrors.AccessRefused,
+			return s.connectionError(conn, amqperrors.AccessRefused,
 				fmt.Sprintf("user %s can only connect via localhost", user.Username), 10, 40)
-			return fmt.Errorf("user %s can only connect via localhost", user.Username)
 		}
 	} else if conn.User != nil {
 		// Authorization disabled, but still enforce loopback restriction
@@ -233,9 +229,8 @@ func (s *Server) processConnectionOpen(conn *protocol.Connection, frame *protoco
 				s.Log.Warn("Loopback restriction violated",
 					zap.String("connection_id", conn.ID),
 					zap.String("username", user.Username))
-				s.sendConnectionClose(conn, amqperrors.AccessRefused,
+				return s.connectionError(conn, amqperrors.AccessRefused,
 					fmt.Sprintf("user %s can only connect via localhost", user.Username), 10, 40)
-				return fmt.Errorf("user %s can only connect via localhost", user.Username)
 			}
 		}
 	}
@@ -264,7 +259,11 @@ func isLoopbackConn(conn net.Conn) bool {
 	return addr.IP.IsLoopback()
 }
 
-// handleConnectionStartOK handles the connection.start-ok method and performs authentication
+// handleConnectionStartOK handles the connection.start-ok method and performs
+// authentication. Every failure branch returns a non-nil *ConnectionError (the
+// close frame is already on the wire), so no path can fall through to
+// connection.tune unauthenticated (P0-1 bypass #2). On success, with
+// authentication enabled, conn.Username is non-empty.
 func (s *Server) handleConnectionStartOK(conn *protocol.Connection, payload []byte) error {
 	// Parse connection.start-ok
 	startOK, err := protocol.ParseConnectionStartOK(payload)
@@ -272,7 +271,8 @@ func (s *Server) handleConnectionStartOK(conn *protocol.Connection, payload []by
 		s.Log.Error("Failed to parse connection.start-ok",
 			zap.String("connection_id", conn.ID),
 			zap.Error(err))
-		return s.sendConnectionClose(conn, 503, "Failed to parse connection.start-ok", 10, 11)
+		return s.connectionError(conn, amqperrors.CommandInvalid,
+			"COMMAND_INVALID - failed to parse connection.start-ok", 10, 11)
 	}
 
 	// Capture the client-advertised properties/capabilities once, before any
@@ -299,8 +299,8 @@ func (s *Server) handleConnectionStartOK(conn *protocol.Connection, payload []by
 	if s.Authenticator == nil || s.MechanismRegistry == nil {
 		s.Log.Error("Authentication enabled but authenticator or mechanism registry is nil",
 			zap.String("connection_id", conn.ID))
-		return s.sendConnectionClose(conn, amqperrors.InternalError,
-			"authentication enabled but no authenticator configured", 10, 11)
+		return s.connectionError(conn, amqperrors.InternalError,
+			"INTERNAL_ERROR - authentication enabled but no authenticator configured", 10, 11)
 	}
 
 	// Get the mechanism
@@ -310,8 +310,8 @@ func (s *Server) handleConnectionStartOK(conn *protocol.Connection, payload []by
 			zap.String("connection_id", conn.ID),
 			zap.String("mechanism", startOK.Mechanism),
 			zap.Error(err))
-		return s.sendConnectionClose(conn, 403,
-			fmt.Sprintf("Unsupported mechanism: %s", startOK.Mechanism), 10, 11)
+		return s.connectionError(conn, amqperrors.AccessRefused,
+			fmt.Sprintf("ACCESS_REFUSED - unsupported mechanism %s", startOK.Mechanism), 10, 11)
 	}
 
 	// Authenticate using the mechanism
@@ -321,9 +321,11 @@ func (s *Server) handleConnectionStartOK(conn *protocol.Connection, payload []by
 			zap.String("connection_id", conn.ID),
 			zap.String("mechanism", startOK.Mechanism),
 			zap.Error(err))
-		_ = s.sendConnectionClose(conn, 403,
-			"Authentication failed", 10, 11)
-		return fmt.Errorf("authentication failed: %w", err)
+		// The client only ever sees the fixed text; the cause stays in the log.
+		cne := s.connectionError(conn, amqperrors.AccessRefused,
+			"ACCESS_REFUSED - authentication failed", 10, 11)
+		cne.Cause = fmt.Errorf("authentication failed: %w", err)
+		return cne
 	}
 
 	// Extract username from authenticated user
@@ -339,6 +341,16 @@ func (s *Server) handleConnectionStartOK(conn *protocol.Connection, payload []by
 		s.Log.Info("Authentication successful",
 			zap.String("connection_id", conn.ID),
 			zap.String("mechanism", startOK.Mechanism))
+	}
+
+	// With authentication enabled, a successful start-ok MUST have produced a
+	// non-empty identity; otherwise the connection would proceed with no
+	// principal (P0-1 bypass #1's remaining hole).
+	if s.Config != nil && s.Config.Security.AuthenticationEnabled && conn.Username == "" {
+		s.Log.Error("authentication produced no identity",
+			zap.String("connection_id", conn.ID))
+		return s.connectionError(conn, amqperrors.AccessRefused,
+			"ACCESS_REFUSED - authentication produced no identity", 10, 11)
 	}
 
 	return nil

@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"math"
 	"net"
@@ -304,7 +305,7 @@ func (s *Server) acceptLoop() error {
 			continue
 		}
 
-		go s.handleConnection(conn)
+		s.dispatchAccepted(conn)
 	}
 }
 
@@ -350,27 +351,39 @@ func (s *Server) tuneSocket(conn net.Conn) {
 			s.Log.Warn("SetWriteBuffer failed", zap.Int("bytes", n), zap.Error(err))
 		}
 	}
+	if s.Config.Network.TCPKeepAlive {
+		if err := tcp.SetKeepAlive(true); err != nil {
+			s.Log.Warn("SetKeepAlive failed", zap.Error(err))
+		}
+		if ms := s.Config.Network.TCPKeepAliveIntervalMS; ms > 0 {
+			if err := tcp.SetKeepAlivePeriod(time.Duration(ms) * time.Millisecond); err != nil {
+				s.Log.Warn("SetKeepAlivePeriod failed", zap.Error(err))
+			}
+		}
+	} else {
+		// Honour an explicit opt-out; Go's listener enables 15s keepalive by
+		// default, so "unset" would silently be on.
+		_ = tcp.SetKeepAlive(false)
+	}
 }
 
-// handleConnection handles a new client connection
+// handleConnection handles a new client connection (§2.4). It owns the
+// pre-auth handshake slot from dispatchAccepted until connection.open-ok is
+// sent (or it exits), so every unauthenticated socket is bounded.
 func (s *Server) handleConnection(conn net.Conn) {
+	defer s.connWG.Done()
+	slot := &handshakeSlot{s: s}
+	defer slot.release()
+	defer s.recoverConnection(conn, "handleConnection") // §8; runs before slot.release, after finishConnection
+
 	// Tune the socket before the handshake so NoDelay/buffer sizing apply to the
 	// whole connection lifetime, including connection.start-ok latency.
 	s.tuneSocket(conn)
 
-	// First, check the protocol header
-	protoHeader := make([]byte, 8)
-	_, err := conn.Read(protoHeader)
-	if err != nil {
-		s.Log.Error("Error reading protocol header", zap.Error(err))
-		conn.Close()
-		return
-	}
-
-	// Verify protocol header: "AMQP" followed by version (0, 0, 9, 1)
-	if string(protoHeader[:4]) != "AMQP" {
-		s.Log.Error("Invalid protocol header", zap.Binary("header", protoHeader))
-		conn.Close()
+	// First, check the protocol header (deadline-bounded; bounds the TLS
+	// handshake too).
+	if !s.readProtocolHeader(conn) {
+		_ = conn.Close()
 		return
 	}
 
@@ -378,20 +391,19 @@ func (s *Server) handleConnection(conn net.Conn) {
 	// coalesced through a bufio.Reader (SQ-1); the 8-byte protocol header above
 	// was read raw before the buffer existed, so no buffered bytes are lost.
 	connection := protocol.NewConnectionWithReadBuffer(conn, s.Config.Network.ReadCoalesceBufferSize)
+	rt := s.newConnRuntime(connection, slot)
 
 	// Add to server's connections, enforcing MaxConnections
 	s.Mutex.Lock()
-	if s.ShuttingDown {
+	if s.ShuttingDown || (s.Config.Network.MaxConnections > 0 && len(s.Connections) >= s.Config.Network.MaxConnections) {
 		s.Mutex.Unlock()
-		conn.Close()
-		return
-	}
-	if s.Config.Network.MaxConnections > 0 && len(s.Connections) >= s.Config.Network.MaxConnections {
-		s.Mutex.Unlock()
-		s.Log.Warn("Max connections exceeded, refusing connection",
-			zap.String("connection_id", connection.ID),
-			zap.Int("max", s.Config.Network.MaxConnections))
-		conn.Close()
+		s.runtimes.Delete(connection)
+		if !s.ShuttingDown {
+			s.Log.Warn("Max connections exceeded, refusing connection",
+				zap.String("connection_id", connection.ID),
+				zap.Int("max", s.Config.Network.MaxConnections))
+		}
+		_ = conn.Close()
 		return
 	}
 	s.Connections[connection.ID] = connection
@@ -405,9 +417,7 @@ func (s *Server) handleConnection(conn net.Conn) {
 	// Process frames for this connection
 	// Note: consumerDeliveryLoop is started later in processConnectionFrames
 	// after the handshake completes (line 312)
-	rt := s.newConnRuntime(connection, nil) // pre-auth slot wired in §2
-	defer s.finishConnection(rt)            // cleanupConnection (recover-guarded) + runtimes.Delete + close(rt.torndown)
-	defer s.recoverConnection(conn, "handleConnection")
+	defer s.finishConnection(rt) // cleanupConnection (recover-guarded) + runtimes.Delete + close(rt.torndown)
 	s.processConnectionFrames(connection)
 }
 
@@ -539,11 +549,13 @@ func negotiateUint32(server, client uint32) uint32 {
 	return client
 }
 
-// processConnectionFrames reads and processes frames from a connection
+// processConnectionFrames reads and processes frames from a connection.
+// The handshake is a strict state machine (§1.2): S1 start-ok → authenticate
+// → tune, S2 tune-ok → negotiate, S3 open → open-ok. One ABSOLUTE deadline
+// covers the whole handshake; every protocol violation sends connection.close
+// and waits briefly for close-ok before the socket closes (D5).
 func (s *Server) processConnectionFrames(conn *protocol.Connection) {
 	defer conn.Conn.Close()
-
-	handshakeCap := uint32(131072 + 8)
 
 	// Send connection start frame
 	if err := s.sendConnectionStart(conn); err != nil {
@@ -551,33 +563,28 @@ func (s *Server) processConnectionFrames(conn *protocol.Connection) {
 		return
 	}
 
-	conn.Conn.SetReadDeadline(time.Now().Add(30 * time.Second))
-	frame, err := protocol.ReadFrameOptimizedWithLimit(conn.Reader, handshakeCap)
+	rt := s.runtimeFor(conn)
+	// ONE absolute handshake deadline, measured from the end of the protocol
+	// header (§1.2) — not a fresh 30s per step.
+	_ = conn.Conn.SetReadDeadline(time.Now().Add(s.handshakeTimeout()))
+
+	// S1: await start-ok, then authenticate. Authentication must yield a
+	// non-empty username when auth is enabled (bypass #1/#2: no path reaches
+	// sendConnectionTune otherwise).
+	payload, err := s.readHandshakeMethod(conn, protocol.ConnectionStartOK, "start-ok")
 	if err != nil {
-		s.Log.Error("Error reading connection.start-ok", zap.Error(err))
-		return
-	}
-	conn.TouchActivity()
-
-	if frame.Type != protocol.FrameMethod {
-		s.Log.Error("Expected method frame", zap.Int("type", int(frame.Type)))
-		return
-	}
-
-	// Process connection.start-ok and perform authentication
-	if len(frame.Payload) >= 4 {
-		classID := (uint16(frame.Payload[0]) << 8) | uint16(frame.Payload[1])
-		methodID := (uint16(frame.Payload[2]) << 8) | uint16(frame.Payload[3])
-
-		if classID == 10 && methodID == protocol.ConnectionStartOK {
-			// Handle authentication
-			if err := s.handleConnectionStartOK(conn, frame.Payload[4:]); err != nil {
-				s.Log.Error("Authentication failed",
-					zap.String("connection_id", conn.ID),
-					zap.Error(err))
-				return
-			}
+		var cne *ConnectionError
+		if errors.As(err, &cne) {
+			s.awaitHandshakeCloseOK(conn)
 		}
+		return
+	}
+	if err := s.handleConnectionStartOK(conn, payload); err != nil {
+		s.Log.Error("Authentication failed",
+			zap.String("connection_id", conn.ID),
+			zap.Error(err))
+		s.awaitHandshakeCloseOK(conn)
+		return
 	}
 
 	// Send tune parameters
@@ -586,76 +593,67 @@ func (s *Server) processConnectionFrames(conn *protocol.Connection) {
 		return
 	}
 
-	// Wait for connection.tune-ok from client
-	conn.Conn.SetReadDeadline(time.Now().Add(30 * time.Second))
-	frame, err = protocol.ReadFrameOptimizedWithLimit(conn.Reader, handshakeCap)
+	// S2: await tune-ok, then negotiate.
+	payload, err = s.readHandshakeMethod(conn, protocol.ConnectionTuneOK, "tune-ok")
 	if err != nil {
-		s.Log.Error("Error reading connection.tune-ok", zap.Error(err))
-		return
-	}
-	conn.TouchActivity()
-
-	if frame.Type != protocol.FrameMethod {
-		s.Log.Error("Expected method frame", zap.Int("type", int(frame.Type)))
-		return
-	}
-
-	// Parse tune-ok payload and store negotiated values on conn
-	if len(frame.Payload) >= 4 {
-		clientChMax, clientFrameMax, clientHeartbeat, parseErr := parseConnectionTuneOK(frame.Payload[4:])
-		if parseErr != nil {
-			s.Log.Error("Failed to parse connection.tune-ok", zap.Error(parseErr))
-			return
+		var cne *ConnectionError
+		if errors.As(err, &cne) {
+			s.awaitHandshakeCloseOK(conn)
 		}
-
-		serverChMax := uint16(s.Config.Server.MaxChannelsPerConnection)
-		serverFrameMax := uint32(s.Config.Server.MaxFrameSize)
-
-		negotiatedChMax := negotiateUint16(serverChMax, clientChMax)
-		negotiatedFrameMax := negotiateUint32(serverFrameMax, clientFrameMax)
-		// AMQP 0-9-1: connection.tune-ok.heartbeat is "the delay … the client
-		// wants. Zero means the client does not want a heartbeat." RabbitMQ
-		// uses the tune-ok value as-is (§4.4).
-		negotiatedHeartbeat := clientHeartbeat
-
-		conn.MaxChannels = negotiatedChMax
-		conn.MaxFrameSize = negotiatedFrameMax
-		conn.HeartbeatSec.Store(uint32(negotiatedHeartbeat))
-
-		s.Log.Debug("Negotiated connection parameters",
-			zap.String("connection_id", conn.ID),
-			zap.Uint16("channel_max", negotiatedChMax),
-			zap.Uint32("frame_max", negotiatedFrameMax),
-			zap.Uint16("heartbeat", negotiatedHeartbeat))
+		return
+	}
+	clientChMax, clientFrameMax, clientHeartbeat, parseErr := parseConnectionTuneOK(payload)
+	if parseErr != nil {
+		s.Log.Error("Failed to parse connection.tune-ok", zap.Error(parseErr))
+		_ = s.connectionError(conn, amqperrors.SyntaxError, "SYNTAX_ERROR - malformed connection.tune-ok", 10, 31)
+		s.awaitHandshakeCloseOK(conn)
+		return
 	}
 
-	// Wait for connection.open from client
-	conn.Conn.SetReadDeadline(time.Now().Add(30 * time.Second))
-	frame, err = protocol.ReadFrameOptimizedWithLimit(conn.Reader, handshakeCap)
+	serverChMax := uint16(s.Config.Server.MaxChannelsPerConnection)
+	serverFrameMax := uint32(s.Config.Server.MaxFrameSize)
+
+	negotiatedChMax := negotiateUint16(serverChMax, clientChMax)
+	negotiatedFrameMax := negotiateUint32(serverFrameMax, clientFrameMax)
+	// AMQP 0-9-1: connection.tune-ok.heartbeat is "the delay … the client
+	// wants. Zero means the client does not want a heartbeat." RabbitMQ
+	// uses the tune-ok value as-is (§4.4).
+	negotiatedHeartbeat := clientHeartbeat
+
+	conn.MaxChannels = negotiatedChMax
+	conn.MaxFrameSize = negotiatedFrameMax
+	conn.HeartbeatSec.Store(uint32(negotiatedHeartbeat))
+
+	s.Log.Debug("Negotiated connection parameters",
+		zap.String("connection_id", conn.ID),
+		zap.Uint16("channel_max", negotiatedChMax),
+		zap.Uint32("frame_max", negotiatedFrameMax),
+		zap.Uint16("heartbeat", negotiatedHeartbeat))
+
+	// S3: await open, then vhost/authz/loopback checks (+ username re-check).
+	payload, err = s.readHandshakeMethod(conn, protocol.ConnectionOpen, "open")
 	if err != nil {
-		s.Log.Error("Error reading connection.open", zap.Error(err))
+		var cne *ConnectionError
+		if errors.As(err, &cne) {
+			s.awaitHandshakeCloseOK(conn)
+		}
 		return
 	}
-	conn.TouchActivity()
-
-	if frame.Type != protocol.FrameMethod {
-		s.Log.Error("Expected method frame", zap.Int("type", int(frame.Type)))
-		return
-	}
-
-	// Process connection.open method
-	if err := s.processConnectionOpen(conn, frame); err != nil {
+	if err := s.processConnectionOpen(conn, payload); err != nil {
 		s.Log.Error("Error processing connection.open", zap.Error(err))
+		s.awaitHandshakeCloseOK(conn)
 		return
 	}
 
-	// Clear handshake deadline; readFrames will manage read deadlines for heartbeats
-	conn.Conn.SetReadDeadline(time.Time{})
+	// The handshake is complete: mark it, release the pre-auth slot (§2.3),
+	// and clear the handshake deadline; readFrames manages read deadlines for
+	// heartbeats from here.
+	rt.handshakeDone.Store(true)
+	rt.releaseHandshakeSlot()
+	_ = conn.Conn.SetReadDeadline(time.Time{})
 
 	// At this point, the connection handshake is complete
 	s.Log.Info("Connection handshake completed", zap.String("connection_id", conn.ID))
-	rt := s.runtimeFor(conn)
-	rt.handshakeDone.Store(true)
 
 	// Reader/processor separation: Reader enqueues frames, processor handles them
 	// This allows the reader to keep draining TCP socket even when processor blocks on fsync.
@@ -1619,7 +1617,7 @@ func (s *Server) StartWithQuitChannel(quit <-chan struct{}) error {
 			}
 
 			// Handle the connection in a goroutine
-			go s.handleConnection(conn)
+			s.dispatchAccepted(conn)
 		case <-quit:
 			s.Log.Info("Server shutdown requested")
 			s.Mutex.Lock()

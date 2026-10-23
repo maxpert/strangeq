@@ -266,7 +266,6 @@ func TestWSB_DeniedPublish_ContentFramesDiscarded(t *testing.T) {
 	assert.Equal(t, "ok", string(msg.Body))
 }
 
-
 // TestWSB_ChannelError_UnackedRequeued: when a channel dies with unacked
 // deliveries, teardownChannel requeues them immediately — another channel can
 // get the message (redelivered) without waiting for connection close.
