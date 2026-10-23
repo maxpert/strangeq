@@ -2935,8 +2935,11 @@ func (qw *QueueWAL) cleanupLoop() {
 	}
 }
 
-// tryDeleteOldFiles deletes WAL files where all messages are ACKed,
-// or where the retention period has expired (with best-effort checkpoint).
+// tryDeleteOldFiles deletes WAL files where all messages are ACKed, or where
+// the retention period has expired — in the latter case ONLY after the file's
+// unacked records are durably checkpointed to segments (WS-C C5: retention
+// never wins over durability; an expired file that cannot be checkpointed is
+// kept and the ERROR log says why, at the cost of disk growth).
 func (qw *QueueWAL) tryDeleteOldFiles() {
 	qw.oldFilesMutex.Lock()
 	defer qw.oldFilesMutex.Unlock()
@@ -2944,6 +2947,7 @@ func (qw *QueueWAL) tryDeleteOldFiles() {
 	qw.bitmapMutex.RLock()
 	defer qw.bitmapMutex.RUnlock()
 
+	unlinkedAny := false
 	for fileNum, info := range qw.oldFiles {
 		// Check if all actual message offsets in this file are ACKed.
 		// Uses bitmap intersection: file offsets ⊆ ackBitmap iff |file ∩ ack| == |file|.
@@ -2967,39 +2971,78 @@ func (qw *QueueWAL) tryDeleteOldFiles() {
 			time.Since(info.createdAt) > qw.cfg.RetentionPeriod
 
 		if allAcked {
-			if err := walUnlink(info.path); err == nil || os.IsNotExist(err) {
+			if err := walUnlink(info.path); err == nil || errors.Is(err, fs.ErrNotExist) {
+				unlinkedAny = true
 				qw.closeOldFileHandle(fileNum)
 				delete(qw.oldFiles, fileNum)
+			} else {
+				qw.logError("fully-acknowledged WAL file could not be unlinked; it stays registered and the next sweep retries",
+					interfaces.LogField{Key: "path", Value: info.path},
+					interfaces.LogField{Key: "error", Value: err.Error()})
 			}
 		} else if expired {
-			// Force-checkpoint unACKed messages to segments before deletion
-			qw.forceCheckpointFile(info)
-			if err := walUnlink(info.path); err == nil || os.IsNotExist(err) {
+			// Force-checkpoint unACKed messages to segments BEFORE deletion,
+			// and only delete when that succeeded. checkpointed (set by
+			// performCheckpoint or a previous successful sweep) means the copy
+			// is already durable and only the unlink remains.
+			if !info.checkpointed {
+				if err := qw.forceCheckpointFile(info); err != nil {
+					if !info.retentionFailLogged {
+						info.retentionFailLogged = true
+						qw.logError("retention: expired WAL file kept because its unacked records could not be checkpointed; disk use grows until this is fixed",
+							interfaces.LogField{Key: "path", Value: info.path},
+							interfaces.LogField{Key: "error", Value: err.Error()})
+					}
+					continue
+				}
+				info.retentionFailLogged = false
+				info.checkpointed = true
+			}
+			if err := walUnlink(info.path); err == nil || errors.Is(err, fs.ErrNotExist) {
+				unlinkedAny = true
 				qw.closeOldFileHandle(fileNum)
 				delete(qw.oldFiles, fileNum)
+			} else {
+				qw.logError("expired WAL file checkpointed but could not be unlinked; it stays registered and the next sweep retries only the unlink",
+					interfaces.LogField{Key: "path", Value: info.path},
+					interfaces.LogField{Key: "error", Value: err.Error()})
 			}
+		}
+	}
+
+	// C4: make this sweep's unlinks durable (once per tick that unlinked
+	// anything). Not a correctness barrier — a resurrected file is collapsed
+	// by the recovery dedup — so a failure is only logged.
+	if unlinkedAny {
+		if serr := syncDir(qw.dataDir); serr != nil {
+			qw.logWarn("WAL directory fsync after retention unlink failed; the space is not reclaimed durably yet and the next sweep retries",
+				interfaces.LogField{Key: "dir", Value: qw.dataDir},
+				interfaces.LogField{Key: "error", Value: serr.Error()})
 		}
 	}
 }
 
-// forceCheckpointFile is a best-effort checkpoint of unACKed messages from an
-// expired WAL file to segments before force-deletion. Errors are logged but
-// do not prevent file deletion (the retention contract takes priority).
-// NOTE: Caller must hold bitmapMutex (RLock) and oldFilesMutex (Lock).
-func (qw *QueueWAL) forceCheckpointFile(info *walFileInfo) {
-	segMgr := qw.getSegmentMgr()
-	if segMgr == nil {
-		return
-	}
-
+// forceCheckpointFile checkpoints an expired WAL file's unACKed messages to
+// segments before deletion. WS-C C5: retention NEVER wins over durability —
+// an error return means the file MUST be kept (its unacked records could not
+// be durably copied, or there is no segment manager to copy them to), and the
+// caller keeps it. A file with nothing unacked deletes losslessly with or
+// without segments, so that case returns nil.
+//
+// NOTE: Caller must hold bitmapMutex (RLock) and oldFilesMutex (Lock). The
+// segment I/O performed under those locks blocks Acknowledge during a
+// retention checkpoint; that is a pre-existing condition recorded as a
+// follow-up (spec §15), deliberately not changed here.
+func (qw *QueueWAL) forceCheckpointFile(info *walFileInfo) error {
 	// A degraded or benign scan fault (torn tail, tail CRC failure) still
 	// yields every intact record before the damage, and those records must
 	// still be checkpointed — bailing on any non-nil error would pin the file
 	// forever. Only a fatal fault, which means the file cannot be interpreted
-	// at all, aborts. The scan is bounded at the durable end (C1 §3.11).
+	// at all, aborts (and keeps the file). The scan is bounded at the durable
+	// end (C1 §3.11).
 	messages, err := qw.scanWALFileUpTo(info.path, info.durableSize)
 	if err != nil && interfaces.OutcomeOf(err) == interfaces.RecoveryFatal {
-		return
+		return fmt.Errorf("retention: WAL file unreadable: %w", err)
 	}
 
 	// Group unACKed messages by queue
@@ -3009,11 +3052,20 @@ func (qw *QueueWAL) forceCheckpointFile(info *walFileInfo) {
 			byQueue[msg.QueueName] = append(byQueue[msg.QueueName], msg)
 		}
 	}
-
-	// Write to segments (best-effort — errors are ignored)
-	for queueName, queueMsgs := range byQueue {
-		_ = segMgr.CheckpointBatch(queueName, queueMsgs)
+	if len(byQueue) == 0 {
+		return nil // nothing unacked: deleting loses nothing
 	}
+
+	segMgr := qw.getSegmentMgr()
+	if segMgr == nil {
+		return errNoSegmentManager
+	}
+	for queueName, queueMsgs := range byQueue {
+		if err := segMgr.CheckpointBatch(queueName, queueMsgs); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // readMessage reads a message from shared WAL by queue+offset
