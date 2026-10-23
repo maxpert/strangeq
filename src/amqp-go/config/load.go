@@ -49,13 +49,18 @@ func normalizeSection(s string) string {
 // security.authenticationconfig map is exempt: its child keys are preserved
 // so map lookups such as AuthenticationConfig["user_file"] keep working.
 func normalizeKey(key string) string {
-	parts := strings.Split(key, ".")
-	keepTail := len(parts) >= 2 && parts[0] == "security" && parts[1] == "authenticationconfig"
-	for i, p := range parts {
-		if keepTail && i >= 2 {
-			continue
-		}
+	raw := strings.Split(key, ".")
+	parts := make([]string, len(raw))
+	for i, p := range raw {
 		parts[i] = strings.ReplaceAll(strings.ToLower(p), "_", "")
+	}
+	// The free-form security.authenticationconfig map keeps its child keys
+	// verbatim, so map lookups such as AuthenticationConfig["user_file"]
+	// keep working. The exemption is decided on the NORMALIZED two-segment
+	// prefix: the snake_case spelling (authentication_config) must exempt
+	// the tail exactly like the canonical one.
+	if len(parts) > 2 && parts[0] == "security" && parts[1] == "authenticationconfig" {
+		copy(parts[2:], raw[2:])
 	}
 	return strings.Join(parts, ".")
 }

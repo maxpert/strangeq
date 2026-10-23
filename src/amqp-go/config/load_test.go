@@ -219,6 +219,24 @@ func TestConfig_EnvWithoutConfigFile(t *testing.T) {
 	})
 }
 
+func TestConfig_AuthenticationConfigMap_KeySpellings(t *testing.T) {
+	// security.authenticationconfig is a free-form map: its child keys must
+	// survive verbatim so AuthenticationConfig["user_file"] (read by
+	// server/builder.go) binds. That exemption must hold for the snake_case
+	// spelling of the section too, not just the canonical concatenated one.
+	for name, yamlDoc := range map[string]string{
+		"canonical":  "security:\n  authenticationconfig:\n    user_file: /etc/amqp/users.json\n",
+		"snake_case": "security:\n  authentication_config:\n    user_file: /etc/amqp/users.json\n",
+	} {
+		t.Run(name, func(t *testing.T) {
+			cfg, report, err := LoadConfig(writeConfigFile(t, yamlDoc))
+			require.NoError(t, err)
+			assert.Empty(t, report.UnknownKeys)
+			assert.Equal(t, "/etc/amqp/users.json", cfg.Security.AuthenticationConfig["user_file"])
+		})
+	}
+}
+
 func TestConfig_AddressPortConflict(t *testing.T) {
 	path := writeConfigFile(t, `network:
   address: "127.0.0.1:5672"
