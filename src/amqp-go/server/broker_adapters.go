@@ -40,6 +40,16 @@ func (a *StorageBrokerAdapter) UnbindQueue(queueName, exchangeName, routingKey s
 	return a.broker.UnbindQueue(queueName, exchangeName, routingKey)
 }
 
+// UnbindQueueWithArguments is the argument-aware queue.unbind (WS-A WI-2):
+// AMQP 0-9-1 binding identity includes the arguments table, so only the
+// binding whose arguments match is removed. It is NOT part of UnifiedBroker —
+// handleQueueUnbind discovers it (on any broker implementation) through the
+// optional-interface assertion, so custom brokers get argument-aware unbind
+// without a concrete *StorageBrokerAdapter type-assert.
+func (a *StorageBrokerAdapter) UnbindQueueWithArguments(queueName, exchangeName, routingKey string, arguments map[string]interface{}) error {
+	return a.broker.UnbindQueueWithArguments(queueName, exchangeName, routingKey, arguments)
+}
+
 func (a *StorageBrokerAdapter) BindExchange(destination, source, routingKey string, arguments map[string]interface{}) error {
 	return a.broker.BindExchange(destination, source, routingKey, arguments)
 }

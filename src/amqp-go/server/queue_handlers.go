@@ -352,9 +352,13 @@ func (s *Server) handleQueueUnbind(conn *protocol.Connection, channelID uint16, 
 	}
 
 	// AMQP 0-9-1 binding identity includes the arguments table: only the
-	// binding whose arguments match may be removed.
-	if sb, ok := s.Broker.(*StorageBrokerAdapter); ok {
-		err = sb.broker.UnbindQueueWithArguments(queueName, unbindMethod.Exchange, unbindMethod.RoutingKey, unbindMethod.Arguments)
+	// binding whose arguments match may be removed. Any broker that
+	// implements argument-aware unbind gets it (custom brokers included);
+	// the rest fall back to the triple-only UnbindQueue.
+	if ub, ok := s.Broker.(interface {
+		UnbindQueueWithArguments(queue, exchange, key string, args map[string]interface{}) error
+	}); ok {
+		err = ub.UnbindQueueWithArguments(queueName, unbindMethod.Exchange, unbindMethod.RoutingKey, unbindMethod.Arguments)
 	} else {
 		err = s.Broker.UnbindQueue(queueName, unbindMethod.Exchange, unbindMethod.RoutingKey)
 	}

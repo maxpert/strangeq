@@ -100,6 +100,86 @@ func TestHandleQueueUnbind_SpecWireWithArguments(t *testing.T) {
 	}
 }
 
+// customUnbindBroker is NOT a *StorageBrokerAdapter: it proves the
+// optional-interface assertion gives ANY broker argument-aware unbind.
+type customUnbindBroker struct {
+	UnifiedBroker
+	argsCalls int
+	lastArgs  map[string]interface{}
+}
+
+func (c *customUnbindBroker) UnbindQueueWithArguments(queue, exchange, key string, args map[string]interface{}) error {
+	c.argsCalls++
+	c.lastArgs = args
+	return c.UnifiedBroker.UnbindQueue(queue, exchange, key)
+}
+
+// plainBroker exposes ONLY the UnifiedBroker surface (the embedded
+// interface), so the argument-aware method does not promote and the
+// triple-only fallback must run.
+type plainBroker struct{ UnifiedBroker }
+
+func TestHandleQueueUnbind_CustomBrokerGetsArgumentAwarePath(t *testing.T) {
+	srv, st := newUnbindTestServer(t)
+	cb := &customUnbindBroker{UnifiedBroker: srv.Broker}
+	srv.Broker = cb
+
+	if err := srv.Broker.DeclareExchange("hx", "headers", false, false, false, nil); err != nil {
+		t.Fatalf("DeclareExchange: %v", err)
+	}
+	if _, err := srv.Broker.DeclareQueue("q", false, false, false, nil); err != nil {
+		t.Fatalf("DeclareQueue: %v", err)
+	}
+	if err := srv.Broker.BindQueue("q", "hx", "", map[string]interface{}{"x-match": "all", "k": "v"}); err != nil {
+		t.Fatalf("BindQueue: %v", err)
+	}
+
+	conn := newPipeConn(t)
+	conn.ID = "c1"
+	conn.Channels.Store(uint16(1), protocol.NewChannel(1, conn))
+
+	payload := queueUnbindPayload("q", "hx", "", xMatchKVTable('v'))
+	if err := srv.handleQueueUnbind(conn, 1, payload); err != nil {
+		t.Fatalf("handleQueueUnbind: %v", err)
+	}
+	if cb.argsCalls != 1 {
+		t.Fatalf("custom broker's argument-aware unbind must be used, got %d calls", cb.argsCalls)
+	}
+	if cb.lastArgs["k"] != "v" {
+		t.Fatalf("arguments must reach the custom broker verbatim, got %v", cb.lastArgs)
+	}
+	if _, err := st.GetBinding("q", "hx", ""); err == nil {
+		t.Fatal("matching-arguments binding must be removed")
+	}
+}
+
+func TestHandleQueueUnbind_BrokerWithoutArgumentsAPIFallsBack(t *testing.T) {
+	srv, st := newUnbindTestServer(t)
+	srv.Broker = plainBroker{UnifiedBroker: srv.Broker}
+
+	if err := srv.Broker.DeclareExchange("hx", "headers", false, false, false, nil); err != nil {
+		t.Fatalf("DeclareExchange: %v", err)
+	}
+	if _, err := srv.Broker.DeclareQueue("q", false, false, false, nil); err != nil {
+		t.Fatalf("DeclareQueue: %v", err)
+	}
+	if err := srv.Broker.BindQueue("q", "hx", "", nil); err != nil {
+		t.Fatalf("BindQueue: %v", err)
+	}
+
+	conn := newPipeConn(t)
+	conn.ID = "c1"
+	conn.Channels.Store(uint16(1), protocol.NewChannel(1, conn))
+
+	payload := queueUnbindPayload("q", "hx", "", []byte{0x00, 0x00, 0x00, 0x00})
+	if err := srv.handleQueueUnbind(conn, 1, payload); err != nil {
+		t.Fatalf("handleQueueUnbind: %v", err)
+	}
+	if _, err := st.GetBinding("q", "hx", ""); err == nil {
+		t.Fatal("triple-only fallback must remove the binding")
+	}
+}
+
 func TestHandleQueueUnbind_EmptyTableStillWorks(t *testing.T) {
 	srv, st := newUnbindTestServer(t)
 
