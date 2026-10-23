@@ -202,9 +202,13 @@ func TestTx_CommitFailure_RestoresWireTags(t *testing.T) {
 	require.NoError(t, srv.Broker.DeleteExchange("doomed-x", false))
 
 	// Commit fails → handleTxCommit reports a channel.close (see i22) and the
-	// undos ran.
+	// undos ran. WS-B contract: the handler RETURNS the typed *ChannelError
+	// (close already on the wire, sent=true) instead of nil.
 	err = srv.handleTxCommit(conn, 1, []byte{})
-	require.NoError(t, err)
+	require.Error(t, err, "handleTxCommit returns the commit-failure ChannelError (WS-B contract)")
+	var chErr *ChannelError
+	require.ErrorAs(t, err, &chErr)
+	assert.Equal(t, uint16(541), chErr.Code)
 	classID, methodID, _ := nextMethodFrame(t, frameCh)
 	assert.Equal(t, uint16(20), classID)
 	assert.Equal(t, uint16(40), methodID, "commit failure closes the channel")
