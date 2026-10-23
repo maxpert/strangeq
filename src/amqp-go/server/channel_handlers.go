@@ -3,6 +3,7 @@ package server
 import (
 	"fmt"
 
+	amqperrors "github.com/maxpert/amqp-go/errors"
 	"github.com/maxpert/amqp-go/protocol"
 	"go.uber.org/zap"
 )
@@ -11,18 +12,34 @@ import (
 func (s *Server) processChannelSpecificMethod(conn *protocol.Connection, channelID uint16, methodID uint16, payload []byte) error {
 	switch methodID {
 	case protocol.ChannelOpen: // Method ID 10 for channel class
+		rt := s.runtimeFor(conn)
+		if rt.isChannelClosing(channelID) {
+			return nil // unreachable: the closing gate discards; defensive
+		}
+		if _, exists := conn.Channels.Load(channelID); exists {
+			// AMQP 0-9-1: "second 'channel.open' seen" is a channel-error, and
+			// 504 is a HARD code: connection.close. A duplicate open must never
+			// overwrite the live channel (its consumers would leak in the
+			// broker, unreachable from conn.Channels).
+			return s.connectionError(conn, amqperrors.ChannelErrorCode,
+				fmt.Sprintf("CHANNEL_ERROR - second 'channel.open' seen on channel %d", channelID), 20, 10)
+		}
 		if conn.MaxChannels > 0 && conn.ChannelCount.Load() >= int32(conn.MaxChannels) {
 			s.Log.Warn("Max channels per connection exceeded",
 				zap.Uint16("channel_id", channelID),
 				zap.String("connection_id", conn.ID),
 				zap.Uint16("max", conn.MaxChannels))
-			s.sendChannelClose(conn, channelID, 503, "CHANNEL_ERROR - too many channels", 20, 10)
-			return nil
+			return s.connectionError(conn, amqperrors.NotAllowed,
+				fmt.Sprintf("NOT_ALLOWED - number of channels opened (%d) has reached the negotiated channel_max (%d)",
+					conn.ChannelCount.Load(), conn.MaxChannels), 20, 10)
 		}
 
 		// Create new channel
 		newChannel := protocol.NewChannel(channelID, conn)
-		conn.Channels.Store(channelID, newChannel)
+		if _, loaded := conn.Channels.LoadOrStore(channelID, newChannel); loaded {
+			return s.connectionError(conn, amqperrors.ChannelErrorCode,
+				fmt.Sprintf("CHANNEL_ERROR - second 'channel.open' seen on channel %d", channelID), 20, 10)
+		}
 		conn.ChannelCount.Add(1)
 
 		s.Log.Debug("Channel opened",
@@ -44,12 +61,12 @@ func (s *Server) processChannelSpecificMethod(conn *protocol.Connection, channel
 				zap.Error(err),
 				zap.Uint16("channel_id", channelID),
 				zap.String("connection_id", conn.ID))
-			return err
+			return s.malformed(conn, err, 20, 20)
 		}
 
 		value, exists := conn.Channels.Load(channelID)
 		if !exists {
-			return fmt.Errorf("channel %d does not exist", channelID)
+			return s.connectionError(conn, amqperrors.ChannelErrorCode, "CHANNEL_ERROR - expected 'channel.open'", 20, 20)
 		}
 		channel := value.(*protocol.Channel)
 
@@ -74,7 +91,7 @@ func (s *Server) processChannelSpecificMethod(conn *protocol.Connection, channel
 				zap.Error(err),
 				zap.Uint16("channel_id", channelID),
 				zap.String("connection_id", conn.ID))
-			return err
+			return s.malformed(conn, err, 20, 21)
 		}
 
 		// The client's flow-ok confirms OUR channel.flow request about the
@@ -116,6 +133,9 @@ func (s *Server) processChannelSpecificMethod(conn *protocol.Connection, channel
 		}
 
 		s.teardownChannel(conn, channelID)
+		// When both peers close at once, each side replies close-ok; receiving
+		// channel.close also ends our closing state.
+		s.runtimeFor(conn).clearChannelClosing(channelID)
 
 		// Send channel.close-ok
 		return s.sendChannelCloseOK(conn, channelID)
@@ -133,6 +153,7 @@ func (s *Server) processChannelSpecificMethod(conn *protocol.Connection, channel
 			zap.String("connection_id", conn.ID))
 
 		s.teardownChannel(conn, channelID)
+		s.runtimeFor(conn).clearChannelClosing(channelID)
 		return nil
 
 	default:
@@ -140,7 +161,8 @@ func (s *Server) processChannelSpecificMethod(conn *protocol.Connection, channel
 			zap.Uint16("method_id", methodID),
 			zap.Uint16("channel_id", channelID),
 			zap.String("connection_id", conn.ID))
-		return fmt.Errorf("unknown channel method ID: %d", methodID)
+		return s.connectionError(conn, amqperrors.FrameError,
+			fmt.Sprintf("FRAME_ERROR - unknown method 20.%d", methodID), 20, methodID)
 	}
 }
 
@@ -186,6 +208,19 @@ func (s *Server) teardownChannel(conn *protocol.Connection, channelID uint16) {
 	channel.Closed = true
 	channel.Mutex.Unlock()
 	conn.ConsumersDirty.Store(true)
+
+	// Drop a half-received publish on this channel (processor-owned map;
+	// teardownChannel only runs on the processor or after it has exited).
+	// PendingMessages is single-writer per the comment at structures.go, so
+	// this stays outside channel.Mutex.
+	if pm, ok := conn.PendingMessages[channelID]; ok {
+		delete(conn.PendingMessages, channelID)
+		protocol.PutBasicPublishMethod(pm.Method)
+		if pm.Header != nil {
+			protocol.PutContentHeader(pm.Header)
+		}
+		protocol.PutPendingMessage(pm)
+	}
 
 	// Unregister consumers from broker (stops poll goroutines)
 	for _, consumerID := range consumerIDs {

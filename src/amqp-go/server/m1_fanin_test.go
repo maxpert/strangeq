@@ -67,7 +67,7 @@ func TestM1_FanInMultipleConsumers(t *testing.T) {
 	// Start the delivery loop
 	done := make(chan struct{})
 	conn.ConsumersDirty.Store(true)
-	go srv.consumerDeliveryLoop(conn, done)
+	go func() { srv.consumerDeliveryLoop(srv.runtimeFor(conn)); close(done) }()
 
 	// Give the loop time to discover consumers
 	time.Sleep(100 * time.Millisecond)
@@ -160,7 +160,7 @@ func TestM1_FanInNoGoroutineLeak(t *testing.T) {
 	// Start the delivery loop
 	done := make(chan struct{})
 	conn.ConsumersDirty.Store(true)
-	go srv.consumerDeliveryLoop(conn, done)
+	go func() { srv.consumerDeliveryLoop(srv.runtimeFor(conn)); close(done) }()
 
 	// Give the loop time to discover consumers and start forwarders
 	time.Sleep(100 * time.Millisecond)
@@ -235,7 +235,7 @@ func TestM1_FanInConsumerRemoval(t *testing.T) {
 
 	done := make(chan struct{})
 	conn.ConsumersDirty.Store(true)
-	go srv.consumerDeliveryLoop(conn, done)
+	go func() { srv.consumerDeliveryLoop(srv.runtimeFor(conn)); close(done) }()
 
 	// Give the loop time to discover the consumer and start a forwarder
 	time.Sleep(100 * time.Millisecond)

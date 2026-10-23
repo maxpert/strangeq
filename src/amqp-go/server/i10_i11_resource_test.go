@@ -2,6 +2,7 @@ package server
 
 import (
 	"encoding/binary"
+	"errors"
 	"net"
 	"testing"
 	"time"
@@ -93,27 +94,22 @@ func TestMaxChannelsPerConnectionEnforced(t *testing.T) {
 	drainFrame(t, frameCh)
 	assert.Equal(t, int32(2), conn.ChannelCount.Load())
 
+	// WS-B: exceeding channel_max is a HARD 530 (AMQP not-allowed is a
+	// connection exception), sent as connection.close 10.50.
 	err = srv.processChannelSpecificMethod(conn, 3, protocol.ChannelOpen, []byte{})
-	assert.NoError(t, err, "exceeding max channels should send channel.close, not return error")
+	require.Error(t, err, "exceeding max channels must return an error")
+	var cne *ConnectionError
+	require.True(t, errors.As(err, &cne), "want *ConnectionError, got %T", err)
+	assert.Equal(t, uint16(530), cne.Code)
 
 	classID, methodID, _ := nextMethodFrame(t, frameCh)
-	assert.Equal(t, uint16(20), classID, "expected channel.close")
-	assert.Equal(t, uint16(40), methodID, "expected channel.close method")
+	assert.Equal(t, uint16(10), classID, "expected connection class")
+	assert.Equal(t, uint16(50), methodID, "expected connection.close method")
 
 	assert.Equal(t, int32(2), conn.ChannelCount.Load(), "channel count should not increment on rejected open")
 
 	_, exists := conn.Channels.Load(uint16(3))
 	assert.False(t, exists, "channel 3 should not be stored")
-
-	err = srv.processChannelSpecificMethod(conn, 2, protocol.ChannelClose, makeChannelClosePayload())
-	require.NoError(t, err)
-	drainFrame(t, frameCh)
-	assert.Equal(t, int32(1), conn.ChannelCount.Load(), "channel count should decrement on close")
-
-	err = srv.processChannelSpecificMethod(conn, 3, protocol.ChannelOpen, []byte{})
-	require.NoError(t, err)
-	drainFrame(t, frameCh)
-	assert.Equal(t, int32(2), conn.ChannelCount.Load(), "should be able to open after closing one")
 }
 
 func makeChannelClosePayload() []byte {

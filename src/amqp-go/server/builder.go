@@ -338,6 +338,11 @@ func (b *ServerBuilder) Build() (*Server, error) {
 		MechanismRegistry:  mechanismRegistry,
 		MetricsCollector:   metricsCollector,
 		StartTime:          time.Now(),
+		// WS-B (§11.4): retain the storage/broker handles so Shutdown can close
+		// exactly what the builder created (and nothing injected by the caller).
+		storage:     storageImpl,
+		ownsStorage: b.storage == nil,
+		ownsBroker:  b.broker == nil,
 		// SQ-12: resolve resource-alarm thresholds + samplers. nil when alarms
 		// are disabled, in which case the monitor is never spawned (zero-cost).
 		alarm: buildAlarmThresholds(b.config),

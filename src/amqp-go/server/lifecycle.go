@@ -115,6 +115,20 @@ func (lm *LifecycleManager) setState(state LifecycleState) {
 	lm.state = state
 }
 
+// markRunning records that the server is actually serving (listener bound).
+// Server.Start / StartWithQuitChannel call it right after binding; before this
+// existed, the state only ever reached StateRunning as the server was on its
+// way DOWN (after Start returned), so Health() never reported "healthy".
+func (lm *LifecycleManager) markRunning() {
+	lm.stateMutex.Lock()
+	defer lm.stateMutex.Unlock()
+	if lm.state == StateStopped || lm.state == StateStarting {
+		lm.state = StateRunning
+		lm.startTime = time.Now()
+		lm.stopTime = time.Time{}
+	}
+}
+
 // GetUptime returns how long the server has been running
 func (lm *LifecycleManager) GetUptime() time.Duration {
 	lm.stateMutex.RLock()
@@ -168,8 +182,6 @@ func (lm *LifecycleManager) Start(ctx context.Context) error {
 			lm.setError(fmt.Errorf("server start failed: %w", err))
 			return
 		}
-
-		lm.setState(StateRunning)
 
 		// Wait for context cancellation
 		<-lm.ctx.Done()
@@ -273,7 +285,7 @@ func (lm *LifecycleManager) forceShutdown() error {
 
 	// Force close all connections
 	lm.server.Mutex.Lock()
-	lm.server.Shutdown = true
+	lm.server.ShuttingDown = true
 	for _, conn := range lm.server.Connections {
 		if conn.Conn != nil {
 			conn.Conn.Close()

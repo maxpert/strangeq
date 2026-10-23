@@ -79,7 +79,7 @@ func TestReaderOverflowHardCapClosesConnection(t *testing.T) {
 	conn := newOverflowTestConn(serverConn)
 
 	readerDone := make(chan struct{})
-	go srv.readFrames(conn, readerDone)
+	go srv.readFrames(srv.runtimeFor(conn), readerDone)
 
 	// Flood ~104-byte publish frames. FrameQueue(1) swallows the first, the next
 	// parks the reader on the hand-off, and each probe read piles one more frame
@@ -121,7 +121,7 @@ func TestReaderOverflowAssertsChannelFlow(t *testing.T) {
 	conn.Channels.Store(uint16(1), protocol.NewChannel(1, conn))
 
 	readerDone := make(chan struct{})
-	go srv.readFrames(conn, readerDone)
+	go srv.readFrames(srv.runtimeFor(conn), readerDone)
 	defer func() { serverConn.Close(); <-readerDone }()
 
 	// Client reader: capture a server-initiated channel.flow(false).

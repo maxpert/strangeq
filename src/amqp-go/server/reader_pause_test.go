@@ -59,7 +59,7 @@ func TestReaderPause_ConsumerOnlyNotThrottled(t *testing.T) {
 	srv.applyAlarmBits(AlarmMemory) // alarm active for the whole test
 
 	readerDone := make(chan struct{})
-	go srv.readFrames(conn, readerDone)
+	go srv.readFrames(srv.runtimeFor(conn), readerDone)
 
 	go func() { _, _ = clientConn.Write(ackFrameBytes(t)) }()
 
@@ -96,7 +96,7 @@ func TestReaderPause_PausesWhileAlarmedResumesOnClear(t *testing.T) {
 	srv.applyAlarmBits(AlarmMemory)
 
 	readerDone := make(chan struct{})
-	go srv.readFrames(conn, readerDone)
+	go srv.readFrames(srv.runtimeFor(conn), readerDone)
 
 	writeDone := make(chan error, 1)
 	go func() {
@@ -148,7 +148,7 @@ func TestReaderPause_LongParkDoesNotTripHeartbeatClose(t *testing.T) {
 
 	srv.applyAlarmBits(AlarmMemory)
 	readerDone := make(chan struct{})
-	go srv.readFrames(conn, readerDone)
+	go srv.readFrames(srv.runtimeFor(conn), readerDone)
 
 	// Park well beyond 2*hb. The reader must stay alive (parked in select, no
 	// active read deadline).
@@ -194,7 +194,7 @@ func TestReaderPause_LostWakeupFree(t *testing.T) {
 
 	srv.applyAlarmBits(AlarmMemory) // arm; reader parks on start
 	readerDone := make(chan struct{})
-	go srv.readFrames(conn, readerDone)
+	go srv.readFrames(srv.runtimeFor(conn), readerDone)
 
 	const cycles = 500
 	for i := 0; i < cycles; i++ {
@@ -230,7 +230,7 @@ func TestReaderPause_HeartbeatsDisabledLiveness(t *testing.T) {
 
 	srv.applyAlarmBits(AlarmMemory) // arm and never clear
 	readerDone := make(chan struct{})
-	go srv.readFrames(conn, readerDone)
+	go srv.readFrames(srv.runtimeFor(conn), readerDone)
 
 	time.Sleep(150 * time.Millisecond) // let it park at least once
 	clientConn.Close()                 // peer dies

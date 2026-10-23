@@ -60,10 +60,17 @@ type Connection struct {
 	ClientProperties map[string]interface{}
 	PendingMessages  map[uint16]*PendingMessage // Track messages being published on each channel.
 	// SINGLE-WRITER: accessed only by the processFrames goroutine. No mutex needed.
-	FrameQueue  chan *Frame   // Buffer frames between reader and processor goroutines
-	AckQueue    chan *Frame   // Buffer ACK/NACK/Reject frames for the ack worker goroutine
-	Done        chan struct{} // Closed during connection teardown to unblock goroutines waiting on AckQueue
-	ConfirmWake chan struct{} // SQ-5: capacity-1 poke channel for the publisher-confirm flusher goroutine
+	FrameQueue chan *Frame // Buffer frames between reader and processor goroutines
+	// FrameQueueBytes is the payload bytes currently buffered in FrameQueue
+	// (reader adds on hand-off, processor subtracts after processing). Lock-free
+	// byte bound for per-connection memory; see server/frame_budget.go.
+	FrameQueueBytes atomic.Int64
+	// FrameBudgetWake (cap 1) is poked by the processor when FrameQueueBytes
+	// drops below the server's budget, unparking a reader blocked on it.
+	FrameBudgetWake chan struct{}
+	AckQueue        chan *Frame   // Buffer ACK/NACK/Reject frames for the ack worker goroutine
+	Done            chan struct{} // Closed during connection teardown to unblock goroutines waiting on AckQueue
+	ConfirmWake     chan struct{} // SQ-5: capacity-1 poke channel for the publisher-confirm flusher goroutine
 	// ConfirmActive is set once any channel on this connection enters confirm
 	// mode (one-way; stays set for the connection's lifetime). The confirm
 	// flusher arms a bounded safety re-check ONLY on connections that use
@@ -171,6 +178,7 @@ func NewConnectionWithReadBuffer(conn net.Conn, bufSize int) *Connection {
 		// Channels: sync.Map needs no initialization
 		PendingMessages: make(map[uint16]*PendingMessage),
 		FrameQueue:      make(chan *Frame, 10000), // 10K frame buffer for reader/processor separation
+		FrameBudgetWake: make(chan struct{}, 1),   // WS-B: unparks a budget-blocked reader (§9)
 		AckQueue:        make(chan *Frame, 4096),  // 4K ACK buffer for off-processor ACK handling
 		ConfirmWake:     make(chan struct{}, 1),   // SQ-5: pokes coalesce; see WakeConfirmFlusher
 		AlarmWake:       make(chan struct{}, 1),   // SQ-12: pokes coalesce; unparks the reader on alarm clear

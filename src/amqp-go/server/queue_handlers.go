@@ -30,7 +30,7 @@ func resolveQueueName(conn *protocol.Connection, channelID uint16, queueName str
 			return current, nil
 		}
 	}
-	return "", fmt.Errorf("no queue name specified and no current queue on channel %d (spec: 502 syntax error)", channelID)
+	return "", fmt.Errorf("%w: channel %d", errNoCurrentQueue, channelID)
 }
 
 // processQueueMethod handles queue-related methods
@@ -51,7 +51,8 @@ func (s *Server) processQueueMethod(conn *protocol.Connection, channelID uint16,
 			zap.Uint16("method_id", methodID),
 			zap.Uint16("channel_id", channelID),
 			zap.String("connection_id", conn.ID))
-		return fmt.Errorf("unknown queue method ID: %d", methodID)
+		return s.connectionError(conn, amqperrors.FrameError,
+			fmt.Sprintf("FRAME_ERROR - unknown method 50.%d", methodID), 50, methodID)
 	}
 }
 
@@ -65,7 +66,7 @@ func (s *Server) handleQueueDeclare(conn *protocol.Connection, channelID uint16,
 			zap.Error(err),
 			zap.String("connection_id", conn.ID),
 			zap.Uint16("channel_id", channelID))
-		return err
+		return s.malformed(conn, err, 50, 10)
 	}
 
 	// AMQP 0.9.1 spec "reserved" rule (on-failure: access-refused 403):
@@ -117,8 +118,7 @@ func (s *Server) handleQueueDeclare(conn *protocol.Connection, channelID uint16,
 		// connection alive. Mirrors the ErrExchangeTypeMismatch handling in
 		// handleExchangeDeclare.
 		if errors.Is(err, broker.ErrInvalidQueueArgument) {
-			s.sendChannelClose(conn, channelID, amqperrors.PreconditionFailed, err.Error(), 50, 10)
-			return nil
+			return s.channelError(conn, channelID, amqperrors.PreconditionFailed, "PRECONDITION_FAILED - "+err.Error(), 50, 10)
 		}
 		s.Log.Error("Failed to declare queue",
 			zap.Error(err),
@@ -130,8 +130,7 @@ func (s *Server) handleQueueDeclare(conn *protocol.Connection, channelID uint16,
 		if sb, ok := s.Broker.(*StorageBrokerAdapter); ok {
 			if !sb.broker.SetQueueOwnerIfFree(queue.Name, conn.ID) {
 				replyText := fmt.Sprintf("QUEUE_LOCKED - queue '%s' is exclusive to another connection", queue.Name)
-				s.sendChannelClose(conn, channelID, uint16(amqperrors.ResourceLocked), replyText, 50, 10)
-				return fmt.Errorf("queue '%s' is exclusive to another connection", queue.Name)
+				return s.channelError(conn, channelID, uint16(amqperrors.ResourceLocked), replyText, 50, 10)
 			}
 			queue.OwnerConnID = conn.ID
 		}
@@ -176,7 +175,7 @@ func (s *Server) handleQueueBind(conn *protocol.Connection, channelID uint16, pa
 			zap.Error(err),
 			zap.String("connection_id", conn.ID),
 			zap.Uint16("channel_id", channelID))
-		return err
+		return s.malformed(conn, err, 50, 20)
 	}
 
 	// AMQP 0.9.1 spec "queue-known" rule: resolve empty queue name to the
@@ -238,7 +237,7 @@ func (s *Server) handleQueueUnbind(conn *protocol.Connection, channelID uint16, 
 			zap.Error(err),
 			zap.String("connection_id", conn.ID),
 			zap.Uint16("channel_id", channelID))
-		return err
+		return s.malformed(conn, err, 50, 50)
 	}
 
 	// AMQP 0.9.1 spec "queue-known" rule: resolve empty queue name to the
@@ -300,7 +299,7 @@ func (s *Server) handleQueuePurge(conn *protocol.Connection, channelID uint16, p
 			zap.Error(err),
 			zap.String("connection_id", conn.ID),
 			zap.Uint16("channel_id", channelID))
-		return err
+		return s.malformed(conn, err, 50, 30)
 	}
 
 	queueName, err := resolveQueueName(conn, channelID, purgeMethod.Queue)
@@ -345,7 +344,7 @@ func (s *Server) handleQueueDelete(conn *protocol.Connection, channelID uint16, 
 			zap.Error(err),
 			zap.String("connection_id", conn.ID),
 			zap.Uint16("channel_id", channelID))
-		return err
+		return s.malformed(conn, err, 50, 40)
 	}
 
 	// AMQP 0.9.1 spec "queue-known" rule: resolve empty queue name to the
@@ -373,8 +372,7 @@ func (s *Server) handleQueueDelete(conn *protocol.Connection, channelID uint16, 
 	if sb, ok := s.Broker.(*StorageBrokerAdapter); ok {
 		if ownerID, exists := sb.broker.GetQueueOwner(queueName); exists && ownerID != conn.ID {
 			replyText := fmt.Sprintf("QUEUE_LOCKED - queue '%s' is exclusive to another connection", queueName)
-			s.sendChannelClose(conn, channelID, uint16(amqperrors.ResourceLocked), replyText, 50, 40)
-			return fmt.Errorf("queue '%s' is exclusive to another connection", queueName)
+			return s.channelError(conn, channelID, uint16(amqperrors.ResourceLocked), replyText, 50, 40)
 		}
 	}
 

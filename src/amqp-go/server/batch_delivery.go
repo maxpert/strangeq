@@ -114,9 +114,7 @@ func (s *Server) sendBatchedDeliveries(conn *protocol.Connection, channelID uint
 		zap.Int("batch_size", len(deliveries)),
 		zap.Int("total_bytes", len(*batchBuf)))
 
-	conn.WriteMutex.Lock()
-	_, err := conn.Conn.Write(*batchBuf)
-	conn.WriteMutex.Unlock()
+	err := s.writeBytes(conn, *batchBuf)
 
 	if err != nil {
 		s.Log.Error("Failed to write batched deliveries",
@@ -304,9 +302,7 @@ func (s *Server) appendHeaderAndBodyFramesVec(vec *deliveryVec, channelID uint16
 // in-flight write. The -race mixed-size publish/consume/ack stress test
 // guards this invariant.
 func (s *Server) writeVectored(conn *protocol.Connection, bufs *net.Buffers, bodySizes []int, consumerTag string, channelID uint16) error {
-	conn.WriteMutex.Lock()
-	_, err := bufs.WriteTo(conn.Conn)
-	conn.WriteMutex.Unlock()
+	err := s.writeBuffers(conn, bufs)
 
 	if err != nil {
 		s.Log.Error("Error sending vectored delivery frames",

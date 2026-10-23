@@ -36,7 +36,8 @@ func (s *Server) processExchangeMethod(conn *protocol.Connection, channelID uint
 			zap.Uint16("method_id", methodID),
 			zap.Uint16("channel_id", channelID),
 			zap.String("connection_id", conn.ID))
-		return fmt.Errorf("unknown exchange method ID: %d", methodID)
+		return s.connectionError(conn, amqperrors.FrameError,
+			fmt.Sprintf("FRAME_ERROR - unknown method 40.%d", methodID), 40, methodID)
 	}
 }
 
@@ -52,7 +53,11 @@ func (s *Server) handleExchangeDeclare(conn *protocol.Connection, channelID uint
 			zap.Error(err),
 			zap.String("connection_id", conn.ID),
 			zap.Uint16("channel_id", channelID))
-		return err
+		s.Log.Error("Failed to deserialize exchange.declare",
+			zap.Error(err),
+			zap.String("connection_id", conn.ID),
+			zap.Uint16("channel_id", channelID))
+		return s.malformed(conn, err, 40, 10)
 	}
 
 	s.Log.Debug("Exchange declared",
@@ -82,8 +87,8 @@ func (s *Server) handleExchangeDeclare(conn *protocol.Connection, channelID uint
 	}
 
 	if !declareMethod.Passive && !isSupportedExchangeType(declareMethod.Type) {
-		s.sendConnectionClose(conn, 503, "COMMAND_INVALID - unsupported exchange type", 40, 10)
-		return fmt.Errorf("unsupported exchange type: %s", declareMethod.Type)
+		return s.connectionError(conn, amqperrors.CommandInvalid,
+			fmt.Sprintf("COMMAND_INVALID - unknown exchange type '%s'", declareMethod.Type), 40, 10)
 	}
 
 	err = s.Broker.DeclareExchange(
@@ -97,8 +102,7 @@ func (s *Server) handleExchangeDeclare(conn *protocol.Connection, channelID uint
 
 	if err != nil {
 		if errors.Is(err, broker.ErrExchangeTypeMismatch) {
-			s.sendChannelClose(conn, channelID, amqperrors.PreconditionFailed, err.Error(), 40, 10)
-			return nil
+			return s.channelError(conn, channelID, amqperrors.PreconditionFailed, "PRECONDITION_FAILED - "+err.Error(), 40, 10)
 		}
 		s.Log.Error("Failed to declare exchange",
 			zap.Error(err),
@@ -127,7 +131,7 @@ func (s *Server) handleExchangeDelete(conn *protocol.Connection, channelID uint1
 			zap.Error(err),
 			zap.String("connection_id", conn.ID),
 			zap.Uint16("channel_id", channelID))
-		return err
+		return s.malformed(conn, err, 40, 20)
 	}
 
 	s.Log.Debug("Exchange deleted",
@@ -171,7 +175,7 @@ func (s *Server) handleExchangeBind(conn *protocol.Connection, channelID uint16,
 			zap.Error(err),
 			zap.String("connection_id", conn.ID),
 			zap.Uint16("channel_id", channelID))
-		return err
+		return s.malformed(conn, err, 40, 30)
 	}
 
 	s.Log.Debug("Exchange bound",
@@ -220,7 +224,7 @@ func (s *Server) handleExchangeUnbind(conn *protocol.Connection, channelID uint1
 			zap.Error(err),
 			zap.String("connection_id", conn.ID),
 			zap.Uint16("channel_id", channelID))
-		return err
+		return s.malformed(conn, err, 40, 40)
 	}
 
 	s.Log.Debug("Exchange unbound",

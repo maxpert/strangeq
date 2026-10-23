@@ -57,7 +57,7 @@ func TestA7_DirtyFlagGatesRediscovery(t *testing.T) {
 	conn.ConsumersDirty.Store(true)
 
 	done := make(chan struct{})
-	go srv.consumerDeliveryLoop(conn, done)
+	go func() { srv.consumerDeliveryLoop(srv.runtimeFor(conn)); close(done) }()
 	defer func() {
 		conn.Closed.Store(true)
 		<-done
@@ -203,7 +203,7 @@ func TestA7_TimeoutFallbackSelfHeals(t *testing.T) {
 	conn.ConsumersDirty.Store(true)
 
 	done := make(chan struct{})
-	go srv.consumerDeliveryLoop(conn, done)
+	go func() { srv.consumerDeliveryLoop(srv.runtimeFor(conn)); close(done) }()
 	defer func() {
 		conn.Closed.Store(true)
 		<-done
@@ -272,7 +272,7 @@ func TestA7_NoAllocationsInSteadyState(t *testing.T) {
 	activeTags := make(map[string]struct{})
 	fanIn := make(chan *protocol.Delivery, 100)
 
-	srv.discoverConsumers(conn, consumerInfos, forwarders, activeTags, fanIn)
+	srv.discoverConsumers(srv.runtimeFor(conn), consumerInfos, forwarders, activeTags, fanIn)
 
 	defer func() {
 		for _, stop := range forwarders {
@@ -281,7 +281,7 @@ func TestA7_NoAllocationsInSteadyState(t *testing.T) {
 	}()
 
 	allocs := testing.AllocsPerRun(100, func() {
-		srv.discoverConsumers(conn, consumerInfos, forwarders, activeTags, fanIn)
+		srv.discoverConsumers(srv.runtimeFor(conn), consumerInfos, forwarders, activeTags, fanIn)
 	})
 
 	if allocs != 0 {

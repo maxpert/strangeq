@@ -184,13 +184,16 @@ func (b *ackTestBroker) RebuildDeliveryIndex(deliveryTag uint64, consumerTag str
 func (b *ackTestBroker) GetMessageForGet(queueName string, noAck bool) (*protocol.Message, uint64, uint32, error) {
 	return nil, 0, 0, nil
 }
+func (b *ackTestBroker) GetMessageForGetOwned(queueName string, noAck bool, connID string) (*protocol.Message, uint64, uint32, error) {
+	return nil, 0, 0, nil
+}
 func (b *ackTestBroker) PurgeQueue(name string) (int, error)             { return 0, nil }
 func (b *ackTestBroker) AcknowledgeGetDelivery(deliveryTag uint64) error { return nil }
 func (b *ackTestBroker) RejectGetDelivery(deliveryTag uint64, requeue bool) error {
 	return nil
 }
 func (b *ackTestBroker) NackGetDelivery(deliveryTag uint64, requeue bool) error          { return nil }
-func (b *ackTestBroker) RequeueAllGetDeliveries()                                        {}
+func (b *ackTestBroker) RequeueGetDeliveries(connID string)                              {}
 func (b *ackTestBroker) GetQueues() map[string]*protocol.Queue                           { return nil }
 func (b *ackTestBroker) GetExchanges() map[string]*protocol.Exchange                     { return nil }
 func (b *ackTestBroker) GetConsumers() map[string]*protocol.Consumer                     { return nil }
@@ -388,7 +391,7 @@ func TestA2_AckProcessorProcessesAck(t *testing.T) {
 	conn.AckQueue <- ackFrame
 
 	done := make(chan struct{})
-	go srv.ackProcessor(conn, done)
+	go srv.ackProcessor(srv.runtimeFor(conn), done)
 
 	select {
 	case <-broker.ackEntered:
@@ -423,11 +426,14 @@ func TestA2_AckProcessorProcessesNack(t *testing.T) {
 	defer serverConn.Close()
 	conn := protocol.NewConnection(serverConn)
 
-	nackFrame := encodeNackFrame(t, 1, 42, true, true)
+	// WS-B: acks on a channel that was never opened are ignored (§5.2), so
+	// register a real channel + delivery exactly as production has.
+	nackWireTag := registerAckTestDelivery(conn, 1, 42, "test-consumer")
+	nackFrame := encodeNackFrame(t, 1, nackWireTag, true, true)
 	conn.AckQueue <- nackFrame
 
 	done := make(chan struct{})
-	go srv.ackProcessor(conn, done)
+	go srv.ackProcessor(srv.runtimeFor(conn), done)
 
 	select {
 	case <-broker.nackEntered:
@@ -449,8 +455,11 @@ func TestA2_AckProcessorProcessesNack(t *testing.T) {
 	if nacks[0].deliveryTag != 42 {
 		t.Errorf("expected delivery tag 42, got %d", nacks[0].deliveryTag)
 	}
-	if nacks[0].multiple != true {
-		t.Error("expected multiple=true")
+	// A multiple=true wire nack settles through cumulativeSettle, which routes
+	// each tag via the broker's single-message path (multiple=false) so credit
+	// accounting stays exact — pre-existing cumulativeSettle behavior.
+	if nacks[0].multiple != false {
+		t.Error("expected multiple=false (cumulative settle uses the single-message path)")
 	}
 	if nacks[0].requeue != true {
 		t.Error("expected requeue=true")
@@ -470,7 +479,7 @@ func TestA2_AckProcessorProcessesReject(t *testing.T) {
 	conn.AckQueue <- rejectFrame
 
 	done := make(chan struct{})
-	go srv.ackProcessor(conn, done)
+	go srv.ackProcessor(srv.runtimeFor(conn), done)
 
 	select {
 	case <-broker.rejectEntered:
@@ -513,7 +522,7 @@ func TestA2_AckProcessorDrainsOnClose(t *testing.T) {
 	}
 
 	done := make(chan struct{})
-	go srv.ackProcessor(conn, done)
+	go srv.ackProcessor(srv.runtimeFor(conn), done)
 
 	close(conn.AckQueue)
 
@@ -548,7 +557,7 @@ func TestA2_AckProcessorNoGoroutineLeak(t *testing.T) {
 	before := runtime.NumGoroutine()
 
 	done := make(chan struct{})
-	go srv.ackProcessor(conn, done)
+	go srv.ackProcessor(srv.runtimeFor(conn), done)
 
 	close(conn.AckQueue)
 
@@ -586,10 +595,10 @@ func TestA2_AckConcurrentWithPublish(t *testing.T) {
 	ch.TrackDelivery(99, 99, "test-consumer", false)
 
 	processorDone := make(chan struct{})
-	go srv.processFrames(conn, processorDone)
+	go srv.processFrames(srv.runtimeFor(conn), processorDone)
 
 	ackDone := make(chan struct{})
-	go srv.ackProcessor(conn, ackDone)
+	go srv.ackProcessor(srv.runtimeFor(conn), ackDone)
 
 	conn.FrameQueue <- encodeAckFrame(t, 1, 99, false)
 	conn.FrameQueue <- encodePublishFrame(t, 1, "", "test")

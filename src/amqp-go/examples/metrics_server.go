@@ -90,7 +90,7 @@ func main() {
 
 	// Shutdown AMQP server
 	amqpServer.Mutex.Lock()
-	amqpServer.Shutdown = true
+	amqpServer.ShuttingDown = true
 	amqpServer.Mutex.Unlock()
 
 	if amqpServer.Listener != nil {

@@ -69,7 +69,7 @@ func TestReaderBackpressures_NoCloseWhenBacklogged(t *testing.T) {
 	conn := newOverflowTestConn(serverConn)
 
 	readerDone := make(chan struct{})
-	go srv.readFrames(conn, readerDone)
+	go srv.readFrames(srv.runtimeFor(conn), readerDone)
 
 	const nFrames = 50
 	const payload = 100 // ~104 wire bytes each; 50 * 104 = 5200 bytes >> 500 hard cap
@@ -131,7 +131,7 @@ func TestReaderProbeDrainsAckWhileBacklogged(t *testing.T) {
 	conn := newOverflowTestConn(serverConn) // FrameQueue cap 1, never drained
 
 	readerDone := make(chan struct{})
-	go srv.readFrames(conn, readerDone)
+	go srv.readFrames(srv.runtimeFor(conn), readerDone)
 
 	// Establish a backlog: pub1 fills FrameQueue(1), pub2 lands in pending and the
 	// reader parks on the hand-off. Then send the ack behind them.
@@ -182,7 +182,7 @@ func TestReaderProbeDrainsControlFrame(t *testing.T) {
 	conn := newOverflowTestConn(serverConn) // FrameQueue cap 1, never drained
 
 	readerDone := make(chan struct{})
-	go srv.readFrames(conn, readerDone)
+	go srv.readFrames(srv.runtimeFor(conn), readerDone)
 
 	// pub1 -> FrameQueue(1); pub2 -> pending (reader parks). Both writes complete
 	// while the reader is still draining normally.

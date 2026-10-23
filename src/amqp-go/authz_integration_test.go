@@ -133,7 +133,7 @@ func startAuthzTestServer(t *testing.T, port string) *server.Server {
 	waitForListening(t, srv)
 	t.Cleanup(func() {
 		srv.Mutex.Lock()
-		srv.Shutdown = true
+		srv.ShuttingDown = true
 		ln := srv.Listener
 		srv.Mutex.Unlock()
 		if ln != nil {

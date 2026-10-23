@@ -1,7 +1,6 @@
 package server
 
 import (
-	"encoding/binary"
 	"encoding/json"
 	"io"
 	"net"
@@ -67,20 +66,17 @@ func newNonLoopbackPipeConn(t *testing.T) *protocol.Connection {
 	})
 }
 
-// encodeConnectionOpen builds a protocol.Frame containing a connection.open
-// method (class 10, method 40) with the given virtual host.
-func encodeConnectionOpen(t *testing.T, vhost string) *protocol.Frame {
+// encodeConnectionOpen builds the method payload of a connection.open frame
+// (class 10, method 40, after the 4-byte prefix) with the given virtual host —
+// the shape processConnectionOpen takes.
+func encodeConnectionOpen(t *testing.T, vhost string) []byte {
 	t.Helper()
 	method := &protocol.ConnectionOpenMethod{VirtualHost: vhost}
 	data, err := method.Serialize()
 	if err != nil {
 		t.Fatalf("failed to serialize connection.open: %v", err)
 	}
-	payload := make([]byte, 4+len(data))
-	binary.BigEndian.PutUint16(payload[0:2], 10) // classID
-	binary.BigEndian.PutUint16(payload[2:4], 40) // methodID
-	copy(payload[4:], data)
-	return &protocol.Frame{Type: protocol.FrameMethod, Channel: 0, Payload: payload}
+	return data
 }
 
 func newAuthzTestServer(t *testing.T, authEnabled bool, authenticator interfaces.Authenticator) *Server {
@@ -159,6 +155,7 @@ func TestVHostAccessAllowed(t *testing.T) {
 		t.Fatalf("GetUser failed: %v", err)
 	}
 	conn.User = user
+	conn.Username = user.Username // WS-B: production sets both at start-ok
 
 	// Process connection.open for vhost "/"
 	err = srv.processConnectionOpen(conn, encodeConnectionOpen(t, "/"))
@@ -189,6 +186,7 @@ func TestVHostAccessRefused(t *testing.T) {
 		t.Fatalf("GetUser failed: %v", err)
 	}
 	conn.User = user
+	conn.Username = user.Username // WS-B: production sets both at start-ok
 
 	// User has permission for /prod but not /dev
 	err = srv.processConnectionOpen(conn, encodeConnectionOpen(t, "/dev"))
@@ -231,6 +229,7 @@ func TestLoopbackGuestAllowed(t *testing.T) {
 		t.Fatalf("GetUser failed: %v", err)
 	}
 	conn.User = user
+	conn.Username = user.Username // WS-B: production sets both at start-ok
 
 	// Guest from localhost should be allowed
 	err = srv.processConnectionOpen(conn, encodeConnectionOpen(t, "/"))
@@ -259,6 +258,7 @@ func TestLoopbackGuestRefused(t *testing.T) {
 		t.Fatalf("GetUser failed: %v", err)
 	}
 	conn.User = user
+	conn.Username = user.Username // WS-B: production sets both at start-ok
 
 	// Guest from non-localhost should be refused
 	err = srv.processConnectionOpen(conn, encodeConnectionOpen(t, "/"))
@@ -287,6 +287,7 @@ func TestLoopbackNonGuestAllowed(t *testing.T) {
 		t.Fatalf("GetUser failed: %v", err)
 	}
 	conn.User = user
+	conn.Username = user.Username // WS-B: production sets both at start-ok
 
 	// Non-guest user from non-localhost should be allowed
 	err = srv.processConnectionOpen(conn, encodeConnectionOpen(t, "/"))
@@ -326,6 +327,7 @@ func TestVHostAccessEmptyPermissions(t *testing.T) {
 		t.Fatalf("GetUser failed: %v", err)
 	}
 	conn.User = user
+	conn.Username = user.Username // WS-B: production sets both at start-ok
 
 	err = srv.processConnectionOpen(conn, encodeConnectionOpen(t, "/"))
 	if err == nil {

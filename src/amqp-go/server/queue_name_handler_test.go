@@ -1,6 +1,7 @@
 package server
 
 import (
+	"errors"
 	"io"
 	"net"
 	"strings"
@@ -246,6 +247,10 @@ func TestQueueBindEmptyNameNoCurrentQueueReturnsError(t *testing.T) {
 	if err == nil {
 		t.Error("handleQueueBind with empty queue name and no current queue should return an error (spec: 502 syntax error)")
 	}
+	// WS-B: the error wraps the errNoCurrentQueue sentinel (mapped to 404).
+	if !errors.Is(err, errNoCurrentQueue) {
+		t.Errorf("expected errors.Is(err, errNoCurrentQueue), got %v", err)
+	}
 }
 
 func TestQueueDeleteEmptyNameResolvesCurrentQueue(t *testing.T) {
@@ -311,5 +316,9 @@ func TestQueueDeleteEmptyNameNoCurrentQueueReturnsError(t *testing.T) {
 	err = srv.handleQueueDelete(conn, 1, deletePayload)
 	if err == nil {
 		t.Error("handleQueueDelete with empty queue name and no current queue should return an error (spec: 502 syntax error)")
+	}
+	// WS-B: the error wraps the errNoCurrentQueue sentinel (mapped to 404).
+	if !errors.Is(err, errNoCurrentQueue) {
+		t.Errorf("expected errors.Is(err, errNoCurrentQueue), got %v", err)
 	}
 }

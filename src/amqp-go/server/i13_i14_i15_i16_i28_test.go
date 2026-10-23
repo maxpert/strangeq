@@ -2,6 +2,7 @@ package server
 
 import (
 	"encoding/binary"
+	"errors"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -297,7 +298,7 @@ func TestMetricsConnectionErrorFiresOnFrameProcessingError(t *testing.T) {
 
 	done := make(chan struct{})
 	go func() {
-		srv.processFrames(conn, done)
+		srv.processFrames(srv.runtimeFor(conn), done)
 	}()
 
 	select {
@@ -413,7 +414,12 @@ func TestExchangeRedeclareTypeMismatchSendsChannelClose406(t *testing.T) {
 	}).Serialize()
 	require.NoError(t, err)
 	err = srv.handleExchangeDeclare(conn, 1, redeclarePayload)
-	require.NoError(t, err, "type mismatch should return nil (channel close, not connection close)")
+	// WS-B: the type mismatch raises a *ChannelError 406 (channel close, not
+	// connection close); the frame assertions below are unchanged.
+	require.Error(t, err)
+	var ce *ChannelError
+	require.True(t, errors.As(err, &ce), "want *ChannelError, got %T", err)
+	assert.Equal(t, uint16(406), ce.Code)
 
 	classID, methodID, payload := nextMethodFrame(t, frameCh)
 	assert.Equal(t, uint16(20), classID, "expected channel class")

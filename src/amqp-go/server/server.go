@@ -5,12 +5,14 @@ import (
 	"crypto/tls"
 	"errors"
 	"fmt"
+	"math"
 	"net"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/maxpert/amqp-go/config"
+	amqperrors "github.com/maxpert/amqp-go/errors"
 	"github.com/maxpert/amqp-go/interfaces"
 	"github.com/maxpert/amqp-go/protocol"
 	"go.uber.org/zap"
@@ -30,7 +32,7 @@ type Server struct {
 	Listener           net.Listener
 	Connections        map[string]*protocol.Connection
 	Mutex              sync.RWMutex
-	Shutdown           bool
+	ShuttingDown       bool
 	Log                *zap.Logger
 	Broker             UnifiedBroker
 	Config             *config.AMQPConfig
@@ -120,6 +122,25 @@ type Server struct {
 	// checked. Per-server scoping removes the premise rather than documenting
 	// it. Appended at the end of the struct so no pre-existing field moves.
 	generateConsumerTag func() string
+
+	// --- WS-B (append-only; see specs/WS-B-server-safety.md) ---
+	pendingHandshakes            atomic.Int64       // sockets accepted but not yet past connection.open-ok
+	headerTimeoutOverride        time.Duration      // tests; 0 → protocolHeaderTimeout
+	handshakeTimeoutOverride     time.Duration      // tests; 0 → handshakeTimeout
+	pendingLimitOverride         int64              // tests; 0 → max(64, MaxConnections/4)
+	writeTimeoutOverride         time.Duration      // tests; 0 → defaultWriteTimeout
+	closeOKTimeoutOverride       time.Duration      // tests; 0 → connectionCloseOKTimeout
+	frameQueueByteBudgetOverride int64              // tests; 0 → defaultFrameQueueByteBudget
+	runtimes                     sync.Map           // *protocol.Connection → *connRuntime
+	panics                       atomic.Int64       // exposed via PanicCount()
+	storage                      interfaces.Storage // retained from Build (§11.4)
+	ownsStorage                  bool               // builder created it (not WithStorage)
+	ownsBroker                   bool               // builder created the StorageBroker (not WithUnifiedBroker)
+	connWG                       sync.WaitGroup     // one per handleConnection (dispatchAccepted Adds)
+	shutdownOnce                 sync.Once
+	shutdownErr                  error
+	storageClosed                atomic.Bool           // set after storage.Close returns (tests/health)
+	onConnTornDown               func(rt *connRuntime) // tests only; nil in production (cold path, §13)
 }
 
 // markUnsafeRecovery records that this process booted with --unsafe-recovery
@@ -214,6 +235,12 @@ func (s *Server) Start() error {
 	s.Listener = listener
 	s.Mutex.Unlock()
 
+	// The server is actually serving now — the lifecycle only used to reach
+	// "running" after Start returned (i.e. on the way down).
+	if s.Lifecycle != nil {
+		s.Lifecycle.markRunning()
+	}
+
 	if s.Config.Security.TLSEnabled {
 		s.Log.Info("AMQP server listening (TLS)", zap.String("addr", s.Addr))
 	} else {
@@ -265,7 +292,7 @@ func (s *Server) createListener() (net.Listener, error) {
 func (s *Server) IsListening() bool {
 	s.Mutex.RLock()
 	defer s.Mutex.RUnlock()
-	return s.Listener != nil && !s.Shutdown
+	return s.Listener != nil && !s.ShuttingDown
 }
 
 // acceptLoop accepts connections in a loop until shutdown.
@@ -274,7 +301,7 @@ func (s *Server) acceptLoop() error {
 		conn, err := s.Listener.Accept()
 		if err != nil {
 			s.Mutex.RLock()
-			shutdown := s.Shutdown
+			shutdown := s.ShuttingDown
 			s.Mutex.RUnlock()
 			if shutdown {
 				return nil
@@ -284,7 +311,7 @@ func (s *Server) acceptLoop() error {
 			continue
 		}
 
-		go s.handleConnection(conn)
+		s.dispatchAccepted(conn)
 	}
 }
 
@@ -330,27 +357,39 @@ func (s *Server) tuneSocket(conn net.Conn) {
 			s.Log.Warn("SetWriteBuffer failed", zap.Int("bytes", n), zap.Error(err))
 		}
 	}
+	if s.Config.Network.TCPKeepAlive {
+		if err := tcp.SetKeepAlive(true); err != nil {
+			s.Log.Warn("SetKeepAlive failed", zap.Error(err))
+		}
+		if ms := s.Config.Network.TCPKeepAliveIntervalMS; ms > 0 {
+			if err := tcp.SetKeepAlivePeriod(time.Duration(ms) * time.Millisecond); err != nil {
+				s.Log.Warn("SetKeepAlivePeriod failed", zap.Error(err))
+			}
+		}
+	} else {
+		// Honour an explicit opt-out; Go's listener enables 15s keepalive by
+		// default, so "unset" would silently be on.
+		_ = tcp.SetKeepAlive(false)
+	}
 }
 
-// handleConnection handles a new client connection
+// handleConnection handles a new client connection (§2.4). It owns the
+// pre-auth handshake slot from dispatchAccepted until connection.open-ok is
+// sent (or it exits), so every unauthenticated socket is bounded.
 func (s *Server) handleConnection(conn net.Conn) {
+	defer s.connWG.Done()
+	slot := &handshakeSlot{s: s}
+	defer slot.release()
+	defer s.recoverConnection(conn, "handleConnection") // §8; runs before slot.release, after finishConnection
+
 	// Tune the socket before the handshake so NoDelay/buffer sizing apply to the
 	// whole connection lifetime, including connection.start-ok latency.
 	s.tuneSocket(conn)
 
-	// First, check the protocol header
-	protoHeader := make([]byte, 8)
-	_, err := conn.Read(protoHeader)
-	if err != nil {
-		s.Log.Error("Error reading protocol header", zap.Error(err))
-		conn.Close()
-		return
-	}
-
-	// Verify protocol header: "AMQP" followed by version (0, 0, 9, 1)
-	if string(protoHeader[:4]) != "AMQP" {
-		s.Log.Error("Invalid protocol header", zap.Binary("header", protoHeader))
-		conn.Close()
+	// First, check the protocol header (deadline-bounded; bounds the TLS
+	// handshake too).
+	if !s.readProtocolHeader(conn) {
+		_ = conn.Close()
 		return
 	}
 
@@ -358,20 +397,19 @@ func (s *Server) handleConnection(conn net.Conn) {
 	// coalesced through a bufio.Reader (SQ-1); the 8-byte protocol header above
 	// was read raw before the buffer existed, so no buffered bytes are lost.
 	connection := protocol.NewConnectionWithReadBuffer(conn, s.Config.Network.ReadCoalesceBufferSize)
+	rt := s.newConnRuntime(connection, slot)
 
 	// Add to server's connections, enforcing MaxConnections
 	s.Mutex.Lock()
-	if s.Shutdown {
+	if s.ShuttingDown || (s.Config.Network.MaxConnections > 0 && len(s.Connections) >= s.Config.Network.MaxConnections) {
 		s.Mutex.Unlock()
-		conn.Close()
-		return
-	}
-	if s.Config.Network.MaxConnections > 0 && len(s.Connections) >= s.Config.Network.MaxConnections {
-		s.Mutex.Unlock()
-		s.Log.Warn("Max connections exceeded, refusing connection",
-			zap.String("connection_id", connection.ID),
-			zap.Int("max", s.Config.Network.MaxConnections))
-		conn.Close()
+		s.runtimes.Delete(connection)
+		if !s.ShuttingDown {
+			s.Log.Warn("Max connections exceeded, refusing connection",
+				zap.String("connection_id", connection.ID),
+				zap.Int("max", s.Config.Network.MaxConnections))
+		}
+		_ = conn.Close()
 		return
 	}
 	s.Connections[connection.ID] = connection
@@ -385,9 +423,8 @@ func (s *Server) handleConnection(conn net.Conn) {
 	// Process frames for this connection
 	// Note: consumerDeliveryLoop is started later in processConnectionFrames
 	// after the handshake completes (line 312)
+	defer s.finishConnection(rt) // cleanupConnection (recover-guarded) + runtimes.Delete + close(rt.torndown)
 	s.processConnectionFrames(connection)
-
-	s.cleanupConnection(connection)
 }
 
 // cleanupConnection tears down all per-channel state for a connection:
@@ -439,9 +476,10 @@ func (s *Server) cleanupConnection(connection *protocol.Connection) {
 		return true // continue iteration
 	})
 
-	// Requeue any orphaned basic.get deliveries (no_ack=false, unacked)
+	// Requeue this connection's orphaned basic.get deliveries (no_ack=false,
+	// unacked) — scoped to the closing connection (WS-B §10).
 	if s.Broker != nil {
-		s.Broker.RequeueAllGetDeliveries()
+		s.Broker.RequeueGetDeliveries(connection.ID)
 	}
 
 	if s.Broker != nil {
@@ -471,6 +509,21 @@ func (s *Server) cleanupConnection(connection *protocol.Connection) {
 	}
 
 	s.updateConsumersTotal()
+}
+
+// serverHeartbeatSeconds converts Network.HeartbeatIntervalMS to the whole-second
+// value AMQP carries, rounding UP so a positive sub-second setting never becomes 0
+// (disabled). <=0 means disabled; clamps to 65535.
+func (s *Server) serverHeartbeatSeconds() uint16 {
+	ms := s.Config.Network.HeartbeatIntervalMS
+	if ms <= 0 {
+		return 0
+	}
+	sec := (ms + 999) / 1000
+	if sec > math.MaxUint16 {
+		sec = math.MaxUint16
+	}
+	return uint16(sec)
 }
 
 // negotiateUint16 returns the minimum of server and client values, where 0
@@ -503,11 +556,13 @@ func negotiateUint32(server, client uint32) uint32 {
 	return client
 }
 
-// processConnectionFrames reads and processes frames from a connection
+// processConnectionFrames reads and processes frames from a connection.
+// The handshake is a strict state machine (§1.2): S1 start-ok → authenticate
+// → tune, S2 tune-ok → negotiate, S3 open → open-ok. One ABSOLUTE deadline
+// covers the whole handshake; every protocol violation sends connection.close
+// and waits briefly for close-ok before the socket closes (D5).
 func (s *Server) processConnectionFrames(conn *protocol.Connection) {
 	defer conn.Conn.Close()
-
-	handshakeCap := uint32(131072 + 8)
 
 	// Send connection start frame
 	if err := s.sendConnectionStart(conn); err != nil {
@@ -515,33 +570,28 @@ func (s *Server) processConnectionFrames(conn *protocol.Connection) {
 		return
 	}
 
-	conn.Conn.SetReadDeadline(time.Now().Add(30 * time.Second))
-	frame, err := protocol.ReadFrameOptimizedWithLimit(conn.Reader, handshakeCap)
+	rt := s.runtimeFor(conn)
+	// ONE absolute handshake deadline, measured from the end of the protocol
+	// header (§1.2) — not a fresh 30s per step.
+	_ = conn.Conn.SetReadDeadline(time.Now().Add(s.handshakeTimeout()))
+
+	// S1: await start-ok, then authenticate. Authentication must yield a
+	// non-empty username when auth is enabled (bypass #1/#2: no path reaches
+	// sendConnectionTune otherwise).
+	payload, err := s.readHandshakeMethod(conn, protocol.ConnectionStartOK, "start-ok")
 	if err != nil {
-		s.Log.Error("Error reading connection.start-ok", zap.Error(err))
-		return
-	}
-	conn.TouchActivity()
-
-	if frame.Type != protocol.FrameMethod {
-		s.Log.Error("Expected method frame", zap.Int("type", int(frame.Type)))
-		return
-	}
-
-	// Process connection.start-ok and perform authentication
-	if len(frame.Payload) >= 4 {
-		classID := (uint16(frame.Payload[0]) << 8) | uint16(frame.Payload[1])
-		methodID := (uint16(frame.Payload[2]) << 8) | uint16(frame.Payload[3])
-
-		if classID == 10 && methodID == protocol.ConnectionStartOK {
-			// Handle authentication
-			if err := s.handleConnectionStartOK(conn, frame.Payload[4:]); err != nil {
-				s.Log.Error("Authentication failed",
-					zap.String("connection_id", conn.ID),
-					zap.Error(err))
-				return
-			}
+		var cne *ConnectionError
+		if errors.As(err, &cne) {
+			s.awaitHandshakeCloseOK(conn)
 		}
+		return
+	}
+	if err := s.handleConnectionStartOK(conn, payload); err != nil {
+		s.Log.Error("Authentication failed",
+			zap.String("connection_id", conn.ID),
+			zap.Error(err))
+		s.awaitHandshakeCloseOK(conn)
+		return
 	}
 
 	// Send tune parameters
@@ -550,99 +600,97 @@ func (s *Server) processConnectionFrames(conn *protocol.Connection) {
 		return
 	}
 
-	// Wait for connection.tune-ok from client
-	conn.Conn.SetReadDeadline(time.Now().Add(30 * time.Second))
-	frame, err = protocol.ReadFrameOptimizedWithLimit(conn.Reader, handshakeCap)
+	// S2: await tune-ok, then negotiate.
+	payload, err = s.readHandshakeMethod(conn, protocol.ConnectionTuneOK, "tune-ok")
 	if err != nil {
-		s.Log.Error("Error reading connection.tune-ok", zap.Error(err))
-		return
-	}
-	conn.TouchActivity()
-
-	if frame.Type != protocol.FrameMethod {
-		s.Log.Error("Expected method frame", zap.Int("type", int(frame.Type)))
-		return
-	}
-
-	// Parse tune-ok payload and store negotiated values on conn
-	if len(frame.Payload) >= 4 {
-		clientChMax, clientFrameMax, clientHeartbeat, parseErr := parseConnectionTuneOK(frame.Payload[4:])
-		if parseErr != nil {
-			s.Log.Error("Failed to parse connection.tune-ok", zap.Error(parseErr))
-			return
+		var cne *ConnectionError
+		if errors.As(err, &cne) {
+			s.awaitHandshakeCloseOK(conn)
 		}
-
-		serverChMax := uint16(s.Config.Server.MaxChannelsPerConnection)
-		serverFrameMax := uint32(s.Config.Server.MaxFrameSize)
-		serverHeartbeat := uint16(s.Config.Network.HeartbeatIntervalMS / 1000)
-
-		negotiatedChMax := negotiateUint16(serverChMax, clientChMax)
-		negotiatedFrameMax := negotiateUint32(serverFrameMax, clientFrameMax)
-		negotiatedHeartbeat := negotiateUint16(serverHeartbeat, clientHeartbeat)
-
-		conn.MaxChannels = negotiatedChMax
-		conn.MaxFrameSize = negotiatedFrameMax
-		conn.HeartbeatSec.Store(uint32(negotiatedHeartbeat))
-
-		s.Log.Debug("Negotiated connection parameters",
-			zap.String("connection_id", conn.ID),
-			zap.Uint16("channel_max", negotiatedChMax),
-			zap.Uint32("frame_max", negotiatedFrameMax),
-			zap.Uint16("heartbeat", negotiatedHeartbeat))
+		return
+	}
+	clientChMax, clientFrameMax, clientHeartbeat, parseErr := parseConnectionTuneOK(payload)
+	if parseErr != nil {
+		s.Log.Error("Failed to parse connection.tune-ok", zap.Error(parseErr))
+		_ = s.connectionError(conn, amqperrors.SyntaxError, "SYNTAX_ERROR - malformed connection.tune-ok", 10, 31)
+		s.awaitHandshakeCloseOK(conn)
+		return
 	}
 
-	// Wait for connection.open from client
-	conn.Conn.SetReadDeadline(time.Now().Add(30 * time.Second))
-	frame, err = protocol.ReadFrameOptimizedWithLimit(conn.Reader, handshakeCap)
+	serverChMax := uint16(s.Config.Server.MaxChannelsPerConnection)
+	serverFrameMax := uint32(s.Config.Server.MaxFrameSize)
+
+	negotiatedChMax := negotiateUint16(serverChMax, clientChMax)
+	negotiatedFrameMax := negotiateUint32(serverFrameMax, clientFrameMax)
+	// AMQP 0-9-1: connection.tune-ok.heartbeat is "the delay … the client
+	// wants. Zero means the client does not want a heartbeat." RabbitMQ
+	// uses the tune-ok value as-is (§4.4).
+	negotiatedHeartbeat := clientHeartbeat
+
+	conn.MaxChannels = negotiatedChMax
+	conn.MaxFrameSize = negotiatedFrameMax
+	conn.HeartbeatSec.Store(uint32(negotiatedHeartbeat))
+
+	s.Log.Debug("Negotiated connection parameters",
+		zap.String("connection_id", conn.ID),
+		zap.Uint16("channel_max", negotiatedChMax),
+		zap.Uint32("frame_max", negotiatedFrameMax),
+		zap.Uint16("heartbeat", negotiatedHeartbeat))
+
+	// S3: await open, then vhost/authz/loopback checks (+ username re-check).
+	payload, err = s.readHandshakeMethod(conn, protocol.ConnectionOpen, "open")
 	if err != nil {
-		s.Log.Error("Error reading connection.open", zap.Error(err))
+		var cne *ConnectionError
+		if errors.As(err, &cne) {
+			s.awaitHandshakeCloseOK(conn)
+		}
 		return
 	}
-	conn.TouchActivity()
-
-	if frame.Type != protocol.FrameMethod {
-		s.Log.Error("Expected method frame", zap.Int("type", int(frame.Type)))
-		return
-	}
-
-	// Process connection.open method
-	if err := s.processConnectionOpen(conn, frame); err != nil {
+	if err := s.processConnectionOpen(conn, payload); err != nil {
 		s.Log.Error("Error processing connection.open", zap.Error(err))
+		s.awaitHandshakeCloseOK(conn)
 		return
 	}
 
-	// Clear handshake deadline; readFrames will manage read deadlines for heartbeats
-	conn.Conn.SetReadDeadline(time.Time{})
+	// The handshake is complete: mark it, release the pre-auth slot (§2.3),
+	// and clear the handshake deadline; readFrames manages read deadlines for
+	// heartbeats from here.
+	rt.handshakeDone.Store(true)
+	rt.releaseHandshakeSlot()
+	_ = conn.Conn.SetReadDeadline(time.Time{})
 
 	// At this point, the connection handshake is complete
 	s.Log.Info("Connection handshake completed", zap.String("connection_id", conn.ID))
 
 	// Reader/processor separation: Reader enqueues frames, processor handles them
-	// This allows the reader to keep draining TCP socket even when processor blocks on fsync
+	// This allows the reader to keep draining TCP socket even when processor blocks on fsync.
+	// Every goroutine is registered in rt.wg and panic-recovered via goConn (§8/§13).
 	readerDone := make(chan struct{})
-	go s.readFrames(conn, readerDone)
+	s.goConn(rt, "reader", func() { s.readFrames(rt, readerDone) })
 
 	// Start frame processor goroutine (can block on WAL fsync without affecting reader)
 	processorDone := make(chan struct{})
-	go s.processFrames(conn, processorDone)
+	s.goConn(rt, "processor", func() { s.processFrames(rt, processorDone) })
 
 	// Start ACK processor goroutine (handles basic.ack/nack/reject off the frame processor)
 	ackProcessorDone := make(chan struct{})
-	go s.ackProcessor(conn, ackProcessorDone)
+	s.goConn(rt, "ack-processor", func() { s.ackProcessor(rt, ackProcessorDone) })
 
-	// Start heartbeat sender goroutine (sends heartbeat frames to client periodically)
-	heartbeatSenderDone := make(chan struct{})
-	go s.sendHeartbeats(conn, heartbeatSenderDone)
+	// Start the heartbeat sender ONLY when a heartbeat was negotiated: with
+	// hb == 0 there is no sender at all, so it can never become a spurious
+	// teardown trigger (P1 heartbeat=0 disconnect).
+	if conn.HeartbeatSec.Load() > 0 {
+		s.goConn(rt, "heartbeat", func() { s.sendHeartbeats(conn) })
+	}
 
 	// Start consumer delivery loop
-	consumerDeliveryDone := make(chan struct{})
 	conn.ConsumersDirty.Store(true)
-	go s.consumerDeliveryLoop(conn, consumerDeliveryDone)
+	s.goConn(rt, "delivery", func() { s.consumerDeliveryLoop(rt) })
 
 	// Start publisher-confirm flusher (SQ-5: batches basic.ack writes for
 	// pipelining confirm-mode publishers)
 	confirmFlusherDone := make(chan struct{})
-	go s.confirmFlusher(conn, confirmFlusherDone)
+	s.goConn(rt, "confirm-flusher", func() { s.confirmFlusher(conn, confirmFlusherDone) })
 
 	// SQ-12: a freshly handshaked connection has not published yet, so it is
 	// consumer-only and must NOT be blocked (RabbitMQ blocks publishers, not
@@ -650,43 +698,56 @@ func (s *Server) processConnectionFrames(conn *protocol.Connection) {
 	// blocked, with the handshake/clear race reconciled, at its first publish
 	// under an active alarm (blockPublisherConnection in processCompleteMessage).
 
-	// Wait for any goroutine to finish (connection close or error)
+	// 1. Trigger: ONLY input-side goroutines. Heartbeat/delivery/flusher exits
+	//    are never triggers; when they fail they close the socket (writeLocked,
+	//    §7), which makes the reader fail, which is a trigger.
 	select {
 	case <-readerDone:
 		s.Log.Info("Frame reader completed", zap.String("connection_id", conn.ID))
 	case <-processorDone:
 		s.Log.Info("Frame processor completed", zap.String("connection_id", conn.ID))
-	case <-heartbeatSenderDone:
-		s.Log.Info("Heartbeat sender completed", zap.String("connection_id", conn.ID))
-	case <-consumerDeliveryDone:
-		s.Log.Info("Consumer delivery completed", zap.String("connection_id", conn.ID))
 	case <-ackProcessorDone:
 		s.Log.Info("ACK processor completed", zap.String("connection_id", conn.ID))
 	}
 
-	// Belt-and-suspenders confirm drain (repro D — teardown ordering): the socket
-	// is closed just below to unblock the reader/processor, and only afterwards is
-	// conn.Done signaled to stop the confirm flusher. A durability completion that
-	// advances a channel's confirm watermark in that window would otherwise be lost
-	// (the flusher's write hits the already-closed socket). Flush any advanced-but-
-	// unemitted confirms + pending nacks NOW, while the socket is still open. This
-	// runs on the teardown goroutine, concurrently with the still-live flusher, but
-	// is safe and idempotent — per-channel FlushConfirms is serialized under
-	// confirmFlushMu. Errors are ignored: the connection is closing regardless.
-	_ = s.drainConfirmNacks(conn)
-	_ = s.flushAllChannelConfirms(conn)
+	// 2. Confirm belt (teardown ordering), ONLY if no close handshake started:
+	//    after connection.close/close-ok nothing else may be written (§1.4, §3.4).
+	//    The socket is closed just below to unblock the reader/processor, and only
+	//    afterwards is conn.Done signaled to stop the confirm flusher. A durability
+	//    completion that advances a channel's confirm watermark in that window would
+	//    otherwise be lost (the flusher's write hits the already-closed socket).
+	//    Flush any advanced-but-unemitted confirms + pending nacks NOW, while the
+	//    socket is still open. This runs on the teardown goroutine, concurrently
+	//    with the still-live flusher, but is safe and idempotent — per-channel
+	//    FlushConfirms is serialized under confirmFlushMu. Errors are ignored: the
+	//    connection is closing regardless.
+	if !rt.closeHandshakeStarted.Load() {
+		_ = s.drainConfirmNacks(conn)
+		_ = s.flushAllChannelConfirms(conn)
+	}
 
-	// Close the connection to unblock reader and processor
-	conn.Conn.Close()
-	// Signal all goroutines that the connection is shutting down.
-	// This unblocks processFrame if it's waiting to send to AckQueue.
+	// 3. Unblock everyone: stop further writes, then close the socket. Closing
+	//    the socket fails any writer blocked in Write while holding WriteMutex,
+	//    releasing it (and the write deadline bounds it regardless). Go's
+	//    tls.Conn.Close skips close_notify when a Write is in flight
+	//    (crypto/tls activeCall interlock), so it cannot block behind a stuck
+	//    writer.
+	conn.Closed.Store(true)
+	if t := rt.closeTimer.Load(); t != nil {
+		t.Stop()
+	}
+	_ = conn.Conn.Close()
+
+	// 4. Signal shutdown to every Done-select (reader hand-offs, flow sender,
+	//    heartbeat, confirm flusher, alarm/depth parks). This also unblocks
+	//    processFrame if it's waiting to send to AckQueue.
 	close(conn.Done)
 
-	// Wait for BOTH senders to ackQueue to exit before closing it. The frame
-	// processor routes acks it dequeues, and (since the SQ-0 fix) the reader
-	// diverts acks directly. processFrames may exit on error before the reader
-	// closes FrameQueue, so we must explicitly wait for the reader too;
-	// otherwise a late reader ack-send could hit a closed channel and panic.
+	// 5. Wait for BOTH senders to ackQueue to exit before closing it. The frame
+	//    processor routes acks it dequeues, and (since the SQ-0 fix) the reader
+	//    diverts acks directly. processFrames may exit on error before the reader
+	//    closes FrameQueue, so we must explicitly wait for the reader too;
+	//    otherwise a late reader ack-send could hit a closed channel and panic.
 	<-processorDone
 	<-readerDone
 	// Close ackQueue so ackProcessor drains remaining frames and exits
@@ -695,6 +756,11 @@ func (s *Server) processConnectionFrames(conn *protocol.Connection) {
 	// The confirm flusher exits on conn.Done (closed above); if it was mid-write
 	// the closed socket fails the write and it exits on its own error path.
 	<-confirmFlusherDone
+
+	// 6. Join EVERYTHING else (heartbeat, delivery, forwarders, flow sender).
+	//    There is no cycle: nothing joined here waits on cleanupConnection,
+	//    which runs only after this (§13.3).
+	rt.wg.Wait()
 }
 
 // defaultReaderBackpressureProbe bounds how long the reader blocks handing a
@@ -781,7 +847,8 @@ func (s *Server) parkReaderWhileDepthBackpressured(conn *protocol.Connection) (p
 
 // readFrames reads frames from TCP connection and enqueues them for processing
 // This goroutine NEVER blocks on frame processing - it only reads and enqueues
-func (s *Server) readFrames(conn *protocol.Connection, done chan struct{}) {
+func (s *Server) readFrames(rt *connRuntime, done chan struct{}) {
+	conn := rt.conn
 	defer close(done)
 	defer close(conn.FrameQueue) // Signal processor to stop
 
@@ -850,7 +917,7 @@ func (s *Server) readFrames(conn *protocol.Connection, done chan struct{}) {
 	flowWake := make(chan struct{}, 1)
 	flowQuit := make(chan struct{})
 	defer close(flowQuit)
-	go func() {
+	s.goConn(rt, "flow-sender", func() {
 		lastSent := true
 		for {
 			select {
@@ -876,7 +943,7 @@ func (s *Server) readFrames(conn *protocol.Connection, done chan struct{}) {
 			}
 			lastSent = want
 		}
-	}()
+	})
 	requestFlow := func(active bool) {
 		flowDesiredActive.Store(active)
 		select {
@@ -894,6 +961,12 @@ func (s *Server) readFrames(conn *protocol.Connection, done chan struct{}) {
 			// while we still hold the stale reference.
 			head := pending[0]
 			headSize := int64(head.Size)
+			headCost := frameCost(head)
+			// §9: "budget exhausted" behaves exactly like "channel full".
+			if !s.frameBudgetAllows(conn, headCost) {
+				break
+			}
+			conn.FrameQueueBytes.Add(headCost)
 			select {
 			case conn.FrameQueue <- head:
 				pendingBytes -= headSize
@@ -903,6 +976,7 @@ func (s *Server) readFrames(conn *protocol.Connection, done chan struct{}) {
 			case <-conn.Done:
 				return
 			default:
+				conn.FrameQueueBytes.Add(-headCost) // rollback: not handed off
 			}
 			break
 		}
@@ -941,14 +1015,28 @@ func (s *Server) readFrames(conn *protocol.Connection, done chan struct{}) {
 			// instant it receives it (mirrors the opportunistic drain above).
 			head := pending[0]
 			headSize := int64(head.Size)
+			headCost := frameCost(head)
+			// §9: an exhausted byte budget makes the hand-off channel never-ready
+			// (nil chan), so the reader parks on FrameBudgetWake exactly as it
+			// would park on a full FrameQueue (TCP backpressure).
+			q := conn.FrameQueue
+			if !s.frameBudgetAllows(conn, headCost) {
+				q = nil
+			}
 			backpressureProbe.Reset(s.readerBackpressureProbeInterval())
 			select {
-			case conn.FrameQueue <- head:
+			case q <- head:
 				backpressureProbe.Stop()
+				// Add after the send: a transient negative is harmless
+				// (frameBudgetAllows always admits q <= 0).
+				conn.FrameQueueBytes.Add(headCost)
 				pendingBytes -= headSize
 				pending[0] = nil
 				pending = pending[1:]
 				continue
+			case <-conn.FrameBudgetWake:
+				backpressureProbe.Stop()
+				continue // re-evaluate budget
 			case <-conn.Done:
 				backpressureProbe.Stop()
 				return
@@ -1105,6 +1193,12 @@ func (s *Server) readFrames(conn *protocol.Connection, done chan struct{}) {
 		// were already handled on a separate goroutine, so this introduces
 		// no new reordering — it only moves the diversion point earlier.)
 		if isAckFrame(frame) {
+			// §9: an "ack" is classified by class/method only, so its size is
+			// bounded per frame — a malicious oversized ack payload hard-closes
+			// the connection (the reader must not write, so no close frame).
+			if !s.admitOversizedAckFrame(conn, frame) {
+				return
+			}
 			select {
 			case conn.AckQueue <- frame:
 			case <-conn.Done:
@@ -1119,15 +1213,19 @@ func (s *Server) readFrames(conn *protocol.Connection, done chan struct{}) {
 		// a publish's method, header and body frames must stay contiguous). When
 		// FrameQueue is full, buffer instead; the reader must never block here or
 		// acks stall behind it.
-		if len(pending) == 0 {
+		cost := frameCost(frame)
+		if len(pending) == 0 && s.frameBudgetAllows(conn, cost) {
+			conn.FrameQueueBytes.Add(cost)
 			select {
 			case conn.FrameQueue <- frame:
 				continue // queued directly
 			case <-conn.Done:
+				conn.FrameQueueBytes.Add(-cost)
 				protocol.PutFrame(frame)
 				return
 			default:
-				// FrameQueue full — fall through to bounded buffering.
+				// FrameQueue full — roll back and fall through to bounded buffering.
+				conn.FrameQueueBytes.Add(-cost)
 			}
 		}
 		pending = append(pending, frame)
@@ -1164,7 +1262,8 @@ func (s *Server) readFrames(conn *protocol.Connection, done chan struct{}) {
 
 // processFrames processes frames from the queue
 // This goroutine CAN block on WAL fsync without affecting the reader
-func (s *Server) processFrames(conn *protocol.Connection, done chan struct{}) {
+func (s *Server) processFrames(rt *connRuntime, done chan struct{}) {
+	conn := rt.conn
 	defer close(done)
 
 	for {
@@ -1175,41 +1274,66 @@ func (s *Server) processFrames(conn *protocol.Connection, done chan struct{}) {
 				return
 			}
 
+			// §9: capture the budget cost immediately (before processFrame can
+			// pool the frame) and release it on EVERY path that finishes with
+			// the frame — heartbeat, gate discards, and after processFrame
+			// (whether the frame is pooled or handed to the AckQueue).
+			cost := frameCost(frame)
+
 			if frame.Type == protocol.FrameHeartbeat {
+				s.releaseFrameBudget(conn, cost)
 				protocol.PutFrame(frame)
 				continue
 			}
 
-			// Capture before processFrame: it may transfer frame ownership
-			// (AckQueue hand-off) or we pool it right after — either way the
-			// next owner can overwrite the frame while we still hold the ref.
-			frameChannel := frame.Channel
+			// Capture the error-classification context before processFrame: it
+			// may transfer frame ownership (AckQueue hand-off) or we pool it
+			// right after — either way the next owner can overwrite the frame
+			// while we still hold the ref.
+			fc := frameCtx{channel: frame.Channel}
+			if cls, mth, isMethod := methodIDs(frame); isMethod {
+				fc.classID, fc.methodID = cls, mth
+			} else if frame.Type == protocol.FrameHeader || frame.Type == protocol.FrameBody {
+				fc.classID, fc.methodID = 60, 40 // basic.publish content frames
+			}
+
+			// §6.3 per-frame channel-ID gate: a channel ID above the negotiated
+			// channel_max is a hard 530. conn.MaxChannels is written once during
+			// the handshake, before this goroutine starts, so this is a plain read.
+			if frame.Channel != 0 && conn.MaxChannels > 0 && frame.Channel > conn.MaxChannels {
+				err := s.connectionError(conn, amqperrors.NotAllowed,
+					fmt.Sprintf("NOT_ALLOWED - channel %d exceeds negotiated channel_max %d", frame.Channel, conn.MaxChannels),
+					fc.classID, fc.methodID)
+				s.releaseFrameBudget(conn, cost)
+				protocol.PutFrame(frame)
+				if s.handleFrameError(rt, fc, err, true) {
+					return
+				}
+				continue
+			}
+
+			// §3.7 closing gate: after sending close, discard everything except
+			// close / close-ok (two atomic loads when nothing is closing).
+			if rt.connClosing.Load() || rt.closingCount.Load() != 0 {
+				if s.discardWhileClosing(rt, frame) {
+					s.releaseFrameBudget(conn, cost)
+					protocol.PutFrame(frame)
+					continue
+				}
+			}
+
 			pooled, err := s.processFrame(conn, frame)
+			s.releaseFrameBudget(conn, cost)
 			if pooled {
 				protocol.PutFrame(frame)
 			}
 			if err != nil {
-				if errors.Is(err, errClientRequestedClose) {
-					s.Log.Info("Connection closed by client",
-						zap.String("connection_id", conn.ID))
-					conn.Closed.Store(true)
+				if s.handleFrameError(rt, fc, err, true) {
 					return
 				}
-				s.Log.Error("Error processing frame",
-					zap.String("connection_id", conn.ID),
-					zap.Uint16("channel", frameChannel),
-					zap.Error(err))
-				if s.MetricsCollector != nil {
-					if frameChannel != 0 {
-						s.MetricsCollector.RecordChannelError("method_processing")
-					}
-					s.MetricsCollector.RecordConnectionError("frame_processing")
-				}
-				conn.Closed.Store(true)
-				return
 			}
 
-		case <-done:
+		case <-conn.Done:
 			return
 		}
 	}
@@ -1241,7 +1365,8 @@ func (s *Server) processFrame(conn *protocol.Connection, frame *protocol.Frame) 
 		s.Log.Warn("Unknown frame type",
 			zap.Int("type", int(frame.Type)),
 			zap.String("connection_id", conn.ID))
-		return true, nil
+		return true, s.connectionError(conn, amqperrors.FrameError,
+			fmt.Sprintf("FRAME_ERROR - unknown frame type %d", frame.Type), 0, 0)
 	}
 }
 
@@ -1264,7 +1389,7 @@ func isAckFrame(frame *protocol.Frame) bool {
 
 func (s *Server) processAckFrame(conn *protocol.Connection, frame *protocol.Frame) error {
 	if len(frame.Payload) < 4 {
-		return fmt.Errorf("ack frame payload too short")
+		return s.connectionError(conn, amqperrors.FrameError, "FRAME_ERROR - ack frame payload too short", 60, 0)
 	}
 	methodID := (uint16(frame.Payload[2]) << 8) | uint16(frame.Payload[3])
 	payload := frame.Payload[4:]
@@ -1276,42 +1401,43 @@ func (s *Server) processAckFrame(conn *protocol.Connection, frame *protocol.Fram
 	case protocol.BasicNack:
 		return s.handleBasicNack(conn, frame.Channel, payload)
 	default:
-		return fmt.Errorf("unexpected method %d in ack processor", methodID)
+		return s.connectionError(conn, amqperrors.FrameError,
+			fmt.Sprintf("FRAME_ERROR - unexpected method 60.%d in ack processor", methodID), 60, methodID)
 	}
 }
 
-func (s *Server) ackProcessor(conn *protocol.Connection, done chan struct{}) {
+func (s *Server) ackProcessor(rt *connRuntime, done chan struct{}) {
+	conn := rt.conn
 	defer close(done)
 	for frame := range conn.AckQueue {
+		// §3.7: ack frames are never close frames, so for a closing channel or
+		// connection they are always discarded.
+		if rt.connClosing.Load() || (frame.Channel != 0 && rt.isChannelClosing(frame.Channel)) {
+			protocol.PutFrame(frame)
+			continue
+		}
 		// Capture before PutFrame: the pool may recycle the frame to another
 		// goroutine's GetFrame, which overwrites it while we still hold the ref.
-		frameChannel := frame.Channel
+		fc := frameCtx{channel: frame.Channel, classID: 60}
+		if len(frame.Payload) >= 4 {
+			fc.methodID = (uint16(frame.Payload[2]) << 8) | uint16(frame.Payload[3])
+		}
 		err := s.processAckFrame(conn, frame)
 		protocol.PutFrame(frame)
 		if err != nil {
-			s.Log.Error("Error processing ACK frame",
-				zap.String("connection_id", conn.ID),
-				zap.Uint16("channel", frameChannel),
-				zap.Error(err))
-			if s.MetricsCollector != nil {
-				s.MetricsCollector.RecordConnectionError("ack_processing")
+			if s.handleFrameError(rt, fc, err, false) {
+				return
 			}
-			conn.Closed.Store(true)
-			return
 		}
 	}
 }
 
 // sendHeartbeats periodically sends heartbeat frames to the client
 // This keeps the connection alive independently of frame processing
-// RabbitMQ sends heartbeats every (heartbeat_timeout / 2) seconds
-func (s *Server) sendHeartbeats(conn *protocol.Connection, done chan struct{}) {
-	defer close(done)
-
+// RabbitMQ sends heartbeats every (heartbeat_timeout / 2) seconds.
+// Only started when the negotiated heartbeat is > 0 (§4.2).
+func (s *Server) sendHeartbeats(conn *protocol.Connection) {
 	hb := conn.HeartbeatSec.Load()
-	if hb == 0 {
-		return
-	}
 
 	heartbeatInterval := time.Duration(hb) * time.Second / 2
 	if heartbeatInterval < 1*time.Second {
@@ -1336,8 +1462,9 @@ func (s *Server) sendHeartbeats(conn *protocol.Connection, done chan struct{}) {
 				Payload: []byte{},
 			}
 
-			// WriteFrame handles locking internally
-			if err := protocol.WriteFrameToConnection(conn, heartbeatFrame); err != nil {
+			// writeFrame arms the write deadline; on error it has already
+			// marked the connection closed and closed the socket.
+			if err := s.writeFrame(conn, heartbeatFrame); err != nil {
 				s.Log.Error("Failed to send heartbeat",
 					zap.String("connection_id", conn.ID),
 					zap.Error(err))
@@ -1350,7 +1477,7 @@ func (s *Server) sendHeartbeats(conn *protocol.Connection, done chan struct{}) {
 
 			s.Log.Debug("Sent heartbeat to client", zap.String("connection_id", conn.ID))
 
-		case <-done:
+		case <-conn.Done:
 			// Connection is closing
 			return
 		}
@@ -1365,22 +1492,26 @@ func (s *Server) processMethodFrame(conn *protocol.Connection, frame *protocol.F
 		return s.processChannelMethod(conn, frame)
 	}
 
-	// For now, just check the class and method IDs in the payload
 	if len(frame.Payload) < 4 {
-		return fmt.Errorf("method frame payload too short")
+		return s.connectionError(conn, amqperrors.FrameError, "FRAME_ERROR - method frame payload too short", 0, 0)
 	}
 
 	classID := (uint16(frame.Payload[0]) << 8) | uint16(frame.Payload[1])
 	methodID := (uint16(frame.Payload[2]) << 8) | uint16(frame.Payload[3])
 
-	// Process based on class and method IDs
+	// Only the connection class is valid on channel 0 (AMQP 0-9-1 §4.1).
 	switch {
 	case classID == 10: // Connection class
 		return s.processConnectionMethod(conn, methodID, frame.Payload[4:])
-	case classID == 20: // Channel class
-		return s.processChannelMethod(conn, frame)
+	case classID == 20 && methodID == protocol.ChannelOpen:
+		return s.connectionError(conn, amqperrors.CommandInvalid,
+			"COMMAND_INVALID - channel.open on channel 0", 20, 10)
+	case classID == 20 || classID == 40 || classID == 50 || classID == 60 || classID == 85 || classID == 90:
+		return s.connectionError(conn, amqperrors.CommandInvalid,
+			fmt.Sprintf("COMMAND_INVALID - class %d on channel 0", classID), classID, methodID)
 	default:
-		return fmt.Errorf("unknown class ID: %d", classID)
+		return s.connectionError(conn, amqperrors.FrameError,
+			fmt.Sprintf("FRAME_ERROR - unknown method %d.%d", classID, methodID), classID, methodID)
 	}
 }
 
@@ -1390,14 +1521,33 @@ func (s *Server) processChannelMethod(conn *protocol.Connection, frame *protocol
 		s.Log.Warn("Method frame payload too short",
 			zap.Int("length", len(frame.Payload)),
 			zap.String("connection_id", conn.ID))
-		return fmt.Errorf("method frame payload too short")
+		return s.connectionError(conn, amqperrors.FrameError, "FRAME_ERROR - method frame payload too short", 0, 0)
 	}
 
 	classID := (uint16(frame.Payload[0]) << 8) | uint16(frame.Payload[1])
 	methodID := (uint16(frame.Payload[2]) << 8) | uint16(frame.Payload[3])
 
+	// §6.3 opened-channel gate: every method except channel.open requires a
+	// previously opened channel (AMQP 0-9-1 "expected 'channel.open'"). One
+	// sync.Map.Load per method frame — the read-mostly lock-free fast path.
+	if !(classID == 20 && methodID == protocol.ChannelOpen) {
+		if _, ok := conn.Channels.Load(frame.Channel); !ok {
+			// A channel in the closing set WAS opened and torn down at error
+			// time (D4); its close / close-ok must still complete the
+			// handshake (§3.7 lets only those through).
+			isCloseHandshake := classID == 20 && (methodID == protocol.ChannelClose || methodID == protocol.ChannelCloseOK)
+			if !(isCloseHandshake && s.runtimeFor(conn).isChannelClosing(frame.Channel)) {
+				return s.connectionError(conn, amqperrors.ChannelErrorCode,
+					fmt.Sprintf("CHANNEL_ERROR - expected 'channel.open' on channel %d", frame.Channel), classID, methodID)
+			}
+		}
+	}
+
 	// Process based on class and method IDs
 	switch classID {
+	case 10: // Connection class is invalid on a channel
+		return s.connectionError(conn, amqperrors.CommandInvalid,
+			fmt.Sprintf("COMMAND_INVALID - connection method on channel %d", frame.Channel), classID, methodID)
 	case 20: // Channel class
 		return s.processChannelSpecificMethod(conn, frame.Channel, methodID, frame.Payload[4:])
 	case 40: // Exchange class
@@ -1414,14 +1564,15 @@ func (s *Server) processChannelMethod(conn *protocol.Connection, frame *protocol
 		s.Log.Warn("Unknown class ID",
 			zap.Uint16("class_id", classID),
 			zap.String("connection_id", conn.ID))
-		return fmt.Errorf("unknown class ID: %d", classID)
+		return s.connectionError(conn, amqperrors.FrameError,
+			fmt.Sprintf("FRAME_ERROR - unknown method %d.%d", classID, methodID), classID, methodID)
 	}
 }
 
 // Stop stops the server gracefully
 func (s *Server) Stop() error {
 	s.Mutex.Lock()
-	s.Shutdown = true
+	s.ShuttingDown = true
 	ln := s.Listener
 	cancel := s.metricsCancel
 	alarmCancel := s.alarmCancel
@@ -1454,6 +1605,10 @@ func (s *Server) StartWithQuitChannel(quit <-chan struct{}) error {
 	s.Mutex.Lock()
 	s.Listener = listener
 	s.Mutex.Unlock()
+
+	if s.Lifecycle != nil {
+		s.Lifecycle.markRunning()
+	}
 
 	if s.Config.Security.TLSEnabled {
 		s.Log.Info("AMQP server listening (TLS)", zap.String("addr", s.Addr))
@@ -1503,7 +1658,7 @@ func (s *Server) StartWithQuitChannel(quit <-chan struct{}) error {
 			err := <-errChan
 			if err != nil {
 				s.Mutex.RLock()
-				shutdown := s.Shutdown
+				shutdown := s.ShuttingDown
 				s.Mutex.RUnlock()
 				if shutdown {
 					return nil
@@ -1514,11 +1669,11 @@ func (s *Server) StartWithQuitChannel(quit <-chan struct{}) error {
 			}
 
 			// Handle the connection in a goroutine
-			go s.handleConnection(conn)
+			s.dispatchAccepted(conn)
 		case <-quit:
 			s.Log.Info("Server shutdown requested")
 			s.Mutex.Lock()
-			s.Shutdown = true
+			s.ShuttingDown = true
 			cancel := s.metricsCancel
 			alarmCancel := s.alarmCancel
 			s.Mutex.Unlock()

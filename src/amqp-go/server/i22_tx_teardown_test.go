@@ -1,6 +1,7 @@
 package server
 
 import (
+	"errors"
 	"net"
 	"testing"
 
@@ -80,7 +81,12 @@ func TestHandleTxCommitFailureClosesChannelNotConnection(t *testing.T) {
 	srv.TransactionManager.SetExecutor(nil)
 
 	err = srv.handleTxCommit(conn, 1, []byte{})
-	assert.NoError(t, err, "handleTxCommit should return nil on commit failure (channel.close sent instead of connection kill)")
+	// WS-B: commit failure returns a *ChannelError with code 541 (channel
+	// closed, connection alive); frame and Closed assertions are unchanged.
+	require.Error(t, err, "handleTxCommit must return the commit-failure ChannelError")
+	var ce *ChannelError
+	require.True(t, errors.As(err, &ce), "want *ChannelError, got %T", err)
+	assert.Equal(t, uint16(541), ce.Code)
 
 	classID, methodID, _ := nextMethodFrame(t, frameCh)
 	assert.Equal(t, uint16(20), classID, "expected channel class (20)")

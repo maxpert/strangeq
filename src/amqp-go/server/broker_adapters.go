@@ -99,6 +99,10 @@ func (a *StorageBrokerAdapter) GetMessageForGet(queueName string, noAck bool) (*
 	return a.broker.GetMessageForGet(queueName, noAck)
 }
 
+func (a *StorageBrokerAdapter) GetMessageForGetOwned(queueName string, noAck bool, connID string) (*protocol.Message, uint64, uint32, error) {
+	return a.broker.GetMessageForGetOwned(queueName, noAck, connID)
+}
+
 func (a *StorageBrokerAdapter) PurgeQueue(name string) (int, error) {
 	return a.broker.PurgeQueue(name)
 }
@@ -115,8 +119,8 @@ func (a *StorageBrokerAdapter) NackGetDelivery(deliveryTag uint64, requeue bool)
 	return a.broker.NackGetDelivery(deliveryTag, requeue)
 }
 
-func (a *StorageBrokerAdapter) RequeueAllGetDeliveries() {
-	a.broker.RequeueAllGetDeliveries()
+func (a *StorageBrokerAdapter) RequeueGetDeliveries(connID string) {
+	a.broker.RequeueGetDeliveries(connID)
 }
 
 func (a *StorageBrokerAdapter) RecoverQueue(queueName string, minTag, maxTag, count uint64) {
