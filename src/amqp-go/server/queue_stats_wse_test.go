@@ -22,7 +22,7 @@ func TestQueueReadyCount_AgainstWSDStorageBroker(t *testing.T) {
 
 	assert.Equal(t, uint32(0), adapter.QueueReadyCount("s7-q"), "empty queue")
 	assert.Equal(t, uint32(0), adapter.QueueReadyCount("never-declared"),
-		"unknown queue reports 0 and materializes nothing")
+		"unknown queue reports 0 without materializing queue state")
 
 	publishMessageToQueue(t, srv, "s7-q", "m1")
 	publishMessageToQueue(t, srv, "s7-q", "m2")
