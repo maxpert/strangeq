@@ -37,14 +37,36 @@ const maxDropHeadEvictionsPerPublish = 1 << 20
 // would-exceed test, so a single body larger than the byte limit is accepted
 // into an empty queue. The caller has already loaded p (non-nil) and confirmed
 // Overflow == OverflowRejectPublish.
+//
+// WS-D §7: the counts include pending RESERVATIONS (admitted-but-not-yet-
+// counted copies), so a publisher admitted behind a gated/out-of-order
+// completion is still seen by every later admission.
 func maxLenRejectsPublish(qs *QueueState, p *QueuePolicy) bool {
-	if p.HasMaxLength && qs.WaitingCount() >= p.MaxLength {
+	if p.HasMaxLength && qs.WaitingCount()+qs.pendingCount.Load() >= p.MaxLength {
 		return true
 	}
-	if p.HasMaxLengthBytes && qs.ReadyBytes() >= p.MaxLengthBytes {
+	if p.HasMaxLengthBytes && qs.ReadyBytes()+qs.pendingBytes.Load() >= p.MaxLengthBytes {
 		return true
 	}
 	return false
+}
+
+// admitRejectPublish atomically checks the reject-publish limit (counting
+// reservations) and, if admitted, mints the tag WITH a reservation of
+// (1 message, bytes). maxLenMu is held ONLY for check+reserve (O(1), never
+// across I/O). A later FrontierComplete(tag, false) — store/enqueue failure —
+// pops the tag and releases its reservation.
+func admitRejectPublish(qs *QueueState, p *QueuePolicy, bodyLen int) (tag uint64, admitted bool) {
+	var bytes int64
+	if p.HasMaxLengthBytes {
+		bytes = int64(bodyLen)
+	}
+	qs.maxLenMu.Lock()
+	defer qs.maxLenMu.Unlock()
+	if maxLenRejectsPublish(qs, p) {
+		return 0, false
+	}
+	return qs.FrontierReserveReserved(bytes), true
 }
 
 // dropHeadTrim evicts the globally-oldest ready messages (requeue ring first,

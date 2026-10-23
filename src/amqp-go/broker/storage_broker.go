@@ -2618,21 +2618,12 @@ func (b *StorageBroker) PublishMessage(exchangeName, routingKey string, message 
 		// AT OR OVER its limit; the message is not enqueued to this target and
 		// not dead-lettered. drop-head is applied AFTER enqueue (below).
 		p := queueState.Policy()
-		// For reject-publish, the AT-OR-OVER check and the matching enqueue must
-		// be atomic w.r.t. other publishers to this queue: two publishers both
-		// observing count == limit-1 would otherwise both accept and push the
-		// ready set permanently past the cap. maxLenMu serializes only this
-		// admission path; drop-head and no-policy queues stay lock-free.
+		// For reject-publish, the AT-OR-OVER check and the matching tag mint are
+		// atomic w.r.t. other publishers via admitRejectPublish (maxLenMu held
+		// for O(1) check+reserve only, never across I/O): two publishers both
+		// observing count == limit-1 can no longer both accept (§7).
 		rejectPublish := p != nil && p.Overflow == OverflowRejectPublish &&
 			(p.HasMaxLength || p.HasMaxLengthBytes)
-		if rejectPublish {
-			queueState.maxLenMu.Lock()
-			if maxLenRejectsPublish(queueState, p) {
-				queueState.maxLenMu.Unlock()
-				rejected = true
-				continue
-			}
-		}
 
 		// Assign the delivery tag. Every publish — transient or durable —
 		// reserves the tag as pending on the contiguous frontier UNDER the
@@ -2644,7 +2635,17 @@ func (b *StorageBroker) PublishMessage(exchangeName, routingKey string, message 
 		// reset), so pure-transient queues also go through the frontier after
 		// their first publish. The lock is held for O(1) work (append + atomic
 		// store), never across I/O.
-		msgID := queueState.FrontierReserve()
+		var msgID uint64
+		if rejectPublish {
+			id, ok := admitRejectPublish(queueState, p, len(message.Body))
+			if !ok {
+				rejected = true
+				continue
+			}
+			msgID = id
+		} else {
+			msgID = queueState.FrontierReserve()
+		}
 
 		var storeMsg *protocol.Message
 		if i == 0 {
@@ -2682,10 +2683,8 @@ func (b *StorageBroker) PublishMessage(exchangeName, routingKey string, message 
 		// Store to persistent storage
 		err := b.storage.StoreMessage(queueName, storeMsg)
 		if err != nil {
+			// FrontierComplete(false) pops the tag and releases its reservation.
 			queueState.FrontierComplete(msgID, false)
-			if rejectPublish {
-				queueState.maxLenMu.Unlock()
-			}
 			return fmt.Errorf("failed to store message to queue '%s': %w", queueName, err)
 		}
 
@@ -2693,17 +2692,18 @@ func (b *StorageBroker) PublishMessage(exchangeName, routingKey string, message 
 
 		// SQ-11 max-length: byte accounting + drop-head eviction AFTER the
 		// enqueue, so the just-published newest message is retained and the
-		// globally-oldest ready message is evicted first.
+		// globally-oldest ready message is evicted first. A RESERVED
+		// (reject-publish) copy's bytes were already transferred into readyBytes
+		// by the frontier pop — adding them here would double-count (drop-head
+		// and reject-publish are mutually exclusive, so the trim branch is
+		// unaffected).
 		if p != nil {
-			addReadyBytesOnEnqueue(queueState, p, len(storeMsg.Body))
+			if !rejectPublish {
+				addReadyBytesOnEnqueue(queueState, p, len(storeMsg.Body))
+			}
 			if p.Overflow == OverflowDropHead && (p.HasMaxLength || p.HasMaxLengthBytes) {
 				b.dropHeadTrim(queueState, queueName, p)
 			}
-		}
-		if rejectPublish {
-			// Admission (check + Publish + AddReadyBytes) is complete and now
-			// visible under the cap; release so the next publisher re-checks.
-			queueState.maxLenMu.Unlock()
 		}
 
 		// Done - polling loops will discover it (NO consumer iteration needed)
@@ -2863,18 +2863,12 @@ func (b *StorageBroker) PublishMessageAsyncConfirm(exchangeName, routingKey stri
 			backpressure = queueState
 		}
 
-		// SQ-11 reject-publish admission (synchronous), identical to PublishMessage.
+		// SQ-11 reject-publish admission (synchronous), identical to PublishMessage:
+		// admitRejectPublish reserves the admitted copy under maxLenMu (§7), so
+		// admissions behind gated/out-of-order completions are still counted.
 		p := queueState.Policy()
 		rejectPublish := p != nil && p.Overflow == OverflowRejectPublish &&
 			(p.HasMaxLength || p.HasMaxLengthBytes)
-		if rejectPublish {
-			queueState.maxLenMu.Lock()
-			if maxLenRejectsPublish(queueState, p) {
-				queueState.maxLenMu.Unlock()
-				rejected = true
-				continue
-			}
-		}
 
 		// Assign the delivery tag AND register it pending on this queue's
 		// contiguous durable frontier atomically, holding the queue's frontier
@@ -2882,7 +2876,17 @@ func (b *StorageBroker) PublishMessageAsyncConfirm(exchangeName, routingKey stri
 		// in tag order and any concurrent transient publisher that mints a higher
 		// tag observes the queue frontier-active and routes through it (A3
 		// race-safety — see QueueState.FrontierReserve).
-		msgID := queueState.FrontierReserve()
+		var msgID uint64
+		if rejectPublish {
+			id, ok := admitRejectPublish(queueState, p, len(message.Body))
+			if !ok {
+				rejected = true
+				continue
+			}
+			msgID = id
+		} else {
+			msgID = queueState.FrontierReserve()
+		}
 
 		var storeMsg *protocol.Message
 		if i == 0 {
@@ -2921,9 +2925,12 @@ func (b *StorageBroker) PublishMessageAsyncConfirm(exchangeName, routingKey stri
 		qn := queueName
 		pol := p
 		bodyLen := len(storeMsg.Body)
+		reserved := rejectPublish
 		completion := func(cerr error) {
 			qs.FrontierComplete(id, cerr == nil)
-			if cerr == nil && pol != nil {
+			// A RESERVED copy's bytes were transferred into readyBytes by the
+			// frontier pop; only an unreserved copy adds them here (§7).
+			if cerr == nil && pol != nil && !reserved {
 				addReadyBytesOnEnqueue(qs, pol, bodyLen)
 				if pol.Overflow == OverflowDropHead && (pol.HasMaxLength || pol.HasMaxLengthBytes) {
 					// Runs on the WAL batch-writer goroutine — eviction can block on
@@ -2941,17 +2948,11 @@ func (b *StorageBroker) PublishMessageAsyncConfirm(exchangeName, routingKey stri
 			// so RELEASE the frontier slot we reserved for this tag — otherwise it
 			// stays pending forever and wedges the per-queue frontier, blocking all
 			// later publishes to this queue (M1). real=false advances head past it
-			// without counting it ready. The aggregator is abandoned (guard never
-			// dropped => onDurable never fires). Propagate the failure synchronously.
+			// without counting it ready AND releases its reject-publish reservation
+			// (§7). The aggregator is abandoned (guard never dropped => onDurable
+			// never fires). Propagate the failure synchronously.
 			queueState.FrontierComplete(msgID, false)
-			if rejectPublish {
-				queueState.maxLenMu.Unlock()
-			}
 			return false, nil, fmt.Errorf("failed to store durable message to queue '%s': %w", queueName, serr)
-		}
-
-		if rejectPublish {
-			queueState.maxLenMu.Unlock()
 		}
 	}
 
@@ -3012,16 +3013,18 @@ func (b *StorageBroker) fanoutSharedAsyncConfirm(sdw sharedDurableWriter, agg *p
 		p := queueState.Policy()
 		rejectPublish := p != nil && p.Overflow == OverflowRejectPublish &&
 			(p.HasMaxLength || p.HasMaxLengthBytes)
+
+		var msgID uint64
 		if rejectPublish {
-			queueState.maxLenMu.Lock()
-			if maxLenRejectsPublish(queueState, p) {
-				queueState.maxLenMu.Unlock()
+			id, ok := admitRejectPublish(queueState, p, len(message.Body))
+			if !ok {
 				rejected = true
 				continue
 			}
+			msgID = id
+		} else {
+			msgID = queueState.FrontierReserve()
 		}
-
-		msgID := queueState.FrontierReserve()
 
 		var storeMsg *protocol.Message
 		if i == 0 {
@@ -3054,9 +3057,12 @@ func (b *StorageBroker) fanoutSharedAsyncConfirm(sdw sharedDurableWriter, agg *p
 		qn := queueName
 		pol := p
 		bodyLen := len(storeMsg.Body)
+		reservedCopy := rejectPublish
 		completion := func(cerr error) {
 			qs.FrontierComplete(id, cerr == nil)
-			if cerr == nil && pol != nil {
+			// A RESERVED copy's bytes were transferred into readyBytes by the
+			// frontier pop; only an unreserved copy adds them here (§7).
+			if cerr == nil && pol != nil && !reservedCopy {
 				addReadyBytesOnEnqueue(qs, pol, bodyLen)
 				if pol.Overflow == OverflowDropHead && (pol.HasMaxLength || pol.HasMaxLengthBytes) {
 					// Runs on the WAL batch-writer goroutine — hand drop-head trim to
@@ -3074,10 +3080,6 @@ func (b *StorageBroker) fanoutSharedAsyncConfirm(sdw sharedDurableWriter, agg *p
 			Message:   storeMsg,
 			OnDurable: completion,
 		})
-
-		if rejectPublish {
-			queueState.maxLenMu.Unlock()
-		}
 	}
 
 	if len(subs) > 0 {
@@ -3147,21 +3149,23 @@ func (b *StorageBroker) fanoutSharedSync(sdw sharedDurableWriter, message *proto
 		p := queueState.Policy()
 		rejectPublish := p != nil && p.Overflow == OverflowRejectPublish &&
 			(p.HasMaxLength || p.HasMaxLengthBytes)
-		if rejectPublish {
-			queueState.maxLenMu.Lock()
-			if maxLenRejectsPublish(queueState, p) {
-				queueState.maxLenMu.Unlock()
-				rejected = true
-				continue
-			}
-		}
 
 		// Reserve-at-mint on every target (I1-safe, symmetric with the async path):
 		// the tag registers pending on the contiguous durable frontier under the
 		// frontier lock, so a concurrent durable publisher minting a higher tag
 		// observes the queue frontier-active and can never advance head past this
 		// still-pending lower tag before its completion below marks it done.
-		msgID := queueState.FrontierReserve()
+		var msgID uint64
+		if rejectPublish {
+			id, ok := admitRejectPublish(queueState, p, len(message.Body))
+			if !ok {
+				rejected = true
+				continue
+			}
+			msgID = id
+		} else {
+			msgID = queueState.FrontierReserve()
+		}
 
 		var storeMsg *protocol.Message
 		if i == 0 {
@@ -3189,6 +3193,7 @@ func (b *StorageBroker) fanoutSharedSync(sdw sharedDurableWriter, message *proto
 		qn := queueName
 		pol := p
 		bodyLen := len(storeMsg.Body)
+		reservedCopy := rejectPublish
 		wg.Add(1)
 		completion := func(cerr error) {
 			defer wg.Done()
@@ -3201,7 +3206,9 @@ func (b *StorageBroker) fanoutSharedSync(sdw sharedDurableWriter, message *proto
 				errOnce.Do(func() { firstErr = cerr })
 				return
 			}
-			if pol != nil {
+			// A RESERVED copy's bytes were transferred into readyBytes by the
+			// frontier pop; only an unreserved copy adds them here (§7).
+			if pol != nil && !reservedCopy {
 				addReadyBytesOnEnqueue(qs, pol, bodyLen)
 				if pol.Overflow == OverflowDropHead && (pol.HasMaxLength || pol.HasMaxLengthBytes) {
 					// Completion runs on the WAL batch-writer goroutine — hand drop-head
@@ -3217,10 +3224,6 @@ func (b *StorageBroker) fanoutSharedSync(sdw sharedDurableWriter, message *proto
 			Message:   storeMsg,
 			OnDurable: completion,
 		})
-
-		if rejectPublish {
-			queueState.maxLenMu.Unlock()
-		}
 	}
 
 	if len(subs) > 0 {
@@ -3335,11 +3338,31 @@ func (b *StorageBroker) PublishMessageTx(txnStore interfaces.Storage, exchangeNa
 			return nil, fmt.Errorf("queue '%s' closed during backpressure wait: %w", queueName, ErrQueueClosed)
 		}
 
+		// W4 SQ-9 + SQ-11: one shared Policy() load for this target — used by the
+		// TTL anchor stamp (below) and the deferred max-length accounting closure.
+		p := queueState.Policy()
+
 		// Reserve the tag on the frontier at stage time, minting inside the
 		// callback so this queue's frontier tags register in tag order (same
 		// pattern as PublishMessage). The tag stays pending on the frontier
 		// until the deferred closure calls FrontierComplete after commit/abort.
-		msgID := queueState.FrontierReserve()
+		//
+		// §7.4 (D7): reject-publish admission applies in tx too. A refused copy
+		// is DROPPED (RabbitMQ silently drops a non-confirm reject-publish
+		// publish) — the tx proceeds with its other operations; no reserved
+		// slot and no deferred closure are produced for the dropped copy.
+		rejectPublish := p != nil && p.Overflow == OverflowRejectPublish &&
+			(p.HasMaxLength || p.HasMaxLengthBytes)
+		var msgID uint64
+		if rejectPublish {
+			id, ok := admitRejectPublish(queueState, p, len(message.Body))
+			if !ok {
+				continue
+			}
+			msgID = id
+		} else {
+			msgID = queueState.FrontierReserve()
+		}
 		reserved = append(reserved, reservedSlot{queueState, msgID})
 
 		var storeMsg *protocol.Message
@@ -3360,10 +3383,6 @@ func (b *StorageBroker) PublishMessageTx(txnStore interfaces.Storage, exchangeNa
 			}
 			storeMsg = &msgCopy
 		}
-
-		// W4 SQ-9 + SQ-11: one shared Policy() load for this target — used by the
-		// TTL anchor stamp (below) and the deferred max-length accounting closure.
-		p := queueState.Policy()
 
 		// W4 SQ-9: stamp the TTL anchor for a queue-level x-message-ttl target that
 		// carried no per-message expiration, per copy. Like the top-of-function
@@ -3389,9 +3408,12 @@ func (b *StorageBroker) PublishMessageTx(txnStore interfaces.Storage, exchangeNa
 		qn := queueName
 		pol := p
 		bodyLen := len(storeMsg.Body)
+		reservedCopy := rejectPublish
 		deferred = append(deferred, func(commit bool) {
 			qs.FrontierComplete(id, commit)
-			if commit && pol != nil {
+			// A RESERVED copy's bytes were transferred into readyBytes by the
+			// frontier pop; only an unreserved copy adds them here (§7).
+			if commit && pol != nil && !reservedCopy {
 				addReadyBytesOnEnqueue(qs, pol, bodyLen)
 				if pol.Overflow == OverflowDropHead && (pol.HasMaxLength || pol.HasMaxLengthBytes) {
 					b.dropHeadTrim(qs, qn, pol)

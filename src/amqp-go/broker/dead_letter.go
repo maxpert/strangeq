@@ -387,21 +387,24 @@ func (b *StorageBroker) republishToTargets(srcQueueName string, targets []string
 		p := qs.Policy()
 
 		// x-overflow=reject-publish: refuse the dead-letter when the target is
-		// AT-OR-OVER its limit. maxLenMu makes the check+enqueue atomic w.r.t. other
-		// admitters (normal publishers and concurrent republishes), so two dead-
-		// letters cannot both observe count==limit-1 and both push past the cap.
+		// AT-OR-OVER its limit. admitRejectPublish makes the check+reserve atomic
+		// w.r.t. other admitters (normal publishers and concurrent republishes),
+		// so two dead-letters cannot both observe count==limit-1 and both push
+		// past the cap — and an admitted dead-letter behind a gated completion is
+		// still counted (§7).
 		rejectPublish := p != nil && p.Overflow == OverflowRejectPublish &&
 			(p.HasMaxLength || p.HasMaxLengthBytes)
+		var msgID uint64
 		if rejectPublish {
-			qs.maxLenMu.Lock()
-			if maxLenRejectsPublish(qs, p) {
-				qs.maxLenMu.Unlock()
+			id, ok := admitRejectPublish(qs, p, len(clone.Body))
+			if !ok {
 				b.recordDeadLetterOverflow(srcQueueName, target)
 				continue
 			}
+			msgID = id
+		} else {
+			msgID = qs.FrontierReserve()
 		}
-
-		msgID := qs.FrontierReserve()
 
 		var storeMsg *protocol.Message
 		if first {
@@ -427,21 +430,17 @@ func (b *StorageBroker) republishToTargets(srcQueueName string, targets []string
 		// hook — rather than dropped silently. Behavior is unchanged: drop and
 		// continue.
 		if err := b.storage.StoreMessage(target, storeMsg); err != nil {
+			// FrontierComplete(false) pops the tag and releases its reservation.
 			qs.FrontierComplete(msgID, false)
-			if rejectPublish {
-				qs.maxLenMu.Unlock()
-			}
 			b.recordDeadLetterDrop(srcQueueName, target, err)
 			continue
 		}
 		qs.FrontierComplete(msgID, true)
 		// SQ-11: keep the DLX target's ready-bytes counter consistent when the
-		// target itself enforces x-max-length-bytes.
-		addReadyBytesOnEnqueue(qs, p, len(storeMsg.Body))
-		if rejectPublish {
-			// Admission (check + Publish + AddReadyBytes) is complete and now
-			// visible under the cap; release so the next admitter re-checks.
-			qs.maxLenMu.Unlock()
+		// target itself enforces x-max-length-bytes. A RESERVED copy's bytes
+		// were transferred by the frontier pop (§7) — skip the add here.
+		if !rejectPublish {
+			addReadyBytesOnEnqueue(qs, p, len(storeMsg.Body))
 		}
 
 		// drop-head with a limit: trim AFTER enqueue (lock-free) so the target
