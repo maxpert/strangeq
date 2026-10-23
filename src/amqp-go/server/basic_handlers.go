@@ -426,6 +426,14 @@ func (s *Server) processCompleteMessage(conn *protocol.Connection, channelID uin
 
 	// Buffer into transaction if channel is in transactional mode
 	if s.TransactionManager != nil && s.TransactionManager.IsTransactional(channelID) {
+		// WS-D §11.2 (R11 check_internal_exchange runs BEFORE tx buffering, in
+		// tx and non-tx mode alike): a publish to a missing/internal exchange
+		// fails NOW with the channel error, not at commit.
+		if sb, ok := s.Broker.(*StorageBrokerAdapter); ok {
+			if verr := sb.broker.ValidatePublishTarget(message.Exchange); verr != nil {
+				return s.closeChannelWithBrokerError(conn, channelID, verr, 60, 40)
+			}
+		}
 		op := transaction.NewPublishOperation(message.Exchange, message.RoutingKey, message)
 		if confirmTag > 0 {
 			op.DeliveryTag = confirmTag

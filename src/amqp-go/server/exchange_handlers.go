@@ -2,6 +2,7 @@ package server
 
 import (
 	"fmt"
+	"strings"
 
 	"github.com/maxpert/amqp-go/broker"
 	amqperrors "github.com/maxpert/amqp-go/errors"
@@ -184,6 +185,18 @@ func (s *Server) handleExchangeDelete(conn *protocol.Connection, channelID uint1
 		zap.String("exchange", deleteMethod.Exchange),
 		zap.Bool("if_unused", deleteMethod.IfUnused))
 
+	// WS-D §3.6 (R4 check_not_default_exchange /
+	// check_exchange_deletion): deleting the default exchange or an amq.*
+	// system exchange is a 403 channel error.
+	if deleteMethod.Exchange == "" {
+		return s.closeChannelWith(conn, channelID, uint16(amqperrors.AccessRefused),
+			"ACCESS_REFUSED - operation not permitted on the default exchange", 40, 20)
+	}
+	if strings.HasPrefix(deleteMethod.Exchange, "amq.") {
+		return s.closeChannelWith(conn, channelID, uint16(amqperrors.AccessRefused),
+			"ACCESS_REFUSED - deletion of system exchange '"+deleteMethod.Exchange+"' in vhost '/' not allowed", 40, 20)
+	}
+
 	// Authorization check: exchange.delete requires configure permission on exchange
 	if err := s.authorize(conn, channelID, interfaces.Operation{
 		Action:       interfaces.ActionConfigure,
@@ -197,6 +210,10 @@ func (s *Server) handleExchangeDelete(conn *protocol.Connection, channelID uint1
 	// Call the broker to delete the exchange
 	err = s.Broker.DeleteExchange(deleteMethod.Exchange, deleteMethod.IfUnused)
 	if err != nil {
+		// WS-D §3.6: if-unused refusal is a 406 channel error (M9).
+		if _, _, ok := brokerErrorReply(err); ok {
+			return s.closeChannelWithBrokerError(conn, channelID, err, 40, 20)
+		}
 		s.Log.Error("Failed to delete exchange",
 			zap.Error(err),
 			zap.String("exchange", deleteMethod.Exchange))

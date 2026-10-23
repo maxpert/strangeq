@@ -280,6 +280,10 @@ func (b *StorageBroker) deadLetter(policy *QueuePolicy, srcQueueName string, msg
 	// Re-enter routing ONLY through routeMessage (never a second router). The
 	// scratch is pooled and owned by this goroutine until releaseRouteScratch;
 	// republish happens before that release, so iterating rs.queues is safe.
+	// NOTE (§11): DLX republish intentionally bypasses ErrExchangeInternal —
+	// RabbitMQ allows a DLX to be an internal exchange (R11's
+	// check_internal_exchange guards only the basic.publish entry points,
+	// which this path never calls).
 	rs := acquireRouteScratch()
 	defer releaseRouteScratch(rs)
 	if err := b.routeMessage(exchange, routingKey, clone, rs); err != nil {

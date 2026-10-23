@@ -1507,18 +1507,27 @@ func (b *StorageBroker) DeleteExchange(name string, ifUnused bool) error {
 	_, err := b.storage.GetExchange(name)
 	if err != nil {
 		if errors.Is(err, interfaces.ErrExchangeNotFound) {
+			// D2/R4: deleting a missing exchange is delete-ok
+			// (rabbit_exchange:ensure_deleted → ok).
 			return nil
 		}
 		return err
 	}
 
+	// R4: in_use means "has bindings where this exchange is the SOURCE" —
+	// queue bindings (GetExchangeBindings) OR exchange-to-exchange source
+	// bindings (GetExchangeBindingsFrom).
 	if ifUnused {
-		bindings, err := b.storage.GetExchangeBindings(name)
+		qb, err := b.storage.GetExchangeBindings(name)
 		if err != nil {
 			return fmt.Errorf("failed to check exchange bindings: %w", err)
 		}
-		if len(bindings) > 0 {
-			return fmt.Errorf("exchange '%s' in use", name)
+		eb, err := b.storage.GetExchangeBindingsFrom(name)
+		if err != nil {
+			return fmt.Errorf("failed to check exchange bindings: %w", err)
+		}
+		if len(qb) > 0 || len(eb) > 0 {
+			return semErr(exchangeRS(name)+" in use", ErrExchangeInUse)
 		}
 	}
 
@@ -1538,6 +1547,9 @@ func (b *StorageBroker) DeleteExchange(name string, ifUnused bool) error {
 		for _, eb := range exchBindings {
 			if eb.Destination == name {
 				b.storage.DeleteExchangeBinding(eb.Source, eb.Destination, eb.RoutingKey)
+				// §12: the deleted exchange was the DESTINATION of this e2e
+				// binding; removing it may orphan an auto-delete SOURCE.
+				b.maybeAutoDeleteExchange(eb.Source)
 			}
 		}
 	}
@@ -1833,6 +1845,8 @@ func (b *StorageBroker) DeleteQueue(name string, ifUnused, ifEmpty bool) (int, e
 	record, err := b.storage.GetQueue(name)
 	if err != nil {
 		if errors.Is(err, interfaces.ErrQueueNotFound) {
+			// D2/R3: deleting a missing queue is delete-ok with count 0
+			// (rabbit_amqqueue:delete_with/6 maps not_found → {ok, 0}).
 			return 0, nil
 		}
 		return 0, err
@@ -1851,23 +1865,13 @@ func (b *StorageBroker) DeleteQueue(name string, ifUnused, ifEmpty bool) (int, e
 // ordinal its caller actually intends to destroy is what makes a stale
 // caller's delete a safe no-op instead of a silent cross-incarnation strand.
 func (b *StorageBroker) deleteQueueIncarnation(name string, wantOrdinal uint64, ifUnused, ifEmpty bool) (int, error) {
-	if ifUnused {
-		consumers, err := b.storage.GetQueueConsumers(name)
-		if err != nil {
-			return 0, fmt.Errorf("failed to check queue consumers: %w", err)
-		}
-		if len(consumers) > 0 {
-			return 0, fmt.Errorf("queue '%s' in use", name)
-		}
-	}
-
+	// R5 order: if-empty is checked BEFORE if-unused. is_empty means
+	// len == 0 where len counts READY messages only (depth = len +
+	// pending_acks): delivered-unacked messages do NOT block if-empty.
+	// WaitingCount is the ready set (the same count declare-ok reports).
 	if ifEmpty {
-		count, err := b.storage.GetQueueMessageCount(name)
-		if err != nil {
-			return 0, fmt.Errorf("failed to check queue message count: %w", err)
-		}
-		if count > 0 {
-			return 0, fmt.Errorf("queue '%s' not empty", name)
+		if qv, ok := b.queueStates.Load(name); ok && qv.(*QueueState).WaitingCount() > 0 {
+			return 0, semErr(queueRS(name)+" not empty", ErrQueueNotEmpty)
 		}
 	}
 
@@ -1889,8 +1893,19 @@ func (b *StorageBroker) deleteQueueIncarnation(name string, wantOrdinal uint64, 
 	// to being refused. That is disruption, not loss: the successor's confirmed
 	// messages and its dispatch cursors are untouched, and consumers reconnect.
 	// Unchanged from before this fix; logged as a follow-up.
+	// if-unused consults the LIVE consumer registry (R5 is_unused == consumer
+	// count 0). The check runs under the SAME consumers-mutex hold that
+	// performs the sweep, so a consumer registering concurrently either lands
+	// before the check (refused) or after the sweep (the pre-existing
+	// register-after-delete window, spec §16).
 	mu := b.getQueueConsumersMutex(name)
 	mu.Lock()
+	if ifUnused {
+		if val, ok := b.queueConsumers.Load(name); ok && len(val.([]*ConsumerState)) > 0 {
+			mu.Unlock()
+			return 0, semErr(queueRS(name)+" in use", ErrQueueInUse)
+		}
+	}
 	if val, ok := b.queueConsumers.Load(name); ok {
 		consumers := val.([]*ConsumerState)
 		for _, state := range consumers {
@@ -1920,6 +1935,17 @@ func (b *StorageBroker) deleteQueueIncarnation(name string, wantOrdinal uint64, 
 	// without persisting it, leaving a live publishable queue with no metadata
 	// record — whose durable publishes are confirmed and then discarded at the
 	// next restart as a deleted queue.
+	//
+	// §12: exchanges whose bindings are swept below are collected for
+	// auto-delete AFTER the create mutex is released (defers run LIFO, so this
+	// runs after cmu.Unlock): the leaf-lock section stays free of the extra
+	// DeleteExchange work (leaf rule, see getQueueCreateMutex).
+	var touched []string
+	defer func() {
+		for _, x := range touched {
+			b.maybeAutoDeleteExchange(x)
+		}
+	}()
 	cmu := b.getQueueCreateMutex(name)
 	cmu.Lock()
 	defer cmu.Unlock()
@@ -1953,6 +1979,7 @@ func (b *StorageBroker) deleteQueueIncarnation(name string, wantOrdinal uint64, 
 	if err == nil {
 		for _, binding := range bindings {
 			b.storage.DeleteBinding(binding.QueueName, binding.ExchangeName, binding.RoutingKey)
+			touched = append(touched, binding.ExchangeName)
 		}
 	}
 
@@ -1964,9 +1991,9 @@ func (b *StorageBroker) deleteQueueIncarnation(name string, wantOrdinal uint64, 
 	// never executes. PersistentMetadataStore.StoreConsumer is a documented
 	// no-op ("Consumer registration is ephemeral"), so nothing ever writes the
 	// consumers/<queue>/ directory that GetQueueConsumers reads, and it always
-	// returns an empty slice. The same fact silently disables the ifUnused
-	// check at the top of this function. That is a pre-existing defect wider
-	// than this change and is logged as a follow-up rather than fixed here.
+	// returns an empty slice. That fact no longer disables anything: WS-D §3
+	// moved the ifUnused check onto the LIVE consumer registry (queueConsumers)
+	// above, which is authoritative for running consumers.
 	consumers, err := b.storage.GetQueueConsumers(name)
 	if err == nil {
 		for _, consumer := range consumers {
@@ -2050,19 +2077,33 @@ func (b *StorageBroker) BindQueue(queueName, exchangeName, routingKey string, ar
 	return nil
 }
 
+// maybeAutoDeleteExchange deletes exchange `name` if it is auto-delete and
+// has no remaining bindings where it is the SOURCE (queue bindings + e2e) —
+// RabbitMQ's maybe_auto_delete on the source (§12). Storage-only; takes no
+// broker lock. Centralised so every binding-removal path (unbind, queue
+// delete, destination-exchange delete) gets the same cleanup.
+func (b *StorageBroker) maybeAutoDeleteExchange(name string) {
+	if name == "" {
+		return
+	}
+	ex, err := b.storage.GetExchange(name)
+	if err != nil || !ex.AutoDelete {
+		return
+	}
+	qb, _ := b.storage.GetExchangeBindings(name)
+	eb, _ := b.storage.GetExchangeBindingsFrom(name)
+	if len(qb) == 0 && len(eb) == 0 {
+		_ = b.DeleteExchange(name, false)
+	}
+}
+
 // UnbindQueue removes a binding between queue and exchange
 func (b *StorageBroker) UnbindQueue(queueName, exchangeName, routingKey string) error {
 	if err := b.storage.DeleteBinding(queueName, exchangeName, routingKey); err != nil {
 		return err
 	}
 
-	if exch, err := b.storage.GetExchange(exchangeName); err == nil && exch.AutoDelete {
-		bindings, _ := b.storage.GetExchangeBindings(exchangeName)
-		fromBindings, _ := b.storage.GetExchangeBindingsFrom(exchangeName)
-		if len(bindings) == 0 && len(fromBindings) == 0 {
-			b.DeleteExchange(exchangeName, false)
-		}
-	}
+	b.maybeAutoDeleteExchange(exchangeName)
 
 	return nil
 }
@@ -2095,7 +2136,7 @@ func (b *StorageBroker) BindExchange(destination, source, routingKey string, arg
 		}
 	}
 
-	destExchange, err := b.storage.GetExchange(destination)
+	_, err = b.storage.GetExchange(destination)
 	if err != nil {
 		if errors.Is(err, interfaces.ErrExchangeNotFound) {
 			return errNoExchange(destination)
@@ -2103,9 +2144,10 @@ func (b *StorageBroker) BindExchange(destination, source, routingKey string, arg
 		return err
 	}
 
-	if destExchange.Internal {
-		return fmt.Errorf("cannot bind to internal exchange '%s'", destination)
-	}
+	// §11 (R11): binding TO an internal exchange is exactly the supported use
+	// of internal exchanges — the old rejection here is removed. Publishing
+	// DIRECTLY to an internal exchange is what RabbitMQ forbids, and that is
+	// enforced at the publish entry points (ValidatePublishTarget et al).
 
 	if source == destination {
 		return fmt.Errorf("exchange binding cycle detected: %s -> %s", destination, source)
@@ -2124,13 +2166,7 @@ func (b *StorageBroker) UnbindExchange(destination, source, routingKey string) e
 		return err
 	}
 
-	if exch, err := b.storage.GetExchange(source); err == nil && exch.AutoDelete {
-		bindings, _ := b.storage.GetExchangeBindings(source)
-		fromBindings, _ := b.storage.GetExchangeBindingsFrom(source)
-		if len(bindings) == 0 && len(fromBindings) == 0 {
-			b.DeleteExchange(source, false)
-		}
-	}
+	b.maybeAutoDeleteExchange(source)
 
 	return nil
 }
@@ -2479,6 +2515,24 @@ func (b *StorageBroker) requeueInflightDelivery(qs *QueueState, queueName string
 // treated as immutable after publish). Reusing one Message object across
 // publishes aliases the same pointer in multiple ring slots, which breaks the
 // ring's tag-identity checks and permanently leaks ring count.
+// ValidatePublishTarget reports the errors basic.publish must raise
+// synchronously even in tx mode (R11, rabbit_channel.erl
+// check_internal_exchange runs before tx buffering): errNoExchange (404) and
+// ErrExchangeInternal (403).
+func (b *StorageBroker) ValidatePublishTarget(exchangeName string) error {
+	exchange, err := b.storage.GetExchange(exchangeName)
+	if err != nil {
+		if errors.Is(err, interfaces.ErrExchangeNotFound) {
+			return errNoExchange(exchangeName)
+		}
+		return err
+	}
+	if exchange.Internal {
+		return semErr("cannot publish to internal "+exchangeRS(exchangeName), ErrExchangeInternal)
+	}
+	return nil
+}
+
 func (b *StorageBroker) PublishMessage(exchangeName, routingKey string, message *protocol.Message) error {
 	// Get exchange (lock-free)
 	exchange, err := b.storage.GetExchange(exchangeName)
@@ -2487,6 +2541,11 @@ func (b *StorageBroker) PublishMessage(exchangeName, routingKey string, message 
 			return errNoExchange(exchangeName)
 		}
 		return err
+	}
+	// §11 (R11): publishing DIRECTLY to an internal exchange is refused
+	// (403); routing INTO one via e2e bindings remains allowed.
+	if exchange.Internal {
+		return semErr("cannot publish to internal "+exchangeRS(exchangeName), ErrExchangeInternal)
 	}
 
 	// W4 SQ-9: stamp the durable TTL anchor (enqueue instant) up front for a
@@ -2723,6 +2782,10 @@ func (b *StorageBroker) PublishMessageAsyncConfirm(exchangeName, routingKey stri
 			return false, nil, errNoExchange(exchangeName)
 		}
 		return false, nil, err
+	}
+	// §11 (R11): publishing DIRECTLY to an internal exchange is refused (403).
+	if exchange.Internal {
+		return false, nil, semErr("cannot publish to internal "+exchangeRS(exchangeName), ErrExchangeInternal)
 	}
 
 	// W4 SQ-9: stamp the durable TTL anchor for a valid per-message expiration
@@ -3198,6 +3261,12 @@ func (b *StorageBroker) PublishMessageTx(txnStore interfaces.Storage, exchangeNa
 			return nil, errNoExchange(exchangeName)
 		}
 		return nil, err
+	}
+	// §11 (R11): check_internal_exchange runs at publish time in tx and
+	// non-tx mode alike; the server also pre-checks via ValidatePublishTarget
+	// before buffering (spec §11.2).
+	if exchange.Internal {
+		return nil, semErr("cannot publish to internal "+exchangeRS(exchangeName), ErrExchangeInternal)
 	}
 
 	// Same pooled-scratch routing as PublishMessage. The deferred visibility

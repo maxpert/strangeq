@@ -401,8 +401,24 @@ func (s *Server) handleQueuePurge(conn *protocol.Connection, channelID uint16, p
 		return s.authzChannelError(conn, channelID, err, 50, 30)
 	}
 
+	// WS-D §4.4 (RabbitMQ with_exclusive_access_or_die): purging an exclusive
+	// queue owned by another connection is 405.
+	if sb, ok := s.Broker.(*StorageBrokerAdapter); ok {
+		if ownerID, exists := sb.broker.GetQueueOwner(queueName); exists && ownerID != conn.ID {
+			return s.closeChannelWith(conn, channelID, uint16(amqperrors.ResourceLocked),
+				"RESOURCE_LOCKED - cannot obtain exclusive access to locked queue '"+queueName+
+					"' in vhost '/'. It could be originally declared on another connection or the exclusive property value does not match that of the original declaration.",
+				50, 30)
+		}
+	}
+
 	count, err := s.Broker.PurgeQueue(queueName)
 	if err != nil {
+		// WS-D §4.4: a purge of a nonexistent queue is 404 via the shared
+		// mapping (the broker's closed-state path).
+		if _, _, ok := brokerErrorReply(err); ok {
+			return s.closeChannelWithBrokerError(conn, channelID, err, 50, 30)
+		}
 		s.Log.Error("Failed to purge queue",
 			zap.Error(err),
 			zap.String("queue", queueName))
@@ -454,8 +470,7 @@ func (s *Server) handleQueueDelete(conn *protocol.Connection, channelID uint16, 
 	if sb, ok := s.Broker.(*StorageBrokerAdapter); ok {
 		if ownerID, exists := sb.broker.GetQueueOwner(queueName); exists && ownerID != conn.ID {
 			replyText := fmt.Sprintf("QUEUE_LOCKED - queue '%s' is exclusive to another connection", queueName)
-			s.sendChannelClose(conn, channelID, uint16(amqperrors.ResourceLocked), replyText, 50, 40)
-			return fmt.Errorf("queue '%s' is exclusive to another connection", queueName)
+			return s.closeChannelWith(conn, channelID, uint16(amqperrors.ResourceLocked), replyText, 50, 40)
 		}
 	}
 
@@ -466,6 +481,11 @@ func (s *Server) handleQueueDelete(conn *protocol.Connection, channelID uint16, 
 
 	count, err := s.Broker.DeleteQueue(queueName, deleteMethod.IfUnused, deleteMethod.IfEmpty)
 	if err != nil {
+		// WS-D §3.6: if-unused/if-empty refusals are 406 channel errors
+		// (M8); the connection stays alive.
+		if _, _, ok := brokerErrorReply(err); ok {
+			return s.closeChannelWithBrokerError(conn, channelID, err, 50, 40)
+		}
 		s.Log.Error("Failed to delete queue",
 			zap.Error(err),
 			zap.String("queue", queueName))

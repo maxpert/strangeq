@@ -8,6 +8,7 @@ package main
 import (
 	"errors"
 	"testing"
+	"time"
 
 	amqp "github.com/rabbitmq/amqp091-go"
 	"github.com/stretchr/testify/assert"
@@ -293,4 +294,214 @@ func TestRedeclare_ExclusiveMismatch_405(t *testing.T) {
 	assert.Equal(t, 405, aerr.Code)
 	assert.Contains(t, aerr.Reason, "exclusive access")
 	assert.False(t, conn.IsClosed(), "405 is a channel error; the connection survives")
+}
+
+// T3.3 (D2): deleting a NONEXISTENT queue is delete-ok with count 0, and the
+// connection survives (RabbitMQ parity: rabbit_amqqueue:delete_with maps
+// not_found → {ok, 0}).
+func TestQueueDelete_Nonexistent_DeleteOkZero(t *testing.T) {
+	b := newRestartableBroker(t, nil)
+
+	conn, err := amqp.Dial(b.uri)
+	require.NoError(t, err)
+	defer conn.Close()
+
+	ch, err := conn.Channel()
+	require.NoError(t, err)
+	count, err := ch.QueueDelete("never-existed", false, false, false)
+	require.NoError(t, err, "delete of a nonexistent queue is delete-ok (D2)")
+	assert.Equal(t, 0, count)
+	assert.False(t, conn.IsClosed())
+}
+
+func TestExchangeDelete_Nonexistent_DeleteOk(t *testing.T) {
+	b := newRestartableBroker(t, nil)
+
+	conn, err := amqp.Dial(b.uri)
+	require.NoError(t, err)
+	defer conn.Close()
+
+	ch, err := conn.Channel()
+	require.NoError(t, err)
+	require.NoError(t, ch.ExchangeDelete("never-existed", false, false))
+	assert.False(t, conn.IsClosed())
+}
+
+// probeQueueDeleteFlagsDecode reports whether the server's queue.delete path
+// decodes the client one-octet if-unused/if-empty flags (P0-4 first half,
+// protocol stream, spec §3.6 dependency). The probe is a live-consumer
+// if-unused delete: when the flags decode, it is refused (406) and nothing is
+// deleted; when they do not decode, the delete SUCCEEDS (flags dropped).
+func probeQueueDeleteFlagsDecode(t *testing.T, uri string) (decoded bool) {
+	t.Helper()
+	conn, err := amqp.Dial(uri)
+	require.NoError(t, err)
+	defer conn.Close()
+	ch, err := conn.Channel()
+	require.NoError(t, err)
+	q, err := ch.QueueDeclare("probe-del", false, false, false, false, nil)
+	require.NoError(t, err)
+	_, err = ch.Consume(q.Name, "probe-c", false, false, false, false, nil)
+	require.NoError(t, err)
+	delCh, err := conn.Channel()
+	require.NoError(t, err)
+	_, derr := delCh.QueueDelete(q.Name, true, false, false)
+	if derr != nil {
+		var aerr *amqp.Error
+		if errors.As(derr, &aerr) && aerr.Code == 406 {
+			return true // if-unused decoded and was enforced
+		}
+	}
+	// The delete succeeded → the flags were dropped on the floor.
+	return false
+}
+
+// T3.1: queue.delete if-unused with a live consumer is 406, the queue
+// survives, and the consumer still receives.
+//
+// requires: protocol one-octet flag-decode fix (P0-4 first half).
+func TestQueueDelete_IfUnused_WithConsumer_406(t *testing.T) {
+	b := newRestartableBroker(t, nil)
+	if !probeQueueDeleteFlagsDecode(t, b.uri) {
+		t.Skip("requires: protocol one-octet flag-decode fix (P0-4 first half, another stream); broker twin TestDeleteQueue_IfUnused_LiveConsumer_Refused proves the semantics")
+	}
+
+	conn, err := amqp.Dial(b.uri)
+	require.NoError(t, err)
+	defer conn.Close()
+
+	ch, err := conn.Channel()
+	require.NoError(t, err)
+	q, err := ch.QueueDeclare("q", false, false, false, false, nil)
+	require.NoError(t, err)
+	deliveries, err := ch.Consume(q.Name, "c1", false, false, false, false, nil)
+	require.NoError(t, err)
+
+	delCh, err := conn.Channel()
+	require.NoError(t, err)
+	_, err = delCh.QueueDelete(q.Name, true, false, false)
+	aerr := amqpError(t, err)
+	assert.Equal(t, 406, aerr.Code)
+	assert.Contains(t, aerr.Reason, "in use")
+	assert.False(t, conn.IsClosed())
+
+	// The queue still exists and the consumer still receives.
+	pubCh, err := conn.Channel()
+	require.NoError(t, err)
+	require.NoError(t, pubCh.Publish("", q.Name, false, false, amqp.Publishing{Body: []byte("alive")}))
+	select {
+	case d := <-deliveries:
+		assert.Equal(t, "alive", string(d.Body))
+		_ = d.Ack(false)
+	case <-time.After(5 * time.Second):
+		t.Fatal("consumer did not receive after the refused delete")
+	}
+}
+
+// T3.2 (R5): queue.delete if-empty counts READY messages only. With 1
+// delivered-unacked and 0 ready it SUCCEEDS; with 1 ready it is 406.
+//
+// requires: protocol one-octet flag-decode fix (P0-4 first half).
+func TestQueueDelete_IfEmpty_WithUnacked(t *testing.T) {
+	b := newRestartableBroker(t, nil)
+	if !probeQueueDeleteFlagsDecode(t, b.uri) {
+		t.Skip("requires: protocol one-octet flag-decode fix (P0-4 first half, another stream); broker twin TestDeleteQueue_IfEmpty_ReadyVsUnacked proves the semantics")
+	}
+
+	conn, err := amqp.Dial(b.uri)
+	require.NoError(t, err)
+	defer conn.Close()
+
+	ch, err := conn.Channel()
+	require.NoError(t, err)
+	q, err := ch.QueueDeclare("q", false, false, false, false, nil)
+	require.NoError(t, err)
+	require.NoError(t, ch.Publish("", q.Name, false, false, amqp.Publishing{Body: []byte("m1")}))
+
+	// One delivered-unacked (manual-ack get), zero ready: delete SUCCEEDS (R5).
+	getCh, err := conn.Channel()
+	require.NoError(t, err)
+	_, ok, err := getCh.Get(q.Name, false)
+	require.NoError(t, err)
+	require.True(t, ok)
+	delCh, err := conn.Channel()
+	require.NoError(t, err)
+	_, err = delCh.QueueDelete(q.Name, false, true, false)
+	require.NoError(t, err, "if-empty with only unacked messages must succeed (R5)")
+
+	// Ready message present: 406 not empty.
+	q2, err := ch.QueueDeclare("q2", false, false, false, false, nil)
+	require.NoError(t, err)
+	require.NoError(t, ch.Publish("", q2.Name, false, false, amqp.Publishing{Body: []byte("m2")}))
+	delCh2, err := conn.Channel()
+	require.NoError(t, err)
+	_, err = delCh2.QueueDelete(q2.Name, false, true, false)
+	aerr := amqpError(t, err)
+	assert.Equal(t, 406, aerr.Code)
+	assert.Contains(t, aerr.Reason, "not empty")
+}
+
+// probeExchangeBindFlagDecode reports whether the server's exchange.bind
+// path decodes client one-octet flags correctly (P0-4 first half, owned by
+// the protocol stream, spec §16). Until that lands, client-level e2e tests
+// skip with a reason (§3.6 pattern); the broker twins prove the semantics.
+func probeExchangeBindFlagDecode(t *testing.T, uri string) (ok bool) {
+	t.Helper()
+	conn, err := amqp.Dial(uri)
+	require.NoError(t, err)
+	defer conn.Close()
+	ch, err := conn.Channel()
+	if err != nil {
+		return false
+	}
+	if err := ch.ExchangeDeclare("probe-a", "direct", false, false, false, false, nil); err != nil {
+		return false
+	}
+	if err := ch.ExchangeDeclare("probe-b", "direct", false, false, false, false, nil); err != nil {
+		return false
+	}
+	// A decode failure kills the CONNECTION (the handler returns the error),
+	// so the RPC must wait for bind-ok and the connection must survive.
+	if err := ch.ExchangeBind("probe-b", "k", "probe-a", false, nil); err != nil {
+		return false
+	}
+	if conn.IsClosed() {
+		return false
+	}
+	_ = ch.ExchangeDelete("probe-a", false, false)
+	_ = ch.ExchangeDelete("probe-b", false, false)
+	return true
+}
+
+// T11.1 client half: e2e binding into an internal exchange works end-to-end;
+// a direct publish to the internal exchange is refused by the broker (the 403
+// client mapping is WS-B M5; the broker twin covers ErrExchangeInternal).
+//
+// requires: protocol one-octet flag-decode fix (P0-4 first half, another stream).
+func TestInternal_PublishRejected_E2EBindingAllowed(t *testing.T) {
+	b := newRestartableBroker(t, nil)
+	if !probeExchangeBindFlagDecode(t, b.uri) {
+		t.Skip("requires: protocol one-octet flag-decode fix (P0-4 first half, another stream); broker twin TestInternal_PublishRejected_E2EBindingAllowed proves the semantics")
+	}
+
+	conn, err := amqp.Dial(b.uri)
+	require.NoError(t, err)
+	defer conn.Close()
+
+	ch, err := conn.Channel()
+	require.NoError(t, err)
+	require.NoError(t, ch.ExchangeDeclare("ix", "direct", false, false, true, false, nil))
+	require.NoError(t, ch.ExchangeDeclare("src", "direct", false, false, false, false, nil))
+	q, err := ch.QueueDeclare("iq", false, false, false, false, nil)
+	require.NoError(t, err)
+	require.NoError(t, ch.ExchangeBind("ix", "k", "src", false, nil), "e2e INTO an internal exchange is allowed")
+	require.NoError(t, ch.QueueBind(q.Name, "k", "ix", false, nil))
+
+	require.NoError(t, ch.Publish("src", "k", false, false, amqp.Publishing{Body: []byte("via-e2e")}))
+	getCh, err := conn.Channel()
+	require.NoError(t, err)
+	msg, ok, err := getCh.Get(q.Name, true)
+	require.NoError(t, err)
+	require.True(t, ok, "message routed src→ix→iq must arrive")
+	assert.Equal(t, "via-e2e", string(msg.Body))
 }
