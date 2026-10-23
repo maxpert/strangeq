@@ -93,11 +93,12 @@ type xDeathEvent struct {
 // increments that entry's count and moves it to the FRONT (head-insertion), so
 // x-death[0] is always the most recent death; a new pair is prepended with
 // count=1. On a repeat (R13, mc.erl update_death), the EXISTING entry is
-// PRESERVED VERBATIM — exchange, routing-keys, first time and ttl
-// (original-expiration) are NOT merged from the new event; only count and
-// last_time advance. x-first-death-{reason,queue,exchange} are set exactly
-// once, gated on the absence of x-first-death-reason (so a message recovered
-// with a prior first-death keeps it).
+// PRESERVED VERBATIM — exchange, routing-keys, time and ttl
+// (original-expiration) are NOT merged from the new event; only count
+// advances; time (first death) is preserved. x-first-death-{reason,queue,
+// exchange} are set exactly once, gated on the absence of
+// x-first-death-reason (so a message recovered with a prior first-death keeps
+// it).
 //
 // CONTRACT: annotateXDeath MUST be called on a message clone's Headers, never on
 // the live message pointer — see deadLetter.

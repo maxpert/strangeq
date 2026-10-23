@@ -232,7 +232,16 @@ func (tm *DefaultTransactionManager) CommitForConnection(connID string, channelI
 	}
 
 	if tm.executor == nil {
+		// Restore the channel-side state consumed at buffer time, exactly like
+		// a failed commit (WS-D §5.4): undos run in REVERSE order. Dropping the
+		// operations without running them leaked the taken wire-tag entries —
+		// never settled, never restored.
+		undos := tx.undos
 		tx.operations = tx.operations[:0]
+		tx.undos = nil
+		for i := len(undos) - 1; i >= 0; i-- {
+			undos[i]()
+		}
 		tx.state = interfaces.TransactionStateNone
 		return fmt.Errorf("no transaction executor available")
 	}
