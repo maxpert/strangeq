@@ -3,8 +3,8 @@ package broker
 import (
 	"errors"
 	"fmt"
-	"reflect"
 	"slices"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -1868,12 +1868,20 @@ func (b *StorageBroker) deleteQueueIncarnation(name string, wantOrdinal uint64, 
 // BindQueue binds a queue to an exchange
 func (b *StorageBroker) BindQueue(queueName, exchangeName, routingKey string, arguments map[string]interface{}) error {
 	// Validate exchange exists (lock-free)
-	_, err := b.storage.GetExchange(exchangeName)
+	bindEx, err := b.storage.GetExchange(exchangeName)
 	if err != nil {
 		if errors.Is(err, interfaces.ErrExchangeNotFound) {
 			return errNoExchange(exchangeName)
 		}
 		return err
+	}
+
+	// Headers-exchange bindings validate x-match at bind time (R9
+	// validate_binding), BEFORE anything is stored.
+	if bindEx.Kind == "headers" {
+		if verr := validateHeadersBinding(arguments); verr != nil {
+			return verr
+		}
 	}
 
 	// Validate the queue exists and store the binding under the queue's create
@@ -1950,12 +1958,20 @@ func (b *StorageBroker) BindExchange(destination, source, routingKey string, arg
 		return fmt.Errorf("cannot bind to default exchange")
 	}
 
-	_, err := b.storage.GetExchange(source)
+	srcExchange, err := b.storage.GetExchange(source)
 	if err != nil {
 		if errors.Is(err, interfaces.ErrExchangeNotFound) {
 			return errNoExchange(source)
 		}
 		return err
+	}
+
+	// Headers-SOURCE e2e bindings validate x-match at bind time (R9), before
+	// anything is stored.
+	if srcExchange.Kind == "headers" {
+		if verr := validateHeadersBinding(arguments); verr != nil {
+			return verr
+		}
 	}
 
 	destExchange, err := b.storage.GetExchange(destination)
@@ -3404,46 +3420,55 @@ func (b *StorageBroker) collectTargetQueues(exchange *protocol.Exchange, routing
 
 // Helper methods for routing
 
+// matchHeaders implements RabbitMQ's headers-exchange match (R9,
+// rabbit_exchange_type_headers.erl): every x-* binding key is skipped except
+// under the *-with-x modes; a void (nil) binding value is a PRESENCE check
+// (D5); typed values compare with headerValueMatches (integer widths equal,
+// integer vs float not, longstr ≡ binary by bytes). match_all([]) = true,
+// match_any([]) = false — a nil/empty binding therefore matches every
+// message. x-match itself is validated at bind time (validateHeadersBinding).
 func (b *StorageBroker) matchHeaders(bindingArgs map[string]interface{}, messageHeaders map[string]interface{}) bool {
-	if len(bindingArgs) == 0 {
-		return false
-	}
-
-	anyMatch := false
-	headerCount := 0
-	for key, value := range bindingArgs {
-		if key == "x-match" {
-			if s, ok := value.(string); ok && s == "any" {
-				anyMatch = true
-			}
+	mode, _ := bindingArgs["x-match"].(string) // validated at bind time
+	withX := mode == "all-with-x" || mode == "any-with-x"
+	any := mode == "any" || mode == "any-with-x"
+	for k, bv := range bindingArgs {
+		if k == "x-match" || (!withX && strings.HasPrefix(k, "x-")) {
 			continue
 		}
-		headerCount++
-	}
-
-	if headerCount == 0 {
-		return true
-	}
-
-	if messageHeaders == nil {
-		return false
-	}
-
-	for key, value := range bindingArgs {
-		if key == "x-match" {
-			continue
+		hv, present := messageHeaders[k] // nil map read is safe
+		var ok bool
+		if bv == nil {
+			ok = present // void binding value = presence check
+		} else {
+			ok = present && headerValueMatches(bv, hv)
 		}
-		msgValue, exists := messageHeaders[key]
-		matched := exists && reflect.DeepEqual(msgValue, value)
-		if anyMatch {
-			if matched {
-				return true
-			}
-		} else if !matched {
+		if any && ok {
+			return true
+		}
+		if !any && !ok {
 			return false
 		}
 	}
-	return !anyMatch
+	return !any // match_all([]) = true, match_any([]) = false
+}
+
+// validateHeadersBinding implements RabbitMQ's validate_binding for a headers
+// exchange (R9): x-match must be absent or a longstr naming one of the four
+// modes; anything else is binding_invalid (406).
+func validateHeadersBinding(args map[string]interface{}) error {
+	v, present := args["x-match"]
+	if !present {
+		return nil
+	}
+	s, ok := v.(string)
+	if !ok {
+		return semErr(fmt.Sprintf("Invalid x-match field type %T (value %v); expected longstr", v, v), ErrInvalidBindingArgument)
+	}
+	switch s {
+	case "all", "any", "all-with-x", "any-with-x":
+		return nil
+	}
+	return semErr(fmt.Sprintf("Invalid x-match field value %s; expected all, any, all-with-x, or any-with-x", s), ErrInvalidBindingArgument)
 }
 
 // Compatibility methods for existing broker interface

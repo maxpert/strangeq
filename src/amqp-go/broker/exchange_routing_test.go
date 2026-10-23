@@ -514,17 +514,22 @@ func TestMatchHeaders(t *testing.T) {
 		{"any: single header match", map[string]interface{}{"x-match": "any", "h1": "v1"}, map[string]interface{}{"h1": "v1"}, true},
 
 		{"xmatch only all matches nonempty", map[string]interface{}{"x-match": "all"}, map[string]interface{}{"h1": "v1"}, true},
-		{"xmatch only any matches nonempty", map[string]interface{}{"x-match": "any"}, map[string]interface{}{"h1": "v1"}, true},
+		// WS-D §10 (R9 match_any([]) = false): x-match "any" with zero keys
+		// matches NOTHING, even a nonempty header set.
+		{"xmatch only any matches nonempty", map[string]interface{}{"x-match": "any"}, map[string]interface{}{"h1": "v1"}, false},
 		{"xmatch only all matches nil headers", map[string]interface{}{"x-match": "all"}, nil, true},
-		{"xmatch only any matches nil headers", map[string]interface{}{"x-match": "any"}, nil, true},
+		{"xmatch only any matches nil headers", map[string]interface{}{"x-match": "any"}, nil, false},
 		{"xmatch only matches empty headers", map[string]interface{}{"x-match": "all"}, map[string]interface{}{}, true},
 
-		{"nil binding no match", nil, map[string]interface{}{"h1": "v1"}, false},
-		{"empty binding no match", map[string]interface{}{}, map[string]interface{}{"h1": "v1"}, false},
+		// WS-D §10 (R9 match_all([]) = true): a nil/empty binding is mode
+		// "all" with zero keys, so it matches EVERY message.
+		{"nil binding matches everything", nil, map[string]interface{}{"h1": "v1"}, true},
+		{"empty binding matches everything", map[string]interface{}{}, map[string]interface{}{"h1": "v1"}, true},
 
 		{"int32 equal", map[string]interface{}{"n": int32(5)}, map[string]interface{}{"n": int32(5)}, true},
 		{"int64 equal", map[string]interface{}{"n": int64(5)}, map[string]interface{}{"n": int64(5)}, true},
-		{"int32 vs int64 not equal", map[string]interface{}{"n": int32(5)}, map[string]interface{}{"n": int64(5)}, false},
+		// WS-D §10 (R9 untyped terms): integer widths compare by value.
+		{"int32 vs int64 equal by value", map[string]interface{}{"n": int32(5)}, map[string]interface{}{"n": int64(5)}, true},
 		{"string vs int not equal", map[string]interface{}{"n": "5"}, map[string]interface{}{"n": 5}, false},
 	}
 
