@@ -7,6 +7,26 @@ import (
 	"github.com/maxpert/amqp-go/protocol"
 )
 
+// txm returns the connection-scoped transaction manager view (WS-D D-NEW-1):
+// ForConnection(conn.ID) when the manager supports it, so channel numbers
+// (which AMQP scopes per connection) never collide across connections. It
+// returns nil when there is no manager, and the shared manager when the
+// manager cannot scope (a foreign implementation). WS-B switches the call
+// sites (tx_handlers.go, confirm_handlers.go, channel_handlers.go,
+// server.go, basic_handlers.go's tx checks) from s.TransactionManager to
+// s.txm(conn) on merge — the addendum reserves those files for WS-B.
+func (s *Server) txm(conn *protocol.Connection) interfaces.TransactionManager {
+	if s.TransactionManager == nil {
+		return nil
+	}
+	if scoper, ok := s.TransactionManager.(interface {
+		ForConnection(string) interfaces.TransactionManager
+	}); ok {
+		return scoper.ForConnection(conn.ID)
+	}
+	return s.TransactionManager
+}
+
 // txBufferSettlement takes the wire tag(s) NOW (RabbitMQ removes from the
 // unacked map at ack time, R14) and registers an undo that re-tracks them on
 // rollback/failed commit (WS-D §6). Returns known=false if wireTag is not

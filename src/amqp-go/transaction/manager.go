@@ -11,10 +11,19 @@ import (
 	"github.com/maxpert/amqp-go/protocol"
 )
 
+// txKey scopes a channel transaction to (connection, channel) (WS-D D-NEW-1):
+// channel numbers are per-CONNECTION in AMQP, so keying by channelID alone
+// made connection A's tx.select swallow every connection's same-numbered
+// channel. The legacy (zero connID) scope preserves the original API.
+type txKey struct {
+	conn string
+	ch   uint16
+}
+
 // DefaultTransactionManager provides the default implementation of TransactionManager
 type DefaultTransactionManager struct {
 	mutex         sync.RWMutex
-	channels      map[uint16]*ChannelTransaction
+	channels      map[txKey]*ChannelTransaction
 	executor      interfaces.TransactionExecutor
 	stats         *TransactionStats
 	atomicStorage interfaces.AtomicStorage // For atomic operations when available
@@ -44,7 +53,7 @@ type TransactionStats struct {
 // NewTransactionManager creates a new default transaction manager
 func NewTransactionManager() *DefaultTransactionManager {
 	return &DefaultTransactionManager{
-		channels: make(map[uint16]*ChannelTransaction),
+		channels: make(map[txKey]*ChannelTransaction),
 		stats: &TransactionStats{
 			operationCounts: make(map[interfaces.TransactionOperationType]int64),
 		},
@@ -67,18 +76,25 @@ func (tm *DefaultTransactionManager) SetExecutor(executor interfaces.Transaction
 
 // Select puts the channel into transactional mode
 func (tm *DefaultTransactionManager) Select(channelID uint16) error {
+	return tm.SelectForConnection("", channelID)
+}
+
+// SelectForConnection is Select scoped to a connection (D-NEW-1).
+func (tm *DefaultTransactionManager) SelectForConnection(connID string, channelID uint16) error {
 	tm.mutex.Lock()
 	defer tm.mutex.Unlock()
 
+	key := txKey{connID, channelID}
+
 	// Check if channel already has a transaction
-	if existing, exists := tm.channels[channelID]; exists {
+	if existing, exists := tm.channels[key]; exists {
 		if existing.state != interfaces.TransactionStateNone {
 			return fmt.Errorf("channel %d already has an active transaction", channelID)
 		}
 	}
 
 	// Create new transaction for the channel
-	tm.channels[channelID] = &ChannelTransaction{
+	tm.channels[key] = &ChannelTransaction{
 		channelID:  channelID,
 		state:      interfaces.TransactionStateActive,
 		operations: make([]*interfaces.TransactionOperation, 0),
@@ -89,10 +105,15 @@ func (tm *DefaultTransactionManager) Select(channelID uint16) error {
 
 // IsTransactional returns true if the channel is in transactional mode
 func (tm *DefaultTransactionManager) IsTransactional(channelID uint16) bool {
+	return tm.IsTransactionalForConnection("", channelID)
+}
+
+// IsTransactionalForConnection is IsTransactional scoped to a connection.
+func (tm *DefaultTransactionManager) IsTransactionalForConnection(connID string, channelID uint16) bool {
 	tm.mutex.RLock()
 	defer tm.mutex.RUnlock()
 
-	if tx, exists := tm.channels[channelID]; exists {
+	if tx, exists := tm.channels[txKey{connID, channelID}]; exists {
 		return tx.state != interfaces.TransactionStateNone
 	}
 	return false
@@ -100,10 +121,15 @@ func (tm *DefaultTransactionManager) IsTransactional(channelID uint16) bool {
 
 // GetState returns the current transaction state for a channel
 func (tm *DefaultTransactionManager) GetState(channelID uint16) interfaces.TransactionState {
+	return tm.GetStateForConnection("", channelID)
+}
+
+// GetStateForConnection is GetState scoped to a connection.
+func (tm *DefaultTransactionManager) GetStateForConnection(connID string, channelID uint16) interfaces.TransactionState {
 	tm.mutex.RLock()
 	defer tm.mutex.RUnlock()
 
-	if tx, exists := tm.channels[channelID]; exists {
+	if tx, exists := tm.channels[txKey{connID, channelID}]; exists {
 		tx.mutex.RLock()
 		defer tx.mutex.RUnlock()
 		return tx.state
@@ -113,8 +139,13 @@ func (tm *DefaultTransactionManager) GetState(channelID uint16) interfaces.Trans
 
 // AddOperation adds an operation to the current transaction
 func (tm *DefaultTransactionManager) AddOperation(channelID uint16, operation *interfaces.TransactionOperation) error {
+	return tm.AddOperationForConnection("", channelID, operation)
+}
+
+// AddOperationForConnection is AddOperation scoped to a connection.
+func (tm *DefaultTransactionManager) AddOperationForConnection(connID string, channelID uint16, operation *interfaces.TransactionOperation) error {
 	tm.mutex.RLock()
-	tx, exists := tm.channels[channelID]
+	tx, exists := tm.channels[txKey{connID, channelID}]
 	tm.mutex.RUnlock()
 
 	if !exists {
@@ -145,8 +176,13 @@ func (tm *DefaultTransactionManager) AddOperation(channelID uint16, operation *i
 // WS-D §6). It behaves like AddOperation; on error it runs undo itself and
 // returns.
 func (tm *DefaultTransactionManager) AddOperationWithUndo(channelID uint16, op *interfaces.TransactionOperation, undo func()) error {
+	return tm.AddOperationWithUndoForConnection("", channelID, op, undo)
+}
+
+// AddOperationWithUndoForConnection is AddOperationWithUndo scoped to a connection.
+func (tm *DefaultTransactionManager) AddOperationWithUndoForConnection(connID string, channelID uint16, op *interfaces.TransactionOperation, undo func()) error {
 	tm.mutex.RLock()
-	tx, exists := tm.channels[channelID]
+	tx, exists := tm.channels[txKey{connID, channelID}]
 	tm.mutex.RUnlock()
 
 	if !exists {
@@ -175,8 +211,13 @@ func (tm *DefaultTransactionManager) AddOperationWithUndo(channelID uint16, op *
 
 // Commit commits all pending operations in the transaction
 func (tm *DefaultTransactionManager) Commit(channelID uint16) error {
+	return tm.CommitForConnection("", channelID)
+}
+
+// CommitForConnection is Commit scoped to a connection.
+func (tm *DefaultTransactionManager) CommitForConnection(connID string, channelID uint16) error {
 	tm.mutex.RLock()
-	tx, exists := tm.channels[channelID]
+	tx, exists := tm.channels[txKey{connID, channelID}]
 	tm.mutex.RUnlock()
 
 	if !exists {
@@ -229,8 +270,13 @@ func (tm *DefaultTransactionManager) Commit(channelID uint16) error {
 
 // Rollback discards all pending operations in the transaction
 func (tm *DefaultTransactionManager) Rollback(channelID uint16) error {
+	return tm.RollbackForConnection("", channelID)
+}
+
+// RollbackForConnection is Rollback scoped to a connection.
+func (tm *DefaultTransactionManager) RollbackForConnection(connID string, channelID uint16) error {
 	tm.mutex.RLock()
-	tx, exists := tm.channels[channelID]
+	tx, exists := tm.channels[txKey{connID, channelID}]
 	tm.mutex.RUnlock()
 
 	if !exists {
@@ -262,17 +308,29 @@ func (tm *DefaultTransactionManager) Rollback(channelID uint16) error {
 
 // Close cleans up transaction state for a channel
 func (tm *DefaultTransactionManager) Close(channelID uint16) error {
+	return tm.CloseForConnection("", channelID)
+}
+
+// CloseForConnection is Close scoped to a connection: only THAT connection's
+// channel state is dropped (D-NEW-1). Undos are dropped without running (the
+// channel is gone).
+func (tm *DefaultTransactionManager) CloseForConnection(connID string, channelID uint16) error {
 	tm.mutex.Lock()
 	defer tm.mutex.Unlock()
 
-	delete(tm.channels, channelID)
+	delete(tm.channels, txKey{connID, channelID})
 	return nil
 }
 
 // GetPendingOperations returns all pending operations for debugging/introspection
 func (tm *DefaultTransactionManager) GetPendingOperations(channelID uint16) ([]*interfaces.TransactionOperation, error) {
+	return tm.GetPendingOperationsForConnection("", channelID)
+}
+
+// GetPendingOperationsForConnection is GetPendingOperations scoped to a connection.
+func (tm *DefaultTransactionManager) GetPendingOperationsForConnection(connID string, channelID uint16) ([]*interfaces.TransactionOperation, error) {
 	tm.mutex.RLock()
-	tx, exists := tm.channels[channelID]
+	tx, exists := tm.channels[txKey{connID, channelID}]
 	tm.mutex.RUnlock()
 
 	if !exists {
@@ -459,13 +517,16 @@ func (tm *DefaultTransactionManager) GetTransactionStats() *interfaces.Transacti
 	channelStates := make(map[uint16]interfaces.TransactionState)
 	pendingOpsCount := 0
 
-	for channelID, tx := range tm.channels {
+	// Aggregate across ALL (conn, channel) keys (D-NEW-1): two connections may
+	// share a channel number, so channelStates is keyed by channel ID with
+	// last-write-wins — it is a stats view, not a correctness surface.
+	for key, tx := range tm.channels {
 		tx.mutex.RLock()
 		state := tx.state
 		opsCount := len(tx.operations)
 		tx.mutex.RUnlock()
 
-		channelStates[channelID] = state
+		channelStates[key.ch] = state
 		if state != interfaces.TransactionStateNone {
 			activeCount++
 		}
@@ -488,6 +549,71 @@ func (tm *DefaultTransactionManager) GetTransactionStats() *interfaces.Transacti
 		ChannelTransactions: channelStates,
 		OperationCounts:     opCounts,
 	}
+}
+
+// ForConnection returns a view implementing interfaces.TransactionManager
+// (plus AddOperationWithUndo) whose channel IDs are scoped to connID
+// (D-NEW-1). The legacy channelID-only methods on the manager itself keep
+// working through the zero-connID scope.
+func (tm *DefaultTransactionManager) ForConnection(connID string) interfaces.TransactionManager {
+	return &connTxView{tm: tm, connID: connID}
+}
+
+// connTxView scopes every channel-scoped TransactionManager call to connID.
+type connTxView struct {
+	tm     *DefaultTransactionManager
+	connID string
+}
+
+func (v *connTxView) Select(channelID uint16) error {
+	return v.tm.SelectForConnection(v.connID, channelID)
+}
+
+func (v *connTxView) IsTransactional(channelID uint16) bool {
+	return v.tm.IsTransactionalForConnection(v.connID, channelID)
+}
+
+func (v *connTxView) GetState(channelID uint16) interfaces.TransactionState {
+	return v.tm.GetStateForConnection(v.connID, channelID)
+}
+
+func (v *connTxView) AddOperation(channelID uint16, operation *interfaces.TransactionOperation) error {
+	return v.tm.AddOperationForConnection(v.connID, channelID, operation)
+}
+
+// AddOperationWithUndo is the §6 undo-carrying variant, scoped to the view's
+// connection. It is not part of interfaces.TransactionManager; the server
+// discovers it via the same anonymous-interface assertion as the legacy path.
+func (v *connTxView) AddOperationWithUndo(channelID uint16, op *interfaces.TransactionOperation, undo func()) error {
+	return v.tm.AddOperationWithUndoForConnection(v.connID, channelID, op, undo)
+}
+
+func (v *connTxView) Commit(channelID uint16) error {
+	return v.tm.CommitForConnection(v.connID, channelID)
+}
+
+func (v *connTxView) Rollback(channelID uint16) error {
+	return v.tm.RollbackForConnection(v.connID, channelID)
+}
+
+func (v *connTxView) Close(channelID uint16) error {
+	return v.tm.CloseForConnection(v.connID, channelID)
+}
+
+func (v *connTxView) GetPendingOperations(channelID uint16) ([]*interfaces.TransactionOperation, error) {
+	return v.tm.GetPendingOperationsForConnection(v.connID, channelID)
+}
+
+func (v *connTxView) SetExecutor(executor interfaces.TransactionExecutor) {
+	v.tm.SetExecutor(executor)
+}
+
+func (v *connTxView) ExecuteAtomic(channelID uint16, operations func() error) error {
+	return v.tm.ExecuteAtomic(channelID, operations)
+}
+
+func (v *connTxView) GetTransactionStats() *interfaces.TransactionStats {
+	return v.tm.GetTransactionStats()
 }
 
 // Helper function to create transaction operations
