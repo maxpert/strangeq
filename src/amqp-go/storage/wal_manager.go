@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"hash/crc32"
 	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"sync"
@@ -308,7 +309,55 @@ type QueueWAL struct {
 	// (SQ-8). It pairs a Begin marker with its Commit marker so recovery can
 	// detect a stray/torn commit whose begin is missing.
 	txEpoch atomic.Uint64
+
+	// --- WS-C: write-error repair / roll state. Guarded by fileMutex. ---
+	// Every field below is appended AFTER txEpoch: the layout test pins only
+	// the fields above, and all of these are cold-path.
+
+	// poisoned is non-nil when the current file's size != fileOffset and the
+	// divergence could not be repaired. While poisoned, no byte is written to
+	// the diverged file; ensureWritableLocked tries to roll it away first.
+	poisoned error
+	// consecutiveFailures counts failed batches/txs in a row; reset on success.
+	consecutiveFailures int
+	// degraded is set when consecutiveFailures >= walDegradedAfterFailures or
+	// the file is poisoned; errors then carry ErrWALUnavailable. Cleared by a
+	// successful roll (the WAL is writable again) or a successful batch.
+	degraded bool
+	// rollBackoff / nextRollAttempt bound roll retries: a failed roll is
+	// retried on a later flush once the backoff window expires, inline — no
+	// timer goroutine (acceptance rule 9).
+	rollBackoff     time.Duration
+	nextRollAttempt time.Time // zero = may attempt now
+	// rollFailures counts consecutive failed roll attempts, for log throttling.
+	rollFailures int
+	// fileClosed is set by close() under fileMutex; flushBatch and
+	// writeTxAtomic refuse with ErrWALClosed after it.
+	fileClosed bool
+
+	// --- WS-C: close race (C9) ---
+	// enqueueMu/closing make "Close has begun" visible to enqueuers. Every
+	// successful writeChan send happens-before closing = true (RWMutex), so
+	// after close(stopChan) the writer's final drain observes every enqueued
+	// request and no send can arrive after it.
+	enqueueMu sync.RWMutex
+	closing   bool // guarded by enqueueMu
+
+	// logger reports the WAL's cold-path durability failures (poison, roll
+	// backoff, degraded transitions). nil = silent. Wired by
+	// WALManager.SetLogger.
+	logger atomicLogger
 }
+
+// Package tunables for the WS-C roll/retry machinery. Unexported vars so
+// tests can shrink them; every test that mutates one restores it with
+// t.Cleanup and mutates it before the first write (the values are read under
+// fileMutex, so a mutation concurrent with a flush would be a data race).
+var (
+	walRollBackoffMin        = 10 * time.Millisecond
+	walRollBackoffMax        = 1 * time.Second
+	walDegradedAfterFailures = 8
+)
 
 // offsetLocation tracks where an offset lives in the WAL
 type offsetLocation struct {
@@ -383,6 +432,31 @@ type walFileInfo struct {
 	// BodyBlock record. performCheckpoint skips such files (keeping the body as
 	// ONE copy) unless the SharedBodyMaxPinAge backstop forces re-inline.
 	hasSharedBody bool
+
+	// --- WS-C (C1/C2/C5) durability bookkeeping, appended below the pinned
+	// fields. durableSize and damagedTail are written once, at roll time,
+	// before the entry is published under oldFilesMutex, so any read through
+	// the published entry is ordered by construction. checkpointed and
+	// retentionFailLogged are MUTATED after publication and are therefore
+	// only ever accessed under oldFilesMutex: tryDeleteOldFiles reads and
+	// writes them under Lock, and performCheckpoint copies checkpointed out
+	// under the RLock of its map snapshot (walCheckpointTarget) instead of
+	// reading it in its unlocked loop body. ---
+
+	// durableSize is the number of bytes known durable and intact. -1 (the
+	// inherited value set by rebuildBootState) means the whole file.
+	durableSize int64
+	// damagedTail is true when bytes beyond durableSize are a nacked partial
+	// batch that could not be truncated. The file is still checkpointed (up
+	// to durableSize) and unlinked once that succeeds.
+	damagedTail bool
+	// checkpointed is true once every unacked record in [0, durableSize) has
+	// been durably copied to a segment, so only the unlink remains.
+	// Access discipline: oldFilesMutex only (see the block comment above).
+	checkpointed bool
+	// retentionFailLogged throttles the retention keep-ERROR to once per file
+	// per failure streak. Access discipline: oldFilesMutex only.
+	retentionFailLogged bool
 }
 
 // NewWALManager creates a new WAL manager with shared WAL using default config
@@ -393,7 +467,7 @@ func NewWALManager(dataDir string) (*WALManager, error) {
 // NewWALManagerWithConfig creates a new WAL manager with custom config
 func NewWALManagerWithConfig(dataDir string, cfg WALConfig) (*WALManager, error) {
 	walDir := filepath.Join(dataDir, "wal")
-	if err := os.MkdirAll(walDir, 0755); err != nil {
+	if err := mkdirAllDurable(walDir); err != nil {
 		return nil, fmt.Errorf("failed to create WAL directory: %w", err)
 	}
 
@@ -474,6 +548,31 @@ func putDoneChannel(pool *sync.Pool, ch chan error) {
 	pool.Put(ch)
 }
 
+// enqueue hands req to the batch writer, refusing fast once Close has begun.
+//
+// C9 race fix: the entry points used to select between `writeChan <- req` and
+// `<-stopChan`; after close(stopChan) both cases could be ready, so a send
+// could win the select AFTER the writer's stop arm drained the channel and
+// returned — that request then sat in the buffer forever, hanging Write on
+// <-doneChan and losing an async onDone.
+//
+// closing is observed under enqueueMu: every successful send
+// happens-before closing = true (RWMutex), and close() closes stopChan only
+// after every in-flight sender has released the RLock. The writer's final
+// drain therefore observes every enqueued request, and no send can arrive
+// after it. A sender blocked on a full writeChan still makes progress: the
+// writer is guaranteed alive (stopChan is not yet closed) and never takes
+// enqueueMu, and completion callbacks are non-blocking by contract.
+func (qw *QueueWAL) enqueue(req *writeRequest) error {
+	qw.enqueueMu.RLock()
+	defer qw.enqueueMu.RUnlock()
+	if qw.closing {
+		return ErrWALClosed
+	}
+	qw.writeChan <- req
+	return nil
+}
+
 // Write writes a message to the shared WAL (synchronous batch write)
 // Blocks until the batch containing this message is fsynced to disk.
 // This ensures proper AMQP durability semantics (Option 2: Batch Synchronous).
@@ -482,25 +581,20 @@ func (wm *WALManager) Write(queueName string, message *protocol.Message, offset 
 	sw := wm.sharedWAL
 	wm.mu.RUnlock()
 	if sw == nil {
-		return fmt.Errorf("shared WAL not initialized")
+		return ErrWALClosed
 	}
 
 	// Get a response channel from the pool (avoids make(chan error, 1) per write)
 	doneChan := getDoneChannel(&doneChannelPool)
 	defer putDoneChannel(&doneChannelPool, doneChan)
 
-	// Guard against send-on-closed-channel panic during concurrent Close:
-	// select on stopChan so a shutting-down WAL returns an error instead of
-	// blocking forever or panicking (mirrors Acknowledge's pattern).
-	select {
-	case sw.writeChan <- &writeRequest{
+	if err := sw.enqueue(&writeRequest{
 		queueName: queueName,
 		message:   message,
 		offset:    offset,
 		done:      doneChan,
-	}:
-	case <-sw.stopChan:
-		return fmt.Errorf("WAL shutting down")
+	}); err != nil {
+		return err
 	}
 
 	// Block waiting for batch to be fsynced
@@ -527,22 +621,18 @@ func (wm *WALManager) WriteAsync(queueName string, message *protocol.Message, of
 	wm.mu.RUnlock()
 	if sw == nil {
 		if onDone != nil {
-			onDone(fmt.Errorf("shared WAL not initialized"))
+			onDone(ErrWALClosed)
 		}
 		return
 	}
 
-	select {
-	case sw.writeChan <- &writeRequest{
+	if err := sw.enqueue(&writeRequest{
 		queueName: queueName,
 		message:   message,
 		offset:    offset,
 		onDone:    onDone,
-	}:
-	case <-sw.stopChan:
-		if onDone != nil {
-			onDone(fmt.Errorf("WAL shutting down"))
-		}
+	}); err != nil && onDone != nil {
+		onDone(err)
 	}
 }
 
@@ -562,23 +652,18 @@ func (wm *WALManager) WriteSharedAsync(subs []sharedSub, body []byte, fanoutHint
 	sw := wm.sharedWAL
 	wm.mu.RUnlock()
 	if sw == nil {
-		return fmt.Errorf("shared WAL not initialized")
+		return ErrWALClosed
 	}
 	if len(subs) == 0 {
 		return nil
 	}
-	select {
-	case sw.writeChan <- &writeRequest{
+	return sw.enqueue(&writeRequest{
 		unit: &sharedUnit{
 			body:       body,
 			fanoutHint: fanoutHint,
 			subs:       subs,
 		},
-	}:
-		return nil
-	case <-sw.stopChan:
-		return fmt.Errorf("WAL shutting down")
-	}
+	})
 }
 
 // walGroupCommitFsync is the fsync applied by the group-commit batch writer
@@ -709,7 +794,140 @@ func scanWALFileRecordCounts(filePath string) (WALRecordCounts, error) {
 	return c, nil
 }
 
-// WriteTxAtomic durably writes a set of message records as one all-or-nothing
+// repairAfterFailedWriteLocked repairs the WAL file after a failed batch/tx
+// write or fsync: truncate back to the pre-write offset (which is >= the
+// header and equals the durable end, I4), make the truncation durable, and
+// verify with Stat. Precondition: fileMutex is held and pre is the fileOffset
+// captured before the write.
+//
+// WHY TRUNCATE ON FSYNC FAILURE, DELETING BYTES THAT MAY BE ON DISK: on
+// Linux a failed fsync can leave dirty pages marked clean ("fsyncgate").
+// The batch has been nacked; leaving the bytes creates (a) a resurrected
+// nacked record at restart, (b) for a tx, a resurrected nacked commit, and
+// (c) once more data is appended after possibly-lost pages, a zero/stale
+// hole followed by data — exactly the interior pattern that refuses boot.
+// Truncating removes the region from the page cache and the file; the
+// publisher retries and at-least-once is preserved. The truncate happens
+// even when n == 0: one syscall that guards a kernel/FUSE layer reporting an
+// error after a partial append.
+//
+// If the repair itself fails, the file is POISONED (never written again; the
+// roll is attempted immediately) and the caller reports Repaired=false.
+func (qw *QueueWAL) repairAfterFailedWriteLocked(pre int64, op string, cause error) *WALWriteError {
+	werr := &WALWriteError{Op: op, Cause: cause}
+	err := walTruncate(qw.currentFile, pre, !qw.cfg.SyncDisabled)
+	if err == nil {
+		st, serr := qw.currentFile.Stat()
+		switch {
+		case serr != nil:
+			err = fmt.Errorf("stat after truncate: %w", serr)
+		case st.Size() != pre:
+			err = fmt.Errorf("size %d after truncate to %d", st.Size(), pre)
+		}
+	}
+	if err == nil {
+		// Belt-and-braces: fileOffset was never advanced past pre, but
+		// restoring it explicitly keeps I3 true by construction.
+		qw.fileOffset.Store(pre)
+		werr.Repaired = true
+		return werr
+	}
+	qw.poisonLocked(fmt.Errorf("WAL file %s diverged after failed %s and could not be truncated: %w",
+		qw.currentFile.Name(), op, err))
+	// First attempt is immediate (ignoreBackoff): if the roll works, the very
+	// next batch is served by a fresh file.
+	_ = qw.tryRollLocked(true)
+	return werr
+}
+
+// poisonLocked marks the current file as diverged. While poisoned, no byte is
+// written to it (ensureWritableLocked refuses or rolls first). The diverged
+// file STAYS OPEN FOR READS: every index entry for it points below the
+// pre-write offset, which is intact, and read-ahead is bounded at the durable
+// end (C7). On a successful roll it is retired with durableSize/damagedTail
+// and the poison clears.
+func (qw *QueueWAL) poisonLocked(cause error) {
+	qw.poisoned = cause
+	qw.degraded = true
+	qw.logError("WAL file diverged after a failed write and could not be repaired; rolling it away (the file stays readable and is checkpointed only up to its durable end)",
+		interfaces.LogField{Key: "error", Value: cause.Error()},
+		interfaces.LogField{Key: "file", Value: qw.currentFile.Name()})
+}
+
+// ensureWritableLocked refuses to write while the current file is poisoned
+// and tries to roll it away first. Precondition: fileMutex is held.
+func (qw *QueueWAL) ensureWritableLocked() error {
+	if qw.poisoned == nil {
+		return nil
+	}
+	if err := qw.tryRollLocked(false); err != nil {
+		// Fail fast, no disk I/O on the diverged file. The roll is retried on
+		// the next batch once the backoff window expires.
+		return fmt.Errorf("%w: %w", ErrWALUnavailable, qw.poisoned)
+	}
+	return nil // roll replaced the poisoned file; poisoned cleared inside
+}
+
+// failBatchLocked accounts one failed batch/tx, escalating to the typed
+// ErrWALUnavailable signal once the WAL is degraded (poisoned, or the
+// failure streak crossed walDegradedAfterFailures). While a writable file
+// exists there is NO request short-circuit: a cleared fault heals on the very
+// next batch. Short-circuiting happens only while poisoned (ensureWritableLocked).
+func (qw *QueueWAL) failBatchLocked(e *WALWriteError) error {
+	qw.consecutiveFailures++
+	if qw.consecutiveFailures == 1 || qw.consecutiveFailures%100 == 0 {
+		qw.logError("WAL batch failed; the batch was nacked and its partial bytes removed",
+			interfaces.LogField{Key: "op", Value: e.Op},
+			interfaces.LogField{Key: "repaired", Value: e.Repaired},
+			interfaces.LogField{Key: "error", Value: e.Cause.Error()},
+			interfaces.LogField{Key: "streak", Value: qw.consecutiveFailures})
+	}
+	if !qw.degraded && (qw.poisoned != nil || qw.consecutiveFailures >= walDegradedAfterFailures) {
+		qw.degraded = true
+		qw.logError("WAL DEGRADED: publishes are being nacked with ErrWALUnavailable-typed errors; the WAL self-heals on the next successful batch or roll",
+			interfaces.LogField{Key: "streak", Value: qw.consecutiveFailures})
+	}
+	if qw.degraded {
+		return fmt.Errorf("%w: %w", ErrWALUnavailable, e)
+	}
+	return e
+}
+
+// noteSuccessLocked records a durable success: the failure streak resets and
+// a degraded WAL recovers (logged once per transition). Precondition:
+// fileMutex is held.
+func (qw *QueueWAL) noteSuccessLocked() {
+	if qw.degraded {
+		qw.degraded = false
+		qw.logWarn("WAL recovered: a durable batch succeeded and publishes are confirmed again")
+	}
+	qw.consecutiveFailures = 0
+}
+
+// Health reports the WAL's write-path health: nil when healthy, or an error
+// wrapping ErrWALUnavailable when the WAL is degraded or poisoned. Cold path
+// (readiness wiring is a follow-up, spec §17). A closed manager reports nil:
+// it is not sick, it is gone.
+func (wm *WALManager) Health() error {
+	wm.mu.RLock()
+	sw := wm.sharedWAL
+	wm.mu.RUnlock()
+	if sw == nil {
+		return nil
+	}
+	sw.fileMutex.Lock()
+	defer sw.fileMutex.Unlock()
+	if sw.degraded || sw.poisoned != nil {
+		cause := sw.poisoned
+		if cause == nil {
+			cause = fmt.Errorf("%d consecutive write failures", sw.consecutiveFailures)
+		}
+		return fmt.Errorf("%w: %w", ErrWALUnavailable, cause)
+	}
+	return nil
+}
+
+// writeTxAtomic durably writes a set of message records as one all-or-nothing
 // transaction unit (SQ-8): a Begin marker, the records, then a Commit marker,
 // appended contiguously and fsynced exactly once. Recovery only applies the
 // records if the trailing Commit marker is present, so a crash before the fsync
@@ -738,6 +956,16 @@ func (qw *QueueWAL) writeTxAtomic(records []*RecoveryMessage) error {
 	qw.fileMutex.Lock()
 	defer qw.fileMutex.Unlock()
 
+	// The transaction slow path bypasses writeChan, so the enqueue gate cannot
+	// protect it: refuse under fileMutex once Close has shut the file down.
+	if qw.fileClosed {
+		return ErrWALClosed
+	}
+	// C1: never write to a diverged (poisoned) file; roll it away first.
+	if err := qw.ensureWritableLocked(); err != nil {
+		return err
+	}
+
 	currentFileNum := qw.fileNum.Load()
 	startPos := qw.fileOffset.Load()
 	epoch := qw.txEpoch.Add(1)
@@ -759,19 +987,37 @@ func (qw *QueueWAL) writeTxAtomic(records []*RecoveryMessage) error {
 	}
 	buf = append(buf, serializeTxMarker(WALTxMarkerCommit, epoch, qw.cfg.CRCDisabled)...)
 
-	n, err := qw.currentFile.Write(buf)
+	// Single write; through the walWrite hook seam (TEST-ONLY faults;
+	// default is f.Write). A short write (n < len(buf) with no error) is
+	// normalised to io.ErrShortWrite so the repair path is taken either way.
+	n, err := walWrite(qw.currentFile, buf)
+	if err == nil && n != len(buf) {
+		err = io.ErrShortWrite
+	}
 	if err != nil {
 		if qw.metrics != nil {
 			qw.metrics.RecordWALWriteError()
 		}
-		return fmt.Errorf("WAL transaction write failed: %w", err)
+		// C1: the whole contiguous tx unit is [startPos, EOF) — one truncate
+		// to startPos removes it and nothing else. Recovery never sees a
+		// half tx from a HANDLED error (a crash's torn Begin is already
+		// discarded by scanWALFile).
+		e := qw.failBatchLocked(qw.repairAfterFailedWriteLocked(startPos, "tx-write", err))
+		qw.assertOffsetInvariantLocked()
+		return e
 	}
 
 	// Single fsync makes the whole bracketed unit durable. The Commit marker is
 	// the last thing written, so if this fsync does not complete the tail
-	// (Commit) is lost and recovery discards the transaction.
+	// (Commit) is lost and recovery discards the transaction. walTxFsync is a
+	// hook seam whose default is exactly the previous direct fdatasyncFile.
+	//
+	// C1: a FAILED fsync no longer leaves the unit on disk. The client was
+	// told the commit failed; keeping the bytes would resurrect a nacked
+	// commit after restart and seed interior corruption once more data
+	// follows possibly-lost pages (fsyncgate). Truncate to startPos instead.
 	fsyncStart := time.Now()
-	fsyncErr := fdatasyncFile(qw.currentFile)
+	fsyncErr := walTxFsync(qw.currentFile)
 	if qw.metrics != nil {
 		qw.metrics.RecordWALFsync(time.Since(fsyncStart).Seconds())
 		if fsyncErr != nil {
@@ -779,7 +1025,9 @@ func (qw *QueueWAL) writeTxAtomic(records []*RecoveryMessage) error {
 		}
 	}
 	if fsyncErr != nil {
-		return fmt.Errorf("WAL transaction fsync failed: %w", fsyncErr)
+		e := qw.failBatchLocked(qw.repairAfterFailedWriteLocked(startPos, "tx-fsync", fsyncErr))
+		qw.assertOffsetInvariantLocked()
+		return e
 	}
 	if qw.metrics != nil {
 		for range records {
@@ -805,8 +1053,10 @@ func (qw *QueueWAL) writeTxAtomic(records []*RecoveryMessage) error {
 	qw.currentFileOffsetsMutex.Unlock()
 
 	newOffset := qw.fileOffset.Add(int64(n))
+	qw.noteSuccessLocked()
+	qw.assertOffsetInvariantLocked()
 	if newOffset >= qw.cfg.FileSize {
-		qw.rollFile()
+		qw.maybeRollLocked()
 	}
 	return nil
 }
@@ -1072,15 +1322,30 @@ func walBlankRecordHeader(crc, dataLen uint32) bool { return crc == 0 && dataLen
 // refused the boot, for damage entirely inside the last 2 KB of the file.
 //
 // Ra inspects the remaining bytes precisely because zeros are what a crash
-// leaves. So does this: everything from `from` to EOF must be zero. A read
+// leaves. So does this: everything from `from` to the end must be zero. A read
 // failure reports false — we cannot PROVE nothing follows, and the safe
 // direction for an unprovable tail is to treat it as interior corruption.
-func walNothingIntelligibleFollows(f *os.File, from int64) bool {
+//
+// limit bounds the "end": -1 means the file's real EOF. A bounded caller (a
+// damaged-tail WAL file scanned only up to its durable end, WS-C C1 §3.11)
+// treats bytes beyond the limit as ignorable, because it already knows they
+// are a nacked partial batch that will go away with the unlink.
+func walNothingIntelligibleFollows(f *os.File, from, limit int64) bool {
 	buf := make([]byte, 64*1024)
 	pos := from
 	for {
-		n, err := f.ReadAt(buf, pos)
-		for i := 0; i < n; i++ {
+		n := int64(len(buf))
+		if limit >= 0 {
+			remaining := limit - pos
+			if remaining <= 0 {
+				return true
+			}
+			if remaining < n {
+				n = remaining
+			}
+		}
+		nr, err := f.ReadAt(buf[:n], pos)
+		for i := 0; i < nr; i++ {
 			if buf[i] != 0 {
 				return false
 			}
@@ -1091,14 +1356,15 @@ func walNothingIntelligibleFollows(f *os.File, from int64) bool {
 		if err != nil {
 			return false
 		}
-		if n == 0 {
+		if nr == 0 {
 			return true
 		}
-		pos += int64(n)
+		pos += int64(nr)
 	}
 }
 
-// scanWALFile scans a single WAL file and returns all messages.
+// scanWALFile scans a single WAL file and returns all messages. It is
+// scanWALFileUpTo with no bound (the file's real EOF).
 //
 // CLASSIFICATION (Ra's three-way split, ref-rabbitmq.md §1.3 — RabbitMQ's own
 // answer for its own modern engine):
@@ -1125,6 +1391,17 @@ func walNothingIntelligibleFollows(f *os.File, from int64) bool {
 // It returns the messages it did parse ALONGSIDE any fault, so a degraded or
 // benign outcome keeps its partial data; only a fatal outcome discards it.
 func (qw *QueueWAL) scanWALFile(filePath string) ([]*RecoveryMessage, error) {
+	return qw.scanWALFileUpTo(filePath, -1)
+}
+
+// scanWALFileUpTo scans a single WAL file up to limit bytes (-1 = whole
+// file). WS-C C1 §3.11: a rolled file whose tail holds a nacked partial batch
+// that could not be truncated (damagedTail) is checkpointed by scanning ONLY
+// [0, durableSize) — the garbage is never read and goes away with the unlink.
+// The bound is the scan's EOF: a record that would cross it is a torn tail
+// (benign), and walNothingIntelligibleFollows treats bytes beyond it as
+// ignorable.
+func (qw *QueueWAL) scanWALFileUpTo(filePath string, limit int64) ([]*RecoveryMessage, error) {
 	file, err := os.Open(filePath)
 	if err != nil {
 		return nil, err
@@ -1132,12 +1409,17 @@ func (qw *QueueWAL) scanWALFile(filePath string) ([]*RecoveryMessage, error) {
 	defer file.Close()
 
 	// fileSize is what makes "is this the last record" a fact rather than a
-	// guess: a CRC failure is tolerable exactly when nothing follows it.
+	// guess: a CRC failure is tolerable exactly when nothing follows it. When
+	// a durable-end bound is given, bytes beyond it are known garbage and are
+	// excluded from both the scan and the nothing-follows test.
 	stat, serr := file.Stat()
 	if serr != nil {
 		return nil, serr
 	}
 	fileSize := stat.Size()
+	if limit >= 0 && fileSize > limit {
+		fileSize = limit
+	}
 	var scanFault error
 
 	// Detect the file-level header and start parsing records after it. ITER4 is a
@@ -1147,7 +1429,11 @@ func (qw *QueueWAL) scanWALFile(filePath string) ([]*RecoveryMessage, error) {
 	if err != nil {
 		return nil, err
 	}
-	if _, err := file.Seek(dataStart, io.SeekStart); err != nil {
+
+	// Read records through a section reader bounded at fileSize so a bounded
+	// scan cannot run past the durable end.
+	reader := io.NewSectionReader(file, 0, fileSize)
+	if _, err := reader.Seek(dataStart, io.SeekStart); err != nil {
 		return nil, err
 	}
 
@@ -1179,7 +1465,7 @@ func (qw *QueueWAL) scanWALFile(filePath string) ([]*RecoveryMessage, error) {
 		// short read at the tail (a crash mid-write) breaks out, dropping the
 		// partial trailing record — CRC would reject it anyway.
 		hdr := make([]byte, 8)
-		if _, err := io.ReadFull(file, hdr); err != nil {
+		if _, err := io.ReadFull(reader, hdr); err != nil {
 			if errors.Is(err, io.ErrUnexpectedEOF) {
 				scanFault = interfaces.BenignFault("wal-scan", filePath,
 					fmt.Sprintf("truncated record header at byte offset %d; the trailing partial record was never fsynced, so no publisher was confirmed for it", recStart))
@@ -1192,7 +1478,7 @@ func (qw *QueueWAL) scanWALFile(filePath string) ([]*RecoveryMessage, error) {
 		if walBlankRecordHeader(crc, dataLen) {
 			// A zero region starting exactly on a record boundary. See
 			// walBlankRecordHeader: the write path cannot produce this.
-			if walNothingIntelligibleFollows(file, recStart) {
+			if walNothingIntelligibleFollows(file, recStart, fileSize) {
 				scanFault = interfaces.BenignFault("wal-scan", filePath,
 					fmt.Sprintf("zero-filled tail from byte offset %d to end of file (%d bytes); those blocks never reached the platter, so nothing in them was ever fsynced or confirmed", recStart, fileSize-recStart))
 				break
@@ -1204,7 +1490,7 @@ func (qw *QueueWAL) scanWALFile(filePath string) ([]*RecoveryMessage, error) {
 		}
 
 		data := make([]byte, dataLen)
-		if _, err := io.ReadFull(file, data); err != nil {
+		if _, err := io.ReadFull(reader, data); err != nil {
 			if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
 				scanFault = interfaces.BenignFault("wal-scan", filePath,
 					fmt.Sprintf("truncated record body at byte offset %d; the trailing partial record was never fsynced, so no publisher was confirmed for it", recStart))
@@ -1222,7 +1508,7 @@ func (qw *QueueWAL) scanWALFile(filePath string) ([]*RecoveryMessage, error) {
 			h.Write(hdr[4:8])
 			h.Write(data)
 			if crc != h.Sum32() {
-				if !walNothingIntelligibleFollows(file, recStart) {
+				if !walNothingIntelligibleFollows(file, recStart, fileSize) {
 					// INTERIOR. Silently skipping it (what this line used to do,
 					// with no count and no log) drops a confirmed durable
 					// message and reports the boot successful.
@@ -1318,7 +1604,7 @@ func (qw *QueueWAL) scanWALFile(filePath string) ([]*RecoveryMessage, error) {
 func (wm *WALManager) createSharedWAL() (*QueueWAL, error) {
 	// Create shared WAL directory
 	sharedDir := filepath.Join(wm.dataDir, "shared")
-	if err := os.MkdirAll(sharedDir, 0755); err != nil {
+	if err := mkdirAllDurable(sharedDir); err != nil {
 		return nil, fmt.Errorf("failed to create shared WAL directory: %w", err)
 	}
 
@@ -1451,9 +1737,29 @@ func (qw *QueueWAL) flushBatch(batch []*writeRequest, bufp *[]byte, positionsp *
 
 	qw.fileMutex.Lock()
 
+	// C9 belt-and-braces: a batch cannot normally arrive after close()
+	// finished waiting (enqueue closed the window), but refuse it cleanly if
+	// one ever does.
+	if qw.fileClosed {
+		qw.fileMutex.Unlock()
+		qw.deliverCompletions(batch, nil, ErrWALClosed)
+		return
+	}
+	// C1: never write to a file whose size != fileOffset (poisoned); roll it
+	// away first or fail fast.
+	if err := qw.ensureWritableLocked(); err != nil {
+		qw.fileMutex.Unlock()
+		qw.deliverCompletions(batch, nil, err)
+		return
+	}
+
 	// Get current file number and position BEFORE write
 	currentFileNum := qw.fileNum.Load()
 	currentFilePos := qw.fileOffset.Load()
+	// C1: currentFileHasSharedBody is set during serialization below; a failed
+	// write/fsync restores it so a nacked shared unit cannot pin the file out
+	// of checkpoint forever.
+	prevShared := qw.currentFileHasSharedBody
 
 	// Reuse the persistent serialization buffer (grow-once) and position scratch.
 	buf := (*bufp)[:0]
@@ -1554,18 +1860,30 @@ func (qw *QueueWAL) flushBatch(batch []*writeRequest, bufp *[]byte, positionsp *
 		*bufp = buf
 	}
 
-	// Single write (O_APPEND makes this atomic across processes)
-	n, err := qw.currentFile.Write(buf)
+	// Single write (O_APPEND makes this atomic across processes). The write
+	// goes through the walWrite hook seam (TEST-ONLY faults; default is
+	// f.Write). A short write (n < len(buf), no error) is normalised to
+	// io.ErrShortWrite: Go's os.File.Write sets it itself, but a hook may not.
+	n, err := walWrite(qw.currentFile, buf)
+	if err == nil && n != len(buf) {
+		err = io.ErrShortWrite
+	}
 	if err != nil {
 		// Record WAL write error
 		if qw.metrics != nil {
 			qw.metrics.RecordWALWriteError()
 		}
-		// Write failed - not durable, index NOT updated. Release the file lock
-		// before delivering completions (async callbacks must not run under
-		// fileMutex; see deliverCompletions).
+		// C1: the kernel may have appended n bytes. Truncate back to the
+		// pre-write offset (repaired, or poisoned+rolled if that fails), so
+		// the next batch's positions match the file and no interior
+		// corruption is produced. Not durable, index NOT updated. Release the
+		// file lock before delivering completions (async callbacks must not
+		// run under fileMutex; see deliverCompletions).
+		qw.currentFileHasSharedBody = prevShared
+		e := qw.failBatchLocked(qw.repairAfterFailedWriteLocked(currentFilePos, "write", err))
+		qw.assertOffsetInvariantLocked()
 		qw.fileMutex.Unlock()
-		qw.deliverCompletions(batch, serErr, fmt.Errorf("WAL write failed: %w", err))
+		qw.deliverCompletions(batch, serErr, e)
 		return
 	}
 
@@ -1607,9 +1925,19 @@ func (qw *QueueWAL) flushBatch(batch []*writeRequest, bufp *[]byte, positionsp *
 	// If fsync failed, messages are NOT durable: do NOT update the index (so a
 	// reader can never observe a non-durable record and no async caller ever
 	// advances visibility), and deliver the error to every caller.
+	//
+	// C1: the bytes are also REMOVED. A failed fsync can leave dirty pages
+	// marked clean (fsyncgate); nobody knows whether they reached the media,
+	// and a later fsync can succeed without them. Keeping them would
+	// resurrect nacked records at restart and, once more data is appended
+	// after possibly-lost pages, create the zero-hole-then-data interior
+	// pattern that refuses boot. Truncate back to the pre-write offset.
 	if fsyncErr != nil {
+		qw.currentFileHasSharedBody = prevShared
+		e := qw.failBatchLocked(qw.repairAfterFailedWriteLocked(currentFilePos, "fsync", fsyncErr))
+		qw.assertOffsetInvariantLocked()
 		qw.fileMutex.Unlock()
-		qw.deliverCompletions(batch, serErr, fsyncErr)
+		qw.deliverCompletions(batch, serErr, e)
 		return
 	}
 
@@ -1654,9 +1982,14 @@ func (qw *QueueWAL) flushBatch(batch []*writeRequest, bufp *[]byte, positionsp *
 	// Update offset
 	newOffset := qw.fileOffset.Add(int64(n))
 
-	// Check if we need to roll to new file
+	// Durable success: reset the failure streak (and recover from degraded).
+	qw.noteSuccessLocked()
+	qw.assertOffsetInvariantLocked()
+
+	// Check if we need to roll to new file. A failed roll never fails this
+	// durable batch (C3); the next flush retries it with backoff.
 	if newOffset >= qw.cfg.FileSize {
-		qw.rollFile()
+		qw.maybeRollLocked()
 	}
 
 	// Release the file lock, THEN deliver completions. Completions fire LAST,
@@ -2249,9 +2582,31 @@ func readShort(payload []byte, pos int) (s string, newPos int, ok bool) {
 	return string(payload[pos : pos+n]), pos + n, true
 }
 
-// rollFile rolls to a new WAL file when size limit reached
-func (qw *QueueWAL) rollFile() {
-	currentFileNum := qw.fileNum.Load()
+// rollFile rolls to a new WAL file when the size limit is reached.
+//
+// C3: OPEN BEFORE CLOSE. The next file is opened first; only then is the
+// current file retired and the handles switched over, all in one critical
+// section under fileMutex. If the open fails, NOTHING changes — the current
+// file stays active and writable (oversized; FileSize is a soft limit), and
+// the roll is retried by tryRollLocked/maybeRollLocked with backoff. The
+// previous shape (close, then open, error discarded) wedged the WAL until
+// restart on any open failure.
+//
+// Precondition: caller holds fileMutex.
+func (qw *QueueWAL) rollFile() error {
+	curNum := qw.fileNum.Load()
+	num := curNum + 1
+
+	// 1. Open the next file FIRST; the current file is untouched.
+	w, r, size, err := qw.openWALFile(num)
+	if err != nil {
+		return fmt.Errorf("WAL roll: %w", err)
+	}
+
+	// 2. Retire the current file. oldFiles/oldFileCache are published BEFORE
+	// the fileNum switch, so a reader that sees the new fileNum and holds an
+	// index entry for the old file takes the old-file arm and finds the cached
+	// handle.
 	currentPath := qw.currentFile.Name()
 
 	qw.currentFileOffsetsMutex.Lock()
@@ -2266,42 +2621,144 @@ func (qw *QueueWAL) rollFile() {
 	sharedBody := qw.currentFileHasSharedBody
 	qw.currentFileHasSharedBody = false
 
-	// Close current write file
-	_ = qw.currentFile.Close()
-
 	// Move current read handle to old file cache (it's already open, no need to reopen)
 	if qw.currentReadFile != nil {
 		qw.oldFileCacheMutex.Lock()
 		if qw.oldFileCache == nil {
 			qw.oldFileCache = make(map[uint64]*os.File)
 		}
-		qw.oldFileCache[currentFileNum] = qw.currentReadFile
-		qw.currentReadFile = nil
+		qw.oldFileCache[curNum] = qw.currentReadFile
 		qw.oldFileCacheMutex.Unlock()
 	}
 
-	// Move to old files map
+	// Move to old files map. durableSize is the durable end (I4: fileOffset is
+	// advanced only after a successful fsync); damagedTail records that bytes
+	// beyond it are a nacked partial batch that could not be truncated (C1).
 	qw.oldFilesMutex.Lock()
-	qw.oldFiles[currentFileNum] = &walFileInfo{
+	qw.oldFiles[curNum] = &walFileInfo{
 		path:          currentPath,
 		offsets:       fileOffsets,
 		createdAt:     time.Now(),
 		hasSharedBody: sharedBody,
+		durableSize:   qw.fileOffset.Load(),
+		damagedTail:   qw.poisoned != nil,
 	}
 	qw.oldFilesMutex.Unlock()
 
-	// Open next file
-	_ = qw.openNextFile()
+	// Close current write file. The close error is ignored as before: the
+	// file's records were fdatasynced by their batches, and the read handle
+	// stays open in the cache.
+	_ = qw.currentFile.Close()
+
+	// 3. Switch over in one step (still under fileMutex). A successful roll
+	// clears poison and degradation: the diverged file was just retired above
+	// and the WAL is writable again, so Health() reports nil.
+	qw.fileNum.Store(num)
+	qw.currentFile = w
+	qw.currentReadFile = r
+	qw.fileOffset.Store(size)
+	qw.poisoned = nil
+	qw.degraded = false
+	qw.rollBackoff = 0
+	qw.nextRollAttempt = time.Time{}
+	qw.rollFailures = 0
+	qw.assertOffsetInvariantLocked()
+	return nil
 }
 
-// openNextFile opens the next WAL file
-func (qw *QueueWAL) openNextFile() error {
-	fileNum := qw.fileNum.Add(1)
-	filename := filepath.Join(qw.dataDir, fmt.Sprintf("%020d%s", fileNum, WALFileExtension))
+// errRollBackoff is returned by tryRollLocked when the next roll attempt is
+// still inside the backoff window. It is an internal pacing signal, never a
+// write outcome.
+var errRollBackoff = errors.New("WAL roll backoff")
 
-	file, err := os.OpenFile(filename, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+// clampDuration clamps d into [min, max].
+func clampDuration(d, min, max time.Duration) time.Duration {
+	if d < min {
+		return min
+	}
+	if d > max {
+		return max
+	}
+	return d
+}
+
+// tryRollLocked attempts a roll, honouring the backoff window.
+// Precondition: caller holds fileMutex. On failure the backoff grows
+// (doubled, clamped to [walRollBackoffMin, walRollBackoffMax]) and the error
+// is returned; nothing else changes — the current file stays active and
+// writes continue past it (FileSize is a soft limit). ignoreBackoff skips the
+// window so the first attempt after a poison is immediate.
+func (qw *QueueWAL) tryRollLocked(ignoreBackoff bool) error {
+	now := time.Now()
+	if !ignoreBackoff && now.Before(qw.nextRollAttempt) {
+		return errRollBackoff
+	}
+	err := qw.rollFile()
+	if err == nil {
+		return nil
+	}
+	qw.rollBackoff = clampDuration(2*qw.rollBackoff, walRollBackoffMin, walRollBackoffMax)
+	qw.nextRollAttempt = now.Add(qw.rollBackoff)
+	qw.rollFailures++
+	if qw.rollFailures == 1 || qw.rollFailures%10 == 0 {
+		qw.logError("WAL roll failed; the current file stays active and writes continue past the size limit; retrying with backoff",
+			interfaces.LogField{Key: "error", Value: err.Error()},
+			interfaces.LogField{Key: "backoff", Value: qw.rollBackoff.String()},
+			interfaces.LogField{Key: "attempt", Value: qw.rollFailures})
+	}
+	return err
+}
+
+// maybeRollLocked is called after a durable batch/tx pushed the file past
+// FileSize. A failed roll never fails the durable batch: the bytes are
+// already fdatasynced and indexed, and nacking them would misreport durable
+// data and mint duplicates on retry. fileOffset stays >= FileSize until a
+// roll succeeds, so every later flush past the backoff window retries
+// automatically — no timer goroutine (acceptance rule 9).
+func (qw *QueueWAL) maybeRollLocked() {
+	_ = qw.tryRollLocked(false)
+}
+
+// logError / logWarn report a cold-path WAL failure when a logger is wired
+// (C1 §3.8); a nil logger (the default for a bare WALManager) is silent.
+func (qw *QueueWAL) logError(msg string, fields ...interfaces.LogField) {
+	if l := qw.logger.Load(); l != nil {
+		l.Error(msg, fields...)
+	}
+}
+
+func (qw *QueueWAL) logWarn(msg string, fields ...interfaces.LogField) {
+	if l := qw.logger.Load(); l != nil {
+		l.Warn(msg, fields...)
+	}
+}
+
+// SetLogger wires a structured logger into the shared WAL's cold failure
+// paths (poison, roll backoff, degraded transitions). Also publishes it as
+// the package-level sink for the one-time "directory fsync unsupported" WARN
+// (syncdir.go). Safe to call after the goroutines have started: the logger is
+// read atomically and only on failure paths.
+func (wm *WALManager) SetLogger(l interfaces.Logger) {
+	wm.mu.Lock()
+	defer wm.mu.Unlock()
+	storageWarnLogger.Store(l)
+	if wm.sharedWAL != nil {
+		wm.sharedWAL.logger.Store(l)
+	}
+}
+
+// openWALFile opens (creating if needed) WAL file number num and returns its
+// write handle, read handle and data size. It does NOT touch QueueWAL state,
+// which is what lets rollFile open the next file before retiring the current
+// one. On any failure AFTER the file was created, the handles are closed and
+// the file is removed, so a failed roll leaves at most nothing behind — never
+// a 1–5 byte headerless stub that every later boot refuses to append to.
+func (qw *QueueWAL) openWALFile(num uint64) (w, r *os.File, size int64, err error) {
+	filename := filepath.Join(qw.dataDir, fmt.Sprintf("%020d%s", num, WALFileExtension))
+
+	file, err := walOpenFile(filename, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
 	if err != nil {
-		return fmt.Errorf("failed to open WAL file: %w", err)
+		return nil, nil, 0, fmt.Errorf("failed to open WAL file: %w", err)
 	}
 
 	// Determine the current size so we (a) only write the file-level header on a
@@ -2312,9 +2769,10 @@ func (qw *QueueWAL) openNextFile() error {
 	stat, err := file.Stat()
 	if err != nil {
 		_ = file.Close()
-		return fmt.Errorf("failed to stat WAL file: %w", err)
+		return nil, nil, 0, fmt.Errorf("failed to stat WAL file: %w", err)
 	}
-	size := stat.Size()
+	size = stat.Size()
+	created := size == 0
 
 	// Write the file-level header (magic + version) only on a brand-new file
 	// (SQ-4). The header is flushed to disk together with the first record
@@ -2333,33 +2791,50 @@ func (qw *QueueWAL) openNextFile() error {
 	// COLD PATH: once per WAL file, i.e. once per FileSize bytes written
 	// (512 MB by default). The probe handle is opened only when the file is
 	// non-empty, which for every file this process creates is never.
-	if size == 0 {
+	if created {
 		header := make([]byte, 0, WALHeaderSize)
 		header = append(header, WALMagic...)
 		header = append(header, WALFormatVersion)
 		n, werr := file.Write(header)
 		if werr != nil {
+			// Best-effort truncate first (a 1–5 byte partial header is refused
+			// by every later boot), then close and REMOVE the file: a retry
+			// reuses the same number and starts clean.
+			_ = file.Truncate(0)
 			_ = file.Close()
-			return fmt.Errorf("failed to write WAL file header: %w", werr)
+			_ = os.Remove(filename)
+			return nil, nil, 0, fmt.Errorf("failed to write WAL file header: %w", werr)
 		}
 		size = int64(n)
+		// C4: make the file's directory entry durable NOW, at creation. The
+		// reliance point is the first confirm of a record in this file, which
+		// is always later; syncing here costs one directory fsync per WAL file
+		// (cold path: once per FileSize bytes) and keeps the per-batch cost
+		// flat. On failure the file is removed and the open fails — a file
+		// whose entry may not survive a crash must not be handed to the
+		// writer.
+		if serr := syncDir(qw.dataDir); serr != nil {
+			_ = file.Close()
+			_ = os.Remove(filename)
+			return nil, nil, 0, fmt.Errorf("WAL file directory fsync failed: %w", serr)
+		}
 	} else {
 		if size < int64(WALHeaderSize) {
 			_ = file.Close()
-			return fmt.Errorf("refusing to append to WAL file %s: %w: file is %d bytes, too short to carry a %d-byte header",
+			return nil, nil, 0, fmt.Errorf("refusing to append to WAL file %s: %w: file is %d bytes, too short to carry a %d-byte header",
 				filename, ErrUnsupportedWALVersion, size, WALHeaderSize)
 		}
 		// currentFile is O_WRONLY and cannot ReadAt; probe with its own handle.
 		probe, perr := os.Open(filename)
 		if perr != nil {
 			_ = file.Close()
-			return fmt.Errorf("failed to open WAL file %s for header validation: %w", filename, perr)
+			return nil, nil, 0, fmt.Errorf("failed to open WAL file %s for header validation: %w", filename, perr)
 		}
 		_, verr := walFileDataStart(probe)
 		_ = probe.Close()
 		if verr != nil {
 			_ = file.Close()
-			return fmt.Errorf("refusing to append to WAL file %s: %w", filename, verr)
+			return nil, nil, 0, fmt.Errorf("refusing to append to WAL file %s: %w", filename, verr)
 		}
 	}
 
@@ -2367,16 +2842,29 @@ func (qw *QueueWAL) openNextFile() error {
 	readFile, err := os.Open(filename)
 	if err != nil {
 		file.Close()
-		return fmt.Errorf("failed to open WAL read handle: %w", err)
+		if created {
+			// The file is ours and brand new; do not leave it behind.
+			_ = os.Remove(filename)
+		}
+		return nil, nil, 0, fmt.Errorf("failed to open WAL read handle: %w", err)
 	}
 
-	// Close previous read handle if any
-	if qw.currentReadFile != nil {
-		_ = qw.currentReadFile.Close()
-	}
+	return file, readFile, size, nil
+}
 
-	qw.currentFile = file
-	qw.currentReadFile = readFile
+// openNextFile opens the next WAL file and installs it. BOOT ONLY: it is
+// called from createSharedWAL before any background goroutine starts, which
+// is why it may install the new triple directly. Runtime rolls go through
+// rollFile, which retires the current file first.
+func (qw *QueueWAL) openNextFile() error {
+	num := qw.fileNum.Load() + 1
+	w, r, size, err := qw.openWALFile(num)
+	if err != nil {
+		return err
+	}
+	qw.fileNum.Store(num)
+	qw.currentFile = w
+	qw.currentReadFile = r
 	qw.fileOffset.Store(size)
 	return nil
 }
@@ -2453,8 +2941,11 @@ func (qw *QueueWAL) cleanupLoop() {
 	}
 }
 
-// tryDeleteOldFiles deletes WAL files where all messages are ACKed,
-// or where the retention period has expired (with best-effort checkpoint).
+// tryDeleteOldFiles deletes WAL files where all messages are ACKed, or where
+// the retention period has expired — in the latter case ONLY after the file's
+// unacked records are durably checkpointed to segments (WS-C C5: retention
+// never wins over durability; an expired file that cannot be checkpointed is
+// kept and the ERROR log says why, at the cost of disk growth).
 func (qw *QueueWAL) tryDeleteOldFiles() {
 	qw.oldFilesMutex.Lock()
 	defer qw.oldFilesMutex.Unlock()
@@ -2462,6 +2953,7 @@ func (qw *QueueWAL) tryDeleteOldFiles() {
 	qw.bitmapMutex.RLock()
 	defer qw.bitmapMutex.RUnlock()
 
+	unlinkedAny := false
 	for fileNum, info := range qw.oldFiles {
 		// Check if all actual message offsets in this file are ACKed.
 		// Uses bitmap intersection: file offsets ⊆ ackBitmap iff |file ∩ ack| == |file|.
@@ -2485,37 +2977,78 @@ func (qw *QueueWAL) tryDeleteOldFiles() {
 			time.Since(info.createdAt) > qw.cfg.RetentionPeriod
 
 		if allAcked {
-			_ = os.Remove(info.path)
-			qw.closeOldFileHandle(fileNum)
-			delete(qw.oldFiles, fileNum)
+			if err := walUnlink(info.path); err == nil || errors.Is(err, fs.ErrNotExist) {
+				unlinkedAny = true
+				qw.closeOldFileHandle(fileNum)
+				delete(qw.oldFiles, fileNum)
+			} else {
+				qw.logError("fully-acknowledged WAL file could not be unlinked; it stays registered and the next sweep retries",
+					interfaces.LogField{Key: "path", Value: info.path},
+					interfaces.LogField{Key: "error", Value: err.Error()})
+			}
 		} else if expired {
-			// Force-checkpoint unACKed messages to segments before deletion
-			qw.forceCheckpointFile(info)
-			_ = os.Remove(info.path)
-			qw.closeOldFileHandle(fileNum)
-			delete(qw.oldFiles, fileNum)
+			// Force-checkpoint unACKed messages to segments BEFORE deletion,
+			// and only delete when that succeeded. checkpointed (set by
+			// performCheckpoint or a previous successful sweep) means the copy
+			// is already durable and only the unlink remains.
+			if !info.checkpointed {
+				if err := qw.forceCheckpointFile(info); err != nil {
+					if !info.retentionFailLogged {
+						info.retentionFailLogged = true
+						qw.logError("retention: expired WAL file kept because its unacked records could not be checkpointed; disk use grows until this is fixed",
+							interfaces.LogField{Key: "path", Value: info.path},
+							interfaces.LogField{Key: "error", Value: err.Error()})
+					}
+					continue
+				}
+				info.retentionFailLogged = false
+				info.checkpointed = true
+			}
+			if err := walUnlink(info.path); err == nil || errors.Is(err, fs.ErrNotExist) {
+				unlinkedAny = true
+				qw.closeOldFileHandle(fileNum)
+				delete(qw.oldFiles, fileNum)
+			} else {
+				qw.logError("expired WAL file checkpointed but could not be unlinked; it stays registered and the next sweep retries only the unlink",
+					interfaces.LogField{Key: "path", Value: info.path},
+					interfaces.LogField{Key: "error", Value: err.Error()})
+			}
+		}
+	}
+
+	// C4: make this sweep's unlinks durable (once per tick that unlinked
+	// anything). Not a correctness barrier — a resurrected file is collapsed
+	// by the recovery dedup — so a failure is only logged.
+	if unlinkedAny {
+		if serr := syncDir(qw.dataDir); serr != nil {
+			qw.logWarn("WAL directory fsync after retention unlink failed; the space is not reclaimed durably yet and the next sweep retries",
+				interfaces.LogField{Key: "dir", Value: qw.dataDir},
+				interfaces.LogField{Key: "error", Value: serr.Error()})
 		}
 	}
 }
 
-// forceCheckpointFile is a best-effort checkpoint of unACKed messages from an
-// expired WAL file to segments before force-deletion. Errors are logged but
-// do not prevent file deletion (the retention contract takes priority).
-// NOTE: Caller must hold bitmapMutex (RLock) and oldFilesMutex (Lock).
-func (qw *QueueWAL) forceCheckpointFile(info *walFileInfo) {
-	segMgr := qw.getSegmentMgr()
-	if segMgr == nil {
-		return
-	}
-
+// forceCheckpointFile checkpoints an expired WAL file's unACKed messages to
+// segments before deletion. WS-C C5: retention NEVER wins over durability —
+// an error return means the file MUST be kept (its unacked records could not
+// be durably copied, or there is no segment manager to copy them to), and the
+// caller keeps it. A file with nothing unacked deletes losslessly with or
+// without segments, so that case returns nil.
+//
+// NOTE: Caller must hold bitmapMutex (RLock) and oldFilesMutex (Lock). The
+// segment I/O performed under those locks blocks Acknowledge during a
+// retention checkpoint; that is a pre-existing condition recorded as a
+// follow-up (spec §15), deliberately not changed here.
+func (qw *QueueWAL) forceCheckpointFile(info *walFileInfo) error {
 	// A degraded or benign scan fault (torn tail, tail CRC failure) still
 	// yields every intact record before the damage, and those records must
 	// still be checkpointed — bailing on any non-nil error would pin the file
 	// forever. Only a fatal fault, which means the file cannot be interpreted
-	// at all, aborts.
-	messages, err := qw.scanWALFile(info.path)
+	// at all, aborts (and keeps the file). The scan is bounded at the durable
+	// end (C1 §3.11).
+	messages, err := qw.scanWALFileUpTo(info.path, info.durableSize)
 	if err != nil && interfaces.OutcomeOf(err) == interfaces.RecoveryFatal {
-		return
+		return fmt.Errorf("retention: WAL file unreadable: %w", err)
 	}
 
 	// Group unACKed messages by queue
@@ -2525,11 +3058,20 @@ func (qw *QueueWAL) forceCheckpointFile(info *walFileInfo) {
 			byQueue[msg.QueueName] = append(byQueue[msg.QueueName], msg)
 		}
 	}
-
-	// Write to segments (best-effort — errors are ignored)
-	for queueName, queueMsgs := range byQueue {
-		_ = segMgr.CheckpointBatch(queueName, queueMsgs)
+	if len(byQueue) == 0 {
+		return nil // nothing unacked: deleting loses nothing
 	}
+
+	segMgr := qw.getSegmentMgr()
+	if segMgr == nil {
+		return errNoSegmentManager
+	}
+	for queueName, queueMsgs := range byQueue {
+		if err := segMgr.CheckpointBatch(queueName, queueMsgs); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // readMessage reads a message from shared WAL by queue+offset
@@ -3049,21 +3591,53 @@ func (qw *QueueWAL) sharedBodyBackstopFired(info *walFileInfo) bool {
 		time.Since(info.createdAt) > qw.cfg.SharedBodyMaxPinAge
 }
 
+// walCheckpointTarget is performCheckpoint's RLock-guarded snapshot of one
+// old file: the shared info pointer plus the fields that are MUTATED after
+// publication (checkpointed) or that the loop must not re-read unlocked
+// (durableSize, copied belt-and-braces), both taken under the same
+// oldFilesMutex.RLock that snapshots the map. The loop body then never reads
+// a field the cleanup goroutine may be writing under oldFilesMutex.Lock.
+type walCheckpointTarget struct {
+	info         *walFileInfo
+	checkpointed bool
+	durableSize  int64
+}
+
 // performCheckpoint moves messages from old WAL files to segments.
 // Only operates on old/rolled files — never touches the current active file.
 // For each old file: scan messages, filter out ACKed ones, write unACKed
 // messages to segments, then delete the WAL file and clean up the offset index.
+//
+// WS-C C2/C4: a WAL file is unlinked ONLY after every CheckpointBatch for its
+// unacked records returned nil — and nil now means written-in-full +
+// fdatasynced + directory-entry-durable (see CheckpointBatch). The
+// checkpointed flag records that state, so a pass that could not unlink (a
+// crash between fsync and unlink, or an unlink error) retries ONLY the unlink
+// on the next pass instead of re-writing the records. A multi-queue
+// checkpoint that fails part-way keeps the WAL file; the retry may rewrite a
+// queue that already succeeded, which the recovery-time dedup (C8) collapses.
 func (qw *QueueWAL) performCheckpoint() {
 	segMgr := qw.getSegmentMgr()
 	if segMgr == nil {
 		return
 	}
 
-	// Snapshot old files to avoid holding the lock during I/O
+	// Snapshot old files to avoid holding the lock during I/O. The MUTABLE
+	// flag (and the durable end, belt-and-braces) is copied under the same
+	// RLock: tryDeleteOldFiles (the cleanup goroutine) writes checkpointed
+	// under oldFilesMutex.Lock, so reading it from the loop body without this
+	// snapshot is a data race even though the flag only ever flips
+	// false→true. Everything else on walFileInfo is written once, before the
+	// entry is published under oldFilesMutex, so reading it through the
+	// snapshot-published pointer is ordered by construction.
 	qw.oldFilesMutex.RLock()
-	filesToCheckpoint := make(map[uint64]*walFileInfo, len(qw.oldFiles))
+	filesToCheckpoint := make(map[uint64]*walCheckpointTarget, len(qw.oldFiles))
 	for num, info := range qw.oldFiles {
-		filesToCheckpoint[num] = info
+		filesToCheckpoint[num] = &walCheckpointTarget{
+			info:         info,
+			checkpointed: info.checkpointed,
+			durableSize:  info.durableSize,
+		}
 	}
 	qw.oldFilesMutex.RUnlock()
 
@@ -3071,7 +3645,9 @@ func (qw *QueueWAL) performCheckpoint() {
 		return
 	}
 
-	for fileNum, info := range filesToCheckpoint {
+	unlinkedAny := false
+	for fileNum, target := range filesToCheckpoint {
+		info := target.info
 		// ITER5 cold-tail hardening (§2): a rolled file that carries a shared
 		// BodyBlock is SKIPPED (left in oldFiles), so the shared body survives as
 		// ONE copy across arbitrarily many checkpoints — reclaimed whole by
@@ -3084,39 +3660,65 @@ func (qw *QueueWAL) performCheckpoint() {
 			continue
 		}
 
-		// Scan the WAL file. See forceCheckpointFile: only a FATAL scan fault
-		// aborts; a torn tail still has every earlier record intact and they
-		// must reach a segment or the file can never be reclaimed.
-		messages, err := qw.scanWALFile(info.path)
-		if err != nil && interfaces.OutcomeOf(err) == interfaces.RecoveryFatal {
+		if !target.checkpointed {
+			// Scan the WAL file. See forceCheckpointFile: only a FATAL scan fault
+			// aborts; a torn tail still has every earlier record intact and they
+			// must reach a segment or the file can never be reclaimed. The scan is
+			// bounded at the file's durable end (C1 §3.11): a damaged tail (a
+			// nacked partial batch that could not be truncated) is never read and
+			// goes away with the unlink.
+			messages, err := qw.scanWALFileUpTo(info.path, target.durableSize)
+			if err != nil && interfaces.OutcomeOf(err) == interfaces.RecoveryFatal {
+				continue
+			}
+
+			// Group unACKed messages by queue
+			byQueue := make(map[string][]*RecoveryMessage)
+			qw.bitmapMutex.RLock()
+			for _, msg := range messages {
+				if !qw.ackBitmap.Contains(msg.Offset) {
+					byQueue[msg.QueueName] = append(byQueue[msg.QueueName], msg)
+				}
+			}
+			qw.bitmapMutex.RUnlock()
+
+			// Write unACKed messages to segments
+			checkpointOK := true
+			for queueName, queueMsgs := range byQueue {
+				if err := segMgr.CheckpointBatch(queueName, queueMsgs); err != nil {
+					checkpointOK = false
+					break
+				}
+			}
+
+			if !checkpointOK {
+				// WAL kept; the next pass retries the whole file. Queues that
+				// already succeeded get rewritten (duplicates, collapsed at
+				// recovery by the C8 dedup).
+				continue
+			}
+
+			// Every batch durably succeeded: only the unlink remains. The flag
+			// is written under oldFilesMutex.Lock — the same lock
+			// tryDeleteOldFiles reads and writes it under, and the same lock
+			// this pass's own snapshot copied it under.
+			qw.oldFilesMutex.Lock()
+			info.checkpointed = true
+			qw.oldFilesMutex.Unlock()
+		}
+
+		// Delete WAL file and clean up. walUnlink is the hookable seam whose
+		// default is os.Remove (TEST-ONLY faults: a blocked hook inspects the
+		// state between fsync and unlink; an error simulates a crash there).
+		// A file whose unlink fails stays registered; the next pass retries
+		// ONLY the unlink (checkpointed is already set).
+		if err := walUnlink(info.path); err != nil && !errors.Is(err, fs.ErrNotExist) {
+			qw.logError("checkpointed WAL file could not be unlinked; it stays registered and the next pass retries only the unlink",
+				interfaces.LogField{Key: "path", Value: info.path},
+				interfaces.LogField{Key: "error", Value: err.Error()})
 			continue
 		}
-
-		// Group unACKed messages by queue
-		byQueue := make(map[string][]*RecoveryMessage)
-		qw.bitmapMutex.RLock()
-		for _, msg := range messages {
-			if !qw.ackBitmap.Contains(msg.Offset) {
-				byQueue[msg.QueueName] = append(byQueue[msg.QueueName], msg)
-			}
-		}
-		qw.bitmapMutex.RUnlock()
-
-		// Write unACKed messages to segments
-		checkpointOK := true
-		for queueName, queueMsgs := range byQueue {
-			if err := segMgr.CheckpointBatch(queueName, queueMsgs); err != nil {
-				checkpointOK = false
-				break
-			}
-		}
-
-		if !checkpointOK {
-			continue
-		}
-
-		// Checkpoint succeeded — delete WAL file and clean up
-		_ = os.Remove(info.path)
+		unlinkedAny = true
 		qw.closeOldFileHandle(fileNum)
 
 		// Remove from oldFiles map
@@ -3147,10 +3749,33 @@ func (qw *QueueWAL) performCheckpoint() {
 			qw.offsetIndexMutex.Unlock()
 		}
 	}
+
+	// C4: make the unlinks durable (once per pass that unlinked anything).
+	// Not a correctness requirement — if a crash undoes an unlink, the WAL
+	// file comes back next to its segment copy and the recovery dedup (WAL
+	// wins + C8) collapses it — but it bounds replay work and frees the space
+	// for real, which is why a failure is only logged.
+	if unlinkedAny {
+		if serr := syncDir(qw.dataDir); serr != nil {
+			qw.logWarn("WAL directory fsync after checkpoint unlink failed; the space is not reclaimed durably yet and the next pass retries",
+				interfaces.LogField{Key: "dir", Value: qw.dataDir},
+				interfaces.LogField{Key: "error", Value: serr.Error()})
+		}
+	}
 }
 
-// close stops background goroutines and closes files
+// close stops background goroutines and closes files.
+//
+// C9 ORDERING: closing is published under enqueueMu BEFORE stopChan is
+// closed, so no writeChan send can race past the writer's final drain; and
+// fileClosed is set only after wg.Wait(), so the final drain's flushBatch
+// still runs normally and delivers exactly one completion per enqueued
+// request. See enqueue.
 func (qw *QueueWAL) close() {
+	qw.enqueueMu.Lock()
+	qw.closing = true
+	qw.enqueueMu.Unlock()
+
 	close(qw.stopChan)
 	qw.wg.Wait()
 
@@ -3163,6 +3788,7 @@ func (qw *QueueWAL) close() {
 	qw.oldFileCacheMutex.Unlock()
 
 	qw.fileMutex.Lock()
+	qw.fileClosed = true
 	defer qw.fileMutex.Unlock()
 
 	if qw.currentFile != nil {

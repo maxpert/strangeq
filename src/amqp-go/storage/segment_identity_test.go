@@ -565,9 +565,20 @@ var segSealRaceDuration = 20 * time.Second
 // to reach segSealRaceMinSeals. It exists so the premise below is a one-sided
 // LIVENESS bound ("this run eventually reached the regime") rather than a
 // throughput assertion ("this machine seals fast enough"), which would flake on
-// a loaded CI runner. Only a machine more than 4x slower than this one runs out
-// of extension.
-var segSealRaceMaxDuration = 4 * segSealRaceDuration
+// a loaded CI runner.
+//
+// RECALIBRATED (WS-C review finding 2, 4x -> 8x): every segment roll now
+// fsyncs the queue DIRECTORY at creation (WS-C C4: the directory entry must
+// be durable before a checkpoint's WAL unlink relies on the segment). On this
+// machine that is one more F_FULLFSYNC per seal — the very same ~20ms-class
+// barrier this comment always attributed sealSegment's own fsync to — which
+// cuts the fixture's seal rate from ~100/s to ~30-40/s under suite load. At
+// that rate 3,000 seals needs ~80-100s of wall time, so the old 4x (80s)
+// extension intermittently ran out (observed 2,318-2,776 seals in the full
+// window). The durability barrier is correct and stays; only the liveness
+// window grows. segSealRaceMinSeals (the mutation-tested detection premise)
+// is NOT lowered, and the syncDir is NOT skipped or weakened.
+var segSealRaceMaxDuration = 8 * segSealRaceDuration
 
 // segSealRaceMinSeals is the seal count below which this fixture has measured
 // nothing and its green is meaningless, so it is asserted rather than assumed.

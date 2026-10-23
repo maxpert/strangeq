@@ -668,6 +668,14 @@ func TestWAL_Checkpoint_OffsetIndexCleanup(t *testing.T) {
 
 // TestWAL_Retention_DeletesExpiredFile verifies that files older than
 // the retention period are deleted.
+//
+// WS-C C5 test 21 change: this test used to run with NO segment manager while
+// every record was unacknowledged — i.e. it asserted the exact loss path C5
+// removes (an expired file force-deleted with unacked records and nowhere to
+// copy them). A segment manager is now attached so the assertion "expired
+// files are deleted" still holds, by the correct route: the unacked records
+// are durably checkpointed first, then the file is unlinked. The assertion
+// itself is unchanged; nothing was weakened.
 func TestWAL_Retention_DeletesExpiredFile(t *testing.T) {
 	tmpDir := t.TempDir()
 
@@ -678,6 +686,11 @@ func TestWAL_Retention_DeletesExpiredFile(t *testing.T) {
 	wm, err := NewWALManagerWithConfig(tmpDir, cfg)
 	require.NoError(t, err)
 	defer wm.Close()
+
+	sm, err := NewSegmentManager(tmpDir)
+	require.NoError(t, err)
+	wm.SetSegmentManager(sm)
+	defer sm.Close()
 
 	// Write enough to roll files
 	for i := uint64(1); i <= 20; i++ {

@@ -827,6 +827,9 @@ func (ds *DisruptorStorage) GetExchangeBindingsFrom(source string) ([]*interface
 // withdrawn from compaction (review-4 B-4), and a segment fault discovered on
 // the write path rather than at boot (review-4 N-7). nil disables logging.
 func (ds *DisruptorStorage) SetLogger(l interfaces.Logger) {
+	if ds.wal != nil {
+		ds.wal.SetLogger(l)
+	}
 	if ds.segments != nil {
 		ds.segments.SetLogger(l)
 	}
@@ -1097,12 +1100,20 @@ func (ds *DisruptorStorage) GetDurableEntityMetadata() (*protocol.DurableEntityM
 	return metadata, nil
 }
 
+// ValidateStorageIntegrity is not implemented: integrity is enforced
+// fail-closed by the classified recovery scan (GetRecoverableMessages /
+// RecoverFromWAL / rebuildBootState), which runs right after this call and
+// already refuses the boot on interior corruption. It returns
+// ErrNotImplemented rather than an empty success, which would claim a
+// validation that never ran. The stats pointer is non-nil so a caller that
+// ignores the error cannot crash on a nil dereference.
 func (ds *DisruptorStorage) ValidateStorageIntegrity() (*protocol.RecoveryStats, error) {
-	return &protocol.RecoveryStats{}, nil
+	return &protocol.RecoveryStats{}, fmt.Errorf("storage: ValidateStorageIntegrity: %w", ErrNotImplemented)
 }
 
+// RepairCorruption is not implemented (see ValidateStorageIntegrity).
 func (ds *DisruptorStorage) RepairCorruption(autoRepair bool) (*protocol.RecoveryStats, error) {
-	return &protocol.RecoveryStats{}, nil
+	return &protocol.RecoveryStats{}, fmt.Errorf("storage: RepairCorruption: %w", ErrNotImplemented)
 }
 
 // GetRecoverableMessages returns everything recovery should consider, together
@@ -1130,51 +1141,68 @@ func (ds *DisruptorStorage) GetRecoverableMessages() (map[string][]*protocol.Mes
 			faults = append(faults, err)
 		}
 
+		// walKeys is the WAL's recovery inventory keyed EXPLICITLY by
+		// RecoveryMessage.Offset — the same key segments use (C8), rather than
+		// the reconstructed DeliveryTag (the two are equal today; this makes
+		// the key the deliberate one).
+		walKeys := make(map[string]map[uint64]bool)
 		for _, recoveryMsg := range recoveredMessages {
 			messagesByQueue[recoveryMsg.QueueName] = append(
 				messagesByQueue[recoveryMsg.QueueName],
 				recoveryMsg.Message,
 			)
+			if walKeys[recoveryMsg.QueueName] == nil {
+				walKeys[recoveryMsg.QueueName] = make(map[uint64]bool)
+			}
+			walKeys[recoveryMsg.QueueName][recoveryMsg.Offset] = true
 		}
+
+		if ds.segments != nil {
+			// STEP 4 SLOT. RecoverFromSegments cannot currently return a non-nil
+			// error (it swallows its own ReadDir failure and every per-segment
+			// read error), so this branch is unreachable today. Step 4 makes the
+			// segment tier authoritative — performCheckpoint unlinks the source WAL
+			// file, so the segment becomes the only copy — and its error
+			// classification lands HERE, in exactly this shape: a segment fault is
+			// constructed with interfaces.FatalFault/DegradedFault at the site that
+			// knows the semantics and appended to `faults`. Nothing above or below
+			// needs restructuring; the outcome type, the join, the refusal message
+			// and the --unsafe-recovery gate are all tier-agnostic.
+			//
+			// STEP 3-FIX CHANGED THIS SLOT'S CONTRACT, and Step 4 must honour it:
+			// a fatal fault no longer returns early and no longer discards the map.
+			// RecoverFromSegments must therefore confine a fatal segment fault to
+			// the segment file that produced it — quarantine it, keep scanning, and
+			// return everything else — exactly as RecoverFromWAL now does.
+			segmentMessages, err := ds.segments.RecoverFromSegments()
+			if err != nil {
+				faults = append(faults, err)
+			}
+
+			for queueName, segMsgs := range segmentMessages {
+				for _, rm := range segMsgs {
+					if walKeys[queueName] != nil && walKeys[queueName][rm.Offset] {
+						continue
+					}
+					messagesByQueue[queueName] = append(
+						messagesByQueue[queueName],
+						rm.Message,
+					)
+				}
+			}
+		}
+
+		return messagesByQueue, joinFaults(faults)
 	}
 
 	if ds.segments != nil {
-		// STEP 4 SLOT. RecoverFromSegments cannot currently return a non-nil
-		// error (it swallows its own ReadDir failure and every per-segment
-		// read error), so this branch is unreachable today. Step 4 makes the
-		// segment tier authoritative — performCheckpoint unlinks the source WAL
-		// file, so the segment becomes the only copy — and its error
-		// classification lands HERE, in exactly this shape: a segment fault is
-		// constructed with interfaces.FatalFault/DegradedFault at the site that
-		// knows the semantics and appended to `faults`. Nothing above or below
-		// needs restructuring; the outcome type, the join, the refusal message
-		// and the --unsafe-recovery gate are all tier-agnostic.
-		//
-		// STEP 3-FIX CHANGED THIS SLOT'S CONTRACT, and Step 4 must honour it:
-		// a fatal fault no longer returns early and no longer discards the map.
-		// RecoverFromSegments must therefore confine a fatal segment fault to
-		// the segment file that produced it — quarantine it, keep scanning, and
-		// return everything else — exactly as RecoverFromWAL now does.
 		segmentMessages, err := ds.segments.RecoverFromSegments()
 		if err != nil {
 			faults = append(faults, err)
 		}
 
-		walKeys := make(map[string]map[uint64]bool)
-		for queueName, msgs := range messagesByQueue {
-			if walKeys[queueName] == nil {
-				walKeys[queueName] = make(map[uint64]bool)
-			}
-			for _, msg := range msgs {
-				walKeys[queueName][msg.DeliveryTag] = true
-			}
-		}
-
 		for queueName, segMsgs := range segmentMessages {
 			for _, rm := range segMsgs {
-				if walKeys[queueName] != nil && walKeys[queueName][rm.Offset] {
-					continue
-				}
 				messagesByQueue[queueName] = append(
 					messagesByQueue[queueName],
 					rm.Message,

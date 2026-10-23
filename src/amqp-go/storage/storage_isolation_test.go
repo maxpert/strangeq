@@ -30,6 +30,11 @@ const repoRelativeDataDir = "data"
 // the next caller of NewDisruptorStorage() from silently reinstating it — the
 // directory is gitignored, so nothing else in the toolchain would report it.
 func TestMain(m *testing.M) {
+	// WS-C: arm the runtime invariant assertions (I3 and its segment twin)
+	// package-wide, so every test in this package runs with them. See
+	// storage/invariants.go. A test that deliberately mutates a LIVE active
+	// file disables them locally with SetStorageInvariantChecksForTest(false).
+	storageInvariantChecks.Store(true)
 	os.Exit(runWithStorageLeakCheck(repoRelativeDataDir, m.Run))
 }
 

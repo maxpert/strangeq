@@ -100,9 +100,10 @@ func (qw *QueueWAL) readMessageBatch(queueName string, startOffset uint64) (map[
 	}
 
 	var messages map[uint64]*protocol.Message
+	var limit int64
 	collect := func(file *os.File) error {
 		var cerr error
-		messages, cerr = qw.collectBatchFrom(file, queueName, location.filePosition)
+		messages, cerr = qw.collectBatchFrom(file, queueName, location.filePosition, limit)
 		return cerr
 	}
 
@@ -110,6 +111,10 @@ func (qw *QueueWAL) readMessageBatch(queueName string, startOffset uint64) (map[
 	currentFileNum := qw.fileNum.Load()
 	if location.fileNum == currentFileNum {
 		file := qw.currentReadFile
+		// C7: the durable frontier. fileOffset is advanced only after a
+		// successful fsync (I4), so bytes past it are in flight or belong to
+		// a nacked batch — read-ahead must not cache or serve them.
+		limit = qw.fileOffset.Load()
 		qw.fileMutex.Unlock()
 		if file == nil {
 			return nil, fmt.Errorf("WAL current read file not open for fileNum %d", location.fileNum)
@@ -119,6 +124,16 @@ func (qw *QueueWAL) readMessageBatch(queueName string, startOffset uint64) (map[
 		}
 	} else {
 		qw.fileMutex.Unlock()
+		// C7: a rolled file's read-ahead is bounded at its durable end
+		// (durableSize, captured at roll); an inherited file (-1) is bounded
+		// by nothing because it was never damaged by this incarnation.
+		qw.oldFilesMutex.RLock()
+		info, registered := qw.oldFiles[location.fileNum]
+		limit = -1
+		if registered {
+			limit = info.durableSize
+		}
+		qw.oldFilesMutex.RUnlock()
 		// The old-file handle comes from a cache that no longer holds its lock
 		// across this read, so the handle can be closed under us. That surfaces
 		// as os.ErrClosed and withOldFileHandle retries it against a fresh one.
@@ -148,16 +163,39 @@ func (qw *QueueWAL) readMessageBatch(queueName string, startOffset uint64) (map[
 	return messages, nil
 }
 
-// collectBatchFrom reads one read-ahead chunk from file at filePosition and
-// decodes every whole record in it belonging to queueName. It is split out of
-// readMessageBatch so the retrying old-file arm and the current-file arm share
-// one decoder, and so the retry has a single unit to re-run: everything that
-// touches the file handle is inside here, and everything that does not — the
-// acknowledgement filter, the empty check — is outside it.
+// collectBatchFrom reads one read-ahead chunk from file at filePosition,
+// bounded at limit (-1 = no bound), and decodes every whole record in it
+// belonging to queueName. It is split out of readMessageBatch so the retrying
+// old-file arm and the current-file arm share one decoder, and so the retry
+// has a single unit to re-run: everything that touches the file handle is
+// inside here, and everything that does not — the acknowledgement filter, the
+// empty check — is outside it.
 //
 // A short read at end of file is not an error: io.EOF simply bounds the chunk.
-func (qw *QueueWAL) collectBatchFrom(file *os.File, queueName string, filePosition int64) (map[uint64]*protocol.Message, error) {
-	chunk := make([]byte, readAheadChunkSize)
+//
+// WS-C C7:
+//   - a stored CRC of 0 means CRC was disabled at write time — skip
+//     verification, exactly the rule the four scanners apply
+//     (wal_manager.go). The old unconditional check broke read-ahead on every
+//     first record whenever crccheck was off.
+//   - an all-zero record header is the start of a zero region, not a run of
+//     zero-length records (walBlankRecordHeader): stop, like the scanners.
+//   - limit is the durable end (fileOffset for the current file, durableSize
+//     for a rolled one). Bytes past it are written but not fsynced, or belong
+//     to a nacked batch; caching them would let GetMessage serve a message
+//     whose publisher was never confirmed (or was nacked).
+func (qw *QueueWAL) collectBatchFrom(file *os.File, queueName string, filePosition, limit int64) (map[uint64]*protocol.Message, error) {
+	want := int64(readAheadChunkSize)
+	if limit >= 0 {
+		remaining := limit - filePosition
+		if remaining <= 0 {
+			return map[uint64]*protocol.Message{}, nil
+		}
+		if remaining < want {
+			want = remaining
+		}
+	}
+	chunk := make([]byte, want)
 	n, err := file.ReadAt(chunk, filePosition)
 	if err != nil && !errors.Is(err, io.EOF) {
 		return nil, err
@@ -173,12 +211,20 @@ func (qw *QueueWAL) collectBatchFrom(file *os.File, queueName string, filePositi
 		crc := binary.BigEndian.Uint32(chunk[pos : pos+4])
 		dataLen := binary.BigEndian.Uint32(chunk[pos+4 : pos+8])
 
+		// A zero region starting on a record boundary is the end of the data
+		// (the write path cannot produce a zero-length record).
+		if walBlankRecordHeader(crc, dataLen) {
+			break
+		}
+
 		recordEnd := pos + 8 + int(dataLen)
 		if recordEnd > len(chunk) {
 			break
 		}
 
-		if crc != crc32.ChecksumIEEE(chunk[pos+4:recordEnd]) {
+		// A stored CRC of 0 means CRC was disabled at write time — skip
+		// verification (the scanner's rule).
+		if crc != 0 && crc != crc32.ChecksumIEEE(chunk[pos+4:recordEnd]) {
 			break
 		}
 
