@@ -2,6 +2,9 @@ package storage
 
 import (
 	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
 	"sync/atomic"
 
 	"github.com/maxpert/amqp-go/interfaces"
@@ -71,3 +74,41 @@ func (a *atomicLogger) Load() interfaces.Logger {
 // managers' SetLogger; nil = silent, which is the state of any storage
 // constructed without a logger.
 var storageWarnLogger atomicLogger
+
+// mkdirAllDurable creates dir and every missing parent, then makes each
+// created component's directory entry durable by fsyncing its parent,
+// top-down. Boot-path only (WAL dir, shared dir, segments dir). A directory
+// that already exists is left alone — nothing was created, nothing needs
+// syncing.
+func mkdirAllDurable(dir string) error {
+	// Note which path components are missing, deepest first.
+	var missing []string
+	p := dir
+	for {
+		_, err := os.Stat(p)
+		if err == nil {
+			break
+		}
+		if !os.IsNotExist(err) {
+			return err
+		}
+		missing = append(missing, p)
+		parent := filepath.Dir(p)
+		if parent == p {
+			break
+		}
+		p = parent
+	}
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		return err
+	}
+	// Sync each created component's parent, top-down (missing was built
+	// deepest-first, so walk it backwards): the shallowest entry must be
+	// durable before the deeper one that lives inside it can be.
+	for i := len(missing) - 1; i >= 0; i-- {
+		if err := syncDir(filepath.Dir(missing[i])); err != nil {
+			return fmt.Errorf("durable mkdir %s: directory fsync failed: %w", missing[i], err)
+		}
+	}
+	return nil
+}

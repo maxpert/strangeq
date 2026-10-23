@@ -233,7 +233,7 @@ func NewSegmentManager(dataDir string) (*SegmentManager, error) {
 // NewSegmentManagerWithConfig creates a new segment manager with custom config
 func NewSegmentManagerWithConfig(dataDir string, cfg SegmentConfig) (*SegmentManager, error) {
 	segDir := filepath.Join(dataDir, "segments")
-	if err := os.MkdirAll(segDir, 0755); err != nil {
+	if err := mkdirAllDurable(segDir); err != nil {
 		return nil, fmt.Errorf("failed to create segments directory: %w", err)
 	}
 
@@ -1253,6 +1253,15 @@ func (sm *SegmentManager) getOrCreateQueueSegmentsAt(queueName, dirName string) 
 			fmt.Sprintf("the segment directory for queue %q could not be created", queueName),
 			"this queue's messages are not checkpointed to cold storage; the source WAL file is NOT deleted, so nothing is lost, but the WAL will keep growing until this is fixed",
 			err)
+	}
+	// C4: make the queue directory's entry durable in its PARENT (segments/)
+	// before any segment file is created inside it — the marker's own
+	// atomicWriteFile already syncs queueDir itself.
+	if serr := syncDir(sm.dataDir); serr != nil {
+		return nil, interfaces.DegradedFault("segment-open", sm.dataDir,
+			fmt.Sprintf("the segment directory for queue %q was created but its directory entry could not be made durable", queueName),
+			"this queue's messages are not checkpointed to cold storage; the source WAL file is NOT deleted, so nothing is lost, but the WAL will keep growing until this is fixed",
+			serr)
 	}
 
 	// OWNERSHIP. The marker is written before any segment file can exist here,

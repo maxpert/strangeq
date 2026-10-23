@@ -461,7 +461,7 @@ func NewWALManager(dataDir string) (*WALManager, error) {
 // NewWALManagerWithConfig creates a new WAL manager with custom config
 func NewWALManagerWithConfig(dataDir string, cfg WALConfig) (*WALManager, error) {
 	walDir := filepath.Join(dataDir, "wal")
-	if err := os.MkdirAll(walDir, 0755); err != nil {
+	if err := mkdirAllDurable(walDir); err != nil {
 		return nil, fmt.Errorf("failed to create WAL directory: %w", err)
 	}
 
@@ -1598,7 +1598,7 @@ func (qw *QueueWAL) scanWALFileUpTo(filePath string, limit int64) ([]*RecoveryMe
 func (wm *WALManager) createSharedWAL() (*QueueWAL, error) {
 	// Create shared WAL directory
 	sharedDir := filepath.Join(wm.dataDir, "shared")
-	if err := os.MkdirAll(sharedDir, 0755); err != nil {
+	if err := mkdirAllDurable(sharedDir); err != nil {
 		return nil, fmt.Errorf("failed to create shared WAL directory: %w", err)
 	}
 
@@ -2800,6 +2800,18 @@ func (qw *QueueWAL) openWALFile(num uint64) (w, r *os.File, size int64, err erro
 			return nil, nil, 0, fmt.Errorf("failed to write WAL file header: %w", werr)
 		}
 		size = int64(n)
+		// C4: make the file's directory entry durable NOW, at creation. The
+		// reliance point is the first confirm of a record in this file, which
+		// is always later; syncing here costs one directory fsync per WAL file
+		// (cold path: once per FileSize bytes) and keeps the per-batch cost
+		// flat. On failure the file is removed and the open fails — a file
+		// whose entry may not survive a crash must not be handed to the
+		// writer.
+		if serr := syncDir(qw.dataDir); serr != nil {
+			_ = file.Close()
+			_ = os.Remove(filename)
+			return nil, nil, 0, fmt.Errorf("WAL file directory fsync failed: %w", serr)
+		}
 	} else {
 		if size < int64(WALHeaderSize) {
 			_ = file.Close()
