@@ -199,6 +199,115 @@ func TestTx_CumulativeAck_UnknownTopTag_406(t *testing.T) {
 	assert.Empty(t, ops, "no settlement ops buffered after 406 cumulative ack")
 }
 
+// TestTx_CumulativeAck_Tag0_Multiple_NoOutstanding (T5.7a): a tx cumulative ack
+// with (tag=0, multiple=true) on a channel with NO outstanding deliveries does
+// not error and buffers nothing — §6 R14: tag=0 "never errors", and there is
+// nothing to take.
+func TestTx_CumulativeAck_Tag0_Multiple_NoOutstanding(t *testing.T) {
+	srv := newTransactionTestServer(t)
+	conn, frameCh := newPipeConnWithFrames(t)
+	setupTxChannelAndQueue(t, srv, conn, frameCh, "tx-t0-none")
+
+	publishMessageToQueue(t, srv, "tx-t0-none", "m1")
+	wireTag := getDeliveryTag(t, srv, conn, frameCh, "tx-t0-none")
+
+	txSelect(t, srv, conn, frameCh, 1)
+
+	// Ack the one outstanding delivery first (single-tag) to leave nothing.
+	require.NoError(t, srv.handleBasicAck(conn, 1, makeAckPayload(wireTag, false)))
+
+	// Now tag=0, multiple=true — no outstanding deliveries.
+	require.NoError(t, srv.handleBasicAck(conn, 1, makeAckPayload(0, true)))
+
+	ops, err := srv.txm(conn).GetPendingOperations(1)
+	require.NoError(t, err)
+	assert.Len(t, ops, 1, "the original single-tag ack op is buffered; tag=0 adds nothing")
+}
+
+// TestTx_CumulativeAck_Tag0_Multiple_SettlesAll (T5.7b): a tx cumulative ack
+// with (tag=0, multiple=true) on a channel with 2 outstanding deliveries
+// settles both — no error, and exactly 2 settlement ops are buffered.
+func TestTx_CumulativeAck_Tag0_Multiple_SettlesAll(t *testing.T) {
+	srv := newTransactionTestServer(t)
+	conn, frameCh := newPipeConnWithFrames(t)
+	setupTxChannelAndQueue(t, srv, conn, frameCh, "tx-t0-all-a")
+	setupTxChannelAndQueue(t, srv, conn, frameCh, "tx-t0-all-b")
+
+	publishMessageToQueue(t, srv, "tx-t0-all-a", "m1")
+	publishMessageToQueue(t, srv, "tx-t0-all-b", "m2")
+	wt1 := getDeliveryTag(t, srv, conn, frameCh, "tx-t0-all-a")
+	wt2 := getDeliveryTag(t, srv, conn, frameCh, "tx-t0-all-b")
+
+	txSelect(t, srv, conn, frameCh, 1)
+
+	// tag=0, multiple=true — takes every outstanding entry (2).
+	require.NoError(t, srv.handleBasicAck(conn, 1, makeAckPayload(0, true)))
+
+	ops, err := srv.txm(conn).GetPendingOperations(1)
+	require.NoError(t, err)
+	assert.Len(t, ops, 2, "tag=0 cumulative ack buffers one op per outstanding delivery")
+
+	ch := srv.wireChannel(conn, 1)
+	_, ok1 := ch.ResolveWireTag(wt1)
+	assert.False(t, ok1, "wire tag %d taken at buffer time", wt1)
+	_, ok2 := ch.ResolveWireTag(wt2)
+	assert.False(t, ok2, "wire tag %d taken at buffer time", wt2)
+}
+
+// TestTx_CumulativeNack_Tag0_Multiple_NoOutstanding (T5.7c): a tx cumulative
+// nack with (tag=0, multiple=true, requeue=true) on a channel with NO
+// outstanding deliveries does not error and buffers nothing.
+func TestTx_CumulativeNack_Tag0_Multiple_NoOutstanding(t *testing.T) {
+	srv := newTransactionTestServer(t)
+	conn, frameCh := newPipeConnWithFrames(t)
+	setupTxChannelAndQueue(t, srv, conn, frameCh, "tx-t0-none-nack")
+
+	publishMessageToQueue(t, srv, "tx-t0-none-nack", "m1")
+	wireTag := getDeliveryTag(t, srv, conn, frameCh, "tx-t0-none-nack")
+
+	txSelect(t, srv, conn, frameCh, 1)
+
+	// Ack the one outstanding delivery first.
+	require.NoError(t, srv.handleBasicAck(conn, 1, makeAckPayload(wireTag, false)))
+
+	// tag=0, multiple=true nack — no outstanding deliveries.
+	require.NoError(t, srv.handleBasicNack(conn, 1, makeNackPayload(0, true, true)))
+
+	ops, err := srv.txm(conn).GetPendingOperations(1)
+	require.NoError(t, err)
+	assert.Len(t, ops, 1, "the original single-tag ack op is buffered; tag=0 nack adds nothing")
+}
+
+// TestTx_CumulativeNack_Tag0_Multiple_SettlesAll (T5.7d): a tx cumulative nack
+// with (tag=0, multiple=true, requeue=true) on a channel with 2 outstanding
+// deliveries settles both — no error, and exactly 2 settlement ops buffered.
+func TestTx_CumulativeNack_Tag0_Multiple_SettlesAll(t *testing.T) {
+	srv := newTransactionTestServer(t)
+	conn, frameCh := newPipeConnWithFrames(t)
+	setupTxChannelAndQueue(t, srv, conn, frameCh, "tx-t0-all-nack-a")
+	setupTxChannelAndQueue(t, srv, conn, frameCh, "tx-t0-all-nack-b")
+
+	publishMessageToQueue(t, srv, "tx-t0-all-nack-a", "m1")
+	publishMessageToQueue(t, srv, "tx-t0-all-nack-b", "m2")
+	wt1 := getDeliveryTag(t, srv, conn, frameCh, "tx-t0-all-nack-a")
+	wt2 := getDeliveryTag(t, srv, conn, frameCh, "tx-t0-all-nack-b")
+
+	txSelect(t, srv, conn, frameCh, 1)
+
+	// tag=0, multiple=true nack — takes every outstanding entry (2).
+	require.NoError(t, srv.handleBasicNack(conn, 1, makeNackPayload(0, true, true)))
+
+	ops, err := srv.txm(conn).GetPendingOperations(1)
+	require.NoError(t, err)
+	assert.Len(t, ops, 2, "tag=0 cumulative nack buffers one op per outstanding delivery")
+
+	ch := srv.wireChannel(conn, 1)
+	_, ok1 := ch.ResolveWireTag(wt1)
+	assert.False(t, ok1, "wire tag %d taken at buffer time", wt1)
+	_, ok2 := ch.ResolveWireTag(wt2)
+	assert.False(t, ok2, "wire tag %d taken at buffer time", wt2)
+}
+
 // TestTx_CumulativeNack_Rollback_RestoresAllTags (T6.2): nack(multiple,
 // requeue) then rollback → every taken wire tag is re-resolvable and NOTHING
 // was requeued (the settlements never ran).
