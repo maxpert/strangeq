@@ -235,6 +235,12 @@ func (s *Server) Start() error {
 	s.Listener = listener
 	s.Mutex.Unlock()
 
+	// The server is actually serving now — the lifecycle only used to reach
+	// "running" after Start returned (i.e. on the way down).
+	if s.Lifecycle != nil {
+		s.Lifecycle.markRunning()
+	}
+
 	if s.Config.Security.TLSEnabled {
 		s.Log.Info("AMQP server listening (TLS)", zap.String("addr", s.Addr))
 	} else {
@@ -1599,6 +1605,10 @@ func (s *Server) StartWithQuitChannel(quit <-chan struct{}) error {
 	s.Mutex.Lock()
 	s.Listener = listener
 	s.Mutex.Unlock()
+
+	if s.Lifecycle != nil {
+		s.Lifecycle.markRunning()
+	}
 
 	if s.Config.Security.TLSEnabled {
 		s.Log.Info("AMQP server listening (TLS)", zap.String("addr", s.Addr))

@@ -37,9 +37,8 @@ func loadTLSConfig(secCfg interfaces.SecurityConfig) (*tls.Config, error) {
 	}
 
 	tlsCfg := &tls.Config{
-		Certificates:             []tls.Certificate{cert},
-		MinVersion:               tls.VersionTLS12,
-		PreferServerCipherSuites: true,
+		Certificates: []tls.Certificate{cert},
+		MinVersion:   tls.VersionTLS12,
 	}
 
 	if secCfg.TLSCAFile != "" {

@@ -2,6 +2,7 @@ package server
 
 import (
 	"bufio"
+	"context"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
@@ -65,10 +66,12 @@ func startWSBServer(t *testing.T, mutate func(*config.AMQPConfig), tweak func(*S
 	return srv, addr
 }
 
-// wsbStopServer is the single cleanup seam for startWSBServer; it flips to
-// Shutdown(ctx) when §11 lands (one-line change, here).
+// wsbStopServer is the single cleanup seam for startWSBServer (Shutdown with a
+// 5s context, §11).
 func wsbStopServer(srv *Server) {
-	_ = srv.Stop()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_ = srv.Shutdown(ctx)
 }
 
 // withFileAuth writes an auth file (same shape as authz_handler_test.go) and
