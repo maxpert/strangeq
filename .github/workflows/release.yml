@@ -80,15 +80,26 @@ jobs:
           CGO_ENABLED: 0
         run: |
           cd src/amqp-go
-          VERSION="${{ steps.version.outputs.version }}"
+          TAG="${{ steps.version.outputs.version }}"
+          VERSION="${TAG#v}"
           BINARY_NAME="amqp-server"
           PACKAGE_NAME="amqp-server-${VERSION}-${{ matrix.os }}-${{ matrix.arch }}"
+          COMMIT="${GITHUB_SHA::7}"
+          BUILD_DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
-          # Build with version information
+          # Build with the full identity: main.version/commit/date are
+          # variables so -X actually stamps them.
           go build \
-            -ldflags="-s -w -X main.version=${VERSION}" \
+            -ldflags="-s -w -X main.version=${VERSION} -X main.commit=${COMMIT} -X main.date=${BUILD_DATE}" \
             -o "${BINARY_NAME}" \
             ./cmd/amqp-server
+
+          # Assert the version stamp survived; -X against a const silently
+          # produces the source default, which is what this catches.
+          grep -a -q -- "${VERSION}" "${BINARY_NAME}" || { echo "version not stamped"; exit 1; }
+          if [ "${GOOS}" = "$(go env GOHOSTOS)" ] && [ "${GOARCH}" = "$(go env GOHOSTARCH)" ]; then
+            ./"${BINARY_NAME}" --version | grep -F "amqp-server ${VERSION} (commit ${COMMIT}"
+          fi
 
           # Create package directory
           mkdir -p "${PACKAGE_NAME}"

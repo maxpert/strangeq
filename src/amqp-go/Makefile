@@ -2,10 +2,15 @@
 
 AMQP_URL ?= amqp://guest:guest@localhost:5672/
 
+VERSION ?= 0.1.0-dev
+COMMIT  ?= $(shell git rev-parse --short HEAD 2>/dev/null || echo unknown)
+DATE    ?= $(shell date -u +%Y-%m-%dT%H:%M:%SZ)
+LDFLAGS = -ldflags "-X main.version=$(VERSION) -X main.commit=$(COMMIT) -X main.date=$(DATE)"
+
 build: build-server build-perftest
 
 build-server:
-	go build -o amqp-server ./cmd/amqp-server
+	go build $(LDFLAGS) -o amqp-server ./cmd/amqp-server
 
 build-perftest:
 	go build -o perftest ./cmd/perftest

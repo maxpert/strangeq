@@ -4,10 +4,14 @@
 BINARY_NAME=amqp-server
 SRC_DIR=src/amqp-go
 MAIN_PKG=./cmd/amqp-server
-VERSION?=dev
+VERSION ?= 0.1.0-dev
+COMMIT  ?= $(shell git rev-parse --short HEAD 2>/dev/null || echo unknown)
+DATE    ?= $(shell date -u +%Y-%m-%dT%H:%M:%SZ)
 BUILD_DIR=build
 DOCKER_IMAGE=amqp-go
-PLATFORMS=darwin/amd64 darwin/arm64 linux/amd64 linux/arm64 linux/386 windows/amd64 windows/386
+# Windows is unsupported: main.go imports golang.org/x/sys/unix unconditionally
+# and the server uses untagged syscall.Statfs.
+PLATFORMS=darwin/amd64 darwin/arm64 linux/amd64 linux/arm64 linux/386
 
 # Go parameters
 GOCMD=go
@@ -19,7 +23,7 @@ GOFMT=$(GOCMD) fmt
 GOVET=$(GOCMD) vet
 
 # Build flags
-LDFLAGS=-ldflags "-s -w -X main.version=$(VERSION)"
+LDFLAGS=-ldflags "-s -w -X main.version=$(VERSION) -X main.commit=$(COMMIT) -X main.date=$(DATE)"
 
 help: ## Show this help
 	@echo "AMQP-Go Build System"
@@ -40,9 +44,8 @@ build-all: ## Build for all platforms
 	@for platform in $(PLATFORMS); do \
 		GOOS=$${platform%/*} GOARCH=$${platform#*/} ; \
 		output=$(BUILD_DIR)/$(BINARY_NAME)-$$GOOS-$$GOARCH ; \
-		if [ "$$GOOS" = "windows" ]; then output="$$output.exe"; fi ; \
 		echo "Building $$platform -> $$output" ; \
-		cd $(SRC_DIR) && GOOS=$$GOOS GOARCH=$$GOARCH $(GOBUILD) $(LDFLAGS) -o ../../$$output $(MAIN_PKG) ; \
+		(cd $(SRC_DIR) && GOOS=$$GOOS GOARCH=$$GOARCH CGO_ENABLED=0 $(GOBUILD) $(LDFLAGS) -o ../../$$output $(MAIN_PKG)) || exit 1 ; \
 	done
 	@echo "All builds complete in $(BUILD_DIR)/"
 
@@ -104,7 +107,11 @@ deps-update: ## Update dependencies
 
 docker-build: ## Build Docker image
 	@echo "Building Docker image..."
-	cd $(SRC_DIR) && docker build -t $(DOCKER_IMAGE):$(VERSION) -t $(DOCKER_IMAGE):latest .
+	cd $(SRC_DIR) && docker build \
+		--build-arg VERSION=$(VERSION) \
+		--build-arg COMMIT=$(COMMIT) \
+		--build-arg DATE=$(DATE) \
+		-t $(DOCKER_IMAGE):$(VERSION) -t $(DOCKER_IMAGE):latest .
 	@echo "Docker image built: $(DOCKER_IMAGE):$(VERSION)"
 
 docker-run: ## Run Docker container
@@ -126,11 +133,11 @@ release-local: clean build-all ## Build release locally
 
 run: ## Run the server
 	@echo "Starting AMQP server..."
-	cd $(SRC_DIR) && $(GOBUILD) -o $(BINARY_NAME) $(MAIN_PKG) && ./$(BINARY_NAME)
+	cd $(SRC_DIR) && $(GOBUILD) $(LDFLAGS) -o $(BINARY_NAME) $(MAIN_PKG) && ./$(BINARY_NAME)
 
 dev: ## Run in development mode
 	@echo "Starting AMQP server in dev mode..."
-	cd $(SRC_DIR) && $(GOBUILD) -o $(BINARY_NAME) $(MAIN_PKG) && ./$(BINARY_NAME) --log-level debug
+	cd $(SRC_DIR) && $(GOBUILD) $(LDFLAGS) -o $(BINARY_NAME) $(MAIN_PKG) && AMQP_SERVER_LOGLEVEL=debug ./$(BINARY_NAME)
 
 check: fmt vet lint test ## Run all checks
 

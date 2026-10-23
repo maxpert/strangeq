@@ -97,10 +97,18 @@ jobs:
       - name: Build binary
         run: |
           cd src/amqp-go
-          go build -v ./cmd/amqp-server
+          go build -v \
+            -ldflags "-X main.version=ci-${GITHUB_SHA::7} -X main.commit=${GITHUB_SHA::7} -X main.date=ci" \
+            ./cmd/amqp-server
 
-      - name: Verify build
+      - name: Verify version stamp
         run: |
           cd src/amqp-go
-          ./amqp-server -version
+          ./amqp-server --version | grep -F "amqp-server ci-${GITHUB_SHA::7} (commit ${GITHUB_SHA::7}, built ci"
+
+      - name: systemd unit smoke test
+        run: bash scripts/systemd_smoke.sh src/amqp-go/amqp-server
+
+      - name: Shell script syntax
+        run: bash -n src/amqp-go/scripts/crash_test.sh src/amqp-go/scripts/low_stress_test.sh
 

@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"runtime"
 	"syscall"
 	"time"
 
@@ -17,18 +18,34 @@ import (
 )
 
 const (
-	version = "0.9.1"
-	banner  = `
+	banner = `
     ___   __  ______  ____        ______      
    /   | /  |/  / __ \/ __ \      / ____/___   
   / /| |/ /|_/ / / / / /_/ /_____/ / __/ __ \  
  / ___ / /  / / /_/ / ____/_____/ /_/ / /_/ /  
 /_/  |_/_/  /_/\___\_/          \____/\____/   
-                                              
+                                               
 AMQP 0.9.1 Server - High Performance Message Broker
 Version: %s
 `
 )
+
+// Build identity. These are variables, not constants, so -X can stamp them:
+//
+//	go build -ldflags "-X main.version=0.1.0 -X main.commit=abc1234 -X main.date=..."
+//
+// An unstamped source build says 0.1.0-dev so it is never mistaken for a
+// release. Releases stamp from the tag with the leading "v" stripped.
+var (
+	version = "0.1.0-dev"
+	commit  = "unknown"
+	date    = "unknown"
+)
+
+// versionString is the one-line --version output.
+func versionString() string {
+	return fmt.Sprintf("amqp-server %s (commit %s, built %s, %s)", version, commit, date, runtime.Version())
+}
 
 func main() {
 	// Define command-line flags
@@ -59,7 +76,7 @@ func main() {
 
 	// Show version and exit
 	if *showVersion {
-		fmt.Printf("AMQP-Go Server version %s\n", version)
+		fmt.Println(versionString())
 		return
 	}
 
@@ -122,6 +139,9 @@ func main() {
 	if *unsafeRecovery {
 		cfg.Storage.UnsafeRecovery = true
 	}
+
+	// The stamped build identity is the product version advertised to clients.
+	cfg.Server.Version = version
 
 	// Re-validate after CLI overrides
 	if err := cfg.Validate(); err != nil {
