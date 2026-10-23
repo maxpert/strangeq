@@ -2,6 +2,7 @@ package server
 
 import (
 	"encoding/binary"
+	"fmt"
 	"net"
 	"sync/atomic"
 	"testing"
@@ -306,6 +307,37 @@ func TestUserBlockList(t *testing.T) {
 		assert.Equal(t, uint16(403), code)
 		assert.Equal(t, "Authentication failed", text, "user deny must not leak an allow-list oracle")
 	})
+}
+
+func TestAuthRateLimit_TableFullWarnsOncePerMinute(t *testing.T) {
+	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	// A long refill window keeps the planted buckets non-idle (below full)
+	// even after the clock advances, so the sweep never frees a slot.
+	l := newFailureLimiter(1, time.Hour)
+	l.now = func() time.Time { return now }
+	var warns []string
+	l.warn = func(msg string) { warns = append(warns, msg) }
+
+	// Fill the table to capacity with non-idle buckets (zero tokens), so the
+	// sweep frees nothing and a new key cannot be tracked.
+	for i := 0; i < maxLimiterKeys; i++ {
+		l.buckets[fmt.Sprintf("10.%d.%d.%d", (i>>16)&0xff, (i>>8)&0xff, i&0xff)] = &tokenBucket{last: now}
+	}
+
+	// New peer at capacity: tracking is skipped (fail-open) and the operator
+	// gets exactly one warning.
+	l.fail("192.0.2.1")
+	require.Len(t, warns, 1, "skipping a new key at capacity must warn")
+	assert.Contains(t, warns[0], "limiter")
+
+	// Within the warn interval the warning is not repeated.
+	l.fail("192.0.2.2")
+	assert.Len(t, warns, 1)
+
+	// After the interval (on the injected clock) it fires again.
+	now = now.Add(61 * time.Second)
+	l.fail("192.0.2.3")
+	assert.Len(t, warns, 2)
 }
 
 func TestAuthRateLimit(t *testing.T) {

@@ -62,6 +62,10 @@ func (s *Server) gate() *accessGate {
 				zap.Error(err))
 		}
 	}
+	if built.limiter != nil && s.Log != nil {
+		log := s.Log
+		built.limiter.warn = func(msg string) { log.Warn(msg) }
+	}
 	actual, _ := gates.LoadOrStore(s, built)
 	return actual.(*accessGate)
 }
@@ -260,6 +264,11 @@ type failureLimiter struct {
 	window time.Duration
 	// now is injectable so tests can advance time without sleeping.
 	now func() time.Time
+	// warn, when set, reports a full table (tracking skipped, fail-open) at
+	// most once per minute on the limiter's clock — never the wall clock, so
+	// tests stay deterministic.
+	warn     func(msg string)
+	lastWarn time.Time
 
 	mu      sync.Mutex
 	buckets map[string]*tokenBucket
@@ -310,8 +319,24 @@ func (l *failureLimiter) bucket(key string) *tokenBucket {
 	b := &tokenBucket{tokens: l.limit, last: l.now()}
 	if len(l.buckets) < maxLimiterKeys {
 		l.buckets[key] = b
+	} else {
+		l.warnFullLocked()
 	}
 	return b
+}
+
+// warnFullLocked reports a full table at most once per minute on the
+// limiter's (injectable) clock. Tracking fails open; host lists still apply.
+func (l *failureLimiter) warnFullLocked() {
+	if l.warn == nil {
+		return
+	}
+	now := l.now()
+	if !l.lastWarn.IsZero() && now.Sub(l.lastWarn) < time.Minute {
+		return
+	}
+	l.lastWarn = now
+	l.warn("failed-auth limiter table full: not tracking new peers (fail-open; host lists still apply)")
 }
 
 // sweepLocked drops buckets that are already full (idle peers), so the table
