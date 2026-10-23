@@ -507,10 +507,13 @@ Recovery is incremental and completes in milliseconds for typical workloads.
 ### Using systemd
 
 ```bash
-# Copy service file
+# Install the unit and the shipped config (see deployment/systemd/README.md
+# for the auth file and directory setup)
 sudo cp deployment/systemd/amqp-server.service /etc/systemd/system/
+sudo install -o root -g amqp -m 0640 deployment/systemd/config.yaml /etc/amqp/config.yaml
 
 # Enable and start
+sudo systemctl daemon-reload
 sudo systemctl enable amqp-server
 sudo systemctl start amqp-server
 
@@ -520,7 +523,20 @@ sudo systemctl status amqp-server
 
 ### Using Docker
 
-The repository includes a docker-compose file for protocol interoperability testing with RabbitMQ:
+```bash
+make docker-build VERSION=0.1.0
+docker run --rm -p 5672:5672 -p 9419:9419 -v amqp-data:/var/lib/amqp amqp-go:0.1.0
+```
+
+The image binds `0.0.0.0` with authentication off by default (it prints the
+startup security warning). To enable authentication, mount an auth file and set
+`AMQP_SECURITY_AUTHENTICATIONENABLED=true` and
+`AMQP_SECURITY_AUTHENTICATIONFILEPATH=/etc/amqp/auth.json`.
+The image's `HEALTHCHECK` uses `amqp-server --healthcheck`, which probes the
+same telemetry address/port from the environment.
+
+For protocol interoperability testing with RabbitMQ, the repository also
+includes a docker-compose file:
 
 ```bash
 cd src/amqp-go/protocol
