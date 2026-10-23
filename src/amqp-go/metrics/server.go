@@ -9,9 +9,11 @@ import (
 	"net/http/pprof"
 	"runtime"
 	"strconv"
+	"strings"
 	"sync/atomic"
 	"time"
 
+	"github.com/maxpert/amqp-go/interfaces"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
@@ -246,5 +248,26 @@ func ReadinessFromServer(listening func() bool, health func() error, shutting *a
 			return health()
 		}
 		return nil
+	}
+}
+
+// HealthStatusFunc adapts WS-B's Server.Health() (interfaces.HealthStatus) to
+// the func() error readiness shape: ready iff Status == "healthy", otherwise
+// an error naming the status and any recorded Errors. It is the single place
+// the Status-string mapping lives (S5) so main and the module-root health test
+// cannot drift apart.
+func HealthStatusFunc(health func() interfaces.HealthStatus) func() error {
+	if health == nil {
+		return nil
+	}
+	return func() error {
+		st := health()
+		if st.Status == "healthy" {
+			return nil
+		}
+		if len(st.Errors) > 0 {
+			return fmt.Errorf("server unhealthy (%s): %s", st.Status, strings.Join(st.Errors, "; "))
+		}
+		return fmt.Errorf("server unhealthy (%s)", st.Status)
 	}
 }

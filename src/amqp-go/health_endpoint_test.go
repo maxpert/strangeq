@@ -6,6 +6,7 @@ import (
 	"sync/atomic"
 	"testing"
 
+	"github.com/maxpert/amqp-go/interfaces"
 	"github.com/maxpert/amqp-go/metrics"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -18,10 +19,14 @@ func healthHandler(srv interface {
 }) (http.Handler, *atomic.Bool) {
 	var shutting atomic.Bool
 	// Same logic as main.readyFunc: the read-only root test package cannot
-	// import cmd/amqp-server, so both call the shared metrics helper.
+	// import cmd/amqp-server, so both call the shared metrics helpers. S5:
+	// WS-B's Health returns interfaces.HealthStatus, not error — assert the
+	// real signature and adapt through the shared mapping.
 	var health func() error
-	if h, ok := any(srv).(interface{ Health() error }); ok {
-		health = h.Health
+	if h, ok := any(srv).(interface {
+		Health() interfaces.HealthStatus
+	}); ok {
+		health = metrics.HealthStatusFunc(h.Health)
 	}
 	telemetry := metrics.NewServerWithOptions(metrics.ServerOptions{
 		Port:  9419,

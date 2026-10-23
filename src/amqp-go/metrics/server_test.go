@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/maxpert/amqp-go/interfaces"
 	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -173,6 +174,30 @@ func TestReadinessFromServer(t *testing.T) {
 func TestReadinessFromServer_NilHealth(t *testing.T) {
 	ready := ReadinessFromServer(func() bool { return true }, nil, nil)
 	assert.NoError(t, ready())
+}
+
+// TestHealthStatusFunc (S5): WS-B's Health() interfaces.HealthStatus feeds
+// /health readiness through this single mapping — "healthy" is ready, any
+// other status is not, and recorded Errors surface in the message.
+func TestHealthStatusFunc(t *testing.T) {
+	assert.Nil(t, HealthStatusFunc(nil))
+
+	healthy := HealthStatusFunc(func() interfaces.HealthStatus {
+		return interfaces.HealthStatus{Status: "healthy"}
+	})
+	assert.NoError(t, healthy())
+
+	degraded := HealthStatusFunc(func() interfaces.HealthStatus {
+		return interfaces.HealthStatus{Status: "degraded"}
+	})
+	assert.ErrorContains(t, degraded(), "degraded")
+
+	withErrors := HealthStatusFunc(func() interfaces.HealthStatus {
+		return interfaces.HealthStatus{Status: "unhealthy", Errors: []string{"wal replay incomplete"}}
+	})
+	err := withErrors()
+	assert.ErrorContains(t, err, "unhealthy")
+	assert.ErrorContains(t, err, "wal replay incomplete")
 }
 
 func TestCollector_RecordAuthFailure(t *testing.T) {

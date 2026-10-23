@@ -9,9 +9,24 @@ import (
 	"strconv"
 	"sync/atomic"
 
+	"github.com/maxpert/amqp-go/interfaces"
 	"github.com/maxpert/amqp-go/metrics"
 	"github.com/maxpert/amqp-go/protocol"
+	"github.com/maxpert/amqp-go/server"
 	"go.uber.org/zap"
+)
+
+// S5 compile-time seams: the dynamic guards in serverHealth/shutdownServer
+// fall back to non-graceful Stop() (or no health signal) when the methods are
+// missing, which would silently turn a future signature drift into skipped
+// drain/close-ok waits. These assertions make such drift a BUILD failure
+// instead. (WS-B's Health returns interfaces.HealthStatus, NOT error — the
+// pre-merge guard asserted Health() error and never matched.)
+var (
+	_ interface{ Shutdown(context.Context) error } = (*server.Server)(nil)
+	_ interface {
+		Health() interfaces.HealthStatus
+	} = (*server.Server)(nil)
 )
 
 // queueLister is the narrow broker surface the queue-stats provider needs.
@@ -87,14 +102,11 @@ func readyFunc(listening func() bool, health func() error, shuttingDown *atomic.
 	return metrics.ReadinessFromServer(listening, health, shuttingDown)
 }
 
-// serverHealth returns Server.Health when the merged tree provides it. The
-// worktree that owns this branch may not have WS-B's method yet, so the
-// assertion is deliberately dynamic: main compiles and works standalone.
-func serverHealth(s any) func() error {
-	if h, ok := s.(interface{ Health() error }); ok {
-		return h.Health
-	}
-	return nil
+// serverHealth wires WS-B's Server.Health into the /health readiness
+// predicate through the shared metrics adapter (S5). The compile-time
+// assertion above guarantees the method exists with exactly this signature.
+func serverHealth(s *server.Server) func() error {
+	return metrics.HealthStatusFunc(s.Health)
 }
 
 // shutdownServer calls Server.Shutdown(ctx) when present (WS-B seam S-1) and
