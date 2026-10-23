@@ -28,6 +28,22 @@ func TestRegistryForMechanisms_Strict(t *testing.T) {
 		}
 	})
 
+	t.Run("all-unknown list still falls back to PLAIN", func(t *testing.T) {
+		// Spec §10.4: if the result is empty, register PLAIN. A config of
+		// authmechanisms: [EXTERNAL] must not leave the broker advertising zero
+		// mechanisms and refusing every login.
+		registry, unknown := RegistryForMechanismsReport([]string{"EXTERNAL"})
+		if len(unknown) != 1 || unknown[0] != "EXTERNAL" {
+			t.Fatalf("unknown = %v, want [EXTERNAL]", unknown)
+		}
+		if _, err := registry.Get("PLAIN"); err != nil {
+			t.Fatal("an all-unknown list must fall back to PLAIN so the broker can still authenticate")
+		}
+		if _, err := registry.Get("ANONYMOUS"); err == nil {
+			t.Fatal("ANONYMOUS must not be implied by the fallback")
+		}
+	})
+
 	t.Run("nil list defaults to PLAIN", func(t *testing.T) {
 		registry, unknown := RegistryForMechanismsReport(nil)
 		if len(unknown) != 0 {

@@ -72,7 +72,8 @@ func DefaultRegistry() *Registry {
 
 // RegistryForMechanisms returns a registry populated with the mechanisms
 // named in the provided list, compared case-insensitively. Unknown names are
-// skipped. If names is empty, only PLAIN is registered.
+// skipped. If the result is empty (no names, or only unknown names), PLAIN is
+// registered so the broker never advertises zero mechanisms.
 func RegistryForMechanisms(names []string) *Registry {
 	registry, _ := RegistryForMechanismsReport(names)
 	return registry
@@ -95,7 +96,10 @@ func RegistryForMechanismsReport(names []string) (*Registry, []string) {
 			unknown = append(unknown, name)
 		}
 	}
-	if len(names) == 0 {
+	// Fall back to PLAIN whenever the registry ended up empty — either no
+	// names were given or every name was unknown. An empty registry would
+	// advertise zero mechanisms and refuse every login.
+	if len(registry.List()) == 0 {
 		registry.Register(&PlainMechanism{})
 	}
 	return registry, unknown
