@@ -10,7 +10,7 @@ import (
 )
 
 // mustDeclareQueue declares a non-durable queue and fails the test on error.
-func mustDeclareQueue(t *testing.T, b *StorageBroker, name string) {
+func mustDeclareQueue(t testing.TB, b *StorageBroker, name string) {
 	t.Helper()
 	_, err := b.DeclareQueue(name, false, false, false, nil)
 	require.NoError(t, err)

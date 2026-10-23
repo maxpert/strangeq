@@ -3,6 +3,7 @@ package broker
 import (
 	"testing"
 
+	"github.com/maxpert/amqp-go/interfaces"
 	"github.com/maxpert/amqp-go/protocol"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -67,7 +68,9 @@ func TestBindExchange_SourceNotFound(t *testing.T) {
 
 	err := broker.BindExchange("dst", "nonexistent", "key", nil)
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "not found")
+	// WS-D sentinel hygiene: RabbitMQ-shaped "no exchange '<x>' in vhost '/'".
+	assert.Contains(t, err.Error(), "no exchange 'nonexistent'")
+	assert.ErrorIs(t, err, interfaces.ErrExchangeNotFound)
 }
 
 func TestBindExchange_DestinationNotFound(t *testing.T) {
@@ -78,7 +81,9 @@ func TestBindExchange_DestinationNotFound(t *testing.T) {
 
 	err := broker.BindExchange("nonexistent", "src", "key", nil)
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "not found")
+	// WS-D sentinel hygiene: RabbitMQ-shaped "no exchange '<x>' in vhost '/'".
+	assert.Contains(t, err.Error(), "no exchange 'nonexistent'")
+	assert.ErrorIs(t, err, interfaces.ErrExchangeNotFound)
 }
 
 func TestBindExchange_CycleDetection_Direct(t *testing.T) {

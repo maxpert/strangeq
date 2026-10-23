@@ -1,7 +1,6 @@
 package server
 
 import (
-	"errors"
 	"fmt"
 
 	"github.com/maxpert/amqp-go/broker"
@@ -69,6 +68,13 @@ func (s *Server) handleQueueDeclare(conn *protocol.Connection, channelID uint16,
 		return s.malformed(conn, err, 50, 10)
 	}
 
+	// WS-D §1.3: passive declare is a strictly read-only path (R1) — it never
+	// generates a name, never resolves the empty-name shortcut (D1), never
+	// creates anything, and never runs redeclare equivalence.
+	if declareMethod.Passive {
+		return s.handleQueueDeclarePassive(conn, channelID, declareMethod)
+	}
+
 	// AMQP 0.9.1 spec "reserved" rule (on-failure: access-refused 403):
 	// Queue names starting with "amq." are reserved. The client MAY declare
 	// a queue starting with "amq." if the passive option is set, or the
@@ -113,12 +119,12 @@ func (s *Server) handleQueueDeclare(conn *protocol.Connection, channelID uint16,
 	)
 
 	if err != nil {
-		// Malformed known x-arguments (SQ-7 policy validation) are a
-		// channel-level soft error: 406 PreconditionFailed, keep the
-		// connection alive. Mirrors the ErrExchangeTypeMismatch handling in
-		// handleExchangeDeclare.
-		if errors.Is(err, broker.ErrInvalidQueueArgument) {
-			return s.channelError(conn, channelID, amqperrors.PreconditionFailed, "PRECONDITION_FAILED - "+err.Error(), 50, 10)
+		// WS-D: every known broker semantic error (invalid-argument 406,
+		// inequivalent-args 406, queue-locked 405, queue-limit 406, ...) is a
+		// channel-level soft error through the shared mapping; the connection
+		// stays alive. Unknown errors keep the log-and-return path.
+		if _, _, ok := brokerErrorReply(err); ok {
+			return s.closeChannelWithBrokerError(conn, channelID, err, 50, 10)
 		}
 		s.Log.Error("Failed to declare queue",
 			zap.Error(err),
@@ -130,7 +136,7 @@ func (s *Server) handleQueueDeclare(conn *protocol.Connection, channelID uint16,
 		if sb, ok := s.Broker.(*StorageBrokerAdapter); ok {
 			if !sb.broker.SetQueueOwnerIfFree(queue.Name, conn.ID) {
 				replyText := fmt.Sprintf("QUEUE_LOCKED - queue '%s' is exclusive to another connection", queue.Name)
-				return s.channelError(conn, channelID, uint16(amqperrors.ResourceLocked), replyText, 50, 10)
+				return s.closeChannelWith(conn, channelID, uint16(amqperrors.ResourceLocked), replyText, 50, 10)
 			}
 			queue.OwnerConnID = conn.ID
 		}
@@ -159,6 +165,79 @@ func (s *Server) handleQueueDeclare(conn *protocol.Connection, channelID uint16,
 	msgCount := uint32(0)
 	consumerCount := uint32(0)
 	if sb, ok := s.Broker.(*StorageBrokerAdapter); ok {
+		msgCount = sb.broker.GetQueueReadyCount(queue.Name)
+		consumerCount = uint32(sb.broker.GetQueueConsumerCount(queue.Name))
+	}
+	return s.sendQueueDeclareOK(conn, channelID, queue.Name, msgCount, consumerCount)
+}
+
+// handleQueueDeclarePassive implements WS-D §1.3: a strictly read-only
+// queue.declare (R1). It never generates a server name and never resolves the
+// empty-name "queue-known" shortcut (D1: queue.declare is not in RabbitMQ's
+// expand_shortcuts), so an empty name is a plain 404 for queue ”. Flags and
+// arguments in the frame are IGNORED: the passive clause never calls
+// assert_equivalence, so a passive declare matching an existing queue with
+// different flags/args still returns declare-ok with the real counts.
+func (s *Server) handleQueueDeclarePassive(conn *protocol.Connection, channelID uint16, declareMethod *protocol.QueueDeclareMethod) error {
+	// 1. D1: no name generation, no resolveQueueName.
+	name := declareMethod.Queue
+
+	// 2. Authorization: same configure check as the active path (changing the
+	// required permission class is the authz owner's call, spec §16).
+	if err := s.authorize(conn, channelID, interfaces.Operation{
+		Action:       interfaces.ActionConfigure,
+		ResourceType: interfaces.ResourceQueue,
+		Resource:     name,
+		VHost:        conn.Vhost,
+	}); err != nil {
+		return s.authzChannelError(conn, channelID, err, 50, 10)
+	}
+
+	// 3. Read-only lookup through the storage broker; a non-storage broker
+	// falls back to the management view.
+	var queue *protocol.Queue
+	var err error
+	sb, ok := s.Broker.(*StorageBrokerAdapter)
+	if ok {
+		queue, err = sb.broker.QueueDeclarePassive(name)
+	} else {
+		queue = s.Broker.GetQueues()[name]
+		if queue == nil {
+			err = broker.QueueNotFoundError(name)
+		}
+	}
+	if err != nil {
+		return s.closeChannelWithBrokerError(conn, channelID, err, 50, 10)
+	}
+
+	// 4. Exclusive access (lax, R1 check_exclusive_access): 405 when the queue
+	// is exclusively owned by ANOTHER connection.
+	if ok {
+		if owner, exists := sb.broker.GetQueueOwner(queue.Name); exists && owner != conn.ID {
+			return s.closeChannelWith(conn, channelID, uint16(amqperrors.ResourceLocked),
+				"RESOURCE_LOCKED - cannot obtain exclusive access to locked queue '"+queue.Name+
+					"' in vhost '/'. It could be originally declared on another connection or the exclusive property value does not match that of the original declaration.",
+				50, 10)
+		}
+	}
+
+	// 5. Track the channel's current queue exactly as the active path does.
+	if val, exists := conn.Channels.Load(channelID); exists {
+		ch := val.(*protocol.Channel)
+		ch.Mutex.Lock()
+		ch.CurrentQueue = queue.Name
+		ch.Mutex.Unlock()
+	}
+
+	// 6. Nothing was declared: no RecordQueueDeclared metric.
+	if declareMethod.NoWait {
+		return nil
+	}
+
+	// 7. Declare-ok carries the REAL ready/consumer counts (read-only getters).
+	msgCount := uint32(0)
+	consumerCount := uint32(0)
+	if ok {
 		msgCount = sb.broker.GetQueueReadyCount(queue.Name)
 		consumerCount = uint32(sb.broker.GetQueueConsumerCount(queue.Name))
 	}
@@ -319,8 +398,24 @@ func (s *Server) handleQueuePurge(conn *protocol.Connection, channelID uint16, p
 		return s.authzChannelError(conn, channelID, err, 50, 30)
 	}
 
+	// WS-D §4.4 (RabbitMQ with_exclusive_access_or_die): purging an exclusive
+	// queue owned by another connection is 405.
+	if sb, ok := s.Broker.(*StorageBrokerAdapter); ok {
+		if ownerID, exists := sb.broker.GetQueueOwner(queueName); exists && ownerID != conn.ID {
+			return s.closeChannelWith(conn, channelID, uint16(amqperrors.ResourceLocked),
+				"RESOURCE_LOCKED - cannot obtain exclusive access to locked queue '"+queueName+
+					"' in vhost '/'. It could be originally declared on another connection or the exclusive property value does not match that of the original declaration.",
+				50, 30)
+		}
+	}
+
 	count, err := s.Broker.PurgeQueue(queueName)
 	if err != nil {
+		// WS-D §4.4: a purge of a nonexistent queue is 404 via the shared
+		// mapping (the broker's closed-state path).
+		if _, _, ok := brokerErrorReply(err); ok {
+			return s.closeChannelWithBrokerError(conn, channelID, err, 50, 30)
+		}
 		s.Log.Error("Failed to purge queue",
 			zap.Error(err),
 			zap.String("queue", queueName))
@@ -372,7 +467,7 @@ func (s *Server) handleQueueDelete(conn *protocol.Connection, channelID uint16, 
 	if sb, ok := s.Broker.(*StorageBrokerAdapter); ok {
 		if ownerID, exists := sb.broker.GetQueueOwner(queueName); exists && ownerID != conn.ID {
 			replyText := fmt.Sprintf("QUEUE_LOCKED - queue '%s' is exclusive to another connection", queueName)
-			return s.channelError(conn, channelID, uint16(amqperrors.ResourceLocked), replyText, 50, 40)
+			return s.closeChannelWith(conn, channelID, uint16(amqperrors.ResourceLocked), replyText, 50, 40)
 		}
 	}
 
@@ -383,6 +478,11 @@ func (s *Server) handleQueueDelete(conn *protocol.Connection, channelID uint16, 
 
 	count, err := s.Broker.DeleteQueue(queueName, deleteMethod.IfUnused, deleteMethod.IfEmpty)
 	if err != nil {
+		// WS-D §3.6: if-unused/if-empty refusals are 406 channel errors
+		// (M8); the connection stays alive.
+		if _, _, ok := brokerErrorReply(err); ok {
+			return s.closeChannelWithBrokerError(conn, channelID, err, 50, 40)
+		}
 		s.Log.Error("Failed to delete queue",
 			zap.Error(err),
 			zap.String("queue", queueName))

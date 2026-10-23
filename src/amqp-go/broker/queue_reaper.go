@@ -34,7 +34,9 @@ package broker
 //      ClaimInflight is the sole decrementer.
 //   2. For an expired ready tag, both the reaper and the head-check gate their
 //      ReapDrop on winning DeleteMessageIfPresent (a single ring-slot CAS with
-//      exactly one winner). The loser observes the tag already gone: a consumer
+//      exactly one winner); for spilled tags the arbitration is
+//      DeleteMessageIfPresentDetailed's per-tag stripe (§8). The loser observes
+//      the tag already gone: a consumer
 //      that had claimed it off the tail then finds GetMessage empty → gap path
 //      (GapSkipAdvance, no depth change); the reaper simply skips. Hence exactly
 //      one ReapDrop per tag.

@@ -226,6 +226,13 @@ type ServerConfig struct {
 	MaxFrameSize             int
 	MaxMessageSize           int64
 
+	// MaxQueues caps the number of queues (all kinds: durable, transient,
+	// exclusive, auto-delete, server-named). 0 = unlimited.
+	MaxQueues int
+	// MaxExchanges caps the number of user-declared exchanges; the default
+	// exchange and amq.* are not counted. 0 = unlimited.
+	MaxExchanges int
+
 	// Timeouts and intervals (in milliseconds)
 	CleanupIntervalMS int64 // Background cleanup interval
 }

@@ -78,11 +78,12 @@ func TestDeclareQueue_InvalidArgumentFailsDeclare(t *testing.T) {
 	require.Nil(t, broker.GetQueuePolicy("bad-q"))
 }
 
-// TestDeclareQueue_RedeclareKeepsOriginalPolicy documents current redeclare
-// semantics: arguments on a redeclare of an existing queue are not compared
-// (known gap vs. AMQP 0.9.1 equivalence rules — differing args should be a
-// 406) and must not overwrite the policy resolved from the original
-// arguments.
+// TestDeclareQueue_RedeclareKeepsOriginalPolicy documents WS-D §2 redeclare
+// semantics: arguments on a redeclare of an existing queue are compared
+// against RabbitMQ's classic-queue argument list (R6/R7), so a differing
+// x-message-ttl is REFUSED with ErrInequivalentArgs (AMQP 0.9.1 equivalence
+// rules — the former "known gap" is closed), and the refused redeclare does
+// not overwrite the policy resolved from the original arguments.
 func TestDeclareQueue_RedeclareKeepsOriginalPolicy(t *testing.T) {
 	broker, cleanup := createTestBroker(t)
 	defer cleanup()
@@ -92,17 +93,17 @@ func TestDeclareQueue_RedeclareKeepsOriginalPolicy(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	// Redeclare with different (and even invalid) arguments: today these are
-	// ignored entirely, so the declare succeeds and the original policy stays.
+	// Redeclare with different arguments: refused (406 class), original stays.
 	_, err = broker.DeclareQueue("redeclare-q", false, false, false, map[string]interface{}{
 		"x-message-ttl": int32(99999),
 	})
-	require.NoError(t, err)
+	require.Error(t, err)
+	require.ErrorIs(t, err, ErrInequivalentArgs)
 
 	policy := broker.GetQueuePolicy("redeclare-q")
 	require.NotNil(t, policy)
 	require.Equal(t, 10*time.Second, policy.MessageTTL,
-		"redeclare arguments must not overwrite the original policy")
+		"a refused redeclare must not overwrite the original policy")
 }
 
 // TestDeclareQueue_PolicySurvivesBrokerRestart simulates a broker restart on
@@ -141,7 +142,15 @@ func TestDeclareQueue_PolicySurvivesBrokerRestart(t *testing.T) {
 	// Re-declare (as recovery does): the queue exists in persisted metadata,
 	// so this takes the existing-queue branch and re-resolves the policy from
 	// the stored arguments (which may have been JSON round-tripped to float64).
-	_, err = broker2.DeclareQueue("durable-policy-q", true, false, false, nil)
+	// WS-D §2: a nil-arguments redeclare of an args-carrying queue is now
+	// INEQUIVALENT (RabbitMQ parity), so the redeclare passes the SAME
+	// argument values — with deliberately different integer widths, which R7
+	// type-class equivalence treats as equal (and which is exactly what a
+	// CBOR round trip produces after a real restart).
+	_, err = broker2.DeclareQueue("durable-policy-q", true, false, false, map[string]interface{}{
+		"x-message-ttl": int64(45000),
+		"x-max-length":  int32(2000),
+	})
 	require.NoError(t, err)
 
 	policy := broker2.GetQueuePolicy("durable-policy-q")

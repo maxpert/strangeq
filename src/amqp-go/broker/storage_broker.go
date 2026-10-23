@@ -3,7 +3,6 @@ package broker
 import (
 	"errors"
 	"fmt"
-	"reflect"
 	"slices"
 	"strings"
 	"sync"
@@ -291,6 +290,16 @@ type StorageBroker struct {
 	maxLenTrimStop   chan struct{}
 	maxLenTrimWG     sync.WaitGroup
 	maxLenTrimClosed bool
+
+	// WS-D §15 topology limits (R12): maxQueues/maxExchanges are the
+	// configured caps (0 = unlimited); queueCount/exchangeCount track the live
+	// entity counts, seeded from the metadata store at construction and
+	// CAS-reserved at declare time so concurrent declares never overshoot.
+	// exchangeCreateMuByName serializes check+create per exchange NAME (the
+	// queueCreateMuByName pattern).
+	maxQueues, maxExchanges   atomic.Int64
+	queueCount, exchangeCount atomic.Int64
+	exchangeCreateMuByName    sync.Map
 }
 
 // maxLenTrimReq is a deferred drop-head trim handed from an async publish
@@ -312,8 +321,41 @@ func NewStorageBroker(storage interfaces.Storage, engineConfig interfaces.Engine
 
 	broker.initErr = broker.initOrdinalAllocator()
 	broker.initializeDefaultExchanges()
+	broker.seedTopologyCounts()
 
 	return broker
+}
+
+// SetTopologyLimits configures the MaxQueues/MaxExchanges caps (§15; 0 =
+// unlimited). Called at server build time; not on any hot path.
+func (b *StorageBroker) SetTopologyLimits(maxQueues, maxExchanges int) {
+	b.maxQueues.Store(int64(maxQueues))
+	b.maxExchanges.Store(int64(maxExchanges))
+}
+
+// seedTopologyCounts initializes exchangeCount from the metadata store at
+// construction (queueCount is seeded by initOrdinalAllocator's own
+// ListQueues), so a restart does not reset the budget (§15). The exchange
+// count excludes the default exchange ("") and amq.* system exchanges (they
+// are not user-declared, R12's extension).
+func (b *StorageBroker) seedTopologyCounts() {
+	if exchanges, err := b.storage.ListExchanges(); err == nil {
+		var n int64
+		for _, ex := range exchanges {
+			if ex.Name == "" || strings.HasPrefix(ex.Name, "amq.") {
+				continue
+			}
+			n++
+		}
+		b.exchangeCount.Store(n)
+	}
+}
+
+// exchangeCreateMu returns the per-exchange-name mutex serializing
+// check+create for MaxExchanges enforcement (the getQueueCreateMutex pattern).
+func (b *StorageBroker) exchangeCreateMu(name string) *sync.Mutex {
+	val, _ := b.exchangeCreateMuByName.LoadOrStore(name, &sync.Mutex{})
+	return val.(*sync.Mutex)
 }
 
 // InitError reports a failure that occurred while constructing the broker and
@@ -388,6 +430,11 @@ func (b *StorageBroker) initOrdinalAllocator() error {
 			maxOrdinal = q.Ordinal
 		}
 	}
+	// §15: seed the MaxQueues counter from the same ListQueues (a restart
+	// doesn't reset the budget). On a read error the count stays 0 — the
+	// fail-open direction, matching the allocator's best-effort posture; the
+	// fault is still propagated below.
+	b.queueCount.Store(int64(len(queues)))
 	if qerr != nil {
 		// Pass a classified error straight through: the storage layer knows the
 		// absolute path of the directory it failed to read and this package
@@ -618,6 +665,13 @@ type ringDeleter interface {
 	DeleteMessageIfPresent(queueName string, deliveryTag uint64) (bool, error)
 }
 
+// ringDeleterDetailed is the §8 capability that also reports removals of
+// SPILLED (WAL/segment-only) messages, so depth accounting is correct for a
+// non-ring-resident ready message.
+type ringDeleterDetailed interface {
+	DeleteMessageIfPresentDetailed(queueName string, deliveryTag uint64) (removed, wasResident bool, err error)
+}
+
 // asyncDurableWriter is the optional storage capability that decouples a durable
 // publish's fsync from the caller: the message is ring-stored synchronously and
 // its WAL write is enqueued for group commit, with the fsync completion reported
@@ -654,9 +708,17 @@ func (b *StorageBroker) sharedBodyThreshold() int {
 }
 
 // deleteIfPresent removes a message from storage and reports whether THIS call
-// won the removal (the ring CAS). Depth is decremented only by the winner, so at
-// most one of {reaper drop, consumer head-check} decrements depth per tag.
+// removed a message that was PRESENT — the ring CAS win OR the first
+// acknowledgement of a spilled (WAL/segment-only) record (§8). Depth is
+// decremented only by the winner, so at most one of {reaper drop, consumer
+// head-check, drop-head evict, no-ack get, purge} decrements depth per tag,
+// and a spilled message's removal now decrements depth exactly once (the old
+// ring-CAS-only contract leaked depth for spilled tags at all five call sites).
 func (b *StorageBroker) deleteIfPresent(queueName string, tag uint64) bool {
+	if rd, ok := b.storage.(ringDeleterDetailed); ok {
+		removed, _, _ := rd.DeleteMessageIfPresentDetailed(queueName, tag)
+		return removed
+	}
 	if rd, ok := b.storage.(ringDeleter); ok {
 		removed, _ := rd.DeleteMessageIfPresent(queueName, tag)
 		return removed
@@ -1428,10 +1490,30 @@ func (b *StorageBroker) DeclareExchange(name, exchangeType string, durable, auto
 		return fmt.Errorf("failed to check existing exchange: %w", err)
 	}
 
-	// If exists, validate properties match
+	// If exists, validate properties match (R8 assert_equivalence), in order:
+	// type, durable, auto_delete, internal, then ONLY the alternate-exchange
+	// argument (D3); other argument keys are ignored. The type check keeps
+	// ErrExchangeTypeMismatch errors.Is-reachable (§2.3).
 	if existing != nil {
 		if existing.Kind != exchangeType {
-			return fmt.Errorf("%w: exchange '%s' expected %s, got %s", ErrExchangeTypeMismatch, name, existing.Kind, exchangeType)
+			return inequivalent("exchange", name, "type", fmtBareVal(exchangeType), fmtBareVal(existing.Kind), ErrExchangeTypeMismatch)
+		}
+		if existing.Durable != durable {
+			return inequivalent("exchange", name, "durable", fmtBool(durable), fmtBool(existing.Durable))
+		}
+		if existing.AutoDelete != autoDelete {
+			return inequivalent("exchange", name, "auto_delete", fmtBool(autoDelete), fmtBool(existing.AutoDelete))
+		}
+		if existing.Internal != internal {
+			return inequivalent("exchange", name, "internal", fmtBool(internal), fmtBool(existing.Internal))
+		}
+		o, oOK := existing.Arguments["alternate-exchange"]
+		n, nOK := arguments["alternate-exchange"]
+		if oOK != nOK {
+			return inequivalent("exchange", name, "alternate-exchange", fmtArgVal(n, nOK), fmtArgVal(o, oOK))
+		}
+		if oOK && nOK && !argEquivalent(o, n) {
+			return inequivalent("exchange", name, "alternate-exchange", fmtArgVal(n, nOK), fmtArgVal(o, oOK))
 		}
 		// Exchange already exists with matching properties
 		return nil
@@ -1439,6 +1521,36 @@ func (b *StorageBroker) DeclareExchange(name, exchangeType string, durable, auto
 
 	if !isSupportedExchangeType(exchangeType) {
 		return fmt.Errorf("unsupported exchange type: %s", exchangeType)
+	}
+
+	// §15 (R12 extension): MaxExchanges enforcement for USER exchanges (the
+	// default exchange and amq.* are not counted). Serialize check+reserve+
+	// create per NAME so racing declares of the same name see each other.
+	isCounted := name != "" && !strings.HasPrefix(name, "amq.")
+	var mu *sync.Mutex
+	if isCounted {
+		mu = b.exchangeCreateMu(name)
+		mu.Lock()
+		// Re-read under the mutex: a concurrent creator may have won while we
+		// waited — delegate so the equivalence branch validates the redeclare.
+		if existing, rerr := b.storage.GetExchange(name); rerr == nil && existing != nil {
+			mu.Unlock()
+			return b.DeclareExchange(name, exchangeType, durable, autoDelete, internal, arguments)
+		}
+		if lim := b.maxExchanges.Load(); lim > 0 {
+			for {
+				c := b.exchangeCount.Load()
+				if c >= lim {
+					mu.Unlock()
+					return semErr(fmt.Sprintf("cannot declare exchange '%s': exchange limit in cluster (%d) is reached", name, lim), ErrExchangeLimitReached)
+				}
+				if b.exchangeCount.CompareAndSwap(c, c+1) {
+					break
+				}
+			}
+		} else {
+			b.exchangeCount.Add(1)
+		}
 	}
 
 	// Create new exchange
@@ -1457,7 +1569,13 @@ func (b *StorageBroker) DeclareExchange(name, exchangeType string, durable, auto
 	}
 
 	err = b.storage.StoreExchange(exchange)
+	if mu != nil {
+		mu.Unlock()
+	}
 	if err != nil {
+		if isCounted {
+			b.exchangeCount.Add(-1) // release the §15 reservation
+		}
 		return err
 	}
 
@@ -1472,23 +1590,47 @@ func (b *StorageBroker) DeclareExchange(name, exchangeType string, durable, auto
 	return nil
 }
 
+// ExchangeDeclarePassive returns the existing exchange record for name, never
+// creating anything. Missing → errNoExchange(name) (R1 with_or_die → 404).
+// Type/durable/auto-delete/internal/arguments in a passive frame are IGNORED:
+// R1's passive clause never calls assert_equivalence.
+func (b *StorageBroker) ExchangeDeclarePassive(name string) (*protocol.Exchange, error) {
+	ex, err := b.storage.GetExchange(name)
+	if err != nil {
+		if errors.Is(err, interfaces.ErrExchangeNotFound) {
+			return nil, errNoExchange(name)
+		}
+		return nil, fmt.Errorf("failed to check exchange '%s': %w", name, err)
+	}
+	return ex, nil
+}
+
 // DeleteExchange removes an exchange
 func (b *StorageBroker) DeleteExchange(name string, ifUnused bool) error {
 	_, err := b.storage.GetExchange(name)
 	if err != nil {
 		if errors.Is(err, interfaces.ErrExchangeNotFound) {
+			// D2/R4: deleting a missing exchange is delete-ok
+			// (rabbit_exchange:ensure_deleted → ok).
 			return nil
 		}
 		return err
 	}
 
+	// R4: in_use means "has bindings where this exchange is the SOURCE" —
+	// queue bindings (GetExchangeBindings) OR exchange-to-exchange source
+	// bindings (GetExchangeBindingsFrom).
 	if ifUnused {
-		bindings, err := b.storage.GetExchangeBindings(name)
+		qb, err := b.storage.GetExchangeBindings(name)
 		if err != nil {
 			return fmt.Errorf("failed to check exchange bindings: %w", err)
 		}
-		if len(bindings) > 0 {
-			return fmt.Errorf("exchange '%s' in use", name)
+		eb, err := b.storage.GetExchangeBindingsFrom(name)
+		if err != nil {
+			return fmt.Errorf("failed to check exchange bindings: %w", err)
+		}
+		if len(qb) > 0 || len(eb) > 0 {
+			return semErr(exchangeRS(name)+" in use", ErrExchangeInUse)
 		}
 	}
 
@@ -1508,11 +1650,18 @@ func (b *StorageBroker) DeleteExchange(name string, ifUnused bool) error {
 		for _, eb := range exchBindings {
 			if eb.Destination == name {
 				b.storage.DeleteExchangeBinding(eb.Source, eb.Destination, eb.RoutingKey)
+				// §12: the deleted exchange was the DESTINATION of this e2e
+				// binding; removing it may orphan an auto-delete SOURCE.
+				b.maybeAutoDeleteExchange(eb.Source)
 			}
 		}
 	}
 
-	return b.storage.DeleteExchange(name)
+	err = b.storage.DeleteExchange(name)
+	if err == nil && name != "" && !strings.HasPrefix(name, "amq.") {
+		b.exchangeCount.Add(-1) // §15: release the deleted user exchange's slot
+	}
+	return err
 }
 
 // DeclareQueue creates or updates a queue
@@ -1535,7 +1684,7 @@ func (b *StorageBroker) DeclareQueue(name string, durable, autoDelete, exclusive
 		mu.Lock()
 		fresh, ferr := b.storage.GetQueue(name)
 		if ferr == nil && fresh != nil {
-			q, derr := b.declareExistingQueueLocked(fresh, durable, autoDelete, exclusive)
+			q, derr := b.declareExistingQueueLocked(fresh, durable, autoDelete, exclusive, arguments)
 			mu.Unlock()
 			return q, derr
 		}
@@ -1592,9 +1741,28 @@ func (b *StorageBroker) DeclareQueue(name string, durable, autoDelete, exclusive
 	// inside declareExistingQueueLocked, which is the exact race this whole
 	// change eliminates.
 	if existing, gerr := b.storage.GetQueue(name); gerr == nil && existing != nil {
-		q, derr := b.declareExistingQueueLocked(existing, durable, autoDelete, exclusive)
+		q, derr := b.declareExistingQueueLocked(existing, durable, autoDelete, exclusive, arguments)
 		mu.Unlock()
 		return q, derr
+	}
+
+	// §15 (R12): MaxQueues enforcement — CAS-reserve a slot BEFORE allocating
+	// the ordinal, so racing declares of distinct names can never both pass
+	// the check at count == limit-1. The redeclare branch above never counts
+	// (the record already exists and was seeded).
+	if lim := b.maxQueues.Load(); lim > 0 {
+		for {
+			c := b.queueCount.Load()
+			if c >= lim {
+				mu.Unlock()
+				return nil, semErr(fmt.Sprintf("cannot declare queue '%s': queue limit in cluster (%d) is reached", name, lim), ErrQueueLimitReached)
+			}
+			if b.queueCount.CompareAndSwap(c, c+1) {
+				break
+			}
+		}
+	} else {
+		b.queueCount.Add(1)
 	}
 
 	// Create new queue and resolve its composite-tag ordinal (see
@@ -1606,6 +1774,7 @@ func (b *StorageBroker) DeclareQueue(name string, durable, autoDelete, exclusive
 
 	ordinal, aerr := b.allocateOrdinal()
 	if aerr != nil {
+		b.queueCount.Add(-1) // release the §15 reservation
 		mu.Unlock()
 		// Unreachable in any real deployment (see tag_packing.go); a silent
 		// wrap here would be cross-queue delivery-tag collision, so fail the
@@ -1619,6 +1788,7 @@ func (b *StorageBroker) DeclareQueue(name string, durable, autoDelete, exclusive
 	// not be silently lost, so the declare fails rather than proceeding with
 	// an unpersisted identity.
 	if serr := b.storage.StoreQueue(queue); serr != nil {
+		b.queueCount.Add(-1) // release the §15 reservation
 		mu.Unlock()
 		return nil, serr
 	}
@@ -1661,22 +1831,61 @@ func (b *StorageBroker) DeclareQueue(name string, durable, autoDelete, exclusive
 // is why this function calls createQueueStateLocked (which assumes the lock
 // is held) rather than getOrCreateQueueState (which would try to take it
 // again and self-deadlock).
-func (b *StorageBroker) declareExistingQueueLocked(existing *protocol.Queue, durable, autoDelete, exclusive bool) (*protocol.Queue, error) {
-	if existing.Durable != durable || existing.AutoDelete != autoDelete || existing.Exclusive != exclusive {
-		return nil, fmt.Errorf("queue '%s' properties mismatch", existing.Name)
+func (b *StorageBroker) declareExistingQueueLocked(existing *protocol.Queue, durable, autoDelete, exclusive bool, arguments map[string]interface{}) (*protocol.Queue, error) {
+	// RabbitMQ redeclare equivalence (R6/R7), checked in order; the first
+	// failure wins. Equivalence runs BEFORE any side effect (activeQueues,
+	// QueueState, reaper), so a refused redeclare changes nothing.
+	//
+	// 1. exclusive is the strict 405 check (D4); cross-CONNECTION ownership
+	//    stays in the server (SetQueueOwnerIfFree).
+	if existing.Exclusive != exclusive {
+		return nil, semErr("cannot obtain exclusive access to locked "+queueRS(existing.Name)+
+			". It could be originally declared on another connection or the exclusive property value does not match that of the original declaration.",
+			ErrQueueLocked)
+	}
+	// 2/3. durable, then auto_delete.
+	if existing.Durable != durable {
+		return nil, inequivalent("queue", existing.Name, "durable", fmtBool(durable), fmtBool(existing.Durable))
+	}
+	if existing.AutoDelete != autoDelete {
+		return nil, inequivalent("queue", existing.Name, "auto_delete", fmtBool(autoDelete), fmtBool(existing.AutoDelete))
+	}
+	// 4. arguments: ONLY the queue type's declared argument keys are compared
+	// (D3, R6 classic queue_arguments); keys outside the list are ignored.
+	for _, k := range classicQueueArgumentKeys {
+		o, oOK := existing.Arguments[k]
+		n, nOK := arguments[k]
+		if !oOK && !nOK {
+			continue
+		}
+		// R7 assert_field_equivalence: x-queue-type "classic" vs absent is ok.
+		if k == "x-queue-type" && (!oOK || !nOK) {
+			present, presentOK := o, oOK
+			if !presentOK {
+				present = n
+			}
+			if s, isStr := present.(string); isStr && s == "classic" {
+				continue
+			}
+		}
+		if oOK != nOK {
+			return nil, inequivalent("queue", existing.Name, k, fmtArgVal(n, nOK), fmtArgVal(o, oOK))
+		}
+		if !argEquivalent(o, n) {
+			return nil, inequivalent("queue", existing.Name, k, fmtArgVal(n, nOK), fmtArgVal(o, oOK))
+		}
 	}
 
 	// Add to active cache (lock-free)
 	b.activeQueues.Store(existing.Name, existing)
 
-	// Ensure queue state exists and carries the resolved policy. The
-	// stored (original) arguments win: redeclare arguments are not
-	// compared today (known gap — AMQP 0.9.1 says differing args should
-	// be a 406), so they must not overwrite the policy either. This
-	// branch also covers recovery when the storage backend already holds
-	// the durable queue across restarts. Resolution errors are tolerated
-	// here (nil policy) so queues persisted before validation existed
-	// remain usable.
+	// Ensure queue state exists and carries the resolved policy. The stored
+	// (original) arguments win: equivalence above guarantees the redeclare
+	// carries nothing new, so they must not overwrite the policy either. This
+	// branch also covers recovery when the storage backend already holds the
+	// durable queue across restarts. Resolution errors are tolerated here
+	// (nil policy) so queues persisted before validation existed remain
+	// usable.
 	qs := b.createQueueStateLocked(existing.Name)
 	if policy, perr := ResolveQueuePolicy(existing.Arguments); perr == nil {
 		qs.SetPolicy(policy)
@@ -1688,6 +1897,53 @@ func (b *StorageBroker) declareExistingQueueLocked(existing *protocol.Queue, dur
 	b.maybeStartReaper(existing.Name, qs)
 
 	return existing, nil
+}
+
+// classicQueueArgumentKeys is RabbitMQ's classic-queue argument list (R6,
+// rabbit_classic_queue.erl capabilities/0 queue_arguments), in the fixed
+// comparison order of §2.2. Redeclare equivalence compares ONLY these keys;
+// plugin/client keys outside the list are ignored (D3).
+var classicQueueArgumentKeys = []string{
+	"x-expires",
+	"x-message-ttl",
+	"x-dead-letter-exchange",
+	"x-dead-letter-routing-key",
+	"x-max-length",
+	"x-max-length-bytes",
+	"x-max-priority",
+	"x-overflow",
+	"x-queue-mode",
+	"x-queue-version",
+	"x-single-active-consumer",
+	"x-queue-type",
+	"x-queue-master-locator",
+	"x-queue-leader-locator",
+}
+
+// QueueDeclarePassive returns the existing queue record for name, never
+// creating anything (no record, no QueueState, no ordinal, no reaper).
+// Missing → errNoQueue(name) (R1 with_or_die → 404). It resets the x-expires
+// idle clock when a QueueState already exists and the policy has x-expires (a
+// declare renews the lease; RabbitMQ's stat path re-arms the expiry timer).
+// Durable/exclusive/auto-delete/arguments in a passive frame are IGNORED
+// (R1's passive clause never calls assert_equivalence).
+func (b *StorageBroker) QueueDeclarePassive(name string) (*protocol.Queue, error) {
+	q, err := b.storage.GetQueue(name)
+	if err != nil {
+		if errors.Is(err, interfaces.ErrQueueNotFound) {
+			return nil, errNoQueue(name)
+		}
+		return nil, fmt.Errorf("failed to check queue '%s': %w", name, err)
+	}
+	// Deliberately NOT getOrCreateQueueState: a passive declare creates no
+	// runtime state. An existing QueueState just gets its lease renewed.
+	if qsVal, ok := b.queueStates.Load(name); ok {
+		qs := qsVal.(*QueueState)
+		if p := qs.Policy(); p != nil && p.HasQueueExpires {
+			qs.MarkActivity(b.ttlNowMillis())
+		}
+	}
+	return q, nil
 }
 
 // DeleteQueue removes a queue. It captures the identity (Ordinal) of the
@@ -1717,6 +1973,8 @@ func (b *StorageBroker) DeleteQueue(name string, ifUnused, ifEmpty bool) (int, e
 	record, err := b.storage.GetQueue(name)
 	if err != nil {
 		if errors.Is(err, interfaces.ErrQueueNotFound) {
+			// D2/R3: deleting a missing queue is delete-ok with count 0
+			// (rabbit_amqqueue:delete_with/6 maps not_found → {ok, 0}).
 			return 0, nil
 		}
 		return 0, err
@@ -1735,23 +1993,13 @@ func (b *StorageBroker) DeleteQueue(name string, ifUnused, ifEmpty bool) (int, e
 // ordinal its caller actually intends to destroy is what makes a stale
 // caller's delete a safe no-op instead of a silent cross-incarnation strand.
 func (b *StorageBroker) deleteQueueIncarnation(name string, wantOrdinal uint64, ifUnused, ifEmpty bool) (int, error) {
-	if ifUnused {
-		consumers, err := b.storage.GetQueueConsumers(name)
-		if err != nil {
-			return 0, fmt.Errorf("failed to check queue consumers: %w", err)
-		}
-		if len(consumers) > 0 {
-			return 0, fmt.Errorf("queue '%s' in use", name)
-		}
-	}
-
+	// R5 order: if-empty is checked BEFORE if-unused. is_empty means
+	// len == 0 where len counts READY messages only (depth = len +
+	// pending_acks): delivered-unacked messages do NOT block if-empty.
+	// WaitingCount is the ready set (the same count declare-ok reports).
 	if ifEmpty {
-		count, err := b.storage.GetQueueMessageCount(name)
-		if err != nil {
-			return 0, fmt.Errorf("failed to check queue message count: %w", err)
-		}
-		if count > 0 {
-			return 0, fmt.Errorf("queue '%s' not empty", name)
+		if qv, ok := b.queueStates.Load(name); ok && qv.(*QueueState).WaitingCount() > 0 {
+			return 0, semErr(queueRS(name)+" not empty", ErrQueueNotEmpty)
 		}
 	}
 
@@ -1773,8 +2021,19 @@ func (b *StorageBroker) deleteQueueIncarnation(name string, wantOrdinal uint64, 
 	// to being refused. That is disruption, not loss: the successor's confirmed
 	// messages and its dispatch cursors are untouched, and consumers reconnect.
 	// Unchanged from before this fix; logged as a follow-up.
+	// if-unused consults the LIVE consumer registry (R5 is_unused == consumer
+	// count 0). The check runs under the SAME consumers-mutex hold that
+	// performs the sweep, so a consumer registering concurrently either lands
+	// before the check (refused) or after the sweep (the pre-existing
+	// register-after-delete window, spec §16).
 	mu := b.getQueueConsumersMutex(name)
 	mu.Lock()
+	if ifUnused {
+		if val, ok := b.queueConsumers.Load(name); ok && len(val.([]*ConsumerState)) > 0 {
+			mu.Unlock()
+			return 0, semErr(queueRS(name)+" in use", ErrQueueInUse)
+		}
+	}
 	if val, ok := b.queueConsumers.Load(name); ok {
 		consumers := val.([]*ConsumerState)
 		for _, state := range consumers {
@@ -1804,6 +2063,17 @@ func (b *StorageBroker) deleteQueueIncarnation(name string, wantOrdinal uint64, 
 	// without persisting it, leaving a live publishable queue with no metadata
 	// record — whose durable publishes are confirmed and then discarded at the
 	// next restart as a deleted queue.
+	//
+	// §12: exchanges whose bindings are swept below are collected for
+	// auto-delete AFTER the create mutex is released (defers run LIFO, so this
+	// runs after cmu.Unlock): the leaf-lock section stays free of the extra
+	// DeleteExchange work (leaf rule, see getQueueCreateMutex).
+	var touched []string
+	defer func() {
+		for _, x := range touched {
+			b.maybeAutoDeleteExchange(x)
+		}
+	}()
 	cmu := b.getQueueCreateMutex(name)
 	cmu.Lock()
 	defer cmu.Unlock()
@@ -1837,6 +2107,7 @@ func (b *StorageBroker) deleteQueueIncarnation(name string, wantOrdinal uint64, 
 	if err == nil {
 		for _, binding := range bindings {
 			b.storage.DeleteBinding(binding.QueueName, binding.ExchangeName, binding.RoutingKey)
+			touched = append(touched, binding.ExchangeName)
 		}
 	}
 
@@ -1848,9 +2119,9 @@ func (b *StorageBroker) deleteQueueIncarnation(name string, wantOrdinal uint64, 
 	// never executes. PersistentMetadataStore.StoreConsumer is a documented
 	// no-op ("Consumer registration is ephemeral"), so nothing ever writes the
 	// consumers/<queue>/ directory that GetQueueConsumers reads, and it always
-	// returns an empty slice. The same fact silently disables the ifUnused
-	// check at the top of this function. That is a pre-existing defect wider
-	// than this change and is logged as a follow-up rather than fixed here.
+	// returns an empty slice. That fact no longer disables anything: WS-D §3
+	// moved the ifUnused check onto the LIVE consumer registry (queueConsumers)
+	// above, which is authoritative for running consumers.
 	consumers, err := b.storage.GetQueueConsumers(name)
 	if err == nil {
 		for _, consumer := range consumers {
@@ -1867,18 +2138,27 @@ func (b *StorageBroker) deleteQueueIncarnation(name string, wantOrdinal uint64, 
 	if err := b.storage.DeleteQueue(name); err != nil {
 		return purgedCount, err
 	}
+	b.queueCount.Add(-1) // §15: release the deleted record's slot
 	return purgedCount, nil
 }
 
 // BindQueue binds a queue to an exchange
 func (b *StorageBroker) BindQueue(queueName, exchangeName, routingKey string, arguments map[string]interface{}) error {
 	// Validate exchange exists (lock-free)
-	_, err := b.storage.GetExchange(exchangeName)
+	bindEx, err := b.storage.GetExchange(exchangeName)
 	if err != nil {
 		if errors.Is(err, interfaces.ErrExchangeNotFound) {
-			return fmt.Errorf("exchange '%s' not found", exchangeName)
+			return errNoExchange(exchangeName)
 		}
 		return err
+	}
+
+	// Headers-exchange bindings validate x-match at bind time (R9
+	// validate_binding), BEFORE anything is stored.
+	if bindEx.Kind == "headers" {
+		if verr := validateHeadersBinding(arguments); verr != nil {
+			return verr
+		}
 	}
 
 	// Validate the queue exists and store the binding under the queue's create
@@ -1907,7 +2187,7 @@ func (b *StorageBroker) BindQueue(queueName, exchangeName, routingKey string, ar
 	if _, err = b.storage.GetQueue(queueName); err != nil {
 		cmu.Unlock()
 		if errors.Is(err, interfaces.ErrQueueNotFound) {
-			return fmt.Errorf("queue '%s' not found", queueName)
+			return errNoQueue(queueName)
 		}
 		return err
 	}
@@ -1926,6 +2206,26 @@ func (b *StorageBroker) BindQueue(queueName, exchangeName, routingKey string, ar
 	return nil
 }
 
+// maybeAutoDeleteExchange deletes exchange `name` if it is auto-delete and
+// has no remaining bindings where it is the SOURCE (queue bindings + e2e) —
+// RabbitMQ's maybe_auto_delete on the source (§12). Storage-only; takes no
+// broker lock. Centralised so every binding-removal path (unbind, queue
+// delete, destination-exchange delete) gets the same cleanup.
+func (b *StorageBroker) maybeAutoDeleteExchange(name string) {
+	if name == "" {
+		return
+	}
+	ex, err := b.storage.GetExchange(name)
+	if err != nil || !ex.AutoDelete {
+		return
+	}
+	qb, _ := b.storage.GetExchangeBindings(name)
+	eb, _ := b.storage.GetExchangeBindingsFrom(name)
+	if len(qb) == 0 && len(eb) == 0 {
+		_ = b.DeleteExchange(name, false)
+	}
+}
+
 // UnbindQueue removes a binding between queue and exchange, matching on
 // (queue, exchange, routing-key) only. Kept for UnifiedBroker compatibility;
 // the AMQP queue.unbind path uses UnbindQueueWithArguments.
@@ -1933,7 +2233,7 @@ func (b *StorageBroker) UnbindQueue(queueName, exchangeName, routingKey string) 
 	if err := b.storage.DeleteBinding(queueName, exchangeName, routingKey); err != nil {
 		return err
 	}
-	b.autoDeleteExchangeIfUnbound(exchangeName)
+	b.maybeAutoDeleteExchange(exchangeName)
 	return nil
 }
 
@@ -1972,20 +2272,8 @@ func (b *StorageBroker) UnbindQueueWithArguments(queueName, exchangeName, routin
 	if err != nil {
 		return err
 	}
-	b.autoDeleteExchangeIfUnbound(exchangeName)
+	b.maybeAutoDeleteExchange(exchangeName)
 	return nil
-}
-
-// autoDeleteExchangeIfUnbound deletes an auto-delete exchange once it has no
-// remaining queue or exchange bindings (moved verbatim from UnbindQueue).
-func (b *StorageBroker) autoDeleteExchangeIfUnbound(exchangeName string) {
-	if exch, err := b.storage.GetExchange(exchangeName); err == nil && exch.AutoDelete {
-		bindings, _ := b.storage.GetExchangeBindings(exchangeName)
-		fromBindings, _ := b.storage.GetExchangeBindingsFrom(exchangeName)
-		if len(bindings) == 0 && len(fromBindings) == 0 {
-			b.DeleteExchange(exchangeName, false)
-		}
-	}
 }
 
 // BindExchange binds a destination exchange to a source exchange with a routing key.
@@ -2000,25 +2288,34 @@ func (b *StorageBroker) BindExchange(destination, source, routingKey string, arg
 		return fmt.Errorf("cannot bind to default exchange")
 	}
 
-	_, err := b.storage.GetExchange(source)
+	srcExchange, err := b.storage.GetExchange(source)
 	if err != nil {
 		if errors.Is(err, interfaces.ErrExchangeNotFound) {
-			return fmt.Errorf("source exchange '%s' not found", source)
+			return errNoExchange(source)
 		}
 		return err
 	}
 
-	destExchange, err := b.storage.GetExchange(destination)
+	// Headers-SOURCE e2e bindings validate x-match at bind time (R9), before
+	// anything is stored.
+	if srcExchange.Kind == "headers" {
+		if verr := validateHeadersBinding(arguments); verr != nil {
+			return verr
+		}
+	}
+
+	_, err = b.storage.GetExchange(destination)
 	if err != nil {
 		if errors.Is(err, interfaces.ErrExchangeNotFound) {
-			return fmt.Errorf("destination exchange '%s' not found", destination)
+			return errNoExchange(destination)
 		}
 		return err
 	}
 
-	if destExchange.Internal {
-		return fmt.Errorf("cannot bind to internal exchange '%s'", destination)
-	}
+	// §11 (R11): binding TO an internal exchange is exactly the supported use
+	// of internal exchanges — the old rejection here is removed. Publishing
+	// DIRECTLY to an internal exchange is what RabbitMQ forbids, and that is
+	// enforced at the publish entry points (ValidatePublishTarget et al).
 
 	if source == destination {
 		return fmt.Errorf("exchange binding cycle detected: %s -> %s", destination, source)
@@ -2037,13 +2334,7 @@ func (b *StorageBroker) UnbindExchange(destination, source, routingKey string) e
 		return err
 	}
 
-	if exch, err := b.storage.GetExchange(source); err == nil && exch.AutoDelete {
-		bindings, _ := b.storage.GetExchangeBindings(source)
-		fromBindings, _ := b.storage.GetExchangeBindingsFrom(source)
-		if len(bindings) == 0 && len(fromBindings) == 0 {
-			b.DeleteExchange(source, false)
-		}
-	}
+	b.maybeAutoDeleteExchange(source)
 
 	return nil
 }
@@ -2109,7 +2400,7 @@ func (b *StorageBroker) RegisterConsumer(queueName, consumerID string, consumer 
 	_, err := b.storage.GetQueue(queueName)
 	if err != nil {
 		if errors.Is(err, interfaces.ErrQueueNotFound) {
-			return errors.New("queue does not exist")
+			return errNoQueue(queueName)
 		}
 		return err
 	}
@@ -2392,14 +2683,37 @@ func (b *StorageBroker) requeueInflightDelivery(qs *QueueState, queueName string
 // treated as immutable after publish). Reusing one Message object across
 // publishes aliases the same pointer in multiple ring slots, which breaks the
 // ring's tag-identity checks and permanently leaks ring count.
+// ValidatePublishTarget reports the errors basic.publish must raise
+// synchronously even in tx mode (R11, rabbit_channel.erl
+// check_internal_exchange runs before tx buffering): errNoExchange (404) and
+// ErrExchangeInternal (403).
+func (b *StorageBroker) ValidatePublishTarget(exchangeName string) error {
+	exchange, err := b.storage.GetExchange(exchangeName)
+	if err != nil {
+		if errors.Is(err, interfaces.ErrExchangeNotFound) {
+			return errNoExchange(exchangeName)
+		}
+		return err
+	}
+	if exchange.Internal {
+		return semErr("cannot publish to internal "+exchangeRS(exchangeName), ErrExchangeInternal)
+	}
+	return nil
+}
+
 func (b *StorageBroker) PublishMessage(exchangeName, routingKey string, message *protocol.Message) error {
 	// Get exchange (lock-free)
 	exchange, err := b.storage.GetExchange(exchangeName)
 	if err != nil {
 		if errors.Is(err, interfaces.ErrExchangeNotFound) {
-			return fmt.Errorf("exchange '%s' not found", exchangeName)
+			return errNoExchange(exchangeName)
 		}
 		return err
+	}
+	// §11 (R11): publishing DIRECTLY to an internal exchange is refused
+	// (403); routing INTO one via e2e bindings remains allowed.
+	if exchange.Internal {
+		return semErr("cannot publish to internal "+exchangeRS(exchangeName), ErrExchangeInternal)
 	}
 
 	// W4 SQ-9: stamp the durable TTL anchor (enqueue instant) up front for a
@@ -2457,21 +2771,12 @@ func (b *StorageBroker) PublishMessage(exchangeName, routingKey string, message 
 		// AT OR OVER its limit; the message is not enqueued to this target and
 		// not dead-lettered. drop-head is applied AFTER enqueue (below).
 		p := queueState.Policy()
-		// For reject-publish, the AT-OR-OVER check and the matching enqueue must
-		// be atomic w.r.t. other publishers to this queue: two publishers both
-		// observing count == limit-1 would otherwise both accept and push the
-		// ready set permanently past the cap. maxLenMu serializes only this
-		// admission path; drop-head and no-policy queues stay lock-free.
+		// For reject-publish, the AT-OR-OVER check and the matching tag mint are
+		// atomic w.r.t. other publishers via admitRejectPublish (maxLenMu held
+		// for O(1) check+reserve only, never across I/O): two publishers both
+		// observing count == limit-1 can no longer both accept (§7).
 		rejectPublish := p != nil && p.Overflow == OverflowRejectPublish &&
 			(p.HasMaxLength || p.HasMaxLengthBytes)
-		if rejectPublish {
-			queueState.maxLenMu.Lock()
-			if maxLenRejectsPublish(queueState, p) {
-				queueState.maxLenMu.Unlock()
-				rejected = true
-				continue
-			}
-		}
 
 		// Assign the delivery tag. Every publish — transient or durable —
 		// reserves the tag as pending on the contiguous frontier UNDER the
@@ -2483,7 +2788,17 @@ func (b *StorageBroker) PublishMessage(exchangeName, routingKey string, message 
 		// reset), so pure-transient queues also go through the frontier after
 		// their first publish. The lock is held for O(1) work (append + atomic
 		// store), never across I/O.
-		msgID := queueState.FrontierReserve()
+		var msgID uint64
+		if rejectPublish {
+			id, ok := admitRejectPublish(queueState, p, len(message.Body))
+			if !ok {
+				rejected = true
+				continue
+			}
+			msgID = id
+		} else {
+			msgID = queueState.FrontierReserve()
+		}
 
 		var storeMsg *protocol.Message
 		if i == 0 {
@@ -2521,10 +2836,8 @@ func (b *StorageBroker) PublishMessage(exchangeName, routingKey string, message 
 		// Store to persistent storage
 		err := b.storage.StoreMessage(queueName, storeMsg)
 		if err != nil {
+			// FrontierComplete(false) pops the tag and releases its reservation.
 			queueState.FrontierComplete(msgID, false)
-			if rejectPublish {
-				queueState.maxLenMu.Unlock()
-			}
 			return fmt.Errorf("failed to store message to queue '%s': %w", queueName, err)
 		}
 
@@ -2532,17 +2845,18 @@ func (b *StorageBroker) PublishMessage(exchangeName, routingKey string, message 
 
 		// SQ-11 max-length: byte accounting + drop-head eviction AFTER the
 		// enqueue, so the just-published newest message is retained and the
-		// globally-oldest ready message is evicted first.
+		// globally-oldest ready message is evicted first. A RESERVED
+		// (reject-publish) copy's bytes were already transferred into readyBytes
+		// by the frontier pop — adding them here would double-count (drop-head
+		// and reject-publish are mutually exclusive, so the trim branch is
+		// unaffected).
 		if p != nil {
-			addReadyBytesOnEnqueue(queueState, p, len(storeMsg.Body))
+			if !rejectPublish {
+				addReadyBytesOnEnqueue(queueState, p, len(storeMsg.Body))
+			}
 			if p.Overflow == OverflowDropHead && (p.HasMaxLength || p.HasMaxLengthBytes) {
 				b.dropHeadTrim(queueState, queueName, p)
 			}
-		}
-		if rejectPublish {
-			// Admission (check + Publish + AddReadyBytes) is complete and now
-			// visible under the cap; release so the next publisher re-checks.
-			queueState.maxLenMu.Unlock()
 		}
 
 		// Done - polling loops will discover it (NO consumer iteration needed)
@@ -2633,9 +2947,13 @@ func (b *StorageBroker) PublishMessageAsyncConfirm(exchangeName, routingKey stri
 	exchange, err := b.storage.GetExchange(exchangeName)
 	if err != nil {
 		if errors.Is(err, interfaces.ErrExchangeNotFound) {
-			return false, nil, fmt.Errorf("exchange '%s' not found", exchangeName)
+			return false, nil, errNoExchange(exchangeName)
 		}
 		return false, nil, err
+	}
+	// §11 (R11): publishing DIRECTLY to an internal exchange is refused (403).
+	if exchange.Internal {
+		return false, nil, semErr("cannot publish to internal "+exchangeRS(exchangeName), ErrExchangeInternal)
 	}
 
 	// W4 SQ-9: stamp the durable TTL anchor for a valid per-message expiration
@@ -2698,18 +3016,12 @@ func (b *StorageBroker) PublishMessageAsyncConfirm(exchangeName, routingKey stri
 			backpressure = queueState
 		}
 
-		// SQ-11 reject-publish admission (synchronous), identical to PublishMessage.
+		// SQ-11 reject-publish admission (synchronous), identical to PublishMessage:
+		// admitRejectPublish reserves the admitted copy under maxLenMu (§7), so
+		// admissions behind gated/out-of-order completions are still counted.
 		p := queueState.Policy()
 		rejectPublish := p != nil && p.Overflow == OverflowRejectPublish &&
 			(p.HasMaxLength || p.HasMaxLengthBytes)
-		if rejectPublish {
-			queueState.maxLenMu.Lock()
-			if maxLenRejectsPublish(queueState, p) {
-				queueState.maxLenMu.Unlock()
-				rejected = true
-				continue
-			}
-		}
 
 		// Assign the delivery tag AND register it pending on this queue's
 		// contiguous durable frontier atomically, holding the queue's frontier
@@ -2717,7 +3029,17 @@ func (b *StorageBroker) PublishMessageAsyncConfirm(exchangeName, routingKey stri
 		// in tag order and any concurrent transient publisher that mints a higher
 		// tag observes the queue frontier-active and routes through it (A3
 		// race-safety — see QueueState.FrontierReserve).
-		msgID := queueState.FrontierReserve()
+		var msgID uint64
+		if rejectPublish {
+			id, ok := admitRejectPublish(queueState, p, len(message.Body))
+			if !ok {
+				rejected = true
+				continue
+			}
+			msgID = id
+		} else {
+			msgID = queueState.FrontierReserve()
+		}
 
 		var storeMsg *protocol.Message
 		if i == 0 {
@@ -2756,9 +3078,12 @@ func (b *StorageBroker) PublishMessageAsyncConfirm(exchangeName, routingKey stri
 		qn := queueName
 		pol := p
 		bodyLen := len(storeMsg.Body)
+		reserved := rejectPublish
 		completion := func(cerr error) {
 			qs.FrontierComplete(id, cerr == nil)
-			if cerr == nil && pol != nil {
+			// A RESERVED copy's bytes were transferred into readyBytes by the
+			// frontier pop; only an unreserved copy adds them here (§7).
+			if cerr == nil && pol != nil && !reserved {
 				addReadyBytesOnEnqueue(qs, pol, bodyLen)
 				if pol.Overflow == OverflowDropHead && (pol.HasMaxLength || pol.HasMaxLengthBytes) {
 					// Runs on the WAL batch-writer goroutine — eviction can block on
@@ -2776,17 +3101,11 @@ func (b *StorageBroker) PublishMessageAsyncConfirm(exchangeName, routingKey stri
 			// so RELEASE the frontier slot we reserved for this tag — otherwise it
 			// stays pending forever and wedges the per-queue frontier, blocking all
 			// later publishes to this queue (M1). real=false advances head past it
-			// without counting it ready. The aggregator is abandoned (guard never
-			// dropped => onDurable never fires). Propagate the failure synchronously.
+			// without counting it ready AND releases its reject-publish reservation
+			// (§7). The aggregator is abandoned (guard never dropped => onDurable
+			// never fires). Propagate the failure synchronously.
 			queueState.FrontierComplete(msgID, false)
-			if rejectPublish {
-				queueState.maxLenMu.Unlock()
-			}
 			return false, nil, fmt.Errorf("failed to store durable message to queue '%s': %w", queueName, serr)
-		}
-
-		if rejectPublish {
-			queueState.maxLenMu.Unlock()
 		}
 	}
 
@@ -2847,16 +3166,18 @@ func (b *StorageBroker) fanoutSharedAsyncConfirm(sdw sharedDurableWriter, agg *p
 		p := queueState.Policy()
 		rejectPublish := p != nil && p.Overflow == OverflowRejectPublish &&
 			(p.HasMaxLength || p.HasMaxLengthBytes)
+
+		var msgID uint64
 		if rejectPublish {
-			queueState.maxLenMu.Lock()
-			if maxLenRejectsPublish(queueState, p) {
-				queueState.maxLenMu.Unlock()
+			id, ok := admitRejectPublish(queueState, p, len(message.Body))
+			if !ok {
 				rejected = true
 				continue
 			}
+			msgID = id
+		} else {
+			msgID = queueState.FrontierReserve()
 		}
-
-		msgID := queueState.FrontierReserve()
 
 		var storeMsg *protocol.Message
 		if i == 0 {
@@ -2889,9 +3210,12 @@ func (b *StorageBroker) fanoutSharedAsyncConfirm(sdw sharedDurableWriter, agg *p
 		qn := queueName
 		pol := p
 		bodyLen := len(storeMsg.Body)
+		reservedCopy := rejectPublish
 		completion := func(cerr error) {
 			qs.FrontierComplete(id, cerr == nil)
-			if cerr == nil && pol != nil {
+			// A RESERVED copy's bytes were transferred into readyBytes by the
+			// frontier pop; only an unreserved copy adds them here (§7).
+			if cerr == nil && pol != nil && !reservedCopy {
 				addReadyBytesOnEnqueue(qs, pol, bodyLen)
 				if pol.Overflow == OverflowDropHead && (pol.HasMaxLength || pol.HasMaxLengthBytes) {
 					// Runs on the WAL batch-writer goroutine — hand drop-head trim to
@@ -2909,10 +3233,6 @@ func (b *StorageBroker) fanoutSharedAsyncConfirm(sdw sharedDurableWriter, agg *p
 			Message:   storeMsg,
 			OnDurable: completion,
 		})
-
-		if rejectPublish {
-			queueState.maxLenMu.Unlock()
-		}
 	}
 
 	if len(subs) > 0 {
@@ -2982,21 +3302,23 @@ func (b *StorageBroker) fanoutSharedSync(sdw sharedDurableWriter, message *proto
 		p := queueState.Policy()
 		rejectPublish := p != nil && p.Overflow == OverflowRejectPublish &&
 			(p.HasMaxLength || p.HasMaxLengthBytes)
-		if rejectPublish {
-			queueState.maxLenMu.Lock()
-			if maxLenRejectsPublish(queueState, p) {
-				queueState.maxLenMu.Unlock()
-				rejected = true
-				continue
-			}
-		}
 
 		// Reserve-at-mint on every target (I1-safe, symmetric with the async path):
 		// the tag registers pending on the contiguous durable frontier under the
 		// frontier lock, so a concurrent durable publisher minting a higher tag
 		// observes the queue frontier-active and can never advance head past this
 		// still-pending lower tag before its completion below marks it done.
-		msgID := queueState.FrontierReserve()
+		var msgID uint64
+		if rejectPublish {
+			id, ok := admitRejectPublish(queueState, p, len(message.Body))
+			if !ok {
+				rejected = true
+				continue
+			}
+			msgID = id
+		} else {
+			msgID = queueState.FrontierReserve()
+		}
 
 		var storeMsg *protocol.Message
 		if i == 0 {
@@ -3024,6 +3346,7 @@ func (b *StorageBroker) fanoutSharedSync(sdw sharedDurableWriter, message *proto
 		qn := queueName
 		pol := p
 		bodyLen := len(storeMsg.Body)
+		reservedCopy := rejectPublish
 		wg.Add(1)
 		completion := func(cerr error) {
 			defer wg.Done()
@@ -3036,7 +3359,9 @@ func (b *StorageBroker) fanoutSharedSync(sdw sharedDurableWriter, message *proto
 				errOnce.Do(func() { firstErr = cerr })
 				return
 			}
-			if pol != nil {
+			// A RESERVED copy's bytes were transferred into readyBytes by the
+			// frontier pop; only an unreserved copy adds them here (§7).
+			if pol != nil && !reservedCopy {
 				addReadyBytesOnEnqueue(qs, pol, bodyLen)
 				if pol.Overflow == OverflowDropHead && (pol.HasMaxLength || pol.HasMaxLengthBytes) {
 					// Completion runs on the WAL batch-writer goroutine — hand drop-head
@@ -3052,10 +3377,6 @@ func (b *StorageBroker) fanoutSharedSync(sdw sharedDurableWriter, message *proto
 			Message:   storeMsg,
 			OnDurable: completion,
 		})
-
-		if rejectPublish {
-			queueState.maxLenMu.Unlock()
-		}
 	}
 
 	if len(subs) > 0 {
@@ -3108,9 +3429,15 @@ func (b *StorageBroker) PublishMessageTx(txnStore interfaces.Storage, exchangeNa
 	exchange, err := b.storage.GetExchange(exchangeName)
 	if err != nil {
 		if errors.Is(err, interfaces.ErrExchangeNotFound) {
-			return nil, fmt.Errorf("exchange '%s' not found", exchangeName)
+			return nil, errNoExchange(exchangeName)
 		}
 		return nil, err
+	}
+	// §11 (R11): check_internal_exchange runs at publish time in tx and
+	// non-tx mode alike; the server also pre-checks via ValidatePublishTarget
+	// before buffering (spec §11.2).
+	if exchange.Internal {
+		return nil, semErr("cannot publish to internal "+exchangeRS(exchangeName), ErrExchangeInternal)
 	}
 
 	// Same pooled-scratch routing as PublishMessage. The deferred visibility
@@ -3164,11 +3491,31 @@ func (b *StorageBroker) PublishMessageTx(txnStore interfaces.Storage, exchangeNa
 			return nil, fmt.Errorf("queue '%s' closed during backpressure wait: %w", queueName, ErrQueueClosed)
 		}
 
+		// W4 SQ-9 + SQ-11: one shared Policy() load for this target — used by the
+		// TTL anchor stamp (below) and the deferred max-length accounting closure.
+		p := queueState.Policy()
+
 		// Reserve the tag on the frontier at stage time, minting inside the
 		// callback so this queue's frontier tags register in tag order (same
 		// pattern as PublishMessage). The tag stays pending on the frontier
 		// until the deferred closure calls FrontierComplete after commit/abort.
-		msgID := queueState.FrontierReserve()
+		//
+		// §7.4 (D7): reject-publish admission applies in tx too. A refused copy
+		// is DROPPED (RabbitMQ silently drops a non-confirm reject-publish
+		// publish) — the tx proceeds with its other operations; no reserved
+		// slot and no deferred closure are produced for the dropped copy.
+		rejectPublish := p != nil && p.Overflow == OverflowRejectPublish &&
+			(p.HasMaxLength || p.HasMaxLengthBytes)
+		var msgID uint64
+		if rejectPublish {
+			id, ok := admitRejectPublish(queueState, p, len(message.Body))
+			if !ok {
+				continue
+			}
+			msgID = id
+		} else {
+			msgID = queueState.FrontierReserve()
+		}
 		reserved = append(reserved, reservedSlot{queueState, msgID})
 
 		var storeMsg *protocol.Message
@@ -3189,10 +3536,6 @@ func (b *StorageBroker) PublishMessageTx(txnStore interfaces.Storage, exchangeNa
 			}
 			storeMsg = &msgCopy
 		}
-
-		// W4 SQ-9 + SQ-11: one shared Policy() load for this target — used by the
-		// TTL anchor stamp (below) and the deferred max-length accounting closure.
-		p := queueState.Policy()
 
 		// W4 SQ-9: stamp the TTL anchor for a queue-level x-message-ttl target that
 		// carried no per-message expiration, per copy. Like the top-of-function
@@ -3218,9 +3561,12 @@ func (b *StorageBroker) PublishMessageTx(txnStore interfaces.Storage, exchangeNa
 		qn := queueName
 		pol := p
 		bodyLen := len(storeMsg.Body)
+		reservedCopy := rejectPublish
 		deferred = append(deferred, func(commit bool) {
 			qs.FrontierComplete(id, commit)
-			if commit && pol != nil {
+			// A RESERVED copy's bytes were transferred into readyBytes by the
+			// frontier pop; only an unreserved copy adds them here (§7).
+			if commit && pol != nil && !reservedCopy {
 				addReadyBytesOnEnqueue(qs, pol, bodyLen)
 				if pol.Overflow == OverflowDropHead && (pol.HasMaxLength || pol.HasMaxLengthBytes) {
 					b.dropHeadTrim(qs, qn, pol)
@@ -3231,6 +3577,11 @@ func (b *StorageBroker) PublishMessageTx(txnStore interfaces.Storage, exchangeNa
 
 	return deferred, nil
 }
+
+// directDedupMapThreshold is the binding count above which the direct
+// no-e2e fast path switches from slices.Contains dedup (O(n²), map-free) to
+// the pooled scratch map (O(n), zero-alloc after warm-up). §14.
+const directDedupMapThreshold = 8
 
 // routeScratch holds per-publish routing state. Instances are pooled so the
 // publish hot path performs zero steady-state heap allocations: the queues
@@ -3320,9 +3671,24 @@ func (b *StorageBroker) routeMessage(exchange *protocol.Exchange, routingKey str
 			if err != nil {
 				return fmt.Errorf("failed to get exchange bindings: %w", err)
 			}
+			// WS-D §14: the small case stays map-free (preserving the
+			// no-e2e zero-alloc pin); past the threshold dedup goes O(n)
+			// through the pooled scratch map instead of O(n²) slices.Contains.
+			if len(bindings) <= directDedupMapThreshold {
+				for _, binding := range bindings {
+					if binding.RoutingKey == routingKey && !slices.Contains(rs.queues, binding.QueueName) {
+						rs.queues = append(rs.queues, binding.QueueName)
+					}
+				}
+				return nil
+			}
+			rs.resetMaps() // pooled; zero-alloc after warm-up
 			for _, binding := range bindings {
-				if binding.RoutingKey == routingKey && !slices.Contains(rs.queues, binding.QueueName) {
-					rs.queues = append(rs.queues, binding.QueueName)
+				if binding.RoutingKey == routingKey {
+					if _, ok := rs.seen[binding.QueueName]; !ok {
+						rs.queues = append(rs.queues, binding.QueueName)
+						rs.seen[binding.QueueName] = struct{}{}
+					}
 				}
 			}
 			return nil
@@ -3454,92 +3820,55 @@ func (b *StorageBroker) collectTargetQueues(exchange *protocol.Exchange, routing
 
 // Helper methods for routing
 
-func (b *StorageBroker) matchTopicPattern(pattern, routingKey string) bool {
-	if pattern == routingKey || pattern == "#" {
-		return true
-	}
-
-	pi := strings.IndexByte(pattern, '.')
-	var pWord, pRest string
-	if pi >= 0 {
-		pWord, pRest = pattern[:pi], pattern[pi+1:]
-	} else {
-		pWord = pattern
-	}
-
-	if pWord == "#" {
-		if b.matchTopicPattern(pRest, routingKey) {
+// matchHeaders implements RabbitMQ's headers-exchange match (R9,
+// rabbit_exchange_type_headers.erl): every x-* binding key is skipped except
+// under the *-with-x modes; a void (nil) binding value is a PRESENCE check
+// (D5); typed values compare with headerValueMatches (integer widths equal,
+// integer vs float not, longstr ≡ binary by bytes). match_all([]) = true,
+// match_any([]) = false — a nil/empty binding therefore matches every
+// message. x-match itself is validated at bind time (validateHeadersBinding).
+func (b *StorageBroker) matchHeaders(bindingArgs map[string]interface{}, messageHeaders map[string]interface{}) bool {
+	mode, _ := bindingArgs["x-match"].(string) // validated at bind time
+	withX := mode == "all-with-x" || mode == "any-with-x"
+	any := mode == "any" || mode == "any-with-x"
+	for k, bv := range bindingArgs {
+		if k == "x-match" || (!withX && strings.HasPrefix(k, "x-")) {
+			continue
+		}
+		hv, present := messageHeaders[k] // nil map read is safe
+		var ok bool
+		if bv == nil {
+			ok = present // void binding value = presence check
+		} else {
+			ok = present && headerValueMatches(bv, hv)
+		}
+		if any && ok {
 			return true
 		}
-		if routingKey != "" {
-			ki := strings.IndexByte(routingKey, '.')
-			var kRest string
-			if ki >= 0 {
-				kRest = routingKey[ki+1:]
-			}
-			return b.matchTopicPattern(pattern, kRest)
-		}
-		return false
-	}
-
-	if routingKey == "" {
-		return false
-	}
-
-	ki := strings.IndexByte(routingKey, '.')
-	var kWord, kRest string
-	if ki >= 0 {
-		kWord, kRest = routingKey[:ki], routingKey[ki+1:]
-	} else {
-		kWord = routingKey
-	}
-
-	if pWord == "*" || pWord == kWord {
-		return b.matchTopicPattern(pRest, kRest)
-	}
-	return false
-}
-
-func (b *StorageBroker) matchHeaders(bindingArgs map[string]interface{}, messageHeaders map[string]interface{}) bool {
-	if len(bindingArgs) == 0 {
-		return false
-	}
-
-	anyMatch := false
-	headerCount := 0
-	for key, value := range bindingArgs {
-		if key == "x-match" {
-			if s, ok := value.(string); ok && s == "any" {
-				anyMatch = true
-			}
-			continue
-		}
-		headerCount++
-	}
-
-	if headerCount == 0 {
-		return true
-	}
-
-	if messageHeaders == nil {
-		return false
-	}
-
-	for key, value := range bindingArgs {
-		if key == "x-match" {
-			continue
-		}
-		msgValue, exists := messageHeaders[key]
-		matched := exists && reflect.DeepEqual(msgValue, value)
-		if anyMatch {
-			if matched {
-				return true
-			}
-		} else if !matched {
+		if !any && !ok {
 			return false
 		}
 	}
-	return !anyMatch
+	return !any // match_all([]) = true, match_any([]) = false
+}
+
+// validateHeadersBinding implements RabbitMQ's validate_binding for a headers
+// exchange (R9): x-match must be absent or a longstr naming one of the four
+// modes; anything else is binding_invalid (406).
+func validateHeadersBinding(args map[string]interface{}) error {
+	v, present := args["x-match"]
+	if !present {
+		return nil
+	}
+	s, ok := v.(string)
+	if !ok {
+		return semErr(fmt.Sprintf("Invalid x-match field type %T (value %v); expected longstr", v, v), ErrInvalidBindingArgument)
+	}
+	switch s {
+	case "all", "any", "all-with-x", "any-with-x":
+		return nil
+	}
+	return semErr(fmt.Sprintf("Invalid x-match field value %s; expected all, any, all-with-x, or any-with-x", s), ErrInvalidBindingArgument)
 }
 
 // Compatibility methods for existing broker interface
@@ -3899,7 +4228,7 @@ func (b *StorageBroker) GetMessageForGetOwned(queueName string, noAck bool, conn
 	_, err := b.storage.GetQueue(queueName)
 	if err != nil {
 		if errors.Is(err, interfaces.ErrQueueNotFound) {
-			return nil, 0, 0, fmt.Errorf("queue '%s' not found", queueName)
+			return nil, 0, 0, errNoQueue(queueName)
 		}
 		return nil, 0, 0, err
 	}
@@ -4005,7 +4334,8 @@ func (b *StorageBroker) GetMessageForGetOwned(queueName string, noAck bool, conn
 		// already removed by deleteIfPresent, so we only settle the counters —
 		// ClaimInflight (waiting-1, inflight+1) + subReadyBytesOnClaim + AckAdvance
 		// (inflight-1) — matching how the reaper/head-check remove-then-account. On
-		// a loss the reaper already removed and accounted the tag, so we advance the
+		// a loss the reaper already removed and accounted the tag, or the tag was
+		// absent, so we advance the
 		// depth frontier without touching the counters (GapSkipAdvance). Without
 		// this branch a no-ack basic.get leaked the message (durable redelivery
 		// after restart) and drifted both `waiting` and `readyBytes` upward.
@@ -4035,54 +4365,102 @@ func (b *StorageBroker) PurgeQueue(name string) (int, error) {
 	return b.purgeIncarnation(name, b.getOrCreateQueueState(name))
 }
 
-// purgeIncarnation applies a purge to the ONE incarnation it is handed. Every
-// effect below derives from qs; `name` survives only because the storage layer
-// is name-addressed, and it is paired with qs's tag band so that resolving to a
-// successor's ring removes nothing rather than the wrong thing.
+// purgeIncarnation applies a purge to the ONE incarnation it is handed,
+// removing READY messages ONLY (WS-D §4, RabbitMQ parity). A message is ready
+// iff it is (a) in the requeue ring or (b) an unclaimed tag in [tail, head);
+// both sets are popped through the SAME claim mechanisms consumers use
+// (requeueMu snapshot / tail CAS), so an in-flight (delivered-unacked) tag is
+// never touched: its body survives for a later requeue, `inflight` stays
+// correct for AckAdvance, and spilled ready messages are WAL-acked through the
+// §8 cold path (they no longer resurrect on restart, D-NEW-3). purge-ok's
+// message-count is the number of READY messages removed.
 //
-// The closed check must precede TagBand: a dead QueueState (see
-// createQueueStateLocked) never had SetOrdinal called, so its band is ordinal
-// zero's — reserved, never allocated, and not this queue's.
+// Concurrency: consumers' Claim/tryPopRequeue and drop-head's PopOldestReady
+// arbitrate with purge on the same CAS and mutex, so each tag has exactly one
+// owner; the TTL reaper's deleteIfPresent and §8 arbitration ensure exactly
+// one of {reaper, purge} decrements depth per tag. No new lock is taken:
+// maxLenMu is not needed because purge only LOWERS waiting/readyBytes, which
+// can never cause a reject-publish overshoot. Cost is O(ready) per purge.
 //
-// DELIBERATE BEHAVIOUR CHANGE, and it is a regression in one respect. The
-// replaced AtomicRing.Purge() wiped every slot; this clears only the live
-// incarnation's band. A ring resident whose tag lies OUTSIDE that band — see
-// TagBand's doc for how one gets there, via B-2's deferred republish race —
-// was already unclaimable before this change, but it used to be cleaned up by
-// any queue.purge. Now nothing removes it: no purge this queue can ever issue
-// covers that band, and GetQueueMessageCount keeps counting it, so
-// queue.delete(if-empty) on that queue is refused PERMANENTLY and its reported
-// message_count never returns to zero.
-//
-// Accepted rather than fixed here, because the alternatives are worse in scope:
-// widening the band back reopens exactly the cross-incarnation wipe this fix
-// exists to prevent, and the clean fix is to stop out-of-band tags being
-// stored at all — B-2's republish half, which is a dead-letter-path change
-// with its own step. Tracked on the Step 6 backlog. If it needs closing sooner
-// than that, the shape is E-2's: take getQueueCreateMutex(name), revalidate
-// the incarnation under it, and then wipe the whole ring — correct, and it
-// costs queue.purge a lock it does not currently take.
+// DELIBERATE BEHAVIOUR CHANGE (documented, was :3977-4003): ring residents
+// that are neither ready nor in-flight (the B-2 out-of-band leak) are no
+// longer swept by purge. storage.PurgeQueue is still used by
+// deleteQueueIncarnation, unchanged.
 func (b *StorageBroker) purgeIncarnation(name string, qs *QueueState) (int, error) {
 	if qs.closed.Load() {
-		return 0, interfaces.ErrQueueNotFound
+		return 0, errNoQueue(name)
 	}
-	minTag, maxTag := qs.TagBand()
-	count, err := b.storage.PurgeQueue(name, minTag, maxTag)
-	if err != nil {
-		return 0, err
-	}
-	qs.tail.Store(qs.head.Load())
-	qs.waiting.Store(0)
-	qs.inflight.Store(0)
-	qs.readyBytes.Store(0) // SQ-11: purge clears the ready-bytes counter
+	p := qs.Policy()
+	purged := 0
+
+	// (a) Snapshot-and-empty the requeue ring under requeueMu. Requeue() after
+	// this point re-adds to the (now empty) ring; those are post-purge readies.
 	qs.requeueMu.Lock()
-	qs.requeueBuf = make([]requeueEntry, requeueInitialCap)
-	qs.requeueHead = 0
-	qs.requeueLen = 0
+	snap := make([]uint64, 0, qs.requeueLen)
+	bufCap := cap(qs.requeueBuf)
+	for i := 0; i < qs.requeueLen; i++ {
+		snap = append(snap, qs.requeueBuf[(qs.requeueHead+i)%bufCap].tag)
+	}
+	qs.requeueHead, qs.requeueLen = 0, 0
 	qs.requeueCount.Store(0)
 	qs.requeueMu.Unlock()
+	for _, tag := range snap {
+		if b.purgeOne(qs, name, tag, p) {
+			purged++
+		}
+	}
+
+	// (b) Pop [tail, h0) by CAS, exactly like PopOldestReady. h0 is captured
+	// once: messages that become visible after the purge started are retained.
+	h0 := qs.head.Load()
+	for {
+		t := qs.tail.Load()
+		if t >= h0 {
+			break
+		}
+		if !qs.tail.CompareAndSwap(t, t+1) {
+			continue
+		}
+		if b.purgeOne(qs, name, t, p) {
+			purged++
+		}
+	}
+	qs.SetMinAckCursor(b.storage.GetMinAckCursor(name))
 	qs.WakeAll()
-	return count, nil
+	return purged, nil
+}
+
+// purgeOne removes one popped ready tag. Mirrors dropHeadEvictOne
+// (max_length.go) minus dead-lettering (purge never dead-letters).
+func (b *StorageBroker) purgeOne(qs *QueueState, name string, tag uint64, p *QueuePolicy) bool {
+	var bodyLen int
+	if p != nil && p.HasMaxLengthBytes {
+		m, err := b.storage.GetMessage(name, tag)
+		if err != nil || m == nil {
+			qs.GapSkipAdvance(tag)
+			return false
+		}
+		bodyLen = len(m.Body)
+	}
+	if !b.deleteIfPresent(name, tag) { // §8 semantics: true iff THIS call removed a present message
+		qs.GapSkipAdvance(tag) // gap tag, or the reaper won the race
+		return false
+	}
+	qs.ClaimInflight(tag)
+	subReadyBytesOnClaim(qs, p, bodyLen)
+	qs.AckAdvance(tag)
+	return true
+}
+
+// QueueCounters reports (ready, inflight, pending) for name without creating
+// any state — a test-only hook (spec §17). pending is the §7 reject-publish
+// reservation count (0 until that lands).
+func (b *StorageBroker) QueueCounters(name string) (ready, inflight, pending int64) {
+	if qv, ok := b.queueStates.Load(name); ok {
+		qs := qv.(*QueueState)
+		return qs.WaitingCount(), qs.InflightCount(), qs.pendingCount.Load()
+	}
+	return 0, 0, 0
 }
 
 // AcknowledgeGetDelivery handles acknowledgment of a basic.get delivery

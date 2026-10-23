@@ -202,9 +202,11 @@ func TestAnnotateXDeath_Aggregation(t *testing.T) {
 	assertEntry(t, entries[0], "Q1", DeadLetterRejected, 3)
 	assertEntry(t, entries[1], "Q2", DeadLetterExpired, 1)
 
-	// time on the moved-to-front entry reflects the most recent death.
-	if ts := entries[0]["time"].(time.Time); ts.Unix() != base.Add(3*time.Second).Unix() {
-		t.Errorf("aggregated entry time = %v, want %v", ts.Unix(), base.Add(3*time.Second).Unix())
+	// WS-D §13 (D6/R13, mc.erl update_death): on a repeat death the EXISTING
+	// entry is preserved verbatim — `time` stays the FIRST death's time; only
+	// count advances. (The old merge-from-current behaviour is gone.)
+	if ts := entries[0]["time"].(time.Time); ts.Unix() != base.Unix() {
+		t.Errorf("aggregated entry time = %v, want the FIRST death's time %v (R13 preserve-on-repeat)", ts.Unix(), base.Unix())
 	}
 }
 

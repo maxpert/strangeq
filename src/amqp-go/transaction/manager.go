@@ -11,10 +11,19 @@ import (
 	"github.com/maxpert/amqp-go/protocol"
 )
 
+// txKey scopes a channel transaction to (connection, channel) (WS-D D-NEW-1):
+// channel numbers are per-CONNECTION in AMQP, so keying by channelID alone
+// made connection A's tx.select swallow every connection's same-numbered
+// channel. The legacy (zero connID) scope preserves the original API.
+type txKey struct {
+	conn string
+	ch   uint16
+}
+
 // DefaultTransactionManager provides the default implementation of TransactionManager
 type DefaultTransactionManager struct {
 	mutex         sync.RWMutex
-	channels      map[uint16]*ChannelTransaction
+	channels      map[txKey]*ChannelTransaction
 	executor      interfaces.TransactionExecutor
 	stats         *TransactionStats
 	atomicStorage interfaces.AtomicStorage // For atomic operations when available
@@ -25,7 +34,12 @@ type ChannelTransaction struct {
 	channelID  uint16
 	state      interfaces.TransactionState
 	operations []*interfaces.TransactionOperation
-	mutex      sync.RWMutex
+	// undos restore the channel-side state consumed when an operation was
+	// buffered (WS-D §5.4/§6: wire-tag table entries taken at buffer time).
+	// They run in REVERSE order on rollback and on a failed commit; a
+	// successful commit clears them without running; Close drops them.
+	undos []func()
+	mutex sync.RWMutex
 }
 
 // TransactionStats holds statistics for the transaction manager
@@ -39,7 +53,7 @@ type TransactionStats struct {
 // NewTransactionManager creates a new default transaction manager
 func NewTransactionManager() *DefaultTransactionManager {
 	return &DefaultTransactionManager{
-		channels: make(map[uint16]*ChannelTransaction),
+		channels: make(map[txKey]*ChannelTransaction),
 		stats: &TransactionStats{
 			operationCounts: make(map[interfaces.TransactionOperationType]int64),
 		},
@@ -62,18 +76,25 @@ func (tm *DefaultTransactionManager) SetExecutor(executor interfaces.Transaction
 
 // Select puts the channel into transactional mode
 func (tm *DefaultTransactionManager) Select(channelID uint16) error {
+	return tm.SelectForConnection("", channelID)
+}
+
+// SelectForConnection is Select scoped to a connection (D-NEW-1).
+func (tm *DefaultTransactionManager) SelectForConnection(connID string, channelID uint16) error {
 	tm.mutex.Lock()
 	defer tm.mutex.Unlock()
 
+	key := txKey{connID, channelID}
+
 	// Check if channel already has a transaction
-	if existing, exists := tm.channels[channelID]; exists {
+	if existing, exists := tm.channels[key]; exists {
 		if existing.state != interfaces.TransactionStateNone {
 			return fmt.Errorf("channel %d already has an active transaction", channelID)
 		}
 	}
 
 	// Create new transaction for the channel
-	tm.channels[channelID] = &ChannelTransaction{
+	tm.channels[key] = &ChannelTransaction{
 		channelID:  channelID,
 		state:      interfaces.TransactionStateActive,
 		operations: make([]*interfaces.TransactionOperation, 0),
@@ -84,10 +105,15 @@ func (tm *DefaultTransactionManager) Select(channelID uint16) error {
 
 // IsTransactional returns true if the channel is in transactional mode
 func (tm *DefaultTransactionManager) IsTransactional(channelID uint16) bool {
+	return tm.IsTransactionalForConnection("", channelID)
+}
+
+// IsTransactionalForConnection is IsTransactional scoped to a connection.
+func (tm *DefaultTransactionManager) IsTransactionalForConnection(connID string, channelID uint16) bool {
 	tm.mutex.RLock()
 	defer tm.mutex.RUnlock()
 
-	if tx, exists := tm.channels[channelID]; exists {
+	if tx, exists := tm.channels[txKey{connID, channelID}]; exists {
 		return tx.state != interfaces.TransactionStateNone
 	}
 	return false
@@ -95,10 +121,15 @@ func (tm *DefaultTransactionManager) IsTransactional(channelID uint16) bool {
 
 // GetState returns the current transaction state for a channel
 func (tm *DefaultTransactionManager) GetState(channelID uint16) interfaces.TransactionState {
+	return tm.GetStateForConnection("", channelID)
+}
+
+// GetStateForConnection is GetState scoped to a connection.
+func (tm *DefaultTransactionManager) GetStateForConnection(connID string, channelID uint16) interfaces.TransactionState {
 	tm.mutex.RLock()
 	defer tm.mutex.RUnlock()
 
-	if tx, exists := tm.channels[channelID]; exists {
+	if tx, exists := tm.channels[txKey{connID, channelID}]; exists {
 		tx.mutex.RLock()
 		defer tx.mutex.RUnlock()
 		return tx.state
@@ -108,8 +139,13 @@ func (tm *DefaultTransactionManager) GetState(channelID uint16) interfaces.Trans
 
 // AddOperation adds an operation to the current transaction
 func (tm *DefaultTransactionManager) AddOperation(channelID uint16, operation *interfaces.TransactionOperation) error {
+	return tm.AddOperationForConnection("", channelID, operation)
+}
+
+// AddOperationForConnection is AddOperation scoped to a connection.
+func (tm *DefaultTransactionManager) AddOperationForConnection(connID string, channelID uint16, operation *interfaces.TransactionOperation) error {
 	tm.mutex.RLock()
-	tx, exists := tm.channels[channelID]
+	tx, exists := tm.channels[txKey{connID, channelID}]
 	tm.mutex.RUnlock()
 
 	if !exists {
@@ -135,10 +171,53 @@ func (tm *DefaultTransactionManager) AddOperation(channelID uint16, operation *i
 	return nil
 }
 
+// AddOperationWithUndo buffers op and registers undo, which restores the
+// channel-side state consumed when op was buffered (wire-tag table entry,
+// WS-D §6). It behaves like AddOperation; on error it runs undo itself and
+// returns.
+func (tm *DefaultTransactionManager) AddOperationWithUndo(channelID uint16, op *interfaces.TransactionOperation, undo func()) error {
+	return tm.AddOperationWithUndoForConnection("", channelID, op, undo)
+}
+
+// AddOperationWithUndoForConnection is AddOperationWithUndo scoped to a connection.
+func (tm *DefaultTransactionManager) AddOperationWithUndoForConnection(connID string, channelID uint16, op *interfaces.TransactionOperation, undo func()) error {
+	tm.mutex.RLock()
+	tx, exists := tm.channels[txKey{connID, channelID}]
+	tm.mutex.RUnlock()
+
+	if !exists {
+		undo()
+		return fmt.Errorf("channel %d is not in transactional mode", channelID)
+	}
+
+	tx.mutex.Lock()
+	defer tx.mutex.Unlock()
+
+	if tx.state != interfaces.TransactionStateActive && tx.state != interfaces.TransactionStatePending {
+		undo()
+		return fmt.Errorf("channel %d transaction is not active", channelID)
+	}
+
+	tx.operations = append(tx.operations, op)
+	tx.undos = append(tx.undos, undo)
+	tx.state = interfaces.TransactionStatePending
+
+	tm.stats.operationMutex.Lock()
+	tm.stats.operationCounts[op.Type]++
+	tm.stats.operationMutex.Unlock()
+
+	return nil
+}
+
 // Commit commits all pending operations in the transaction
 func (tm *DefaultTransactionManager) Commit(channelID uint16) error {
+	return tm.CommitForConnection("", channelID)
+}
+
+// CommitForConnection is Commit scoped to a connection.
+func (tm *DefaultTransactionManager) CommitForConnection(connID string, channelID uint16) error {
 	tm.mutex.RLock()
-	tx, exists := tm.channels[channelID]
+	tx, exists := tm.channels[txKey{connID, channelID}]
 	tm.mutex.RUnlock()
 
 	if !exists {
@@ -166,12 +245,22 @@ func (tm *DefaultTransactionManager) Commit(channelID uint16) error {
 	}
 
 	tx.operations = tx.operations[:0]
+	undos := tx.undos
+	tx.undos = nil
 
 	if err != nil {
+		// WS-D §5.4: a FAILED commit restores the channel-side state consumed
+		// at buffer time (wire-tag entries), in reverse order; the server then
+		// closes the channel.
+		for i := len(undos) - 1; i >= 0; i-- {
+			undos[i]()
+		}
 		tx.state = interfaces.TransactionStateNone
 		return fmt.Errorf("failed to commit transaction for channel %d: %w", channelID, err)
 	}
 
+	// Success: undos are dropped WITHOUT running (the buffered state was
+	// genuinely consumed by the commit).
 	tx.state = interfaces.TransactionStateActive
 
 	atomic.AddInt64(&tm.stats.totalCommits, 1)
@@ -181,8 +270,13 @@ func (tm *DefaultTransactionManager) Commit(channelID uint16) error {
 
 // Rollback discards all pending operations in the transaction
 func (tm *DefaultTransactionManager) Rollback(channelID uint16) error {
+	return tm.RollbackForConnection("", channelID)
+}
+
+// RollbackForConnection is Rollback scoped to a connection.
+func (tm *DefaultTransactionManager) RollbackForConnection(connID string, channelID uint16) error {
 	tm.mutex.RLock()
-	tx, exists := tm.channels[channelID]
+	tx, exists := tm.channels[txKey{connID, channelID}]
 	tm.mutex.RUnlock()
 
 	if !exists {
@@ -196,8 +290,14 @@ func (tm *DefaultTransactionManager) Rollback(channelID uint16) error {
 		return fmt.Errorf("channel %d is not in transactional mode", channelID)
 	}
 
-	// Simply discard all pending operations
+	// Discard all pending operations, restoring the channel-side state
+	// consumed at buffer time (WS-D §5.4: undos run in REVERSE order).
+	undos := tx.undos
 	tx.operations = tx.operations[:0]
+	tx.undos = nil
+	for i := len(undos) - 1; i >= 0; i-- {
+		undos[i]()
+	}
 	tx.state = interfaces.TransactionStateActive
 
 	// Update statistics
@@ -208,17 +308,29 @@ func (tm *DefaultTransactionManager) Rollback(channelID uint16) error {
 
 // Close cleans up transaction state for a channel
 func (tm *DefaultTransactionManager) Close(channelID uint16) error {
+	return tm.CloseForConnection("", channelID)
+}
+
+// CloseForConnection is Close scoped to a connection: only THAT connection's
+// channel state is dropped (D-NEW-1). Undos are dropped without running (the
+// channel is gone).
+func (tm *DefaultTransactionManager) CloseForConnection(connID string, channelID uint16) error {
 	tm.mutex.Lock()
 	defer tm.mutex.Unlock()
 
-	delete(tm.channels, channelID)
+	delete(tm.channels, txKey{connID, channelID})
 	return nil
 }
 
 // GetPendingOperations returns all pending operations for debugging/introspection
 func (tm *DefaultTransactionManager) GetPendingOperations(channelID uint16) ([]*interfaces.TransactionOperation, error) {
+	return tm.GetPendingOperationsForConnection("", channelID)
+}
+
+// GetPendingOperationsForConnection is GetPendingOperations scoped to a connection.
+func (tm *DefaultTransactionManager) GetPendingOperationsForConnection(connID string, channelID uint16) ([]*interfaces.TransactionOperation, error) {
 	tm.mutex.RLock()
-	tx, exists := tm.channels[channelID]
+	tx, exists := tm.channels[txKey{connID, channelID}]
 	tm.mutex.RUnlock()
 
 	if !exists {
@@ -262,33 +374,64 @@ type txStagingExecutor interface {
 // reserved frontier slot so the tag is gap-skipped, never stranded) — nothing
 // published in the transaction becomes durable or visible.
 //
-// Acks/nacks/rejects are applied inline within the atomic scope via the normal
-// executor; their storage settlement participates in the transaction, while the
-// broker's in-memory consumer bookkeeping is applied as it executes.
+// WS-D §5: settlements (acks/nacks/rejects) are NOT applied inside the atomic
+// scope — an acknowledgement is never a durable record, so it lands nowhere in
+// the WAL unit; applying it against the LIVE broker inside the scope meant a
+// later op's failure left the settlement applied while the publishes aborted
+// (and txStagingStorage.DeleteMessage was dead code). Settlements are COLLECTED
+// during staging and applied AFTER the unit commits, in RabbitMQ's commit order
+// (R14): publishes visible first (deferred(true)), then settlements in buffered
+// order. A crash between the WAL commit and the settlement application is
+// exactly as durable as any non-tx ack today (at-least-once redelivery).
 func (tm *DefaultTransactionManager) executeAtomically(operations []*interfaces.TransactionOperation) error {
 	var deferred []func(bool)
+	var settles []*interfaces.TransactionOperation
 
 	err := tm.atomicStorage.ExecuteAtomic(func(txnStorage interfaces.Storage) error {
-		return tm.executeStaged(txnStorage, operations, &deferred)
+		return tm.executeStaged(txnStorage, operations, &deferred, &settles)
 	})
 	if err != nil {
 		for _, apply := range deferred {
 			apply(false)
 		}
-		return err
+		return err // settlements never touched the broker
 	}
 
 	for _, apply := range deferred {
-		apply(true)
+		apply(true) // publishes visible first (R14 order)
+	}
+	return tm.applySettlements(settles)
+}
+
+// applySettlements applies the transaction's settlement operations against the
+// LIVE broker, in buffered order. Every op is attempted; the first error is
+// returned wrapped — the server treats it as a commit failure (channel closed;
+// teardown requeues anything still unacked). In practice the broker methods
+// return nil, and the broker's LoadAndDelete settle paths make a stale
+// settlement (e.g. a tag already requeued by a consumer cancel) a no-op.
+func (tm *DefaultTransactionManager) applySettlements(settles []*interfaces.TransactionOperation) error {
+	for _, op := range settles {
+		var err error
+		switch op.Type {
+		case interfaces.OpAck:
+			err = tm.executor.ExecuteAck(op.ConsumerTag, op.DeliveryTag, op.Multiple)
+		case interfaces.OpNack:
+			err = tm.executor.ExecuteNack(op.ConsumerTag, op.DeliveryTag, op.Multiple, op.Requeue)
+		case interfaces.OpReject:
+			err = tm.executor.ExecuteReject(op.ConsumerTag, op.DeliveryTag, op.Requeue)
+		}
+		if err != nil {
+			return fmt.Errorf("transaction committed but settlement failed: %w", err)
+		}
 	}
 	return nil
 }
 
 // executeStaged runs the transaction's operations against the staging storage.
 // Publishes use the staged path (deferred visibility) when the executor
-// supports it; if not, they fall back to immediate execution. Settlements run
-// inline.
-func (tm *DefaultTransactionManager) executeStaged(txnStorage interfaces.Storage, operations []*interfaces.TransactionOperation, deferred *[]func(bool)) error {
+// supports it; if not, they fall back to immediate execution. Settlements are
+// COLLECTED (never executed here — see executeAtomically's doc).
+func (tm *DefaultTransactionManager) executeStaged(txnStorage interfaces.Storage, operations []*interfaces.TransactionOperation, deferred *[]func(bool), settles *[]*interfaces.TransactionOperation) error {
 	stager, canStage := tm.executor.(txStagingExecutor)
 
 	for _, op := range operations {
@@ -318,20 +461,8 @@ func (tm *DefaultTransactionManager) executeStaged(txnStorage interfaces.Storage
 				return err
 			}
 
-		case interfaces.OpAck:
-			if err := tm.executor.ExecuteAck(op.ConsumerTag, op.DeliveryTag, op.Multiple); err != nil {
-				return fmt.Errorf("failed to execute ack: %w", err)
-			}
-
-		case interfaces.OpNack:
-			if err := tm.executor.ExecuteNack(op.ConsumerTag, op.DeliveryTag, op.Multiple, op.Requeue); err != nil {
-				return fmt.Errorf("failed to execute nack: %w", err)
-			}
-
-		case interfaces.OpReject:
-			if err := tm.executor.ExecuteReject(op.ConsumerTag, op.DeliveryTag, op.Requeue); err != nil {
-				return fmt.Errorf("failed to execute reject: %w", err)
-			}
+		case interfaces.OpAck, interfaces.OpNack, interfaces.OpReject:
+			*settles = append(*settles, op)
 
 		default:
 			return fmt.Errorf("unknown transaction operation type: %d", op.Type)
@@ -350,8 +481,13 @@ func (tm *DefaultTransactionManager) executePublishInline(op *interfaces.Transac
 	return nil
 }
 
-// executeSequentially executes operations one by one
+// executeSequentially executes operations one by one (non-atomic manager).
+// WS-D §5.3: pass 1 executes all OpPublish; pass 2 applies the settlement ops
+// in buffered order via applySettlements — a publish failure in pass 1 means
+// NO settlement is applied (previously a settlement buffered before a failing
+// publish was applied anyway).
 func (tm *DefaultTransactionManager) executeSequentially(operations []*interfaces.TransactionOperation) error {
+	var settles []*interfaces.TransactionOperation
 	for _, op := range operations {
 		switch op.Type {
 		case interfaces.OpPublish:
@@ -360,30 +496,15 @@ func (tm *DefaultTransactionManager) executeSequentially(operations []*interface
 				return fmt.Errorf("failed to execute publish: %w", err)
 			}
 
-		case interfaces.OpAck:
-			err := tm.executor.ExecuteAck(op.ConsumerTag, op.DeliveryTag, op.Multiple)
-			if err != nil {
-				return fmt.Errorf("failed to execute ack: %w", err)
-			}
-
-		case interfaces.OpNack:
-			err := tm.executor.ExecuteNack(op.ConsumerTag, op.DeliveryTag, op.Multiple, op.Requeue)
-			if err != nil {
-				return fmt.Errorf("failed to execute nack: %w", err)
-			}
-
-		case interfaces.OpReject:
-			err := tm.executor.ExecuteReject(op.ConsumerTag, op.DeliveryTag, op.Requeue)
-			if err != nil {
-				return fmt.Errorf("failed to execute reject: %w", err)
-			}
+		case interfaces.OpAck, interfaces.OpNack, interfaces.OpReject:
+			settles = append(settles, op)
 
 		default:
 			return fmt.Errorf("unknown transaction operation type: %d", op.Type)
 		}
 	}
 
-	return nil
+	return tm.applySettlements(settles)
 }
 
 // GetTransactionStats returns current transaction statistics
@@ -396,13 +517,16 @@ func (tm *DefaultTransactionManager) GetTransactionStats() *interfaces.Transacti
 	channelStates := make(map[uint16]interfaces.TransactionState)
 	pendingOpsCount := 0
 
-	for channelID, tx := range tm.channels {
+	// Aggregate across ALL (conn, channel) keys (D-NEW-1): two connections may
+	// share a channel number, so channelStates is keyed by channel ID with
+	// last-write-wins — it is a stats view, not a correctness surface.
+	for key, tx := range tm.channels {
 		tx.mutex.RLock()
 		state := tx.state
 		opsCount := len(tx.operations)
 		tx.mutex.RUnlock()
 
-		channelStates[channelID] = state
+		channelStates[key.ch] = state
 		if state != interfaces.TransactionStateNone {
 			activeCount++
 		}
@@ -425,6 +549,71 @@ func (tm *DefaultTransactionManager) GetTransactionStats() *interfaces.Transacti
 		ChannelTransactions: channelStates,
 		OperationCounts:     opCounts,
 	}
+}
+
+// ForConnection returns a view implementing interfaces.TransactionManager
+// (plus AddOperationWithUndo) whose channel IDs are scoped to connID
+// (D-NEW-1). The legacy channelID-only methods on the manager itself keep
+// working through the zero-connID scope.
+func (tm *DefaultTransactionManager) ForConnection(connID string) interfaces.TransactionManager {
+	return &connTxView{tm: tm, connID: connID}
+}
+
+// connTxView scopes every channel-scoped TransactionManager call to connID.
+type connTxView struct {
+	tm     *DefaultTransactionManager
+	connID string
+}
+
+func (v *connTxView) Select(channelID uint16) error {
+	return v.tm.SelectForConnection(v.connID, channelID)
+}
+
+func (v *connTxView) IsTransactional(channelID uint16) bool {
+	return v.tm.IsTransactionalForConnection(v.connID, channelID)
+}
+
+func (v *connTxView) GetState(channelID uint16) interfaces.TransactionState {
+	return v.tm.GetStateForConnection(v.connID, channelID)
+}
+
+func (v *connTxView) AddOperation(channelID uint16, operation *interfaces.TransactionOperation) error {
+	return v.tm.AddOperationForConnection(v.connID, channelID, operation)
+}
+
+// AddOperationWithUndo is the §6 undo-carrying variant, scoped to the view's
+// connection. It is not part of interfaces.TransactionManager; the server
+// discovers it via the same anonymous-interface assertion as the legacy path.
+func (v *connTxView) AddOperationWithUndo(channelID uint16, op *interfaces.TransactionOperation, undo func()) error {
+	return v.tm.AddOperationWithUndoForConnection(v.connID, channelID, op, undo)
+}
+
+func (v *connTxView) Commit(channelID uint16) error {
+	return v.tm.CommitForConnection(v.connID, channelID)
+}
+
+func (v *connTxView) Rollback(channelID uint16) error {
+	return v.tm.RollbackForConnection(v.connID, channelID)
+}
+
+func (v *connTxView) Close(channelID uint16) error {
+	return v.tm.CloseForConnection(v.connID, channelID)
+}
+
+func (v *connTxView) GetPendingOperations(channelID uint16) ([]*interfaces.TransactionOperation, error) {
+	return v.tm.GetPendingOperationsForConnection(v.connID, channelID)
+}
+
+func (v *connTxView) SetExecutor(executor interfaces.TransactionExecutor) {
+	v.tm.SetExecutor(executor)
+}
+
+func (v *connTxView) ExecuteAtomic(channelID uint16, operations func() error) error {
+	return v.tm.ExecuteAtomic(channelID, operations)
+}
+
+func (v *connTxView) GetTransactionStats() *interfaces.TransactionStats {
+	return v.tm.GetTransactionStats()
 }
 
 // Helper function to create transaction operations

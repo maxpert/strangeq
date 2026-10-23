@@ -112,6 +112,16 @@ type QueueState struct {
 	frontierPHead   int
 	frontierDone    map[uint64]bool
 	frontierMax     uint64
+
+	// SQ-11 reject-publish reservations (WS-D §7): admitted-but-not-yet-counted
+	// copies. Incremented ONLY under maxLenMu (admission); transferred into
+	// waiting/readyBytes atomically with the frontier pop that makes the tag
+	// visible (FrontierComplete, under frontierMu), or released if the tag
+	// completes real=false. frontierResv (guarded by frontierMu, nil unless the
+	// queue has ever reserved) maps a reserved tag to its reserved body bytes.
+	pendingCount atomic.Int64
+	pendingBytes atomic.Int64
+	frontierResv map[uint64]int64
 }
 
 // Policy returns the queue's resolved policy, or nil if the queue has no
@@ -313,6 +323,35 @@ func (qs *QueueState) FrontierReserve() uint64 {
 	return tag
 }
 
+// FrontierReserveReserved is FrontierReserve + record a reject-publish
+// reservation of (1 message, bytes) (WS-D §7). The reservation makes the
+// admitted-but-not-yet-visible copy visible to maxLenRejectsPublish BEFORE
+// the frontier pop increments waiting/readyBytes, closing the admission race.
+// Caller MUST hold qs.maxLenMu. Lock order: maxLenMu → frontierMu (nothing
+// takes them in reverse).
+func (qs *QueueState) FrontierReserveReserved(bytes int64) uint64 {
+	qs.frontierMu.Lock()
+	seq := qs.nextSeq
+	if seq > SeqMask {
+		qs.frontierMu.Unlock()
+		panic("QueueState.FrontierReserveReserved: per-queue delivery-tag sequence exhausted (SeqMask overflow)")
+	}
+	qs.nextSeq++
+	tag := qs.ordinalBase | seq
+	qs.frontierPending = append(qs.frontierPending, tag)
+	if tag > qs.frontierMax {
+		qs.frontierMax = tag
+	}
+	if qs.frontierResv == nil {
+		qs.frontierResv = make(map[uint64]int64)
+	}
+	qs.frontierResv[tag] = bytes
+	qs.pendingCount.Add(1)
+	qs.pendingBytes.Add(bytes)
+	qs.frontierMu.Unlock()
+	return tag
+}
+
 // FrontierComplete records that a frontier-reserved tag's store completed:
 // real=true makes it a delivered message (durable fsync succeeded, or a
 // transient message was stored); real=false (fsync/write/store error) releases
@@ -330,7 +369,7 @@ func (qs *QueueState) FrontierComplete(tag uint64, real bool) {
 		qs.frontierDone = make(map[uint64]bool)
 	}
 	qs.frontierDone[tag] = real
-	newHead, newlyReal := qs.frontierAdvanceLocked()
+	newHead, newlyReal, resvPopped, resvRealBytes, resvPoppedBytes := qs.frontierAdvanceLocked()
 	// Count the popped real tags ready ATOMICALLY WITH THE POP, before releasing
 	// frontierMu. This upholds the invariant Recover already documents ("Store
 	// `waiting` BEFORE `head`: head is the visibility gate the SQ-9 reaper scans
@@ -352,8 +391,19 @@ func (qs *QueueState) FrontierComplete(tag uint64, real bool) {
 	// credits. The clamp stays as a dead-man's guard against genuine double
 	// decrements. casMaxHead deliberately remains OUTSIDE the lock — frontierMu
 	// is never held across anything but O(1) bookkeeping (invariant A4).
+	//
+	// WS-D §7 reservations transfer ADD-BEFORE-SUBTRACT (the sum never
+	// under-counts): reserved bytes land in readyBytes for REAL pops, then the
+	// reservation is released for every popped tag (real or not).
 	if newlyReal > 0 {
 		qs.waiting.Add(int64(newlyReal))
+	}
+	if resvRealBytes > 0 {
+		qs.readyBytes.Add(resvRealBytes)
+	}
+	if resvPopped > 0 {
+		qs.pendingCount.Add(-int64(resvPopped))
+		qs.pendingBytes.Add(-resvPoppedBytes)
 	}
 	qs.frontierMu.Unlock()
 
@@ -363,9 +413,13 @@ func (qs *QueueState) FrontierComplete(tag uint64, real bool) {
 
 // frontierAdvanceLocked pops the contiguous done-prefix off the pending ring and
 // returns the new head target (lowest still-pending tag, or frontierMax+1 when
-// none pending) plus the count of REAL messages the pop newly exposes. Caller
-// holds frontierMu.
-func (qs *QueueState) frontierAdvanceLocked() (newHead uint64, newlyReal int) {
+// none pending) plus the count of REAL messages the pop newly exposes. It also
+// resolves any §7 reject-publish reservations attached to popped tags:
+// resvPopped counts reserved tags popped, resvPoppedBytes sums their reserved
+// bytes (released regardless of outcome), and resvRealBytes sums the bytes of
+// reserved tags popped REAL (transferred into readyBytes). The extra cost for
+// non-reserving queues is one nil check per pop. Caller holds frontierMu.
+func (qs *QueueState) frontierAdvanceLocked() (newHead uint64, newlyReal, resvPopped int, resvRealBytes, resvPoppedBytes int64) {
 	for qs.frontierPHead < len(qs.frontierPending) {
 		front := qs.frontierPending[qs.frontierPHead]
 		real, done := qs.frontierDone[front]
@@ -377,6 +431,16 @@ func (qs *QueueState) frontierAdvanceLocked() (newHead uint64, newlyReal int) {
 		if real {
 			newlyReal++
 		}
+		if qs.frontierResv != nil {
+			if bytes, ok := qs.frontierResv[front]; ok {
+				delete(qs.frontierResv, front)
+				resvPopped++
+				resvPoppedBytes += bytes
+				if real {
+					resvRealBytes += bytes
+				}
+			}
+		}
 	}
 	// Compact the ring when the consumed prefix dominates, bounding memory.
 	if qs.frontierPHead > 1024 && qs.frontierPHead*2 > len(qs.frontierPending) {
@@ -386,9 +450,9 @@ func (qs *QueueState) frontierAdvanceLocked() (newHead uint64, newlyReal int) {
 		qs.frontierPHead = 0
 	}
 	if qs.frontierPHead < len(qs.frontierPending) {
-		return qs.frontierPending[qs.frontierPHead], newlyReal
+		return qs.frontierPending[qs.frontierPHead], newlyReal, resvPopped, resvRealBytes, resvPoppedBytes
 	}
-	return qs.frontierMax + 1, newlyReal
+	return qs.frontierMax + 1, newlyReal, resvPopped, resvRealBytes, resvPoppedBytes
 }
 
 // casMaxHead advances head to newHead via CAS-max (never regresses), then wakes

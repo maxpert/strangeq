@@ -405,31 +405,11 @@ func TestTx_DropHeadEvictsOldestAfterCommit(t *testing.T) {
 	require.Equal(t, []string{"m2", "m3"}, drainBodies(t, b, "q"))
 }
 
-// TestTx_RejectPublishAcceptedInsideTx documents + tests the spec W5 divergence:
-// reject-publish is NOT enforced for transactional publishes (refusing an
-// already-committed message would strand a durable message), and a
-// reject-publish queue applies no drop-head trim in tx. Every tx publish is
-// therefore accepted and the queue may transiently exceed its cap. W7 locks the
-// exact tx-vs-reject-publish semantics.
-func TestTx_RejectPublishAcceptedInsideTx(t *testing.T) {
-	b, cleanup := createTestBroker(t)
-	defer cleanup()
-
-	qs := declareMaxLen(t, b, "q", map[string]interface{}{
-		"x-max-length": int64(1), "x-overflow": "reject-publish",
-	})
-
-	var deferred []func(bool)
-	for i := 0; i < 3; i++ {
-		deferred = append(deferred, publishTxToLiveStore(t, b, "q", fmt.Sprintf("m%d", i))...)
-	}
-	for _, d := range deferred {
-		d(true)
-	}
-
-	require.Equal(t, int64(3), qs.WaitingCount(),
-		"tx publishes to a reject-publish queue are all accepted with no trim (documented W7 divergence)")
-}
+// TestTx_RejectPublishAcceptedInsideTx was REMOVED per WS-D §18: the "tx
+// publishes bypass reject-publish" divergence is closed by §7.4/D7 — a
+// refused tx copy is dropped (the tx proceeds) and reject-publish is now
+// enforced through the same admission reservation as every other path. The
+// replacement is TestTx_Publish_RejectPublish_Enforced (wsd_reject_publish_test.go).
 
 // --- eviction vs. inflight ring-overwrite safety ----------------------------
 

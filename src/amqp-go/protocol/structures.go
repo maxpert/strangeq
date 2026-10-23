@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"sort"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -673,6 +674,33 @@ func (c *Channel) TakeWireTagsUpTo(upto uint64) []WireDeliveryRef {
 	}
 	c.wireTagMu.Unlock()
 	return refs
+}
+
+// TakeWireTagEntriesUpTo is TakeWireTagsUpTo that also returns each entry's
+// wire tag (needed to restore entries on tx.rollback, WS-D §6). Result is
+// sorted by wire tag ascending, with refs aligned to wireTags. Bounded by the
+// channel's outstanding window. WireDeliveryRef gains NO field: its size is
+// pinned by consumer_layout_test.go and it is the per-unacked map value.
+func (c *Channel) TakeWireTagEntriesUpTo(upto uint64) (wireTags []uint64, refs []WireDeliveryRef) {
+	c.wireTagMu.Lock()
+	type entry struct {
+		w   uint64
+		ref WireDeliveryRef
+	}
+	var taken []entry
+	for w, ref := range c.wireTagTable {
+		if w <= upto {
+			taken = append(taken, entry{w, ref})
+			delete(c.wireTagTable, w)
+		}
+	}
+	c.wireTagMu.Unlock()
+	sort.Slice(taken, func(i, j int) bool { return taken[i].w < taken[j].w })
+	for _, e := range taken {
+		wireTags = append(wireTags, e.w)
+		refs = append(refs, e.ref)
+	}
+	return wireTags, refs
 }
 
 // Exchange represents an AMQP exchange

@@ -534,45 +534,80 @@ func (ds *DisruptorStorage) DeleteMessage(queueName string, deliveryTag uint64) 
 	return nil
 }
 
-// DeleteMessageIfPresent removes a message and reports whether THIS call won the
-// ring removal — AtomicRing.Delete's CAS result. It underpins the SQ-9 TTL
-// reaper / delivery head-check linearization: for a ring-resident tag exactly
-// one of many concurrent callers observes true, so queue depth is decremented
-// exactly once even when the reaper and a consumer race the same waiting
-// message. WAL/segment acknowledgement mirrors DeleteMessage.
-//
-// A tag that is NOT ring-resident (a rare spilled/WAL-only message) reports
-// false: there is no ring CAS to arbitrate. Callers gate their depth decrement
-// on true, so such a message is removed from durable storage but its depth is
-// reconciled by the storage-synced min-ack path rather than the reaper — a
-// bounded divergence documented for the >64K-unacked spill edge in W4.
+// DeleteMessageIfPresent removes a message and reports whether THIS call won
+// the RING removal — AtomicRing.Delete's CAS result only (the legacy
+// contract). New callers that account queue depth MUST use
+// DeleteMessageIfPresentDetailed: a spilled (WAL/segment-only) tag wins its
+// removal through the detailed cold path but reports false here.
 func (ds *DisruptorStorage) DeleteMessageIfPresent(queueName string, deliveryTag uint64) (bool, error) {
+	removed, resident, err := ds.DeleteMessageIfPresentDetailed(queueName, deliveryTag)
+	return removed && resident, err // legacy contract: ring-CAS result only
+}
+
+// coldRemovalShards serialises DeleteMessageIfPresentDetailed per tag so that
+// concurrent removers of the same tag — ring-resident OR spilled — observe
+// exactly one winner. Package-level so no DisruptorStorage field (and no
+// layout pin) changes. Taken only here; never while holding any WAL/segment lock.
+var coldRemovalShards [64]sync.Mutex
+
+// DeleteMessageIfPresentDetailed removes a ready message and reports whether
+// THIS call is the unique remover of a message that was actually present.
+//
+//	removed=true,  wasResident=true : won the ring CAS
+//	removed=false, wasResident=true : lost the ring CAS to a concurrent remover
+//	removed=true,  wasResident=false: message was WAL/segment-only (spilled or
+//	                                  recovered), present and not yet acked;
+//	                                  this call acknowledged it
+//	removed=false, wasResident=false: absent (gap tag, never stored, or
+//	                                  already acknowledged)
+//
+// Callers decrement queue depth iff removed. Acknowledgement of WAL/segment
+// tiers mirrors DeleteMessage.
+func (ds *DisruptorStorage) DeleteMessageIfPresentDetailed(queueName string, deliveryTag uint64) (removed, wasResident bool, err error) {
 	ring := ds.getQueueRing(queueName)
 	if ring == nil {
-		return false, interfaces.ErrQueueNotFound
+		return false, false, interfaces.ErrQueueNotFound
 	}
+	// The stripe lock spans the ring path too: a durable ring winner deletes
+	// the slot and then acks the WAL; without the lock, a loser could reach
+	// the cold path in between, find the WAL record unacked, and double-remove.
+	mu := &coldRemovalShards[deliveryTag&63]
+	mu.Lock()
+	defer mu.Unlock()
 
-	msg, foundInRing := ring.ring.LoadByTag(deliveryTag)
-	isDurable := foundInRing && msg.DeliveryMode == 2
-
-	removed := ring.ring.Delete(deliveryTag)
-
-	// See DeleteMessage: the read-ahead cache sits in front of the WAL and must
-	// not outlive the acknowledgement. This is the path reapTTLSweep takes.
+	if msg, ok := ring.ring.LoadByTag(deliveryTag); ok {
+		won := ring.ring.Delete(deliveryTag)
+		if ring.readAhead != nil {
+			ring.readAhead.remove(deliveryTag)
+		}
+		if won && msg.DeliveryMode == 2 {
+			ds.ackColdTiers(queueName, deliveryTag)
+		}
+		return won, true, nil
+	}
+	if ds.wal != nil && ds.wal.IsAcknowledged(deliveryTag) {
+		return false, false, nil
+	}
+	m, gerr := ds.GetMessage(queueName, deliveryTag) // ring miss → cold tiers, ack-gated
+	if gerr != nil || m == nil {
+		return false, false, nil
+	}
 	if ring.readAhead != nil {
 		ring.readAhead.remove(deliveryTag)
 	}
+	ds.ackColdTiers(queueName, deliveryTag)
+	return true, false, nil
+}
 
-	if !foundInRing || isDurable {
-		if ds.wal != nil {
-			ds.wal.Acknowledge(queueName, deliveryTag)
-		}
-		if ds.segments != nil {
-			ds.segments.Acknowledge(queueName, deliveryTag)
-		}
+// ackColdTiers acknowledges a tag in the WAL and segment tiers, mirroring the
+// acknowledgement half of DeleteMessage.
+func (ds *DisruptorStorage) ackColdTiers(queueName string, deliveryTag uint64) {
+	if ds.wal != nil {
+		ds.wal.Acknowledge(queueName, deliveryTag)
 	}
-
-	return removed, nil
+	if ds.segments != nil {
+		ds.segments.Acknowledge(queueName, deliveryTag)
+	}
 }
 
 func (ds *DisruptorStorage) RegisterConsumerCursor(queueName string, consumerTag string) {

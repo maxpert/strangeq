@@ -433,6 +433,14 @@ func (s *Server) processCompleteMessage(conn *protocol.Connection, channelID uin
 
 	// Buffer into transaction if channel is in transactional mode
 	if s.TransactionManager != nil && s.TransactionManager.IsTransactional(channelID) {
+		// WS-D §11.2 (R11 check_internal_exchange runs BEFORE tx buffering, in
+		// tx and non-tx mode alike): a publish to a missing/internal exchange
+		// fails NOW with the channel error, not at commit.
+		if sb, ok := s.Broker.(*StorageBrokerAdapter); ok {
+			if verr := sb.broker.ValidatePublishTarget(message.Exchange); verr != nil {
+				return s.closeChannelWithBrokerError(conn, channelID, verr, 60, 40)
+			}
+		}
 		op := transaction.NewPublishOperation(message.Exchange, message.RoutingKey, message)
 		if confirmTag > 0 {
 			op.DeliveryTag = confirmTag
@@ -1191,6 +1199,22 @@ func (s *Server) handleBasicAck(conn *protocol.Connection, channelID uint16, pay
 	}
 	tx := s.TransactionManager != nil && s.TransactionManager.IsTransactional(channelID)
 
+	// WS-D §6: in tx mode the wire tag(s) are TAKEN now (RabbitMQ removes from
+	// the unacked map at ack time, R14) and restored on rollback/failed commit;
+	// neither the cumulative branch nor resolveDeliveryTag runs in tx mode (the
+	// take happens inside txBufferSettlement, one single-tag op per entry).
+	if tx {
+		known, err := s.txBufferSettlement(conn, channel, channelID, interfaces.OpAck, wireTag, multiple, false)
+		if !known {
+			// WS-B: unknown-tag policy (406 PRECONDITION_FAILED - unknown delivery tag N)
+			s.Log.Debug("Delivery tag already processed (consumer cancelled?)",
+				zap.Uint64("delivery_tag", wireTag),
+				zap.Uint16("channel_id", channelID))
+			return nil
+		}
+		return err
+	}
+
 	// Non-transactional cumulative ack spans every consumer on the channel
 	// (SQ-18): the client's "all tags <= N" may cover deliveries that came from
 	// different queues, so it cannot be routed to a single consumer's broker
@@ -1215,11 +1239,6 @@ func (s *Server) handleBasicAck(conn *protocol.Connection, channelID uint16, pay
 	msgID, consumerID, isGet, known := s.resolveDeliveryTag(channel, wireTag)
 	if !known {
 		return s.unknownDeliveryTag(conn, channelID, wireTag, protocol.BasicAck)
-	}
-
-	if tx {
-		op := transaction.NewAckOperation(consumerID, msgID, multiple)
-		return s.TransactionManager.AddOperation(channelID, op)
 	}
 
 	if isGet {
@@ -1256,15 +1275,22 @@ func (s *Server) handleBasicReject(conn *protocol.Connection, channelID uint16, 
 		return nil
 	}
 
+	// WS-D §6: tx reject takes the wire tag now (R14) with rollback restore.
+	if s.TransactionManager != nil && s.TransactionManager.IsTransactional(channelID) {
+		known, err := s.txBufferSettlement(conn, channel, channelID, interfaces.OpReject, wireTag, false, requeue)
+		if !known {
+			// WS-B: unknown-tag policy (406 PRECONDITION_FAILED - unknown delivery tag N)
+			s.Log.Debug("Delivery tag already processed (consumer cancelled?)",
+				zap.Uint64("delivery_tag", wireTag),
+				zap.Uint16("channel_id", channelID))
+			return nil
+		}
+		return err
+	}
+
 	msgID, consumerID, isGet, known := s.resolveDeliveryTag(channel, wireTag)
 	if !known {
 		return s.unknownDeliveryTag(conn, channelID, wireTag, protocol.BasicReject)
-	}
-
-	// Buffer into transaction if channel is in transactional mode
-	if s.TransactionManager != nil && s.TransactionManager.IsTransactional(channelID) {
-		op := transaction.NewRejectOperation(consumerID, msgID, requeue)
-		return s.TransactionManager.AddOperation(channelID, op)
 	}
 
 	if isGet {
@@ -1303,6 +1329,19 @@ func (s *Server) handleBasicNack(conn *protocol.Connection, channelID uint16, pa
 	}
 	tx := s.TransactionManager != nil && s.TransactionManager.IsTransactional(channelID)
 
+	// WS-D §6: tx nack takes the wire tag(s) now (R14) with rollback restore.
+	if tx {
+		known, err := s.txBufferSettlement(conn, channel, channelID, interfaces.OpNack, wireTag, multiple, requeue)
+		if !known {
+			// WS-B: unknown-tag policy (406 PRECONDITION_FAILED - unknown delivery tag N)
+			s.Log.Debug("Delivery tag already processed (consumer cancelled?)",
+				zap.Uint64("delivery_tag", wireTag),
+				zap.Uint16("channel_id", channelID))
+			return nil
+		}
+		return err
+	}
+
 	// Non-transactional cumulative nack spans every consumer on the channel
 	// (SQ-18), mirroring cumulative ack.
 	if multiple && !tx {
@@ -1321,11 +1360,6 @@ func (s *Server) handleBasicNack(conn *protocol.Connection, channelID uint16, pa
 	msgID, consumerID, isGet, known := s.resolveDeliveryTag(channel, wireTag)
 	if !known {
 		return s.unknownDeliveryTag(conn, channelID, wireTag, protocol.BasicNack)
-	}
-
-	if tx {
-		op := transaction.NewNackOperation(consumerID, msgID, multiple, requeue)
-		return s.TransactionManager.AddOperation(channelID, op)
 	}
 
 	if isGet {

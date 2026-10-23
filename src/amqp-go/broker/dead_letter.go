@@ -92,9 +92,12 @@ type xDeathEvent struct {
 // Aggregation is keyed by the (queue,reason) pair: a repeat of an existing pair
 // increments that entry's count and moves it to the FRONT (head-insertion), so
 // x-death[0] is always the most recent death; a new pair is prepended with
-// count=1. x-first-death-{reason,queue,exchange} are set exactly once, gated on
-// the absence of x-first-death-reason (so a message recovered with a prior
-// first-death keeps it).
+// count=1. On a repeat (R13, mc.erl update_death), the EXISTING entry is
+// PRESERVED VERBATIM — exchange, routing-keys, first time and ttl
+// (original-expiration) are NOT merged from the new event; only count and
+// last_time advance. x-first-death-{reason,queue,exchange} are set exactly
+// once, gated on the absence of x-first-death-reason (so a message recovered
+// with a prior first-death keeps it).
 //
 // CONTRACT: annotateXDeath MUST be called on a message clone's Headers, never on
 // the live message pointer — see deadLetter.
@@ -132,29 +135,31 @@ func annotateXDeath(headers map[string]interface{}, ev xDeathEvent) map[string]i
 
 // mergeXDeath folds entry into the existing x-death array (existing may be nil
 // or of an unexpected type, in which case it is treated as empty). If an entry
-// for (queue,reason) already exists, its count is carried forward+1 into the
-// new entry and the old slot is dropped; the (new or updated) entry is placed at
-// the head so x-death[0] is the most recent death.
+// for (queue,reason) already exists, that entry is PRESERVED VERBATIM with
+// count+1 (R13, mc.erl update_death: exchange, routing-keys, first time and
+// original-expiration are kept, not merged) and moved to the head; the freshly
+// built entry is discarded. With no match, the fresh entry is prepended. Either
+// way x-death[0] is the most recent death.
 func mergeXDeath(existing interface{}, entry map[string]interface{}, queue, reason string) []interface{} {
 	prev, _ := existing.([]interface{})
-
-	out := make([]interface{}, 0, len(prev)+1)
-	out = append(out, entry) // head-insertion: newest first
+	head := entry
+	matched := false
+	rest := make([]interface{}, 0, len(prev))
 	for _, e := range prev {
 		tbl, ok := e.(map[string]interface{})
-		if !ok {
-			// Preserve unexpected/foreign entries verbatim rather than dropping.
-			out = append(out, e)
+		if ok && !matched && xDeathMatches(tbl, queue, reason) { // first match only
+			upd := make(map[string]interface{}, len(tbl))
+			for k, v := range tbl {
+				upd[k] = v
+			}
+			upd[xDeathCount] = asInt64(tbl[xDeathCount]) + 1
+			head = upd
+			matched = true
 			continue
 		}
-		if xDeathMatches(tbl, queue, reason) {
-			// Same (queue,reason): carry its count forward and drop the old slot.
-			entry[xDeathCount] = asInt64(tbl[xDeathCount]) + 1
-			continue
-		}
-		out = append(out, tbl)
+		rest = append(rest, e)
 	}
-	return out
+	return append([]interface{}{head}, rest...)
 }
 
 // xDeathMatches reports whether an existing x-death entry is for (queue,reason).
@@ -280,6 +285,10 @@ func (b *StorageBroker) deadLetter(policy *QueuePolicy, srcQueueName string, msg
 	// Re-enter routing ONLY through routeMessage (never a second router). The
 	// scratch is pooled and owned by this goroutine until releaseRouteScratch;
 	// republish happens before that release, so iterating rs.queues is safe.
+	// NOTE (§11): DLX republish intentionally bypasses ErrExchangeInternal —
+	// RabbitMQ allows a DLX to be an internal exchange (R11's
+	// check_internal_exchange guards only the basic.publish entry points,
+	// which this path never calls).
 	rs := acquireRouteScratch()
 	defer releaseRouteScratch(rs)
 	if err := b.routeMessage(exchange, routingKey, clone, rs); err != nil {
@@ -383,21 +392,24 @@ func (b *StorageBroker) republishToTargets(srcQueueName string, targets []string
 		p := qs.Policy()
 
 		// x-overflow=reject-publish: refuse the dead-letter when the target is
-		// AT-OR-OVER its limit. maxLenMu makes the check+enqueue atomic w.r.t. other
-		// admitters (normal publishers and concurrent republishes), so two dead-
-		// letters cannot both observe count==limit-1 and both push past the cap.
+		// AT-OR-OVER its limit. admitRejectPublish makes the check+reserve atomic
+		// w.r.t. other admitters (normal publishers and concurrent republishes),
+		// so two dead-letters cannot both observe count==limit-1 and both push
+		// past the cap — and an admitted dead-letter behind a gated completion is
+		// still counted (§7).
 		rejectPublish := p != nil && p.Overflow == OverflowRejectPublish &&
 			(p.HasMaxLength || p.HasMaxLengthBytes)
+		var msgID uint64
 		if rejectPublish {
-			qs.maxLenMu.Lock()
-			if maxLenRejectsPublish(qs, p) {
-				qs.maxLenMu.Unlock()
+			id, ok := admitRejectPublish(qs, p, len(clone.Body))
+			if !ok {
 				b.recordDeadLetterOverflow(srcQueueName, target)
 				continue
 			}
+			msgID = id
+		} else {
+			msgID = qs.FrontierReserve()
 		}
-
-		msgID := qs.FrontierReserve()
 
 		var storeMsg *protocol.Message
 		if first {
@@ -423,21 +435,17 @@ func (b *StorageBroker) republishToTargets(srcQueueName string, targets []string
 		// hook — rather than dropped silently. Behavior is unchanged: drop and
 		// continue.
 		if err := b.storage.StoreMessage(target, storeMsg); err != nil {
+			// FrontierComplete(false) pops the tag and releases its reservation.
 			qs.FrontierComplete(msgID, false)
-			if rejectPublish {
-				qs.maxLenMu.Unlock()
-			}
 			b.recordDeadLetterDrop(srcQueueName, target, err)
 			continue
 		}
 		qs.FrontierComplete(msgID, true)
 		// SQ-11: keep the DLX target's ready-bytes counter consistent when the
-		// target itself enforces x-max-length-bytes.
-		addReadyBytesOnEnqueue(qs, p, len(storeMsg.Body))
-		if rejectPublish {
-			// Admission (check + Publish + AddReadyBytes) is complete and now
-			// visible under the cap; release so the next admitter re-checks.
-			qs.maxLenMu.Unlock()
+		// target itself enforces x-max-length-bytes. A RESERVED copy's bytes
+		// were transferred by the frontier pop (§7) — skip the add here.
+		if !rejectPublish {
+			addReadyBytesOnEnqueue(qs, p, len(storeMsg.Body))
 		}
 
 		// drop-head with a limit: trim AFTER enqueue (lock-free) so the target
