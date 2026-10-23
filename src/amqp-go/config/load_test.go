@@ -217,6 +217,21 @@ func TestConfig_EnvWithoutConfigFile(t *testing.T) {
 		assert.Contains(t, report.IgnoredEnv, "AMQP_URL")
 		assert.NotContains(t, report.EnvKeys, "AMQP_URL")
 	})
+
+	t.Run("resource alarms section aliases", func(t *testing.T) {
+		// Spec 1.3 step 4: both RESOURCE_ALARMS and the concatenated
+		// RESOURCEALARMS alias map onto the resourcealarms section.
+		for _, name := range []string{"AMQP_RESOURCE_ALARMS_ENABLED", "AMQP_RESOURCEALARMS_ENABLED"} {
+			t.Run(name, func(t *testing.T) {
+				t.Setenv(name, "true")
+				cfg, report, err := LoadConfig("")
+				require.NoError(t, err)
+				assert.True(t, cfg.ResourceAlarms.Enabled)
+				assert.Contains(t, report.EnvKeys, name)
+				assert.NotContains(t, report.IgnoredEnv, name)
+			})
+		}
+	})
 }
 
 func TestConfig_AuthenticationConfigMap_KeySpellings(t *testing.T) {

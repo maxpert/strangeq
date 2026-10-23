@@ -30,6 +30,7 @@ type LoadReport struct {
 // "resource_alarms" is listed before any shorter name.
 var knownEnvSections = []string{
 	"resource_alarms",
+	"resourcealarms", // concatenated alias (spec 1.3 step 4)
 	"network",
 	"storage",
 	"security",
