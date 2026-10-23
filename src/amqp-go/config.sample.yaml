@@ -193,6 +193,16 @@ server:
   # Maximum message size in bytes (default: 16 MB)
   maxmessagesize: 16777216
 
+  # Maximum number of queues (all kinds: durable, transient, exclusive,
+  # auto-delete, server-named). Declaring beyond the cap fails with
+  # 406 PRECONDITION_FAILED. 0 = unlimited (default).
+  maxqueues: 0
+
+  # Maximum number of user-declared exchanges (the default exchange and the
+  # built-in amq.* exchanges are not counted). Declaring beyond the cap fails
+  # with 406 PRECONDITION_FAILED. 0 = unlimited (default).
+  maxexchanges: 0
+
   # Interval for cleanup tasks (milliseconds)
   cleanupintervalms: 300000  # 5 minutes
 
