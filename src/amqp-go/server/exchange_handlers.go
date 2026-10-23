@@ -53,10 +53,6 @@ func (s *Server) handleExchangeDeclare(conn *protocol.Connection, channelID uint
 			zap.Error(err),
 			zap.String("connection_id", conn.ID),
 			zap.Uint16("channel_id", channelID))
-		s.Log.Error("Failed to deserialize exchange.declare",
-			zap.Error(err),
-			zap.String("connection_id", conn.ID),
-			zap.Uint16("channel_id", channelID))
 		return s.malformed(conn, err, 40, 10)
 	}
 
