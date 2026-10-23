@@ -40,7 +40,7 @@ func (s *Server) handleConfirmSelect(conn *protocol.Connection, channelID uint16
 	}
 	channel := value.(*protocol.Channel)
 
-	if s.TransactionManager != nil && s.TransactionManager.IsTransactional(channelID) {
+	if txm := s.txm(conn); txm != nil && txm.IsTransactional(channelID) {
 		s.Log.Warn("Cannot enable confirm mode on transactional channel",
 			zap.Uint16("channel_id", channelID),
 			zap.String("connection_id", conn.ID))

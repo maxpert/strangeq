@@ -21,9 +21,9 @@ func TestTransactionStateCleanedOnConnectionTeardown(t *testing.T) {
 	conn.Channels.Store(uint16(1), ch1)
 
 	require.NotNil(t, srv.TransactionManager)
-	err := srv.TransactionManager.Select(uint16(1))
+	err := srv.txm(conn).Select(uint16(1))
 	require.NoError(t, err)
-	assert.True(t, srv.TransactionManager.IsTransactional(uint16(1)))
+	assert.True(t, srv.txm(conn).IsTransactional(uint16(1)))
 
 	srv.Mutex.Lock()
 	srv.Connections[conn.ID] = conn
@@ -31,7 +31,7 @@ func TestTransactionStateCleanedOnConnectionTeardown(t *testing.T) {
 
 	srv.cleanupConnection(conn)
 
-	assert.False(t, srv.TransactionManager.IsTransactional(uint16(1)),
+	assert.False(t, srv.txm(conn).IsTransactional(uint16(1)),
 		"transaction state must be cleaned up on connection teardown")
 
 	srv.Mutex.RLock()
@@ -47,9 +47,9 @@ func TestTransactionStateCleanedOnConnectionTeardownMultipleChannels(t *testing.
 	for _, id := range []uint16{1, 2, 3} {
 		ch := protocol.NewChannel(id, conn)
 		conn.Channels.Store(id, ch)
-		err := srv.TransactionManager.Select(id)
+		err := srv.txm(conn).Select(id)
 		require.NoError(t, err)
-		assert.True(t, srv.TransactionManager.IsTransactional(id))
+		assert.True(t, srv.txm(conn).IsTransactional(id))
 	}
 
 	srv.Mutex.Lock()
@@ -59,7 +59,7 @@ func TestTransactionStateCleanedOnConnectionTeardownMultipleChannels(t *testing.
 	srv.cleanupConnection(conn)
 
 	for _, id := range []uint16{1, 2, 3} {
-		assert.False(t, srv.TransactionManager.IsTransactional(id),
+		assert.False(t, srv.txm(conn).IsTransactional(id),
 			"transaction state for channel %d must be cleaned on teardown", id)
 	}
 }

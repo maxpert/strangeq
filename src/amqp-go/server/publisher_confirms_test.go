@@ -399,7 +399,7 @@ func TestTxPublishCommitInConfirmModeSendsAckAfterCommit(t *testing.T) {
 	require.NoError(t, err)
 	drainFrame(t, frameCh)
 
-	require.NoError(t, srv.TransactionManager.Select(1))
+	require.NoError(t, srv.txm(conn).Select(1))
 
 	err = srv.processCompleteMessage(conn, 1, makePendingMessage("", "confirm-tx-q", "tx-confirm"))
 	require.NoError(t, err)
@@ -448,7 +448,7 @@ func TestTxPublishCommitMultipleInConfirmModeSendsAcksInOrder(t *testing.T) {
 	require.NoError(t, err)
 	drainFrame(t, frameCh)
 
-	require.NoError(t, srv.TransactionManager.Select(1))
+	require.NoError(t, srv.txm(conn).Select(1))
 
 	for i := 0; i < 3; i++ {
 		err = srv.processCompleteMessage(conn, 1, makePendingMessage("", "confirm-tx-multi-q", "msg"))
@@ -494,7 +494,7 @@ func TestTxPublishRollbackInConfirmModeDoesNotSendAck(t *testing.T) {
 	require.NoError(t, err)
 	drainFrame(t, frameCh)
 
-	require.NoError(t, srv.TransactionManager.Select(1))
+	require.NoError(t, srv.txm(conn).Select(1))
 
 	err = srv.processCompleteMessage(conn, 1, makePendingMessage("", "confirm-tx-rb-q", "rolled-back"))
 	require.NoError(t, err)
@@ -595,7 +595,7 @@ func TestConfirmSequenceContinuesAcrossTransactions(t *testing.T) {
 	require.NoError(t, err)
 	drainFrame(t, frameCh)
 
-	require.NoError(t, srv.TransactionManager.Select(1))
+	require.NoError(t, srv.txm(conn).Select(1))
 
 	err = srv.processCompleteMessage(conn, 1, makePendingMessage("", "confirm-seq-q", "first"))
 	require.NoError(t, err)
@@ -646,12 +646,12 @@ func TestConfirmTagStoredInTxOperation(t *testing.T) {
 	require.NoError(t, err)
 	drainFrame(t, frameCh)
 
-	require.NoError(t, srv.TransactionManager.Select(1))
+	require.NoError(t, srv.txm(conn).Select(1))
 
 	err = srv.processCompleteMessage(conn, 1, makePendingMessage("", "confirm-op-q", "op-test"))
 	require.NoError(t, err)
 
-	ops, err := srv.TransactionManager.GetPendingOperations(1)
+	ops, err := srv.txm(conn).GetPendingOperations(1)
 	require.NoError(t, err)
 	require.Len(t, ops, 1)
 	assert.Equal(t, interfaces.OpPublish, ops[0].Type)

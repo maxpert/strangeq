@@ -58,7 +58,7 @@ func TestInternal_TxPublishRejectedAtPublishTime(t *testing.T) {
 	assert.Equal(t, uint16(40), closeMethodID)
 
 	// Nothing was buffered into the transaction.
-	ops, oerr := srv.TransactionManager.GetPendingOperations(1)
+	ops, oerr := srv.txm(conn).GetPendingOperations(1)
 	require.NoError(t, oerr)
 	assert.Empty(t, ops, "a refused publish must not be buffered (R11: the check runs before buffering)")
 }

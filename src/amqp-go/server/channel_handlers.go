@@ -241,9 +241,11 @@ func (s *Server) teardownChannel(conn *protocol.Connection, channelID uint16) {
 	conn.Channels.Delete(channelID)
 	conn.ChannelCount.Add(-1)
 
-	// Clean up transaction state for this channel
-	if s.TransactionManager != nil {
-		s.TransactionManager.Close(channelID)
+	// Clean up transaction state for this channel (conn-scoped, D-NEW-1:
+	// closing this connection's channel must not drop another connection's
+	// same-numbered tx state).
+	if txm := s.txm(conn); txm != nil {
+		txm.Close(channelID)
 	}
 
 	// Record channel closed metric

@@ -451,9 +451,11 @@ func (s *Server) cleanupConnection(connection *protocol.Connection) {
 
 		// Clean up transaction state for this channel to prevent
 		// cross-connection state leak where stale tx state keyed by
-		// channelID persists after the connection is gone.
-		if s.TransactionManager != nil {
-			s.TransactionManager.Close(channel.ID)
+		// channelID persists after the connection is gone. Conn-scoped
+		// (D-NEW-1): only THIS connection's (conn, channel) entry is dropped;
+		// another connection's same-numbered tx channel is untouched.
+		if txm := s.txm(connection); txm != nil {
+			txm.Close(channel.ID)
 		}
 
 		// Unregister from broker (stops poll goroutines)

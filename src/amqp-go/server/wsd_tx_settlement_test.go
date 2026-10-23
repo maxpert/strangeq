@@ -26,7 +26,7 @@ func TestTx_Rollback_AckNotApplied(t *testing.T) {
 	require.NoError(t, srv.handleBasicAck(conn, 1, makeAckPayload(wireTag, false)))
 
 	// One op buffered; the wire tag was TAKEN at buffer time (R14).
-	ops, err := srv.TransactionManager.GetPendingOperations(1)
+	ops, err := srv.txm(conn).GetPendingOperations(1)
 	require.NoError(t, err)
 	require.Len(t, ops, 1)
 	ch := srv.wireChannel(conn, 1)
@@ -71,7 +71,7 @@ func TestTx_Commit_AckAppliedOnce(t *testing.T) {
 
 	// Second tx: ack the same wire tag — unknown → debug no-op, nothing buffered.
 	require.NoError(t, srv.handleBasicAck(conn, 1, makeAckPayload(wireTag, false)))
-	ops, err := srv.TransactionManager.GetPendingOperations(1)
+	ops, err := srv.txm(conn).GetPendingOperations(1)
 	require.NoError(t, err)
 	assert.Empty(t, ops, "a duplicate ack of a consumed wire tag buffers nothing (R14 parity)")
 	txCommit(t, srv, conn, frameCh, 1)
@@ -97,7 +97,7 @@ func TestTx_DuplicateAckInSameTx_SecondUnknown(t *testing.T) {
 	require.NoError(t, srv.handleBasicAck(conn, 1, makeAckPayload(wireTag, false)))
 	require.NoError(t, srv.handleBasicAck(conn, 1, makeAckPayload(wireTag, false)))
 
-	ops, err := srv.TransactionManager.GetPendingOperations(1)
+	ops, err := srv.txm(conn).GetPendingOperations(1)
 	require.NoError(t, err)
 	assert.Len(t, ops, 1, "exactly one settlement op buffered (duplicate is unknown, R14 parity)")
 }
@@ -128,7 +128,7 @@ func TestTx_CumulativeAck_MultipleConsumers(t *testing.T) {
 	require.NoError(t, srv.handleBasicAck(conn, 1, makeAckPayload(wt3, true)))
 
 	// Three single-tag settlement ops buffered (one per taken entry).
-	ops, err := srv.TransactionManager.GetPendingOperations(1)
+	ops, err := srv.txm(conn).GetPendingOperations(1)
 	require.NoError(t, err)
 	require.Len(t, ops, 3, "cumulative tx ack settles every outstanding delivery, one op each")
 

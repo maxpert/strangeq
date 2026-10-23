@@ -431,8 +431,9 @@ func (s *Server) processCompleteMessage(conn *protocol.Connection, channelID uin
 		}
 	}
 
-	// Buffer into transaction if channel is in transactional mode
-	if s.TransactionManager != nil && s.TransactionManager.IsTransactional(channelID) {
+	// Buffer into transaction if channel is in transactional mode (conn-scoped,
+	// D-NEW-1)
+	if txm := s.txm(conn); txm != nil && txm.IsTransactional(channelID) {
 		// WS-D §11.2 (R11 check_internal_exchange runs BEFORE tx buffering, in
 		// tx and non-tx mode alike): a publish to a missing/internal exchange
 		// fails NOW with the channel error, not at commit.
@@ -445,7 +446,7 @@ func (s *Server) processCompleteMessage(conn *protocol.Connection, channelID uin
 		if confirmTag > 0 {
 			op.DeliveryTag = confirmTag
 		}
-		return s.TransactionManager.AddOperation(channelID, op)
+		return txm.AddOperation(channelID, op)
 	}
 
 	var publishStart time.Time
@@ -1197,7 +1198,8 @@ func (s *Server) handleBasicAck(conn *protocol.Connection, channelID uint16, pay
 			zap.String("connection_id", conn.ID))
 		return nil
 	}
-	tx := s.TransactionManager != nil && s.TransactionManager.IsTransactional(channelID)
+	txm := s.txm(conn)
+	tx := txm != nil && txm.IsTransactional(channelID)
 
 	// WS-D §6: in tx mode the wire tag(s) are TAKEN now (RabbitMQ removes from
 	// the unacked map at ack time, R14) and restored on rollback/failed commit;
@@ -1276,7 +1278,7 @@ func (s *Server) handleBasicReject(conn *protocol.Connection, channelID uint16, 
 	}
 
 	// WS-D §6: tx reject takes the wire tag now (R14) with rollback restore.
-	if s.TransactionManager != nil && s.TransactionManager.IsTransactional(channelID) {
+	if txm := s.txm(conn); txm != nil && txm.IsTransactional(channelID) {
 		known, err := s.txBufferSettlement(conn, channel, channelID, interfaces.OpReject, wireTag, false, requeue)
 		if !known {
 			// WS-B: unknown-tag policy (406 PRECONDITION_FAILED - unknown delivery tag N)
@@ -1327,7 +1329,8 @@ func (s *Server) handleBasicNack(conn *protocol.Connection, channelID uint16, pa
 			zap.String("connection_id", conn.ID))
 		return nil
 	}
-	tx := s.TransactionManager != nil && s.TransactionManager.IsTransactional(channelID)
+	txm := s.txm(conn)
+	tx := txm != nil && txm.IsTransactional(channelID)
 
 	// WS-D §6: tx nack takes the wire tag(s) now (R14) with rollback restore.
 	if tx {

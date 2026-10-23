@@ -57,9 +57,10 @@ func (s *Server) handleTxSelect(conn *protocol.Connection, channelID uint16, pay
 		zap.String("connection_id", conn.ID),
 		zap.Uint16("channel_id", channelID))
 
-	// Put channel into transactional mode
-	if s.TransactionManager != nil {
-		err = s.TransactionManager.Select(channelID)
+	// Put channel into transactional mode (conn-scoped, D-NEW-1: channel
+	// numbers are per-connection, so key by conn.ID too).
+	if txm := s.txm(conn); txm != nil {
+		err = txm.Select(channelID)
 		if err != nil {
 			s.Log.Error("Failed to select transaction mode",
 				zap.Error(err),
@@ -107,12 +108,12 @@ func (s *Server) handleTxCommit(conn *protocol.Connection, channelID uint16, pay
 		inConfirmMode = ch.ConfirmMode.Load()
 	}
 	if inConfirmMode && s.TransactionManager != nil {
-		ops, _ = s.TransactionManager.GetPendingOperations(channelID)
+		ops, _ = s.txm(conn).GetPendingOperations(channelID)
 	}
 
-	// Commit pending operations
-	if s.TransactionManager != nil {
-		err = s.TransactionManager.Commit(channelID)
+	// Commit pending operations (conn-scoped, D-NEW-1)
+	if txm := s.txm(conn); txm != nil {
+		err = txm.Commit(channelID)
 		if err != nil {
 			s.Log.Error("Failed to commit transaction",
 				zap.Error(err),
@@ -187,9 +188,9 @@ func (s *Server) handleTxRollback(conn *protocol.Connection, channelID uint16, p
 		zap.String("connection_id", conn.ID),
 		zap.Uint16("channel_id", channelID))
 
-	// Rollback pending operations
-	if s.TransactionManager != nil {
-		err = s.TransactionManager.Rollback(channelID)
+	// Rollback pending operations (conn-scoped, D-NEW-1)
+	if txm := s.txm(conn); txm != nil {
+		err = txm.Rollback(channelID)
 		if err != nil {
 			s.Log.Error("Failed to rollback transaction",
 				zap.Error(err),

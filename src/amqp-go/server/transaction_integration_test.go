@@ -163,7 +163,7 @@ func TestTxPublishBuffers(t *testing.T) {
 	assert.Nil(t, msg, "message should be buffered, not published")
 
 	// Verify operation was buffered
-	ops, err := srv.TransactionManager.GetPendingOperations(1)
+	ops, err := srv.txm(conn).GetPendingOperations(1)
 	require.NoError(t, err)
 	require.Len(t, ops, 1)
 	assert.Equal(t, interfaces.OpPublish, ops[0].Type)
@@ -210,7 +210,7 @@ func TestTxPublishRollbackDiscards(t *testing.T) {
 	assert.Nil(t, msg, "message should be discarded by rollback")
 
 	// No pending operations
-	ops, err := srv.TransactionManager.GetPendingOperations(1)
+	ops, err := srv.txm(conn).GetPendingOperations(1)
 	require.NoError(t, err)
 	assert.Empty(t, ops)
 }
@@ -258,7 +258,7 @@ func TestTxAckBuffers(t *testing.T) {
 	assert.True(t, ok, "delivery should still be tracked after buffered ack")
 
 	// Verify operation was buffered
-	ops, err := srv.TransactionManager.GetPendingOperations(1)
+	ops, err := srv.txm(conn).GetPendingOperations(1)
 	require.NoError(t, err)
 	require.Len(t, ops, 1)
 	assert.Equal(t, interfaces.OpAck, ops[0].Type)
@@ -310,7 +310,7 @@ func TestTxAckRollbackDiscards(t *testing.T) {
 	assert.True(t, ok, "delivery should still be tracked after rolled-back ack")
 
 	// No pending operations
-	ops, err := srv.TransactionManager.GetPendingOperations(1)
+	ops, err := srv.txm(conn).GetPendingOperations(1)
 	require.NoError(t, err)
 	assert.Empty(t, ops)
 }
@@ -333,7 +333,7 @@ func TestTxRejectBuffers(t *testing.T) {
 	_, ok := srv.Broker.GetConsumerForDelivery(msgID)
 	assert.True(t, ok, "delivery should still be tracked after buffered reject")
 
-	ops, err := srv.TransactionManager.GetPendingOperations(1)
+	ops, err := srv.txm(conn).GetPendingOperations(1)
 	require.NoError(t, err)
 	require.Len(t, ops, 1)
 	assert.Equal(t, interfaces.OpReject, ops[0].Type)
@@ -357,7 +357,7 @@ func TestTxNackBuffers(t *testing.T) {
 	_, ok := srv.Broker.GetConsumerForDelivery(msgID)
 	assert.True(t, ok, "delivery should still be tracked after buffered nack")
 
-	ops, err := srv.TransactionManager.GetPendingOperations(1)
+	ops, err := srv.txm(conn).GetPendingOperations(1)
 	require.NoError(t, err)
 	require.Len(t, ops, 1)
 	assert.Equal(t, interfaces.OpNack, ops[0].Type)
@@ -388,7 +388,7 @@ func TestTxMultipleOperationsCommit(t *testing.T) {
 	require.NoError(t, err)
 
 	// Verify 2 pending operations
-	ops, err := srv.TransactionManager.GetPendingOperations(1)
+	ops, err := srv.txm(conn).GetPendingOperations(1)
 	require.NoError(t, err)
 	require.Len(t, ops, 2)
 	assert.Equal(t, interfaces.OpPublish, ops[0].Type)
@@ -415,7 +415,7 @@ func TestTxMultipleOperationsCommit(t *testing.T) {
 	assert.False(t, ok)
 
 	// No pending operations
-	ops, err = srv.TransactionManager.GetPendingOperations(1)
+	ops, err = srv.txm(conn).GetPendingOperations(1)
 	require.NoError(t, err)
 	assert.Empty(t, ops)
 }
@@ -439,7 +439,7 @@ func TestTxChannelRemainsTransactionalAfterCommit(t *testing.T) {
 	assert.Equal(t, "first", string(msg.Body))
 
 	// Channel should still be transactional
-	assert.True(t, srv.TransactionManager.IsTransactional(1))
+	assert.True(t, srv.txm(conn).IsTransactional(1))
 
 	// Second publish should also buffer (not publish immediately)
 	err = srv.processCompleteMessage(conn, 1, makePendingMessage("", "tx-remains", "second"))
@@ -471,7 +471,7 @@ func TestTxChannelRemainsTransactionalAfterRollback(t *testing.T) {
 	txRollback(t, srv, conn, frameCh, 1)
 
 	// Channel should still be transactional
-	assert.True(t, srv.TransactionManager.IsTransactional(1))
+	assert.True(t, srv.txm(conn).IsTransactional(1))
 
 	// New publish should buffer
 	err = srv.processCompleteMessage(conn, 1, makePendingMessage("", "tx-remains-rb", "kept"))

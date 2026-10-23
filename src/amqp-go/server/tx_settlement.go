@@ -62,7 +62,10 @@ func (s *Server) txBufferSettlement(conn *protocol.Connection, channel *protocol
 		tags, refs = []uint64{wireTag}, []protocol.WireDeliveryRef{ref}
 	}
 
-	// 2. Buffer one settlement op per entry, each with its restore undo.
+	// 2. Buffer one settlement op per entry, each with its restore undo
+	// (conn-scoped view, D-NEW-1: the same channel number on another
+	// connection is a different transaction).
+	txm := s.txm(conn)
 	for i := range refs {
 		r := refs[i]
 		w := tags[i]
@@ -74,13 +77,13 @@ func (s *Server) txBufferSettlement(conn *protocol.Connection, channel *protocol
 			Requeue:     requeue,
 		}
 		undo := func() { channel.TrackDelivery(w, r.MsgID, r.ConsumerID, r.IsGet) }
-		if u, ok := s.TransactionManager.(interface {
+		if u, ok := txm.(interface {
 			AddOperationWithUndo(uint16, *interfaces.TransactionOperation, func()) error
 		}); ok {
 			if aerr := u.AddOperationWithUndo(channelID, op, undo); aerr != nil {
 				return true, aerr
 			}
-		} else if aerr := s.TransactionManager.AddOperation(channelID, op); aerr != nil {
+		} else if aerr := txm.AddOperation(channelID, op); aerr != nil {
 			undo() // best-effort restore when the manager cannot carry undos
 			return true, aerr
 		}

@@ -69,7 +69,7 @@ func TestConnectionClose_TriggersTeardown(t *testing.T) {
 	ch := protocol.NewChannel(1, conn)
 	conn.Channels.Store(uint16(1), ch)
 	require.NotNil(t, srv.TransactionManager)
-	require.NoError(t, srv.TransactionManager.Select(1))
+	require.NoError(t, srv.txm(conn).Select(1))
 
 	closePayload := make([]byte, 4)
 	binary.BigEndian.PutUint16(closePayload[0:2], 10)
@@ -80,7 +80,7 @@ func TestConnectionClose_TriggersTeardown(t *testing.T) {
 	assert.True(t, conn.Closed.Load())
 
 	srv.cleanupConnection(conn)
-	assert.False(t, srv.TransactionManager.IsTransactional(1),
+	assert.False(t, srv.txm(conn).IsTransactional(1),
 		"teardown after client close must clean up transaction state")
 }
 
