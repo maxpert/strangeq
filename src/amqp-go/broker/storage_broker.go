@@ -613,6 +613,13 @@ type ringDeleter interface {
 	DeleteMessageIfPresent(queueName string, deliveryTag uint64) (bool, error)
 }
 
+// ringDeleterDetailed is the §8 capability that also reports removals of
+// SPILLED (WAL/segment-only) messages, so depth accounting is correct for a
+// non-ring-resident ready message.
+type ringDeleterDetailed interface {
+	DeleteMessageIfPresentDetailed(queueName string, deliveryTag uint64) (removed, wasResident bool, err error)
+}
+
 // asyncDurableWriter is the optional storage capability that decouples a durable
 // publish's fsync from the caller: the message is ring-stored synchronously and
 // its WAL write is enqueued for group commit, with the fsync completion reported
@@ -649,9 +656,17 @@ func (b *StorageBroker) sharedBodyThreshold() int {
 }
 
 // deleteIfPresent removes a message from storage and reports whether THIS call
-// won the removal (the ring CAS). Depth is decremented only by the winner, so at
-// most one of {reaper drop, consumer head-check} decrements depth per tag.
+// removed a message that was PRESENT — the ring CAS win OR the first
+// acknowledgement of a spilled (WAL/segment-only) record (§8). Depth is
+// decremented only by the winner, so at most one of {reaper drop, consumer
+// head-check, drop-head evict, no-ack get, purge} decrements depth per tag,
+// and a spilled message's removal now decrements depth exactly once (the old
+// ring-CAS-only contract leaked depth for spilled tags at all five call sites).
 func (b *StorageBroker) deleteIfPresent(queueName string, tag uint64) bool {
+	if rd, ok := b.storage.(ringDeleterDetailed); ok {
+		removed, _, _ := rd.DeleteMessageIfPresentDetailed(queueName, tag)
+		return removed
+	}
 	if rd, ok := b.storage.(ringDeleter); ok {
 		removed, _ := rd.DeleteMessageIfPresent(queueName, tag)
 		return removed
@@ -4112,7 +4127,8 @@ func (b *StorageBroker) GetMessageForGet(queueName string, noAck bool) (*protoco
 		// already removed by deleteIfPresent, so we only settle the counters —
 		// ClaimInflight (waiting-1, inflight+1) + subReadyBytesOnClaim + AckAdvance
 		// (inflight-1) — matching how the reaper/head-check remove-then-account. On
-		// a loss the reaper already removed and accounted the tag, so we advance the
+		// a loss the reaper already removed and accounted the tag, or the tag was
+		// absent, so we advance the
 		// depth frontier without touching the counters (GapSkipAdvance). Without
 		// this branch a no-ack basic.get leaked the message (durable redelivery
 		// after restart) and drifted both `waiting` and `readyBytes` upward.

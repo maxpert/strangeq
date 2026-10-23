@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/maxpert/amqp-go/config"
 	amqp "github.com/rabbitmq/amqp091-go"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -325,6 +326,59 @@ func TestExchangeDelete_Nonexistent_DeleteOk(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, ch.ExchangeDelete("never-existed", false, false))
 	assert.False(t, conn.IsClosed())
+}
+
+// T8.1: no-ack basic.get on spilled (WAL-only) messages decrements the
+// reported depth exactly once per message. Pre-fix mechanism:
+// DeleteMessageIfPresent returned the ring-CAS result, so a spilled removal
+// reported a "loss" and GetMessageForGet's no-ack branch never decremented —
+// the queue's message-count stayed inflated forever.
+func TestGetNoAck_SpilledDepth_NoLeak(t *testing.T) {
+	b := newRestartableBroker(t, func(cfg *config.AMQPConfig) {
+		cfg.Engine.RingBufferSize = 16
+		cfg.Engine.SpillThresholdPercent = 50
+		cfg.Engine.DepthHighWMOverride = 100000
+	})
+
+	conn, err := amqp.Dial(b.uri)
+	require.NoError(t, err)
+	defer conn.Close()
+
+	ch, err := conn.Channel()
+	require.NoError(t, err)
+	q, err := ch.QueueDeclare("sq", false, false, false, false, nil)
+	require.NoError(t, err)
+	require.NoError(t, ch.Confirm(false))
+
+	const n = 20
+	confirms := ch.NotifyPublish(make(chan amqp.Confirmation, n))
+	for i := 0; i < n; i++ {
+		require.NoError(t, ch.Publish("", q.Name, false, false, amqp.Publishing{
+			Body: []byte{byte('a' + i)},
+		}))
+	}
+	for i := 0; i < n; i++ {
+		require.True(t, (<-confirms).Ack, "publish %d must be confirmed", i)
+	}
+
+	// 20 messages ready (some spilled — the ring holds ~9).
+	qd, err := ch.QueueDeclarePassive(q.Name, false, false, false, false, nil)
+	require.NoError(t, err)
+	require.Equal(t, n, qd.Messages, "all 20 ready before the gets")
+
+	// No-ack gets must drain exactly n, each decrementing depth.
+	seen := make(map[byte]bool)
+	for i := 0; i < n; i++ {
+		msg, ok, err := ch.Get(q.Name, true)
+		require.NoError(t, err)
+		require.True(t, ok, "get %d must return a message", i)
+		seen[msg.Body[0]] = true
+	}
+	assert.Len(t, seen, n, "all bodies distinct")
+
+	qd, err = ch.QueueDeclarePassive(q.Name, false, false, false, false, nil)
+	require.NoError(t, err)
+	assert.Equal(t, 0, qd.Messages, "depth returns to 0 — no spilled-depth leak")
 }
 
 // probeQueueDeleteFlagsDecode reports whether the server's queue.delete path
