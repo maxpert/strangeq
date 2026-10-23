@@ -3,8 +3,11 @@ package broker
 import (
 	"errors"
 	"fmt"
+	"strconv"
+	"time"
 
 	"github.com/maxpert/amqp-go/interfaces"
+	"github.com/maxpert/amqp-go/protocol"
 )
 
 // DefaultVHost is used in RabbitMQ-shaped error texts. Vhost scoping is out of
@@ -73,4 +76,108 @@ func inequivalent(kind, name, key, received, current string, extra ...error) err
 	}
 	return semErr(fmt.Sprintf("inequivalent arg '%s' for %s: received %s but current is %s",
 		key, rs, received, current), append([]error{ErrInequivalentArgs}, extra...)...)
+}
+
+// fmtBool formats a flag field the way RabbitMQ's val/1 prints a bare value
+// (R7): 'true' / 'false'.
+func fmtBool(v bool) string { return "'" + strconv.FormatBool(v) + "'" }
+
+// fmtBareVal prints a bare (non-table) value for an inequivalence message
+// (R7 val/1): '<v>'.
+func fmtBareVal(v string) string { return "'" + v + "'" }
+
+// fmtArgVal formats a redeclare argument value per R7 val/1: absent → none;
+// present → the value '<v>' of type '<t>', where <v> is the string, the
+// decimal integer, or strconv.FormatFloat(f,'g',-1,64), and <t> is the AMQP
+// type name (amqpTypeName).
+func fmtArgVal(v interface{}, present bool) string {
+	if !present {
+		return "none"
+	}
+	return fmt.Sprintf("the value '%s' of type '%s'", argValueString(v), amqpTypeName(v))
+}
+
+// argValueString renders the value half of R7's typed val/1.
+func argValueString(v interface{}) string {
+	switch n := v.(type) {
+	case string:
+		return n
+	case []byte:
+		return string(n)
+	case int8:
+		return strconv.FormatInt(int64(n), 10)
+	case uint8:
+		return strconv.FormatUint(uint64(n), 10)
+	case int16:
+		return strconv.FormatInt(int64(n), 10)
+	case uint16:
+		return strconv.FormatUint(uint64(n), 10)
+	case int32:
+		return strconv.FormatInt(int64(n), 10)
+	case uint32:
+		return strconv.FormatUint(uint64(n), 10)
+	case int64:
+		return strconv.FormatInt(n, 10)
+	case int:
+		return strconv.FormatInt(int64(n), 10)
+	case uint64:
+		return strconv.FormatUint(n, 10)
+	case uint:
+		return strconv.FormatUint(uint64(n), 10)
+	case float32:
+		return strconv.FormatFloat(float64(n), 'g', -1, 64)
+	case float64:
+		return strconv.FormatFloat(n, 'g', -1, 64)
+	case bool:
+		return strconv.FormatBool(n)
+	case time.Time:
+		return strconv.FormatInt(n.Unix(), 10)
+	case nil:
+		return ""
+	default:
+		return fmt.Sprintf("%v", v)
+	}
+}
+
+// amqpTypeName maps a decoded Go field value to its AMQP wire type name, per
+// R7's printed type tags.
+func amqpTypeName(v interface{}) string {
+	switch v.(type) {
+	case string:
+		return "longstr"
+	case []byte:
+		return "binary"
+	case int8:
+		return "byte"
+	case uint8:
+		return "unsignedbyte"
+	case int16:
+		return "short"
+	case uint16:
+		return "unsignedshort"
+	case int32:
+		return "signedint"
+	case uint32:
+		return "unsignedint"
+	case int64, int, uint64, uint:
+		return "long"
+	case float32:
+		return "float"
+	case float64:
+		return "double"
+	case bool:
+		return "bool"
+	case time.Time:
+		return "timestamp"
+	case map[string]interface{}, map[interface{}]interface{}:
+		return "table"
+	case []interface{}:
+		return "array"
+	case nil:
+		return "void"
+	case protocol.Decimal:
+		return "decimal"
+	default:
+		return "unknown"
+	}
 }

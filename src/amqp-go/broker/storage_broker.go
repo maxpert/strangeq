@@ -1423,10 +1423,30 @@ func (b *StorageBroker) DeclareExchange(name, exchangeType string, durable, auto
 		return fmt.Errorf("failed to check existing exchange: %w", err)
 	}
 
-	// If exists, validate properties match
+	// If exists, validate properties match (R8 assert_equivalence), in order:
+	// type, durable, auto_delete, internal, then ONLY the alternate-exchange
+	// argument (D3); other argument keys are ignored. The type check keeps
+	// ErrExchangeTypeMismatch errors.Is-reachable (§2.3).
 	if existing != nil {
 		if existing.Kind != exchangeType {
-			return fmt.Errorf("%w: exchange '%s' expected %s, got %s", ErrExchangeTypeMismatch, name, existing.Kind, exchangeType)
+			return inequivalent("exchange", name, "type", fmtBareVal(exchangeType), fmtBareVal(existing.Kind), ErrExchangeTypeMismatch)
+		}
+		if existing.Durable != durable {
+			return inequivalent("exchange", name, "durable", fmtBool(durable), fmtBool(existing.Durable))
+		}
+		if existing.AutoDelete != autoDelete {
+			return inequivalent("exchange", name, "auto_delete", fmtBool(autoDelete), fmtBool(existing.AutoDelete))
+		}
+		if existing.Internal != internal {
+			return inequivalent("exchange", name, "internal", fmtBool(internal), fmtBool(existing.Internal))
+		}
+		o, oOK := existing.Arguments["alternate-exchange"]
+		n, nOK := arguments["alternate-exchange"]
+		if oOK != nOK {
+			return inequivalent("exchange", name, "alternate-exchange", fmtArgVal(n, nOK), fmtArgVal(o, oOK))
+		}
+		if oOK && nOK && !argEquivalent(o, n) {
+			return inequivalent("exchange", name, "alternate-exchange", fmtArgVal(n, nOK), fmtArgVal(o, oOK))
 		}
 		// Exchange already exists with matching properties
 		return nil
@@ -1530,7 +1550,7 @@ func (b *StorageBroker) DeclareQueue(name string, durable, autoDelete, exclusive
 		mu.Lock()
 		fresh, ferr := b.storage.GetQueue(name)
 		if ferr == nil && fresh != nil {
-			q, derr := b.declareExistingQueueLocked(fresh, durable, autoDelete, exclusive)
+			q, derr := b.declareExistingQueueLocked(fresh, durable, autoDelete, exclusive, arguments)
 			mu.Unlock()
 			return q, derr
 		}
@@ -1587,7 +1607,7 @@ func (b *StorageBroker) DeclareQueue(name string, durable, autoDelete, exclusive
 	// inside declareExistingQueueLocked, which is the exact race this whole
 	// change eliminates.
 	if existing, gerr := b.storage.GetQueue(name); gerr == nil && existing != nil {
-		q, derr := b.declareExistingQueueLocked(existing, durable, autoDelete, exclusive)
+		q, derr := b.declareExistingQueueLocked(existing, durable, autoDelete, exclusive, arguments)
 		mu.Unlock()
 		return q, derr
 	}
@@ -1656,22 +1676,61 @@ func (b *StorageBroker) DeclareQueue(name string, durable, autoDelete, exclusive
 // is why this function calls createQueueStateLocked (which assumes the lock
 // is held) rather than getOrCreateQueueState (which would try to take it
 // again and self-deadlock).
-func (b *StorageBroker) declareExistingQueueLocked(existing *protocol.Queue, durable, autoDelete, exclusive bool) (*protocol.Queue, error) {
-	if existing.Durable != durable || existing.AutoDelete != autoDelete || existing.Exclusive != exclusive {
-		return nil, fmt.Errorf("queue '%s' properties mismatch", existing.Name)
+func (b *StorageBroker) declareExistingQueueLocked(existing *protocol.Queue, durable, autoDelete, exclusive bool, arguments map[string]interface{}) (*protocol.Queue, error) {
+	// RabbitMQ redeclare equivalence (R6/R7), checked in order; the first
+	// failure wins. Equivalence runs BEFORE any side effect (activeQueues,
+	// QueueState, reaper), so a refused redeclare changes nothing.
+	//
+	// 1. exclusive is the strict 405 check (D4); cross-CONNECTION ownership
+	//    stays in the server (SetQueueOwnerIfFree).
+	if existing.Exclusive != exclusive {
+		return nil, semErr("cannot obtain exclusive access to locked "+queueRS(existing.Name)+
+			". It could be originally declared on another connection or the exclusive property value does not match that of the original declaration.",
+			ErrQueueLocked)
+	}
+	// 2/3. durable, then auto_delete.
+	if existing.Durable != durable {
+		return nil, inequivalent("queue", existing.Name, "durable", fmtBool(durable), fmtBool(existing.Durable))
+	}
+	if existing.AutoDelete != autoDelete {
+		return nil, inequivalent("queue", existing.Name, "auto_delete", fmtBool(autoDelete), fmtBool(existing.AutoDelete))
+	}
+	// 4. arguments: ONLY the queue type's declared argument keys are compared
+	// (D3, R6 classic queue_arguments); keys outside the list are ignored.
+	for _, k := range classicQueueArgumentKeys {
+		o, oOK := existing.Arguments[k]
+		n, nOK := arguments[k]
+		if !oOK && !nOK {
+			continue
+		}
+		// R7 assert_field_equivalence: x-queue-type "classic" vs absent is ok.
+		if k == "x-queue-type" && (!oOK || !nOK) {
+			present, presentOK := o, oOK
+			if !presentOK {
+				present = n
+			}
+			if s, isStr := present.(string); isStr && s == "classic" {
+				continue
+			}
+		}
+		if oOK != nOK {
+			return nil, inequivalent("queue", existing.Name, k, fmtArgVal(n, nOK), fmtArgVal(o, oOK))
+		}
+		if !argEquivalent(o, n) {
+			return nil, inequivalent("queue", existing.Name, k, fmtArgVal(n, nOK), fmtArgVal(o, oOK))
+		}
 	}
 
 	// Add to active cache (lock-free)
 	b.activeQueues.Store(existing.Name, existing)
 
-	// Ensure queue state exists and carries the resolved policy. The
-	// stored (original) arguments win: redeclare arguments are not
-	// compared today (known gap — AMQP 0.9.1 says differing args should
-	// be a 406), so they must not overwrite the policy either. This
-	// branch also covers recovery when the storage backend already holds
-	// the durable queue across restarts. Resolution errors are tolerated
-	// here (nil policy) so queues persisted before validation existed
-	// remain usable.
+	// Ensure queue state exists and carries the resolved policy. The stored
+	// (original) arguments win: equivalence above guarantees the redeclare
+	// carries nothing new, so they must not overwrite the policy either. This
+	// branch also covers recovery when the storage backend already holds the
+	// durable queue across restarts. Resolution errors are tolerated here
+	// (nil policy) so queues persisted before validation existed remain
+	// usable.
 	qs := b.createQueueStateLocked(existing.Name)
 	if policy, perr := ResolveQueuePolicy(existing.Arguments); perr == nil {
 		qs.SetPolicy(policy)
@@ -1683,6 +1742,27 @@ func (b *StorageBroker) declareExistingQueueLocked(existing *protocol.Queue, dur
 	b.maybeStartReaper(existing.Name, qs)
 
 	return existing, nil
+}
+
+// classicQueueArgumentKeys is RabbitMQ's classic-queue argument list (R6,
+// rabbit_classic_queue.erl capabilities/0 queue_arguments), in the fixed
+// comparison order of §2.2. Redeclare equivalence compares ONLY these keys;
+// plugin/client keys outside the list are ignored (D3).
+var classicQueueArgumentKeys = []string{
+	"x-expires",
+	"x-message-ttl",
+	"x-dead-letter-exchange",
+	"x-dead-letter-routing-key",
+	"x-max-length",
+	"x-max-length-bytes",
+	"x-max-priority",
+	"x-overflow",
+	"x-queue-mode",
+	"x-queue-version",
+	"x-single-active-consumer",
+	"x-queue-type",
+	"x-queue-master-locator",
+	"x-queue-leader-locator",
 }
 
 // DeleteQueue removes a queue. It captures the identity (Ordinal) of the
