@@ -102,11 +102,15 @@ fi
 # Step 7: Stop cleanly and report.
 echo "[7/7] Stopping server..."
 kill -TERM "$SERVER_PID" 2>/dev/null || true
-rm -f "$WORKDIR/server.pid"
 for _ in $(seq 1 45); do
     kill -0 "$SERVER_PID" 2>/dev/null || break
     sleep 1
 done
+# Remove the pidfile only once the process is gone; if it outlived the wait,
+# the EXIT trap's stop_server backstop still needs the pidfile to kill it.
+if ! kill -0 "$SERVER_PID" 2>/dev/null; then
+    rm -f "$WORKDIR/server.pid"
+fi
 
 echo ""
 echo "=================================================="

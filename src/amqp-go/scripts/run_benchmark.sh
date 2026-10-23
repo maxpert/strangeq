@@ -28,10 +28,19 @@ echo "Prefetch: $PREFETCH"
 echo "Size: $SIZE bytes"
 echo ""
 
-# Step 1: Cleanup
+# Step 1: Cleanup — kill only processes recorded by a previous run of THIS
+# script (never pkill: other brokers/perf processes on this machine are not
+# ours to kill).
 echo "[1/8] Cleaning up existing processes..."
-pkill -9 amqp-server || true
-pkill -9 perftest || true
+for pf in "$RESULTS_DIR/benchmark-server.pid" "$RESULTS_DIR/benchmark-perftest.pid"; do
+    if [ -f "$pf" ]; then
+        OLD_PID=$(cat "$pf")
+        if [ -n "$OLD_PID" ] && kill -0 "$OLD_PID" 2>/dev/null; then
+            kill -9 "$OLD_PID" 2>/dev/null || true
+        fi
+        rm -f "$pf"
+    fi
+done
 rm -rf /tmp/amqp-storage-* || true
 sleep 1
 
@@ -93,6 +102,7 @@ EOF
 
 ./amqp-server --config "$PROFILE_DIR/benchmark-config.yaml" --enable-telemetry --enable-pprof --telemetry-port 9419 > "$PROFILE_DIR/server.log" 2>&1 &
 SERVER_PID=$!
+echo "$SERVER_PID" > "$RESULTS_DIR/benchmark-server.pid"
 echo "Server PID: $SERVER_PID"
 sleep 2
 
@@ -125,6 +135,7 @@ cd "$PROJECT_DIR"
     2>&1 | tee "$PROFILE_DIR/benchmark.txt" &
 
 PERFTEST_PID=$!
+echo "$PERFTEST_PID" > "$RESULTS_DIR/benchmark-perftest.pid"
 echo "Perftest PID: $PERFTEST_PID"
 
 # Wait up to 40 seconds for perftest to complete
@@ -134,15 +145,16 @@ while kill -0 $PERFTEST_PID 2>/dev/null && [ $WAIT_COUNT -lt 40 ]; do
     WAIT_COUNT=$((WAIT_COUNT + 1))
 done
 
-# Force kill if still running
+# Force kill if still running (only the process this script started)
 if kill -0 $PERFTEST_PID 2>/dev/null; then
     echo "Perftest exceeded 40s timeout, force killing..."
-    pkill -9 perftest
+    kill -9 $PERFTEST_PID 2>/dev/null || true
     BENCHMARK_EXIT_CODE=124
 else
     wait $PERFTEST_PID
     BENCHMARK_EXIT_CODE=$?
 fi
+rm -f "$RESULTS_DIR/benchmark-perftest.pid"
 
 # Step 7: Capture all profiles
 echo "[7/8] Capturing all profiles from telemetry endpoint..."
@@ -158,6 +170,9 @@ curl -s -o "$PROFILE_DIR/threadcreate.prof" "http://localhost:9419/debug/pprof/t
 echo "[8/8] Cleaning up..."
 kill $SERVER_PID 2>/dev/null || true
 sleep 1
+if ! kill -0 $SERVER_PID 2>/dev/null; then
+    rm -f "$RESULTS_DIR/benchmark-server.pid"
+fi
 
 echo ""
 echo "=================================================="

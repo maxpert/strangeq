@@ -109,7 +109,15 @@ if ! "$TEST_TOOL" verify --count "$MESSAGE_COUNT" --queue "$QUEUE_NAME" --url "$
 fi
 
 kill -TERM "$SERVER_PID" 2>/dev/null || true
-rm -f "$WORKDIR/server.pid"
+for _ in $(seq 1 45); do
+    kill -0 "$SERVER_PID" 2>/dev/null || break
+    sleep 1
+done
+# Remove the pidfile only once the process is gone; the EXIT trap's
+# stop_server backstop needs it if the broker outlived the wait.
+if ! kill -0 "$SERVER_PID" 2>/dev/null; then
+    rm -f "$WORKDIR/server.pid"
+fi
 
 echo ""
 echo "=================================================="
