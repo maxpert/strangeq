@@ -101,11 +101,32 @@ tls: certificate required
 
 ## TLS + Authentication
 
-TLS and SASL authentication can be used simultaneously. TLS encrypts the connection while SASL authenticates the user:
+TLS and SASL authentication can be used simultaneously. TLS encrypts the connection while SASL authenticates the user. Put both in the config file:
+
+```yaml
+security:
+  tlsenabled: true
+  tlscertfile: cert.pem
+  tlskeyfile: key.pem
+  authenticationenabled: true
+  authenticationfilepath: auth.json
+```
+
+Then start the broker with the config (TLS flags still work as overrides):
 
 ```bash
-amqp-server --tls --tls-cert cert.pem --tls-key key.pem \
-  --auth-enabled --auth-file auth.json
+amqp-server --config config.yaml
+```
+
+The same settings can come from the environment:
+
+```bash
+AMQP_SECURITY_TLSENABLED=true \
+AMQP_SECURITY_TLSCERTFILE=cert.pem \
+AMQP_SECURITY_TLSKEYFILE=key.pem \
+AMQP_SECURITY_AUTHENTICATIONENABLED=true \
+AMQP_SECURITY_AUTHENTICATIONFILEPATH=auth.json \
+  amqp-server --tls
 ```
 
 Connect with credentials over TLS:

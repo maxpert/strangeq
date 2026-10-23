@@ -1,6 +1,8 @@
 # systemd Deployment
 
-This directory contains systemd service files for running AMQP-Go as a system service.
+This directory contains systemd service files for running StrangeQ (AMQP 0.9.1)
+as a system service. Logs go to the journal; there is no log file or PID file to
+manage.
 
 ## Installation
 
@@ -22,16 +24,6 @@ sudo chmod 750 /var/lib/amqp
 sudo mkdir -p /etc/amqp
 sudo chown root:amqp /etc/amqp
 sudo chmod 750 /etc/amqp
-
-# Log directory
-sudo mkdir -p /var/log/amqp
-sudo chown amqp:amqp /var/log/amqp
-sudo chmod 750 /var/log/amqp
-
-# Runtime directory
-sudo mkdir -p /run/amqp
-sudo chown amqp:amqp /run/amqp
-sudo chmod 755 /run/amqp
 ```
 
 ### 3. Install Binary
@@ -42,30 +34,40 @@ sudo cp amqp-server /usr/local/bin/
 sudo chmod 755 /usr/local/bin/amqp-server
 ```
 
-### 4. Create Configuration
+### 4. Install Configuration and Auth File
 
 ```bash
-sudo cat > /etc/amqp/config.yaml << 'EOF'
-network:
-  address: ":5672"
-  port: 5672
-  maxconnections: 10000
+# Shipped production config: binds 0.0.0.0, enables authentication, enables
+# loopback-only telemetry.
+sudo install -o root -g amqp -m 0640 config.yaml /etc/amqp/config.yaml
 
-storage:
-  path: /var/lib/amqp/data
+# Optional environment overrides (the unit loads this file only if present).
+sudo install -o root -g amqp -m 0640 amqp-server.env.example /etc/amqp/amqp-server.env
 
-security:
-  authenticationenabled: false
-
-server:
-  loglevel: info
-  logfile: /var/log/amqp/server.log
-  pidfile: /run/amqp/amqp-server.pid
+# Create the auth file referenced by the config. Generate a bcrypt hash:
+HASH=$(htpasswd -bnBC 10 "" 'change-me' | tr -d ':\n')
+sudo install -o root -g amqp -m 0640 /dev/null /etc/amqp/auth.json
+sudo tee /etc/amqp/auth.json >/dev/null <<EOF
+{
+  "users": [
+    {
+      "username": "guest",
+      "password_hash": "$HASH",
+      "vhost_permissions": [
+        {"vhost": "/", "permission": {"configure": ".*", "write": ".*", "read": ".*"}}
+      ],
+      "tags": ["administrator"]
+    }
+  ]
+}
 EOF
-
-sudo chown root:amqp /etc/amqp/config.yaml
-sudo chmod 640 /etc/amqp/config.yaml
 ```
+
+Replace `change-me` before installing. The hash is quoted as a JSON string;
+bcrypt hashes contain no characters that need escaping.
+
+The broker only re-reads `auth.json` on `systemctl reload` (SIGHUP). Other
+settings require a restart.
 
 ### 5. Install Service File
 
@@ -104,9 +106,12 @@ sudo systemctl stop amqp-server
 # Restart
 sudo systemctl restart amqp-server
 
-# Reload configuration (graceful)
+# Re-read the auth file (users/permissions). Other settings need a restart.
 sudo systemctl reload amqp-server
 ```
+
+`reload` sends SIGHUP. The broker reloads `/etc/amqp/auth.json` when the
+configured authenticator supports it and never exits on SIGHUP.
 
 ### Check Status
 
@@ -159,26 +164,22 @@ systemctl show-environment
 sudo -u amqp /usr/local/bin/amqp-server --config /etc/amqp/config.yaml
 ```
 
-## Log Rotation
+## Log Retention
 
-Create `/etc/logrotate.d/amqp-server`:
+The unit sends stdout/stderr to the journal, so log rotation is journald's job:
 
 ```bash
-sudo cat > /etc/logrotate.d/amqp-server << 'EOF'
-/var/log/amqp/server.log {
-    daily
-    rotate 14
-    compress
-    delaycompress
-    notifempty
-    create 0640 amqp amqp
-    sharedscripts
-    postrotate
-        systemctl reload amqp-server > /dev/null 2>&1 || true
-    endscript
-}
+sudo mkdir -p /etc/systemd/journald.conf.d
+sudo tee /etc/systemd/journald.conf.d/amqp-server.conf >/dev/null <<'EOF'
+[Journal]
+SystemMaxUse=2G
+SystemMaxFileSize=100M
 EOF
+sudo systemctl restart systemd-journald
 ```
+
+If you configure `server.logfile` instead, the broker does not reopen the file
+on SIGHUP. Use logrotate with `copytruncate`, or use the journal (recommended).
 
 ## Security Hardening
 
@@ -250,7 +251,13 @@ chmod +x /usr/local/bin/amqp-status.sh
 
 ### Metrics Endpoint
 
-If metrics are enabled, expose via nginx:
+The shipped config binds telemetry to `127.0.0.1:9419` (loopback only), so
+scrape it from the host or proxy it locally. `/health` reports readiness: 503
+while recovery runs, during shutdown, and 503 when the AMQP listener is not
+bound. pprof is disabled unless `--enable-pprof` is passed.
+
+If metrics must be reachable from another host, expose them via nginx (keep
+the broker's telemetry listener on loopback):
 
 ```nginx
 location /metrics {
@@ -268,13 +275,16 @@ location /metrics {
 # Check logs
 sudo journalctl -u amqp-server -n 50
 
-# Verify configuration
-/usr/local/bin/amqp-server --config /etc/amqp/config.json --help
+# Verify the binary version and list flags
+/usr/local/bin/amqp-server --version
+/usr/local/bin/amqp-server -h
+
+# Check that the config loads (start in the foreground; Ctrl-C to stop)
+sudo -u amqp /usr/local/bin/amqp-server --config /etc/amqp/config.yaml
 
 # Check file permissions
 ls -la /etc/amqp/
 ls -la /var/lib/amqp/
-ls -la /var/log/amqp/
 ```
 
 ### Permission Errors
@@ -282,8 +292,7 @@ ls -la /var/log/amqp/
 ```bash
 # Reset ownership
 sudo chown -R amqp:amqp /var/lib/amqp
-sudo chown -R amqp:amqp /var/log/amqp
-sudo chown -R amqp:amqp /run/amqp
+sudo chown root:amqp /etc/amqp/config.yaml /etc/amqp/auth.json
 ```
 
 ### Port Binding Issues
@@ -314,7 +323,6 @@ sudo rm /usr/local/bin/amqp-server
 # Remove data (optional - backup first!)
 # sudo rm -rf /var/lib/amqp
 # sudo rm -rf /etc/amqp
-# sudo rm -rf /var/log/amqp
 
 # Remove user
 # sudo userdel amqp

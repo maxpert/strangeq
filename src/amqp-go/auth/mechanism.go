@@ -2,6 +2,7 @@ package auth
 
 import (
 	"fmt"
+	"slices"
 	"strings"
 
 	"github.com/maxpert/amqp-go/interfaces"
@@ -42,12 +43,15 @@ func (r *Registry) Get(name string) (Mechanism, error) {
 	return mechanism, nil
 }
 
-// List returns all registered mechanism names
+// List returns all registered mechanism names in sorted order. The order is
+// deterministic so that the wire-level mechanism advertisement (String) is
+// stable across restarts.
 func (r *Registry) List() []string {
 	names := make([]string, 0, len(r.mechanisms))
 	for name := range r.mechanisms {
 		names = append(names, name)
 	}
+	slices.Sort(names)
 	return names
 }
 
@@ -67,16 +71,36 @@ func DefaultRegistry() *Registry {
 }
 
 // RegistryForMechanisms returns a registry populated with the mechanisms
-// named in the provided list. PLAIN is always registered. ANONYMOUS is
-// registered only if "ANONYMOUS" appears in names (compared case-insensitively
-// via strings.EqualFold). If names is empty, only PLAIN is registered.
+// named in the provided list, compared case-insensitively. Unknown names are
+// skipped. If the result is empty (no names, or only unknown names), PLAIN is
+// registered so the broker never advertises zero mechanisms.
 func RegistryForMechanisms(names []string) *Registry {
+	registry, _ := RegistryForMechanismsReport(names)
+	return registry
+}
+
+// RegistryForMechanismsReport behaves like RegistryForMechanisms and also
+// returns the names that matched no known mechanism, so callers can warn the
+// operator instead of silently ignoring a typo. The configured list is
+// authoritative: a list that omits PLAIN yields a registry without PLAIN.
+func RegistryForMechanismsReport(names []string) (*Registry, []string) {
 	registry := NewRegistry()
-	registry.Register(&PlainMechanism{})
+	var unknown []string
 	for _, name := range names {
-		if strings.EqualFold(name, "ANONYMOUS") {
+		switch {
+		case strings.EqualFold(name, "PLAIN"):
+			registry.Register(&PlainMechanism{})
+		case strings.EqualFold(name, "ANONYMOUS"):
 			registry.Register(&AnonymousMechanism{})
+		default:
+			unknown = append(unknown, name)
 		}
 	}
-	return registry
+	// Fall back to PLAIN whenever the registry ended up empty — either no
+	// names were given or every name was unknown. An empty registry would
+	// advertise zero mechanisms and refuse every login.
+	if len(registry.List()) == 0 {
+		registry.Register(&PlainMechanism{})
+	}
+	return registry, unknown
 }

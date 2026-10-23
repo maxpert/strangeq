@@ -14,7 +14,7 @@ func TestDefaultConfig(t *testing.T) {
 	config := DefaultConfig()
 
 	// Test default values
-	assert.Equal(t, ":5672", config.Network.Address)
+	assert.Equal(t, "127.0.0.1:5672", config.Network.Address)
 	assert.Equal(t, 5672, config.Network.Port)
 	assert.Equal(t, 1000, config.Network.MaxConnections)
 	assert.Equal(t, "./data", config.Storage.Path)

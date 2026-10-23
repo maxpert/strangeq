@@ -5,9 +5,11 @@
 *.dylib
 *.out
 
-# Build artifacts
-amqp-go
-amqp-server
+# Build artifacts (anchored: an unanchored "amqp-server" also ignores the
+# cmd/amqp-server SOURCE directory, which once let daemon.go/telemetry.go
+# go untracked while tracked main.go referenced them)
+/amqp-go
+/amqp-server
 /benchgate
 /dist
 /bin

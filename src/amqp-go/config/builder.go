@@ -158,6 +158,23 @@ func (b *ConfigBuilder) WithAccessControl(allowedUsers, blockedUsers, allowedHos
 	return b
 }
 
+// WithAuthFailureLimit configures the per-peer failed-authentication limiter.
+// limit 0 disables it; window is the refill window.
+func (b *ConfigBuilder) WithAuthFailureLimit(limit int, window time.Duration) *ConfigBuilder {
+	b.config.Security.AuthFailureLimit = limit
+	b.config.Security.AuthFailureWindowMS = window.Milliseconds()
+	return b
+}
+
+// WithTelemetry configures the telemetry HTTP endpoint.
+func (b *ConfigBuilder) WithTelemetry(enabled bool, address string, port int, pprof bool) *ConfigBuilder {
+	b.config.Telemetry.Enabled = enabled
+	b.config.Telemetry.Address = address
+	b.config.Telemetry.Port = port
+	b.config.Telemetry.PprofEnabled = pprof
+	return b
+}
+
 // Server Configuration
 
 // WithServerInfo sets server identification information

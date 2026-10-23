@@ -2,27 +2,52 @@ package metrics
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"net"
 	"net/http"
 	"net/http/pprof"
 	"runtime"
+	"strconv"
+	"sync/atomic"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
-// Server provides an HTTP server for Prometheus metrics and profiling
+// ServerOptions configures the telemetry HTTP server.
+type ServerOptions struct {
+	Address     string        // "" → "127.0.0.1" (loopback only)
+	Port        int           // required, 1..65535 (no silent 9419 substitution; config defaults it)
+	EnablePprof bool          // register /debug/pprof/* and enable mutex/block profiling
+	Ready       func() error  // nil → always ready; non-nil error → 503
+	Annotate    func() string // optional suffix for 200 bodies (alarms)
+
+	// writeTimeout is a test hook. Production keeps 10s so /metrics cannot be
+	// held open by a slow reader; Go 1.25's net/http/pprof extends the write
+	// deadline for /profile, /trace and delta profiles.
+	writeTimeout time.Duration
+}
+
+// Server provides an HTTP server for Prometheus metrics, health and profiling.
 type Server struct {
 	httpServer       *http.Server
+	listener         net.Listener
+	listenAddress    string
 	port             int
 	profilingEnabled bool
 }
 
-// NewServer creates a new telemetry HTTP server
-// If profiling is enabled, pprof endpoints are registered
-func NewServer(port int, enableProfiling bool) *Server {
-	if port == 0 {
-		port = 9419 // Default AMQP exporter port (registered with Prometheus)
+// NewServerWithOptions creates a telemetry server.
+func NewServerWithOptions(o ServerOptions) *Server {
+	address := o.Address
+	if address == "" {
+		address = "127.0.0.1"
+	}
+
+	writeTimeout := o.writeTimeout
+	if writeTimeout == 0 {
+		writeTimeout = 10 * time.Second
 	}
 
 	mux := http.NewServeMux()
@@ -30,26 +55,37 @@ func NewServer(port int, enableProfiling bool) *Server {
 	// Prometheus metrics endpoint (always enabled)
 	mux.Handle("/metrics", promhttp.Handler())
 
-	// Health check endpoint
+	// Readiness endpoint: 200 only when Ready is nil or returns nil.
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		if o.Ready != nil {
+			if err := o.Ready(); err != nil {
+				w.WriteHeader(http.StatusServiceUnavailable)
+				fmt.Fprintf(w, "NOT READY: %v", err)
+				return
+			}
+		}
+		body := "OK"
+		if o.Annotate != nil {
+			if annotation := o.Annotate(); annotation != "" {
+				body += " (" + annotation + ")"
+			}
+		}
 		w.WriteHeader(http.StatusOK)
-		w.Write([]byte("OK"))
+		_, _ = w.Write([]byte(body))
 	})
 
-	// Enable profiling endpoints if requested
-	if enableProfiling {
-		// Enable mutex and block profiling
+	// Enable profiling endpoints only when explicitly requested.
+	if o.EnablePprof {
 		runtime.SetMutexProfileFraction(1)
 		runtime.SetBlockProfileRate(1)
 
-		// Register pprof handlers
 		mux.HandleFunc("/debug/pprof/", pprof.Index)
 		mux.HandleFunc("/debug/pprof/cmdline", pprof.Cmdline)
 		mux.HandleFunc("/debug/pprof/profile", pprof.Profile)
 		mux.HandleFunc("/debug/pprof/symbol", pprof.Symbol)
 		mux.HandleFunc("/debug/pprof/trace", pprof.Trace)
 
-		// Manually add the other pprof handlers
 		mux.Handle("/debug/pprof/goroutine", pprof.Handler("goroutine"))
 		mux.Handle("/debug/pprof/heap", pprof.Handler("heap"))
 		mux.Handle("/debug/pprof/threadcreate", pprof.Handler("threadcreate"))
@@ -58,12 +94,18 @@ func NewServer(port int, enableProfiling bool) *Server {
 		mux.Handle("/debug/pprof/allocs", pprof.Handler("allocs"))
 	}
 
-	// Root endpoint with documentation
+	// Root endpoint with documentation. 404 for every other path: the "/"
+	// pattern is a catch-all, so without this guard a disabled pprof endpoint
+	// would fall through to the HTML index with 200.
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/" {
+			http.NotFound(w, r)
+			return
+		}
 		w.Header().Set("Content-Type", "text/html")
 
-		pprofSection := ""
-		if enableProfiling {
+		pprofSection := `<p><em>Profiling endpoints are disabled. Start server with --enable-pprof to enable.</em></p>`
+		if o.EnablePprof {
 			pprofSection = `<h2>Profiling Endpoints (pprof)</h2>
 <ul>
 <li><a href="/debug/pprof/">/debug/pprof/</a> - Profiling index</li>
@@ -77,16 +119,14 @@ func NewServer(port int, enableProfiling bool) *Server {
 <h3>Usage Examples</h3>
 <pre>
 # Collect CPU profile (30 seconds)
-curl -o cpu.prof http://localhost:` + fmt.Sprintf("%d", port) + `/debug/pprof/profile?seconds=30
+curl -o cpu.prof http://localhost:` + strconv.Itoa(o.Port) + `/debug/pprof/profile?seconds=30
 
 # Collect mutex profile
-curl -o mutex.prof http://localhost:` + fmt.Sprintf("%d", port) + `/debug/pprof/mutex
+curl -o mutex.prof http://localhost:` + strconv.Itoa(o.Port) + `/debug/pprof/mutex
 
 # Analyze with pprof
 go tool pprof -http=:8080 cpu.prof
 </pre>`
-		} else {
-			pprofSection = `<p><em>Profiling endpoints are disabled. Start server with --enable-telemetry to enable.</em></p>`
 		}
 
 		html := `<!DOCTYPE html>
@@ -98,7 +138,7 @@ go tool pprof -http=:8080 cpu.prof
 <h2>Metrics Endpoints</h2>
 <ul>
 <li><a href="/metrics">/metrics</a> - Prometheus metrics in text format</li>
-<li><a href="/health">/health</a> - Health check endpoint</li>
+<li><a href="/health">/health</a> - Readiness check (503 until the broker is ready)</li>
 </ul>
 
 ` + pprofSection + `
@@ -110,25 +150,74 @@ go tool pprof -http=:8080 cpu.prof
 </ul>
 </body>
 </html>`
-		w.Write([]byte(html))
+		_, _ = w.Write([]byte(html))
 	})
 
 	return &Server{
 		httpServer: &http.Server{
-			Addr:         fmt.Sprintf(":%d", port),
-			Handler:      mux,
-			ReadTimeout:  5 * time.Second,
-			WriteTimeout: 10 * time.Second,
-			IdleTimeout:  120 * time.Second,
+			Handler:           mux,
+			ReadTimeout:       5 * time.Second,
+			ReadHeaderTimeout: 5 * time.Second,
+			WriteTimeout:      writeTimeout,
+			IdleTimeout:       120 * time.Second,
 		},
-		port:             port,
-		profilingEnabled: enableProfiling,
+		port:             o.Port,
+		profilingEnabled: o.EnablePprof,
+		// Remember the address for Listen (the http.Server no longer listens
+		// through Addr so bind errors can be surfaced synchronously).
+		listenAddress: address,
 	}
 }
 
-// Start starts the metrics HTTP server
+// NewServer is the compatibility wrapper: loopback bind, explicit port.
+func NewServer(port int, enableProfiling bool) *Server {
+	return NewServerWithOptions(ServerOptions{Port: port, EnablePprof: enableProfiling})
+}
+
+// Handler returns the HTTP handler, for tests.
+func (s *Server) Handler() http.Handler { return s.httpServer.Handler }
+
+// Listen binds the telemetry socket synchronously so callers see bind errors
+// before serving. The port never silently defaults: config supplies 9419.
+func (s *Server) Listen() error {
+	if s.port < 1 || s.port > 65535 {
+		return fmt.Errorf("invalid telemetry port: %d", s.port)
+	}
+	addr := net.JoinHostPort(s.listenAddress, strconv.Itoa(s.port))
+	listener, err := net.Listen("tcp", addr)
+	if err != nil {
+		return fmt.Errorf("telemetry listen %s: %w", addr, err)
+	}
+	s.listener = listener
+	return nil
+}
+
+// Serve serves on the listener created by Listen. http.ErrServerClosed is not
+// an error: it is what a graceful Stop returns.
+func (s *Server) Serve() error {
+	if s.listener == nil {
+		return errors.New("telemetry server: Serve called before Listen")
+	}
+	if err := s.httpServer.Serve(s.listener); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		return err
+	}
+	return nil
+}
+
+// Addr returns the bound address (nil before Listen).
+func (s *Server) Addr() net.Addr {
+	if s.listener == nil {
+		return nil
+	}
+	return s.listener.Addr()
+}
+
+// Start is the compatibility entry point used by examples: Listen + Serve.
 func (s *Server) Start() error {
-	return s.httpServer.ListenAndServe()
+	if err := s.Listen(); err != nil {
+		return err
+	}
+	return s.Serve()
 }
 
 // Stop gracefully stops the metrics HTTP server
@@ -139,4 +228,23 @@ func (s *Server) Stop(ctx context.Context) error {
 // Port returns the port the metrics server is listening on
 func (s *Server) Port() int {
 	return s.port
+}
+
+// ReadinessFromServer builds the /health readiness predicate used by both
+// main and the module-root health test. health may be nil (no Server.Health
+// yet); shutting may be nil. Everything here is cheap enough to run per
+// request: no I/O and no caching.
+func ReadinessFromServer(listening func() bool, health func() error, shutting *atomic.Bool) func() error {
+	return func() error {
+		if shutting != nil && shutting.Load() {
+			return errors.New("shutting down")
+		}
+		if listening != nil && !listening() {
+			return errors.New("AMQP listener not bound")
+		}
+		if health != nil {
+			return health()
+		}
+		return nil
+	}
 }

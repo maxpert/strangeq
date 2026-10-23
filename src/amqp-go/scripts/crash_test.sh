@@ -1,122 +1,126 @@
 #!/bin/bash
-set -e
+set -euo pipefail
 
-# Crash Recovery Stress Test
-# Tests WAL recovery by force-killing server and verifying message recovery
+# Crash Recovery Test
+# Publishes durable messages, kills the broker with SIGKILL, then restarts it
+# on the same storage directory and checks the messages are still consumable.
+#
 # Usage: ./scripts/crash_test.sh [message_count]
 # Example: ./scripts/crash_test.sh 10000
 
 MESSAGE_COUNT=${1:-1000}
-STORAGE_PATH="/tmp/amqp-crash-test"
 QUEUE_NAME="crash_test_queue"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
-TEST_TOOL="$PROJECT_DIR/crash_test_tool"
+# shellcheck source=lib/test_env.sh
+source "$SCRIPT_DIR/lib/test_env.sh"
+
+WORKDIR=$(mktemp -d)
+STORAGE_PATH=${STORAGE_PATH:-$WORKDIR/data}
+AMQP_PORT=$(pick_port)
+TELEMETRY_PORT=$(pick_port)
+CONFIG="$WORKDIR/config.yaml"
+URL="amqp://guest:guest@127.0.0.1:${AMQP_PORT}/"
+
+gen_config "$STORAGE_PATH" "$AMQP_PORT" "$TELEMETRY_PORT" >"$CONFIG"
+
+cleanup() {
+    stop_server "$WORKDIR" KILL
+    rm -rf "$WORKDIR"
+}
+trap cleanup EXIT
 
 echo "=================================================="
 echo "AMQP Crash Recovery Test"
 echo "=================================================="
 echo "Message Count: $MESSAGE_COUNT"
 echo "Queue: $QUEUE_NAME"
+echo "Storage: $STORAGE_PATH"
+echo "AMQP port: $AMQP_PORT  telemetry port: $TELEMETRY_PORT"
 echo ""
 
-# Step 1: Cleanup
-echo "[1/7] Cleaning up..."
-pkill -9 amqp-server || true
-rm -rf "$STORAGE_PATH" || true
-sleep 1
-
-# Step 2: Build server
-echo "[2/7] Building server..."
+# Step 1: Build the server and the test tool
+echo "[1/7] Building server and test tool..."
 cd "$PROJECT_DIR"
 go build -o amqp-server ./cmd/amqp-server
-if [ $? -ne 0 ]; then
-    echo "ERROR: Server build failed"
-    exit 1
-fi
-
-# Step 3: Build test tool
-echo "[3/7] Building crash test tool..."
 go build -o crash_test_tool ./cmd/crash_test_tool
-if [ $? -ne 0 ]; then
-    echo "ERROR: Test tool build failed"
-    exit 1
-fi
+TEST_TOOL="$PROJECT_DIR/crash_test_tool"
 
-# Step 4: Start server (first session)
-echo "[4/7] Starting server (first session)..."
-./amqp-server --storage-path "$STORAGE_PATH" > /tmp/amqp-crash-test.log 2>&1 &
-SERVER_PID=$!
+# Step 2: Start the first session
+echo "[2/7] Starting server (first session)..."
+SERVER_PID=$(start_server "$CONFIG" "$WORKDIR/server.log")
 echo "Server PID: $SERVER_PID"
-sleep 2
-
-# Verify server is running
-if ! kill -0 $SERVER_PID 2>/dev/null; then
+if ! wait_healthy "$TELEMETRY_PORT" 120; then
     echo "ERROR: Server failed to start"
-    cat /tmp/amqp-crash-test.log
+    cat "$WORKDIR/server.log"
     exit 1
 fi
 
-# Step 5: Publish messages
-echo "[5/7] Publishing $MESSAGE_COUNT durable messages..."
-$TEST_TOOL publish --count $MESSAGE_COUNT --queue "$QUEUE_NAME"
-PUBLISH_EXIT=$?
-
-if [ $PUBLISH_EXIT -ne 0 ]; then
+# Step 3: Publish durable messages
+echo "[3/7] Publishing $MESSAGE_COUNT durable messages..."
+if ! "$TEST_TOOL" publish --count "$MESSAGE_COUNT" --queue "$QUEUE_NAME" --url "$URL"; then
     echo "ERROR: Failed to publish messages"
-    kill $SERVER_PID 2>/dev/null || true
+    cat "$WORKDIR/server.log"
     exit 1
 fi
-
 echo "✓ Published $MESSAGE_COUNT messages successfully"
 
-# Step 6: CRASH! Force kill server
-echo "[6/7] CRASH! Force killing server (kill -9)..."
-kill -9 $SERVER_PID
+# Step 4: CRASH! Force kill the broker.
+echo "[4/7] CRASH! Force killing server (kill -9)..."
+kill -9 "$SERVER_PID"
+rm -f "$WORKDIR/server.pid"
 sleep 1
-
-# Verify server is dead
-if kill -0 $SERVER_PID 2>/dev/null; then
+if kill -0 "$SERVER_PID" 2>/dev/null; then
     echo "ERROR: Server still running after kill -9"
     exit 1
 fi
 echo "✓ Server killed"
 
-# Step 7: Restart and verify recovery
-echo "[7/7] Restarting server and verifying recovery..."
-./amqp-server --storage-path "$STORAGE_PATH" > /tmp/amqp-crash-test-recovery.log 2>&1 &
-SERVER_PID=$!
+# Step 5: Restart on the same storage and wait for recovery to finish.
+echo "[5/7] Restarting server and waiting for recovery..."
+SERVER_PID=$(start_server "$CONFIG" "$WORKDIR/server-recovery.log")
 echo "Server PID: $SERVER_PID"
-sleep 3
-
-# Verify server is running
-if ! kill -0 $SERVER_PID 2>/dev/null; then
+if ! wait_healthy "$TELEMETRY_PORT" 120; then
     echo "ERROR: Server failed to restart"
-    cat /tmp/amqp-crash-test-recovery.log
+    cat "$WORKDIR/server-recovery.log"
+    exit 1
+fi
+echo "✓ Server restarted"
+
+# Step 6: Verify every message is recoverable.
+echo "[6/7] Verifying $MESSAGE_COUNT messages recovered..."
+if ! "$TEST_TOOL" verify --count "$MESSAGE_COUNT" --queue "$QUEUE_NAME" --url "$URL"; then
+    echo "ERROR: Recovery verification failed"
+    echo "--- first session ---"
+    cat "$WORKDIR/server.log"
+    echo "--- recovery session ---"
+    cat "$WORKDIR/server-recovery.log"
     exit 1
 fi
 
-# Verify all messages recovered
-echo "Verifying $MESSAGE_COUNT messages recovered..."
-$TEST_TOOL verify --count $MESSAGE_COUNT --queue "$QUEUE_NAME"
-VERIFY_EXIT=$?
-
-# Cleanup
-kill $SERVER_PID 2>/dev/null || true
+# Step 7: Stop cleanly and report.
+echo "[7/7] Stopping server..."
+kill -TERM "$SERVER_PID" 2>/dev/null || true
+for _ in $(seq 1 45); do
+    kill -0 "$SERVER_PID" 2>/dev/null || break
+    sleep 1
+done
+# Remove the pidfile only once the process is gone; if it outlived the wait,
+# the EXIT trap's stop_server backstop still needs the pidfile to kill it.
+if ! kill -0 "$SERVER_PID" 2>/dev/null; then
+    rm -f "$WORKDIR/server.pid"
+fi
 
 echo ""
 echo "=================================================="
-if [ $VERIFY_EXIT -eq 0 ]; then
-    echo "✓ CRASH RECOVERY TEST PASSED"
-    echo "=================================================="
-    echo "All $MESSAGE_COUNT messages successfully recovered!"
-    exit 0
-else
-    echo "✗ CRASH RECOVERY TEST FAILED"
-    echo "=================================================="
-    echo "Recovery verification failed. Check logs:"
-    echo "  - /tmp/amqp-crash-test.log (initial run)"
-    echo "  - /tmp/amqp-crash-test-recovery.log (recovery run)"
-    exit 1
-fi
+echo "✓ CRASH RECOVERY TEST PASSED"
+echo "=================================================="
+echo "All $MESSAGE_COUNT messages successfully recovered!"
+echo ""
+echo "Logs:"
+echo "--- first session ---"
+cat "$WORKDIR/server.log"
+echo "--- recovery session ---"
+cat "$WORKDIR/server-recovery.log"
+exit 0

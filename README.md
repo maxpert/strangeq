@@ -67,18 +67,17 @@ go build -o amqp-server ./cmd/amqp-server
 sudo mv amqp-server /usr/local/bin/
 ```
 
-### Go Install
-
-```bash
-go install github.com/maxpert/amqp-go/cmd/amqp-server@latest
-```
+The Go module path (`github.com/maxpert/amqp-go`) does not match the
+repository path (`github.com/maxpert/strangeq`), so `go install ...@latest` is
+not supported. Build from source as shown above.
 
 ## Quick Start
 
 ### Start Server
 
 ```bash
-# Defaults (in-memory, port 5672)
+# Defaults: persistent storage in ./data, listening on 127.0.0.1:5672,
+# authentication off
 amqp-server
 
 # Generate example config
@@ -93,35 +92,53 @@ amqp-server --tls --tls-cert cert.pem --tls-key key.pem
 # With mutual TLS (client cert verification)
 amqp-server --tls --tls-cert cert.pem --tls-key key.pem --tls-ca ca.pem
 
-# With telemetry (Prometheus + pprof)
-amqp-server --config config.yaml --enable-telemetry --telemetry-port 9419
+# With telemetry (Prometheus metrics and /health)
+amqp-server --config config.yaml --enable-telemetry
+
+# Telemetry also with pprof (heap/goroutine dumps)
+amqp-server --config config.yaml --enable-telemetry --enable-pprof
 ```
 
 ### Environment Variables
 
-Override any configuration setting using `AMQP_<section>_<key>` format:
+Environment variables apply with or without `--config`. The format is
+`AMQP_<SECTION>_<KEY>`; keys may use underscores. Precedence is
+defaults → file → environment → explicitly set flags.
 
 ```bash
 AMQP_NETWORK_PORT=15672 amqp-server --config config.yaml
+AMQP_NETWORK_ADDRESS=0.0.0.0:5672 amqp-server
 AMQP_STORAGE_PATH=/var/lib/amqp amqp-server
+AMQP_SECURITY_AUTHENTICATION_ENABLED=true amqp-server
 AMQP_SERVER_LOGLEVEL=debug amqp-server
 ```
+
+`AMQP_NETWORK_PORT` rewrites the port in `network.address`. List-valued keys
+can only be set from the environment as a single element; use the config file
+for lists.
 
 ### Command Line Options
 
 ```
 amqp-server [options]
 
-  --config string          Configuration file path (YAML/JSON)
-  --generate-config string Generate default config file and exit
-  --version                Show version and exit
-  --enable-telemetry       Enable Prometheus + pprof endpoint
-  --telemetry-port int     Telemetry port (default: 9419)
-  --tls                    Enable TLS (amqps)
-  --tls-cert string        TLS certificate file (PEM)
-  --tls-key string         TLS private key file (PEM)
-  --tls-ca string          TLS CA file for mutual TLS client verification (PEM)
+  --config string           Configuration file path (YAML/JSON)
+  --generate-config string  Generate default config file (mode 0600) and exit
+  --version                 Show version and exit
+  --enable-telemetry        Enable telemetry HTTP endpoint (/metrics, /health)
+  --telemetry-port int      Telemetry port (default from config: 9419)
+  --telemetry-address string Telemetry bind address (default from config: 127.0.0.1)
+  --enable-pprof            Enable pprof endpoints (off by default)
+  --healthcheck             Probe the local /health endpoint and exit 0/1
+  --unsafe-recovery         Start despite unrecoverable artifacts (DATA LOSS)
+  --tls                     Enable TLS (amqps)
+  --tls-cert string         TLS certificate file (PEM)
+  --tls-key string          TLS private key file (PEM)
+  --tls-ca string           TLS CA file for mutual TLS client verification (PEM)
 ```
+
+Flags that are not passed keep the value from the file or environment; flag
+defaults are documentation only.
 
 ### Connect from Python
 
@@ -215,8 +232,7 @@ See `src/amqp-go/config.sample.yaml` for full configuration with documented defa
 
 ```yaml
 network:
-  address: :5672
-  port: 5672
+  address: 127.0.0.1:5672
 
 storage:
   path: ./data
@@ -225,16 +241,20 @@ server:
   loglevel: info
 ```
 
+This loads on top of the defaults; omitted keys keep their default values. A
+minimal file no longer fails validation.
+
 ### Production Configuration
 
 ```yaml
 network:
-  address: :5672
+  address: "0.0.0.0:5672"
   maxconnections: 10000
   tcpkeepalive: true
 
 storage:
   path: /var/lib/amqp
+  fsync: true
 
 security:
   tlsenabled: true
@@ -242,24 +262,32 @@ security:
   tlskeyfile: /etc/amqp/key.pem
   authenticationenabled: true
   authenticationfilepath: /etc/amqp/auth.json
+  allowedhosts: ["10.0.0.0/8", "localhost"]
+
+resourcealarms:
+  enabled: true
+  memoryhighwatermark: 0.8
+
+telemetry:
+  enabled: true
+  address: 127.0.0.1
+  port: 9419
 
 server:
   loglevel: info
-  logfile: /var/log/amqp-server.log
-  pidfile: /var/run/amqp-server.pid
-  daemonize: true
-  memorylimitpercent: 60
 
 engine:
   ringbuffersize: 262144
   walbatchsize: 1000
-  walbatchtimeout: 10ms
 ```
+
+Run it under systemd (see `deployment/systemd/`) rather than `daemonize: true`
+and a PID file; the unit handles restart, environment, and logging.
 
 Key engine tuning parameters:
 - `ringbuffersize` — In-memory ring buffer per queue (must be power of 2, default 64K)
 - `spillthresholdpercent` — Ring fill % before spilling to WAL (default 80)
-- `walbatchsize` / `walbatchtimeoutms` — WAL batching for durable writes (1000 msgs / 10ms)
+- `walbatchsize` / `walbatchtimeoutms` — WAL batching for durable writes (1000 msgs / 10ms); `walbatchtimeoutms` is retained for compatibility
 - `segmentsize` — Cold storage segment file size (default 1 GB)
 - `consumermaxbatchsize` — Max messages to deliver per consumer per poll (default 100)
 
@@ -298,6 +326,10 @@ RabbitMQ 4.3 rejects transient non-exclusive queues by default, so the head-to-h
 ### Crash safety
 
 Confirmed durable messages survive `kill -9` and are recovered on restart. The invariant is **confirm ⇒ fsynced ⇒ recoverable**: a publish is confirmed only after its WAL batch is fsynced, so every confirmed message is present after a crash.
+
+This holds with `storage.fsync: true` (the default). With `fsync: false`,
+confirms are sent before data reaches stable storage and a crash or power loss
+can lose confirmed messages.
 
 ### Reproducing
 
@@ -475,10 +507,13 @@ Recovery is incremental and completes in milliseconds for typical workloads.
 ### Using systemd
 
 ```bash
-# Copy service file
+# Install the unit and the shipped config (see deployment/systemd/README.md
+# for the auth file and directory setup)
 sudo cp deployment/systemd/amqp-server.service /etc/systemd/system/
+sudo install -o root -g amqp -m 0640 deployment/systemd/config.yaml /etc/amqp/config.yaml
 
 # Enable and start
+sudo systemctl daemon-reload
 sudo systemctl enable amqp-server
 sudo systemctl start amqp-server
 
@@ -488,7 +523,20 @@ sudo systemctl status amqp-server
 
 ### Using Docker
 
-The repository includes a docker-compose file for protocol interoperability testing with RabbitMQ:
+```bash
+make docker-build VERSION=0.1.0
+docker run --rm -p 5672:5672 -p 9419:9419 -v amqp-data:/var/lib/amqp amqp-go:0.1.0
+```
+
+The image binds `0.0.0.0` with authentication off by default (it prints the
+startup security warning). To enable authentication, mount an auth file and set
+`AMQP_SECURITY_AUTHENTICATIONENABLED=true` and
+`AMQP_SECURITY_AUTHENTICATIONFILEPATH=/etc/amqp/auth.json`.
+The image's `HEALTHCHECK` uses `amqp-server --healthcheck`, which probes the
+same telemetry address/port from the environment.
+
+For protocol interoperability testing with RabbitMQ, the repository also
+includes a docker-compose file:
 
 ```bash
 cd src/amqp-go/protocol
@@ -497,11 +545,17 @@ docker-compose up
 
 ## Monitoring
 
-Enable telemetry to expose Prometheus metrics and pprof profiling:
+Enable telemetry to expose Prometheus metrics and readiness:
 
 ```bash
-amqp-server --config config.yaml --enable-telemetry --telemetry-port 9419
+amqp-server --config config.yaml --enable-telemetry
 ```
+
+Telemetry binds `127.0.0.1:9419` by default. Use `--telemetry-address` (or
+`telemetry.address`) to change the bind address. `/health` is a readiness
+probe: it returns 503 until recovery has completed and the AMQP listener is
+bound, and 503 during shutdown. During a resource alarm it still returns 200
+with `OK (resource alarm active: memory,disk)` so consumers keep draining.
 
 ### Prometheus Metrics
 
@@ -512,6 +566,10 @@ curl http://localhost:9419/metrics
 Available metrics include message throughput, connection and channel counts, queue depths, memory usage, and storage utilization.
 
 ### Profiling
+
+pprof is disabled unless `--enable-pprof` (or `telemetry.pprofenabled: true`) is
+set. When enabled, heap and goroutine dumps are unauthenticated, so keep
+telemetry on loopback or behind a firewall.
 
 ```bash
 # CPU profile (30 seconds)

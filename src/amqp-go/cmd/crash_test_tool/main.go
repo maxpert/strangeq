@@ -19,29 +19,31 @@ func main() {
 	publishCmd := flag.NewFlagSet("publish", flag.ExitOnError)
 	publishCount := publishCmd.Int("count", 1000, "number of messages to publish")
 	publishQueue := publishCmd.String("queue", "crash_test_queue", "queue name")
+	publishURL := publishCmd.String("url", amqpURL, "AMQP URL of the broker")
 
 	verifyCmd := flag.NewFlagSet("verify", flag.ExitOnError)
 	verifyCount := verifyCmd.Int("count", 1000, "expected number of messages")
 	verifyQueue := verifyCmd.String("queue", "crash_test_queue", "queue name")
+	verifyURL := verifyCmd.String("url", amqpURL, "AMQP URL of the broker")
 
 	if len(os.Args) < 2 {
 		fmt.Println("Usage: crash_test_tool [publish|verify] [options]")
 		fmt.Println("\nPublish messages:")
-		fmt.Println("  crash_test_tool publish --count 1000 --queue test_queue")
+		fmt.Println("  crash_test_tool publish --count 1000 --queue test_queue [--url amqp://guest:guest@127.0.0.1:5672/]")
 		fmt.Println("\nVerify recovery:")
-		fmt.Println("  crash_test_tool verify --count 1000 --queue test_queue")
+		fmt.Println("  crash_test_tool verify --count 1000 --queue test_queue [--url amqp://guest:guest@127.0.0.1:5672/]")
 		os.Exit(1)
 	}
 
 	switch os.Args[1] {
 	case "publish":
 		publishCmd.Parse(os.Args[2:])
-		if err := publishMessages(*publishCount, *publishQueue); err != nil {
+		if err := publishMessages(*publishURL, *publishCount, *publishQueue); err != nil {
 			log.Fatalf("Publish failed: %v", err)
 		}
 	case "verify":
 		verifyCmd.Parse(os.Args[2:])
-		if err := verifyRecovery(*verifyCount, *verifyQueue); err != nil {
+		if err := verifyRecovery(*verifyURL, *verifyCount, *verifyQueue); err != nil {
 			log.Fatalf("Verify failed: %v", err)
 		}
 	default:
@@ -51,7 +53,7 @@ func main() {
 	}
 }
 
-func publishMessages(count int, queueName string) error {
+func publishMessages(amqpURL string, count int, queueName string) error {
 	// Connect to AMQP server
 	conn, err := amqp.Dial(amqpURL)
 	if err != nil {
@@ -127,7 +129,7 @@ func publishMessages(count int, queueName string) error {
 	return nil
 }
 
-func verifyRecovery(expectedCount int, queueName string) error {
+func verifyRecovery(amqpURL string, expectedCount int, queueName string) error {
 	// Connect to AMQP server
 	conn, err := amqp.Dial(amqpURL)
 	if err != nil {

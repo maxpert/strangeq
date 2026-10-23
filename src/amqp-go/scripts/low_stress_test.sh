@@ -1,118 +1,133 @@
 #!/bin/bash
-set -e
+set -euo pipefail
 
-# Simple crash recovery stress test using perftest
-# Tests that durable messages survive server crash
+# Low-stress crash recovery test.
+# Publishes durable messages with the crash test tool, kills the broker with
+# SIGKILL, restarts it, and verifies the messages via the same tool. The exit
+# code is the verdict; nothing here requires manual inspection.
+#
 # Usage: ./scripts/low_stress_test.sh [message_count]
 
 MESSAGE_COUNT=${1:-1000}
-STORAGE_PATH="/tmp/amqp-low-stress"
 QUEUE_NAME="stress_queue"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+# shellcheck source=lib/test_env.sh
+source "$SCRIPT_DIR/lib/test_env.sh"
+
+WORKDIR=$(mktemp -d)
+STORAGE_PATH=${STORAGE_PATH:-$WORKDIR/data}
+AMQP_PORT=$(pick_port)
+TELEMETRY_PORT=$(pick_port)
+CONFIG="$WORKDIR/config.yaml"
+URL="amqp://guest:guest@127.0.0.1:${AMQP_PORT}/"
+
+gen_config "$STORAGE_PATH" "$AMQP_PORT" "$TELEMETRY_PORT" >"$CONFIG"
+
+cleanup() {
+    stop_server "$WORKDIR" KILL
+    rm -rf "$WORKDIR"
+}
+trap cleanup EXIT
 
 echo "=================================================="
-echo "AMQP Crash Recovery Stress Test (Simple)"
+echo "AMQP Crash Recovery Stress Test"
 echo "=================================================="
 echo "Message Count: $MESSAGE_COUNT"
 echo "Queue: $QUEUE_NAME"
+echo "Storage: $STORAGE_PATH"
+echo "AMQP port: $AMQP_PORT  telemetry port: $TELEMETRY_PORT"
 echo ""
 
-# Step 1: Cleanup
-echo "[1/6] Cleaning up..."
-pkill -9 amqp-server || true
-pkill -9 perftest || true
-rm -rf "$STORAGE_PATH" || true
-sleep 1
-
-# Step 2: Build server
-echo "[2/6] Building server..."
+# Step 1: Build the server and the test tool
+echo "[1/6] Building server and test tool..."
 cd "$PROJECT_DIR"
 go build -o amqp-server ./cmd/amqp-server
-if [ $? -ne 0 ]; then
-    echo "ERROR: Server build failed"
-    exit 1
-fi
+go build -o crash_test_tool ./cmd/crash_test_tool
+TEST_TOOL="$PROJECT_DIR/crash_test_tool"
 
-# Step 3: Start server (first session)
-echo "[3/6] Starting server (first session)..."
-./amqp-server --storage-path "$STORAGE_PATH" > /tmp/low-stress.log 2>&1 &
-SERVER_PID=$!
+# Step 2: Start the first session
+echo "[2/6] Starting server (first session)..."
+SERVER_PID=$(start_server "$CONFIG" "$WORKDIR/server.log")
 echo "Server PID: $SERVER_PID"
-sleep 2
-
-# Verify server is running
-if ! kill -0 $SERVER_PID 2>/dev/null; then
+if ! wait_healthy "$TELEMETRY_PORT" 120; then
     echo "ERROR: Server failed to start"
-    cat /tmp/low-stress.log
+    cat "$WORKDIR/server.log"
     exit 1
 fi
 
-# Step 4: Publish messages with perftest
-echo "[4/6] Publishing $MESSAGE_COUNT durable messages with perftest..."
-cd "$PROJECT_DIR/benchmark"
-timeout 60 ./perftest \
-    -producers 1 \
-    -consumers 0 \
-    -queue "$QUEUE_NAME" \
-    -count $MESSAGE_COUNT \
-    -size 100 \
-    2>&1 | grep -E "(Published|Consumed|Error)" || true
+# Step 3: Publish durable messages
+echo "[3/6] Publishing $MESSAGE_COUNT durable messages..."
+if ! "$TEST_TOOL" publish --count "$MESSAGE_COUNT" --queue "$QUEUE_NAME" --url "$URL"; then
+    echo "ERROR: Failed to publish messages"
+    cat "$WORKDIR/server.log"
+    exit 1
+fi
 
-sleep 2
-
-# Check WAL and metadata
 echo ""
 echo "Checking storage files..."
 ls -lh "$STORAGE_PATH/wal/shared/" 2>/dev/null || echo "No WAL files"
 ls -lh "$STORAGE_PATH/metadata/queues/" 2>/dev/null || echo "No queue metadata"
 
-# Step 5: CRASH! Force kill server
+# Step 4: CRASH! Force kill the broker.
 echo ""
-echo "[5/6] CRASH! Force killing server (kill -9)..."
-kill -9 $SERVER_PID
+echo "[4/6] CRASH! Force killing server (kill -9)..."
+kill -9 "$SERVER_PID"
+rm -f "$WORKDIR/server.pid"
 sleep 1
-
-# Verify server is dead
-if kill -0 $SERVER_PID 2>/dev/null; then
+if kill -0 "$SERVER_PID" 2>/dev/null; then
     echo "ERROR: Server still running after kill -9"
     exit 1
 fi
 echo "✓ Server killed"
 
-# Step 6: Restart and check recovery
-echo "[6/6] Restarting server and checking recovery..."
-./amqp-server --storage-path "$STORAGE_PATH" > /tmp/low-stress-recovery.log 2>&1 &
-SERVER_PID=$!
+# Step 5: Restart and wait for recovery.
+echo "[5/6] Restarting server and waiting for recovery..."
+SERVER_PID=$(start_server "$CONFIG" "$WORKDIR/server-recovery.log")
 echo "Server PID: $SERVER_PID"
-sleep 3
-
-# Verify server is running
-if ! kill -0 $SERVER_PID 2>/dev/null; then
+if ! wait_healthy "$TELEMETRY_PORT" 120; then
     echo "ERROR: Server failed to restart"
-    cat /tmp/low-stress-recovery.log
+    cat "$WORKDIR/server-recovery.log"
     exit 1
 fi
 
-# Check recovery logs
 echo ""
 echo "Recovery logs:"
-grep -E "recovery|recovered|messages" /tmp/low-stress-recovery.log | head -20
+grep -E "recovery|recovered|messages" "$WORKDIR/server-recovery.log" | head -20 || true
 
-# Cleanup
-kill $SERVER_PID 2>/dev/null || true
+# Step 6: Verify and exit with the verdict.
+echo ""
+echo "[6/6] Verifying $MESSAGE_COUNT messages recovered..."
+if ! "$TEST_TOOL" verify --count "$MESSAGE_COUNT" --queue "$QUEUE_NAME" --url "$URL"; then
+    echo "✗ RECOVERY VERIFICATION FAILED"
+    echo "--- first session ---"
+    cat "$WORKDIR/server.log"
+    echo "--- recovery session ---"
+    cat "$WORKDIR/server-recovery.log"
+    exit 1
+fi
+
+kill -TERM "$SERVER_PID" 2>/dev/null || true
+for _ in $(seq 1 45); do
+    kill -0 "$SERVER_PID" 2>/dev/null || break
+    sleep 1
+done
+# Remove the pidfile only once the process is gone; the EXIT trap's
+# stop_server backstop needs it if the broker outlived the wait.
+if ! kill -0 "$SERVER_PID" 2>/dev/null; then
+    rm -f "$WORKDIR/server.pid"
+fi
 
 echo ""
 echo "=================================================="
-echo "MANUAL VERIFICATION REQUIRED"
+echo "✓ LOW-STRESS CRASH RECOVERY TEST PASSED"
 echo "=================================================="
-echo "Please check:"
-echo "  1. WAL files exist: ls -lh $STORAGE_PATH/wal/shared/"
-echo "  2. Queue metadata exists: ls -lh $STORAGE_PATH/metadata/queues/"
-echo "  3. Recovery logs show messages recovered"
+echo "All $MESSAGE_COUNT messages successfully recovered!"
 echo ""
 echo "Logs:"
-echo "  - /tmp/low-stress.log (first session)"
-echo "  - /tmp/low-stress-recovery.log (recovery session)"
-echo ""
+echo "--- first session ---"
+cat "$WORKDIR/server.log"
+echo "--- recovery session ---"
+cat "$WORKDIR/server-recovery.log"
+exit 0

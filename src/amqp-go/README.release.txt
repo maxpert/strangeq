@@ -1,7 +1,7 @@
-AMQP-Go Server - Quick Start Guide
-====================================
+StrangeQ AMQP 0.9.1 Server - Quick Start Guide
+==============================================
 
-Thank you for downloading AMQP-Go Server!
+Thank you for downloading StrangeQ (module: github.com/maxpert/amqp-go).
 
 ## Quick Start
 
@@ -9,128 +9,93 @@ Thank you for downloading AMQP-Go Server!
    tar -xzf amqp-server-*.tar.gz
    cd amqp-server-*/
 
-2. Start the server (in-memory mode, no persistence):
+2. Start the server:
    ./amqp-server
 
-3. Or with custom config:
-   cp config.sample.json config.json
-   # Edit config.json as needed
-   ./amqp-server -config config.json
+   Defaults: persistent storage in ./data, listening on 127.0.0.1:5672,
+   authentication disabled (loopback only). The first start creates ./data.
 
-## Default Configuration
+3. With the shipped sample configuration:
+   cp config.sample.yaml config.yaml
+   ./amqp-server --config config.yaml
 
-The server starts with these defaults:
-- Address: localhost:5672 (AMQP default port)
-- Storage: In-memory (data lost on restart)
-- Authentication: Disabled (open access)
-- TLS: Disabled
+## Defaults
 
-## Common Configuration Changes
+- Address: 127.0.0.1:5672 (loopback only)
+- Storage: persistent, ./data (fsync on, CRC on)
+- Authentication: disabled
+- TLS: disabled
+- Telemetry: disabled
 
-### Enable Persistence (Recommended for Production)
+Binding to a non-loopback address with authentication disabled logs a loud
+SECURITY WARNING at startup. Set security.authenticationenabled: true before
+exposing the broker to a network.
 
-Edit config.json:
-{
-  "storage": {
-    "backend": "badger",    # Change from "memory" to "badger"
-    "path": "./data",       # Data directory
-    "persistent": true      # Enable persistence
-  }
-}
+## Environment variables
 
-### Enable Authentication
+Every setting can be overridden with AMQP_<SECTION>_<KEY>, with or without
+--config. Precedence: defaults -> file -> env -> explicit flags.
 
-Edit config.json:
-{
-  "security": {
-    "authentication_enabled": true,
-    "authentication_backend": "file",
-    "authentication_config": {
-      "user_file": "users.json"
-    }
-  }
-}
-
-Create users.json:
-{
-  "users": [
-    {
-      "username": "admin",
-      "password_hash": "$2a$10$...",  # Use bcrypt hash
-      "tags": ["administrator"]
-    }
-  ]
-}
-
-### Run as Daemon (Background Process)
-
-./amqp-server -config config.json -daemonize -log /var/log/amqp-server.log
-
-### Enable TLS
-
-Edit config.json:
-{
-  "security": {
-    "tls_enabled": true,
-    "tls_cert_file": "/path/to/server.crt",
-    "tls_key_file": "/path/to/server.key"
-  }
-}
+  AMQP_NETWORK_ADDRESS=0.0.0.0:5672 ./amqp-server
+  AMQP_STORAGE_PATH=/var/lib/amqp ./amqp-server --config config.yaml
+  AMQP_SECURITY_AUTHENTICATIONENABLED=true ./amqp-server
 
 ## Command Line Options
 
 Usage: ./amqp-server [options]
 
 Options:
-  -config string
-        Path to configuration file
-  -addr string
-        Server address (default ":5672")
-  -storage string
-        Storage backend: memory or badger (default "memory")
-  -data-dir string
-        Data directory path (default "./data")
-  -log-level string
-        Log level: debug, info, warn, error (default "info")
-  -daemonize
-        Run as daemon (background process)
-  -log string
-        Log file path (for daemon mode)
-  -pid string
-        PID file path
-  -version
-        Show version information
+  --config string
+        Configuration file path (YAML/JSON)
+  --version
+        Show version, commit, build date and Go version
+  --generate-config string
+        Generate a default config file (mode 0600) and exit
+  --tls
+        Enable TLS (amqps)
+  --tls-cert string
+        Path to TLS certificate file (PEM)
+  --tls-key string
+        Path to TLS private key file (PEM)
+  --tls-ca string
+        Path to TLS CA file for mutual TLS client verification (PEM)
+  --unsafe-recovery
+        DATA-LOSS SWITCH: start even when recovery cannot complete safely
+  --enable-telemetry
+        Enable telemetry HTTP endpoint (/metrics, /health)
+  --telemetry-port int
+        Telemetry HTTP port (default from config: 9419)
+  --telemetry-address string
+        Telemetry bind address (default from config: 127.0.0.1)
+  --enable-pprof
+        Enable pprof profiling endpoints (loopback only; off by default)
+  --healthcheck
+        Probe the local /health endpoint and exit 0/1 (container use)
+  -h
+        List all flags
 
-## Testing the Server
+## Configuration notes
 
-Using rabbitmq-amqp091-go client:
-  go get github.com/rabbitmq/amqp091-go
+- Keys are case-insensitive and accept snake_case (authentication_enabled)
+  or concatenated (authenticationenabled) spellings.
+- Unknown keys are reported at startup and ignored.
+- security.allowedhosts/blockedhosts accept IPs, CIDR ranges or "localhost";
+  hostnames are rejected (reverse DNS is not used). A blocked entry beats an
+  allowed entry. User lists apply only when authentication is enabled.
+- The per-peer failed-auth limiter is security.authfailurelimit (default 5 per
+  60 s); set 0 to disable.
 
-Example client code:
-  conn, err := amqp.Dial("amqp://localhost:5672/")
-  // ... use connection
+## Health and shutdown
+
+With telemetry enabled, GET /health returns 200 only after recovery completed
+and the AMQP listener is bound; it returns 503 while starting and immediately
+after SIGTERM. SIGTERM triggers a graceful shutdown with a 30 s budget.
 
 ## Documentation
 
 Full documentation: https://github.com/maxpert/strangeq
 Report issues: https://github.com/maxpert/strangeq/issues
 
-## Performance Tips
-
-1. Use Badger storage for persistence
-2. Disable sync_writes for better write performance (less durability)
-3. Increase cache_size for better read performance
-4. Adjust max_connections based on your workload
-5. Enable TCP keep-alive for long-lived connections
-
 ## License
 
 See LICENSE file for details.
-
-## Support
-
-For questions and support:
-- GitHub Issues: https://github.com/maxpert/strangeq/issues
-- Documentation: https://github.com/maxpert/strangeq
-
-Enjoy using AMQP-Go Server!

@@ -1,47 +1,33 @@
 [Unit]
-Description=AMQP-Go Message Broker
+Description=StrangeQ AMQP 0.9.1 Message Broker
 Documentation=https://github.com/maxpert/strangeq
-After=network.target
+After=network-online.target
+Wants=network-online.target
 
 [Service]
 Type=simple
 User=amqp
 Group=amqp
-
-# Working directory
 WorkingDirectory=/var/lib/amqp
-
-# Binary location
-ExecStart=/usr/local/bin/amqp-server \
-    --config /etc/amqp/config.json \
-    --log-file /var/log/amqp/server.log \
-    --pid-file /run/amqp/amqp-server.pid
-
-# Restart policy
+EnvironmentFile=-/etc/amqp/amqp-server.env
+ExecStart=/usr/local/bin/amqp-server --config /etc/amqp/config.yaml --enable-telemetry
+ExecReload=/bin/kill -HUP $MAINPID
 Restart=on-failure
 RestartSec=5s
-
-# Resource limits
 LimitNOFILE=65536
 LimitNPROC=4096
-
-# Security hardening
+UMask=0027
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=true
-ReadWritePaths=/var/lib/amqp /var/log/amqp /run/amqp
-
-# Process management
+ReadWritePaths=/var/lib/amqp
 KillMode=mixed
 KillSignal=SIGTERM
-TimeoutStopSec=30
-
-# Standard output/error
+TimeoutStopSec=45
 StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=amqp-server
 
 [Install]
 WantedBy=multi-user.target
-

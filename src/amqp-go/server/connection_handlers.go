@@ -280,6 +280,13 @@ func (s *Server) handleConnectionStartOK(conn *protocol.Connection, payload []by
 	// client's connection.blocked capability (conn.ClientSupportsBlocked()).
 	conn.ClientProperties = startOK.ClientProperties
 
+	// WS-E: host policy and failed-auth rate limiting run before SASL and
+	// before the authentication-disabled early return, so host lists apply
+	// even when authentication is off (they are network policy, not identity).
+	if err := s.admitPeer(conn); err != nil {
+		return err
+	}
+
 	s.Log.Debug("Connection.start-ok parsed",
 		zap.String("connection_id", conn.ID),
 		zap.String("mechanism", startOK.Mechanism),
@@ -310,6 +317,10 @@ func (s *Server) handleConnectionStartOK(conn *protocol.Connection, payload []by
 			zap.String("connection_id", conn.ID),
 			zap.String("mechanism", startOK.Mechanism),
 			zap.Error(err))
+		// WS-E: rate-limit accounting on every refused attempt; WS-B: the
+		// close itself goes out through the typed ConnectionError path so
+		// exactly one connection.close is written (S4).
+		s.recordAuthFailure(conn, "unsupported_mechanism")
 		return s.connectionError(conn, amqperrors.AccessRefused,
 			fmt.Sprintf("ACCESS_REFUSED - unsupported mechanism %s", startOK.Mechanism), 10, 11)
 	}
@@ -320,8 +331,12 @@ func (s *Server) handleConnectionStartOK(conn *protocol.Connection, payload []by
 		s.Log.Warn("Authentication failed",
 			zap.String("connection_id", conn.ID),
 			zap.String("mechanism", startOK.Mechanism),
+			zap.String("remote_addr", remoteAddrString(conn)),
 			zap.Error(err))
-		// The client only ever sees the fixed text; the cause stays in the log.
+		// WS-E: rate-limit accounting on every refused attempt. The client
+		// only ever sees the fixed text; the cause stays in the log. WS-B:
+		// exactly one connection.close via the typed ConnectionError (S4).
+		s.recordAuthFailure(conn, "bad_credentials")
 		cne := s.connectionError(conn, amqperrors.AccessRefused,
 			"ACCESS_REFUSED - authentication failed", 10, 11)
 		cne.Cause = fmt.Errorf("authentication failed: %w", err)
@@ -330,6 +345,9 @@ func (s *Server) handleConnectionStartOK(conn *protocol.Connection, payload []by
 
 	// Extract username from authenticated user
 	if user, ok := userInterface.(*interfaces.User); ok {
+		if err := s.checkUserAccess(conn, user.Username); err != nil {
+			return err
+		}
 		conn.Username = user.Username
 		conn.User = user
 		s.Log.Info("User authenticated successfully",
