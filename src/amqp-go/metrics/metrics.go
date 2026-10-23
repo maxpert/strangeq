@@ -5,7 +5,14 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promauto"
 )
 
-// Collector holds all Prometheus metrics for the AMQP server
+// Collector holds all Prometheus metrics for the AMQP server.
+//
+// Cardinality: per-queue series = 4 gauges (ready, unacknowledged, total,
+// consumers) plus message_age when wired, times the number of queues. The
+// queue poller caps per-queue series at maxQueueSeries (2000) and keeps
+// publishing only the authoritative queues_total above that; segment, ring
+// and dropped series carry no vhost label because the broker is not
+// vhost-scoped yet (the label would be the constant "/").
 type Collector struct {
 	// Connection metrics
 	ConnectionsTotal   prometheus.Gauge
@@ -99,6 +106,17 @@ type Collector struct {
 	ConnectionErrorsTotal *prometheus.CounterVec
 	ChannelErrorsTotal    *prometheus.CounterVec
 	MessagesDroppedTotal  *prometheus.CounterVec
+
+	// AuthFailuresTotal counts refused authentication attempts by reason:
+	// host_blocked, host_not_allowed, user_blocked, user_not_allowed,
+	// rate_limited, bad_credentials, unsupported_mechanism.
+	AuthFailuresTotal *prometheus.CounterVec
+
+	// ResourceAlarmActive is 1 while the named resource alarm is tripped.
+	ResourceAlarmActive *prometheus.GaugeVec
+
+	// BuildInfo is the constant-1 build identity gauge.
+	BuildInfo *prometheus.GaugeVec
 }
 
 // NewCollector creates a new metrics collector with all Prometheus metrics
@@ -418,7 +436,46 @@ func NewCollector(namespace string) *Collector {
 			Name:      "messages_dropped_total",
 			Help:      "Total number of messages dropped by reason",
 		}, []string{"queue", "reason"}),
+
+		AuthFailuresTotal: promauto.NewCounterVec(prometheus.CounterOpts{
+			Namespace: namespace,
+			Name:      "auth_failures_total",
+			Help:      "Total number of refused authentication attempts by reason",
+		}, []string{"reason"}),
+
+		ResourceAlarmActive: promauto.NewGaugeVec(prometheus.GaugeOpts{
+			Namespace: namespace,
+			Name:      "resource_alarm_active",
+			Help:      "1 while the named resource alarm (memory|disk) is tripped",
+		}, []string{"resource"}),
+
+		BuildInfo: promauto.NewGaugeVec(prometheus.GaugeOpts{
+			Namespace: namespace,
+			Name:      "build_info",
+			Help:      "Build identity; the value is always 1",
+		}, []string{"version", "commit", "go_version"}),
 	}
+}
+
+// RecordAuthFailure increments the failed-authentication counter for reason.
+func (c *Collector) RecordAuthFailure(reason string) {
+	c.AuthFailuresTotal.WithLabelValues(reason).Inc()
+}
+
+// SetBuildInfo publishes the constant-1 build identity gauge.
+func (c *Collector) SetBuildInfo(version, commit, goVersion string) {
+	c.BuildInfo.WithLabelValues(version, commit, goVersion).Set(1)
+}
+
+// UpdateQueueReadyAndConsumers sets the ready depth (only when known) and the
+// consumer count for one queue. Unacked/total are deliberately not written:
+// no cheap unacked accessor exists, and total = ready + 0 would mislead.
+func (c *Collector) UpdateQueueReadyAndConsumers(queue, vhost string, ready int, readyKnown bool, consumers int) {
+	labels := prometheus.Labels{"queue": queue, "vhost": vhost}
+	if readyKnown {
+		c.QueueMessagesReady.With(labels).Set(float64(ready))
+	}
+	c.QueueConsumers.With(labels).Set(float64(consumers))
 }
 
 // RecordConnectionCreated increments connection creation counter and total
