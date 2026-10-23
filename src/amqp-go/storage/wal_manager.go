@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"hash/crc32"
 	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"sync"
@@ -3524,6 +3525,15 @@ func (qw *QueueWAL) sharedBodyBackstopFired(info *walFileInfo) bool {
 // Only operates on old/rolled files — never touches the current active file.
 // For each old file: scan messages, filter out ACKed ones, write unACKed
 // messages to segments, then delete the WAL file and clean up the offset index.
+//
+// WS-C C2/C4: a WAL file is unlinked ONLY after every CheckpointBatch for its
+// unacked records returned nil — and nil now means written-in-full +
+// fdatasynced + directory-entry-durable (see CheckpointBatch). The
+// checkpointed flag records that state, so a pass that could not unlink (a
+// crash between fsync and unlink, or an unlink error) retries ONLY the unlink
+// on the next pass instead of re-writing the records. A multi-queue
+// checkpoint that fails part-way keeps the WAL file; the retry may rewrite a
+// queue that already succeeded, which the recovery-time dedup (C8) collapses.
 func (qw *QueueWAL) performCheckpoint() {
 	segMgr := qw.getSegmentMgr()
 	if segMgr == nil {
@@ -3542,6 +3552,7 @@ func (qw *QueueWAL) performCheckpoint() {
 		return
 	}
 
+	unlinkedAny := false
 	for fileNum, info := range filesToCheckpoint {
 		// ITER5 cold-tail hardening (§2): a rolled file that carries a shared
 		// BodyBlock is SKIPPED (left in oldFiles), so the shared body survives as
@@ -3555,43 +3566,64 @@ func (qw *QueueWAL) performCheckpoint() {
 			continue
 		}
 
-		// Scan the WAL file. See forceCheckpointFile: only a FATAL scan fault
-		// aborts; a torn tail still has every earlier record intact and they
-		// must reach a segment or the file can never be reclaimed. The scan is
-		// bounded at the file's durable end (C1 §3.11): a damaged tail (a
-		// nacked partial batch that could not be truncated) is never read and
-		// goes away with the unlink.
-		messages, err := qw.scanWALFileUpTo(info.path, info.durableSize)
-		if err != nil && interfaces.OutcomeOf(err) == interfaces.RecoveryFatal {
+		if !info.checkpointed {
+			// Scan the WAL file. See forceCheckpointFile: only a FATAL scan fault
+			// aborts; a torn tail still has every earlier record intact and they
+			// must reach a segment or the file can never be reclaimed. The scan is
+			// bounded at the file's durable end (C1 §3.11): a damaged tail (a
+			// nacked partial batch that could not be truncated) is never read and
+			// goes away with the unlink.
+			messages, err := qw.scanWALFileUpTo(info.path, info.durableSize)
+			if err != nil && interfaces.OutcomeOf(err) == interfaces.RecoveryFatal {
+				continue
+			}
+
+			// Group unACKed messages by queue
+			byQueue := make(map[string][]*RecoveryMessage)
+			qw.bitmapMutex.RLock()
+			for _, msg := range messages {
+				if !qw.ackBitmap.Contains(msg.Offset) {
+					byQueue[msg.QueueName] = append(byQueue[msg.QueueName], msg)
+				}
+			}
+			qw.bitmapMutex.RUnlock()
+
+			// Write unACKed messages to segments
+			checkpointOK := true
+			for queueName, queueMsgs := range byQueue {
+				if err := segMgr.CheckpointBatch(queueName, queueMsgs); err != nil {
+					checkpointOK = false
+					break
+				}
+			}
+
+			if !checkpointOK {
+				// WAL kept; the next pass retries the whole file. Queues that
+				// already succeeded get rewritten (duplicates, collapsed at
+				// recovery by the C8 dedup).
+				continue
+			}
+
+			// Every batch durably succeeded: only the unlink remains. The flag
+			// is published under oldFilesMutex, the same lock
+			// tryDeleteOldFiles reads it under.
+			qw.oldFilesMutex.Lock()
+			info.checkpointed = true
+			qw.oldFilesMutex.Unlock()
+		}
+
+		// Delete WAL file and clean up. walUnlink is the hookable seam whose
+		// default is os.Remove (TEST-ONLY faults: a blocked hook inspects the
+		// state between fsync and unlink; an error simulates a crash there).
+		// A file whose unlink fails stays registered; the next pass retries
+		// ONLY the unlink (checkpointed is already set).
+		if err := walUnlink(info.path); err != nil && !errors.Is(err, fs.ErrNotExist) {
+			qw.logError("checkpointed WAL file could not be unlinked; it stays registered and the next pass retries only the unlink",
+				interfaces.LogField{Key: "path", Value: info.path},
+				interfaces.LogField{Key: "error", Value: err.Error()})
 			continue
 		}
-
-		// Group unACKed messages by queue
-		byQueue := make(map[string][]*RecoveryMessage)
-		qw.bitmapMutex.RLock()
-		for _, msg := range messages {
-			if !qw.ackBitmap.Contains(msg.Offset) {
-				byQueue[msg.QueueName] = append(byQueue[msg.QueueName], msg)
-			}
-		}
-		qw.bitmapMutex.RUnlock()
-
-		// Write unACKed messages to segments
-		checkpointOK := true
-		for queueName, queueMsgs := range byQueue {
-			if err := segMgr.CheckpointBatch(queueName, queueMsgs); err != nil {
-				checkpointOK = false
-				break
-			}
-		}
-
-		if !checkpointOK {
-			continue
-		}
-
-		// Checkpoint succeeded — delete WAL file and clean up. walUnlink is the
-		// hook seam whose default is os.Remove (TEST-ONLY faults).
-		_ = walUnlink(info.path)
+		unlinkedAny = true
 		qw.closeOldFileHandle(fileNum)
 
 		// Remove from oldFiles map
@@ -3620,6 +3652,19 @@ func (qw *QueueWAL) performCheckpoint() {
 				}
 			}
 			qw.offsetIndexMutex.Unlock()
+		}
+	}
+
+	// C4: make the unlinks durable (once per pass that unlinked anything).
+	// Not a correctness requirement — if a crash undoes an unlink, the WAL
+	// file comes back next to its segment copy and the recovery dedup (WAL
+	// wins + C8) collapses it — but it bounds replay work and frees the space
+	// for real, which is why a failure is only logged.
+	if unlinkedAny {
+		if serr := syncDir(qw.dataDir); serr != nil {
+			qw.logWarn("WAL directory fsync after checkpoint unlink failed; the space is not reclaimed durably yet and the next pass retries",
+				interfaces.LogField{Key: "dir", Value: qw.dataDir},
+				interfaces.LogField{Key: "error", Value: serr.Error()})
 		}
 	}
 }

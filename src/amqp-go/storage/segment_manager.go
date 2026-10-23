@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"hash/crc32"
+	"io"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -1018,6 +1019,12 @@ func (qs *QueueSegments) acknowledgeInSegment(offset uint64) {
 // M5: All messages are written in a single file.Write() call with a single
 // mutex acquisition, reducing lock contention and write syscalls from O(N) to O(1).
 // Used during WAL checkpoint to migrate messages from WAL to cold storage.
+//
+// WS-C C2: a nil return now means the batch is DURABLE — written in full (any
+// partial write is truncated away or the segment retired before an error is
+// returned), fdatasynced, and in a file whose directory entry was made durable
+// at creation. Callers (performCheckpoint, forceCheckpointFile) may only unlink
+// the source WAL file on nil.
 func (sm *SegmentManager) CheckpointBatch(queueName string, messages []*RecoveryMessage) error {
 	if len(messages) == 0 {
 		return nil
@@ -1026,13 +1033,8 @@ func (sm *SegmentManager) CheckpointBatch(queueName string, messages []*Recovery
 	if err != nil {
 		return sm.reportCheckpointFailure(queueName, fmt.Errorf("checkpoint failed for queue %s: %w", queueName, err))
 	}
-	if err := segments.writeMessageBatch(messages); err != nil {
+	if err := segments.writeMessageBatchDurable(messages); err != nil {
 		return sm.reportCheckpointFailure(queueName, fmt.Errorf("checkpoint batch write failed for queue %s: %w", queueName, err))
-	}
-	// Fdatasync the segment file to ensure durability before the WAL file is deleted.
-	// Without this, a crash after WAL deletion but before segment fsync would lose messages.
-	if err := segments.sync(); err != nil {
-		return sm.reportCheckpointFailure(queueName, fmt.Errorf("checkpoint fsync failed for queue %s: %w", queueName, err))
 	}
 	return nil
 }
@@ -1055,16 +1057,36 @@ func (sm *SegmentManager) reportCheckpointFailure(queueName string, err error) e
 	return err
 }
 
-// writeMessageBatch writes multiple messages to the current segment in a single
-// file write, with a single mutex acquisition. This is O(1) in lock acquisitions
-// and write syscalls vs O(N) for individual writeMessage calls.
-func (qs *QueueSegments) writeMessageBatch(messages []*RecoveryMessage) error {
+// writeMessageBatchDurable writes multiple messages to the current segment in
+// a single write, makes them durable with one fdatasync, and only then
+// publishes the index and size — all under ONE hold of qs.mutex, so two
+// concurrent CheckpointBatch calls (checkpointLoop and retention) cannot
+// interleave between the write and the sync.
+//
+// WS-C C2 failure semantics:
+//   - a partial/failed write is truncated back to the pre-batch size (the
+//     active segment is append-only with one writer under qs.mutex, and
+//     nothing reads past the indexed positions), or the segment is RETIRED
+//     (damaged tail, benign at load) if the truncate itself fails;
+//   - a failed fsync gets the same treatment (fsyncgate: nobody knows whether
+//     the bytes reached the media, and the batch is being failed);
+//   - the index is updated only AFTER the fsync, so a failed batch leaves no
+//     readable entries and the WAL is kept for a retry;
+//   - a failed ROLL after a durable batch is logged, not returned: the batch
+//     is durable, and failing the checkpoint would rewrite it (duplicates,
+//     removed at recovery by the C8 dedup) while the oversized active segment
+//     keeps serving writes and reads.
+func (qs *QueueSegments) writeMessageBatchDurable(messages []*RecoveryMessage) error {
 	qs.mutex.Lock()
 	defer qs.mutex.Unlock()
 
-	if qs.currentSegment == nil {
-		return fmt.Errorf("no active segment")
+	if qs.currentSegment == nil || qs.segPoisoned != nil {
+		if err := qs.replaceActiveSegmentLocked(); err != nil {
+			return fmt.Errorf("segment unavailable: %w", err)
+		}
 	}
+	seg := qs.currentSegment
+	pre := seg.fileSize.Load()
 
 	// Serialize all messages and build a single write buffer + index updates
 	type indexUpdate struct {
@@ -1075,7 +1097,7 @@ func (qs *QueueSegments) writeMessageBatch(messages []*RecoveryMessage) error {
 	var buf []byte
 
 	for _, rm := range messages {
-		position := qs.currentSegment.fileSize.Load() + int64(len(buf))
+		position := pre + int64(len(buf))
 		msgBytes, err := serializeSegmentMessage(rm.Message, rm.Offset, qs.cfg.CRCDisabled)
 		if err != nil {
 			// A record that cannot be encoded (shortstr property >255 bytes) fails
@@ -1087,52 +1109,57 @@ func (qs *QueueSegments) writeMessageBatch(messages []*RecoveryMessage) error {
 		updates = append(updates, indexUpdate{offset: rm.Offset, position: position})
 	}
 
-	// Single write syscall for all messages; through the segmentWrite hook
-	// seam (TEST-ONLY faults; default is f.Write).
-	n, err := segmentWrite(qs.currentSegment.file, buf)
+	// Single write syscall for all messages (hookable; default is f.Write).
+	// A short write without an error is normalised to io.ErrShortWrite.
+	n, err := segmentWrite(seg.file, buf)
+	if err == nil && n != len(buf) {
+		err = io.ErrShortWrite
+	}
 	if err != nil {
+		qs.repairSegmentLocked(seg, pre, "write", err)
+		qs.assertSegmentSizeInvariantLocked()
 		return fmt.Errorf("failed to write batch to segment: %w", err)
 	}
 
-	// Update index entries in a single lock acquisition
+	// One fdatasync makes the whole batch durable BEFORE anything is indexed
+	// or counted (hookable; default is fdatasyncFile).
+	if err := segmentFsync(seg.file); err != nil {
+		qs.repairSegmentLocked(seg, pre, "fsync", err)
+		qs.assertSegmentSizeInvariantLocked()
+		return fmt.Errorf("checkpoint fsync failed: %w", err)
+	}
+
+	// Durable. Publish the index entries in a single lock acquisition, then
+	// the metadata.
 	qs.currentIndex.mutex.Lock()
 	for _, u := range updates {
 		qs.currentIndex.entries[u.offset] = u.position
 	}
 	qs.currentIndex.mutex.Unlock()
 
-	// Update segment metadata
-	qs.currentSegment.fileSize.Add(int64(n))
-	qs.currentSegment.messageCount.Add(uint64(len(messages)))
+	seg.fileSize.Add(int64(n))
+	seg.messageCount.Add(uint64(len(messages)))
 	for _, rm := range messages {
-		if rm.Offset < qs.currentSegment.minOffset || qs.currentSegment.minOffset == 0 {
-			qs.currentSegment.minOffset = rm.Offset
+		if rm.Offset < seg.minOffset || seg.minOffset == 0 {
+			seg.minOffset = rm.Offset
 		}
-		if rm.Offset > qs.currentSegment.maxOffset {
-			qs.currentSegment.maxOffset = rm.Offset
+		if rm.Offset > seg.maxOffset {
+			seg.maxOffset = rm.Offset
+		}
+	}
+	qs.assertSegmentSizeInvariantLocked()
+
+	// Check if we need to roll to a new segment. Open-before-close: on
+	// failure the active segment stays writable and the roll is retried on
+	// the next batch.
+	if seg.fileSize.Load() >= qs.cfg.SegmentSize {
+		if err := qs.rollSegmentLocked(); err != nil {
+			qs.logError("segment roll failed; the active segment is kept (its data is durable and it stays writable)",
+				interfaces.LogField{Key: "queue", Value: qs.queueName},
+				interfaces.LogField{Key: "error", Value: err.Error()})
 		}
 	}
 
-	// Check if we need to roll to new segment
-	if qs.currentSegment.fileSize.Load() >= qs.cfg.SegmentSize {
-		if err := qs.sealSegment(); err != nil {
-			return fmt.Errorf("failed to seal segment during batch write: %w", err)
-		}
-		if err := qs.openNextSegmentLocked(); err != nil {
-			return fmt.Errorf("failed to open new segment during batch write: %w", err)
-		}
-	}
-
-	return nil
-}
-
-// sync flushes the current segment file to disk
-func (qs *QueueSegments) sync() error {
-	qs.mutex.Lock()
-	defer qs.mutex.Unlock()
-	if qs.currentSegment != nil && qs.currentSegment.file != nil {
-		return segmentFsync(qs.currentSegment.file)
-	}
 	return nil
 }
 
@@ -1350,9 +1377,18 @@ func (qs *QueueSegments) writeMessage(message *protocol.Message, offset uint64) 
 	// Get current file position
 	position := qs.currentSegment.fileSize.Load()
 
-	// Write to file
-	n, err := qs.currentSegment.file.Write(msgBytes)
+	// Write to file (hookable; default is f.Write). A short write without an
+	// error is normalised to io.ErrShortWrite; on any failure the partial
+	// bytes are truncated away or the segment retired (C2 — writeMessage has
+	// no production caller today, but leaving the stale-fileSize trap in
+	// place would be worse). It does not fsync, which is unchanged.
+	n, err := segmentWrite(qs.currentSegment.file, msgBytes)
+	if err == nil && n != len(msgBytes) {
+		err = io.ErrShortWrite
+	}
 	if err != nil {
+		qs.repairSegmentLocked(qs.currentSegment, position, "write", err)
+		qs.assertSegmentSizeInvariantLocked()
 		return fmt.Errorf("failed to write to segment: %w", err)
 	}
 
@@ -1371,15 +1407,15 @@ func (qs *QueueSegments) writeMessage(message *protocol.Message, offset uint64) 
 		qs.currentSegment.maxOffset = offset
 	}
 
-	// Check if we need to roll to new segment.
-	// openNextSegmentLocked is called instead of openNextSegment because we
-	// already hold qs.mutex here — openNextSegment would deadlock.
+	// Check if we need to roll to a new segment. rollSegmentLocked opens the
+	// next file first, so a failed open leaves the current segment active and
+	// writable instead of sealed-read-only; a roll failure after this record
+	// is on disk is logged, not returned.
 	if qs.currentSegment.fileSize.Load() >= qs.cfg.SegmentSize {
-		if err := qs.sealSegment(); err != nil {
-			return fmt.Errorf("failed to seal segment: %w", err)
-		}
-		if err := qs.openNextSegmentLocked(); err != nil {
-			return fmt.Errorf("failed to open new segment: %w", err)
+		if rerr := qs.rollSegmentLocked(); rerr != nil {
+			qs.logError("segment roll failed; the active segment is kept (its data is durable and it stays writable)",
+				interfaces.LogField{Key: "queue", Value: qs.queueName},
+				interfaces.LogField{Key: "error", Value: rerr.Error()})
 		}
 	}
 
@@ -1535,29 +1571,151 @@ func (qs *QueueSegments) openNextSegment() error {
 	return qs.openNextSegmentLocked()
 }
 
-// openNextSegmentLocked creates and opens the next segment file.
+// openNextSegmentLocked installs a fresh segment file as the active one.
 // Precondition: caller must hold qs.mutex.
 func (qs *QueueSegments) openNextSegmentLocked() error {
-	segmentNum := uint64(time.Now().UnixNano())
-	filename := filepath.Join(qs.dataDir, fmt.Sprintf("%020d%s", segmentNum, SegmentFileExtension))
-
-	file, err := segmentOpenFile(filename, os.O_CREATE|os.O_RDWR|os.O_APPEND, 0644)
+	seg, idx, err := qs.createSegmentFileLocked()
 	if err != nil {
-		return fmt.Errorf("failed to open segment file: %w", err)
+		return err
 	}
-
-	qs.currentSegment = &SegmentFile{
-		segmentNum: segmentNum,
-		path:       filename,
-		file:       file,
-		index:      make(map[uint64]int64),
-	}
-
-	qs.currentIndex = &SegmentIndex{
-		entries: make(map[uint64]int64),
-	}
-
+	qs.currentSegment = seg
+	qs.currentIndex = idx
 	return nil
+}
+
+// createSegmentFileLocked creates a fresh segment file and returns it with a
+// fresh index. Precondition: caller holds qs.mutex.
+//
+// WS-C C2: the number is STRICTLY MONOTONE (max of wall clock and
+// lastSegmentNum+1, and lastSegmentNum is seeded from the highest number
+// loaded at boot), so two numbers can never collide — and the file is opened
+// O_EXCL, so even if one somehow does (a stray file, a number minted by a
+// previous incarnation), the create FAILS instead of reopening the existing
+// file in append mode with fileSize=0, which is the segment twin of the
+// stale-offset bug C1 fixed in the WAL. On an EEXIST collision the number is
+// bumped and retried, up to 16 times.
+//
+// The directory entry is made durable at creation (C4): the reliance point —
+// the first CheckpointBatch == nil that leads to a WAL unlink — always comes
+// later, so syncing here keeps the per-checkpoint cost flat.
+func (qs *QueueSegments) createSegmentFileLocked() (*SegmentFile, *SegmentIndex, error) {
+	num := uint64(time.Now().UnixNano())
+	if num <= qs.lastSegmentNum {
+		num = qs.lastSegmentNum + 1
+	}
+	for attempt := 0; attempt < 16; attempt++ {
+		path := filepath.Join(qs.dataDir, fmt.Sprintf("%020d%s", num, SegmentFileExtension))
+		f, err := segmentOpenFile(path, os.O_CREATE|os.O_EXCL|os.O_RDWR|os.O_APPEND, 0644)
+		if err != nil {
+			if os.IsExist(err) {
+				num++ // never reopen an existing file with fileSize=0
+				continue
+			}
+			return nil, nil, fmt.Errorf("failed to open segment file: %w", err)
+		}
+		if serr := syncDir(qs.dataDir); serr != nil {
+			_ = f.Close()
+			_ = os.Remove(path)
+			return nil, nil, fmt.Errorf("segment dir fsync: %w", serr)
+		}
+		qs.lastSegmentNum = num
+		return &SegmentFile{
+			segmentNum: num,
+			path:       path,
+			file:       f,
+			index:      make(map[uint64]int64),
+		}, &SegmentIndex{entries: make(map[uint64]int64)}, nil
+	}
+	return nil, nil, fmt.Errorf("could not create a segment file in %s: 16 consecutive name collisions", qs.dataDir)
+}
+
+// rollSegmentLocked seals the current segment and installs a fresh one as the
+// active segment. Precondition: caller holds qs.mutex.
+//
+// WS-C C2: the NEXT segment is created FIRST. On a creation failure the
+// current segment stays ACTIVE and writable (oversized; SegmentSize is a soft
+// limit). The previous shape sealed the current segment and then opened the
+// next one, so a failed open left currentSegment pointing at a sealed
+// READ-ONLY handle and every later write failed with EBADF.
+func (qs *QueueSegments) rollSegmentLocked() error {
+	next, nextIdx, err := qs.createSegmentFileLocked()
+	if err != nil {
+		return err // current stays active
+	}
+	if err := qs.sealSegment(); err != nil {
+		_ = next.file.Close()
+		_ = os.Remove(next.path)
+		return err // current stays active (unsealed, writable)
+	}
+	qs.currentSegment = next
+	qs.currentIndex = nextIdx
+	return nil
+}
+
+// replaceActiveSegmentLocked retires the current segment WITHOUT sealing it
+// (no Sync: its earlier batches were fdatasynced by their own
+// writeMessageBatchDurable calls) and installs a fresh one. It is called with
+// the current segment damaged (segPoisoned) or missing.
+// Precondition: caller holds qs.mutex.
+func (qs *QueueSegments) replaceActiveSegmentLocked() error {
+	next, nextIdx, err := qs.createSegmentFileLocked()
+	if err != nil {
+		return err // stays poisoned; the next CheckpointBatch retries
+	}
+	if cur := qs.currentSegment; cur != nil {
+		// Retire: copy the live index into the segment's own index under its
+		// lock (as sealSegment does), try a read-only reopen (best effort, as
+		// sealSegment does), and mark the damaged tail. The failed batch was
+		// never indexed (indexing happens only after fsync), so the retired
+		// segment's index covers only its durable prefix — but the damaged
+		// tail's bytes remain in the file and are classified BENIGN at load:
+		// nothing is ever appended after them, which is what turns tail
+		// damage into interior damage.
+		cur.mutex.Lock()
+		if qs.currentIndex != nil {
+			qs.currentIndex.mutex.RLock()
+			for offset, position := range qs.currentIndex.entries {
+				cur.index[offset] = position
+			}
+			qs.currentIndex.mutex.RUnlock()
+		}
+		if readFile, rerr := os.Open(cur.path); rerr == nil {
+			old := cur.file
+			cur.file = readFile
+			_ = old.Close()
+		}
+		cur.damagedTail = qs.segPoisoned != nil
+		cur.mutex.Unlock()
+
+		qs.sealedMutex.Lock()
+		qs.sealedSegments[cur.segmentNum] = cur
+		qs.sealedMutex.Unlock()
+	}
+	qs.currentSegment = next
+	qs.currentIndex = nextIdx
+	qs.segPoisoned = nil
+	return nil
+}
+
+// repairSegmentLocked repairs the active segment after a failed batch
+// write/fsync: truncate back to the pre-batch size (fdatasync + Stat check).
+// If the truncate fails, the segment is retired (damaged tail is benign;
+// nothing confirmed is lost — everything before pre was fdatasynced by an
+// earlier successful batch) and a fresh active segment takes over.
+// Precondition: caller holds qs.mutex.
+func (qs *QueueSegments) repairSegmentLocked(seg *SegmentFile, pre int64, op string, cause error) {
+	err := segmentTruncate(seg.file, pre)
+	if err == nil {
+		seg.fileSize.Store(pre)
+		return
+	}
+	qs.segPoisoned = fmt.Errorf("segment %s diverged after failed %s: %w", seg.path, op, err)
+	qs.logError("segment write failed and could not be truncated; retiring the segment (its durable records stay readable)",
+		interfaces.LogField{Key: "queue", Value: qs.queueName},
+		interfaces.LogField{Key: "segment", Value: seg.path},
+		interfaces.LogField{Key: "op", Value: op},
+		interfaces.LogField{Key: "error", Value: err.Error()})
+	_ = qs.replaceActiveSegmentLocked()
 }
 
 // compactionLoop periodically checks if compaction is needed
@@ -1900,6 +2058,13 @@ func (qs *QueueSegments) loadExistingSegments() []error {
 
 		if lerr := qs.loadSegmentFile(segmentNum, filepath.Join(qs.dataDir, name)); lerr != nil {
 			faults = append(faults, lerr)
+			continue
+		}
+		// Seed the monotone numbering with the highest loaded number so the
+		// next created segment is strictly greater even if the wall clock has
+		// stepped backwards across the restart (WS-C C2).
+		if segmentNum > qs.lastSegmentNum {
+			qs.lastSegmentNum = segmentNum
 		}
 	}
 
