@@ -92,9 +92,12 @@ type xDeathEvent struct {
 // Aggregation is keyed by the (queue,reason) pair: a repeat of an existing pair
 // increments that entry's count and moves it to the FRONT (head-insertion), so
 // x-death[0] is always the most recent death; a new pair is prepended with
-// count=1. x-first-death-{reason,queue,exchange} are set exactly once, gated on
-// the absence of x-first-death-reason (so a message recovered with a prior
-// first-death keeps it).
+// count=1. On a repeat (R13, mc.erl update_death), the EXISTING entry is
+// PRESERVED VERBATIM — exchange, routing-keys, first time and ttl
+// (original-expiration) are NOT merged from the new event; only count and
+// last_time advance. x-first-death-{reason,queue,exchange} are set exactly
+// once, gated on the absence of x-first-death-reason (so a message recovered
+// with a prior first-death keeps it).
 //
 // CONTRACT: annotateXDeath MUST be called on a message clone's Headers, never on
 // the live message pointer — see deadLetter.
@@ -132,29 +135,31 @@ func annotateXDeath(headers map[string]interface{}, ev xDeathEvent) map[string]i
 
 // mergeXDeath folds entry into the existing x-death array (existing may be nil
 // or of an unexpected type, in which case it is treated as empty). If an entry
-// for (queue,reason) already exists, its count is carried forward+1 into the
-// new entry and the old slot is dropped; the (new or updated) entry is placed at
-// the head so x-death[0] is the most recent death.
+// for (queue,reason) already exists, that entry is PRESERVED VERBATIM with
+// count+1 (R13, mc.erl update_death: exchange, routing-keys, first time and
+// original-expiration are kept, not merged) and moved to the head; the freshly
+// built entry is discarded. With no match, the fresh entry is prepended. Either
+// way x-death[0] is the most recent death.
 func mergeXDeath(existing interface{}, entry map[string]interface{}, queue, reason string) []interface{} {
 	prev, _ := existing.([]interface{})
-
-	out := make([]interface{}, 0, len(prev)+1)
-	out = append(out, entry) // head-insertion: newest first
+	head := entry
+	matched := false
+	rest := make([]interface{}, 0, len(prev))
 	for _, e := range prev {
 		tbl, ok := e.(map[string]interface{})
-		if !ok {
-			// Preserve unexpected/foreign entries verbatim rather than dropping.
-			out = append(out, e)
+		if ok && !matched && xDeathMatches(tbl, queue, reason) { // first match only
+			upd := make(map[string]interface{}, len(tbl))
+			for k, v := range tbl {
+				upd[k] = v
+			}
+			upd[xDeathCount] = asInt64(tbl[xDeathCount]) + 1
+			head = upd
+			matched = true
 			continue
 		}
-		if xDeathMatches(tbl, queue, reason) {
-			// Same (queue,reason): carry its count forward and drop the old slot.
-			entry[xDeathCount] = asInt64(tbl[xDeathCount]) + 1
-			continue
-		}
-		out = append(out, tbl)
+		rest = append(rest, e)
 	}
-	return out
+	return append([]interface{}{head}, rest...)
 }
 
 // xDeathMatches reports whether an existing x-death entry is for (queue,reason).

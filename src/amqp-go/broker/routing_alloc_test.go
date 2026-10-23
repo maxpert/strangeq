@@ -103,6 +103,68 @@ func TestRouteMessage_FanoutGeneralPath_SteadyStateZeroAlloc(t *testing.T) {
 // topic general path: the iterative matcher (broker/topic_match.go) must stay
 // allocation-free per binding, so routing through 4 topic bindings with
 // '#' and '*' wildcards is zero-alloc in steady state.
+// TestRouteMessage_DirectManyBindings_SteadyStateZeroAlloc (WS-D T14.2,
+// !race): the >8-bindings direct fast path dedups through the POOLED scratch
+// map — O(n) and zero-alloc in steady state.
+func TestRouteMessage_DirectManyBindings_SteadyStateZeroAlloc(t *testing.T) {
+	broker, cleanup := createTestBroker(t)
+	defer cleanup()
+
+	require.NoError(t, broker.DeclareExchange("alloc.direct.many", "direct", false, false, false, nil))
+	for i := 0; i < 100; i++ {
+		q := fmt.Sprintf("alloc.direct.many.q%d", i)
+		mustDeclareQueue(t, broker, q)
+		require.NoError(t, broker.BindQueue(q, "alloc.direct.many", "k", nil))
+	}
+
+	exchange, err := broker.storage.GetExchange("alloc.direct.many")
+	require.NoError(t, err)
+	msg := &protocol.Message{Body: []byte("x"), RoutingKey: "k"}
+
+	rs := acquireRouteScratch()
+	defer releaseRouteScratch(rs)
+
+	// Warm scratch maps, slice capacity, and binding caches.
+	require.NoError(t, broker.routeMessage(exchange, "k", msg, rs))
+	require.Len(t, rs.queues, 100)
+
+	allocs := testing.AllocsPerRun(200, func() {
+		if err := broker.routeMessage(exchange, "k", msg, rs); err != nil {
+			t.Fatal(err)
+		}
+		if len(rs.queues) != 100 {
+			t.Fatalf("expected 100 target queues, got %d", len(rs.queues))
+		}
+	})
+	require.Zero(t, allocs, "direct many-bindings path must be allocation-free in steady state with a reused scratch")
+}
+
+// BenchmarkRouteDirect_1000Bindings (WS-D T14.3): old vs new ns/op for the
+// direct fast path at 1000 same-key bindings.
+func BenchmarkRouteDirect_1000Bindings(b *testing.B) {
+	broker, cleanup := createTestBroker(b)
+	defer cleanup()
+
+	require.NoError(b, broker.DeclareExchange("bench.direct", "direct", false, false, false, nil))
+	for i := 0; i < 1000; i++ {
+		q := fmt.Sprintf("bench.direct.q%d", i)
+		mustDeclareQueue(b, broker, q)
+		require.NoError(b, broker.BindQueue(q, "bench.direct", "k", nil))
+	}
+	exchange, err := broker.storage.GetExchange("bench.direct")
+	require.NoError(b, err)
+	msg := &protocol.Message{Body: []byte("x"), RoutingKey: "k"}
+
+	rs := acquireRouteScratch()
+	defer releaseRouteScratch(rs)
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if err := broker.routeMessage(exchange, "k", msg, rs); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
 func TestRouteMessage_TopicGeneralPath_SteadyStateZeroAlloc(t *testing.T) {
 	broker, cleanup := createTestBroker(t)
 	defer cleanup()

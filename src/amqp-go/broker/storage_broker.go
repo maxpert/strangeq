@@ -3425,6 +3425,11 @@ func (b *StorageBroker) PublishMessageTx(txnStore interfaces.Storage, exchangeNa
 	return deferred, nil
 }
 
+// directDedupMapThreshold is the binding count above which the direct
+// no-e2e fast path switches from slices.Contains dedup (O(n²), map-free) to
+// the pooled scratch map (O(n), zero-alloc after warm-up). §14.
+const directDedupMapThreshold = 8
+
 // routeScratch holds per-publish routing state. Instances are pooled so the
 // publish hot path performs zero steady-state heap allocations: the queues
 // slice, seen set, and visited set are all reused across publishes.
@@ -3513,9 +3518,24 @@ func (b *StorageBroker) routeMessage(exchange *protocol.Exchange, routingKey str
 			if err != nil {
 				return fmt.Errorf("failed to get exchange bindings: %w", err)
 			}
+			// WS-D §14: the small case stays map-free (preserving the
+			// no-e2e zero-alloc pin); past the threshold dedup goes O(n)
+			// through the pooled scratch map instead of O(n²) slices.Contains.
+			if len(bindings) <= directDedupMapThreshold {
+				for _, binding := range bindings {
+					if binding.RoutingKey == routingKey && !slices.Contains(rs.queues, binding.QueueName) {
+						rs.queues = append(rs.queues, binding.QueueName)
+					}
+				}
+				return nil
+			}
+			rs.resetMaps() // pooled; zero-alloc after warm-up
 			for _, binding := range bindings {
-				if binding.RoutingKey == routingKey && !slices.Contains(rs.queues, binding.QueueName) {
-					rs.queues = append(rs.queues, binding.QueueName)
+				if binding.RoutingKey == routingKey {
+					if _, ok := rs.seen[binding.QueueName]; !ok {
+						rs.queues = append(rs.queues, binding.QueueName)
+						rs.seen[binding.QueueName] = struct{}{}
+					}
 				}
 			}
 			return nil
