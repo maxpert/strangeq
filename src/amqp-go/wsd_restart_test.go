@@ -212,14 +212,29 @@ func TestHeaders_BindingSurvivesRestart(t *testing.T) {
 	require.True(t, ok, "the binding survived the restart and routes (CBOR-width parity)")
 	assert.Equal(t, "after", string(msg.Body))
 
-	// And a mismatching header does NOT route.
+	// Verify a mismatching header never routes using a matching sentinel:
+	// publish the mismatching message first (n=6), then a matching durable
+	// sentinel (n=5, body "marker"). The queue is FIFO, so if "never" had
+	// routed it would appear before "marker".
 	require.NoError(t, ch2.Publish("hx", "", false, false, amqp.Publishing{
 		Headers:      amqp.Table{"n": int32(6)},
 		DeliveryMode: 2,
 		Body:         []byte("never"),
 	}))
-	_, ok = getWithin(ch2, "hq", 500*time.Millisecond)
-	assert.False(t, ok, "a mismatching header never routes")
+	require.NoError(t, ch2.Publish("hx", "", false, false, amqp.Publishing{
+		Headers:      amqp.Table{"n": int32(5)},
+		DeliveryMode: 2,
+		Body:         []byte("marker"),
+	}))
+	sentinel, ok := getWithin(ch2, "hq", 3*time.Second)
+	require.True(t, ok, "matching sentinel must be delivered")
+	assert.Equal(t, "marker", string(sentinel.Body),
+		"if 'never' had routed it would precede 'marker' in FIFO order")
+
+	// Final immediate Get confirms the queue is drained.
+	_, ok, err = ch2.Get("hq", true)
+	require.NoError(t, err)
+	assert.False(t, ok, "no more messages after the sentinel")
 }
 
 // getWithin polls basic.get (autoAck=true) until a delivery arrives or the
