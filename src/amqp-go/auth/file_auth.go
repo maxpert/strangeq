@@ -1,6 +1,7 @@
 package auth
 
 import (
+	"crypto/rand"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -13,11 +14,35 @@ import (
 	"golang.org/x/crypto/bcrypt"
 )
 
+// dummyHash is a bcrypt hash of a random, never-revealed string. It exists so
+// that an authentication attempt for an unknown username pays the same bcrypt
+// cost as one for a known username; without it, response latency reveals which
+// usernames exist. Computed once at first use, not at package init, so
+// importers do not pay ~60ms of bcrypt work at startup.
+var dummyHash = sync.OnceValue(func() []byte {
+	buf := make([]byte, 32)
+	if _, err := rand.Read(buf); err != nil {
+		// A broken CSPRNG is a process-level problem; fall back to a fixed
+		// value so the dummy comparison still costs bcrypt time.
+		buf = []byte("strangeq-dummy-credential-placeholder")
+	}
+	hash, err := bcrypt.GenerateFromPassword(buf, bcrypt.DefaultCost)
+	if err != nil {
+		panic(fmt.Sprintf("auth: cannot generate dummy bcrypt hash: %v", err))
+	}
+	return hash
+})
+
 // FileAuthenticator implements file-based authentication
 type FileAuthenticator struct {
 	filePath string
 	users    map[string]*UserEntry
 	mutex    sync.RWMutex
+
+	// compare hashes a password against a stored hash. nil means
+	// bcrypt.CompareHashAndPassword; tests replace it to assert mechanism
+	// (which hash was compared) instead of measuring wall-clock time.
+	compare func(hash, password []byte) error
 }
 
 // UserEntry represents a user entry in the auth file
@@ -111,19 +136,22 @@ func (f *FileAuthenticator) load() error {
 	return nil
 }
 
-// Authenticate validates user credentials
+// Authenticate validates user credentials.
+//
+// The error text is deliberately identical for an unknown username and a wrong
+// password ("invalid credentials"), and both paths perform exactly one bcrypt
+// comparison, so callers and timing cannot distinguish the two cases.
 func (f *FileAuthenticator) Authenticate(username, password string) (*interfaces.User, error) {
 	f.mutex.RLock()
 	defer f.mutex.RUnlock()
 
 	entry, exists := f.users[username]
-	if !exists {
-		return nil, fmt.Errorf("user not found: %s", username)
+	hash := dummyHash()
+	if exists {
+		hash = []byte(entry.PasswordHash)
 	}
-
-	// Verify password using bcrypt
-	if err := bcrypt.CompareHashAndPassword([]byte(entry.PasswordHash), []byte(password)); err != nil {
-		return nil, fmt.Errorf("invalid password")
+	if err := f.compareHash(hash, []byte(password)); err != nil || !exists {
+		return nil, fmt.Errorf("invalid credentials")
 	}
 
 	// Create user object (clone slices to avoid sharing backing arrays with UserEntry)
@@ -137,6 +165,14 @@ func (f *FileAuthenticator) Authenticate(username, password string) (*interfaces
 	}
 
 	return user, nil
+}
+
+// compareHash runs the configured comparison hook, defaulting to bcrypt.
+func (f *FileAuthenticator) compareHash(hash, password []byte) error {
+	if f.compare != nil {
+		return f.compare(hash, password)
+	}
+	return bcrypt.CompareHashAndPassword(hash, password)
 }
 
 // Authorize checks if a user has permission for an operation per the

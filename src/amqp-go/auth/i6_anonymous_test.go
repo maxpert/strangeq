@@ -38,7 +38,7 @@ func TestRegistryForMechanismsOptsInAnonymous(t *testing.T) {
 	}
 	_, err = registry.Get("PLAIN")
 	if err != nil {
-		t.Error("RegistryForMechanisms must always register PLAIN")
+		t.Error("RegistryForMechanisms must register every known mechanism named in the list")
 	}
 
 	registryNoAnon := RegistryForMechanisms([]string{"PLAIN"})
