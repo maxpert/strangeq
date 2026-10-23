@@ -8,6 +8,7 @@ import (
 	"github.com/maxpert/amqp-go/broker"
 	"github.com/maxpert/amqp-go/interfaces"
 	"github.com/maxpert/amqp-go/protocol"
+	"github.com/maxpert/amqp-go/storage"
 	"go.uber.org/zap"
 )
 
@@ -172,13 +173,29 @@ func (r *RecoveryManager) PerformRecovery() (*protocol.RecoveryStats, error) {
 }
 
 // validateAndRepairStorage validates storage integrity and repairs corruption
+//
+// WS-C C6 seam: storage.ValidateStorageIntegrity/RepairCorruption are
+// intentionally NOT implemented by the disruptor backend (an empty success
+// would claim a validation that never ran; the classified recovery scan that
+// follows already enforces integrity fail-closed). ErrNotImplemented from
+// validation therefore means "capability unavailable" — log once and proceed
+// to real recovery — never a boot refusal. Any other error still ends
+// recovery early (absorbed Fatal, fail closed).
 func (r *RecoveryManager) validateAndRepairStorage() (*protocol.RecoveryStats, error) {
 	r.logger.Info("Validating storage integrity...")
 
 	// First validate storage integrity
 	stats, err := r.storage.ValidateStorageIntegrity()
+	if errors.Is(err, storage.ErrNotImplemented) {
+		r.logger.Warn("Storage integrity pre-validation is not implemented by this storage backend; " +
+			"integrity is enforced by the classified recovery scan that follows")
+		return &protocol.RecoveryStats{}, nil
+	}
 	if err != nil {
 		return stats, err
+	}
+	if stats == nil {
+		stats = &protocol.RecoveryStats{}
 	}
 
 	// If validation errors were found, attempt auto-repair

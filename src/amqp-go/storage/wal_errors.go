@@ -36,3 +36,15 @@ func (e *WALWriteError) Error() string {
 }
 
 func (e *WALWriteError) Unwrap() error { return e.Cause }
+
+// ErrNotImplemented is returned by an optional DurabilityStore operation the
+// backing store does not implement (WS-C C6). Callers must treat it as
+// "capability unavailable" — never as success and never as corruption.
+//
+// The spec's primary home for this sentinel was interfaces/storage.go; that
+// package is owned by another stream in this wave, so per the spec's own
+// fallback (§8.3) it is defined here and the server seam
+// (recovery_manager.go validateAndRepairStorage) matches
+// storage.ErrNotImplemented. Server already imports storage (builder.go), so
+// no import cycle.
+var ErrNotImplemented = errors.New("not implemented")

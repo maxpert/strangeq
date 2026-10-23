@@ -1100,12 +1100,20 @@ func (ds *DisruptorStorage) GetDurableEntityMetadata() (*protocol.DurableEntityM
 	return metadata, nil
 }
 
+// ValidateStorageIntegrity is not implemented: integrity is enforced
+// fail-closed by the classified recovery scan (GetRecoverableMessages /
+// RecoverFromWAL / rebuildBootState), which runs right after this call and
+// already refuses the boot on interior corruption. It returns
+// ErrNotImplemented rather than an empty success, which would claim a
+// validation that never ran. The stats pointer is non-nil so a caller that
+// ignores the error cannot crash on a nil dereference.
 func (ds *DisruptorStorage) ValidateStorageIntegrity() (*protocol.RecoveryStats, error) {
-	return &protocol.RecoveryStats{}, nil
+	return &protocol.RecoveryStats{}, fmt.Errorf("storage: ValidateStorageIntegrity: %w", ErrNotImplemented)
 }
 
+// RepairCorruption is not implemented (see ValidateStorageIntegrity).
 func (ds *DisruptorStorage) RepairCorruption(autoRepair bool) (*protocol.RecoveryStats, error) {
-	return &protocol.RecoveryStats{}, nil
+	return &protocol.RecoveryStats{}, fmt.Errorf("storage: RepairCorruption: %w", ErrNotImplemented)
 }
 
 // GetRecoverableMessages returns everything recovery should consider, together
