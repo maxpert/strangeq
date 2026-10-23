@@ -1872,7 +1872,7 @@ func (b *StorageBroker) BindQueue(queueName, exchangeName, routingKey string, ar
 	_, err := b.storage.GetExchange(exchangeName)
 	if err != nil {
 		if errors.Is(err, interfaces.ErrExchangeNotFound) {
-			return fmt.Errorf("exchange '%s' not found", exchangeName)
+			return errNoExchange(exchangeName)
 		}
 		return err
 	}
@@ -1903,7 +1903,7 @@ func (b *StorageBroker) BindQueue(queueName, exchangeName, routingKey string, ar
 	if _, err = b.storage.GetQueue(queueName); err != nil {
 		cmu.Unlock()
 		if errors.Is(err, interfaces.ErrQueueNotFound) {
-			return fmt.Errorf("queue '%s' not found", queueName)
+			return errNoQueue(queueName)
 		}
 		return err
 	}
@@ -1954,7 +1954,7 @@ func (b *StorageBroker) BindExchange(destination, source, routingKey string, arg
 	_, err := b.storage.GetExchange(source)
 	if err != nil {
 		if errors.Is(err, interfaces.ErrExchangeNotFound) {
-			return fmt.Errorf("source exchange '%s' not found", source)
+			return errNoExchange(source)
 		}
 		return err
 	}
@@ -1962,7 +1962,7 @@ func (b *StorageBroker) BindExchange(destination, source, routingKey string, arg
 	destExchange, err := b.storage.GetExchange(destination)
 	if err != nil {
 		if errors.Is(err, interfaces.ErrExchangeNotFound) {
-			return fmt.Errorf("destination exchange '%s' not found", destination)
+			return errNoExchange(destination)
 		}
 		return err
 	}
@@ -2060,7 +2060,7 @@ func (b *StorageBroker) RegisterConsumer(queueName, consumerID string, consumer 
 	_, err := b.storage.GetQueue(queueName)
 	if err != nil {
 		if errors.Is(err, interfaces.ErrQueueNotFound) {
-			return errors.New("queue does not exist")
+			return errNoQueue(queueName)
 		}
 		return err
 	}
@@ -2348,7 +2348,7 @@ func (b *StorageBroker) PublishMessage(exchangeName, routingKey string, message 
 	exchange, err := b.storage.GetExchange(exchangeName)
 	if err != nil {
 		if errors.Is(err, interfaces.ErrExchangeNotFound) {
-			return fmt.Errorf("exchange '%s' not found", exchangeName)
+			return errNoExchange(exchangeName)
 		}
 		return err
 	}
@@ -2584,7 +2584,7 @@ func (b *StorageBroker) PublishMessageAsyncConfirm(exchangeName, routingKey stri
 	exchange, err := b.storage.GetExchange(exchangeName)
 	if err != nil {
 		if errors.Is(err, interfaces.ErrExchangeNotFound) {
-			return false, nil, fmt.Errorf("exchange '%s' not found", exchangeName)
+			return false, nil, errNoExchange(exchangeName)
 		}
 		return false, nil, err
 	}
@@ -3059,7 +3059,7 @@ func (b *StorageBroker) PublishMessageTx(txnStore interfaces.Storage, exchangeNa
 	exchange, err := b.storage.GetExchange(exchangeName)
 	if err != nil {
 		if errors.Is(err, interfaces.ErrExchangeNotFound) {
-			return nil, fmt.Errorf("exchange '%s' not found", exchangeName)
+			return nil, errNoExchange(exchangeName)
 		}
 		return nil, err
 	}
@@ -3841,7 +3841,7 @@ func (b *StorageBroker) GetMessageForGet(queueName string, noAck bool) (*protoco
 	_, err := b.storage.GetQueue(queueName)
 	if err != nil {
 		if errors.Is(err, interfaces.ErrQueueNotFound) {
-			return nil, 0, 0, fmt.Errorf("queue '%s' not found", queueName)
+			return nil, 0, 0, errNoQueue(queueName)
 		}
 		return nil, 0, 0, err
 	}
