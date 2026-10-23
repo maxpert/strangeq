@@ -1,0 +1,11 @@
+data/
+bin/
+build/
+*.test
+*.prof
+coverage.*
+amqp-server
+perftest
+crash_test_tool
+cmd/crash_test_tool/crash_test_tool
+amqp-go.test
