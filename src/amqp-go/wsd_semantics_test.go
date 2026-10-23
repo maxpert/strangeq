@@ -576,6 +576,33 @@ func TestGetNoAck_SpilledDepth_NoLeak(t *testing.T) {
 	assert.Equal(t, 0, qd.Messages, "depth returns to 0 — no spilled-depth leak")
 }
 
+// T10.4: QueueBind with an invalid x-match ("both") on a headers exchange is
+// a 406 channel error, and NO binding is stored. Requires WS-B's M7 mapping
+// (bind errors → 406) plus the protocol bind-flags fix; until then, skip with
+// a reason — the broker twin TestBindQueue_HeadersInvalidXMatch_Rejected
+// proves the semantics.
+func TestHeaders_XMatchInvalid_406(t *testing.T) {
+	b := newRestartableBroker(t, nil)
+	if !probeQueueBindArgsDecode(t, b.uri) {
+		t.Skip("requires: protocol one-octet flag-decode fix + WS-B M7 mapping; broker twin proves the semantics")
+	}
+
+	conn, err := amqp.Dial(b.uri)
+	require.NoError(t, err)
+	defer conn.Close()
+	ch, err := conn.Channel()
+	require.NoError(t, err)
+	require.NoError(t, ch.ExchangeDeclare("hx", "headers", false, false, false, false, nil))
+	q, err := ch.QueueDeclare("hq", false, false, false, false, nil)
+	require.NoError(t, err)
+
+	err = ch.QueueBind(q.Name, "", "hx", false, amqp.Table{"x-match": "both"})
+	aerr := amqpError(t, err)
+	assert.Equal(t, 406, aerr.Code)
+	assert.Contains(t, aerr.Reason, "Invalid x-match field value")
+	assert.False(t, conn.IsClosed())
+}
+
 // probeQueueDeleteFlagsDecode reports whether the server's queue.delete path
 // decodes the client one-octet if-unused/if-empty flags (P0-4 first half,
 // protocol stream, spec §3.6 dependency). The probe is a live-consumer
