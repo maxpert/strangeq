@@ -51,9 +51,8 @@ func TestTx_Rollback_AckNotApplied(t *testing.T) {
 
 // TestTx_Commit_AckAppliedOnce (T5.4): ack(1)+commit, then ack(1) again in a
 // second tx → the second ack is unknown (the tag was consumed by the first
-// tx), no op is buffered, and the broker settles EXACTLY once.
-// (basic.get variant: the prefetch-window gate mechanics are pre-existing and
-// unchanged by §6; what §6 adds is exactly-once settlement per wire tag.)
+// tx), 406 PRECONDITION_FAILED, no op is buffered, and the broker settles
+// EXACTLY once (WS-D §6, R14).
 func TestTx_Commit_AckAppliedOnce(t *testing.T) {
 	srv := newTransactionTestServer(t)
 	conn, frameCh := newPipeConnWithFrames(t)
@@ -69,12 +68,18 @@ func TestTx_Commit_AckAppliedOnce(t *testing.T) {
 	_, tracked := srv.Broker.GetConsumerForDelivery(msgID)
 	require.False(t, tracked, "first commit settles")
 
-	// Second tx: ack the same wire tag — unknown → debug no-op, nothing buffered.
-	require.NoError(t, srv.handleBasicAck(conn, 1, makeAckPayload(wireTag, false)))
-	ops, err := srv.txm(conn).GetPendingOperations(1)
-	require.NoError(t, err)
+	// Second tx: ack the same wire tag — unknown → 406 PRECONDITION_FAILED,
+	// nothing buffered.
+	err := srv.handleBasicAck(conn, 1, makeAckPayload(wireTag, false))
+	require.Error(t, err)
+	var chErr *ChannelError
+	require.ErrorAs(t, err, &chErr)
+	assert.Equal(t, uint16(406), chErr.Code)
+
+	// No op was buffered (the channel is closing, but the txm state is
+	// queryable before the frame loop drives teardown).
+	ops, _ := srv.txm(conn).GetPendingOperations(1)
 	assert.Empty(t, ops, "a duplicate ack of a consumed wire tag buffers nothing (R14 parity)")
-	txCommit(t, srv, conn, frameCh, 1)
 
 	// Exactly once: inflight is 0 (not negative / not re-settled).
 	sb := srv.Broker.(*StorageBrokerAdapter)
@@ -84,7 +89,7 @@ func TestTx_Commit_AckAppliedOnce(t *testing.T) {
 }
 
 // TestTx_DuplicateAckInSameTx_SecondUnknown (T5.5): two acks of the same tag
-// in ONE tx buffer exactly ONE settlement op.
+// in ONE tx — the second ack is unknown and raises 406 (WS-D §6, R14).
 func TestTx_DuplicateAckInSameTx_SecondUnknown(t *testing.T) {
 	srv := newTransactionTestServer(t)
 	conn, frameCh := newPipeConnWithFrames(t)
@@ -95,10 +100,16 @@ func TestTx_DuplicateAckInSameTx_SecondUnknown(t *testing.T) {
 
 	txSelect(t, srv, conn, frameCh, 1)
 	require.NoError(t, srv.handleBasicAck(conn, 1, makeAckPayload(wireTag, false)))
-	require.NoError(t, srv.handleBasicAck(conn, 1, makeAckPayload(wireTag, false)))
 
-	ops, err := srv.txm(conn).GetPendingOperations(1)
-	require.NoError(t, err)
+	// Second ack of the same wire tag → 406 PRECONDITION_FAILED.
+	err := srv.handleBasicAck(conn, 1, makeAckPayload(wireTag, false))
+	require.Error(t, err)
+	var chErr *ChannelError
+	require.ErrorAs(t, err, &chErr)
+	assert.Equal(t, uint16(406), chErr.Code)
+
+	// Exactly one settlement op was buffered (the first ack).
+	ops, _ := srv.txm(conn).GetPendingOperations(1)
 	assert.Len(t, ops, 1, "exactly one settlement op buffered (duplicate is unknown, R14 parity)")
 }
 
@@ -137,6 +148,52 @@ func TestTx_CumulativeAck_MultipleConsumers(t *testing.T) {
 		_, tracked := srv.Broker.GetConsumerForDelivery(mid)
 		assert.False(t, tracked, "msgID %d settled by the cumulative commit", mid)
 	}
+}
+
+// TestTx_CumulativeAck_UnknownTopTag_406 (T5.6, §6 R14): a tx cumulative ack
+// with multiple=true and an unknown top wire tag (N not outstanding) raises
+// 406 PRECONDITION_FAILED and settles NOTHING — the lower outstanding
+// deliveries stay untouched. tag=0 ("ack all") is the only exception and
+// never errors.
+func TestTx_CumulativeAck_UnknownTopTag_406(t *testing.T) {
+	srv := newTransactionTestServer(t)
+	conn, frameCh := newPipeConnWithFrames(t)
+	setupTxChannelAndQueue(t, srv, conn, frameCh, "tx-unk-cum")
+	setupTxChannelAndQueue(t, srv, conn, frameCh, "tx-unk-cum-b")
+
+	publishMessageToQueue(t, srv, "tx-unk-cum", "m1")
+	publishMessageToQueue(t, srv, "tx-unk-cum-b", "m2")
+	wt1 := getDeliveryTag(t, srv, conn, frameCh, "tx-unk-cum")
+	mid1 := resolveWireTagToMsgID(t, srv, conn, 1, wt1)
+	wt2 := getDeliveryTag(t, srv, conn, frameCh, "tx-unk-cum-b")
+	mid2 := resolveWireTagToMsgID(t, srv, conn, 1, wt2)
+
+	txSelect(t, srv, conn, frameCh, 1)
+
+	// Cumulative ack with an unknown top tag (higher than any outstanding).
+	unknownTag := wt2 + 100
+	err := srv.handleBasicAck(conn, 1, makeAckPayload(unknownTag, true))
+	require.Error(t, err)
+	var chErr *ChannelError
+	require.ErrorAs(t, err, &chErr)
+	assert.Equal(t, uint16(406), chErr.Code)
+
+	// Nothing was settled: both deliveries are still tracked by the broker.
+	ch := srv.wireChannel(conn, 1)
+	_, tracked1 := srv.Broker.GetConsumerForDelivery(mid1)
+	assert.True(t, tracked1, "delivery 1 must still be tracked after 406 cumulative ack")
+	_, tracked2 := srv.Broker.GetConsumerForDelivery(mid2)
+	assert.True(t, tracked2, "delivery 2 must still be tracked after 406 cumulative ack")
+
+	// Wire tags are still resolvable (never taken).
+	_, ok1 := ch.ResolveWireTag(wt1)
+	assert.True(t, ok1, "wire tag %d must still be resolvable", wt1)
+	_, ok2 := ch.ResolveWireTag(wt2)
+	assert.True(t, ok2, "wire tag %d must still be resolvable", wt2)
+
+	// No op was buffered.
+	ops, _ := srv.txm(conn).GetPendingOperations(1)
+	assert.Empty(t, ops, "no settlement ops buffered after 406 cumulative ack")
 }
 
 // TestTx_CumulativeNack_Rollback_RestoresAllTags (T6.2): nack(multiple,

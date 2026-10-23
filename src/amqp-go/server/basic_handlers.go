@@ -1208,11 +1208,7 @@ func (s *Server) handleBasicAck(conn *protocol.Connection, channelID uint16, pay
 	if tx {
 		known, err := s.txBufferSettlement(conn, channel, channelID, interfaces.OpAck, wireTag, multiple, false)
 		if !known {
-			// WS-B: unknown-tag policy (406 PRECONDITION_FAILED - unknown delivery tag N)
-			s.Log.Debug("Delivery tag already processed (consumer cancelled?)",
-				zap.Uint64("delivery_tag", wireTag),
-				zap.Uint16("channel_id", channelID))
-			return nil
+			return s.unknownDeliveryTag(conn, channelID, wireTag, protocol.BasicAck)
 		}
 		return err
 	}
@@ -1281,11 +1277,7 @@ func (s *Server) handleBasicReject(conn *protocol.Connection, channelID uint16, 
 	if txm := s.txm(conn); txm != nil && txm.IsTransactional(channelID) {
 		known, err := s.txBufferSettlement(conn, channel, channelID, interfaces.OpReject, wireTag, false, requeue)
 		if !known {
-			// WS-B: unknown-tag policy (406 PRECONDITION_FAILED - unknown delivery tag N)
-			s.Log.Debug("Delivery tag already processed (consumer cancelled?)",
-				zap.Uint64("delivery_tag", wireTag),
-				zap.Uint16("channel_id", channelID))
-			return nil
+			return s.unknownDeliveryTag(conn, channelID, wireTag, protocol.BasicReject)
 		}
 		return err
 	}
@@ -1336,11 +1328,7 @@ func (s *Server) handleBasicNack(conn *protocol.Connection, channelID uint16, pa
 	if tx {
 		known, err := s.txBufferSettlement(conn, channel, channelID, interfaces.OpNack, wireTag, multiple, requeue)
 		if !known {
-			// WS-B: unknown-tag policy (406 PRECONDITION_FAILED - unknown delivery tag N)
-			s.Log.Debug("Delivery tag already processed (consumer cancelled?)",
-				zap.Uint64("delivery_tag", wireTag),
-				zap.Uint16("channel_id", channelID))
-			return nil
+			return s.unknownDeliveryTag(conn, channelID, wireTag, protocol.BasicNack)
 		}
 		return err
 	}

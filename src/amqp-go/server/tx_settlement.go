@@ -48,6 +48,15 @@ func (s *Server) txBufferSettlement(conn *protocol.Connection, channel *protocol
 	if multiple {
 		if wireTag == 0 {
 			wireTag = math.MaxUint64 // mirrors the non-tx cumulative path
+		} else {
+			// WS-D §6 (R14): peek first — an unknown top tag raises 406 BEFORE
+			// anything is settled, so a tx cumulative ack with an unknown N does
+			// NOT take outstanding entries below it (RabbitMQ collect_acks
+			// contract). Peeking then taking is race-free: only the ackProcessor
+			// goroutine removes wire-tag entries.
+			if _, ok := channel.ResolveWireTag(wireTag); !ok {
+				return false, nil
+			}
 		}
 		tags, refs = channel.TakeWireTagEntriesUpTo(wireTag)
 		// A cumulative op with zero entries and a real (non-MaxUint64) tag is unknown.
