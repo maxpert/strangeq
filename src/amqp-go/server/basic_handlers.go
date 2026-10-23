@@ -1174,11 +1174,27 @@ func (s *Server) handleBasicAck(conn *protocol.Connection, channelID uint16, pay
 	channel := s.wireChannel(conn, channelID)
 	tx := s.TransactionManager != nil && s.TransactionManager.IsTransactional(channelID)
 
+	// WS-D §6: in tx mode the wire tag(s) are TAKEN now (RabbitMQ removes from
+	// the unacked map at ack time, R14) and restored on rollback/failed commit;
+	// neither the cumulative branch nor resolveDeliveryTag runs in tx mode (the
+	// take happens inside txBufferSettlement, one single-tag op per entry).
+	if tx {
+		known, err := s.txBufferSettlement(conn, channel, channelID, interfaces.OpAck, wireTag, multiple, false)
+		if !known {
+			// WS-B: unknown-tag policy (406 PRECONDITION_FAILED - unknown delivery tag N)
+			s.Log.Debug("Delivery tag already processed (consumer cancelled?)",
+				zap.Uint64("delivery_tag", wireTag),
+				zap.Uint16("channel_id", channelID))
+			return nil
+		}
+		return err
+	}
+
 	// Non-transactional cumulative ack spans every consumer on the channel
 	// (SQ-18): the client's "all tags <= N" may cover deliveries that came from
 	// different queues, so it cannot be routed to a single consumer's broker
 	// multi-ack. The per-channel wire-tag table is the channel-wide unacked set.
-	if multiple && !tx {
+	if multiple {
 		s.cumulativeSettle(channel, wireTag, settleAck, false)
 		if s.MetricsCollector != nil {
 			s.MetricsCollector.RecordMessageAcknowledged()
@@ -1192,11 +1208,6 @@ func (s *Server) handleBasicAck(conn *protocol.Connection, channelID uint16, pay
 			zap.Uint64("delivery_tag", wireTag),
 			zap.Uint16("channel_id", channelID))
 		return nil
-	}
-
-	if tx {
-		op := transaction.NewAckOperation(consumerID, msgID, multiple)
-		return s.TransactionManager.AddOperation(channelID, op)
 	}
 
 	if isGet {
@@ -1226,18 +1237,25 @@ func (s *Server) handleBasicReject(conn *protocol.Connection, channelID uint16, 
 	}
 	channel := s.wireChannel(conn, channelID)
 
+	// WS-D §6: tx reject takes the wire tag now (R14) with rollback restore.
+	if s.TransactionManager != nil && s.TransactionManager.IsTransactional(channelID) {
+		known, err := s.txBufferSettlement(conn, channel, channelID, interfaces.OpReject, wireTag, false, requeue)
+		if !known {
+			// WS-B: unknown-tag policy (406 PRECONDITION_FAILED - unknown delivery tag N)
+			s.Log.Debug("Delivery tag already processed (consumer cancelled?)",
+				zap.Uint64("delivery_tag", wireTag),
+				zap.Uint16("channel_id", channelID))
+			return nil
+		}
+		return err
+	}
+
 	msgID, consumerID, isGet, known := s.resolveDeliveryTag(channel, wireTag)
 	if !known {
 		s.Log.Debug("Delivery tag already processed (consumer cancelled?)",
 			zap.Uint64("delivery_tag", wireTag),
 			zap.Uint16("channel_id", channelID))
 		return nil
-	}
-
-	// Buffer into transaction if channel is in transactional mode
-	if s.TransactionManager != nil && s.TransactionManager.IsTransactional(channelID) {
-		op := transaction.NewRejectOperation(consumerID, msgID, requeue)
-		return s.TransactionManager.AddOperation(channelID, op)
 	}
 
 	if isGet {
@@ -1269,9 +1287,22 @@ func (s *Server) handleBasicNack(conn *protocol.Connection, channelID uint16, pa
 	channel := s.wireChannel(conn, channelID)
 	tx := s.TransactionManager != nil && s.TransactionManager.IsTransactional(channelID)
 
+	// WS-D §6: tx nack takes the wire tag(s) now (R14) with rollback restore.
+	if tx {
+		known, err := s.txBufferSettlement(conn, channel, channelID, interfaces.OpNack, wireTag, multiple, requeue)
+		if !known {
+			// WS-B: unknown-tag policy (406 PRECONDITION_FAILED - unknown delivery tag N)
+			s.Log.Debug("Delivery tag already processed (consumer cancelled?)",
+				zap.Uint64("delivery_tag", wireTag),
+				zap.Uint16("channel_id", channelID))
+			return nil
+		}
+		return err
+	}
+
 	// Non-transactional cumulative nack spans every consumer on the channel
 	// (SQ-18), mirroring cumulative ack.
-	if multiple && !tx {
+	if multiple {
 		s.cumulativeSettle(channel, wireTag, settleNack, requeue)
 		if s.MetricsCollector != nil {
 			s.MetricsCollector.RecordMessageRejected()
@@ -1285,11 +1316,6 @@ func (s *Server) handleBasicNack(conn *protocol.Connection, channelID uint16, pa
 			zap.Uint64("delivery_tag", wireTag),
 			zap.Uint16("channel_id", channelID))
 		return nil
-	}
-
-	if tx {
-		op := transaction.NewNackOperation(consumerID, msgID, multiple, requeue)
-		return s.TransactionManager.AddOperation(channelID, op)
 	}
 
 	if isGet {
