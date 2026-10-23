@@ -47,7 +47,7 @@ const (
 	ExchangeBind      = 30 // 40.30 - class ID 40, method ID 30
 	ExchangeBindOK    = 31 // 40.31 - class ID 40, method ID 31
 	ExchangeUnbind    = 40 // 40.40 - class ID 40, method ID 40
-	ExchangeUnbindOK  = 41 // 40.41 - class ID 40, method ID 41
+	ExchangeUnbindOK  = 51 // 40.51 - class ID 40, method ID 51
 )
 
 // Method IDs for queue class
@@ -711,6 +711,17 @@ func clampShortString(s string) string {
 	return s[:end]
 }
 
+// checkShortStr rejects a shortstr method field over 255 bytes. Client-
+// originated methods call it at the top of Serialize: silently truncating an
+// overlong queue/exchange/routing-key/consumer-tag would produce a frame that
+// names a DIFFERENT entity.
+func checkShortStr(field, s string) error {
+	if len(s) > 255 {
+		return fmt.Errorf("%w: %s is %d bytes", ErrShortStringTooLong, field, len(s))
+	}
+	return nil
+}
+
 func EncodeShortString(s string) []byte {
 	s = clampShortString(s)
 	result := make([]byte, 1+len(s))
@@ -1089,6 +1100,28 @@ func decodeLongString(data []byte, offset int) (string, int, error) {
 	return str, offset, nil
 }
 
+// decodeBitOctet returns the AMQP bit-packing octet at offset. AMQP 0-9-1
+// packs consecutive bit fields into ONE octet (first field = bit 0). An absent
+// octet (offset == len(data)) decodes as all-false, matching the tolerance of
+// the existing basic.publish/basic.get decoders.
+func decodeBitOctet(data []byte, offset int) (byte, int) {
+	if offset >= len(data) {
+		return 0, offset
+	}
+	return data[offset], offset + 1
+}
+
+// decodeTrailingTable decodes a method's trailing field-table argument. Absent
+// (offset == len(data)) yields an empty non-nil map. If ANY byte is present the
+// table must decode completely — a 1-3 byte stub or an overrunning length is an
+// error (it means earlier fields were misaligned or the peer is broken).
+func decodeTrailingTable(data []byte, offset int) (map[string]interface{}, int, error) {
+	if offset >= len(data) {
+		return map[string]interface{}{}, offset, nil
+	}
+	return decodeFieldTable(data, offset)
+}
+
 // ExchangeDeclareMethod represents the exchange.declare method
 type ExchangeDeclareMethod struct {
 	Reserved1  uint16
@@ -1104,6 +1137,12 @@ type ExchangeDeclareMethod struct {
 
 // Serialize encodes the ExchangeDeclareMethod into a byte slice
 func (m *ExchangeDeclareMethod) Serialize() ([]byte, error) {
+	if err := checkShortStr("exchange", m.Exchange); err != nil {
+		return nil, err
+	}
+	if err := checkShortStr("type", m.Type); err != nil {
+		return nil, err
+	}
 	var result []byte
 
 	// Reserved1 (uint16)
@@ -1119,14 +1158,7 @@ func (m *ExchangeDeclareMethod) Serialize() ([]byte, error) {
 	typeBytes := encodeShortString(m.Type)
 	result = append(result, typeBytes...)
 
-	// Now we need to pack the flags together:
-	// bits: 0-6: unused (set to 0)
-	// bit 7: passive
-	// bit 8: durable
-	// bit 9: auto-delete
-	// bit 10: internal
-	// bit 11: no-wait
-	// bits 12-15: unused (set to 0)
+	// Flags: ONE octet — b0 passive, b1 durable, b2 auto-delete, b3 internal, b4 no-wait.
 	var flags byte
 	if m.Passive {
 		flags |= (1 << 0)
@@ -1236,76 +1268,40 @@ type ExchangeDeleteMethod struct {
 	NoWait    bool
 }
 
-// Serialize encodes the ExchangeDeleteMethod into a byte slice
+// Serialize encodes the ExchangeDeleteMethod into a byte slice.
+// Wire order: reserved-1 short, exchange shortstr, ONE flag octet
+// (b0 if-unused, b1 no-wait).
 func (m *ExchangeDeleteMethod) Serialize() ([]byte, error) {
-	var result []byte
-
-	// Reserved1 (uint16)
-	reservedBytes := make([]byte, 2)
-	binary.BigEndian.PutUint16(reservedBytes, m.Reserved1)
-	result = append(result, reservedBytes...)
-
-	// Exchange (short string)
-	exchangeBytes := encodeShortString(m.Exchange)
-	result = append(result, exchangeBytes...)
-
-	// Now we need to pack the flags together:
-	// bits: 0-10: unused (set to 0)
-	// bit 11: if-unused
-	// bit 12: no-wait
-	// bits 13-15: unused (set to 0)
-	flags := uint16(0)
+	if err := checkShortStr("exchange", m.Exchange); err != nil {
+		return nil, err
+	}
+	result := make([]byte, 0, 2+1+len(m.Exchange)+1)
+	result = binary.BigEndian.AppendUint16(result, m.Reserved1)
+	result = AppendShortString(result, m.Exchange)
+	var flags byte
 	if m.IfUnused {
-		flags |= (1 << 11) // bit 11
+		flags |= 1 << 0
 	}
 	if m.NoWait {
-		flags |= (1 << 12) // bit 12
+		flags |= 1 << 1
 	}
-
-	flagBytes := make([]byte, 2)
-	binary.BigEndian.PutUint16(flagBytes, flags)
-	result = append(result, flagBytes...)
-
-	return result, nil
+	return append(result, flags), nil
 }
 
 // Deserialize decodes the ExchangeDeleteMethod from a byte slice
 func (m *ExchangeDeleteMethod) Deserialize(data []byte) error {
-	if len(data) < 4 { // Need at least reserved(2) + exchange length byte(1)
+	if len(data) < 4 { // reserved(2) + exchange len(1) + flags(1)
 		return fmt.Errorf("exchange.delete method data too short")
 	}
-
-	offset := 0
-
-	// Reserved1 (uint16)
-	m.Reserved1 = binary.BigEndian.Uint16(data[offset : offset+2])
-	offset += 2
-
-	// Exchange (short string)
-	if offset >= len(data) {
-		return fmt.Errorf("exchange field missing")
-	}
-	exchange, newOffset, err := decodeShortString(data, offset)
-	if err != nil {
+	m.Reserved1 = binary.BigEndian.Uint16(data[0:2])
+	offset := 2
+	var err error
+	if m.Exchange, offset, err = decodeShortString(data, offset); err != nil {
 		return fmt.Errorf("failed to decode exchange name: %v", err)
 	}
-	m.Exchange = exchange
-	offset = newOffset
-
-	// Flags (uint16)
-	if offset+2 > len(data) {
-		// If not enough bytes for flags, use defaults (false for both)
-		m.IfUnused = false
-		m.NoWait = false
-		return nil
-	}
-	flags := binary.BigEndian.Uint16(data[offset : offset+2])
-	offset += 2
-
-	// Extract flags
-	m.IfUnused = (flags & (1 << 11)) != 0
-	m.NoWait = (flags & (1 << 12)) != 0
-
+	flags, _ := decodeBitOctet(data, offset)
+	m.IfUnused = flags&(1<<0) != 0
+	m.NoWait = flags&(1<<1) != 0
 	return nil
 }
 
@@ -1352,6 +1348,9 @@ type QueueDeclareMethod struct {
 
 // Serialize encodes the QueueDeclareMethod into a byte slice
 func (m *QueueDeclareMethod) Serialize() ([]byte, error) {
+	if err := checkShortStr("queue", m.Queue); err != nil {
+		return nil, err
+	}
 	var result []byte
 
 	// Reserved1 (uint16)
@@ -1481,47 +1480,34 @@ type QueueBindMethod struct {
 	Arguments  map[string]interface{}
 }
 
-// Serialize encodes the QueueBindMethod into a byte slice
+// Serialize encodes the QueueBindMethod into a byte slice.
+// Wire order: reserved-1 short, queue shortstr, exchange shortstr,
+// routing-key shortstr, ONE flag octet (b0 no-wait), arguments table.
 func (m *QueueBindMethod) Serialize() ([]byte, error) {
-	var result []byte
-
-	// Reserved1 (uint16)
-	reservedBytes := make([]byte, 2)
-	binary.BigEndian.PutUint16(reservedBytes, m.Reserved1)
-	result = append(result, reservedBytes...)
-
-	// Queue (short string)
-	queueBytes := encodeShortString(m.Queue)
-	result = append(result, queueBytes...)
-
-	// Exchange (short string)
-	exchangeBytes := encodeShortString(m.Exchange)
-	result = append(result, exchangeBytes...)
-
-	// Routing key (short string)
-	routingKeyBytes := encodeShortString(m.RoutingKey)
-	result = append(result, routingKeyBytes...)
-
-	// NoWait (bit packed into flags)
-	// bit 0: no-wait
-	// bits 1-15: unused (set to 0)
-	flags := uint16(0)
-	if m.NoWait {
-		flags |= (1 << 0) // bit 0
+	if err := checkShortStr("queue", m.Queue); err != nil {
+		return nil, err
 	}
-
-	flagBytes := make([]byte, 2)
-	binary.BigEndian.PutUint16(flagBytes, flags)
-	result = append(result, flagBytes...)
-
-	// Arguments (field table)
+	if err := checkShortStr("exchange", m.Exchange); err != nil {
+		return nil, err
+	}
+	if err := checkShortStr("routing-key", m.RoutingKey); err != nil {
+		return nil, err
+	}
 	argsBytes, err := encodeFieldTable(m.Arguments)
 	if err != nil {
 		return nil, err
 	}
-	result = append(result, argsBytes...)
-
-	return result, nil
+	result := make([]byte, 0, 2+3+len(m.Queue)+len(m.Exchange)+len(m.RoutingKey)+1+len(argsBytes))
+	result = binary.BigEndian.AppendUint16(result, m.Reserved1)
+	result = AppendShortString(result, m.Queue)
+	result = AppendShortString(result, m.Exchange)
+	result = AppendShortString(result, m.RoutingKey)
+	var flags byte
+	if m.NoWait {
+		flags |= 1 << 0
+	}
+	result = append(result, flags)
+	return append(result, argsBytes...), nil
 }
 
 // Deserialize decodes the QueueBindMethod from a byte slice
@@ -1529,68 +1515,24 @@ func (m *QueueBindMethod) Deserialize(data []byte) error {
 	if len(data) < 4 {
 		return fmt.Errorf("queue.bind method data too short")
 	}
-
-	offset := 0
-
-	// Reserved1 (uint16)
-	m.Reserved1 = binary.BigEndian.Uint16(data[offset : offset+2])
-	offset += 2
-
-	// Queue (short string)
-	if offset >= len(data) {
-		return fmt.Errorf("queue field missing")
-	}
-	queue, newOffset, err := decodeShortString(data, offset)
-	if err != nil {
+	m.Reserved1 = binary.BigEndian.Uint16(data[0:2])
+	offset := 2
+	var err error
+	if m.Queue, offset, err = decodeShortString(data, offset); err != nil {
 		return fmt.Errorf("failed to decode queue name: %v", err)
 	}
-	m.Queue = queue
-	offset = newOffset
-
-	// Exchange (short string)
-	if offset >= len(data) {
-		return fmt.Errorf("exchange field missing")
-	}
-	exchange, newOffset, err := decodeShortString(data, offset)
-	if err != nil {
+	if m.Exchange, offset, err = decodeShortString(data, offset); err != nil {
 		return fmt.Errorf("failed to decode exchange name: %v", err)
 	}
-	m.Exchange = exchange
-	offset = newOffset
-
-	// Routing key (short string)
-	if offset >= len(data) {
-		return fmt.Errorf("routing key field missing")
-	}
-	routingKey, newOffset, err := decodeShortString(data, offset)
-	if err != nil {
+	if m.RoutingKey, offset, err = decodeShortString(data, offset); err != nil {
 		return fmt.Errorf("failed to decode routing key: %v", err)
 	}
-	m.RoutingKey = routingKey
-	offset = newOffset
-
-	// Flags (uint16)
-	if offset+2 > len(data) {
-		return fmt.Errorf("flags field missing")
+	var flags byte
+	flags, offset = decodeBitOctet(data, offset)
+	m.NoWait = flags&(1<<0) != 0
+	if m.Arguments, _, err = decodeTrailingTable(data, offset); err != nil {
+		return fmt.Errorf("failed to decode arguments: %w", err)
 	}
-	flags := binary.BigEndian.Uint16(data[offset : offset+2])
-	offset += 2
-
-	// Extract flags
-	m.NoWait = (flags & (1 << 0)) != 0
-
-	// Arguments (field table)
-	if offset+4 <= len(data) { // Need at least 4 bytes for the field table length
-		var err error
-		m.Arguments, offset, err = decodeFieldTable(data, offset)
-		if err != nil {
-			return err
-		}
-	} else {
-		// If not enough data for field table, initialize empty arguments map
-		m.Arguments = make(map[string]interface{})
-	}
-
 	return nil
 }
 
@@ -1604,6 +1546,69 @@ func (m *QueueBindOKMethod) Serialize() ([]byte, error) {
 	return []byte{}, nil
 }
 
+// QueueUnbindMethod represents queue.unbind (class 50, method 50).
+// Fields: reserved-1 short, queue shortstr, exchange shortstr, routing-key
+// shortstr, arguments table. NOTE: queue.unbind has NO no-wait bit.
+type QueueUnbindMethod struct {
+	Reserved1  uint16
+	Queue      string
+	Exchange   string
+	RoutingKey string
+	Arguments  map[string]interface{}
+}
+
+// Serialize encodes the QueueUnbindMethod into a byte slice
+func (m *QueueUnbindMethod) Serialize() ([]byte, error) {
+	if err := checkShortStr("queue", m.Queue); err != nil {
+		return nil, err
+	}
+	if err := checkShortStr("exchange", m.Exchange); err != nil {
+		return nil, err
+	}
+	if err := checkShortStr("routing-key", m.RoutingKey); err != nil {
+		return nil, err
+	}
+	argsBytes, err := encodeFieldTable(m.Arguments)
+	if err != nil {
+		return nil, err
+	}
+	result := make([]byte, 0, 2+3+len(m.Queue)+len(m.Exchange)+len(m.RoutingKey)+len(argsBytes))
+	result = binary.BigEndian.AppendUint16(result, m.Reserved1)
+	result = AppendShortString(result, m.Queue)
+	result = AppendShortString(result, m.Exchange)
+	result = AppendShortString(result, m.RoutingKey)
+	return append(result, argsBytes...), nil
+}
+
+// Deserialize decodes the QueueUnbindMethod from a byte slice
+func (m *QueueUnbindMethod) Deserialize(data []byte) error {
+	if len(data) < 5 { // reserved(2) + three shortstr length octets
+		return fmt.Errorf("queue.unbind method data too short")
+	}
+	m.Reserved1 = binary.BigEndian.Uint16(data[0:2])
+	offset := 2
+	var err error
+	if m.Queue, offset, err = decodeShortString(data, offset); err != nil {
+		return fmt.Errorf("failed to decode queue name: %v", err)
+	}
+	if m.Exchange, offset, err = decodeShortString(data, offset); err != nil {
+		return fmt.Errorf("failed to decode exchange name: %v", err)
+	}
+	if m.RoutingKey, offset, err = decodeShortString(data, offset); err != nil {
+		return fmt.Errorf("failed to decode routing key: %v", err)
+	}
+	if m.Arguments, _, err = decodeTrailingTable(data, offset); err != nil {
+		return fmt.Errorf("failed to decode arguments: %w", err)
+	}
+	return nil
+}
+
+// QueueUnbindOKMethod represents queue.unbind-ok (class 50, method 51). Empty.
+type QueueUnbindOKMethod struct{}
+
+// Serialize encodes the QueueUnbindOKMethod into a byte slice
+func (m *QueueUnbindOKMethod) Serialize() ([]byte, error) { return []byte{}, nil }
+
 // QueueDeleteMethod represents the queue.delete method
 type QueueDeleteMethod struct {
 	Reserved1 uint16
@@ -1613,82 +1618,44 @@ type QueueDeleteMethod struct {
 	NoWait    bool
 }
 
-// Serialize encodes the QueueDeleteMethod into a byte slice
+// Serialize encodes the QueueDeleteMethod into a byte slice.
+// Wire order: reserved-1 short, queue shortstr, ONE flag octet
+// (b0 if-unused, b1 if-empty, b2 no-wait).
 func (m *QueueDeleteMethod) Serialize() ([]byte, error) {
-	var result []byte
-
-	// Reserved1 (uint16)
-	reservedBytes := make([]byte, 2)
-	binary.BigEndian.PutUint16(reservedBytes, m.Reserved1)
-	result = append(result, reservedBytes...)
-
-	// Queue (short string)
-	queueBytes := encodeShortString(m.Queue)
-	result = append(result, queueBytes...)
-
-	// Now we need to pack the flags together:
-	// bits: 0-9: unused (set to 0)
-	// bit 10: if-unused
-	// bit 11: if-empty
-	// bit 12: no-wait
-	// bits 13-15: unused (set to 0)
-	flags := uint16(0)
+	if err := checkShortStr("queue", m.Queue); err != nil {
+		return nil, err
+	}
+	result := make([]byte, 0, 2+1+len(m.Queue)+1)
+	result = binary.BigEndian.AppendUint16(result, m.Reserved1)
+	result = AppendShortString(result, m.Queue)
+	var flags byte
 	if m.IfUnused {
-		flags |= (1 << 10) // bit 10
+		flags |= 1 << 0
 	}
 	if m.IfEmpty {
-		flags |= (1 << 11) // bit 11
+		flags |= 1 << 1
 	}
 	if m.NoWait {
-		flags |= (1 << 12) // bit 12
+		flags |= 1 << 2
 	}
-
-	flagBytes := make([]byte, 2)
-	binary.BigEndian.PutUint16(flagBytes, flags)
-	result = append(result, flagBytes...)
-
-	return result, nil
+	return append(result, flags), nil
 }
 
 // Deserialize decodes the QueueDeleteMethod from a byte slice
 func (m *QueueDeleteMethod) Deserialize(data []byte) error {
-	if len(data) < 3 { // Need at least reserved(2) + queue length byte(1)
+	if len(data) < 3 { // reserved(2) + queue len(1)
 		return fmt.Errorf("queue.delete method data too short")
 	}
-
-	offset := 0
-
-	// Reserved1 (uint16)
-	m.Reserved1 = binary.BigEndian.Uint16(data[offset : offset+2])
-	offset += 2
-
-	// Queue (short string)
-	if offset >= len(data) {
-		return fmt.Errorf("queue field missing")
-	}
-	queue, newOffset, err := decodeShortString(data, offset)
-	if err != nil {
+	m.Reserved1 = binary.BigEndian.Uint16(data[0:2])
+	offset := 2
+	var err error
+	if m.Queue, offset, err = decodeShortString(data, offset); err != nil {
 		return fmt.Errorf("failed to decode queue name: %v", err)
 	}
-	m.Queue = queue
-	offset = newOffset
-
-	// Flags (uint16)
-	if offset+2 > len(data) {
-		// If not enough bytes for flags, use defaults (false for all)
-		m.IfUnused = false
-		m.IfEmpty = false
-		m.NoWait = false
-		return nil
-	}
-	flags := binary.BigEndian.Uint16(data[offset : offset+2])
-	offset += 2
-
-	// Extract flags
-	m.IfUnused = (flags & (1 << 10)) != 0
-	m.IfEmpty = (flags & (1 << 11)) != 0
-	m.NoWait = (flags & (1 << 12)) != 0
-
+	flags, _ := decodeBitOctet(data, offset)
+	m.IfUnused = flags&(1<<0) != 0
+	m.IfEmpty = flags&(1<<1) != 0
+	m.NoWait = flags&(1<<2) != 0
 	return nil
 }
 
@@ -1716,59 +1683,35 @@ type QueuePurgeMethod struct {
 	NoWait    bool
 }
 
-// Serialize encodes the QueuePurgeMethod into a byte slice
+// Serialize encodes the QueuePurgeMethod into a byte slice.
+// Wire order: reserved-1 short, queue shortstr, ONE flag octet (b0 no-wait).
 func (m *QueuePurgeMethod) Serialize() ([]byte, error) {
-	var result []byte
-
-	// Reserved1 (uint16)
-	reservedBytes := make([]byte, 2)
-	binary.BigEndian.PutUint16(reservedBytes, m.Reserved1)
-	result = append(result, reservedBytes...)
-
-	// Queue (short string)
-	queueBytes := encodeShortString(m.Queue)
-	result = append(result, queueBytes...)
-
-	// Flags (uint16) — bit 0: no-wait
-	flags := uint16(0)
-	if m.NoWait {
-		flags |= (1 << 0)
+	if err := checkShortStr("queue", m.Queue); err != nil {
+		return nil, err
 	}
-	flagBytes := make([]byte, 2)
-	binary.BigEndian.PutUint16(flagBytes, flags)
-	result = append(result, flagBytes...)
-
-	return result, nil
+	result := make([]byte, 0, 2+1+len(m.Queue)+1)
+	result = binary.BigEndian.AppendUint16(result, m.Reserved1)
+	result = AppendShortString(result, m.Queue)
+	var flags byte
+	if m.NoWait {
+		flags |= 1 << 0
+	}
+	return append(result, flags), nil
 }
 
 // Deserialize decodes the QueuePurgeMethod from a byte slice
 func (m *QueuePurgeMethod) Deserialize(data []byte) error {
-	if len(data) < 3 { // Need at least reserved(2) + queue length byte(1)
+	if len(data) < 3 {
 		return fmt.Errorf("queue.purge method data too short")
 	}
-
-	offset := 0
-
-	// Reserved1 (uint16)
-	m.Reserved1 = binary.BigEndian.Uint16(data[offset : offset+2])
-	offset += 2
-
-	// Queue (short string)
-	queue, newOffset, err := decodeShortString(data, offset)
-	if err != nil {
+	m.Reserved1 = binary.BigEndian.Uint16(data[0:2])
+	offset := 2
+	var err error
+	if m.Queue, offset, err = decodeShortString(data, offset); err != nil {
 		return fmt.Errorf("failed to decode queue name: %v", err)
 	}
-	m.Queue = queue
-	offset = newOffset
-
-	// Flags (uint16)
-	if offset+2 > len(data) {
-		m.NoWait = false
-		return nil
-	}
-	flags := binary.BigEndian.Uint16(data[offset : offset+2])
-	m.NoWait = (flags & (1 << 0)) != 0
-
+	flags, _ := decodeBitOctet(data, offset)
+	m.NoWait = flags&(1<<0) != 0
 	return nil
 }
 
@@ -1870,6 +1813,12 @@ type BasicPublishMethod struct {
 
 // Serialize encodes the BasicPublishMethod into a byte slice
 func (m *BasicPublishMethod) Serialize() ([]byte, error) {
+	if err := checkShortStr("exchange", m.Exchange); err != nil {
+		return nil, err
+	}
+	if err := checkShortStr("routing-key", m.RoutingKey); err != nil {
+		return nil, err
+	}
 	var result []byte
 
 	// Reserved1 (uint16)
@@ -1976,6 +1925,12 @@ type BasicConsumeMethod struct {
 
 // Serialize encodes the BasicConsumeMethod into a byte slice
 func (m *BasicConsumeMethod) Serialize() ([]byte, error) {
+	if err := checkShortStr("queue", m.Queue); err != nil {
+		return nil, err
+	}
+	if err := checkShortStr("consumer-tag", m.ConsumerTag); err != nil {
+		return nil, err
+	}
 	var result []byte
 
 	// Reserved1 (uint16)
@@ -2118,60 +2073,33 @@ type BasicCancelMethod struct {
 	NoWait      bool
 }
 
-// Serialize encodes the BasicCancelMethod into a byte slice
+// Serialize encodes the BasicCancelMethod into a byte slice.
+// Wire order: consumer-tag shortstr, ONE flag octet (b0 no-wait).
 func (m *BasicCancelMethod) Serialize() ([]byte, error) {
-	var result []byte
-
-	// Consumer tag (short string)
-	consumerTagBytes := encodeShortString(m.ConsumerTag)
-	result = append(result, consumerTagBytes...)
-
-	// NoWait (packed into flags)
-	// bit 0: no-wait
-	// bits 1-15: unused
-	flags := uint16(0)
-	if m.NoWait {
-		flags |= (1 << 0)
+	if err := checkShortStr("consumer-tag", m.ConsumerTag); err != nil {
+		return nil, err
 	}
-
-	flagBytes := make([]byte, 2)
-	binary.BigEndian.PutUint16(flagBytes, flags)
-	result = append(result, flagBytes...)
-
-	return result, nil
+	result := make([]byte, 0, 1+len(m.ConsumerTag)+1)
+	result = AppendShortString(result, m.ConsumerTag)
+	var flags byte
+	if m.NoWait {
+		flags |= 1 << 0
+	}
+	return append(result, flags), nil
 }
 
 // Deserialize decodes the BasicCancelMethod from a byte slice
 func (m *BasicCancelMethod) Deserialize(data []byte) error {
-	if len(data) < 1 { // Need at least consumer tag length byte
+	if len(data) < 1 {
 		return fmt.Errorf("basic.cancel method data too short")
 	}
-
-	offset := 0
-
-	// Consumer tag (short string)
-	if offset >= len(data) {
-		return fmt.Errorf("consumer tag field missing")
-	}
-	consumerTag, newOffset, err := decodeShortString(data, offset)
+	tag, offset, err := decodeShortString(data, 0)
 	if err != nil {
 		return fmt.Errorf("failed to decode consumer tag: %v", err)
 	}
-	m.ConsumerTag = consumerTag
-	offset = newOffset
-
-	// Flags (uint16)
-	if offset+2 <= len(data) {
-		flags := binary.BigEndian.Uint16(data[offset : offset+2])
-		offset += 2
-
-		// Extract flags
-		m.NoWait = (flags & (1 << 0)) != 0
-	} else {
-		// Default to false if flags not provided
-		m.NoWait = false
-	}
-
+	m.ConsumerTag = tag
+	flags, _ := decodeBitOctet(data, offset)
+	m.NoWait = flags&(1<<0) != 0
 	return nil
 }
 
@@ -2200,6 +2128,9 @@ type BasicGetMethod struct {
 
 // Serialize encodes the BasicGetMethod into a byte slice
 func (m *BasicGetMethod) Serialize() ([]byte, error) {
+	if err := checkShortStr("queue", m.Queue); err != nil {
+		return nil, err
+	}
 	var result []byte
 
 	// Reserved1 (uint16)
@@ -2696,118 +2627,59 @@ type ExchangeUnbindMethod struct {
 	Arguments   map[string]interface{}
 }
 
-// Serialize encodes the ExchangeUnbindMethod into a byte slice
+// Serialize encodes the ExchangeUnbindMethod into a byte slice.
+// Wire order: reserved-1 short, destination shortstr, source shortstr,
+// routing-key shortstr, ONE flag octet (b0 no-wait), arguments table.
 func (m *ExchangeUnbindMethod) Serialize() ([]byte, error) {
-	var result []byte
-
-	// Reserved1 (uint16)
-	reservedBytes := make([]byte, 2)
-	binary.BigEndian.PutUint16(reservedBytes, m.Reserved1)
-	result = append(result, reservedBytes...)
-
-	// Destination (short string)
-	destBytes := encodeShortString(m.Destination)
-	result = append(result, destBytes...)
-
-	// Source (short string)
-	sourceBytes := encodeShortString(m.Source)
-	result = append(result, sourceBytes...)
-
-	// Routing key (short string)
-	routingKeyBytes := encodeShortString(m.RoutingKey)
-	result = append(result, routingKeyBytes...)
-
-	// Flags (packed into uint16)
-	// bit 0: no-wait
-	// bits 1-15: unused (set to 0)
-	flags := uint16(0)
-	if m.NoWait {
-		flags |= (1 << 0) // bit 0
+	if err := checkShortStr("destination", m.Destination); err != nil {
+		return nil, err
 	}
-
-	flagBytes := make([]byte, 2)
-	binary.BigEndian.PutUint16(flagBytes, flags)
-	result = append(result, flagBytes...)
-
-	// Arguments (field table)
+	if err := checkShortStr("source", m.Source); err != nil {
+		return nil, err
+	}
+	if err := checkShortStr("routing-key", m.RoutingKey); err != nil {
+		return nil, err
+	}
 	argsBytes, err := encodeFieldTable(m.Arguments)
 	if err != nil {
 		return nil, err
 	}
-	result = append(result, argsBytes...)
-
-	return result, nil
+	result := make([]byte, 0, 2+3+len(m.Destination)+len(m.Source)+len(m.RoutingKey)+1+len(argsBytes))
+	result = binary.BigEndian.AppendUint16(result, m.Reserved1)
+	result = AppendShortString(result, m.Destination)
+	result = AppendShortString(result, m.Source)
+	result = AppendShortString(result, m.RoutingKey)
+	var flags byte
+	if m.NoWait {
+		flags |= 1 << 0
+	}
+	result = append(result, flags)
+	return append(result, argsBytes...), nil
 }
 
 // Deserialize decodes the ExchangeUnbindMethod from a byte slice
 func (m *ExchangeUnbindMethod) Deserialize(data []byte) error {
-	if len(data) < 4 { // Need at least reserved(2) + destination length byte(1)
+	if len(data) < 4 {
 		return fmt.Errorf("exchange.unbind method data too short")
 	}
-
-	offset := 0
-
-	// Reserved1 (uint16)
-	m.Reserved1 = binary.BigEndian.Uint16(data[offset : offset+2])
-	offset += 2
-
-	// Destination (short string)
-	if offset >= len(data) {
-		return fmt.Errorf("destination field missing")
-	}
-	dest, newOffset, err := decodeShortString(data, offset)
-	if err != nil {
+	m.Reserved1 = binary.BigEndian.Uint16(data[0:2])
+	offset := 2
+	var err error
+	if m.Destination, offset, err = decodeShortString(data, offset); err != nil {
 		return fmt.Errorf("failed to decode destination: %v", err)
 	}
-	m.Destination = dest
-	offset = newOffset
-
-	// Source (short string)
-	if offset >= len(data) {
-		return fmt.Errorf("source field missing")
-	}
-	source, newOffset, err := decodeShortString(data, offset)
-	if err != nil {
+	if m.Source, offset, err = decodeShortString(data, offset); err != nil {
 		return fmt.Errorf("failed to decode source: %v", err)
 	}
-	m.Source = source
-	offset = newOffset
-
-	// Routing key (short string)
-	if offset >= len(data) {
-		return fmt.Errorf("routing key field missing")
-	}
-	routingKey, newOffset, err := decodeShortString(data, offset)
-	if err != nil {
+	if m.RoutingKey, offset, err = decodeShortString(data, offset); err != nil {
 		return fmt.Errorf("failed to decode routing key: %v", err)
 	}
-	m.RoutingKey = routingKey
-	offset = newOffset
-
-	// Flags (uint16)
-	if offset+2 > len(data) {
-		// If not enough bytes for flags, use defaults (false for no-wait)
-		m.NoWait = false
-		return nil
+	var flags byte
+	flags, offset = decodeBitOctet(data, offset)
+	m.NoWait = flags&(1<<0) != 0
+	if m.Arguments, _, err = decodeTrailingTable(data, offset); err != nil {
+		return fmt.Errorf("failed to decode arguments: %w", err)
 	}
-	flags := binary.BigEndian.Uint16(data[offset : offset+2])
-	offset += 2
-
-	// Extract flags
-	m.NoWait = (flags & (1 << 0)) != 0
-
-	// Arguments (field table)
-	if offset < len(data) {
-		var err error
-		m.Arguments, offset, err = decodeFieldTable(data, offset)
-		if err != nil {
-			return err
-		}
-	} else {
-		// If no more data, initialize empty arguments map
-		m.Arguments = make(map[string]interface{})
-	}
-
 	return nil
 }
 
@@ -2821,46 +2693,34 @@ type ExchangeBindMethod struct {
 	Arguments   map[string]interface{}
 }
 
-// Serialize encodes the ExchangeBindMethod into a byte slice
+// Serialize encodes the ExchangeBindMethod into a byte slice.
+// Wire order: reserved-1 short, destination shortstr, source shortstr,
+// routing-key shortstr, ONE flag octet (b0 no-wait), arguments table.
 func (m *ExchangeBindMethod) Serialize() ([]byte, error) {
-	var result []byte
-
-	// Reserved1 (uint16)
-	reservedBytes := make([]byte, 2)
-	binary.BigEndian.PutUint16(reservedBytes, m.Reserved1)
-	result = append(result, reservedBytes...)
-
-	// Destination (short string)
-	destBytes := encodeShortString(m.Destination)
-	result = append(result, destBytes...)
-
-	// Source (short string)
-	sourceBytes := encodeShortString(m.Source)
-	result = append(result, sourceBytes...)
-
-	// Routing key (short string)
-	routingKeyBytes := encodeShortString(m.RoutingKey)
-	result = append(result, routingKeyBytes...)
-
-	// Flags (packed into uint16)
-	// bit 0: no-wait
-	flags := uint16(0)
-	if m.NoWait {
-		flags |= (1 << 0)
+	if err := checkShortStr("destination", m.Destination); err != nil {
+		return nil, err
 	}
-
-	flagBytes := make([]byte, 2)
-	binary.BigEndian.PutUint16(flagBytes, flags)
-	result = append(result, flagBytes...)
-
-	// Arguments (field table)
+	if err := checkShortStr("source", m.Source); err != nil {
+		return nil, err
+	}
+	if err := checkShortStr("routing-key", m.RoutingKey); err != nil {
+		return nil, err
+	}
 	argsBytes, err := encodeFieldTable(m.Arguments)
 	if err != nil {
 		return nil, err
 	}
-	result = append(result, argsBytes...)
-
-	return result, nil
+	result := make([]byte, 0, 2+3+len(m.Destination)+len(m.Source)+len(m.RoutingKey)+1+len(argsBytes))
+	result = binary.BigEndian.AppendUint16(result, m.Reserved1)
+	result = AppendShortString(result, m.Destination)
+	result = AppendShortString(result, m.Source)
+	result = AppendShortString(result, m.RoutingKey)
+	var flags byte
+	if m.NoWait {
+		flags |= 1 << 0
+	}
+	result = append(result, flags)
+	return append(result, argsBytes...), nil
 }
 
 // Deserialize decodes the ExchangeBindMethod from a byte slice
@@ -2868,68 +2728,24 @@ func (m *ExchangeBindMethod) Deserialize(data []byte) error {
 	if len(data) < 4 {
 		return fmt.Errorf("exchange.bind method data too short")
 	}
-
-	offset := 0
-
-	// Reserved1 (uint16)
-	m.Reserved1 = binary.BigEndian.Uint16(data[offset : offset+2])
-	offset += 2
-
-	// Destination (short string)
-	if offset >= len(data) {
-		return fmt.Errorf("destination field missing")
-	}
-	dest, newOffset, err := decodeShortString(data, offset)
-	if err != nil {
+	m.Reserved1 = binary.BigEndian.Uint16(data[0:2])
+	offset := 2
+	var err error
+	if m.Destination, offset, err = decodeShortString(data, offset); err != nil {
 		return fmt.Errorf("failed to decode destination: %v", err)
 	}
-	m.Destination = dest
-	offset = newOffset
-
-	// Source (short string)
-	if offset >= len(data) {
-		return fmt.Errorf("source field missing")
-	}
-	source, newOffset, err := decodeShortString(data, offset)
-	if err != nil {
+	if m.Source, offset, err = decodeShortString(data, offset); err != nil {
 		return fmt.Errorf("failed to decode source: %v", err)
 	}
-	m.Source = source
-	offset = newOffset
-
-	// Routing key (short string)
-	if offset >= len(data) {
-		return fmt.Errorf("routing key field missing")
-	}
-	routingKey, newOffset, err := decodeShortString(data, offset)
-	if err != nil {
+	if m.RoutingKey, offset, err = decodeShortString(data, offset); err != nil {
 		return fmt.Errorf("failed to decode routing key: %v", err)
 	}
-	m.RoutingKey = routingKey
-	offset = newOffset
-
-	// Flags (uint16)
-	if offset+2 > len(data) {
-		m.NoWait = false
-		return nil
+	var flags byte
+	flags, offset = decodeBitOctet(data, offset)
+	m.NoWait = flags&(1<<0) != 0
+	if m.Arguments, _, err = decodeTrailingTable(data, offset); err != nil {
+		return fmt.Errorf("failed to decode arguments: %w", err)
 	}
-	flags := binary.BigEndian.Uint16(data[offset : offset+2])
-	offset += 2
-
-	// Extract flags
-	m.NoWait = (flags & (1 << 0)) != 0
-
-	// Arguments (field table)
-	if offset < len(data) {
-		var err error
-		m.Arguments, offset, err = decodeFieldTable(data, offset)
-		if err != nil {
-			return err
-		}
-	} else {
-		m.Arguments = make(map[string]interface{})
-	}
-
 	return nil
 }
 

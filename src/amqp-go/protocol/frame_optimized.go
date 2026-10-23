@@ -24,6 +24,25 @@ import (
 
 const MaxInboundFrameSize = 128 * 1024 * 1024
 
+// checkFrameSize rejects a frame whose TOTAL wire size exceeds maxSize.
+// maxSize == 0 means "no negotiated limit" and applies MaxInboundFrameSize —
+// the reader never allocates an unbounded payload. uint64 math: size+8 can
+// overflow uint32.
+func checkFrameSize(payloadSize, maxSize uint32) error {
+	if maxSize == 0 {
+		maxSize = MaxInboundFrameSize
+	}
+	if uint64(payloadSize)+FrameOverhead > uint64(maxSize) {
+		return fmt.Errorf("%w: %d-byte frame (payload %d + %d overhead) exceeds max %d",
+			ErrFrameTooLarge, uint64(payloadSize)+FrameOverhead, payloadSize, FrameOverhead, maxSize)
+	}
+	return nil
+}
+
+// ReadFrameOptimizedWithLimit reads one frame, rejecting it (ErrFrameTooLarge)
+// when its TOTAL wire size exceeds maxSize. maxSize is the negotiated
+// frame-max, which counts the 7-byte header and the frame-end octet; a zero
+// maxSize applies the MaxInboundFrameSize hard cap.
 func ReadFrameOptimizedWithLimit(reader io.Reader, maxSize uint32) (*Frame, error) {
 	headerPtr := getFrameHeader()
 	header := *headerPtr
@@ -38,8 +57,8 @@ func ReadFrameOptimizedWithLimit(reader io.Reader, maxSize uint32) (*Frame, erro
 	channel := binary.BigEndian.Uint16(header[1:3])
 	size := binary.BigEndian.Uint32(header[3:7])
 
-	if size > maxSize {
-		return nil, fmt.Errorf("frame size %d exceeds max %d", size, maxSize)
+	if err := checkFrameSize(size, maxSize); err != nil {
+		return nil, err
 	}
 
 	payload := make([]byte, size+1)

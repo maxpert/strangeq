@@ -1922,12 +1922,59 @@ func (b *StorageBroker) BindQueue(queueName, exchangeName, routingKey string, ar
 	return nil
 }
 
-// UnbindQueue removes a binding between queue and exchange
+// UnbindQueue removes a binding between queue and exchange, matching on
+// (queue, exchange, routing-key) only. Kept for UnifiedBroker compatibility;
+// the AMQP queue.unbind path uses UnbindQueueWithArguments.
 func (b *StorageBroker) UnbindQueue(queueName, exchangeName, routingKey string) error {
 	if err := b.storage.DeleteBinding(queueName, exchangeName, routingKey); err != nil {
 		return err
 	}
+	b.autoDeleteExchangeIfUnbound(exchangeName)
+	return nil
+}
 
+// UnbindQueueWithArguments removes the binding identified by the full AMQP
+// 0-9-1 binding key (queue, exchange, routing-key, arguments). If no binding
+// exists for the triple, or the stored binding's arguments differ (compared
+// with protocol.FieldTablesEqual, so nil == empty and persisted-type drift is
+// tolerated), it is a successful no-op — the binding the client named does not
+// exist, and queue.unbind of a nonexistent binding replies unbind-ok.
+//
+// Holds the queue's create mutex across the read-compare-delete so a
+// concurrent BindQueue (which stores under the same mutex, see BindQueue) can
+// not swap the arguments between the compare and the delete.
+//
+// Storage keys bindings by the triple, so two bindings that differ only in
+// arguments cannot coexist (a later BindQueue overwrites the arguments). That
+// limitation is WS-D's; this method only guarantees an arguments-qualified
+// unbind never removes a binding with different arguments.
+func (b *StorageBroker) UnbindQueueWithArguments(queueName, exchangeName, routingKey string, arguments map[string]interface{}) error {
+	cmu := b.getQueueCreateMutex(queueName)
+	cmu.Lock()
+	existing, err := b.storage.GetBinding(queueName, exchangeName, routingKey)
+	if err != nil {
+		cmu.Unlock()
+		if errors.Is(err, interfaces.ErrBindingNotFound) {
+			return nil
+		}
+		return err
+	}
+	if !protocol.FieldTablesEqual(existing.Arguments, arguments) {
+		cmu.Unlock()
+		return nil
+	}
+	err = b.storage.DeleteBinding(queueName, exchangeName, routingKey)
+	cmu.Unlock()
+	if err != nil {
+		return err
+	}
+	b.autoDeleteExchangeIfUnbound(exchangeName)
+	return nil
+}
+
+// autoDeleteExchangeIfUnbound deletes an auto-delete exchange once it has no
+// remaining queue or exchange bindings (moved verbatim from UnbindQueue).
+func (b *StorageBroker) autoDeleteExchangeIfUnbound(exchangeName string) {
 	if exch, err := b.storage.GetExchange(exchangeName); err == nil && exch.AutoDelete {
 		bindings, _ := b.storage.GetExchangeBindings(exchangeName)
 		fromBindings, _ := b.storage.GetExchangeBindingsFrom(exchangeName)
@@ -1935,8 +1982,6 @@ func (b *StorageBroker) UnbindQueue(queueName, exchangeName, routingKey string) 
 			b.DeleteExchange(exchangeName, false)
 		}
 	}
-
-	return nil
 }
 
 // BindExchange binds a destination exchange to a source exchange with a routing key.

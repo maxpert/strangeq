@@ -229,14 +229,9 @@ func (s *Server) handleQueueBind(conn *protocol.Connection, channelID uint16, pa
 	return s.sendQueueBindOK(conn, channelID)
 }
 
-// handleQueueUnbind handles the queue.unbind method
+// handleQueueUnbind handles the queue.unbind method (50.50).
 func (s *Server) handleQueueUnbind(conn *protocol.Connection, channelID uint16, payload []byte) error {
-	// Deserialize the queue.unbind method
-	// We need to create a structure for this, but for now we'll implement a basic approach
-	// The queue.unbind method has similar structure to queue.bind but without arguments
-
-	// Create a temporary approach - reuse QueueBindMethod for deserialization since structure is similar
-	unbindMethod := &protocol.QueueBindMethod{}
+	unbindMethod := &protocol.QueueUnbindMethod{}
 	err := unbindMethod.Deserialize(payload)
 	if err != nil {
 		s.Log.Error("Failed to deserialize queue.unbind",
@@ -276,12 +271,13 @@ func (s *Server) handleQueueUnbind(conn *protocol.Connection, channelID uint16, 
 		return s.authzChannelError(conn, channelID, err, 50, 50)
 	}
 
-	// Call the broker to unbind the queue
-	err = s.Broker.UnbindQueue(
-		queueName,
-		unbindMethod.Exchange,
-		unbindMethod.RoutingKey,
-	)
+	// AMQP 0-9-1 binding identity includes the arguments table: only the
+	// binding whose arguments match may be removed.
+	if sb, ok := s.Broker.(*StorageBrokerAdapter); ok {
+		err = sb.broker.UnbindQueueWithArguments(queueName, unbindMethod.Exchange, unbindMethod.RoutingKey, unbindMethod.Arguments)
+	} else {
+		err = s.Broker.UnbindQueue(queueName, unbindMethod.Exchange, unbindMethod.RoutingKey)
+	}
 
 	if err != nil {
 		s.Log.Error("Failed to unbind queue",

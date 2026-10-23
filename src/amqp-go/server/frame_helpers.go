@@ -106,7 +106,7 @@ func (s *Server) sendExchangeBindOK(conn *protocol.Connection, channelID uint16)
 
 // sendExchangeUnbindOK sends the exchange.unbind-ok method frame
 func (s *Server) sendExchangeUnbindOK(conn *protocol.Connection, channelID uint16) error {
-	return s.sendMethodResponse(conn, channelID, 40, 41, &protocol.ExchangeUnbindOKMethod{})
+	return s.sendMethodResponse(conn, channelID, 40, protocol.ExchangeUnbindOK, &protocol.ExchangeUnbindOKMethod{})
 }
 
 // sendQueueDeclareOK sends the queue.declare-ok method frame

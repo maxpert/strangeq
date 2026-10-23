@@ -324,7 +324,7 @@ func TestExchangeMethodsSerialization(t *testing.T) {
 
 	t.Run("ExchangeUnbindOK", func(t *testing.T) {
 		method := &ExchangeUnbindOKMethod{}
-		testMethodSerialization(t, "ExchangeUnbindOK", 40, 41, method.Serialize)
+		testMethodSerialization(t, "ExchangeUnbindOK", 40, 51, method.Serialize)
 	})
 }
 

@@ -16,6 +16,11 @@ const (
 	FrameEnd       = 0xCE // Frame end marker byte
 )
 
+// FrameOverhead is the non-payload size of every AMQP frame: type(1) +
+// channel(2) + size(4) + frame-end(1). frame-max (connection.tune) bounds the
+// WHOLE frame, so the largest legal payload is frame-max - FrameOverhead.
+const FrameOverhead = 8
+
 // Frame represents an AMQP frame
 type Frame struct {
 	Type    byte
@@ -87,8 +92,8 @@ func ReadFrameWithLimit(reader io.Reader, maxSize uint32) (*Frame, error) {
 	channel := binary.BigEndian.Uint16(header[1:3])
 	size := binary.BigEndian.Uint32(header[3:7])
 
-	if size > maxSize {
-		return nil, fmt.Errorf("frame size %d exceeds max %d", size, maxSize)
+	if err := checkFrameSize(size, maxSize); err != nil {
+		return nil, err
 	}
 
 	// Read the payload + end-byte

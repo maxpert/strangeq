@@ -48,7 +48,7 @@ func TestReadFrameOptimizedRejectsMaxUint32(t *testing.T) {
 	}
 }
 
-func TestReadFrameOptimizedAcceptsAtLimit(t *testing.T) {
+func TestReadFrameOptimizedAcceptsAtLimitIncludingOverhead(t *testing.T) {
 	maxSize := uint32(16)
 	payload := []byte{0x00, 0x0A, 0x00, 0x0B}
 	frame := &Frame{Type: FrameMethod, Channel: 1, Size: uint32(len(payload)), Payload: payload}
@@ -56,9 +56,10 @@ func TestReadFrameOptimizedAcceptsAtLimit(t *testing.T) {
 	if err != nil {
 		t.Fatalf("MarshalBinary failed: %v", err)
 	}
-	binary.BigEndian.PutUint32(data[3:7], maxSize)
+	// frame-max bounds the WHOLE frame: payload may be at most maxSize - FrameOverhead.
+	binary.BigEndian.PutUint32(data[3:7], maxSize-FrameOverhead)
 
-	body := make([]byte, maxSize)
+	body := make([]byte, maxSize-FrameOverhead)
 	copy(body, payload)
 	data = append(data[:7], append(body, FrameEnd)...)
 
@@ -146,7 +147,7 @@ func TestReadFrameWithLimitRejectsMaxUint32(t *testing.T) {
 	}
 }
 
-func TestReadFrameWithLimitAcceptsAtLimit(t *testing.T) {
+func TestReadFrameWithLimitAcceptsAtLimitIncludingOverhead(t *testing.T) {
 	maxSize := uint32(16)
 	payload := []byte{0x00, 0x0A, 0x00, 0x0B}
 	frame := &Frame{Type: FrameMethod, Channel: 1, Size: uint32(len(payload)), Payload: payload}
@@ -154,9 +155,10 @@ func TestReadFrameWithLimitAcceptsAtLimit(t *testing.T) {
 	if err != nil {
 		t.Fatalf("MarshalBinary failed: %v", err)
 	}
-	binary.BigEndian.PutUint32(data[3:7], maxSize)
+	// frame-max bounds the WHOLE frame: payload may be at most maxSize - FrameOverhead.
+	binary.BigEndian.PutUint32(data[3:7], maxSize-FrameOverhead)
 
-	body := make([]byte, maxSize)
+	body := make([]byte, maxSize-FrameOverhead)
 	copy(body, payload)
 	data = append(data[:7], append(body, FrameEnd)...)
 
