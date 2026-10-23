@@ -6,6 +6,7 @@ package main
 import (
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/maxpert/amqp-go/interfaces"
 	amqp "github.com/rabbitmq/amqp091-go"
@@ -203,10 +204,13 @@ func TestHeaders_BindingSurvivesRestart(t *testing.T) {
 		Body:         []byte("after"),
 	}))
 
-	// The recovered binding (CBOR uint64) matches the int32 header.
-	msg, ok, err := ch2.Get("hq", true)
-	require.NoError(t, err)
+	// The recovered binding (CBOR uint64) matches the int32 header. Durable
+	// publishes become visible on the group-commit fsync completion, so a
+	// synchronous basic.get must poll (same discipline as getOne in the
+	// conformance harness; this test's immediate get raced the fsync).
+	msg, ok := getWithin(ch2, "hq", 3*time.Second)
 	require.True(t, ok, "the binding survived the restart and routes (CBOR-width parity)")
+	assert.Equal(t, "after", string(msg.Body))
 
 	// And a mismatching header does NOT route.
 	require.NoError(t, ch2.Publish("hx", "", false, false, amqp.Publishing{
@@ -214,12 +218,23 @@ func TestHeaders_BindingSurvivesRestart(t *testing.T) {
 		DeliveryMode: 2,
 		Body:         []byte("never"),
 	}))
-	// Drain "after", then expect empty.
-	msg, ok, err = ch2.Get("hq", true)
-	require.NoError(t, err)
-	require.True(t, ok)
-	_ = msg
-	_, ok, err = ch2.Get("hq", true)
-	require.NoError(t, err)
+	_, ok = getWithin(ch2, "hq", 500*time.Millisecond)
 	assert.False(t, ok, "a mismatching header never routes")
+}
+
+// getWithin polls basic.get (autoAck=true) until a delivery arrives or the
+// timeout elapses. Local twin of the conformance harness's getOne, which sits
+// behind the conformance build tag.
+func getWithin(ch *amqp.Channel, queue string, timeout time.Duration) (amqp.Delivery, bool) {
+	deadline := time.Now().Add(timeout)
+	for {
+		d, ok, err := ch.Get(queue, true)
+		if err == nil && ok {
+			return d, true
+		}
+		if time.Now().After(deadline) {
+			return amqp.Delivery{}, false
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
 }
