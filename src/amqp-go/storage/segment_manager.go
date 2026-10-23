@@ -1374,8 +1374,14 @@ func (qs *QueueSegments) writeMessage(message *protocol.Message, offset uint64) 
 	qs.mutex.Lock()
 	defer qs.mutex.Unlock()
 
-	if qs.currentSegment == nil {
-		return fmt.Errorf("no active segment")
+	// WS-C review finding 3: the same poison gate as writeMessageBatchDurable.
+	// A poisoned (diverged) active segment must never be appended to; retire
+	// it and open a fresh one first, or refuse the write if no replacement can
+	// be opened.
+	if qs.currentSegment == nil || qs.segPoisoned != nil {
+		if err := qs.replaceActiveSegmentLocked(); err != nil {
+			return fmt.Errorf("segment unavailable: %w", err)
+		}
 	}
 
 	// Serialize message
