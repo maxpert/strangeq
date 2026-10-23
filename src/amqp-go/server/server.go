@@ -421,8 +421,8 @@ func (s *Server) handleConnection(conn net.Conn) {
 	}
 
 	// Process frames for this connection
-	// Note: consumerDeliveryLoop is started later in processConnectionFrames
-	// after the handshake completes (line 312)
+	// Note: consumerDeliveryLoop is started later in processConnectionFrames,
+	// after the handshake completes.
 	defer s.finishConnection(rt) // cleanupConnection (recover-guarded) + runtimes.Delete + close(rt.torndown)
 	s.processConnectionFrames(connection)
 }
@@ -976,6 +976,7 @@ func (s *Server) readFrames(rt *connRuntime, done chan struct{}) {
 				pending = pending[1:]
 				continue
 			case <-conn.Done:
+				conn.FrameQueueBytes.Add(-headCost) // rollback: not handed off
 				return
 			default:
 				conn.FrameQueueBytes.Add(-headCost) // rollback: not handed off

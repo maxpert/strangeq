@@ -12,9 +12,11 @@ import (
 
 // resolveQueueName resolves an empty queue name to the channel's "current
 // queue" (the last queue declared on the channel), per AMQP 0.9.1 spec
-// "queue-known" rule. Returns the resolved name, or an error if the name
-// is empty and no queue was previously declared on the channel (spec:
-// "this will result in a 502 (syntax error) channel exception").
+// "queue-known" rule. Returns the resolved name, or errNoCurrentQueue if the
+// name is empty and no queue was previously declared on the channel; the
+// dispatcher maps errNoCurrentQueue to 404 NOT_FOUND (classify in
+// amqp_errors.go), matching RabbitMQ's expand_queue_name_shortcut — the
+// AMQP-XML "502" for this case is a hard code and would kill the connection.
 func resolveQueueName(conn *protocol.Connection, channelID uint16, queueName string) (string, error) {
 	if queueName != "" {
 		return queueName, nil
