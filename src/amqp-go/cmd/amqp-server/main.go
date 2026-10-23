@@ -1,24 +1,28 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
+	"io"
 	"log"
+	"net/http"
 	"os"
-	"os/exec"
 	"os/signal"
+	"path/filepath"
 	"runtime"
+	"strconv"
+	"sync/atomic"
 	"syscall"
 	"time"
 
 	"github.com/maxpert/amqp-go/config"
 	"github.com/maxpert/amqp-go/metrics"
 	"github.com/maxpert/amqp-go/server"
-	"golang.org/x/sys/unix"
+	"go.uber.org/zap"
 )
 
-const (
-	banner = `
+const banner = `
     ___   __  ______  ____        ______      
    /   | /  |/  / __ \/ __ \      / ____/___   
   / /| |/ /|_/ / / / / /_/ /_____/ / __/ __ \  
@@ -28,7 +32,6 @@ const (
 AMQP 0.9.1 Server - High Performance Message Broker
 Version: %s
 `
-)
 
 // Build identity. These are variables, not constants, so -X can stamp them:
 //
@@ -47,359 +50,389 @@ func versionString() string {
 	return fmt.Sprintf("amqp-server %s (commit %s, built %s, %s)", version, commit, date, runtime.Version())
 }
 
+// cliOptions holds the parsed flag values. The pointers exist so the flag
+// package owns storage; applyFlagOverrides only acts on flags the operator
+// actually set (flag.Visit), so defaults never clobber config values.
+type cliOptions struct {
+	configFile       *string
+	showVersion      *bool
+	generateConfig   *string
+	enableTelemetry  *bool
+	telemetryPort    *int
+	telemetryAddress *string
+	enablePprof      *bool
+	healthcheck      *bool
+	tlsEnable        *bool
+	tlsCert          *string
+	tlsKey           *string
+	tlsCA            *string
+	unsafeRecovery   *bool
+}
+
+// newFlagSet defines the final CLI surface. Flag defaults are documentation
+// only (0/""/false) because config supplies the real defaults; applyFlagOverrides
+// uses flag.Visit so an unset flag never overwrites the config.
+func newFlagSet() (*flag.FlagSet, *cliOptions) {
+	fs := flag.NewFlagSet("amqp-server", flag.ExitOnError)
+	o := &cliOptions{}
+
+	o.configFile = fs.String("config", "", "Configuration file path (YAML/JSON)")
+	o.showVersion = fs.Bool("version", false, "Show version and exit")
+	o.generateConfig = fs.String("generate-config", "", "Generate default config file (mode 0600) and exit (e.g., config.yaml)")
+	o.enableTelemetry = fs.Bool("enable-telemetry", false, "Enable telemetry HTTP endpoint (/metrics, /health)")
+	o.telemetryPort = fs.Int("telemetry-port", 0, "Telemetry HTTP server port (default from config: 9419)")
+	o.telemetryAddress = fs.String("telemetry-address", "", "Telemetry bind address (default from config: 127.0.0.1)")
+	o.enablePprof = fs.Bool("enable-pprof", false, "Enable pprof profiling endpoints (off by default; loopback only)")
+	o.healthcheck = fs.Bool("healthcheck", false, "Probe the local /health endpoint and exit 0 (ready) or 1 (not ready)")
+
+	o.tlsEnable = fs.Bool("tls", false, "Enable TLS (amqps)")
+	o.tlsCert = fs.String("tls-cert", "", "Path to TLS certificate file (PEM)")
+	o.tlsKey = fs.String("tls-key", "", "Path to TLS private key file (PEM)")
+	o.tlsCA = fs.String("tls-ca", "", "Path to TLS CA file for mutual TLS client verification (PEM)")
+
+	o.unsafeRecovery = fs.Bool("unsafe-recovery", false,
+		"DATA-LOSS SWITCH. Start even when recovery cannot be completed safely, DISCARDING every artifact the broker could not recover. "+
+			"Each discarded artifact is logged by path at ERROR level, the amqp_unsafe_recovery_discarded_artifacts gauge is pinned above zero "+
+			"for the lifetime of the process, and the broker re-warns every 5 minutes. Confirmed durable messages in the discarded artifacts are "+
+			"NOT recovered. Prefer restoring from a backup, or moving the named files aside so you still have them, before using this.")
+
+	return fs, o
+}
+
+// applyFlagOverrides applies only explicitly-set flags onto cfg.
+func applyFlagOverrides(cfg *config.AMQPConfig, fs *flag.FlagSet) error {
+	var firstErr error
+	fs.Visit(func(f *flag.Flag) {
+		value := f.Value.String()
+		switch f.Name {
+		case "tls":
+			cfg.Security.TLSEnabled = value == "true"
+		case "tls-cert":
+			cfg.Security.TLSCertFile = value
+		case "tls-key":
+			cfg.Security.TLSKeyFile = value
+		case "tls-ca":
+			cfg.Security.TLSCAFile = value
+		case "unsafe-recovery":
+			cfg.Storage.UnsafeRecovery = value == "true"
+		case "enable-telemetry":
+			cfg.Telemetry.Enabled = value == "true"
+		case "telemetry-port":
+			port, err := strconv.Atoi(value)
+			if err != nil {
+				if firstErr == nil {
+					firstErr = fmt.Errorf("invalid --telemetry-port %q: %w", value, err)
+				}
+				return
+			}
+			cfg.Telemetry.Port = port
+		case "telemetry-address":
+			cfg.Telemetry.Address = value
+		case "enable-pprof":
+			cfg.Telemetry.PprofEnabled = value == "true"
+		}
+	})
+	return firstErr
+}
+
+func printLoadReport(w io.Writer, report *config.LoadReport) {
+	config.PrintLoadReport(w, report)
+}
+
 func main() {
-	// Define command-line flags
-	var (
-		configFile      = flag.String("config", "", "Configuration file path (YAML/JSON)")
-		showVersion     = flag.Bool("version", false, "Show version and exit")
-		generateConfig  = flag.String("generate-config", "", "Generate default config file and exit (e.g., config.yaml)")
-		enableTelemetry = flag.Bool("enable-telemetry", false, "Enable telemetry endpoint (Prometheus + pprof profiling)")
-		telemetryPort   = flag.Int("telemetry-port", 9419, "Telemetry HTTP server port")
+	fs, opts := newFlagSet()
+	_ = fs.Parse(os.Args[1:])
 
-		// TLS flags
-		tlsEnable = flag.Bool("tls", false, "Enable TLS (amqps)")
-		tlsCert   = flag.String("tls-cert", "", "Path to TLS certificate file (PEM)")
-		tlsKey    = flag.String("tls-key", "", "Path to TLS private key file (PEM)")
-		tlsCA     = flag.String("tls-ca", "", "Path to TLS CA file for mutual TLS client verification (PEM)")
-
-		// Recovery override. The broker refuses to start on a data directory
-		// whose recovery cannot be completed safely; this is the documented
-		// way past that refusal, and the refusal message names it.
-		unsafeRecovery = flag.Bool("unsafe-recovery", false,
-			"DATA-LOSS SWITCH. Start even when recovery cannot be completed safely, DISCARDING every artifact the broker could not recover. "+
-				"Each discarded artifact is logged by path at ERROR level, the amqp_unsafe_recovery_discarded_artifacts gauge is pinned above zero "+
-				"for the lifetime of the process, and the broker re-warns every 5 minutes. Confirmed durable messages in the discarded artifacts are "+
-				"NOT recovered. Prefer restoring from a backup, or moving the named files aside so you still have them, before using this.")
-	)
-
-	flag.Parse()
-
-	// Show version and exit
-	if *showVersion {
+	if *opts.showVersion {
 		fmt.Println(versionString())
 		return
 	}
 
-	// Generate default config and exit
-	if *generateConfig != "" {
+	if *opts.generateConfig != "" {
 		cfg := config.DefaultConfig()
-		if err := cfg.Save(*generateConfig); err != nil {
+		if err := cfg.Save(*opts.generateConfig); err != nil {
 			log.Fatalf("Failed to generate config file: %v", err)
 		}
-		fmt.Printf("Generated default configuration: %s\n", *generateConfig)
-		fmt.Println("Edit the file and start server with: amqp-server --config " + *generateConfig)
+		fmt.Printf("Generated default configuration: %s\n", *opts.generateConfig)
+		fmt.Println("Edit the file and start server with: amqp-server --config " + *opts.generateConfig)
 		return
 	}
 
-	// Handle daemon stages first
-	if isDaemonChild() {
-		// Final daemon process - complete daemonization
-		if err := finalizeDaemon(""); err != nil {
-			log.Fatalf("Failed to finalize daemon: %v", err)
-		}
+	if *opts.healthcheck {
+		os.Exit(runHealthcheck(*opts.configFile))
 	}
 
-	// Show banner (only for non-daemon or final daemon process)
-	if !isDaemonChild() {
+	if os.Getenv(daemonEnv) == "" {
 		fmt.Printf(banner, version)
 	}
 
-	// Load configuration
-	var cfg *config.AMQPConfig
-	if *configFile != "" {
-		// Load from configuration file
-		cfg = &config.AMQPConfig{}
-		if err := cfg.Load(*configFile); err != nil {
-			log.Fatalf("Failed to load configuration file %s: %v", *configFile, err)
+	// Load: defaults -> file -> env, then explicitly-set flags. The --config
+	// path is made absolute before loading so a later daemon chdir cannot
+	// change which file was meant.
+	configPath := *opts.configFile
+	if configPath != "" {
+		abs, err := filepath.Abs(configPath)
+		if err != nil {
+			log.Fatalf("Failed to resolve config file path %s: %v", configPath, err)
 		}
-		if !isDaemonChild() {
-			fmt.Printf("Loaded configuration from: %s\n", *configFile)
-		}
-	} else {
-		// Use default configuration (can be overridden by AMQP_* environment variables)
-		cfg = config.DefaultConfig()
-		if !isDaemonChild() {
-			fmt.Println("Using default configuration (override with --config or AMQP_* env vars)")
-		}
+		configPath = abs
 	}
 
-	// Apply TLS command-line flags (override config file values)
-	if *tlsEnable {
-		cfg.Security.TLSEnabled = true
+	cfg, report, err := config.LoadConfig(configPath)
+	if err != nil {
+		log.Fatalf("Failed to load configuration: %v", err)
 	}
-	if *tlsCert != "" {
-		cfg.Security.TLSCertFile = *tlsCert
-	}
-	if *tlsKey != "" {
-		cfg.Security.TLSKeyFile = *tlsKey
-	}
-	if *tlsCA != "" {
-		cfg.Security.TLSCAFile = *tlsCA
-	}
-	if *unsafeRecovery {
-		cfg.Storage.UnsafeRecovery = true
+	if err := applyFlagOverrides(cfg, fs); err != nil {
+		log.Fatalf("Invalid flags: %v", err)
 	}
 
-	// The stamped build identity is the product version advertised to clients.
 	cfg.Server.Version = version
-
-	// Re-validate after CLI overrides
+	cwd, err := os.Getwd()
+	if err != nil {
+		log.Fatalf("Failed to determine working directory: %v", err)
+	}
+	cfg.ResolvePaths(cwd)
 	if err := cfg.Validate(); err != nil {
 		log.Fatalf("Invalid configuration: %v", err)
 	}
 
-	// Handle daemonization if requested (and not already a daemon)
-	if cfg.Server.Daemonize && !isDaemonChild() {
-		if err := startDaemon(cfg.Server.LogFile); err != nil {
-			log.Fatalf("Failed to daemonize: %v", err)
-		}
+	printLoadReport(os.Stderr, report)
+	emitSecurityWarnings(os.Stderr, nil, cfg.SecurityWarnings())
+	for _, mechanism := range cfg.UnknownMechanisms() {
+		fmt.Fprintf(os.Stderr, "unknown auth mechanism %q ignored (supported: PLAIN, ANONYMOUS)\n", mechanism)
+	}
+	if cfg.Telemetry.PprofEnabled && !cfg.Telemetry.Enabled {
+		fmt.Fprintln(os.Stderr, "warning: --enable-pprof has no effect without --enable-telemetry")
+	}
+	if cfg.Storage.UnsafeRecovery {
+		fmt.Println("*** --unsafe-recovery IS SET: this broker may have discarded unrecoverable data at boot. See the log lines above. ***")
 	}
 
-	// Finalize daemon setup if we're the final daemon process
-	if isDaemonChild() {
+	// Daemon stages. Stage 0 waits for READY; stage 1 detaches and forks; the
+	// final process resolves paths (above) before finalizeDaemon chdirs.
+	switch os.Getenv(daemonEnv) {
+	case "":
+		if cfg.Server.Daemonize {
+			if err := startDaemon(cfg.Server.LogFile); err != nil {
+				log.Fatalf("Failed to daemonize: %v", err)
+			}
+			os.Exit(0)
+		}
+	case "1":
+		if err := forkFinalDaemon(); err != nil {
+			log.Fatalf("Failed to daemonize: %v", err)
+		}
+		os.Exit(0)
+	case "2":
 		if err := finalizeDaemon(cfg.Server.LogFile); err != nil {
 			log.Fatalf("Failed to finalize daemon: %v", err)
 		}
 	}
+	readyFile := daemonReadyFile()
 
-	// Create metrics collector if telemetry is enabled
-	var metricsCollector *metrics.Collector
-	if *enableTelemetry {
-		metricsCollector = metrics.NewCollector("amqp")
-		telemetryServer := metrics.NewServer(*telemetryPort, true)
-
-		go func() {
-			if !cfg.Server.Daemonize || isDaemonChild() {
-				if isDaemonChild() {
-					log.Printf("Telemetry server listening on http://localhost:%d", *telemetryPort)
-					log.Printf("  Prometheus metrics: http://localhost:%d/metrics", *telemetryPort)
-					log.Printf("  Profiling enabled: http://localhost:%d/debug/pprof/", *telemetryPort)
-				} else {
-					fmt.Printf("Telemetry server listening on http://localhost:%d\n", *telemetryPort)
-					fmt.Printf("  Prometheus metrics: http://localhost:%d/metrics\n", *telemetryPort)
-					fmt.Printf("  Health check: http://localhost:%d/health\n", *telemetryPort)
-					fmt.Printf("  Profiling index: http://localhost:%d/debug/pprof/\n", *telemetryPort)
-					fmt.Printf("  CPU profile: curl -o cpu.prof http://localhost:%d/debug/pprof/profile?seconds=30\n", *telemetryPort)
-					fmt.Printf("  Mutex profile: curl -o mutex.prof http://localhost:%d/debug/pprof/mutex\n", *telemetryPort)
-				}
-			}
-			if err := telemetryServer.Start(); err != nil {
-				log.Printf("Telemetry server failed: %v", err)
-			}
-		}()
+	// Collector must exist before Build (the server binds it for hot-path
+	// counters). The HTTP server is constructed only after Build returns, so
+	// /health cannot report ready while recovery is still replaying the WAL.
+	var collector *metrics.Collector
+	if cfg.Telemetry.Enabled {
+		collector = metrics.NewCollector("amqp")
+		collector.SetBuildInfo(version, commit, runtime.Version())
 	}
 
-	// Create and start server
 	serverBuilder := server.NewServerBuilder().WithConfig(cfg)
-
-	// Add metrics collector if telemetry is enabled
-	if metricsCollector != nil {
-		serverBuilder = serverBuilder.WithMetrics(metricsCollector)
+	if collector != nil {
+		serverBuilder = serverBuilder.WithMetrics(collector)
 	}
-
 	amqpServer, err := serverBuilder.Build()
 	if err != nil {
 		log.Fatalf("Failed to create server: %v", err)
 	}
 
-	// Write PID file if specified
+	// Warnings again through the logger so they land in the journal/log file.
+	for _, warning := range cfg.SecurityWarnings() {
+		amqpServer.Log.Warn(warning, zap.String("component", "startup-security"))
+	}
+	for _, key := range report.UnknownKeys {
+		amqpServer.Log.Warn(fmt.Sprintf("unknown config key %q ignored (check spelling; see config.sample.yaml)", key),
+			zap.String("component", "startup-config"))
+	}
+
 	if cfg.Server.PidFile != "" {
 		if err := writePIDFile(cfg.Server.PidFile); err != nil {
 			log.Fatalf("Failed to write PID file: %v", err)
 		}
 	}
 
-	// Setup signal handling for graceful shutdown
-	setupSignalHandling(amqpServer, cfg.Server.PidFile)
+	var shuttingDown atomic.Bool
+	var telemetryServer *metrics.Server
+	var stopPoller context.CancelFunc
+	if cfg.Telemetry.Enabled {
+		telemetryServer = metrics.NewServerWithOptions(metrics.ServerOptions{
+			Address:     cfg.Telemetry.Address,
+			Port:        cfg.Telemetry.Port,
+			EnablePprof: cfg.Telemetry.PprofEnabled,
+			Ready:       readyFunc(amqpServer.IsListening, serverHealth(amqpServer), &shuttingDown),
+			Annotate:    func() string { return alarmAnnotation(amqpServer.AlarmState()) },
+		})
+		if err := telemetryServer.Listen(); err != nil {
+			log.Fatalf("telemetry: %v", err)
+		}
+		go func() {
+			if err := telemetryServer.Serve(); err != nil {
+				log.Printf("telemetry server failed: %v", err)
+			}
+		}()
 
-	// Start server - show startup info only if not daemonizing
-	if !cfg.Server.Daemonize || isDaemonChild() {
-		if isDaemonChild() {
-			log.Printf("Starting AMQP server daemon on %s", cfg.Network.Address)
-			log.Printf("Storage path: %s (persistent)", cfg.Storage.Path)
-			if cfg.Security.TLSEnabled {
-				if cfg.Security.TLSCAFile != "" {
-					log.Println("TLS: Enabled (mutual TLS, client cert required)")
-				} else {
-					log.Println("TLS: Enabled")
-				}
-			}
-			if cfg.Security.AuthenticationEnabled {
-				log.Printf("Authentication: Enabled (%s)", cfg.Security.AuthenticationBackend)
-			}
-			log.Printf("Transaction support: Enabled")
-			log.Printf("Log level: %s", cfg.Server.LogLevel)
-			log.Println("AMQP daemon started successfully")
-		} else {
-			fmt.Printf("Starting AMQP server on %s\n", cfg.Network.Address)
-			fmt.Printf("Storage path: %s (persistent)\n", cfg.Storage.Path)
-			if cfg.Storage.UnsafeRecovery {
-				fmt.Println("*** --unsafe-recovery IS SET: this broker may have discarded unrecoverable data at boot. See the log lines above. ***")
-			}
-			if cfg.Security.TLSEnabled {
-				if cfg.Security.TLSCAFile != "" {
-					fmt.Println("TLS: Enabled (mutual TLS, client cert required)")
-				} else {
-					fmt.Println("TLS: Enabled")
-				}
-			}
-			if cfg.Security.AuthenticationEnabled {
-				fmt.Printf("Authentication: Enabled (%s)\n", cfg.Security.AuthenticationBackend)
-			}
-			fmt.Printf("Transaction support: Enabled\n")
-			fmt.Printf("Log level: %s\n", cfg.Server.LogLevel)
-			fmt.Println("Server ready - Press Ctrl+C to stop")
+		pollerCtx, cancel := context.WithCancel(context.Background())
+		stopPoller = cancel
+		go collector.RunPoller(pollerCtx, metrics.PollerOptions{
+			Interval: 15 * time.Second,
+			Queues:   brokerQueueStats{b: amqpServer.Broker},
+			Alarms:   amqpServer.AlarmState,
+			Log:      amqpServer.Log,
+		})
+
+		base := "http://" + telemetryServer.Addr().String()
+		fmt.Printf("Telemetry server listening on %s\n", base)
+		fmt.Printf("  Prometheus metrics: %s/metrics\n", base)
+		fmt.Printf("  Health check: %s/health\n", base)
+		if cfg.Telemetry.PprofEnabled {
+			fmt.Printf("  Profiling index: %s/debug/pprof/\n", base)
+			fmt.Printf("  CPU profile: curl -o cpu.prof '%s/debug/pprof/profile?seconds=30'\n", base)
 		}
 	}
 
-	if err := amqpServer.Start(); err != nil {
-		log.Fatalf("Server failed: %v", err)
+	// Signal handling must be installed before Start: SIGHUP's default action
+	// terminates the process.
+	sigCh := make(chan os.Signal, 2)
+	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
+	hupCh := make(chan os.Signal, 1)
+	signal.Notify(hupCh, syscall.SIGHUP)
+	go func() {
+		for range hupCh {
+			reloadAuth(amqpServer)
+		}
+	}()
+
+	fmt.Printf("Starting AMQP server on %s\n", cfg.Network.Address)
+	fmt.Printf("Storage path: %s (persistent)\n", cfg.Storage.Path)
+	if cfg.Security.TLSEnabled {
+		if cfg.Security.TLSCAFile != "" {
+			fmt.Println("TLS: Enabled (mutual TLS, client cert required)")
+		} else {
+			fmt.Println("TLS: Enabled")
+		}
 	}
+	if cfg.Security.AuthenticationEnabled {
+		fmt.Printf("Authentication: Enabled (%s)\n", cfg.Security.AuthenticationBackend)
+	}
+	fmt.Printf("Log level: %s\n", cfg.Server.LogLevel)
+
+	errCh := make(chan error, 1)
+	go func() { errCh <- amqpServer.Start() }()
+
+	for !amqpServer.IsListening() {
+		select {
+		case err := <-errCh:
+			log.Fatalf("Server failed: %v", err)
+		default:
+			time.Sleep(50 * time.Millisecond)
+		}
+	}
+	notifyDaemonReady(readyFile)
+	if !isDaemonChild() {
+		fmt.Println("Server ready - Press Ctrl+C to stop")
+	}
+
+	select {
+	case err := <-errCh:
+		if err != nil {
+			log.Fatalf("Server failed: %v", err)
+		}
+		os.Exit(0)
+	case <-sigCh:
+	}
+
+	// Flip readiness first so load balancers drain before the listener closes.
+	shuttingDown.Store(true)
+	fmt.Println("\nShutting down gracefully (30s budget)...")
+
+	// A second signal means "stop waiting".
+	go func() {
+		<-sigCh
+		fmt.Fprintln(os.Stderr, "second signal received: forcing exit")
+		os.Exit(130)
+	}()
+
+	shutdownCtx, cancelShutdown := context.WithTimeout(context.Background(), 30*time.Second)
+	shutdownErr := shutdownServer(amqpServer, shutdownCtx)
+	cancelShutdown()
+
+	if stopPoller != nil {
+		stopPoller()
+	}
+	if telemetryServer != nil {
+		stopCtx, cancelStop := context.WithTimeout(context.Background(), 5*time.Second)
+		_ = telemetryServer.Stop(stopCtx)
+		cancelStop()
+	}
+	if cfg.Server.PidFile != "" {
+		_ = os.Remove(cfg.Server.PidFile)
+	}
+	_ = amqpServer.Log.Sync()
+
+	if shutdownErr != nil {
+		log.Printf("Shutdown did not complete cleanly: %v", shutdownErr)
+		os.Exit(1)
+	}
+	fmt.Println("Server stopped")
+	os.Exit(0)
+}
+
+// reloadAuth implements SIGHUP: re-read the auth file when the authenticator
+// supports it; never exit. Existing connections keep their user snapshot.
+func reloadAuth(s *server.Server) {
+	if reloader, ok := s.Authenticator.(interface{ Reload() error }); ok {
+		if err := reloader.Reload(); err != nil {
+			s.Log.Error("failed to reload auth file", zap.Error(err))
+			return
+		}
+		s.Log.Info("auth file reloaded")
+		return
+	}
+	s.Log.Info("SIGHUP received: nothing to reload")
+}
+
+// runHealthcheck is the container probe mode. It reads the same config (and
+// env) as the server, probes loopback when the bind is unspecified, and exits
+// 0 only on HTTP 200.
+func runHealthcheck(configPath string) int {
+	if configPath != "" {
+		if abs, err := filepath.Abs(configPath); err == nil {
+			configPath = abs
+		}
+	}
+	cfg, _, err := config.LoadConfig(configPath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "healthcheck: failed to load configuration: %v\n", err)
+		return 1
+	}
+	url := healthcheckURL(cfg.Telemetry.Address, cfg.Telemetry.Port)
+	client := &http.Client{Timeout: 3 * time.Second}
+	resp, err := client.Get(url)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "healthcheck: %v\n", err)
+		return 1
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		fmt.Fprintf(os.Stderr, "healthcheck: %s returned %d\n", url, resp.StatusCode)
+		return 1
+	}
+	return 0
 }
 
 func writePIDFile(pidFile string) error {
 	pid := os.Getpid()
 	return os.WriteFile(pidFile, []byte(fmt.Sprintf("%d\n", pid)), 0644)
-}
-
-func setupSignalHandling(server *server.Server, pidFile string) {
-	c := make(chan os.Signal, 1)
-	signal.Notify(c, os.Interrupt, syscall.SIGTERM)
-
-	go func() {
-		<-c
-		fmt.Println("\nShutting down server gracefully...")
-
-		// Clean up PID file
-		if pidFile != "" {
-			os.Remove(pidFile)
-		}
-
-		// Stop server gracefully (cancels metrics goroutine, closes listener)
-		server.Stop()
-
-		// Give some time for graceful shutdown
-		time.Sleep(2 * time.Second)
-		fmt.Println("Server stopped")
-		os.Exit(0)
-	}()
-}
-
-// startDaemon turns the process into a proper Unix daemon using double-fork technique
-func startDaemon(logFile string) error {
-	// Check if we're already a daemon (child process)
-	if os.Getenv("_AMQP_DAEMON") == "1" {
-		// We're the final daemon process - just do final setup
-		return setupDaemonEnvironment(logFile)
-	}
-
-	// First fork - create child process
-	args := make([]string, len(os.Args))
-	copy(args, os.Args)
-
-	cmd := &exec.Cmd{
-		Path: os.Args[0],
-		Args: args,
-		Env:  append(os.Environ(), "_AMQP_DAEMON=1"),
-	}
-
-	if err := cmd.Start(); err != nil {
-		return fmt.Errorf("failed to start daemon process: %v", err)
-	}
-
-	// Parent exits immediately
-	fmt.Printf("AMQP server daemonized with PID %d\n", cmd.Process.Pid)
-	os.Exit(0)
-	return nil // Never reached
-}
-
-// setupDaemonEnvironment sets up the daemon environment for the child process
-func setupDaemonEnvironment(logFile string) error {
-	// Create new session
-	if _, err := unix.Setsid(); err != nil {
-		return fmt.Errorf("setsid failed: %v", err)
-	}
-
-	// Second fork - prevents daemon from ever acquiring controlling terminal
-	cmd := &exec.Cmd{
-		Path: os.Args[0],
-		Args: os.Args,
-		Env:  append(os.Environ(), "_AMQP_DAEMON=2"),
-	}
-
-	if err := cmd.Start(); err != nil {
-		return fmt.Errorf("second fork failed: %v", err)
-	}
-
-	// First child exits
-	os.Exit(0)
-	return nil // Never reached
-}
-
-// isDaemonChild checks if this is the final daemon process
-func isDaemonChild() bool {
-	return os.Getenv("_AMQP_DAEMON") == "2"
-}
-
-// finalizeDaemon completes the daemonization process
-func finalizeDaemon(logFile string) error {
-	// Change working directory to root
-	if err := os.Chdir("/"); err != nil {
-		return fmt.Errorf("failed to change directory to /: %v", err)
-	}
-
-	// Set file creation mask
-	unix.Umask(0)
-
-	// Redirect standard file descriptors
-	if err := redirectStdFiles(logFile); err != nil {
-		return fmt.Errorf("failed to redirect standard files: %v", err)
-	}
-
-	return nil
-}
-
-// redirectStdFiles redirects stdin to /dev/null and stdout/stderr to log file or /dev/null
-func redirectStdFiles(logFile string) error {
-	// Redirect stdin to /dev/null
-	devNull, err := os.OpenFile("/dev/null", os.O_RDWR, 0)
-	if err != nil {
-		return fmt.Errorf("failed to open /dev/null: %v", err)
-	}
-
-	// Duplicate stdin to /dev/null
-	if err := unix.Dup2(int(devNull.Fd()), int(os.Stdin.Fd())); err != nil {
-		devNull.Close()
-		return fmt.Errorf("failed to redirect stdin: %v", err)
-	}
-
-	// Handle stdout and stderr
-	var outputFile *os.File
-	if logFile != "" {
-		// Redirect to log file
-		outputFile, err = os.OpenFile(logFile, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
-		if err != nil {
-			devNull.Close()
-			return fmt.Errorf("failed to open log file %s: %v", logFile, err)
-		}
-	} else {
-		// Redirect to /dev/null if no log file specified
-		outputFile = devNull
-	}
-
-	// Redirect stdout and stderr
-	if err := unix.Dup2(int(outputFile.Fd()), int(os.Stdout.Fd())); err != nil {
-		outputFile.Close()
-		devNull.Close()
-		return fmt.Errorf("failed to redirect stdout: %v", err)
-	}
-
-	if err := unix.Dup2(int(outputFile.Fd()), int(os.Stderr.Fd())); err != nil {
-		outputFile.Close()
-		devNull.Close()
-		return fmt.Errorf("failed to redirect stderr: %v", err)
-	}
-
-	// Don't close the files as they're now being used by the standard descriptors
-	return nil
 }
