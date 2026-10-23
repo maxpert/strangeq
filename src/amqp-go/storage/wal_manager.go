@@ -435,8 +435,13 @@ type walFileInfo struct {
 
 	// --- WS-C (C1/C2/C5) durability bookkeeping, appended below the pinned
 	// fields. durableSize and damagedTail are written once, at roll time,
-	// before the entry is published under oldFilesMutex; checkpointed and
-	// retentionFailLogged are mutated only under oldFilesMutex. ---
+	// before the entry is published under oldFilesMutex, so any read through
+	// the published entry is ordered by construction. checkpointed and
+	// retentionFailLogged are MUTATED after publication and are therefore
+	// only ever accessed under oldFilesMutex: tryDeleteOldFiles reads and
+	// writes them under Lock, and performCheckpoint copies checkpointed out
+	// under the RLock of its map snapshot (walCheckpointTarget) instead of
+	// reading it in its unlocked loop body. ---
 
 	// durableSize is the number of bytes known durable and intact. -1 (the
 	// inherited value set by rebuildBootState) means the whole file.
@@ -447,9 +452,10 @@ type walFileInfo struct {
 	damagedTail bool
 	// checkpointed is true once every unacked record in [0, durableSize) has
 	// been durably copied to a segment, so only the unlink remains.
+	// Access discipline: oldFilesMutex only (see the block comment above).
 	checkpointed bool
 	// retentionFailLogged throttles the retention keep-ERROR to once per file
-	// per failure streak.
+	// per failure streak. Access discipline: oldFilesMutex only.
 	retentionFailLogged bool
 }
 
@@ -3585,6 +3591,18 @@ func (qw *QueueWAL) sharedBodyBackstopFired(info *walFileInfo) bool {
 		time.Since(info.createdAt) > qw.cfg.SharedBodyMaxPinAge
 }
 
+// walCheckpointTarget is performCheckpoint's RLock-guarded snapshot of one
+// old file: the shared info pointer plus the fields that are MUTATED after
+// publication (checkpointed) or that the loop must not re-read unlocked
+// (durableSize, copied belt-and-braces), both taken under the same
+// oldFilesMutex.RLock that snapshots the map. The loop body then never reads
+// a field the cleanup goroutine may be writing under oldFilesMutex.Lock.
+type walCheckpointTarget struct {
+	info         *walFileInfo
+	checkpointed bool
+	durableSize  int64
+}
+
 // performCheckpoint moves messages from old WAL files to segments.
 // Only operates on old/rolled files — never touches the current active file.
 // For each old file: scan messages, filter out ACKed ones, write unACKed
@@ -3604,11 +3622,22 @@ func (qw *QueueWAL) performCheckpoint() {
 		return
 	}
 
-	// Snapshot old files to avoid holding the lock during I/O
+	// Snapshot old files to avoid holding the lock during I/O. The MUTABLE
+	// flag (and the durable end, belt-and-braces) is copied under the same
+	// RLock: tryDeleteOldFiles (the cleanup goroutine) writes checkpointed
+	// under oldFilesMutex.Lock, so reading it from the loop body without this
+	// snapshot is a data race even though the flag only ever flips
+	// false→true. Everything else on walFileInfo is written once, before the
+	// entry is published under oldFilesMutex, so reading it through the
+	// snapshot-published pointer is ordered by construction.
 	qw.oldFilesMutex.RLock()
-	filesToCheckpoint := make(map[uint64]*walFileInfo, len(qw.oldFiles))
+	filesToCheckpoint := make(map[uint64]*walCheckpointTarget, len(qw.oldFiles))
 	for num, info := range qw.oldFiles {
-		filesToCheckpoint[num] = info
+		filesToCheckpoint[num] = &walCheckpointTarget{
+			info:         info,
+			checkpointed: info.checkpointed,
+			durableSize:  info.durableSize,
+		}
 	}
 	qw.oldFilesMutex.RUnlock()
 
@@ -3617,7 +3646,8 @@ func (qw *QueueWAL) performCheckpoint() {
 	}
 
 	unlinkedAny := false
-	for fileNum, info := range filesToCheckpoint {
+	for fileNum, target := range filesToCheckpoint {
+		info := target.info
 		// ITER5 cold-tail hardening (§2): a rolled file that carries a shared
 		// BodyBlock is SKIPPED (left in oldFiles), so the shared body survives as
 		// ONE copy across arbitrarily many checkpoints — reclaimed whole by
@@ -3630,14 +3660,14 @@ func (qw *QueueWAL) performCheckpoint() {
 			continue
 		}
 
-		if !info.checkpointed {
+		if !target.checkpointed {
 			// Scan the WAL file. See forceCheckpointFile: only a FATAL scan fault
 			// aborts; a torn tail still has every earlier record intact and they
 			// must reach a segment or the file can never be reclaimed. The scan is
 			// bounded at the file's durable end (C1 §3.11): a damaged tail (a
 			// nacked partial batch that could not be truncated) is never read and
 			// goes away with the unlink.
-			messages, err := qw.scanWALFileUpTo(info.path, info.durableSize)
+			messages, err := qw.scanWALFileUpTo(info.path, target.durableSize)
 			if err != nil && interfaces.OutcomeOf(err) == interfaces.RecoveryFatal {
 				continue
 			}
@@ -3669,8 +3699,9 @@ func (qw *QueueWAL) performCheckpoint() {
 			}
 
 			// Every batch durably succeeded: only the unlink remains. The flag
-			// is published under oldFilesMutex, the same lock
-			// tryDeleteOldFiles reads it under.
+			// is written under oldFilesMutex.Lock — the same lock
+			// tryDeleteOldFiles reads and writes it under, and the same lock
+			// this pass's own snapshot copied it under.
 			qw.oldFilesMutex.Lock()
 			info.checkpointed = true
 			qw.oldFilesMutex.Unlock()
