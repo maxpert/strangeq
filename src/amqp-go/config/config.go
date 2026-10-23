@@ -88,6 +88,8 @@ func DefaultConfig() *AMQPConfig {
 			MaxChannelsPerConnection: 2047,
 			MaxFrameSize:             131072,   // 128KB
 			MaxMessageSize:           16777216, // 16MB
+			MaxQueues:                0,        // 0 = unlimited
+			MaxExchanges:             0,        // 0 = unlimited
 			CleanupIntervalMS:        300000,   // 5 minutes
 		},
 		Engine: interfaces.EngineConfig{
@@ -235,6 +237,14 @@ func (c *AMQPConfig) Validate() error {
 
 	if c.Server.MaxMessageSize <= 0 {
 		return fmt.Errorf("max message size must be positive: %d", c.Server.MaxMessageSize)
+	}
+
+	if c.Server.MaxQueues < 0 {
+		return fmt.Errorf("max queues must be >= 0 (0 = unlimited): %d", c.Server.MaxQueues)
+	}
+
+	if c.Server.MaxExchanges < 0 {
+		return fmt.Errorf("max exchanges must be >= 0 (0 = unlimited): %d", c.Server.MaxExchanges)
 	}
 
 	// Validate engine configuration

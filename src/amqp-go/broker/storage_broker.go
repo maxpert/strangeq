@@ -286,6 +286,16 @@ type StorageBroker struct {
 	maxLenTrimStop   chan struct{}
 	maxLenTrimWG     sync.WaitGroup
 	maxLenTrimClosed bool
+
+	// WS-D §15 topology limits (R12): maxQueues/maxExchanges are the
+	// configured caps (0 = unlimited); queueCount/exchangeCount track the live
+	// entity counts, seeded from the metadata store at construction and
+	// CAS-reserved at declare time so concurrent declares never overshoot.
+	// exchangeCreateMuByName serializes check+create per exchange NAME (the
+	// queueCreateMuByName pattern).
+	maxQueues, maxExchanges   atomic.Int64
+	queueCount, exchangeCount atomic.Int64
+	exchangeCreateMuByName    sync.Map
 }
 
 // maxLenTrimReq is a deferred drop-head trim handed from an async publish
@@ -307,8 +317,41 @@ func NewStorageBroker(storage interfaces.Storage, engineConfig interfaces.Engine
 
 	broker.initErr = broker.initOrdinalAllocator()
 	broker.initializeDefaultExchanges()
+	broker.seedTopologyCounts()
 
 	return broker
+}
+
+// SetTopologyLimits configures the MaxQueues/MaxExchanges caps (§15; 0 =
+// unlimited). Called at server build time; not on any hot path.
+func (b *StorageBroker) SetTopologyLimits(maxQueues, maxExchanges int) {
+	b.maxQueues.Store(int64(maxQueues))
+	b.maxExchanges.Store(int64(maxExchanges))
+}
+
+// seedTopologyCounts initializes exchangeCount from the metadata store at
+// construction (queueCount is seeded by initOrdinalAllocator's own
+// ListQueues), so a restart does not reset the budget (§15). The exchange
+// count excludes the default exchange ("") and amq.* system exchanges (they
+// are not user-declared, R12's extension).
+func (b *StorageBroker) seedTopologyCounts() {
+	if exchanges, err := b.storage.ListExchanges(); err == nil {
+		var n int64
+		for _, ex := range exchanges {
+			if ex.Name == "" || strings.HasPrefix(ex.Name, "amq.") {
+				continue
+			}
+			n++
+		}
+		b.exchangeCount.Store(n)
+	}
+}
+
+// exchangeCreateMu returns the per-exchange-name mutex serializing
+// check+create for MaxExchanges enforcement (the getQueueCreateMutex pattern).
+func (b *StorageBroker) exchangeCreateMu(name string) *sync.Mutex {
+	val, _ := b.exchangeCreateMuByName.LoadOrStore(name, &sync.Mutex{})
+	return val.(*sync.Mutex)
 }
 
 // InitError reports a failure that occurred while constructing the broker and
@@ -383,6 +426,11 @@ func (b *StorageBroker) initOrdinalAllocator() error {
 			maxOrdinal = q.Ordinal
 		}
 	}
+	// §15: seed the MaxQueues counter from the same ListQueues (a restart
+	// doesn't reset the budget). On a read error the count stays 0 — the
+	// fail-open direction, matching the allocator's best-effort posture; the
+	// fault is still propagated below.
+	b.queueCount.Store(int64(len(queues)))
 	if qerr != nil {
 		// Pass a classified error straight through: the storage layer knows the
 		// absolute path of the directory it failed to read and this package
@@ -1471,6 +1519,36 @@ func (b *StorageBroker) DeclareExchange(name, exchangeType string, durable, auto
 		return fmt.Errorf("unsupported exchange type: %s", exchangeType)
 	}
 
+	// §15 (R12 extension): MaxExchanges enforcement for USER exchanges (the
+	// default exchange and amq.* are not counted). Serialize check+reserve+
+	// create per NAME so racing declares of the same name see each other.
+	isCounted := name != "" && !strings.HasPrefix(name, "amq.")
+	var mu *sync.Mutex
+	if isCounted {
+		mu = b.exchangeCreateMu(name)
+		mu.Lock()
+		// Re-read under the mutex: a concurrent creator may have won while we
+		// waited — delegate so the equivalence branch validates the redeclare.
+		if existing, rerr := b.storage.GetExchange(name); rerr == nil && existing != nil {
+			mu.Unlock()
+			return b.DeclareExchange(name, exchangeType, durable, autoDelete, internal, arguments)
+		}
+		if lim := b.maxExchanges.Load(); lim > 0 {
+			for {
+				c := b.exchangeCount.Load()
+				if c >= lim {
+					mu.Unlock()
+					return semErr(fmt.Sprintf("cannot declare exchange '%s': exchange limit in cluster (%d) is reached", name, lim), ErrExchangeLimitReached)
+				}
+				if b.exchangeCount.CompareAndSwap(c, c+1) {
+					break
+				}
+			}
+		} else {
+			b.exchangeCount.Add(1)
+		}
+	}
+
 	// Create new exchange
 	exchange := &protocol.Exchange{
 		Name:       name,
@@ -1487,7 +1565,13 @@ func (b *StorageBroker) DeclareExchange(name, exchangeType string, durable, auto
 	}
 
 	err = b.storage.StoreExchange(exchange)
+	if mu != nil {
+		mu.Unlock()
+	}
 	if err != nil {
+		if isCounted {
+			b.exchangeCount.Add(-1) // release the §15 reservation
+		}
 		return err
 	}
 
@@ -1569,7 +1653,11 @@ func (b *StorageBroker) DeleteExchange(name string, ifUnused bool) error {
 		}
 	}
 
-	return b.storage.DeleteExchange(name)
+	err = b.storage.DeleteExchange(name)
+	if err == nil && name != "" && !strings.HasPrefix(name, "amq.") {
+		b.exchangeCount.Add(-1) // §15: release the deleted user exchange's slot
+	}
+	return err
 }
 
 // DeclareQueue creates or updates a queue
@@ -1654,6 +1742,25 @@ func (b *StorageBroker) DeclareQueue(name string, durable, autoDelete, exclusive
 		return q, derr
 	}
 
+	// §15 (R12): MaxQueues enforcement — CAS-reserve a slot BEFORE allocating
+	// the ordinal, so racing declares of distinct names can never both pass
+	// the check at count == limit-1. The redeclare branch above never counts
+	// (the record already exists and was seeded).
+	if lim := b.maxQueues.Load(); lim > 0 {
+		for {
+			c := b.queueCount.Load()
+			if c >= lim {
+				mu.Unlock()
+				return nil, semErr(fmt.Sprintf("cannot declare queue '%s': queue limit in cluster (%d) is reached", name, lim), ErrQueueLimitReached)
+			}
+			if b.queueCount.CompareAndSwap(c, c+1) {
+				break
+			}
+		}
+	} else {
+		b.queueCount.Add(1)
+	}
+
 	// Create new queue and resolve its composite-tag ordinal (see
 	// broker/tag_packing.go) BEFORE the first persist, so the record is
 	// written to disk exactly once, already carrying its final ordinal —
@@ -1663,6 +1770,7 @@ func (b *StorageBroker) DeclareQueue(name string, durable, autoDelete, exclusive
 
 	ordinal, aerr := b.allocateOrdinal()
 	if aerr != nil {
+		b.queueCount.Add(-1) // release the §15 reservation
 		mu.Unlock()
 		// Unreachable in any real deployment (see tag_packing.go); a silent
 		// wrap here would be cross-queue delivery-tag collision, so fail the
@@ -1676,6 +1784,7 @@ func (b *StorageBroker) DeclareQueue(name string, durable, autoDelete, exclusive
 	// not be silently lost, so the declare fails rather than proceeding with
 	// an unpersisted identity.
 	if serr := b.storage.StoreQueue(queue); serr != nil {
+		b.queueCount.Add(-1) // release the §15 reservation
 		mu.Unlock()
 		return nil, serr
 	}
@@ -2025,6 +2134,7 @@ func (b *StorageBroker) deleteQueueIncarnation(name string, wantOrdinal uint64, 
 	if err := b.storage.DeleteQueue(name); err != nil {
 		return purgedCount, err
 	}
+	b.queueCount.Add(-1) // §15: release the deleted record's slot
 	return purgedCount, nil
 }
 

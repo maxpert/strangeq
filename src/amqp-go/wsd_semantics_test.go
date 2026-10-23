@@ -328,6 +328,52 @@ func TestExchangeDelete_Nonexistent_DeleteOk(t *testing.T) {
 	assert.False(t, conn.IsClosed())
 }
 
+// T15.1 (R12): MaxQueues is enforced as a 406 channel error; redeclares at
+// the limit are fine; deletes free slots; server-named queues count.
+func TestMaxQueues_Enforced(t *testing.T) {
+	b := newRestartableBroker(t, func(cfg *config.AMQPConfig) {
+		cfg.Server.MaxQueues = 2
+	})
+
+	conn, err := amqp.Dial(b.uri)
+	require.NoError(t, err)
+	defer conn.Close()
+
+	ch, err := conn.Channel()
+	require.NoError(t, err)
+
+	_, err = ch.QueueDeclare("q1", false, false, false, false, nil)
+	require.NoError(t, err)
+	// A server-named ("") queue counts against the budget.
+	_, err = ch.QueueDeclare("", false, false, true, false, nil)
+	require.NoError(t, err, "second queue (server-named) fits in the budget")
+
+	// Third declare: 406 channel error, connection survives.
+	ch2, err := conn.Channel()
+	require.NoError(t, err)
+	_, err = ch2.QueueDeclare("q3", false, false, false, false, nil)
+	aerr := amqpError(t, err)
+	assert.Equal(t, 406, aerr.Code)
+	assert.Contains(t, aerr.Reason, "queue limit in cluster (2) is reached")
+	assert.False(t, conn.IsClosed())
+
+	// Redeclaring an EXISTING queue at the limit is fine.
+	ch3, err := conn.Channel()
+	require.NoError(t, err)
+	_, err = ch3.QueueDeclare("q1", false, false, false, false, nil)
+	require.NoError(t, err, "redeclare of an existing queue never hits the limit")
+
+	// Delete one → declare succeeds.
+	ch4, err := conn.Channel()
+	require.NoError(t, err)
+	_, err = ch4.QueueDelete("q1", false, false, false)
+	require.NoError(t, err)
+	ch5, err := conn.Channel()
+	require.NoError(t, err)
+	_, err = ch5.QueueDeclare("q3", false, false, false, false, nil)
+	require.NoError(t, err, "a delete frees a slot")
+}
+
 // T4.1: queue.purge removes READY messages only; in-flight (unacked)
 // deliveries keep their bodies and requeue intact. Pre-fix mechanism: purge
 // wiped every ring slot (unacked included) and reset inflight, so the

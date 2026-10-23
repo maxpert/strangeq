@@ -240,6 +240,8 @@ func (b *ServerBuilder) Build() (*Server, error) {
 		// Phase 6G: Pass engine config for tunable parameters
 		storageBroker := broker.NewStorageBroker(storageImpl, b.config.GetEngine())
 		storageBroker.SetLogger(logger)
+		// WS-D §15: wire the MaxQueues/MaxExchanges topology limits.
+		storageBroker.SetTopologyLimits(b.config.GetServer().MaxQueues, b.config.GetServer().MaxExchanges)
 		// initOrdinalAllocator establishes the delivery-tag ordinal high-water
 		// mark. It cannot report through the constructor's signature, and a
 		// zero mark hands a brand-new queue an ordinal whose records are still
