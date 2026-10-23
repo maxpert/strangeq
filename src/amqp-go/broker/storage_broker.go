@@ -1487,6 +1487,21 @@ func (b *StorageBroker) DeclareExchange(name, exchangeType string, durable, auto
 	return nil
 }
 
+// ExchangeDeclarePassive returns the existing exchange record for name, never
+// creating anything. Missing → errNoExchange(name) (R1 with_or_die → 404).
+// Type/durable/auto-delete/internal/arguments in a passive frame are IGNORED:
+// R1's passive clause never calls assert_equivalence.
+func (b *StorageBroker) ExchangeDeclarePassive(name string) (*protocol.Exchange, error) {
+	ex, err := b.storage.GetExchange(name)
+	if err != nil {
+		if errors.Is(err, interfaces.ErrExchangeNotFound) {
+			return nil, errNoExchange(name)
+		}
+		return nil, fmt.Errorf("failed to check exchange '%s': %w", name, err)
+	}
+	return ex, nil
+}
+
 // DeleteExchange removes an exchange
 func (b *StorageBroker) DeleteExchange(name string, ifUnused bool) error {
 	_, err := b.storage.GetExchange(name)
@@ -1763,6 +1778,32 @@ var classicQueueArgumentKeys = []string{
 	"x-queue-type",
 	"x-queue-master-locator",
 	"x-queue-leader-locator",
+}
+
+// QueueDeclarePassive returns the existing queue record for name, never
+// creating anything (no record, no QueueState, no ordinal, no reaper).
+// Missing → errNoQueue(name) (R1 with_or_die → 404). It resets the x-expires
+// idle clock when a QueueState already exists and the policy has x-expires (a
+// declare renews the lease; RabbitMQ's stat path re-arms the expiry timer).
+// Durable/exclusive/auto-delete/arguments in a passive frame are IGNORED
+// (R1's passive clause never calls assert_equivalence).
+func (b *StorageBroker) QueueDeclarePassive(name string) (*protocol.Queue, error) {
+	q, err := b.storage.GetQueue(name)
+	if err != nil {
+		if errors.Is(err, interfaces.ErrQueueNotFound) {
+			return nil, errNoQueue(name)
+		}
+		return nil, fmt.Errorf("failed to check queue '%s': %w", name, err)
+	}
+	// Deliberately NOT getOrCreateQueueState: a passive declare creates no
+	// runtime state. An existing QueueState just gets its lease renewed.
+	if qsVal, ok := b.queueStates.Load(name); ok {
+		qs := qsVal.(*QueueState)
+		if p := qs.Policy(); p != nil && p.HasQueueExpires {
+			qs.MarkActivity(b.ttlNowMillis())
+		}
+	}
+	return q, nil
 }
 
 // DeleteQueue removes a queue. It captures the identity (Ordinal) of the

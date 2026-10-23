@@ -1,7 +1,6 @@
 package server
 
 import (
-	"errors"
 	"fmt"
 
 	"github.com/maxpert/amqp-go/broker"
@@ -55,6 +54,17 @@ func (s *Server) handleExchangeDeclare(conn *protocol.Connection, channelID uint
 		return err
 	}
 
+	// WS-D §1.4 (R4 check_not_default_exchange): declaring the default
+	// exchange is refused, passive or not.
+	if declareMethod.Exchange == "" {
+		return s.closeChannelWith(conn, channelID, uint16(amqperrors.AccessRefused),
+			"ACCESS_REFUSED - operation not permitted on the default exchange", 40, 10)
+	}
+	// WS-D §1.4: passive declare is a strictly read-only path (R1).
+	if declareMethod.Passive {
+		return s.handleExchangeDeclarePassive(conn, channelID, declareMethod)
+	}
+
 	s.Log.Debug("Exchange declared",
 		zap.String("exchange", declareMethod.Exchange),
 		zap.String("type", declareMethod.Type),
@@ -96,9 +106,12 @@ func (s *Server) handleExchangeDeclare(conn *protocol.Connection, channelID uint
 	)
 
 	if err != nil {
-		if errors.Is(err, broker.ErrExchangeTypeMismatch) {
-			s.sendChannelClose(conn, channelID, amqperrors.PreconditionFailed, err.Error(), 40, 10)
-			return nil
+		// WS-D: every known broker semantic error (type mismatch and the whole
+		// inequivalent-args family, exchange-limit 406, ...) goes through the
+		// shared mapping; the connection stays alive. Unknown errors keep the
+		// log-and-return path.
+		if _, _, ok := brokerErrorReply(err); ok {
+			return s.closeChannelWithBrokerError(conn, channelID, err, 40, 10)
 		}
 		s.Log.Error("Failed to declare exchange",
 			zap.Error(err),
@@ -114,6 +127,43 @@ func (s *Server) handleExchangeDeclare(conn *protocol.Connection, channelID uint
 		return nil
 	}
 
+	return s.sendExchangeDeclareOK(conn, channelID)
+}
+
+// handleExchangeDeclarePassive implements WS-D §1.4: a strictly read-only
+// exchange.declare (R1). Type/durable/auto-delete/internal/arguments in the
+// frame are IGNORED (the passive clause never calls assert_equivalence).
+// Missing → 404 via the shared broker-error mapping.
+func (s *Server) handleExchangeDeclarePassive(conn *protocol.Connection, channelID uint16, declareMethod *protocol.ExchangeDeclareMethod) error {
+	// Authorization: same configure check as the active path (40/10).
+	if err := s.authorize(conn, channelID, interfaces.Operation{
+		Action:       interfaces.ActionConfigure,
+		ResourceType: interfaces.ResourceExchange,
+		Resource:     declareMethod.Exchange,
+		VHost:        conn.Vhost,
+	}); err != nil {
+		return s.authzChannelError(conn, channelID, err, 40, 10)
+	}
+
+	var exchange *protocol.Exchange
+	var err error
+	sb, ok := s.Broker.(*StorageBrokerAdapter)
+	if ok {
+		exchange, err = sb.broker.ExchangeDeclarePassive(declareMethod.Exchange)
+	} else {
+		exchange = s.Broker.GetExchanges()[declareMethod.Exchange]
+		if exchange == nil {
+			err = broker.ExchangeNotFoundError(declareMethod.Exchange)
+		}
+	}
+	if err != nil {
+		return s.closeChannelWithBrokerError(conn, channelID, err, 40, 10)
+	}
+
+	// Nothing was declared: no RecordExchangeDeclared metric.
+	if declareMethod.NoWait {
+		return nil
+	}
 	return s.sendExchangeDeclareOK(conn, channelID)
 }
 
