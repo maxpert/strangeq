@@ -58,6 +58,38 @@ func SetWALWriteForTest(fn func(f *os.File, b []byte) (int, error)) (restore fun
 	return func() { walWriteHook.Store(prev) }
 }
 
+// --- WAL stager (WS-F phase 1) ----------------------------------------------
+
+// walStageHookFn observes the stager's progress. It is invoked after every
+// request the stager serializes onto its current batch, with the cumulative
+// number of requests staged so far. TEST-ONLY.
+type walStageHookFn func(stagedRecords int)
+
+var walStageHook atomic.Pointer[walStageHookFn]
+
+// walStageHookFire reports one stager add to the installed hook. A nil hook
+// costs one atomic load, the same pattern as every seam in this file; the
+// production call sites use this wrapper so the hook check never branches on
+// anything but the atomic load.
+func walStageHookFire(stagedRecords int) {
+	if p := walStageHook.Load(); p != nil {
+		(*p)(stagedRecords)
+	}
+}
+
+// SetWALStageHookForTest installs fn as the stager observer and returns a
+// restore function. TEST-ONLY: the WS-F phase 1 pipeline tests use it to
+// prove the NEXT batch is staged while the current batch's fsync is still in
+// flight, and — by blocking inside the hook on the first add — to make
+// first-batch membership deterministic. Never called by production code; nil
+// = default (no observation).
+func SetWALStageHookForTest(fn func(stagedRecords int)) (restore func()) {
+	prev := walStageHook.Load()
+	f := walStageHookFn(fn)
+	walStageHook.Store(&f)
+	return func() { walStageHook.Store(prev) }
+}
+
 // --- WAL transaction fsync ------------------------------------------------
 
 // walTxFsyncHook installs over the walFsyncFn type declared alongside the
