@@ -3,7 +3,7 @@ module github.com/maxpert/amqp-go
 go 1.25.1
 
 require (
-	github.com/HdrHistogram/hdrhistogram-go v1.2.0
+	github.com/HdrHistogram/hdrhistogram-go v1.3.0
 	github.com/RoaringBitmap/roaring v1.9.4
 	github.com/fxamacker/cbor/v2 v2.9.0
 	github.com/go-viper/mapstructure/v2 v2.4.0
