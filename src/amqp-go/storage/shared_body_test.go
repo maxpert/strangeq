@@ -188,14 +188,8 @@ func TestSharedBody_HotPathInlineByteIdentity(t *testing.T) {
 // allocation behaviour including the bookkeeping that add() performs.
 //
 // The warm-up cycle runs through add+reset to reach steady-state buffer sizing,
-// then AllocsPerRun measures the steady-state path. Because the production path
-// allocates reqs and relPos backing arrays on the staged batch's first burst,
-// the steady-state path after warm-up should still be zero-alloc — only the
-// first add reslices the pre-allocated slices without allocating.
-//
-// If the production path legitimately requires a small number of allocations
-// (e.g. for writeRequest bookkeeping), this test pins the actual value rather
-// than silently weakening the assertion.
+// then AllocsPerRun measures the steady-state path. Pre-allocated slices keep
+// the steady-state path at zero allocations.
 func TestSharedBody_HotPathZeroAllocRegression(t *testing.T) {
 	body := sharedTestBody(4096)
 	msg := &protocol.Message{Exchange: "ex", RoutingKey: "rk", DeliveryMode: 2, Body: body}
@@ -226,13 +220,8 @@ func TestSharedBody_HotPathZeroAllocRegression(t *testing.T) {
 		}
 		sb.reset()
 	})
-	// The production path may allocate negligibly (e.g. for the internal
-	// serErr slice if it were needed, or for relPos/reqs backing array growth
-	// if not pre-allocated). Pre-allocated capacities prevent that, so this
-	// should be 0. If not, pin the correct value with an explanation.
-	assert.LessOrEqual(t, allocs, float64(1),
-		"the N==1 / non-shared group-commit add+reset path must add at most 1 allocation (got %.1f); "+
-			"the pre-warmup should bring it to 0, but a single alloc for bookkeeping is tolerable", allocs)
+	assert.Zero(t, allocs,
+		"the N==1 / non-shared group-commit add+reset path must add zero allocations (got %.1f)", allocs)
 }
 
 // TestSharedBody_BelowThresholdInlined (spec test #8, WAL layer): a small body
