@@ -25,14 +25,17 @@ const (
 	DefaultWALFileSize     = 512 * 1024 * 1024     // 512 MB per WAL file
 	WALFileExtension       = ".wal"
 
-	// maxRetainedWALBatchBytes bounds how large the batch writer's persistent,
-	// reused serialization buffer may grow before it is released back to the GC
-	// after a flush. The buffer is normally retained across flushes (grow-once)
-	// to avoid re-allocating the batch accumulator every group commit; this cap
-	// guards against a rare, unusually large batch permanently pinning a very
-	// large buffer. It is comfortably above the steady-state batch size of the
-	// worst benchmarked cell (64KB body × ~1000-record batch ≈ 64 MB) so the
-	// common case keeps its reuse win, while an outlier batch is not retained.
+	// maxRetainedWALBatchBytes bounds how large EACH of the pipelined group
+	// commit writer's two persistent, reused stagedBatch serialization
+	// buffers may grow before it is released back to the GC (WS-F §1.4:
+	// stagedBatch.reset drops the buffer when its capacity exceeds this).
+	// The buffers are normally retained across batches (grow-once) to avoid
+	// re-allocating the batch accumulator every group commit; this cap
+	// guards against a rare, unusually large batch permanently pinning a
+	// very large buffer. Since WS-F phase 1 the stager also seals every
+	// batch at walBatchSealBytes (64 MiB) + one record, so steady-state
+	// buffers stay well below this cap and it only catches outliers; the
+	// retained worst case is two buffers, ~2x this value (§1.4, accepted).
 	maxRetainedWALBatchBytes = 128 * 1024 * 1024 // 128 MB
 
 	// Shared WAL message (record) format (v4, ITER4). The framing envelope is
@@ -166,12 +169,13 @@ type WALConfig struct {
 	RetentionPeriod    time.Duration // for time-based retention
 	CheckpointInterval time.Duration // how often WAL checkpoints old files to segments
 
-	// SyncDisabled, when true, skips the group-commit fdatasync in flushBatch
-	// (the async publish durability barrier). Zero value (false) = fsync ON, the
-	// durable default, so DefaultWALConfig() and zero-value WALConfig{} stay
-	// durable. Set only via WALConfigFromEngine from the user's Storage.Fsync
-	// flag. It does NOT relax WriteTxAtomic, which always fdatasyncs directly —
-	// transactions remain durable even when this is set.
+	// SyncDisabled, when true, skips the group-commit fdatasync in
+	// commitBatch (the async publish durability barrier). Zero value (false)
+	// = fsync ON, the durable default, so DefaultWALConfig() and
+	// zero-value WALConfig{} stay durable. Set only via WALConfigFromEngine
+	// from the user's Storage.Fsync flag. It does NOT relax WriteTxAtomic,
+	// which always fdatasyncs directly — transactions remain durable even
+	// when this is set.
 	SyncDisabled bool
 
 	// CRCDisabled, when true, skips CRC32 computation on the write path (writes
@@ -254,7 +258,7 @@ type QueueWAL struct {
 	// field that was deleted from exactly this position. Deleting it shifted
 	// every field below by -8, which moved fileMutex out of the start of cache
 	// line 3 and into the tail of line 2, sharing that line with fileNum and
-	// fileOffset — all three touched on flushBatch's group-commit path. That is
+	// fileOffset — all three touched on the committer's group-commit path. That is
 	// a hot-path layout change smuggled in by a cold-path deletion, and the
 	// zero-regression rule is measured against the layout at 60b2d21, so the
 	// layout is restored rather than re-measured. storage/wal_layout_test.go
@@ -273,12 +277,13 @@ type QueueWAL struct {
 	currentFileOffsetsMutex sync.Mutex
 
 	// currentFileHasSharedBody (ITER5 §2) records that the active file carries at
-	// least one BodyBlock record. It is set under fileMutex by flushBatch when a
-	// fused shared unit is serialized and captured into walFileInfo.hasSharedBody
+	// least one BodyBlock record. It is set under fileMutex by commitBatch when a
+	// batch carrying a fused shared unit is successfully written, restored on a
+	// failed write/fsync, and captured into walFileInfo.hasSharedBody
 	// (then reset) by rollFile. performCheckpoint skips a rolled file with this set
 	// so a shared body survives as ONE copy across arbitrarily many checkpoints
 	// (until all refs ack -> whole-file reclaim, or the SharedBodyMaxPinAge backstop
-	// fires). Guarded by fileMutex (always held in flushBatch and rollFile).
+	// fires). Guarded by fileMutex (always held in commitBatch and rollFile).
 	currentFileHasSharedBody bool
 
 	// Old inactive files
@@ -331,7 +336,7 @@ type QueueWAL struct {
 	nextRollAttempt time.Time // zero = may attempt now
 	// rollFailures counts consecutive failed roll attempts, for log throttling.
 	rollFailures int
-	// fileClosed is set by close() under fileMutex; flushBatch and
+	// fileClosed is set by close() under fileMutex; commitBatch and
 	// writeTxAtomic refuse with ErrWALClosed after it.
 	fileClosed bool
 
@@ -347,6 +352,32 @@ type QueueWAL struct {
 	// backoff, degraded transitions). nil = silent. Wired by
 	// WALManager.SetLogger.
 	logger atomicLogger
+
+	// --- WS-F phase 1: pipelined group commit. Appended AFTER logger (the
+	// last field the pre-pipeline layout pinned), never above txEpoch, so
+	// the hot-group offsets wal_layout_test.go pins are untouched. ---
+
+	// commitCh hands a sealed stagedBatch from the stager
+	// (batchWriterLoop) to the committer (walCommitLoop). UNBUFFERED by
+	// design (§1.1): a hand-off completes only when the committer has fully
+	// finished the previous batch — write, fsync, index, roll, completions,
+	// and the free <- sb return — so write(i+1) is never issued before
+	// fsync(i) returns (D3) and at most one unfsynced batch ever exists
+	// beyond the durable end.
+	commitCh chan *stagedBatch
+	// free returns staged batches from the committer to the stager, one
+	// buffer per outstanding hand-off. Capacity 2 because the stager owns
+	// at most one and the committer at most one of the exactly
+	// walPipelineBatchCount stagedBatch objects, so a free <- sb can never
+	// block.
+	free chan *stagedBatch
+
+	// pipelineMu guards pipelineBatches (the registry of the ≤2 stagedBatch
+	// objects, created by the stager) and each object's handoffBuf
+	// snapshot, for pipelineBufsForTest. TEST-ONLY observability; its only
+	// production cost is one lock per batch hand-off.
+	pipelineMu      sync.Mutex
+	pipelineBatches []*stagedBatch
 }
 
 // Package tunables for the WS-C roll/retry machinery. Unexported vars so
@@ -357,7 +388,23 @@ var (
 	walRollBackoffMin        = 10 * time.Millisecond
 	walRollBackoffMax        = 1 * time.Second
 	walDegradedAfterFailures = 8
+
+	// walBatchSealBytes (WS-F phase 1 §1.4) is the byte-based batch seal:
+	// the stager stops adding requests to a batch once its serialization
+	// buffer reaches this size, so each staged buffer is bounded at
+	// walBatchSealBytes + one record and steady-state growth never crosses
+	// maxRetainedWALBatchBytes (the b4000 free/regrow cliff). A single
+	// record larger than the seal forms its own batch. Test-shrinkable like
+	// the roll backoff vars; a test that shrinks it must do so before the
+	// manager is created (the stager reads it outside every lock).
+	walBatchSealBytes = 64 << 20 // 64 MiB
 )
+
+// walPipelineBatchCount is the exact number of stagedBatch objects per
+// QueueWAL (WS-F §1.4: exactly two, allocated lazily by the stager, ownership
+// moving only over commitCh/free). It keeps nextStagedBatch's lazy
+// allocation bounded.
+const walPipelineBatchCount = 2
 
 // offsetLocation tracks where an offset lives in the WAL
 type offsetLocation struct {
@@ -365,12 +412,71 @@ type offsetLocation struct {
 	filePosition int64
 }
 
-// sharedIndexEntry records where a fused shared unit's reference record landed,
-// so flushBatch can populate the offset index for it post-fsync (the BodyBlock
-// record itself is never indexed). See flushBatch.
+// sharedIndexEntry records where a fused shared unit's reference record landed
+// so the committer can populate the offset index for it post-fsync (the
+// BodyBlock record itself is never indexed). See commitBatch.
 type sharedIndexEntry struct {
-	offset       uint64
+	offset uint64
+	// filePosition is the position RELATIVE to the staged buffer's start
+	// while the batch is owned by the stager (WS-F §1.1); commitBatch binds
+	// it to an absolute file position (base + filePosition) under
+	// fileMutex before indexing.
 	filePosition int64
+}
+
+// stagedBatch is ONE reusable group-commit batch of the pipelined writer
+// (WS-F phase 1 §1.1). Exactly walPipelineBatchCount objects exist per
+// QueueWAL; ownership moves only over commitCh/free (channel happens-before
+// is the whole synchronization story), so no buffer is ever touched by two
+// goroutines at once. The stager serializes requests onto buf AS THEY ARRIVE
+// and records every position buf-RELATIVE (relPos, sharedRel, refPatch);
+// the committer binds the base under fileMutex and translates to absolute
+// file positions at commit time (§1.2), which is what lets a roll, a
+// truncate-repair, a poison-roll or an interleaved writeTxAtomic between
+// staging and commit never invalidate a staged batch.
+type stagedBatch struct {
+	// reqs are the writeRequests of this batch, in enqueue order.
+	reqs []*writeRequest
+	// buf is the packed, back-to-back serialization of the batch's records.
+	buf []byte
+	// relPos[i] is reqs[i]'s record start RELATIVE to buf[0]; -1 = the
+	// request was not written (a per-record serialize failure, or a fused
+	// shared unit, which is indexed via sharedRel instead).
+	relPos []int64
+	// serErr, when non-nil, carries a per-request serialization error
+	// (index i, kept len-aligned with reqs) that overrides the batch error
+	// for that request's completion. Lazily allocated on the first failure,
+	// nil on the common all-success path (no allocation, as in flushBatch's
+	// day).
+	serErr []error
+	// sharedRel collects the reference records of fused shared units
+	// (filePosition RELATIVE, bound at commit).
+	sharedRel []sharedIndexEntry
+	// refPatch records every shared-unit BodyRef locator to bind at commit:
+	// the stager wrote the block's buf-RELATIVE position into the locator
+	// bytes; the committer patches base+blockRel in and recomputes the
+	// record's CRC (§1.2).
+	refPatch []refPatch
+	// hasShared is true iff the batch serialized at least one fused shared
+	// unit successfully; the committer sets currentFileHasSharedBody under
+	// fileMutex iff this is set after a successful write.
+	hasShared bool
+
+	// handoffBuf is this object's buf as captured at the stager's most
+	// recent hand-off (len > 0), published under QueueWAL.pipelineMu for
+	// pipelineBufsForTest. TEST-ONLY observability.
+	handoffBuf []byte
+}
+
+// refPatch is one shared-unit reference locator awaiting its commit-time
+// binding. All fields are buf-relative indices into the owning stagedBatch:
+// the ref record spans [recStart, recEnd), its 8 locator bytes sit at
+// locAt, and blockRel is the BodyBlock record's start relative to buf[0].
+// locAt is derived from bodyRefLocatorOffset (pinned by
+// TestSharedUnit_LocatorPatchEqualsDirectSerialize), not from byte counting
+// at append time, so a layout change cannot silently drift it.
+type refPatch struct {
+	recStart, recEnd, locAt, blockRel int
 }
 
 type writeRequest struct {
@@ -381,9 +487,10 @@ type writeRequest struct {
 	//   - done  : the synchronous caller (Write, tx staging, transient spill,
 	//     tests) blocks on this cap-1 pooled channel until its batch is fsynced.
 	//   - onDone : the ASYNC caller (WriteAsync) supplies a completion callback
-	//     that flushBatch invokes, in enqueue order, AFTER the batch is durable
-	//     (fdatasync returned) AND the offset index is populated. The callback
-	//     runs on the shared batch-writer goroutine and MUST be non-blocking
+	//     that the committer (commitBatch) invokes, in enqueue order, AFTER the
+	//     batch is durable (fdatasync returned) AND the offset index is
+	//     populated. The callback runs on the shared committer goroutine and
+	//     MUST be non-blocking
 	//     (atomics + non-blocking pokes only) — it must never do socket I/O,
 	//     fsync, or hold a lock across I/O (invariant A4), or it re-creates the
 	//     per-connection fsync stall this design removes.
@@ -391,9 +498,9 @@ type writeRequest struct {
 	onDone func(error)
 
 	// unit, when non-nil, makes this ONE writeChan item a fused shared-body unit
-	// (ITER5, §3): flushBatch serializes it as one BodyBlock record followed by N
-	// reference records, all within this single request so they land in ONE file /
-	// ONE fsync (co-location invariant). unit is mutually exclusive with
+	// (ITER5, §3): the stager serializes it as one BodyBlock record followed by
+	// N reference records, all within this single request so they land in ONE
+	// file / ONE fsync (co-location invariant). unit is mutually exclusive with
 	// queueName/message/offset/done/onDone above (those describe an ordinary
 	// single-record write; a unit carries its own per-sub fields). A nil unit is
 	// the byte-for-byte-unchanged ordinary write path.
@@ -539,7 +646,7 @@ func getDoneChannel(pool *sync.Pool) chan error {
 // putDoneChannel returns a channel to the pool. Defensively drains any stale
 // value to prevent deadlock if a future code path returns the channel without
 // reading the result (a pending value in a cap-1 channel would cause the next
-// flushBatch send to block forever).
+// commitBatch send to block forever).
 func putDoneChannel(pool *sync.Pool, ch chan error) {
 	select {
 	case <-ch: // drain any stale value
@@ -604,15 +711,16 @@ func (wm *WALManager) Write(queueName string, message *protocol.Message, offset 
 
 // WriteAsync enqueues a message for durable group-commit exactly like Write,
 // but returns as soon as the request is queued instead of blocking the caller
-// until the fsync completes. The supplied onDone is invoked by flushBatch after
-// the batch containing this message is fsynced to disk AND the offset index is
-// populated (success => onDone(nil)), or with the write/fsync error on failure
-// (index NOT updated). Completions for a batch fire in enqueue order.
+// until the fsync completes. The supplied onDone is invoked by the committer
+// (commitBatch) after the batch containing this message is fsynced to disk
+// AND the offset index is populated (success => onDone(nil)), or with the
+// write/fsync error on failure (index NOT updated). Completions for a batch
+// fire in enqueue order.
 //
 // This decouples the durable publish path from the per-connection frame
 // processor: pipelined publishes fill writeChan so one F_FULLFSYNC amortises
 // over the whole drained batch (see the design in the async-WAL proposal).
-// onDone runs on the shared batch-writer goroutine and MUST be non-blocking
+// onDone runs on the shared committer goroutine and MUST be non-blocking
 // (see writeRequest.onDone). The blocking writeChan send is preserved, so
 // writeChan's capacity remains the durable in-flight memory bound.
 func (wm *WALManager) WriteAsync(queueName string, message *protocol.Message, offset uint64, onDone func(error)) {
@@ -638,15 +746,17 @@ func (wm *WALManager) WriteAsync(queueName string, message *protocol.Message, of
 
 // WriteSharedAsync enqueues a fused shared-body durable write (ITER5, §3): ONE
 // BodyBlock record carrying body a single time, plus one reference record per
-// sub, as a SINGLE writeChan item. Because a single request is never split across
-// batches (batchWriterLoop) and a batch never rolls mid-flush (flushBatch rolls
-// only AFTER the whole-batch Write+fsync), the block and all N refs are provably
-// in ONE file and made durable by ONE fdatasync (co-location invariant + A1).
-// Each sub's onDone/done fires — in sub order — only AFTER the unit is durable
-// AND indexed, exactly like WriteAsync. All-or-nothing: a serialize error rolls
-// the whole unit back and nacks every sub. body must be the shared body every
-// sub references (the caller keeps each sub.message.Body pointing at it for
-// in-memory delivery; the on-disk record for each sub is a reference).
+// sub, as a SINGLE writeChan item. Because a single request is never split
+// across batches (the stager serializes one request into exactly one
+// stagedBatch) and a batch never rolls mid-commit (the committer rolls only
+// AFTER the whole-batch Write+fsync, inside commitBatch), the block and all
+// N refs are provably in ONE file and made durable by ONE fdatasync
+// (co-location invariant + A1). Each sub's onDone/done fires — in sub order
+// — only AFTER the unit is durable AND indexed, exactly like WriteAsync.
+// All-or-nothing: a serialize error rolls the whole unit back and nacks
+// every sub. body must be the shared body every sub references (the caller
+// keeps each sub.message.Body pointing at it for in-memory delivery; the
+// on-disk record for each sub is a reference).
 func (wm *WALManager) WriteSharedAsync(subs []sharedSub, body []byte, fanoutHint uint32) error {
 	wm.mu.RLock()
 	sw := wm.sharedWAL
@@ -666,8 +776,8 @@ func (wm *WALManager) WriteSharedAsync(subs []sharedSub, body []byte, fanoutHint
 	})
 }
 
-// walGroupCommitFsync is the fsync applied by the group-commit batch writer
-// (flushBatch). It is swappable via an atomic pointer so tests can gate the
+// walGroupCommitFsync is the fsync applied by the group-commit committer
+// (commitBatch). It is swappable via an atomic pointer so tests can gate the
 // durability barrier or inject a write/fsync error deterministically; the
 // production path always uses fdatasyncFile. Only the group-commit path is
 // affected — WriteTxAtomic keeps calling fdatasyncFile directly, so the
@@ -934,10 +1044,10 @@ func (wm *WALManager) Health() error {
 // completes (or a torn tail) leaves the whole transaction uncommitted.
 //
 // This is deliberately a SLOW PATH that is independent of the group-commit
-// batch writer (batchWriterLoop/flushBatch) and its CAS ring — transaction
-// commit favors correctness over throughput and must not be interleaved with
-// unrelated messages, so the records are written directly under fileMutex
-// rather than through writeChan.
+// pipeline (batchWriterLoop/walCommitLoop) — transaction commit favors
+// correctness over throughput and must not be interleaved with unrelated
+// messages beyond the fileMutex serialization, so the records are written
+// directly under fileMutex rather than through writeChan.
 func (wm *WALManager) WriteTxAtomic(records []*RecoveryMessage) error {
 	wm.mu.RLock()
 	sw := wm.sharedWAL
@@ -1620,6 +1730,11 @@ func (wm *WALManager) createSharedWAL() (*QueueWAL, error) {
 		oldFileCache:       make(map[uint64]*os.File),
 		offsetIndex:        make(map[uint64]*offsetLocation), // Phase 6D: Offset index for O(1) reads
 		stopChan:           make(chan struct{}),
+		// WS-F phase 1: the pipelined group-commit hand-off. commitCh is
+		// unbuffered by design (see the QueueWAL field comment); free's
+		// capacity is the exact staged-batch object count.
+		commitCh: make(chan *stagedBatch),
+		free:     make(chan *stagedBatch, walPipelineBatchCount),
 	}
 
 	// Rebuild everything the write path would otherwise be the only producer of:
@@ -1638,100 +1753,205 @@ func (wm *WALManager) createSharedWAL() (*QueueWAL, error) {
 	}
 
 	// Start background goroutines (single set for all queues!)
-	wal.wg.Add(3)
+	// WS-F phase 1: four goroutines — the stager (batchWriterLoop) and the
+	// committer (walCommitLoop) of the pipelined group-commit writer, plus
+	// cleanup and checkpoint. close() waits on all of them (D5).
+	wal.wg.Add(4)
 	go wal.batchWriterLoop()
+	go wal.walCommitLoop()
 	go wal.cleanupLoop()
 	go wal.checkpointLoop()
 
 	return wal, nil
 }
 
-// batchWriterLoop implements group commit for synchronous WAL writes:
-// it greedily coalesces every request already queued in writeChan (writers
-// that arrived while the previous batch was fsyncing) into one batch, then
-// flushes immediately.
+// batchWriterLoop is the STAGER half of the pipelined group-commit writer
+// (WS-F phase 1 §1.1). It owns one stagedBatch at a time, drains writeChan
+// and serializes each request onto that batch's buffer AS IT ARRIVES, so the
+// serialization of batch i+1 overlaps the committer's write+fsync of batch
+// i. It takes NO lock (it reads only the immutable qw.cfg) and never touches
+// the file, fileNum/fileOffset, the index, metrics or completions — those
+// belong to walCommitLoop under fileMutex.
+//
+// Batches are sealed at cfg.BatchSize records or walBatchSealBytes bytes
+// (§1.4); a sealed batch is handed to the committer over the UNBUFFERED
+// commitCh, and because a hand-off completes only when the committer has
+// fully finished the previous batch, write(i+1) is never issued before
+// fsync(i) returns (D3).
 //
 // Flushing as soon as writeChan is drained — instead of holding a
 // sub-BatchSize batch until a BatchTimeout ticker fired, as this loop
-// previously did — is what keeps a lone synchronous writer fast: with the
-// old ticker design every solo Write() stalled for up to BatchTimeout
-// (10ms by default, ~100 writes/s), which presented as a publisher wedge
-// once a queue ring crossed the spill threshold and every transient publish
-// became a synchronous WAL write. Concurrent writers still amortize one
+// did in an earlier design — is what keeps a lone synchronous writer fast:
+// an idle committer is parked in `range commitCh`, so once writeChan is
+// momentarily empty the very next select hands the partial batch off
+// immediately. That is exactly the drain-then-flush behaviour
+// TestWALWrite_LoneWriterNotBatchTimeoutBound pins, and it is why a lone
+// writer still pays no BatchTimeout. Concurrent writers still amortize one
 // fsync across the whole drained batch, so group-commit throughput is
-// preserved; the batch size now self-tunes to arrival-rate × fsync-latency
-// (capped at BatchSize) rather than arrival-rate × BatchTimeout.
+// preserved; the batch size still self-tunes to arrival-rate ×
+// fsync-latency (capped at BatchSize / walBatchSealBytes) rather than
+// arrival-rate × BatchTimeout.
 func (qw *QueueWAL) batchWriterLoop() {
 	defer qw.wg.Done()
 
-	batch := make([]*writeRequest, 0, qw.cfg.BatchSize)
+	var allocated int
+	cur := qw.nextStagedBatch(&allocated)
 
-	// Persistent, single-owner scratch owned exclusively by this goroutine and
-	// passed to flushBatch by pointer. buf is the serialization accumulator
-	// (reset to buf[:0] and re-filled in place each flush — no fresh nil
-	// accumulator, no geometric regrowth); positions is the per-record file
-	// position scratch. Neither ever escapes this goroutine or is aliased to a
-	// message body, which is what makes the reuse race-free (invariant A1 §4).
-	var buf []byte
-	var positions []int64
-
+	staged := 0 // cumulative requests staged, for walStageHookFire (TEST-ONLY)
 	for {
+		if len(cur.reqs) == 0 {
+			select {
+			case r := <-qw.writeChan:
+				cur.add(r, qw.cfg.CRCDisabled)
+				staged++
+				walStageHookFire(staged)
+			case <-qw.stopChan:
+				qw.stageShutdownDrain(cur, &allocated, &staged)
+				return
+			}
+		}
+		// Coalesce everything already queued, until the batch seals.
+	coalesce:
+		for !cur.sealed(qw.cfg.BatchSize) {
+			select {
+			case r := <-qw.writeChan:
+				cur.add(r, qw.cfg.CRCDisabled)
+				staged++
+				walStageHookFire(staged)
+			default:
+				break coalesce
+			}
+		}
+		if cur.sealed(qw.cfg.BatchSize) {
+			// Backpressure: the blocking hand-off parks the stager until the
+			// committer has finished batch i (see commitCh).
+			qw.handoff(cur)
+			cur = qw.nextStagedBatch(&allocated)
+			continue
+		}
+		// Partial batch and writeChan momentarily empty: hand it off if the
+		// committer is idle (the lone-writer fast path — same
+		// drain-then-flush as before), otherwise keep coalescing.
 		select {
-		case req := <-qw.writeChan:
-			batch = append(batch, req)
-			// Coalesce everything already queued, up to BatchSize.
-		drain:
-			for len(batch) < qw.cfg.BatchSize {
-				select {
-				case r := <-qw.writeChan:
-					batch = append(batch, r)
-				default:
-					break drain
-				}
-			}
-			qw.flushBatch(batch, &buf, &positions)
-			batch = batch[:0]
-
+		case qw.commitCh <- cur:
+			cur = qw.nextStagedBatch(&allocated)
+		case r := <-qw.writeChan:
+			cur.add(r, qw.cfg.CRCDisabled)
+			staged++
+			walStageHookFire(staged)
 		case <-qw.stopChan:
-			// Final flush: drain anything still queued so no Write() caller
-			// is left blocked forever on its done channel during shutdown.
-			for {
-				select {
-				case r := <-qw.writeChan:
-					batch = append(batch, r)
-				default:
-					if len(batch) > 0 {
-						qw.flushBatch(batch, &buf, &positions)
-					}
-					return
-				}
-			}
+			qw.stageShutdownDrain(cur, &allocated, &staged)
+			return
 		}
 	}
 }
 
-// flushBatch writes a batch of messages to the current WAL file.
-//
-// bufp and positionsp point to the batch writer's persistent, single-owner
-// scratch (see batchWriterLoop). The serialization accumulator is reset with
-// (*bufp)[:0] and re-filled IN PLACE — each record is serialized directly onto
-// the shared buffer's tail via appendMessageRecord — instead of allocating a
-// fresh nil accumulator per batch and a per-message serialize buffer that is then
-// re-copied in. This removes the two biggest allocators on the durable path (the
-// former flushBatch re-append + serializeMessageVersioned per-message buffer) and
-// the geometric regrowth of the accumulator.
+// stageShutdownDrain is the stager's final drain (D5). After stopChan closes
+// it keeps receiving from writeChan non-blockingly — every request enqueued
+// before `closing` must be committed and completed exactly once — sealing
+// and handing batches off as they fill, then hands the final non-empty
+// batch to the committer and closes commitCh so walCommitLoop exits too.
+// The C9 enqueue gate (enqueueMu) guarantees no send can arrive after this
+// drain sees writeChan empty, so nothing is lost.
+func (qw *QueueWAL) stageShutdownDrain(cur *stagedBatch, allocated *int, staged *int) {
+	for {
+		select {
+		case r := <-qw.writeChan:
+			cur.add(r, qw.cfg.CRCDisabled)
+			*staged++
+			walStageHookFire(*staged)
+			if cur.sealed(qw.cfg.BatchSize) {
+				qw.handoff(cur)
+				cur = qw.nextStagedBatch(allocated)
+			}
+		default:
+			if len(cur.reqs) > 0 {
+				qw.handoff(cur)
+			}
+			close(qw.commitCh)
+			return
+		}
+	}
+}
+
+// nextStagedBatch returns the stager's next working batch: a recycled one
+// from free when available, otherwise — lazily, bounded at
+// walPipelineBatchCount — a freshly allocated object. With exactly two
+// objects and free's capacity of two, the blocking receive on the last line
+// is reachable only while the committer still holds the other object, which
+// it always returns, so it cannot deadlock.
+func (qw *QueueWAL) nextStagedBatch(allocated *int) *stagedBatch {
+	select {
+	case sb := <-qw.free:
+		return sb
+	default:
+	}
+	if *allocated < walPipelineBatchCount {
+		*allocated++
+		c := qw.cfg.BatchSize
+		if c < 1 {
+			c = 1
+		}
+		sb := &stagedBatch{reqs: make([]*writeRequest, 0, c)}
+		qw.pipelineMu.Lock()
+		qw.pipelineBatches = append(qw.pipelineBatches, sb)
+		qw.pipelineMu.Unlock()
+		return sb
+	}
+	return <-qw.free
+}
+
+// handoff passes a sealed (or final) batch to the committer. The blocking
+// send is the pipeline's backpressure point; the buffer snapshot published
+// under pipelineMu is TEST-ONLY observability (pipelineBufsForTest).
+func (qw *QueueWAL) handoff(sb *stagedBatch) {
+	qw.pipelineMu.Lock()
+	sb.handoffBuf = sb.buf
+	qw.pipelineMu.Unlock()
+	qw.commitCh <- sb
+}
+
+// walCommitLoop is the COMMITTER half of the pipelined group-commit writer
+// (WS-F phase 1 §1.1). It receives sealed staged batches over commitCh and
+// runs, under fileMutex, the exact bind → write → fsync → index → advance →
+// roll sequence the single-threaded batchWriterLoop previously ran inline
+// (flushBatch), then delivers completions outside every lock and returns
+// the batch to the stager via free. One committer means fsyncs are strictly
+// ordered and never concurrent (D2), and every completion of batch i fires
+// before any of batch i+1's.
+func (qw *QueueWAL) walCommitLoop() {
+	defer qw.wg.Done()
+	for sb := range qw.commitCh {
+		qw.commitBatch(sb)
+		sb.reset()
+		qw.free <- sb
+	}
+}
+
+// commitBatch writes one sealed staged batch to the current WAL file. It is
+// flushBatch's body with the serialization removed (that now lives in
+// (*stagedBatch).add on the stager goroutine) and the position bookkeeping
+// inverted: the stager recorded every position buf-RELATIVE, so commitBatch
+// binds the base under fileMutex — after the fileClosed / poison checks,
+// atomically with the walWrite that consumes it (§1.2) — and translates
+// base+relPos to absolute file positions. A roll, a truncate-repair, a
+// poison-roll or an interleaved writeTxAtomic between staging and commit
+// can therefore never invalidate a staged batch: ordinary records are
+// position-independent (the CRC covers only the record's own [len][data]).
 //
 // A1 SAFETY: the reused buffer's lifetime ends at qw.currentFile.Write()'s
 // RETURN — write(2) copies the bytes into the kernel page cache, and the
-// subsequent fsync flushes KERNEL state, never this Go slice. So resetting/reusing
-// *bufp on the NEXT flush cannot race, corrupt, or invalidate the previous batch's
-// fsync, CRC (computed during serialization, before Write), any confirm, or any
-// delivery. Everything after Write — metrics, fsync, the fsync-error early return
-// that leaves the index un-updated, offset-index population, offset/roll, unlock,
-// and completions — is byte-for-byte unchanged, so the write→fsync→index→completion
-// ordering and durability barrier are preserved.
-func (qw *QueueWAL) flushBatch(batch []*writeRequest, bufp *[]byte, positionsp *[]int64) {
-	if len(batch) == 0 {
+// subsequent fsync flushes KERNEL state, never this Go slice. So the stager
+// reusing the OTHER staged buffer, and this buffer itself once the batch
+// returns via free, cannot race, corrupt, or invalidate the previous
+// batch's fsync, CRC (computed during staging, before Write), any confirm,
+// or any delivery. Everything after Write — metrics, fsync, the
+// fsync-error early return that leaves the index un-updated, offset-index
+// population, offset/roll, unlock, and completions — is byte-for-byte what
+// flushBatch ran, so the write→fsync→index→completion ordering and the
+// durability barrier are preserved.
+func (qw *QueueWAL) commitBatch(sb *stagedBatch) {
+	if len(sb.reqs) == 0 {
 		return
 	}
 
@@ -1739,133 +1959,56 @@ func (qw *QueueWAL) flushBatch(batch []*writeRequest, bufp *[]byte, positionsp *
 
 	// C9 belt-and-braces: a batch cannot normally arrive after close()
 	// finished waiting (enqueue closed the window), but refuse it cleanly if
-	// one ever does.
+	// one ever does. (serErr is passed as nil here exactly as flushBatch did:
+	// the batch error is the outcome that matters on this arm.)
 	if qw.fileClosed {
 		qw.fileMutex.Unlock()
-		qw.deliverCompletions(batch, nil, ErrWALClosed)
+		qw.deliverCompletions(sb.reqs, nil, ErrWALClosed)
 		return
 	}
 	// C1: never write to a file whose size != fileOffset (poisoned); roll it
 	// away first or fail fast.
 	if err := qw.ensureWritableLocked(); err != nil {
 		qw.fileMutex.Unlock()
-		qw.deliverCompletions(batch, nil, err)
+		qw.deliverCompletions(sb.reqs, nil, err)
 		return
 	}
 
-	// Get current file number and position BEFORE write
+	// WS-F §1.2: bind the batch's file positions NOW, under fileMutex and
+	// after the fileClosed/poison checks, atomically with the walWrite below
+	// that consumes them. This is the whole "reservation": a roll, repair or
+	// interleaved tx between staging and here changes base, never the
+	// staged relPos values.
+	base := qw.fileOffset.Load()
 	currentFileNum := qw.fileNum.Load()
-	currentFilePos := qw.fileOffset.Load()
-	// C1: currentFileHasSharedBody is set during serialization below; a failed
-	// write/fsync restores it so a nacked shared unit cannot pin the file out
-	// of checkpoint forever.
+	// C1: currentFileHasSharedBody is set below after a successful write iff
+	// this batch carried a shared unit; a failed write/fsync restores it so
+	// a nacked shared unit cannot pin the file out of checkpoint forever.
 	prevShared := qw.currentFileHasSharedBody
 
-	// Reuse the persistent serialization buffer (grow-once) and position scratch.
-	buf := (*bufp)[:0]
-	if cap(*positionsp) < len(batch) {
-		*positionsp = make([]int64, len(batch))
-	}
-	positions := (*positionsp)[:len(batch)]
-
-	// Serialize all messages in batch IN PLACE and track their positions.
-	//
-	// A record that fails to encode (e.g. a shortstr property >255 bytes) is
-	// rolled back to its start so no partial/corrupt bytes are written, its
-	// position is marked -1 (skip index + offset-set below), and its own error is
-	// delivered to that caller — the rest of the batch is unaffected. serErr stays
-	// nil (no allocation) on the common all-success path, preserving Stage A's
-	// zero-alloc batch serialization; it is lazily allocated only when a record
-	// actually fails, which the wire decoder's 255-byte bound makes near-unreachable.
-	var serErr []error
-	// sharedIdx collects (offset, filePosition) for the reference records of any
-	// fused shared unit(s) in this batch, to be indexed post-fsync alongside the
-	// ordinary records. It stays nil on the common no-unit path (the N==1 durable
-	// hot path), so that path adds ZERO allocations vs today.
-	var sharedIdx []sharedIndexEntry
-	for i, req := range batch {
-		if req.unit == nil {
-			recStart := len(buf)
-			positions[i] = currentFilePos + int64(recStart) // Position in file
-			var e error
-			buf, e = appendMessageRecord(buf, req.queueName, req.message, req.offset, qw.cfg.CRCDisabled)
-			if e != nil {
-				buf = buf[:recStart] // discard the failed record's partial bytes
-				positions[i] = -1
-				if serErr == nil {
-					serErr = make([]error, len(batch))
-				}
-				serErr[i] = e
-			}
-			continue
+	// Bind shared-unit BodyRef locators (ITER5 + WS-F §1.2). The stager wrote
+	// each ref record with its block's buf-RELATIVE position in the 8 locator
+	// bytes and recorded a refPatch; the block's true file-relative position
+	// is base+blockRel. Patch the locator and recompute that record's CRC
+	// over its own [length][data] span (the locator is covered by it). Ref
+	// records carry no body, so this is O(len(refPatch) × ~100 B); it stays
+	// empty on the ordinary no-unit hot path. With CRCDisabled the staged
+	// CRC is zero and stays zero (D6).
+	for i := range sb.refPatch {
+		p := &sb.refPatch[i]
+		binary.BigEndian.PutUint64(sb.buf[p.locAt:], uint64(base+int64(p.blockRel)))
+		if !qw.cfg.CRCDisabled {
+			crc := crc32.ChecksumIEEE(sb.buf[p.recStart+4 : p.recEnd])
+			binary.BigEndian.PutUint32(sb.buf[p.recStart:p.recStart+4], crc)
 		}
-
-		// FUSED SHARED UNIT (ITER5, §3.3): emit the BodyBlock first (capturing its
-		// file-relative start = the reference locator), then each sub as a message
-		// record carrying that locator via the existing bodyKindReference arm. The
-		// block's offset is NOT indexed (it is not a deliverable message); each
-		// sub's (offset, position) is recorded for post-fsync index population.
-		// This req occupies ONE batch index, so positions[i] is marked -1 (skipped
-		// by the ordinary index loop below); its subs are indexed via sharedIdx.
-		positions[i] = -1
-		u := req.unit
-		unitStart := len(buf)
-		blockStart := currentFilePos + int64(unitStart)
-		buf = appendBodyBlockRecord(buf, u.fanoutHint, u.body, qw.cfg.CRCDisabled)
-
-		var locator [8]byte
-		binary.BigEndian.PutUint64(locator[:], uint64(blockStart))
-
-		savedSharedLen := len(sharedIdx)
-		var unitErr error
-		for si := range u.subs {
-			sub := &u.subs[si]
-			subPos := currentFilePos + int64(len(buf))
-			// Drive the existing bodyKindReference writer arm by setting BodyRef to
-			// the 8-byte locator, then CLEAR it immediately so the caller's in-memory
-			// message stays a clean inline message (a later dead-letter/requeue
-			// re-store must NOT emit a dangling reference into another file). Safe:
-			// the sub message is not consumer-visible until its completion fires
-			// (after this fsync), so nothing reads BodyRef concurrently here.
-			sub.message.BodyRef = locator[:]
-			var e error
-			buf, e = appendMessageRecord(buf, sub.queueName, sub.message, sub.offset, qw.cfg.CRCDisabled)
-			sub.message.BodyRef = nil
-			if e != nil {
-				unitErr = e
-				break
-			}
-			sharedIdx = append(sharedIdx, sharedIndexEntry{offset: sub.offset, filePosition: subPos})
-		}
-		if unitErr != nil {
-			// All-or-nothing per unit: discard the block + every already-written
-			// sub record, drop the partial index entries, and nack every sub.
-			buf = buf[:unitStart]
-			sharedIdx = sharedIdx[:savedSharedLen]
-			if serErr == nil {
-				serErr = make([]error, len(batch))
-			}
-			serErr[i] = unitErr
-			continue
-		}
-		// A shared body is now on the active file: mark it so rollFile can pin the
-		// file out of checkpoint (§2). fileMutex is held for the whole flushBatch.
-		qw.currentFileHasSharedBody = true
-	}
-	// Publish the (possibly reallocated) buffer back so the next flush reuses
-	// its grown capacity. A rare oversized batch is released rather than pinned.
-	if cap(buf) > maxRetainedWALBatchBytes {
-		*bufp = nil
-	} else {
-		*bufp = buf
 	}
 
 	// Single write (O_APPEND makes this atomic across processes). The write
 	// goes through the walWrite hook seam (TEST-ONLY faults; default is
 	// f.Write). A short write (n < len(buf), no error) is normalised to
 	// io.ErrShortWrite: Go's os.File.Write sets it itself, but a hook may not.
-	n, err := walWrite(qw.currentFile, buf)
-	if err == nil && n != len(buf) {
+	n, err := walWrite(qw.currentFile, sb.buf)
+	if err == nil && n != len(sb.buf) {
 		err = io.ErrShortWrite
 	}
 	if err != nil {
@@ -1880,17 +2023,25 @@ func (qw *QueueWAL) flushBatch(batch []*writeRequest, bufp *[]byte, positionsp *
 		// file lock before delivering completions (async callbacks must not
 		// run under fileMutex; see deliverCompletions).
 		qw.currentFileHasSharedBody = prevShared
-		e := qw.failBatchLocked(qw.repairAfterFailedWriteLocked(currentFilePos, "write", err))
+		e := qw.failBatchLocked(qw.repairAfterFailedWriteLocked(base, "write", err))
 		qw.assertOffsetInvariantLocked()
 		qw.fileMutex.Unlock()
-		qw.deliverCompletions(batch, serErr, e)
+		qw.deliverCompletions(sb.reqs, sb.serErr, e)
 		return
+	}
+
+	// A shared body is now on the active file: mark it so rollFile can pin
+	// the file out of checkpoint (§2). Set here (not during staging) so the
+	// flag reflects only batches whose write succeeded; fileMutex is held
+	// for the whole commitBatch.
+	if sb.hasShared {
+		qw.currentFileHasSharedBody = true
 	}
 
 	// Record successful WAL writes (only records that were actually serialized).
 	if qw.metrics != nil {
-		for i := range batch {
-			if positions[i] >= 0 {
+		for i := range sb.reqs {
+			if sb.relPos[i] >= 0 {
 				qw.metrics.RecordWALWrite()
 			}
 		}
@@ -1934,10 +2085,10 @@ func (qw *QueueWAL) flushBatch(batch []*writeRequest, bufp *[]byte, positionsp *
 	// pattern that refuses boot. Truncate back to the pre-write offset.
 	if fsyncErr != nil {
 		qw.currentFileHasSharedBody = prevShared
-		e := qw.failBatchLocked(qw.repairAfterFailedWriteLocked(currentFilePos, "fsync", fsyncErr))
+		e := qw.failBatchLocked(qw.repairAfterFailedWriteLocked(base, "fsync", fsyncErr))
 		qw.assertOffsetInvariantLocked()
 		qw.fileMutex.Unlock()
-		qw.deliverCompletions(batch, serErr, e)
+		qw.deliverCompletions(sb.reqs, sb.serErr, e)
 		return
 	}
 
@@ -1945,36 +2096,36 @@ func (qw *QueueWAL) flushBatch(batch []*writeRequest, bufp *[]byte, positionsp *
 	// and roll BEFORE releasing the lock and BEFORE firing completions, so that
 	// when a completion advances a message's visibility (async path), a woken
 	// consumer's wal.Read finds the record. Records that failed to serialize
-	// (positions[i] < 0) were never written, so they are not indexed.
+	// (relPos[i] < 0) were never written, so they are not indexed.
 	qw.offsetIndexMutex.Lock()
-	for i, req := range batch {
-		if positions[i] < 0 {
+	for i, req := range sb.reqs {
+		if sb.relPos[i] < 0 {
 			continue
 		}
 		qw.offsetIndex[req.offset] = &offsetLocation{
 			fileNum:      currentFileNum,
-			filePosition: positions[i],
+			filePosition: base + sb.relPos[i],
 		}
 	}
 	// Fused shared-unit reference records (never the BodyBlock itself). Empty on
 	// the no-unit hot path, so this loop is a zero-cost no-op there.
-	for _, e := range sharedIdx {
+	for _, e := range sb.sharedRel {
 		qw.offsetIndex[e.offset] = &offsetLocation{
 			fileNum:      currentFileNum,
-			filePosition: e.filePosition,
+			filePosition: base + e.filePosition,
 		}
 	}
 	qw.offsetIndexMutex.Unlock()
 
 	// Track offsets written to current file
 	qw.currentFileOffsetsMutex.Lock()
-	for i, req := range batch {
-		if positions[i] < 0 {
+	for i, req := range sb.reqs {
+		if sb.relPos[i] < 0 {
 			continue
 		}
 		qw.currentFileOffsets.Add(req.offset)
 	}
-	for _, e := range sharedIdx {
+	for _, e := range sb.sharedRel {
 		qw.currentFileOffsets.Add(e.offset)
 	}
 	qw.currentFileOffsetsMutex.Unlock()
@@ -1987,7 +2138,7 @@ func (qw *QueueWAL) flushBatch(batch []*writeRequest, bufp *[]byte, positionsp *
 	qw.assertOffsetInvariantLocked()
 
 	// Check if we need to roll to new file. A failed roll never fails this
-	// durable batch (C3); the next flush retries it with backoff.
+	// durable batch (C3); the next commit retries it with backoff.
 	if newOffset >= qw.cfg.FileSize {
 		qw.maybeRollLocked()
 	}
@@ -1999,7 +2150,193 @@ func (qw *QueueWAL) flushBatch(batch []*writeRequest, bufp *[]byte, positionsp *
 	// (consumers reading via readMessageAtPosition contend on fileMutex) and
 	// honors the "no lock held across the callback" spirit of invariant A4.
 	qw.fileMutex.Unlock()
-	qw.deliverCompletions(batch, serErr, nil)
+	qw.deliverCompletions(sb.reqs, sb.serErr, nil)
+}
+
+// add serializes ONE write request onto the batch's buffer, recording its
+// position buf-RELATIVE (commitBatch binds it to an absolute file position
+// under fileMutex — §1.2). It is the body of the serialization loop
+// flushBatch ran inline, unchanged except for the relative positions and
+// the shared-unit locator patch bookkeeping.
+//
+// A record that fails to encode (e.g. a shortstr property >255 bytes) is
+// rolled back to its start so no partial/corrupt bytes are written, its
+// position is marked -1 (skipped by commitBatch's index loops), and its own
+// error is delivered to that caller — the rest of the batch is unaffected.
+// serErr stays nil (no allocation) on the common all-success path,
+// preserving Stage A's zero-alloc batch serialization; it is lazily
+// allocated only when a record actually fails, which the wire decoder's
+// 255-byte bound makes near-unreachable. Once allocated it is kept
+// len-aligned with reqs (commitBatch indexes it by batch position).
+func (sb *stagedBatch) add(req *writeRequest, crcDisabled bool) {
+	i := len(sb.reqs)
+	sb.reqs = append(sb.reqs, req)
+	if sb.serErr != nil {
+		sb.serErr = append(sb.serErr, nil)
+	}
+	sb.relPos = append(sb.relPos, 0)
+
+	if req.unit == nil {
+		recStart := len(sb.buf)
+		sb.relPos[i] = int64(recStart) // position relative to buf[0]
+		var e error
+		sb.buf, e = appendMessageRecord(sb.buf, req.queueName, req.message, req.offset, crcDisabled)
+		if e != nil {
+			sb.buf = sb.buf[:recStart] // discard the failed record's partial bytes
+			sb.relPos[i] = -1
+			if sb.serErr == nil {
+				sb.serErr = make([]error, len(sb.reqs))
+			}
+			sb.serErr[i] = e
+		}
+		return
+	}
+
+	// FUSED SHARED UNIT (ITER5, §3.3): emit the BodyBlock first (capturing
+	// its buf-RELATIVE start as the locator placeholder), then each sub as a
+	// message record carrying that placeholder via the existing
+	// bodyKindReference arm. The block's offset is NOT indexed (it is not a
+	// deliverable message); each sub's (offset, relative position) is
+	// recorded for post-fsync index population, plus a refPatch for the
+	// commit-time locator binding. This req occupies ONE batch index, so
+	// relPos[i] is marked -1 (skipped by the ordinary index loops); its subs
+	// are indexed via sharedRel.
+	sb.relPos[i] = -1
+	u := req.unit
+	unitStart := len(sb.buf)
+	blockRel := unitStart // the block's position relative to buf[0]
+	sb.buf = appendBodyBlockRecord(sb.buf, u.fanoutHint, u.body, crcDisabled)
+
+	// The locator is staged as the RELATIVE block position and patched to
+	// base+blockRel by commitBatch (§1.2), so a roll, a repair or an
+	// interleaved tx between staging and commit cannot invalidate it.
+	var locator [8]byte
+	binary.BigEndian.PutUint64(locator[:], uint64(blockRel))
+
+	savedSharedLen := len(sb.sharedRel)
+	savedPatchLen := len(sb.refPatch)
+	var unitErr error
+	for si := range u.subs {
+		sub := &u.subs[si]
+		recStart := len(sb.buf)
+		subRel := int64(recStart)
+		// Drive the existing bodyKindReference writer arm by setting BodyRef
+		// to the 8-byte locator, then CLEAR it immediately so the caller's
+		// in-memory message stays a clean inline message (a later
+		// dead-letter/requeue re-store must NOT emit a dangling reference
+		// into another file). Safe: the sub message is not consumer-visible
+		// until its completion fires (after the fsync), so nothing reads
+		// BodyRef concurrently here.
+		sub.message.BodyRef = locator[:]
+		var e error
+		sb.buf, e = appendMessageRecord(sb.buf, sub.queueName, sub.message, sub.offset, crcDisabled)
+		sub.message.BodyRef = nil
+		if e != nil {
+			unitErr = e
+			break
+		}
+		sb.sharedRel = append(sb.sharedRel, sharedIndexEntry{offset: sub.offset, filePosition: subRel})
+		sb.refPatch = append(sb.refPatch, refPatch{
+			recStart: recStart,
+			recEnd:   len(sb.buf),
+			locAt:    recStart + bodyRefLocatorOffset(sub.queueName, sub.message),
+			blockRel: blockRel,
+		})
+	}
+	if unitErr != nil {
+		// All-or-nothing per unit: discard the block + every already-written
+		// sub record, drop the partial index entries and patches, and nack
+		// every sub.
+		sb.buf = sb.buf[:unitStart]
+		sb.sharedRel = sb.sharedRel[:savedSharedLen]
+		sb.refPatch = sb.refPatch[:savedPatchLen]
+		if sb.serErr == nil {
+			sb.serErr = make([]error, len(sb.reqs))
+		}
+		sb.serErr[i] = unitErr
+		return
+	}
+	sb.hasShared = true
+}
+
+// sealed reports whether the batch must be handed off now: cfg.BatchSize
+// requests reached, or the serialization buffer crossed walBatchSealBytes
+// (§1.4; a single record larger than the seal forms its own batch, which
+// the post-add check produces naturally). A non-positive BatchSize
+// degenerates to one record per batch, matching the pre-pipeline drain
+// bound (len(batch) < BatchSize never coalesced anything).
+func (sb *stagedBatch) sealed(batchSize int) bool {
+	if len(sb.buf) >= walBatchSealBytes {
+		return true
+	}
+	if batchSize > 0 {
+		return len(sb.reqs) >= batchSize
+	}
+	return len(sb.reqs) >= 1
+}
+
+// reset recycles the batch for the stager's next use. It runs on the
+// committer goroutine BEFORE free <- sb hands ownership back (§1.4), so no
+// synchronization is needed. Buffer retention follows the old flushBatch
+// rule: keep buf iff its capacity is within maxRetainedWALBatchBytes, else
+// drop it so a rare oversized batch is not pinned (the seal already bounds
+// steady-state growth). reqs/relPos keep their capacity (≤ BatchSize in
+// normal configs); handoffBuf is left as-is — it is a TEST-ONLY snapshot
+// that stays valid until the stager's next hand-off of this object.
+func (sb *stagedBatch) reset() {
+	if cap(sb.buf) > maxRetainedWALBatchBytes {
+		sb.buf = nil
+	} else {
+		sb.buf = sb.buf[:0]
+	}
+	sb.reqs = sb.reqs[:0]
+	sb.relPos = sb.relPos[:0]
+	sb.serErr = nil
+	sb.sharedRel = sb.sharedRel[:0]
+	sb.refPatch = sb.refPatch[:0]
+	sb.hasShared = false
+}
+
+// bodyRefLocatorOffset returns the byte offset, counted from the START of a
+// message record, at which the 8-byte BodyRef locator is stored when the
+// message serializes through the bodyKindReference arm of the v4 layout:
+//
+//	[CRC 4][len 4][type 1][flags 2][queue 1+n][offset 8][exch 1+n][rk 1+n]
+//	[deliveryMode 1][bodyKind 1][refLen u16] <locator HERE>
+//
+// Optional fields follow the body arm and never shift this offset. It is
+// derived from the same layout appendMessagePayload writes (rather than
+// counted at append time) so the two cannot drift apart silently; P1-10
+// (TestSharedUnit_LocatorPatchEqualsDirectSerialize) pins the equivalence.
+func bodyRefLocatorOffset(queueName string, message *protocol.Message) int {
+	return 4 + // CRC
+		4 + // length
+		1 + // record type
+		2 + // payload flags
+		(1 + len(queueName)) + // queue shortstr
+		8 + // offset
+		(1 + len(message.Exchange)) +
+		(1 + len(message.RoutingKey)) +
+		1 + // deliveryMode
+		1 + // bodyKind
+		2 // refLen (u16); the 8 locator bytes follow
+}
+
+// pipelineBufsForTest returns each staged-batch object's buffer as it was
+// sealed at the stager's most recent hand-off (len > 0). TEST-ONLY
+// observability for the phase 1 pipeline tests (P1-11): the snapshots are
+// published under pipelineMu at hand-off time, so reading them never races
+// the stager or the committer. Callers must not read the BYTES (they alias
+// a live reusable buffer); only len/cap and element-0 identity are
+// meaningful.
+func (qw *QueueWAL) pipelineBufsForTest() [][]byte {
+	qw.pipelineMu.Lock()
+	defer qw.pipelineMu.Unlock()
+	out := make([][]byte, len(qw.pipelineBatches))
+	for i, sb := range qw.pipelineBatches {
+		out[i] = sb.handoffBuf
+	}
+	return out
 }
 
 // deliverCompletions signals every request in the batch, iterating in enqueue
@@ -2615,9 +2952,9 @@ func (qw *QueueWAL) rollFile() error {
 	qw.currentFileOffsetsMutex.Unlock()
 
 	// ITER5 §2: capture whether the file being rolled carries a shared BodyBlock,
-	// then reset for the fresh file. rollFile is only ever invoked from flushBatch
-	// (and WriteTxAtomic) while fileMutex is held, so this read+reset is race-free
-	// against the flushBatch writer that sets the flag.
+	// then reset for the fresh file. rollFile is only ever invoked from commitBatch
+	// (and writeTxAtomic) while fileMutex is held, so this read+reset is race-free
+	// against the committer that sets the flag.
 	sharedBody := qw.currentFileHasSharedBody
 	qw.currentFileHasSharedBody = false
 
@@ -3409,7 +3746,7 @@ func (qw *QueueWAL) readMessageSequential(queueName string, offset uint64) (*pro
 	// redden this copy independently.
 
 	// The CURRENT file is searched FIRST. currentFileOffsets is reset by rollFile
-	// and added to only by flushBatch for records written to the file open now, so
+	// and added to only by commitBatch for records written to the file open now, so
 	// an offset in it names a record THIS incarnation wrote to THIS file — by
 	// construction the newest record carrying that offset. Searching oldFiles ahead
 	// of it handed back a previous incarnation's payload for a live tag whenever
@@ -3418,7 +3755,7 @@ func (qw *QueueWAL) readMessageSequential(queueName string, offset uint64) (*pro
 	// band whose records its predecessor still occupies on disk.
 	//
 	// Membership also gates out a record whose bytes reached the file but whose
-	// fsync FAILED, because flushBatch populates currentFileOffsets only AFTER a
+	// fsync FAILED, because commitBatch populates currentFileOffsets only AFTER a
 	// successful fsync. Such a record is in neither that set nor the index and must
 	// not be returned: the frontier advances head past its tag, so the cursor is
 	// claimed, and a raw scan would otherwise deliver a message that was nacked.
@@ -3767,9 +4104,9 @@ func (qw *QueueWAL) performCheckpoint() {
 // close stops background goroutines and closes files.
 //
 // C9 ORDERING: closing is published under enqueueMu BEFORE stopChan is
-// closed, so no writeChan send can race past the writer's final drain; and
-// fileClosed is set only after wg.Wait(), so the final drain's flushBatch
-// still runs normally and delivers exactly one completion per enqueued
+// closed, so no writeChan send can race past the stager's final drain; and
+// fileClosed is set only after wg.Wait(), so the final drain's commits
+// still run normally and deliver exactly one completion per enqueued
 // request. See enqueue.
 func (qw *QueueWAL) close() {
 	qw.enqueueMu.Lock()

@@ -108,7 +108,7 @@ func TestAppendMessageRecord_SharedBufferByteIdentical(t *testing.T) {
 // TestAppendMessageRecord_MultiRecordSharedBuffer proves several records packed
 // back-to-back into ONE shared buffer each recover independently: every record's
 // carved slice re-parses to its own CRC-valid, correctly-lengthed image, matching
-// the legacy per-record serialization. This mirrors exactly what flushBatch does.
+// the legacy per-record serialization. This mirrors exactly what the stager does.
 func TestAppendMessageRecord_MultiRecordSharedBuffer(t *testing.T) {
 	wm, err := NewWALManager(t.TempDir())
 	require.NoError(t, err)

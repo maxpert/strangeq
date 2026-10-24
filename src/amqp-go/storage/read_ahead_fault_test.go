@@ -70,7 +70,7 @@ func TestReadAhead_ZeroCRC_ServesReads(t *testing.T) {
 //
 // SPEC DEVIATION (documented): the spec's variant blocks the group-commit
 // fsync hook and then calls GetMessage — but every WAL read path serializes
-// on fileMutex, which the blocked flushBatch holds, so the public API cannot
+// on fileMutex, which the blocked committer holds, so the public API cannot
 // observe the in-flight window at all (the read blocks until the hook
 // releases, after which the batch is durable and legitimately readable). The
 // same property is therefore asserted two ways: (a) through the public API

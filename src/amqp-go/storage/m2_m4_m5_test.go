@@ -31,7 +31,7 @@ func TestM4_FdatasyncHelper(t *testing.T) {
 		t.Fatalf("Write failed: %v", err)
 	}
 
-	// The write already calls fdatasync internally via flushBatch.
+	// The write already calls fdatasync internally via the group-commit committer.
 	// Read back to verify data integrity after sync.
 	readMsg, err := wm.Read("test-queue", 1)
 	if err != nil {

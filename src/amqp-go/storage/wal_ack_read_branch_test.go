@@ -35,7 +35,7 @@ package storage
 // With all of those executed, exactly ONE arm is left. If Read still returns the
 // message, the current-file arm answered it, and the defective line is named:
 // WALManager.Acknowledge removes the offset from offsetIndex (cleanupLoop) and
-// NEVER from currentFileOffsets, which is only ever added to (flushBatch) and
+// NEVER from currentFileOffsets, which is only ever added to (commitBatch) and
 // reset only by rollFile.
 //
 // NOTE ON WHAT THIS IS AND IS NOT. This is an INSTRUMENT for S1, not a
@@ -142,6 +142,6 @@ func TestWALReadArm_AcknowledgedRecordIsStillServedFromTheCurrentFile(t *testing
 			"Every arm but one is eliminated by execution, and Read still returned the "+
 			"acknowledged record (body=%q). The remaining arm is readMessageSequential's "+
 			"current-file branch, gated only by currentFileOffsets.Contains(offset) — and "+
-			"currentFileOffsets is added to by flushBatch, reset only by rollFile, and NEVER "+
+			"currentFileOffsets is added to by commitBatch, reset only by rollFile, and NEVER "+
 			"touched by Acknowledge, which deletes from offsetIndex alone", tag, body)
 }

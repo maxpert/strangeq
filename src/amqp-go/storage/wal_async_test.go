@@ -251,13 +251,15 @@ func TestAppendMessageRecord_ReuseBufferZeroAlloc(t *testing.T) {
 }
 
 // TestWriteAsync_ReuseBufferRaceClean is STAGE A test A3 (race half). It drives
-// the real group-commit writer with many concurrent WriteAsync of 64KB bodies
-// across several producer goroutines, then verifies every record read back has a
-// bit-identical body. Run under `go test -race`, it pins the single-owner
-// guarantee: only batchWriterLoop touches the persistent batch buffer, so buffer
-// reuse never races the producers or the completions. A regression that aliased
-// the shared buffer to message.Body or shared it across goroutines would trip the
-// race detector or corrupt a body.
+// the real pipelined group-commit writer with many concurrent WriteAsync of
+// 64KB bodies across several producer goroutines, then verifies every record
+// read back has a bit-identical body. Run under `go test -race`, it pins the
+// single-owner guarantee: only the CURRENT OWNER of a staged batch buffer
+// (the stager while staging it, then the committer while committing it —
+// ownership moves only over commitCh/free) ever touches the buffer, so
+// buffer reuse never races the producers or the completions. A regression
+// that aliased a staged buffer to message.Body or shared it across
+// goroutines would trip the race detector or corrupt a body.
 func TestWriteAsync_ReuseBufferRaceClean(t *testing.T) {
 	wm, err := NewWALManagerWithConfig(t.TempDir(), DefaultWALConfig())
 	require.NoError(t, err)

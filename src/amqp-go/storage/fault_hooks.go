@@ -32,7 +32,7 @@ import (
 // --- WAL write ------------------------------------------------------------
 
 // walWriteFn is the signature of the WAL record-append performed by
-// flushBatch's group-commit batch and writeTxAtomic's single-shot unit.
+// commitBatch's group-commit batch and writeTxAtomic's single-shot unit.
 type walWriteFn func(f *os.File, b []byte) (int, error)
 
 var walWriteHook atomic.Pointer[walWriteFn]

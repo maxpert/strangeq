@@ -182,8 +182,10 @@ func TestSharedBody_HotPathInlineByteIdentity(t *testing.T) {
 }
 
 // TestSharedBody_HotPathZeroAllocRegression pins that the fused branch added to
-// flushBatch adds ZERO allocations on the unit==nil (N==1 / non-shared) path. It
-// replicates flushBatch's serialize + post-fsync index loops (minus I/O) over a
+// the group-commit writer adds ZERO allocations on the unit==nil (N==1 /
+// non-shared) path. It
+// replicates the stager's serialize + the committer's post-fsync index loops
+// (minus I/O) over a
 // batch of ordinary (unit==nil) write requests: the new `if req.unit == nil`
 // gate, the nil `sharedIdx` slice, and the `for range sharedIdx` index loops must
 // all be zero-cost. A regression (e.g. eagerly allocating sharedIdx, or a per-
@@ -233,7 +235,7 @@ func TestSharedBody_HotPathZeroAllocRegression(t *testing.T) {
 	}
 	allocs := testing.AllocsPerRun(100, serialize)
 	assert.Zero(t, allocs,
-		"the N==1 / non-shared flushBatch serialize path must add zero allocations (got %.1f)", allocs)
+		"the N==1 / non-shared group-commit serialize path must add zero allocations (got %.1f)", allocs)
 }
 
 // TestSharedBody_BelowThresholdInlined (spec test #8, WAL layer): a small body

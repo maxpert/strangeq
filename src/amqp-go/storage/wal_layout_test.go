@@ -2,7 +2,8 @@ package storage
 
 // Hot-path field layout of QueueWAL, locked at runtime.
 //
-// WHY THIS EXISTS. flushBatch's group-commit critical section touches
+// WHY THIS EXISTS. The committer's group-commit critical section (commitBatch;
+// flushBatch before WS-F phase 1) touches
 // currentFile, fileNum, fileOffset and fileMutex on every durable write, and
 // fileMutex began a fresh 64-byte cache line in the tree the zero-regression
 // baseline was measured on. A cold-path change (deleting an unreferenced field
@@ -72,7 +73,22 @@ func TestQueueWALHotFieldLayoutIsPinned(t *testing.T) {
 	// same path.
 	if got["fileMutex"]%64 != 0 {
 		t.Errorf("QueueWAL.fileMutex is at offset %d, which does not start a 64-byte cache "+
-			"line; it now shares one with the atomics flushBatch stores on the same path",
+			"line; it now shares one with the atomics the committer stores on the same path",
 			got["fileMutex"])
+	}
+
+	// WS-F phase 1: the pipelined group-commit fields (commitCh, free and the
+	// pipeline registry below them) are appended AFTER logger — the last field
+	// of the pre-pipeline struct — and NEVER above txEpoch, so the hot-group
+	// offsets pinned above are untouched. Asserting it here means a future
+	// edit cannot silently move them up past the cold-path boundary the
+	// layout table encodes.
+	if co, te := unsafe.Offsetof(q.commitCh), unsafe.Offsetof(q.txEpoch); co <= te {
+		t.Errorf("QueueWAL.commitCh is at offset %d, at or above txEpoch (%d); the WS-F "+
+			"pipeline fields must stay appended after logger, never above txEpoch", co, te)
+	}
+	if fo, te := unsafe.Offsetof(q.free), unsafe.Offsetof(q.txEpoch); fo <= te {
+		t.Errorf("QueueWAL.free is at offset %d, at or above txEpoch (%d); the WS-F "+
+			"pipeline fields must stay appended after logger, never above txEpoch", fo, te)
 	}
 }

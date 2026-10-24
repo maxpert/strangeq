@@ -27,7 +27,7 @@ package storage
 //
 // Candidate C is NOT implemented and no production code is added here. What is
 // under test is the RESOLUTION MECHANISM C would have to use, which does exist
-// today: the offsetIndex map, its population in rebuildBootState/flushBatch,
+// today: the offsetIndex map, its population in rebuildBootState/commitBatch,
 // and its teardown in performCheckpoint.
 
 import (

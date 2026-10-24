@@ -52,40 +52,6 @@ import (
 )
 
 // ---------------------------------------------------------------------------
-// RED scaffolding (WS-F phase 1 TDD).
-//
-// These declarations let the test file compile against the pre-pipeline
-// writer so the RED run fails behaviourally — for the reasons §1.5's "fails
-// on main because" column states — instead of with "undefined symbol" errors.
-// The phase 1 implementation commit moves each of these into the production
-// files and deletes the stubs:
-//
-//   - walBatchSealBytes     -> wal_manager.go (next to walRollBackoffMin)
-//   - bodyRefLocatorOffset  -> wal_manager.go (next to appendMessagePayload)
-//   - pipelineBufsForTest   -> a real accessor on *QueueWAL (wal_manager.go)
-// ---------------------------------------------------------------------------
-
-// walBatchSealBytes stub: the stager's byte-based batch seal (§1.4), 64 MiB in
-// production. P1-11 shrinks it; nothing reads it pre-pipeline, so the RED run
-// fails on the oversized single write, not on a missing symbol.
-var walBatchSealBytes = 64 << 20
-
-// bodyRefLocatorOffset stub: always wrong (0 is never a valid locator offset)
-// so P1-10 fails on the missing helper rather than silently passing.
-func bodyRefLocatorOffset(queueName string, message *protocol.Message) int {
-	_ = queueName
-	_ = message
-	return 0
-}
-
-// pipelineBufsForTest stub: no staged buffers exist pre-pipeline, so P1-11
-// fails on the missing two retained buffers.
-func (qw *QueueWAL) pipelineBufsForTest() [][]byte {
-	_ = qw
-	return nil
-}
-
-// ---------------------------------------------------------------------------
 // Shared helpers.
 // ---------------------------------------------------------------------------
 
@@ -130,40 +96,80 @@ func waitErrors(t *testing.T, ch <-chan error, n int, what string) []error {
 	return out
 }
 
-// stageObserver observes the stager through SetWALStageHookForTest: it counts
-// staged records and, optionally, parks the stager inside the FIRST add until
-// the test releases it, which makes the first batch's membership exact.
+// stageObserver observes the stager through SetWALStageHookForTest. It counts
+// staged records and can park the stager inside chosen adds (by cumulative
+// staged count): parking the FIRST add of a batch until the test has
+// finished enqueueing the whole batch makes that batch's membership exact,
+// because the coalesce drain that follows the release then sees every
+// record. Brake points are needed whenever a batch is enqueued while the
+// committer is (or may become) idle; a batch staged while the committer is
+// busy can never be handed off partially (the hand-off arm is not ready),
+// so it needs no brake.
 type stageObserver struct {
-	count    atomic.Int64
-	firstAdd chan struct{}
-	brake    chan struct{}
-	brakeOn  bool
-	// once closes firstAdd exactly once (the hook runs on the stager
-	// goroutine); brakeOnce makes releaseBrake idempotent.
-	once      sync.Once
-	brakeOnce sync.Once
+	count atomic.Int64
+	brake []stageBrakePoint
 }
 
-func installStageObserver(t *testing.T, brakeFirstAdd bool) *stageObserver {
+type stageBrakePoint struct {
+	at      int64 // cumulative staged count that engages this brake
+	engaged chan struct{}
+	release chan struct{}
+	once    sync.Once
+	relOnce sync.Once
+}
+
+// installStageObserver installs the counting hook; each brakeAt value is a
+// cumulative staged count at which the stager parks until the test releases
+// that point (releaseAll / each point's release is idempotent).
+func installStageObserver(t *testing.T, brakeAt ...int64) *stageObserver {
 	t.Helper()
-	so := &stageObserver{
-		firstAdd: make(chan struct{}),
-		brake:    make(chan struct{}),
-		brakeOn:  brakeFirstAdd,
+	so := &stageObserver{brake: make([]stageBrakePoint, len(brakeAt))}
+	for i, at := range brakeAt {
+		so.brake[i] = stageBrakePoint{
+			at:      at,
+			engaged: make(chan struct{}),
+			release: make(chan struct{}),
+		}
 	}
 	restore := SetWALStageHookForTest(func(stagedRecords int) {
 		so.count.Store(int64(stagedRecords))
-		if stagedRecords == 1 && so.brakeOn {
-			so.once.Do(func() { close(so.firstAdd) })
-			<-so.brake
+		for i := range so.brake {
+			if int64(stagedRecords) == so.brake[i].at {
+				bp := &so.brake[i]
+				bp.once.Do(func() { close(bp.engaged) })
+				<-bp.release
+			}
 		}
 	})
 	t.Cleanup(restore)
 	return so
 }
 
+// brakePoint returns the brake point engaged at cumulative staged count at.
+func (so *stageObserver) brakePoint(at int64) *stageBrakePoint {
+	for i := range so.brake {
+		if so.brake[i].at == at {
+			return &so.brake[i]
+		}
+	}
+	return nil
+}
+
+// releasePoint releases the brake point engaged at cumulative staged count
+// at (idempotent; a no-op if the point never engaged).
+func (so *stageObserver) releasePoint(at int64) {
+	if bp := so.brakePoint(at); bp != nil {
+		bp.relOnce.Do(func() { close(bp.release) })
+	}
+}
+
+// releaseBrake releases every brake point (idempotent; safe in defers even
+// for points that never engaged).
 func (so *stageObserver) releaseBrake() {
-	so.brakeOnce.Do(func() { close(so.brake) })
+	for i := range so.brake {
+		bp := &so.brake[i]
+		bp.relOnce.Do(func() { close(bp.release) })
+	}
 }
 
 // fsyncGate installs a group-commit-fsync hook where the listed calls park
@@ -367,7 +373,7 @@ func TestWALPipeline_StagesNextBatchWhileFsyncBlocked(t *testing.T) {
 
 	rec := installWalWriteRecorder(t, dir)
 	gate := installGatedFsync(t, map[int]error{1: nil, 2: nil}, rec.count.Load)
-	so := installStageObserver(t, true)
+	so := installStageObserver(t, 1)
 
 	wm, err := NewWALManagerWithConfig(dir, cfg)
 	require.NoError(t, err)
@@ -381,7 +387,7 @@ func TestWALPipeline_StagesNextBatchWhileFsyncBlocked(t *testing.T) {
 		off := uint64(i)
 		wm.WriteAsync("q", pipelineMsg(off), off, func(e error) { aDone <- e })
 	}
-	waitSignal(t, so.firstAdd, "first staged record of batch A")
+	waitSignal(t, so.brakePoint(1).engaged, "first staged record of batch A")
 	so.releaseBrake()
 	waitStageCount(t, so, 8, "batch A (8 records)")
 	waitSignal(t, gate.entered[0], "fsync #1 (batch A)")
@@ -403,6 +409,7 @@ func TestWALPipeline_StagesNextBatchWhileFsyncBlocked(t *testing.T) {
 	waitSignal(t, gate.entered[1], "fsync #2 (batch B)")
 	require.EqualValues(t, 2, gate.enterWrite[1],
 		"write(B) must be issued before fsync(B) begins — at fsync #2's entry exactly 2 writes must have happened")
+	gate.releaseCall(2)
 
 	// B's written bytes are CRC-valid, 8 records, byte-identical to direct
 	// serialization.
@@ -434,7 +441,7 @@ func TestWALPipeline_ConfirmWithheldUntilCoveringFsync(t *testing.T) {
 
 	rec := installWalWriteRecorder(t, dir)
 	gate := installGatedFsync(t, map[int]error{1: nil, 2: nil}, rec.count.Load)
-	so := installStageObserver(t, true)
+	so := installStageObserver(t, 1)
 
 	wm, err := NewWALManagerWithConfig(dir, cfg)
 	require.NoError(t, err)
@@ -447,7 +454,7 @@ func TestWALPipeline_ConfirmWithheldUntilCoveringFsync(t *testing.T) {
 		off := uint64(i)
 		wm.WriteAsync("q", pipelineMsg(off), off, func(e error) { aDone <- e })
 	}
-	waitSignal(t, so.firstAdd, "first staged record of batch A")
+	waitSignal(t, so.brakePoint(1).engaged, "first staged record of batch A")
 	so.releaseBrake()
 	waitStageCount(t, so, 8, "batch A (8 records)")
 	waitSignal(t, gate.entered[0], "fsync #1 (batch A)")
@@ -509,6 +516,7 @@ func TestWALPipeline_CompletionsStrictlyOrderedAndCovered(t *testing.T) {
 
 		var inFsync atomic.Bool
 		var durableEnd atomic.Int64
+		var stagedTotal atomic.Int64
 		var stagedDuringFsync atomic.Int64
 		fsyncRestore := SetWALGroupCommitFsyncForTest(func(f *os.File) error {
 			inFsync.Store(true)
@@ -520,8 +528,16 @@ func TestWALPipeline_CompletionsStrictlyOrderedAndCovered(t *testing.T) {
 			return err
 		})
 		defer fsyncRestore()
-		so := installStageObserver(t, false)
-		defer so.releaseBrake()
+		// The stage observer counts staged records and flags any add that
+		// happens while an fsync is in flight — the overlap the pipeline
+		// exists to create.
+		stageRestore := SetWALStageHookForTest(func(stagedRecords int) {
+			stagedTotal.Store(int64(stagedRecords))
+			if inFsync.Load() {
+				stagedDuringFsync.Add(1)
+			}
+		})
+		defer stageRestore()
 
 		wm, err := NewWALManagerWithConfig(dir, cfg)
 		require.NoError(t, err)
@@ -588,7 +604,7 @@ func TestWALPipeline_CompletionsStrictlyOrderedAndCovered(t *testing.T) {
 
 		require.Positive(t, stagedDuringFsync.Load(),
 			"at least one record must be staged while an fsync is in flight (the stager must overlap the committer)")
-		assert.EqualValues(t, perProducer*producers, so.count.Load(), "every record must have been staged exactly once")
+		assert.EqualValues(t, perProducer*producers, stagedTotal.Load(), "every record must have been staged exactly once")
 	}
 
 	t.Run("single-producer", func(t *testing.T) { run(t, 1) })
@@ -623,7 +639,7 @@ func TestWALPipeline_FsyncErrorNacksOnlyItsBatch(t *testing.T) {
 	cfg.BatchSize = 8
 
 	gate := installGatedFsync(t, map[int]error{1: errors.New("injected")}, nil)
-	so := installStageObserver(t, true)
+	so := installStageObserver(t, 1)
 
 	wm, err := NewWALManagerWithConfig(dir, cfg)
 	require.NoError(t, err)
@@ -637,7 +653,7 @@ func TestWALPipeline_FsyncErrorNacksOnlyItsBatch(t *testing.T) {
 		off := uint64(i)
 		wm.WriteAsync("q", pipelineMsg(off), off, func(e error) { aDone <- e })
 	}
-	waitSignal(t, so.firstAdd, "first staged record of batch A")
+	waitSignal(t, so.brakePoint(1).engaged, "first staged record of batch A")
 	so.releaseBrake()
 	waitStageCount(t, so, 8, "batch A (8 records)")
 	waitSignal(t, gate.entered[0], "fsync #1 (batch A)")
@@ -703,7 +719,7 @@ func TestWALPipeline_ShortWriteWithStagedBatch(t *testing.T) {
 
 	rec := installWalWriteRecorder(t, dir)
 	gate := installGatedFsync(t, map[int]error{1: nil}, rec.count.Load)
-	so := installStageObserver(t, true)
+	so := installStageObserver(t, 1)
 
 	wm, err := NewWALManagerWithConfig(dir, cfg)
 	require.NoError(t, err)
@@ -718,7 +734,7 @@ func TestWALPipeline_ShortWriteWithStagedBatch(t *testing.T) {
 		off := uint64(i)
 		wm.WriteAsync("q", pipelineMsg(off), off, func(e error) { w0Done <- e })
 	}
-	waitSignal(t, so.firstAdd, "first staged record of batch W0")
+	waitSignal(t, so.brakePoint(1).engaged, "first staged record of batch W0")
 	so.releaseBrake()
 	waitStageCount(t, so, 8, "batch W0 (8 records)")
 	waitSignal(t, gate.entered[0], "fsync #1 (batch W0)")
@@ -842,7 +858,7 @@ func TestWALPipeline_RollBetweenStagedBatches(t *testing.T) {
 	cfg.FileSize = 256 << 10
 
 	gate := installGatedFsync(t, map[int]error{1: nil}, nil)
-	so := installStageObserver(t, true)
+	so := installStageObserver(t, 1)
 
 	wm, err := NewWALManagerWithConfig(dir, cfg)
 	require.NoError(t, err)
@@ -859,7 +875,7 @@ func TestWALPipeline_RollBetweenStagedBatches(t *testing.T) {
 	for i := 1; i <= 8; i++ {
 		async(uint64(i))
 	}
-	waitSignal(t, so.firstAdd, "first staged record of batch 1")
+	waitSignal(t, so.brakePoint(1).engaged, "first staged record of batch 1")
 	so.releaseBrake()
 	waitStageCount(t, so, 8, "batch 1 (8 records)")
 	waitSignal(t, gate.entered[0], "fsync #1 (batch 1)")
@@ -962,7 +978,7 @@ func TestWALPipeline_TxInterleavesBetweenBatches(t *testing.T) {
 	cfg.BatchSize = 8
 
 	gate := installGatedFsync(t, map[int]error{1: nil}, nil)
-	so := installStageObserver(t, true)
+	so := installStageObserver(t, 1)
 
 	wm, err := NewWALManagerWithConfig(dir, cfg)
 	require.NoError(t, err)
@@ -975,7 +991,7 @@ func TestWALPipeline_TxInterleavesBetweenBatches(t *testing.T) {
 		off := uint64(i)
 		wm.WriteAsync("q", pipelineMsg(off), off, func(e error) { aDone <- e })
 	}
-	waitSignal(t, so.firstAdd, "first staged record of batch A")
+	waitSignal(t, so.brakePoint(1).engaged, "first staged record of batch A")
 	so.releaseBrake()
 	waitStageCount(t, so, 8, "batch A (8 records)")
 	waitSignal(t, gate.entered[0], "fsync #1 (batch A)")
@@ -1009,8 +1025,19 @@ func TestWALPipeline_TxInterleavesBetweenBatches(t *testing.T) {
 	}
 
 	// Everything readable in-session, whichever order fileMutex was granted
-	// in after A (tx before B, or B before tx).
-	for i := 1; i <= 18; i++ {
+	// in after A (tx before B, or B before tx). The tx records live on their
+	// own queue ("qt"); the async batches on "q".
+	for i := 1; i <= 8; i++ {
+		msg, rerr := wm.Read("q", uint64(i))
+		require.NoError(t, rerr, "in-session read of offset %d", i)
+		assert.True(t, bytesEqual(msg.Body, pipelineBody(uint64(i), 65536)), "offset %d body", i)
+	}
+	for _, off := range []uint64{9, 10} {
+		msg, rerr := wm.Read("qt", off)
+		require.NoError(t, rerr, "in-session read of tx offset %d", off)
+		assert.True(t, bytesEqual(msg.Body, pipelineBody(off, 65536)), "tx offset %d body", off)
+	}
+	for i := 11; i <= 18; i++ {
 		msg, rerr := wm.Read("q", uint64(i))
 		require.NoError(t, rerr, "in-session read of offset %d", i)
 		assert.True(t, bytesEqual(msg.Body, pipelineBody(uint64(i), 65536)), "offset %d body", i)
@@ -1046,7 +1073,11 @@ func TestWALPipeline_TornTrailingBatchRecovers(t *testing.T) {
 	cfg.BatchSize = 8
 
 	gate := installGatedFsync(t, map[int]error{2: nil}, nil) // #1 passthrough, #2 gated
-	so := installStageObserver(t, true)
+	// Brake both A's and B's first add: A is staged while the committer is
+	// idle, and B is staged after A's (real, passthrough) fsync has already
+	// completed — in both windows the committer can be idle, so only a brake
+	// makes each batch's membership exactly 8.
+	so := installStageObserver(t, 1, 9)
 
 	wm, err := NewWALManagerWithConfig(dir, cfg)
 	require.NoError(t, err)
@@ -1054,24 +1085,28 @@ func TestWALPipeline_TornTrailingBatchRecovers(t *testing.T) {
 	defer gate.releaseAll()
 	defer so.releaseBrake()
 
+	// Batch A: durable via the passthrough fsync #1.
 	aDone := make(chan error, 8)
 	for i := 1; i <= 8; i++ {
 		off := uint64(i)
 		wm.WriteAsync("q", pipelineMsg(off), off, func(e error) { aDone <- e })
 	}
-	waitSignal(t, so.firstAdd, "first staged record of batch A")
-	so.releaseBrake()
+	waitSignal(t, so.brakePoint(1).engaged, "first staged record of batch A")
+	so.releasePoint(1)
 	waitStageCount(t, so, 8, "batch A (8 records)")
 	for _, e := range waitErrors(t, aDone, 8, "batch A completions (fsync #1 passthrough)") {
 		require.NoError(t, e)
 	}
 
-	// B: written, its fsync gated open.
+	// Batch B: staged as one exact batch (braked at its first add, released
+	// only after all 8 are enqueued), written, its fsync (#2) gated open.
 	bDone := make(chan error, 8)
 	for i := 9; i <= 16; i++ {
 		off := uint64(i)
 		wm.WriteAsync("q", pipelineMsg(off), off, func(e error) { bDone <- e })
 	}
+	waitSignal(t, so.brakePoint(9).engaged, "first staged record of batch B")
+	so.releasePoint(9)
 	waitStageCount(t, so, 16, "batch B staged")
 	waitSignal(t, gate.entered[1], "fsync #2 (batch B, gated)")
 
@@ -1182,7 +1217,7 @@ func TestWALPipeline_CloseDrainsStagedAndQueued(t *testing.T) {
 	cfg.BatchSize = 8
 
 	gate := installGatedFsync(t, map[int]error{1: nil}, nil)
-	so := installStageObserver(t, true)
+	so := installStageObserver(t, 1)
 
 	wm, err := NewWALManagerWithConfig(dir, cfg)
 	require.NoError(t, err)
@@ -1208,7 +1243,7 @@ func TestWALPipeline_CloseDrainsStagedAndQueued(t *testing.T) {
 	for i := 1; i <= 8; i++ {
 		wm.WriteAsync("q", pipelineMsg(uint64(i)), uint64(i), mk(uint64(i)))
 	}
-	waitSignal(t, so.firstAdd, "first staged record of batch A")
+	waitSignal(t, so.brakePoint(1).engaged, "first staged record of batch A")
 	so.releaseBrake()
 	waitStageCount(t, so, 8, "batch A (8 records)")
 	waitSignal(t, gate.entered[0], "fsync #1 (batch A)")
@@ -1288,7 +1323,12 @@ func TestSharedUnit_LocatorPatchEqualsDirectSerialize(t *testing.T) {
 	}{
 		{"q", &protocol.Message{Exchange: "", RoutingKey: "rk", Body: []byte("shared"), DeliveryMode: 2}},
 		{"queue-with-a-longer-name", &protocol.Message{Exchange: "amq.direct", RoutingKey: "a.b.c", Body: []byte("shared"), DeliveryMode: 2, ContentType: "application/json", Priority: 3}},
-		{"q", &protocol.Message{Exchange: "ex", RoutingKey: "", Body: []byte("shared"), DeliveryMode: 1, Headers: map[string]interface{}{"x": int32(7), "y": "z"}}},
+		// Headers is a SINGLE-entry map on purpose: the field-table encoder
+		// iterates the map unordered (protocol/methods.go serializeFieldTable),
+		// so a multi-key table makes the two serializations' bytes legitimately
+		// differ. One entry still exercises the field-table arm that follows
+		// the locator (the CRC span the patch recomputes).
+		{"q", &protocol.Message{Exchange: "ex", RoutingKey: "", Body: []byte("shared"), DeliveryMode: 1, Headers: map[string]interface{}{"x": int32(7)}}},
 		{"q", &protocol.Message{Exchange: "ex", RoutingKey: "rk", Body: []byte("shared"), DeliveryMode: 2, Timestamp: 1730000000000, Expiration: "60000", MessageID: "m-1", AppID: "app"}},
 		{"q", &protocol.Message{Exchange: "e", RoutingKey: "r", Body: []byte("shared"), DeliveryMode: 2, ContentType: "text/plain", ContentEncoding: "gzip", CorrelationID: "c", ReplyTo: "reply", Type: "T", UserID: "u", ClusterID: "cl"}},
 	}
@@ -1312,7 +1352,7 @@ func TestSharedUnit_LocatorPatchEqualsDirectSerialize(t *testing.T) {
 
 		locAt := bodyRefLocatorOffset(shape.queue, &stagedMsg)
 		require.Greater(t, locAt, 0,
-			"bodyRefLocatorOffset must return the locator's offset from the record start (unimplemented stub returns 0)")
+			"bodyRefLocatorOffset must return the locator's offset from the record start")
 		require.LessOrEqual(t, locAt+8, len(staged), "the locator must sit fully inside the record")
 
 		binary.BigEndian.PutUint64(staged[locAt:locAt+8], finalLoc)

@@ -20,7 +20,7 @@ import (
 // THE DEFECT THIS FILE EXISTS TO CLOSE. Every piece of state the shared WAL
 // needs in order to READ a record back — fileNum, oldFiles, the per-file offset
 // bitmaps, offsetIndex — is written exclusively by the WRITE path (openNextFile,
-// rollFile, flushBatch) and was reconstructed by nothing at boot. Recovery
+// rollFile, commitBatch) and was reconstructed by nothing at boot. Recovery
 // extracted messages (RecoverFromWAL) but never rebuilt the index that makes
 // them readable, and fileNum restarted at zero so every incarnation reopened
 // 00000000000000000001.wal with O_APPEND. Two consequences, both reproduced:
