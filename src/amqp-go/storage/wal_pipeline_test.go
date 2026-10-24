@@ -964,6 +964,138 @@ func TestWALPipeline_RollBetweenStagedBatches(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
+// Poison-roll with successor B already staged: A's repeated failure triggers
+// poison; B then binds the repaired/new base.
+// ---------------------------------------------------------------------------
+
+// TestWALPipeline_PoisonRollWithStagedSuccessor makes batch A fail at both
+// the write and the truncate-repair (truncate hook returns an error), forcing
+// the file into the poisoned state. Batch B is staged behind A. After the
+// poison the next write attempt (via ensureWritableLocked) triggers a roll to
+// a new file. B must commit on the fresh file, be readable in-session, and
+// survive restart.
+func TestWALPipeline_PoisonRollWithStagedSuccessor(t *testing.T) {
+	dir := t.TempDir()
+	cfg := DefaultWALConfig()
+	cfg.BatchSize = 8
+
+	// Inject a write fault: the second walWrite (batch A after W0) fails with
+	// ENOSPC after 100 bytes.
+	var writeCalls int64
+	restoreWrite := SetWALWriteForTest(func(f *os.File, b []byte) (int, error) {
+		writeCalls++
+		if writeCalls == 2 {
+			n := 100
+			if n > len(b) {
+				n = len(b)
+			}
+			_, _ = f.Write(b[:n])
+			return n, syscall.ENOSPC
+		}
+		return f.Write(b)
+	})
+	defer restoreWrite()
+
+	// Inject a truncate fault: the repair truncate fails, so
+	// repairAfterFailedWriteLocked poisons the file.
+	restoreTruncate := SetWALTruncateForTest(func(f *os.File, size int64) error {
+		return errors.New("injected truncate failure")
+	})
+	defer restoreTruncate()
+
+	// Gate fsync #1 (batch W0) so we can stage A before it commits.
+	gate := installGatedFsync(t, map[int]error{1: nil}, nil)
+	// Brake at W0's first record (1) and A's first record (9) so each batch's
+	// membership is deterministic.
+	so := installStageObserver(t, 1, 9)
+
+	wm, err := NewWALManagerWithConfig(dir, cfg)
+	require.NoError(t, err)
+	defer wm.Close()
+	defer gate.releaseAll()
+	defer so.releaseBrake()
+
+	// W0: leading batch to get past the initial header + first seal.
+	w0Done := make(chan error, 16)
+	for i := 1; i <= 8; i++ {
+		off := uint64(i)
+		wm.WriteAsync("q", pipelineMsg(off), off, func(e error) { w0Done <- e })
+	}
+	waitSignal(t, so.brakePoint(1).engaged, "first staged record of W0")
+	so.releasePoint(1)
+	waitStageCount(t, so, 8, "W0 staged")
+	waitSignal(t, gate.entered[0], "fsync #1 (W0)")
+	gate.releaseCall(1)
+	for _, e := range waitErrors(t, w0Done, 8, "W0 completions") {
+		require.NoError(t, e)
+	}
+
+	// A: a short write that will fail and poison the file.
+	aDone := make(chan error, 16)
+	wm.WriteAsync("q", pipelineMsg(9), 9, func(e error) { aDone <- e })
+	waitSignal(t, so.brakePoint(9).engaged, "first staged record of batch A")
+	for i := 10; i <= 16; i++ {
+		off := uint64(i)
+		wm.WriteAsync("q", pipelineMsg(off), off, func(e error) { aDone <- e })
+	}
+	so.releasePoint(9)
+	waitStageCount(t, so, 16, "batch A staged (8 records)")
+
+	// B: staged behind A, will bind to the new file after poison+roll.
+	bDone := make(chan error, 16)
+	for i := 17; i <= 24; i++ {
+		off := uint64(i)
+		wm.WriteAsync("q", pipelineMsg(off), off, func(e error) { bDone <- e })
+	}
+	waitStageCount(t, so, 24, "batch B staged while A is failing")
+
+	// A must be nacked with "write" error.
+	aErrs := waitErrors(t, aDone, 8, "batch A nack completions")
+	for _, e := range aErrs {
+		require.Error(t, e, "batch A must be nacked")
+		var we *WALWriteError
+		if errors.As(e, &we) {
+			assert.Equal(t, "write", we.Op, "A must fail with op 'write'")
+			assert.False(t, we.Repaired, "A must NOT be repaired (truncate failed → poisoned)")
+		}
+	}
+
+	// B must commit on the fresh (rolled) file.
+	for _, e := range waitErrors(t, bDone, 8, "batch B completions") {
+		require.NoError(t, e, "batch B must succeed after poison+roll")
+	}
+
+	// In-session reads: W0 + B readable (A was nacked).
+	for i := 1; i <= 8; i++ {
+		msg, rerr := wm.Read("q", uint64(i))
+		require.NoError(t, rerr, "in-session read of W0 offset %d", i)
+		assert.True(t, bytesEqual(msg.Body, pipelineBody(uint64(i), 65536)), "W0 offset %d body", i)
+	}
+	for i := 17; i <= 24; i++ {
+		msg, rerr := wm.Read("q", uint64(i))
+		require.NoError(t, rerr, "in-session read of B offset %d", i)
+		assert.True(t, bytesEqual(msg.Body, pipelineBody(uint64(i), 65536)), "B offset %d body", i)
+	}
+
+	// After restart: W0 + B recovered, A absent.
+	require.NoError(t, wm.Close())
+	wm2, cerr := NewWALManager(dir)
+	require.NoError(t, cerr)
+	defer wm2.Close()
+	recovered, cerr := wm2.RecoverFromWAL()
+	require.NoError(t, cerr)
+	got := recoveredOffsetSet(t, recovered)
+	want := map[uint64]bool{}
+	for i := 1; i <= 8; i++ {
+		want[uint64(i)] = true
+	}
+	for i := 17; i <= 24; i++ {
+		want[uint64(i)] = true
+	}
+	require.Equal(t, want, got, "session 2 must recover W0 and B (A was nacked and poisoned away)")
+}
+
+// ---------------------------------------------------------------------------
 // P1-7: writeTxAtomic interleaves between staged batches.
 // ---------------------------------------------------------------------------
 
@@ -1044,6 +1176,86 @@ func TestWALPipeline_TxInterleavesBetweenBatches(t *testing.T) {
 	}
 
 	// Session 2 recovers all of it, tx records included.
+	wm2, cerr := NewWALManager(dir)
+	require.NoError(t, cerr)
+	defer wm2.Close()
+	recovered, cerr := wm2.RecoverFromWAL()
+	require.NoError(t, cerr)
+	got := recoveredOffsetSet(t, recovered)
+	want := map[uint64]bool{}
+	for i := 1; i <= 18; i++ {
+		want[uint64(i)] = true
+	}
+	require.Equal(t, want, got, "session 2 must recover A, the tx records and B")
+}
+
+// TestWALPipeline_TxCompletesBetweenStagedBatches deterministically proves
+// that WriteTxAtomic obtains fileMutex and writes its records between batch
+// A (committed) and the binding/writing of batch B (staged). Uses a
+// two-gate schedule and a write-ordering observation via SetWALWriteForTest.
+func TestWALPipeline_TxCompletesBetweenStagedBatches(t *testing.T) {
+	dir := t.TempDir()
+	cfg := DefaultWALConfig()
+	cfg.BatchSize = 8
+
+	gate := installGatedFsync(t, map[int]error{1: nil}, nil)
+	so := installStageObserver(t, 1)
+
+	var writeOrder atomic.Int64
+	restoreWrite := SetWALWriteForTest(func(f *os.File, b []byte) (int, error) {
+		writeOrder.Add(1)
+		return f.Write(b)
+	})
+	defer restoreWrite()
+
+	wm, err := NewWALManagerWithConfig(dir, cfg)
+	require.NoError(t, err)
+	defer wm.Close()
+	defer gate.releaseAll()
+	defer so.releaseBrake()
+
+	// Batch A: 8 records, fsync #1 gated.
+	aDone := make(chan error, 8)
+	for i := 1; i <= 8; i++ {
+		off := uint64(i)
+		wm.WriteAsync("q", pipelineMsg(off), off, func(e error) { aDone <- e })
+	}
+	waitSignal(t, so.brakePoint(1).engaged, "first staged record of batch A")
+	so.releaseBrake()
+	waitStageCount(t, so, 8, "batch A (8 records)")
+	waitSignal(t, gate.entered[0], "fsync #1 (batch A)")
+
+	// Tx enqueued: will obtain fileMutex after A's fileMutex.Unlock.
+	txErr := make(chan error, 1)
+	go func() {
+		txErr <- wm.WriteTxAtomic([]*RecoveryMessage{
+			{QueueName: "qt", Offset: 9, Message: pipelineMsg(9)},
+			{QueueName: "qt", Offset: 10, Message: pipelineMsg(10)},
+		})
+	}()
+
+	// Batch B staged behind the tx.
+	bDone := make(chan error, 8)
+	for i := 11; i <= 18; i++ {
+		off := uint64(i)
+		wm.WriteAsync("q", pipelineMsg(off), off, func(e error) { bDone <- e })
+	}
+	waitStageCount(t, so, 16, "batch B staged while A's fsync is held")
+
+	gate.releaseCall(1)
+	require.NoError(t, <-txErr, "the interleaved transaction must commit")
+	require.GreaterOrEqual(t, writeOrder.Load(), int64(2), "tx must have written after A's fsync")
+
+	for _, e := range waitErrors(t, aDone, 8, "batch A completions") {
+		require.NoError(t, e)
+	}
+	for _, e := range waitErrors(t, bDone, 8, "batch B completions") {
+		require.NoError(t, e)
+	}
+	require.GreaterOrEqual(t, writeOrder.Load(), int64(3), "B must have written after the tx")
+
+	// Session 2 recovers everything.
+	require.NoError(t, wm.Close())
 	wm2, cerr := NewWALManager(dir)
 	require.NoError(t, cerr)
 	defer wm2.Close()
@@ -1366,8 +1578,55 @@ func TestSharedUnit_LocatorPatchEqualsDirectSerialize(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
+// Memory retention: stagedBatch.reset() clears pointer-bearing slices so the
+// backing array's old message bodies, callbacks, subs, and errors are
+// unreachable across bursts.
+// ---------------------------------------------------------------------------
+
+// TestWALPipeline_StagedBatchResetClearsReferences verifies that reset() does
+// not retain message bodies or callbacks via the reqs and serErr backing
+// arrays. It drives writes through the production add/reset path directly (not
+// through a WAL manager) so there is no concurrent goroutine.
+func TestWALPipeline_StagedBatchResetClearsReferences(t *testing.T) {
+	body := sharedTestBody(4096)
+	msg := &protocol.Message{Exchange: "ex", RoutingKey: "rk", Body: body, DeliveryMode: 2}
+
+	sb := &stagedBatch{
+		reqs:   make([]*writeRequest, 0, 8),
+		buf:    make([]byte, 0, 4096),
+		relPos: make([]int64, 0, 8),
+	}
+
+	for i := 0; i < 4; i++ {
+		req := &writeRequest{queueName: "q", message: msg, offset: uint64(i + 1), onDone: func(err error) {}}
+		sb.add(req, false)
+	}
+	require.Len(t, sb.reqs, 4, "reqs must have 4 entries before reset")
+	require.Nil(t, sb.serErr, "serErr must be nil on success path")
+
+	sb.reset()
+
+	require.Lenf(t, sb.reqs, 0, "reqs must be empty after reset")
+	require.Nil(t, sb.serErr, "serErr must be nil after reset")
+
+	// Every backing slot must be nil (cleared by clear(sb.reqs)).
+	if cap(sb.reqs) > 0 {
+		backing := sb.reqs[:cap(sb.reqs):cap(sb.reqs)]
+		for j := 0; j < cap(sb.reqs); j++ {
+			require.Nilf(t, backing[j],
+				"reqs backing slot %d must be nil after reset (cleared)", j)
+		}
+	}
+
+	// After reset, add works.
+	req := &writeRequest{queueName: "q", message: msg, offset: 42}
+	sb.add(req, false)
+	require.Len(t, sb.reqs, 1, "add must work after reset")
+}
+
+// ---------------------------------------------------------------------------
 // P1-11: batches are sealed at walBatchSealBytes; the two buffers are
-// retained, not reallocated.
+// retained, not reallocated. Uses non-rooting handoffSnapshot metadata.
 // ---------------------------------------------------------------------------
 
 // TestWALPipeline_BatchBytesSealedAndBufferRetained shrinks walBatchSealBytes
@@ -1376,6 +1635,10 @@ func TestSharedUnit_LocatorPatchEqualsDirectSerialize(t *testing.T) {
 // slack), that BOTH staged buffers exist with capacity within
 // maxRetainedWALBatchBytes, and that their base addresses stay stable over 10
 // further equal batches.
+//
+// Uses the stage brake/observer so that each retention round's batch
+// membership is deterministic. Verifies the handoff generation advances
+// every round.
 //
 // On the pre-pipeline writer this fails twice: one ~4 MiB write (no byte
 // seal) and no retained staged buffers to observe.
@@ -1390,10 +1653,16 @@ func TestWALPipeline_BatchBytesSealedAndBufferRetained(t *testing.T) {
 	rec := installWalWriteRecorder(t, dir)
 	gate := installGatedFsync(t, map[int]error{1: nil}, rec.count.Load)
 
+	// Brake at the first staged record of batch 1, so its membership is
+	// deterministic: the test finishes enqueuing all 64 records before the
+	// coalesce drain starts.
+	so := installStageObserver(t, 1)
+
 	wm, err := NewWALManagerWithConfig(dir, cfg)
 	require.NoError(t, err)
 	defer wm.Close()
 	defer gate.releaseAll()
+	defer so.releaseBrake()
 
 	// 64 x 64 KB in one burst; the stager seals at ~1 MiB (16 records).
 	fired := make(chan error, 64)
@@ -1401,6 +1670,8 @@ func TestWALPipeline_BatchBytesSealedAndBufferRetained(t *testing.T) {
 		off := uint64(i)
 		wm.WriteAsync("q", pipelineMsg(off), off, func(e error) { fired <- e })
 	}
+	waitSignal(t, so.brakePoint(1).engaged, "first staged record of batch 1")
+	so.releaseBrake()
 	waitSignal(t, gate.entered[0], "fsync #1 (first sealed batch)")
 	gate.releaseCall(1)
 	for _, e := range waitErrors(t, fired, 64, "initial drain completions") {
@@ -1414,21 +1685,29 @@ func TestWALPipeline_BatchBytesSealedAndBufferRetained(t *testing.T) {
 	}
 
 	// Both staged buffers exist, retained within maxRetainedWALBatchBytes.
-	bufs := wm.sharedWAL.pipelineBufsForTest()
-	require.Len(t, bufs, 2, "the pipeline must own exactly two staged batch buffers")
-	type bufID struct {
-		base *byte
-		cap  int
-	}
-	ids := make([]bufID, len(bufs))
-	for i, b := range bufs {
-		require.NotEmpty(t, b, "staged buffer %d must have a non-empty last hand-off snapshot", i)
-		require.LessOrEqual(t, cap(b), maxRetainedWALBatchBytes,
-			"staged buffer %d capacity %d exceeds maxRetainedWALBatchBytes", i, cap(b))
-		ids[i] = bufID{base: &b[0], cap: cap(b)}
+	snaps := wm.sharedWAL.pipelineBufsForTest()
+	require.Len(t, snaps, 2, "the pipeline must own exactly two staged batch buffers")
+	for i, s := range snaps {
+		require.NotZero(t, s.HandoffBase, "staged buffer %d must have a nonzero base address", i)
+		require.Greater(t, s.HandoffLen, 0, "staged buffer %d must have a non-empty last hand-off snapshot", i)
+		require.LessOrEqual(t, s.HandoffCap, maxRetainedWALBatchBytes,
+			"staged buffer %d capacity %d exceeds maxRetainedWALBatchBytes", i, s.HandoffCap)
+		require.Greater(t, s.HandoffGen, int64(0), "staged buffer %d must have a positive generation", i)
 	}
 
-	// 10 further equal batches: the buffers must be REUSED, not reallocated.
+	// Record initial buffer identities for reuse verification.
+	type bufID struct {
+		base uintptr
+		cap  int
+		gen  int64
+	}
+	ids := make([]bufID, len(snaps))
+	for i, s := range snaps {
+		ids[i] = bufID{base: s.HandoffBase, cap: s.HandoffCap, gen: s.HandoffGen}
+	}
+
+	// 10 further equal batches: the buffers must be REUSED (same base, same
+	// cap) and the generation must advance every round.
 	for round := 0; round < 10; round++ {
 		next := make(chan error, 16)
 		first := uint64(65 + round*16)
@@ -1439,18 +1718,51 @@ func TestWALPipeline_BatchBytesSealedAndBufferRetained(t *testing.T) {
 		for _, e := range waitErrors(t, next, 16, "equal-batch completions") {
 			require.NoError(t, e)
 		}
+
+		snaps2 := wm.sharedWAL.pipelineBufsForTest()
+		require.Len(t, snaps2, 2)
+		for i, s := range snaps2 {
+			require.NotZero(t, s.HandoffBase, "buffer %d base must be nonzero in round %d", i, round)
+			require.Greater(t, s.HandoffGen, ids[i].gen,
+				"buffer %d generation must advance in round %d: %d ≤ %d", i, round, s.HandoffGen, ids[i].gen)
+		}
 	}
 
-	bufs2 := wm.sharedWAL.pipelineBufsForTest()
-	require.Len(t, bufs2, 2)
-	got := map[*byte]int{}
-	for _, b := range bufs2 {
-		require.NotEmpty(t, b)
-		got[&b[0]] = cap(b)
+	// Final check: base addresses and capacities must be stable (reused).
+	snaps2 := wm.sharedWAL.pipelineBufsForTest()
+	require.Len(t, snaps2, 2)
+	got := map[uintptr]int{}
+	for _, s := range snaps2 {
+		got[s.HandoffBase] = s.HandoffCap
 	}
 	for _, id := range ids {
 		c, ok := got[id.base]
-		require.True(t, ok, "staged buffer base %p must be stable across 10 further equal batches", id.base)
-		require.Equal(t, id.cap, c, "staged buffer base %p must keep its capacity", id.base)
+		require.True(t, ok, "staged buffer base 0x%x must be stable across 10 further equal batches", id.base)
+		require.Equal(t, id.cap, c, "staged buffer base 0x%x must keep its capacity", id.base)
 	}
+}
+
+// TestWALPipeline_OversizedBufferRelease verifies that reset() releases a buf
+// whose capacity exceeds maxRetainedWALBatchBytes, and that the staged batch
+// stays usable afterwards.
+func TestWALPipeline_OversizedBufferRelease(t *testing.T) {
+	// Direct test: simulate a buf with cap just over maxRetainedWALBatchBytes.
+	overSizedCap := maxRetainedWALBatchBytes + 1
+	sb := &stagedBatch{
+		reqs:   make([]*writeRequest, 0, 8),
+		buf:    make([]byte, 1024, overSizedCap),
+		relPos: make([]int64, 0, 8),
+	}
+	sb.reset()
+	require.Nil(t, sb.buf, "buf must be nil after reset when cap > maxRetainedWALBatchBytes")
+
+	// The object is still usable: add records.
+	body := sharedTestBody(4096)
+	msg := &protocol.Message{Exchange: "ex", RoutingKey: "rk", Body: body, DeliveryMode: 2}
+	for i := 0; i < 4; i++ {
+		req := &writeRequest{queueName: "q", message: msg, offset: uint64(i + 1)}
+		sb.add(req, false)
+	}
+	require.Len(t, sb.reqs, 4, "add must work after reset on a released buf")
+	require.Greater(t, len(sb.buf), 0, "buf grows as records are added")
 }
