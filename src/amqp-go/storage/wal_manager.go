@@ -12,6 +12,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unsafe"
 
 	"github.com/RoaringBitmap/roaring/roaring64"
 	"github.com/maxpert/amqp-go/interfaces"
@@ -373,8 +374,8 @@ type QueueWAL struct {
 	free chan *stagedBatch
 
 	// pipelineMu guards pipelineBatches (the registry of the ≤2 stagedBatch
-	// objects, created by the stager) and each object's handoffBuf
-	// snapshot, for pipelineBufsForTest. TEST-ONLY observability; its only
+	// objects, created by the stager) and each object's handoffSnapshot
+	// metadata, for pipelineBufsForTest. TEST-ONLY observability; its only
 	// production cost is one lock per batch hand-off.
 	pipelineMu      sync.Mutex
 	pipelineBatches []*stagedBatch
@@ -424,6 +425,16 @@ type sharedIndexEntry struct {
 	filePosition int64
 }
 
+// handoffSnapshot is TEST-ONLY observability metadata that replaces the old
+// []byte root-of-backing-array snapshot. It captures enough to compare buffer
+// identity across hand-off rounds without retaining the backing array.
+type handoffSnapshot struct {
+	HandoffLen  int
+	HandoffCap  int
+	HandoffBase uintptr
+	HandoffGen  int64
+}
+
 // stagedBatch is ONE reusable group-commit batch of the pipelined writer
 // (WS-F phase 1 §1.1). Exactly walPipelineBatchCount objects exist per
 // QueueWAL; ownership moves only over commitCh/free (channel happens-before
@@ -462,10 +473,13 @@ type stagedBatch struct {
 	// fileMutex iff this is set after a successful write.
 	hasShared bool
 
-	// handoffBuf is this object's buf as captured at the stager's most
-	// recent hand-off (len > 0), published under QueueWAL.pipelineMu for
-	// pipelineBufsForTest. TEST-ONLY observability.
-	handoffBuf []byte
+	// handoffSnapshot captures the buf metadata at the stager's most recent
+	// hand-off, published under QueueWAL.pipelineMu for pipelineBufsForTest.
+	// Unlike a []byte snapshot this does NOT root the backing array, so the
+	// oversized-buffer release path (reset's maxRetainedWALBatchBytes guard)
+	// is observable via nonzero HandoffBase without retention. TEST-ONLY.
+	// HandoffGen is incremented monotonically at every hand-off of this object.
+	handoffSnapshot handoffSnapshot
 }
 
 // refPatch is one shared-unit reference locator awaiting its commit-time
@@ -1832,6 +1846,13 @@ func (qw *QueueWAL) batchWriterLoop() {
 		// Partial batch and writeChan momentarily empty: hand it off if the
 		// committer is idle (the lone-writer fast path — same
 		// drain-then-flush as before), otherwise keep coalescing.
+		//
+		// Publish the handoff snapshot under pipelineMu BEFORE the send, so
+		// the stager still owns the batch and the snapshot never races with
+		// the committer's reset(). This is the same ordering handoff() uses.
+		qw.pipelineMu.Lock()
+		cur.setHandoffSnapshot()
+		qw.pipelineMu.Unlock()
 		select {
 		case qw.commitCh <- cur:
 			cur = qw.nextStagedBatch(&allocated)
@@ -1902,11 +1923,11 @@ func (qw *QueueWAL) nextStagedBatch(allocated *int) *stagedBatch {
 }
 
 // handoff passes a sealed (or final) batch to the committer. The blocking
-// send is the pipeline's backpressure point; the buffer snapshot published
-// under pipelineMu is TEST-ONLY observability (pipelineBufsForTest).
+// send is the pipeline's backpressure point; the buffer snapshot metadata
+// published under pipelineMu is TEST-ONLY observability (pipelineBufsForTest).
 func (qw *QueueWAL) handoff(sb *stagedBatch) {
 	qw.pipelineMu.Lock()
-	sb.handoffBuf = sb.buf
+	sb.setHandoffSnapshot()
 	qw.pipelineMu.Unlock()
 	qw.commitCh <- sb
 }
@@ -2280,18 +2301,46 @@ func (sb *stagedBatch) sealed(batchSize int) bool {
 // synchronization is needed. Buffer retention follows the old flushBatch
 // rule: keep buf iff its capacity is within maxRetainedWALBatchBytes, else
 // drop it so a rare oversized batch is not pinned (the seal already bounds
-// steady-state growth). reqs/relPos keep their capacity (≤ BatchSize in
-// normal configs); handoffBuf is left as-is — it is a TEST-ONLY snapshot
-// that stays valid until the stager's next hand-off of this object.
+// steady-state growth). reqs and serErr are cleared before reslicing so the
+// backing array's old message bodies, callbacks, subs, and errors are
+// unreachable across bursts. relPos/relPos keep their capacity (≤ BatchSize
+// in normal configs); handoffSnapshot is left as-is — it is a TEST-ONLY
+// metadata record that stays valid until the stager's next hand-off of this
+// object.
+var handoffGen atomic.Int64
+
+// setHandoffSnapshot captures buf's current len, cap, and base address as
+// uintptr in sb.handoffSnapshot, incrementing the hand-off generation so
+// tests can observe buffer identity and reuse without rooting the backing
+// array. Called under pipelineMu. TEST-ONLY observability.
+func (sb *stagedBatch) setHandoffSnapshot() {
+	sn := &sb.handoffSnapshot
+	if len(sb.buf) > 0 {
+		sn.HandoffBase = uintptr(unsafe.Pointer(&sb.buf[0]))
+	} else {
+		sn.HandoffBase = 0
+	}
+	sn.HandoffLen = len(sb.buf)
+	sn.HandoffCap = cap(sb.buf)
+	sn.HandoffGen = handoffGen.Add(1)
+}
+
 func (sb *stagedBatch) reset() {
 	if cap(sb.buf) > maxRetainedWALBatchBytes {
 		sb.buf = nil
 	} else {
 		sb.buf = sb.buf[:0]
 	}
+	// Clear pointer and interface elements before reslicing so the backing
+	// array's old message bodies, callbacks, subs, and errors are unreachable
+	// across bursts (memory retention fix, §1.4).
+	clear(sb.reqs)
 	sb.reqs = sb.reqs[:0]
-	sb.relPos = sb.relPos[:0]
+	if sb.serErr != nil {
+		clear(sb.serErr)
+	}
 	sb.serErr = nil
+	sb.relPos = sb.relPos[:0]
 	sb.sharedRel = sb.sharedRel[:0]
 	sb.refPatch = sb.refPatch[:0]
 	sb.hasShared = false
@@ -2322,19 +2371,19 @@ func bodyRefLocatorOffset(queueName string, message *protocol.Message) int {
 		2 // refLen (u16); the 8 locator bytes follow
 }
 
-// pipelineBufsForTest returns each staged-batch object's buffer as it was
-// sealed at the stager's most recent hand-off (len > 0). TEST-ONLY
-// observability for the phase 1 pipeline tests (P1-11): the snapshots are
-// published under pipelineMu at hand-off time, so reading them never races
-// the stager or the committer. Callers must not read the BYTES (they alias
-// a live reusable buffer); only len/cap and element-0 identity are
-// meaningful.
-func (qw *QueueWAL) pipelineBufsForTest() [][]byte {
+// pipelineBufsForTest returns each staged-batch object's handoff snapshot
+// metadata (len, cap, base µptr, generation). Unlike a []byte snapshot this
+// does NOT root the backing array, so the oversized-buffer release path is
+// observable via nonzero HandoffBase without retention. TEST-ONLY
+// observability for the phase 1 pipeline tests (P1-11). Snapshots are
+// published under pipelineMu, so reading them never races the stager or the
+// committer.
+func (qw *QueueWAL) pipelineBufsForTest() []handoffSnapshot {
 	qw.pipelineMu.Lock()
 	defer qw.pipelineMu.Unlock()
-	out := make([][]byte, len(qw.pipelineBatches))
+	out := make([]handoffSnapshot, len(qw.pipelineBatches))
 	for i, sb := range qw.pipelineBatches {
-		out[i] = sb.handoffBuf
+		out[i] = sb.handoffSnapshot
 	}
 	return out
 }
