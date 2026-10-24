@@ -1847,14 +1847,18 @@ func (qw *QueueWAL) batchWriterLoop() {
 		// committer is idle (the lone-writer fast path — same
 		// drain-then-flush as before), otherwise keep coalescing.
 		//
-		// Publish the handoff snapshot under pipelineMu BEFORE the send, so
-		// the stager still owns the batch and the snapshot never races with
-		// the committer's reset(). This is the same ordering handoff() uses.
+		// Capture the snapshot data BEFORE offering the batch (under pipelineMu)
+		// so the stager still owns the batch and the buf read does not race with
+		// the committer's reset. Publish only inside the successful-send branch,
+		// so generation counts only actual hand-offs, not attempted sends.
 		qw.pipelineMu.Lock()
-		cur.setHandoffSnapshot()
+		ph := cur.captureHandoffSnapshot()
 		qw.pipelineMu.Unlock()
 		select {
 		case qw.commitCh <- cur:
+			qw.pipelineMu.Lock()
+			cur.publishHandoffSnapshot(ph)
+			qw.pipelineMu.Unlock()
 			cur = qw.nextStagedBatch(&allocated)
 		case r := <-qw.writeChan:
 			cur.add(r, qw.cfg.CRCDisabled)
@@ -1925,11 +1929,17 @@ func (qw *QueueWAL) nextStagedBatch(allocated *int) *stagedBatch {
 // handoff passes a sealed (or final) batch to the committer. The blocking
 // send is the pipeline's backpressure point; the buffer snapshot metadata
 // published under pipelineMu is TEST-ONLY observability (pipelineBufsForTest).
+// The snapshot is captured before the send (under pipelineMu) and published
+// with an incremented generation only on the actual hand-off path, so the
+// generation counts only successful hand-offs.
 func (qw *QueueWAL) handoff(sb *stagedBatch) {
 	qw.pipelineMu.Lock()
-	sb.setHandoffSnapshot()
+	ph := sb.captureHandoffSnapshot()
 	qw.pipelineMu.Unlock()
 	qw.commitCh <- sb
+	qw.pipelineMu.Lock()
+	sb.publishHandoffSnapshot(ph)
+	qw.pipelineMu.Unlock()
 }
 
 // walCommitLoop is the COMMITTER half of the pipelined group-commit writer
@@ -2309,19 +2319,39 @@ func (sb *stagedBatch) sealed(batchSize int) bool {
 // object.
 var handoffGen atomic.Int64
 
-// setHandoffSnapshot captures buf's current len, cap, and base address as
-// uintptr in sb.handoffSnapshot, incrementing the hand-off generation so
-// tests can observe buffer identity and reuse without rooting the backing
-// array. Called under pipelineMu. TEST-ONLY observability.
-func (sb *stagedBatch) setHandoffSnapshot() {
-	sn := &sb.handoffSnapshot
+// pendingHandoff stores the snapshot data captured BEFORE a hand-off attempt.
+// Publishing only happens on a successful hand-off, so the generation counter
+// counts only actual hand-offs, not attempted sends. TEST-ONLY.
+type pendingHandoff struct {
+	base uintptr
+	len  int
+	cap  int
+}
+
+// captureHandoffSnapshot reads buf's current len, cap, and base address into
+// the pendingHandoff, without incrementing the generation. The caller must
+// later call publishHandoffSnapshot (after the successful send) to commit it.
+// Called under pipelineMu so the read does not race with the committer's reset
+// of a different batch. TEST-ONLY observability.
+func (sb *stagedBatch) captureHandoffSnapshot() pendingHandoff {
 	if len(sb.buf) > 0 {
-		sn.HandoffBase = uintptr(unsafe.Pointer(&sb.buf[0]))
-	} else {
-		sn.HandoffBase = 0
+		return pendingHandoff{
+			base: uintptr(unsafe.Pointer(&sb.buf[0])),
+			len:  len(sb.buf),
+			cap:  cap(sb.buf),
+		}
 	}
-	sn.HandoffLen = len(sb.buf)
-	sn.HandoffCap = cap(sb.buf)
+	return pendingHandoff{len: len(sb.buf), cap: cap(sb.buf)}
+}
+
+// publishHandoffSnapshot commits a pre-captured pending snapshot into
+// sb.handoffSnapshot and increments the handoff generation. Must be called
+// under pipelineMu after a successful hand-off send. TEST-ONLY observability.
+func (sb *stagedBatch) publishHandoffSnapshot(ph pendingHandoff) {
+	sn := &sb.handoffSnapshot
+	sn.HandoffBase = ph.base
+	sn.HandoffLen = ph.len
+	sn.HandoffCap = ph.cap
 	sn.HandoffGen = handoffGen.Add(1)
 }
 
