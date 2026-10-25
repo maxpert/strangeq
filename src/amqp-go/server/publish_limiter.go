@@ -159,12 +159,63 @@ func (l *PublishLimiter) grantLocked() {
 	}
 }
 
-// Reserve blocks until bytes are granted, ctx is cancelled, or the limiter is
-// closed. Grants are strict FIFO across connections: a Reserve that cannot be
-// granted immediately queues behind every earlier waiter.
-func (l *PublishLimiter) Reserve(ctx context.Context, connID string, bytes int64) (*Lease, error) {
+// LeaseWait is a queued reservation returned by Begin. C delivers the
+// resolution (a grant, or ErrLimiterClosed after Close). Cancel is idempotent
+// and grant/cancel race safe: if the grant was already delivered it is
+// drained and released; otherwise the waiter is removed from the FIFO, the
+// per-connection waiting marker is cleared, and the next waiter is promoted
+// if it now fits.
+type LeaseWait struct {
+	l    *PublishLimiter
+	w    *limiterWaiter
+	done atomic.Bool
+}
+
+// C returns the channel the resolution arrives on (capacity 1, never blocks
+// the limiter).
+func (lw *LeaseWait) C() <-chan limiterGrant { return lw.w.ch }
+
+// Cancel abandons the wait. Idempotent.
+func (lw *LeaseWait) Cancel() {
+	if lw == nil || !lw.done.CompareAndSwap(false, true) {
+		return
+	}
+	l := lw.l
+	w := lw.w
+	l.mu.Lock()
+	if w.granted {
+		// The grant raced the cancellation and is already delivered: take it
+		// and release it so the bytes come back and the next waiter promotes.
+		l.mu.Unlock()
+		if g := <-w.ch; g.lease != nil {
+			g.lease.Release()
+		}
+		return
+	}
+	for i, x := range l.fifo {
+		if x == w {
+			copy(l.fifo[i:], l.fifo[i+1:])
+			l.fifo[len(l.fifo)-1] = nil
+			l.fifo = l.fifo[:len(l.fifo)-1]
+			break
+		}
+	}
+	delete(l.waitingConns, w.connID)
+	// A canceled head may have been the only thing between the next waiter
+	// and a grant (it asked for MORE than the next waiter needs).
+	if !l.closed {
+		l.grantLocked()
+	}
+	l.mu.Unlock()
+}
+
+// Begin starts a reservation. On an immediate grant it returns (lease, nil,
+// nil); otherwise (nil, wait, nil) and the wait resolves via LeaseWait.C.
+// After Close it returns ErrLimiterClosed. A disabled limiter returns the
+// shared disabledLease and never allocates.
+func (l *PublishLimiter) Begin(connID string, bytes int64) (*Lease, *LeaseWait, error) {
 	if l.disabled() {
-		return disabledLease, nil
+		return disabledLease, nil, nil
 	}
 	l.mu.Lock()
 	if l.hooks != nil && l.hooks.BeforeReserve != nil {
@@ -172,13 +223,13 @@ func (l *PublishLimiter) Reserve(ctx context.Context, connID string, bytes int64
 	}
 	if l.closed {
 		l.mu.Unlock()
-		return nil, ErrLimiterClosed
+		return nil, nil, ErrLimiterClosed
 	}
 	if len(l.fifo) == 0 && l.canGrantLocked(bytes) {
 		l.used += bytes
 		le := l.newLeaseLocked(connID, bytes)
 		l.mu.Unlock()
-		return le, nil
+		return le, nil, nil
 	}
 	if _, dup := l.waitingConns[connID]; dup {
 		l.mu.Unlock()
@@ -188,40 +239,26 @@ func (l *PublishLimiter) Reserve(ctx context.Context, connID string, bytes int64
 	l.waitingConns[connID] = struct{}{}
 	l.fifo = append(l.fifo, w)
 	l.mu.Unlock()
+	return nil, &LeaseWait{l: l, w: w}, nil
+}
 
+// Reserve blocks until bytes are granted, ctx is cancelled, or the limiter is
+// closed. Grants are strict FIFO across connections: a Reserve that cannot be
+// granted immediately queues behind every earlier waiter.
+func (l *PublishLimiter) Reserve(ctx context.Context, connID string, bytes int64) (*Lease, error) {
+	le, wait, err := l.Begin(connID, bytes)
+	if le != nil || err != nil {
+		return le, err
+	}
 	start := time.Now()
 	select {
-	case g := <-w.ch:
+	case g := <-wait.C():
 		if l.hooks != nil && l.hooks.OnWait != nil {
 			l.hooks.OnWait(time.Since(start))
 		}
 		return g.lease, g.err
 	case <-ctx.Done():
-		l.mu.Lock()
-		if w.granted {
-			// The grant raced the cancellation and is already delivered: take
-			// it and release it so the bytes come back and the next waiter is
-			// promoted.
-			l.mu.Unlock()
-			g := <-w.ch
-			if g.lease != nil {
-				g.lease.Release()
-			}
-			if l.hooks != nil && l.hooks.OnWait != nil {
-				l.hooks.OnWait(time.Since(start))
-			}
-			return nil, ctx.Err()
-		}
-		for i, x := range l.fifo {
-			if x == w {
-				copy(l.fifo[i:], l.fifo[i+1:])
-				l.fifo[len(l.fifo)-1] = nil
-				l.fifo = l.fifo[:len(l.fifo)-1]
-				break
-			}
-		}
-		delete(l.waitingConns, connID)
-		l.mu.Unlock()
+		wait.Cancel()
 		if l.hooks != nil && l.hooks.OnWait != nil {
 			l.hooks.OnWait(time.Since(start))
 		}
@@ -288,6 +325,17 @@ func (l *PublishLimiter) Stats() (used, budget int64, waiters int) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	return l.used, l.budget, len(l.fifo)
+}
+
+// Closed reports whether the limiter has been closed: a false TryReserve can
+// then be told apart from an overbudget refusal.
+func (l *PublishLimiter) Closed() bool {
+	if l == nil {
+		return true
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.closed
 }
 
 // leaseBytes charges a declared publish body against the lease budget: the
