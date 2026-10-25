@@ -3,7 +3,43 @@ package protocol
 import (
 	"bytes"
 	"sync"
+	"sync/atomic"
 )
+
+// WS-I Phase B lease-leak controls for PutPendingMessage. A PendingMessage
+// returned to the pool while still carrying a lease would silently strand the
+// leased bytes (the budget is never recovered), so PutPendingMessage asserts
+// Lease == nil: under the test-armed panic flag it panics; in production it
+// releases the lease and reports the leak (amqp_publish_lease_leaked_total)
+// so budget is never lost.
+var leaseLeakPanicForTest atomic.Bool
+
+// leaseLeakReporter stores func() — the production leak counter increment.
+var leaseLeakReporter atomic.Value
+
+// SetLeaseLeakPanicForTest arms (true) or disarms the PutPendingMessage
+// lease-leak panic. Armed by the server and broker TestMain so a leaked lease
+// fails the test that leaked it. TEST-ONLY.
+func SetLeaseLeakPanicForTest(v bool) { leaseLeakPanicForTest.Store(v) }
+
+// SetLeaseLeakReporter installs the production leak-report callback (invoked
+// when PutPendingMessage recovers a non-nil lease). Called once from server
+// setup; nil restores the default (report nothing).
+func SetLeaseLeakReporter(fn func()) {
+	if fn == nil {
+		leaseLeakReporter.Store(func() {})
+		return
+	}
+	leaseLeakReporter.Store(fn)
+}
+
+func init() { leaseLeakReporter.Store(func() {}) }
+
+func reportLeaseLeak() {
+	if fn, ok := leaseLeakReporter.Load().(func()); ok && fn != nil {
+		fn()
+	}
+}
 
 // Buffer pooling implementation for optimized frame operations.
 //
@@ -219,6 +255,7 @@ func GetPendingMessage() *PendingMessage {
 	m.BodySize = 0
 	m.Received = 0
 	m.Channel = nil
+	m.Lease = nil
 	return m
 }
 
@@ -232,12 +269,24 @@ func GetPendingMessage() *PendingMessage {
 // body on the next pool Get. The same rule applies to Header (aliased via
 // ContentHeader), Method, and Channel — nil references only, never reuse.
 func PutPendingMessage(m *PendingMessage) {
+	// WS-I Phase B: the lease MUST already be released or transferred (nil).
+	// Returning a leased PendingMessage to the pool would strand the leased
+	// bytes forever: under the test-armed flag this panics; in production the
+	// lease is released and the leak reported so budget is never lost.
+	if m.Lease != nil {
+		if leaseLeakPanicForTest.Load() {
+			panic("PutPendingMessage with a non-nil Lease: the publish lease must be released or transferred first")
+		}
+		m.Lease.Release()
+		reportLeaseLeak()
+	}
 	m.Method = nil
 	m.Header = nil
 	m.Body = nil
 	m.BodySize = 0
 	m.Received = 0
 	m.Channel = nil
+	m.Lease = nil
 	pendingMessagePool.Put(m)
 }
 
