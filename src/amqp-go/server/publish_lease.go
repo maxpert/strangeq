@@ -159,11 +159,10 @@ func (s *Server) leaseForHeaderFrame(rt *connRuntime, frame *protocol.Frame, owe
 	var bodySize uint64
 	if len(frame.Payload) >= 12 {
 		bodySize = binary.BigEndian.Uint64(frame.Payload[4:12])
-		maxMsg := uint64(1<<63 - 1)
-		if s.Config != nil && s.Config.Server.MaxMessageSize > 0 {
-			maxMsg = uint64(s.Config.Server.MaxMessageSize)
-		}
-		valid = bodySize <= maxMsg
+		// EXACTLY the processor's admission condition (basic_handlers.go):
+		// a nil config skips the check; a non-positive MaxMessageSize rejects
+		// any non-empty body.
+		valid = s.Config == nil || bodySize <= uint64(s.Config.Server.MaxMessageSize)
 	}
 	if !valid {
 		conn.LeaseFIFO.Push(nil)
