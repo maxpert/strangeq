@@ -9,6 +9,7 @@ import (
 	"runtime"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -192,6 +193,41 @@ func leaseWaitAcks(t *testing.T, r *rawAMQP, wants map[uint16]uint64) {
 			}
 		}
 	}
+}
+
+// leaseDialer dials with SO_REUSEADDR so thousands of short-lived test
+// connections across -count runs do not exhaust ephemeral ports in TIME_WAIT.
+var leaseDialer = &net.Dialer{
+	Control: func(_, _ string, c syscall.RawConn) error {
+		var serr error
+		if err := c.Control(func(fd uintptr) {
+			serr = syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, syscall.SO_REUSEADDR, 1)
+		}); err != nil {
+			return err
+		}
+		return serr
+	},
+}
+
+// closeRawRST closes the client socket with SO_LINGER=0 (RST instead of FIN):
+// thousands of short-lived test connections would otherwise pile up in
+// TIME_WAIT and exhaust the ephemeral port space (and SO_REUSEADDR cannot
+// rebind a same-destination TIME_WAIT tuple). All confirms were already read
+// before close, so the abort discards nothing the test waits for.
+func closeRawRST(r *rawAMQP) {
+	if tc, ok := r.c.(*net.TCPConn); ok {
+		_ = tc.SetLinger(0)
+	}
+	_ = r.c.Close()
+}
+
+func dialRawReuse(t *testing.T, addr string) *rawAMQP {
+	t.Helper()
+	c, err := leaseDialer.Dial("tcp", addr)
+	require.NoError(t, err)
+	r := &rawAMQP{t: t, c: c, r: bufio.NewReader(c)}
+	t.Cleanup(func() { closeRawRST(r) })
+	return r
 }
 
 // leaseUsed returns the limiter's current used bytes.
@@ -439,11 +475,11 @@ func TestLease_1000Connections(t *testing.T) {
 	}, nil) // 0 → default 256 MiB
 
 	// One shared queue so 1000 declare storms don't dominate the test.
-	setup := dialRaw(t, addr)
+	setup := dialRawReuse(t, addr)
 	setup.handshake("guest", "guest", 1, 0)
 	setup.openChannel(1)
 	setup.declareQueue(1, "sl4-q")
-	setup.c.Close()
+	closeRawRST(setup)
 
 	base := runtime.NumGoroutine()
 
@@ -456,7 +492,7 @@ func TestLease_1000Connections(t *testing.T) {
 		go func(w int) {
 			defer wg.Done()
 			for i := w; i < conns; i += workers {
-				r := dialRaw(t, addr)
+				r := dialRawReuse(t, addr)
 				r.handshake("guest", "guest", 1, 0)
 				r.openChannel(1)
 				leaseConfirmSelect(t, r, 1)
@@ -464,7 +500,7 @@ func TestLease_1000Connections(t *testing.T) {
 				leaseSendPublish(t, r, 1, "", "sl4-q", leaseBody(1024), true)
 				leaseWaitAck(t, r, 1, 2)
 				acked.Add(2)
-				r.c.Close()
+				closeRawRST(r)
 			}
 		}(w)
 	}
@@ -1191,11 +1227,11 @@ func TestLease_MultiChannel20And1000Connections(t *testing.T) {
 		cfg.Network.MaxConnections = 2000
 	}, nil)
 
-	setup := dialRaw(t, addr)
+	setup := dialRawReuse(t, addr)
 	setup.handshake("guest", "guest", 1, 0)
 	setup.openChannel(1)
 	setup.declareQueue(1, "sl17-q")
-	setup.c.Close()
+	closeRawRST(setup)
 
 	// Phase 1: 20 connections × 4 channels, headers first (max nesting), then
 	// interleaved bodies. Each connection either confirms all 4 or is closed
@@ -1207,8 +1243,8 @@ func TestLease_MultiChannel20And1000Connections(t *testing.T) {
 		wg1.Add(1)
 		go func() {
 			defer wg1.Done()
-			r := dialRaw(t, addr)
-			defer r.c.Close()
+			r := dialRawReuse(t, addr)
+			defer closeRawRST(r)
 			r.handshake("guest", "guest", 8, 0)
 			for ch := uint16(1); ch <= 4; ch++ {
 				r.send(ch, 20, 10, []byte{})
@@ -1217,9 +1253,33 @@ func TestLease_MultiChannel20And1000Connections(t *testing.T) {
 			for ch := uint16(1); ch <= 4; ch++ {
 				leaseConfirmSelect(t, r, ch)
 			}
-			for ch := uint16(1); ch <= 4; ch++ {
-				leaseSendMethod(t, r, ch, "", "sl17-q", false)
-				leaseSendHeader(t, r, ch, body, true, "")
+			// Headers first (max nesting). Writes are error-tolerant: a 506
+			// lease-close can race them (broken pipe), which is a legal
+			// outcome and must not fail the test from a client goroutine.
+			writeFailed := false
+			for ch := uint16(1); ch <= 4 && !writeFailed; ch++ {
+				pm := &protocol.BasicPublishMethod{Exchange: "", RoutingKey: "sl17-q"}
+				data, err := pm.Serialize()
+				if err != nil {
+					break
+				}
+				if protocol.WriteFrame(r.c, protocol.EncodeMethodFrameForChannel(ch, 60, 40, data)) != nil {
+					writeFailed = true
+					break
+				}
+				h := &protocol.ContentHeader{ClassID: 60, BodySize: body, PropertyFlags: protocol.FlagDeliveryMode, DeliveryMode: 2}
+				hp, err := h.Serialize()
+				if err != nil {
+					break
+				}
+				if protocol.WriteFrame(r.c, &protocol.Frame{Type: protocol.FrameHeader, Channel: ch, Size: uint32(len(hp)), Payload: hp}) != nil {
+					writeFailed = true
+					break
+				}
+			}
+			if writeFailed {
+				closedOK.Add(1)
+				return
 			}
 			// Read frames: either 4 acks arrive (after sending bodies) or a
 			// 506 connection.close ends it. Send bodies from a goroutine
@@ -1303,14 +1363,14 @@ func TestLease_MultiChannel20And1000Connections(t *testing.T) {
 		go func(w int) {
 			defer wg2.Done()
 			for i := w; i < 1000; i += 100 {
-				r := dialRaw(t, addr)
+				r := dialRawReuse(t, addr)
 				r.handshake("guest", "guest", 1, 0)
 				r.openChannel(1)
 				leaseConfirmSelect(t, r, 1)
 				leaseSendPublish(t, r, 1, "", "sl17-q", leaseBody(1024), true)
 				leaseWaitAck(t, r, 1, 1)
 				acked2.Add(1)
-				r.c.Close()
+				closeRawRST(r)
 			}
 		}(w)
 	}
