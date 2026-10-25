@@ -30,43 +30,41 @@ func readDeliveryTag(t *testing.T, r *rawAMQP) uint64 {
 	return tag
 }
 
-// SL-22 (Sol+Opus): a TRANSIENT publish to a queue at its high-water mark is
-// never parked behind WaitForCapacity holding its lease: the lease is
-// released BEFORE the capacity wait, the reader depth gate paces the
-// producer, and the publish completes once a consumer drains the queue.
-func TestLease_TransientHWMNonBlockingAdmission(t *testing.T) {
+// SL-22 (Sol HIGH, closure): a TRANSIENT publish to a queue at its high-water
+// mark is synchronously STORED and confirmed PROMPTLY (bounded one-publish
+// overshoot, never WaitForCapacity, no drain needed); the returned gate paces
+// SUBSEQUENT producer-only reads. The lease is retained through broker+server
+// completion (two-party join), then used == 0.
+func TestLease_TransientHWMStoredWithGate(t *testing.T) {
 	srv, addr, created, released, _ := leaseServer(t, 1<<20, func(cfg *config.AMQPConfig) {
-		cfg.Engine.DepthHighWMOverride = 2
+		cfg.Engine.DepthHighWMOverride = 1
 	}, nil)
 
-	// Fill the queue to HWM with transient publishes from a producer.
 	p := dialRaw(t, addr)
 	p.handshake("guest", "guest", 4, 0)
 	p.openChannel(1)
 	p.declareQueue(1, "sl22-q")
-	for i := 0; i < 2; i++ {
-		leaseSendPublish(t, p, 1, "", "sl22-q", leaseBody(64), false)
-	}
+	// Fill to HWM=1.
+	leaseSendPublish(t, p, 1, "", "sl22-q", leaseBody(64), false)
 	require.Eventually(t, func() bool {
-		return srv.Broker.(*StorageBrokerAdapter).broker.GetQueueReadyCount("sl22-q") == 2
+		return srv.Broker.(*StorageBrokerAdapter).broker.GetQueueReadyCount("sl22-q") == 1
 	}, 30*time.Second, time.Millisecond)
 
-	// A producer-only connection publishes transient + confirm: NOT admitted
-	// at HWM. The publish must complete WITHOUT its lease ever being held
-	// across the capacity wait.
+	// Producer-only confirm-mode publish AT HWM: stored + confirmed PROMPTLY
+	// (no consumer drains anything).
 	pub := dialRaw(t, addr)
 	pub.handshake("guest", "guest", 4, 0)
 	pub.openChannel(1)
 	leaseConfirmSelect(t, pub, 1)
 	leaseSendPublish(t, pub, 1, "", "sl22-q", leaseBody(64), false)
+	leaseWaitAck(t, pub, 1, 1) // confirmed without any drain
 
-	// The lease for the waiting publish is released BEFORE the wait ends
-	// (created == released while the confirm is still outstanding).
+	// The lease was retained through broker+server completion, then released.
 	require.Eventually(t, func() bool {
-		return created.Load() >= 1 && created.Load() == released.Load()
-	}, 30*time.Second, time.Millisecond, "no lease is ever held across a queue-capacity wait")
+		return created.Load() == released.Load() && created.Load() > 0 && leaseUsed(srv) == 0
+	}, 30*time.Second, time.Millisecond)
 
-	// The producer's reader must be depth-backpressured (the gate armed).
+	// The returned gate paces the producer-only reader for SUBSEQUENT reads.
 	require.Eventually(t, func() bool {
 		srv.Mutex.RLock()
 		defer srv.Mutex.RUnlock()
@@ -76,33 +74,41 @@ func TestLease_TransientHWMNonBlockingAdmission(t *testing.T) {
 			}
 		}
 		return false
-	}, 30*time.Second, time.Millisecond, "the reader depth gate must be armed for the producer-only connection")
+	}, 30*time.Second, time.Millisecond, "the producer-only reader must be depth-backpressured")
 
-	// No confirm while the queue is full.
-	assert.Never(t, func() bool { return false }, 50*time.Millisecond, 10*time.Millisecond)
+	// A MIXED connection (consumer + publisher) at HWM: its publish stores
+	// and confirms, its ACKs flow, it is never 506-closed nor depth-parked.
+	m := dialRaw(t, addr)
+	m.handshake("guest", "guest", 4, 0)
+	m.openChannel(1)
+	leaseConfirmSelect(t, m, 1)
+	m.consume(1, "sl22-q", "c1")
+	leaseSendPublish(t, m, 1, "", "sl22-q", leaseBody(64), false)
+	leaseWaitAck(t, m, 1, 1) // the publish confirms without waiting
+	// Its consumer acks flow on the same connection.
+	tag := readDeliveryTag(t, m)
+	ack := &protocol.BasicAckMethod{DeliveryTag: tag}
+	data, err := ack.Serialize()
+	require.NoError(t, err)
+	m.send(1, 60, 80, data)
 
-	// A consumer drains the queue; the waiting publish is admitted and
-	// confirmed.
-	c := dialRaw(t, addr)
-	c.handshake("guest", "guest", 4, 0)
-	c.openChannel(1)
-	c.consume(1, "sl22-q", "c1")
-	for i := 0; i < 2; i++ {
-		tag := readDeliveryTag(t, c)
-		ack := &protocol.BasicAckMethod{DeliveryTag: tag}
-		data, err := ack.Serialize()
-		require.NoError(t, err)
-		c.send(1, 60, 80, data)
+	srv.Mutex.RLock()
+	var mconn *protocol.Connection
+	for _, c := range srv.Connections {
+		if c.HasActiveConsumer() {
+			mconn = c
+		}
 	}
-
-	leaseWaitAck(t, pub, 1, 1) // the confirm arrives after the drain
-	require.Eventually(t, func() bool { return leaseUsed(srv) == 0 }, 30*time.Second, time.Millisecond)
+	srv.Mutex.RUnlock()
+	require.NotNil(t, mconn)
+	assert.False(t, mconn.Closed.Load(), "the mixed connection is never closed")
+	assert.False(t, mconn.DepthBackpressure.Load(), "the mixed connection's reader is never depth-parked")
 }
 
 // Sol's exact mixed-connection ACK schedule: a mixed consumer+producer
-// connection whose transient publish is not admitted at HWM keeps its ACK
-// diversion live — the publish is admitted only after its own consumer acks
-// drain the queue.
+// connection whose transient publish at HWM stores immediately: the confirm
+// for the publish and the consumer's own acks both flow, in order, with no
+// wait and no close.
 func TestLease_TransientHWMMixedConnAckSchedule(t *testing.T) {
 	srv, addr, _, _, _ := leaseServer(t, 1<<20, func(cfg *config.AMQPConfig) {
 		cfg.Engine.DepthHighWMOverride = 2
@@ -126,34 +132,60 @@ func TestLease_TransientHWMMixedConnAckSchedule(t *testing.T) {
 	leaseConfirmSelect(t, m, 1)
 	m.consume(1, "sl22m-q", "c1")
 
-	// The transient publish is NOT admitted at HWM; the reader is NEVER
-	// parked (mixed connection: its acks must keep flowing).
+	// At HWM: the publish STORES + confirms promptly (overshoot), and the
+	// two queued deliveries arrive on the same connection afterwards.
 	leaseSendPublish(t, m, 1, "", "sl22m-q", leaseBody(64), false)
-
-	// Read the two deliveries of the fill messages and ack them: the publish
-	// must be admitted only AFTER the acks drain the queue — exact schedule.
-	var tags []uint64
+	leaseWaitAck(t, m, 1, 1) // confirm first (the publish was stored at once)
 	for i := 0; i < 2; i++ {
-		tags = append(tags, readDeliveryTag(t, m))
-	}
-	for _, tag := range tags {
+		tag := readDeliveryTag(t, m)
 		ack := &protocol.BasicAckMethod{DeliveryTag: tag}
 		data, err := ack.Serialize()
 		require.NoError(t, err)
 		m.send(1, 60, 80, data)
 	}
 
-	// The confirm arrives only after the acks (never before — the queue was
-	// at HWM until they landed).
-	leaseWaitAck(t, m, 1, 1)
-	// The mixed connection's reader was never depth-parked.
 	srv.Mutex.RLock()
 	var mconn *protocol.Connection
 	for _, c := range srv.Connections {
-		mconn = c
+		if c.HasActiveConsumer() {
+			mconn = c
+		}
 	}
 	srv.Mutex.RUnlock()
 	require.NotNil(t, mconn)
 	assert.False(t, mconn.DepthBackpressure.Load(), "a mixed connection's reader is never depth-parked")
 	assert.Equal(t, int64(0), leaseUsed(srv))
+}
+
+// LOW1 (Opus): the lease-wait metric records exactly one wait when one header
+// waits; immediate grants are never counted.
+func TestLease_WaitMetricsRecorded(t *testing.T) {
+	release := gateWALFsync(t)
+	srv, addr, _, _, probe := leaseServer(t, 1<<20, nil, nil)
+
+	r := dialRaw(t, addr)
+	r.handshake("guest", "guest", 4, 0)
+	r.openChannel(1)
+	r.declareQueue(1, "slpw-q")
+	leaseConfirmSelect(t, r, 1)
+
+	// msg1 holds the whole budget behind the gated fsync (immediate grant).
+	leaseSendPublish(t, r, 1, "", "slpw-q", leaseBody(700<<10), true)
+	require.Eventually(t, func() bool { return leaseUsed(srv) >= 717744 }, 30*time.Second, time.Millisecond)
+
+	// msg2's header waits (no immediate grant possible).
+	leaseSendMethod(t, r, 1, "", "slpw-q", false)
+	leaseSendHeader(t, r, 1, 700<<10, true, "")
+	bodyDone := make(chan struct{})
+	go func() {
+		defer close(bodyDone)
+		leaseSendBody(t, r, 1, leaseBody(700<<10))
+	}()
+	require.Eventually(t, func() bool { return leaseWaiters(srv) == 1 }, 30*time.Second, time.Millisecond)
+
+	release()
+	leaseWaitAck(t, r, 1, 2)
+	<-bodyDone
+	assert.Equal(t, int64(1), probe.waits.Load(),
+		"exactly one wait recorded (immediate grants are never counted)")
 }

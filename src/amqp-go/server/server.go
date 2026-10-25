@@ -771,9 +771,14 @@ func (s *Server) processConnectionFrames(conn *protocol.Connection) {
 	_ = conn.Conn.Close()
 	rt.leaseCancel() // WS-I: unblock a reader parked in a lease Reserve
 	// WS-I: from here on the processor discards (never admits) header/body
-	// content; connection-owned leases are drained in cleanupConnection after
-	// the joins (revokeAndDrainConnectionLeases is once-only).
+	// content. Drain the LeaseFIFO NOW: a processor parked mid-publish (e.g.
+	// in a tx commit) must not hold QUEUED header leases for the whole park.
+	// The processor pops nil for those frames and discards them safely;
+	// processor-owned HeaderLease/PendingMessages leases are NOT touched here
+	// — the once-only drain in cleanupConnection (after the joins) gets them
+	// plus any late pushes.
 	rt.leasesRevoked.Store(true)
+	drainLeaseFIFO(conn)
 
 	// 4. Signal shutdown to every Done-select (reader hand-offs, flow sender,
 	//    heartbeat, confirm flusher, alarm/depth parks). This also unblocks
@@ -1374,25 +1379,23 @@ func (s *Server) processFrames(rt *connRuntime, done chan struct{}) {
 				continue
 			}
 
+			// WS-I: pair the lease the reader reserved for this header FIRST
+			// (FIFO order equals frame order; the reader's pending buffer and
+			// FrameQueue both preserve read order), so EVERY discard arm below
+			// can release it — including the revoked-teardown arm after an
+			// early FIFO drain (Pop is nil then, which is safe).
+			if frame.Type == protocol.FrameHeader {
+				conn.HeaderLease = conn.LeaseFIFO.Pop()
+			}
+
 			// WS-I: once leases are revoked (teardown), header/body content is
 			// NEVER admitted unleased: discard it, releasing its budget and
 			// its paired lease. Method frames (close/close-ok) still process.
 			if rt.leasesRevoked.Load() && (frame.Type == protocol.FrameHeader || frame.Type == protocol.FrameBody) {
-				if frame.Type == protocol.FrameHeader {
-					conn.HeaderLease = conn.LeaseFIFO.Pop()
-					releaseHeaderLease(conn)
-				}
+				releaseHeaderLease(conn)
 				s.releaseFrameBudget(conn, cost)
 				protocol.PutFrame(frame)
 				continue
-			}
-
-			// WS-I Phase B: pair the lease the reader reserved for this header
-			// BEFORE any gate, so every discard arm below can release it. FIFO
-			// order equals frame order (the reader's pending buffer and
-			// FrameQueue both preserve read order).
-			if frame.Type == protocol.FrameHeader {
-				conn.HeaderLease = conn.LeaseFIFO.Pop()
 			}
 
 			// Capture the error-classification context before processFrame: it

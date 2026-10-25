@@ -9,35 +9,36 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// WS-I review (item 2): PublishMessageAdmitted never parks in WaitForCapacity:
-// a target at its high-water mark is reported (gate) with NOTHING stored; an
-// admitted publish stores synchronously.
-func TestPublishMessageAdmitted_NeverParksAtHWM(t *testing.T) {
+// WS-I closure (Sol HIGH): PublishMessageAdmitted synchronously STORES even
+// when at HWM (bounded one-publish overshoot, exactly like the async durable
+// path) AND returns the HWM gate for reader-level backpressure. StopCh and
+// ALL targets are checked before any partial store. It NEVER parks in
+// WaitForCapacity.
+func TestPublishMessageAdmitted_StoresAtHWMWithGate(t *testing.T) {
 	b, cleanup := createTestBroker(t)
 	defer cleanup()
 
 	_, err := b.DeclareQueue("q", true, false, false, nil)
 	require.NoError(t, err)
 	qs := b.getOrCreateQueueState("q")
-	qs.SetDepthHighWM(2)
+	qs.SetDepthHighWM(1)
 
-	// Fill to HWM (transient publishes: admitted + stored).
-	for i := 0; i < 2; i++ {
-		gate, err := b.PublishMessageAdmitted("", "q", &protocol.Message{
-			Body: []byte("fill"), RoutingKey: "q", DeliveryMode: 1,
-		})
-		require.NoError(t, err)
-		require.Nil(t, gate, "under HWM: admitted")
-	}
+	// Under HWM: admitted, stored, no gate.
+	gate, err := b.PublishMessageAdmitted("", "q", &protocol.Message{
+		Body: []byte("m1"), RoutingKey: "q", DeliveryMode: 1,
+	})
+	require.NoError(t, err)
+	require.Nil(t, gate, "under HWM: no backpressure reported")
+	require.Equal(t, uint32(1), b.GetQueueReadyCount("q"))
 	require.True(t, qs.AtHighWaterMark())
-	require.Equal(t, uint32(2), b.GetQueueReadyCount("q"))
 
-	// At HWM: NOT admitted, NOTHING stored, and the call returns PROMPTLY (no
-	// WaitForCapacity park — it would block this goroutine forever, no consumer).
+	// AT HWM: the publish STILL STORES (bounded overshoot) AND returns the
+	// gate — PROMPTLY (a WaitForCapacity park would block this goroutine
+	// forever with no consumer).
 	done := make(chan protocol.DepthGate, 1)
 	go func() {
 		gate, err := b.PublishMessageAdmitted("", "q", &protocol.Message{
-			Body: []byte("over"), RoutingKey: "q", DeliveryMode: 1,
+			Body: []byte("m2"), RoutingKey: "q", DeliveryMode: 1,
 		})
 		require.NoError(t, err)
 		done <- gate
@@ -49,22 +50,28 @@ func TestPublishMessageAdmitted_NeverParksAtHWM(t *testing.T) {
 	case <-time.After(3 * time.Second):
 		t.Fatal("PublishMessageAdmitted parked at HWM")
 	}
-	assert.Equal(t, uint32(2), b.GetQueueReadyCount("q"), "a non-admitted publish stores nothing")
+	assert.Equal(t, uint32(2), b.GetQueueReadyCount("q"), "stored even at HWM (bounded overshoot)")
+}
 
-	// Drain one (simulated consumer claim + ack), then admission succeeds.
-	stop, cancel := makeStop()
-	defer cancel()
-	tag, _, ok := qs.Claim(stop, testTimer(qs))
-	require.True(t, ok)
-	qs.ClaimInflight(tag) // waiting → inflight
-	qs.AckAdvance(tag)    // inflight → settled
-	require.Eventually(t, func() bool { return !qs.AtHighWaterMark() }, 30*time.Second, time.Millisecond)
+// PublishMessageAdmitted: a fanout with one closed target errors BEFORE any
+// partial store (StopCh checked across all targets first).
+func TestPublishMessageAdmitted_NoPartialStoreOnClosedTarget(t *testing.T) {
+	b, cleanup := createTestBroker(t)
+	defer cleanup()
 
-	gate, err := b.PublishMessageAdmitted("", "q", &protocol.Message{
-		Body: []byte("after"), RoutingKey: "q", DeliveryMode: 1,
+	require.NoError(t, b.DeclareExchange("fx", "fanout", true, false, false, nil))
+	for _, q := range []string{"q1", "q2"} {
+		_, err := b.DeclareQueue(q, true, false, false, nil)
+		require.NoError(t, err)
+		require.NoError(t, b.BindQueue(q, "fx", "", nil))
+	}
+	b.getOrCreateQueueState("q2").Close()
+
+	_, err := b.PublishMessageAdmitted("fx", "", &protocol.Message{
+		Body: []byte("m"), DeliveryMode: 1,
 	})
-	require.NoError(t, err)
-	assert.Nil(t, gate)
+	require.ErrorIs(t, err, ErrQueueClosed)
+	assert.Equal(t, uint32(0), b.GetQueueReadyCount("q1"), "no partial store: q1 must hold nothing")
 }
 
 // PublishMessageAdmitted: no-route and closed-queue semantics mirror

@@ -2702,13 +2702,13 @@ func (b *StorageBroker) ValidatePublishTarget(exchangeName string) error {
 }
 
 // PublishMessageAdmitted is the NON-BLOCKING transient publish admission path
-// (WS-I review): it routes and checks every target queue's StopCh + high-water
-// mark BEFORE storing anything. If any target is at/over HWM, NOTHING is
-// stored and that target's gate is returned for reader-level backpressure; the
-// caller retries after the queue drains. When every target is admitted, the
-// publish stores synchronously (never WaitForCapacity: every target was under
-// HWM at admission; a concurrent publisher crossing HWM in the race window is
-// the same bounded overshoot the async durable path allows).
+// (WS-I): it routes and checks every target queue's StopCh BEFORE storing
+// anything (a closed target fails the whole publish with no partial store),
+// then STORES SYNCHRONOUSLY — even when a target is at/over its high-water
+// mark (bounded one-publish overshoot, exactly like the async durable path's
+// admission; it NEVER parks in WaitForCapacity). When any target was at/over
+// HWM, that target's gate is returned for reader-level backpressure of
+// SUBSEQUENT publishes.
 func (b *StorageBroker) PublishMessageAdmitted(exchangeName, routingKey string, message *protocol.Message) (protocol.DepthGate, error) {
 	exchange, err := b.storage.GetExchange(exchangeName)
 	if err != nil {
@@ -2733,6 +2733,7 @@ func (b *StorageBroker) PublishMessageAdmitted(exchangeName, routingKey string, 
 		return nil, nil
 	}
 
+	var gate protocol.DepthGate
 	for _, queueName := range rs.queues {
 		queueState := b.getOrCreateQueueState(queueName)
 		select {
@@ -2740,11 +2741,13 @@ func (b *StorageBroker) PublishMessageAdmitted(exchangeName, routingKey string, 
 			return nil, fmt.Errorf("queue '%s': %w", queueName, ErrQueueClosed)
 		default:
 		}
-		if queueState.AtHighWaterMark() {
-			return queueState, nil // NOT admitted: nothing stored
+		if gate == nil && queueState.AtHighWaterMark() {
+			gate = queueState // report the first at-HWM target
 		}
 	}
-	return nil, b.publishMessage(exchangeName, routingKey, message, false)
+	// Store synchronously (never parks: the per-queue capacity check below is
+	// a StopCh re-check only; HWM overshoot is bounded and deliberate).
+	return gate, b.publishMessage(exchangeName, routingKey, message, false)
 }
 
 func (b *StorageBroker) PublishMessage(exchangeName, routingKey string, message *protocol.Message) error {

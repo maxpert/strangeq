@@ -496,34 +496,21 @@ func (s *Server) processCompleteMessage(conn *protocol.Connection, channelID uin
 	if message.DeliveryMode != 2 {
 		// TRANSIENT publish (confirm mode or not). WS-I: two-party retention
 		// (the lease releases when the broker part AND this function's wire
-		// writes are both done); and with a NonBlockingPublisher broker the
-		// publish is never parked behind WaitForCapacity HOLDING its lease.
+		// writes are both done). A NonBlockingPublisher broker STORES
+		// synchronously even at HWM (bounded overshoot, never WaitForCapacity)
+		// and returns the gate for SUBSEQUENT producer-only reader
+		// backpressure; a mixed connection's reader is never parked, so its
+		// ACK diversion stays live.
 		r := release
 		release = noopRelease
 		jr := newJoinRelease(r)
 		defer jr.serverDone()
 		if np, ok := s.Broker.(NonBlockingPublisher); ok {
-			for {
-				gate, perr := np.PublishMessageAdmitted(message.Exchange, message.RoutingKey, message)
-				if perr != nil || gate == nil {
-					jr.brokerDone()
-					err = perr
-					break
-				}
-				// NOT admitted (a target queue is at/over HWM): release the
-				// lease BEFORE waiting — never hold it across a queue-capacity
-				// wait. The bytes behind the wait are transient
-				// queue-residency, bounded separately (§B.1: not covered by
-				// the lease), and the reader depth gate paces the producer.
-				jr.releaseNow()
-				if !conn.DepthBackpressure.Load() && !conn.HasActiveConsumer() {
-					conn.SetDepthGate(gate)
-				}
-				if !s.waitForGateDrain(conn, gate) {
-					// Teardown mid-wait: the publish is dropped (it was never
-					// confirmed, so the client must republish).
-					return nil
-				}
+			var gate protocol.DepthGate
+			gate, err = np.PublishMessageAdmitted(message.Exchange, message.RoutingKey, message)
+			jr.brokerDone()
+			if err == nil && gate != nil && !conn.DepthBackpressure.Load() && !conn.HasActiveConsumer() {
+				conn.SetDepthGate(gate)
 			}
 		} else {
 			// A custom broker without non-blocking admission (only reachable

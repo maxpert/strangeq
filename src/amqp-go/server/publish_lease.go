@@ -225,11 +225,6 @@ func (j *joinRelease) brokerDone() { j.bit(1) }
 // return/nack/error wire writes).
 func (j *joinRelease) serverDone() { j.bit(2) }
 
-// releaseNow forces both parts (used when the publish leaves the lease's
-// scope WITHOUT waiting for either party — e.g. a transient publish that
-// waits on queue capacity: no lease is ever held across such a wait).
-func (j *joinRelease) releaseNow() { j.bit(3) }
-
 // takeLease nil-safely transfers the publish lease out of pm: it sets
 // pm.Lease = nil and returns the lease's pre-bound ReleaseFunc, or the shared
 // noopRelease when there was none. A second take returns noopRelease.
@@ -374,21 +369,13 @@ func (s *Server) leaseForHeaderFrame(rt *connRuntime, frame *protocol.Frame, rs 
 	return true
 }
 
-// waitForGateDrain waits (processor-side) for a depth gate to drop below the
-// high-water mark, or for the connection to die. Polling on the reader
-// backpressure probe interval; never blocks the reader itself.
-func (s *Server) waitForGateDrain(conn *protocol.Connection, gate protocol.DepthGate) bool {
-	t := time.NewTimer(s.readerBackpressureProbeInterval())
-	defer t.Stop()
-	for gate.AtHighWaterMark() {
-		select {
-		case <-conn.Done:
-			return false
-		case <-t.C:
-			t.Reset(s.readerBackpressureProbeInterval())
+// drainLeaseFIFO releases every lease still queued for the processor.
+func drainLeaseFIFO(conn *protocol.Connection) {
+	for _, le := range conn.LeaseFIFO.Drain() {
+		if le != nil {
+			le.Release()
 		}
 	}
-	return true
 }
 
 // revokeAndDrainConnectionLeases releases every publish lease the connection
@@ -400,11 +387,7 @@ func (s *Server) waitForGateDrain(conn *protocol.Connection, gate protocol.Depth
 func (s *Server) revokeAndDrainConnectionLeases(rt *connRuntime) {
 	conn := rt.conn
 	rt.leasesDrainOnce.Do(func() {
-		for _, le := range conn.LeaseFIFO.Drain() {
-			if le != nil {
-				le.Release()
-			}
-		}
+		drainLeaseFIFO(conn)
 		releaseHeaderLease(conn)
 		for _, pm := range conn.PendingMessages {
 			takeLease(pm)()
@@ -453,6 +436,14 @@ func (s *Server) leaseClose506(rt *connRuntime, channel uint16, wireReason, logR
 // when the reader must exit (teardown, limiter close, or a processor stall).
 func (s *Server) waitForHeaderLease(rt *connRuntime, channel uint16, wait *LeaseWait, rs *readerState) (*Lease, bool) {
 	conn := rt.conn
+	// Record exactly one wait (with its duration) on every return path.
+	// Immediate grants never reach here, so they are never counted.
+	start := time.Now()
+	defer func() {
+		if h := s.publishLimiter().hooks; h != nil && h.OnWait != nil {
+			h.OnWait(time.Since(start))
+		}
+	}()
 	stall := time.NewTimer(s.writeTimeout())
 	defer stall.Stop()
 	seq := rt.procSeq.Load()
