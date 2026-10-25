@@ -215,6 +215,7 @@ func (s *Server) teardownChannel(conn *protocol.Connection, channelID uint16) {
 	// this stays outside channel.Mutex.
 	if pm, ok := conn.PendingMessages[channelID]; ok {
 		delete(conn.PendingMessages, channelID)
+		takeLease(pm)() // WS-I: a half-received publish releases its lease here
 		protocol.PutBasicPublishMethod(pm.Method)
 		if pm.Header != nil {
 			protocol.PutContentHeader(pm.Header)

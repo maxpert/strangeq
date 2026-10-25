@@ -85,6 +85,16 @@ type NetworkConfig struct {
 	// ack draining under sustained backpressure at the cost of more wakeups.
 	// Default: 5 ms. <=0 falls back to the default.
 	ReaderBackpressureProbeMS int64
+
+	// PublishInflightBudgetBytes (WS-I Phase B) bounds DECLARED publish body
+	// bytes (plus fixed framing) in flight between the content-header read
+	// and durability/return/teardown — the header-time fair publish lease G.
+	// It covers exactly that one quantity; the per-connection frame budget,
+	// reader overflow cap, queue-resident messages, WAL staged buffers and tx
+	// staging are bounded (or, for tx, unbounded) separately. 0 → the default
+	// 4 × WAL batch seal (256 MiB); −1 → disabled; any other value must be
+	// ≥ 1 MiB. Tied to the WAL byte target, never re-tuned after the fact.
+	PublishInflightBudgetBytes int64
 }
 
 // StorageConfig holds storage-related configuration

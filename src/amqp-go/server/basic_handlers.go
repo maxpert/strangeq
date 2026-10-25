@@ -161,7 +161,13 @@ func (s *Server) handleBasicPublish(conn *protocol.Connection, channelID uint16,
 	pendingMsg.Method = publishMethod
 	pendingMsg.Channel = channelRef
 
-	// Store the pending message for this channel
+	// Store the pending message for this channel. A client violating the
+	// protocol with a second basic.publish before the previous content
+	// completed displaces the old entry: release its lease so budget is never
+	// lost (the displaced message itself is dropped, as before).
+	if old := conn.PendingMessages[channelID]; old != nil {
+		takeLease(old)()
+	}
 	conn.PendingMessages[channelID] = pendingMsg
 
 	if ce := s.Log.Check(zapcore.DebugLevel, "Started tracking pending message"); ce != nil {
@@ -212,6 +218,17 @@ func (s *Server) processHeaderFrame(conn *protocol.Connection, frame *protocol.F
 			fmt.Sprintf("PRECONDITION_FAILED - message size %d is larger than configured max size %d", contentHeader.BodySize, s.Config.Server.MaxMessageSize),
 			60, 40)
 	}
+
+	// WS-I Phase B: the header parsed and the declared size is admissible —
+	// transfer the lease the reader paired with this frame into the pending
+	// message (processCompleteMessage takes it from there). The error arms
+	// ABOVE leave it in conn.HeaderLease for the processor's discard release.
+	// A protocol-violating second header on the same channel displaces the
+	// previous lease — release it so budget is never lost.
+	if pendingMsg.Lease != nil {
+		pendingMsg.Lease.Release()
+	}
+	pendingMsg.Lease, conn.HeaderLease = conn.HeaderLease, nil
 
 	// Leave pendingMsg.Body nil here. The allocation decision is deferred to the
 	// FIRST body frame (processBodyFrame): a body that arrives in a single frame
@@ -351,6 +368,14 @@ func (s *Server) processBodyFrame(conn *protocol.Connection, frame *protocol.Fra
 
 // processCompleteMessage processes a message that has been fully received (method + header + body)
 func (s *Server) processCompleteMessage(conn *protocol.Connection, channelID uint16, pendingMsg *protocol.PendingMessage) error {
+	// WS-I Phase B: take the publish lease OUT of the pending message at entry
+	// and release it on EVERY early return via this structural defer. Each
+	// transfer site below sets r := release; release = noopRelease before
+	// handing r over (tx buffer, broker onReleased) or calling it inline
+	// (transient), so the lease is released exactly once.
+	release := takeLease(pendingMsg)
+	defer func() { release() }()
+
 	// SQ-12: mark this connection as a publisher so the reader-pause applies to
 	// it (consumer-only connections are never paused). Load-guarded so it is a
 	// single relaxed load per publish in steady state, storing only once.
@@ -446,7 +471,13 @@ func (s *Server) processCompleteMessage(conn *protocol.Connection, channelID uin
 		if confirmTag > 0 {
 			op.DeliveryTag = confirmTag
 		}
-		return txm.AddOperation(channelID, op)
+		// WS-I: tx bytes leave G once the publish is buffered (tx staging has
+		// no byte bound today, spec §B.1).
+		r := release
+		release = noopRelease
+		err := txm.AddOperation(channelID, op)
+		r()
+		return err
 	}
 
 	var publishStart time.Time
@@ -477,11 +508,19 @@ func (s *Server) processCompleteMessage(conn *protocol.Connection, channelID uin
 				}
 			}
 		}
-		// WS-I Phase B: onReleased is wired in the lease-transfer commit; nil
-		// until then (treated as a no-op by the broker).
-		durableInflight, backpressure, err = s.Broker.PublishMessageAsyncConfirm(message.Exchange, message.RoutingKey, message, onDurable, nil)
+		// WS-I: the broker owns the lease from here on (onReleased fires
+		// exactly once after all accepted copies complete, or synchronously on
+		// a transient/no-route/error return — even after the connection is
+		// gone).
+		r := release
+		release = noopRelease
+		durableInflight, backpressure, err = s.Broker.PublishMessageAsyncConfirm(message.Exchange, message.RoutingKey, message, onDurable, r)
 	} else {
+		// WS-I: transient synchronous publish — release when it returns.
+		r := release
+		release = noopRelease
 		err = s.Broker.PublishMessage(message.Exchange, message.RoutingKey, message)
+		r()
 	}
 
 	// Iteration 2 (option A): arm queue-depth reader backpressure. The async

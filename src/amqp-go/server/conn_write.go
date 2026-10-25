@@ -38,6 +38,12 @@ func (s *Server) writeLocked(conn *protocol.Connection, fn func(w net.Conn) erro
 	if err != nil {
 		conn.Closed.Store(true)
 		_ = conn.Conn.Close()
+		// WS-I: unblock a reader parked in a publish-lease Reserve — the
+		// connection is dead, so its wait must not linger until WAL progress
+		// or shutdown (cold path: the runtimes lookup is fine here).
+		if rt, ok := s.runtimes.Load(conn); ok {
+			rt.(*connRuntime).leaseCancel()
+		}
 	}
 	return err
 }

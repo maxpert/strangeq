@@ -87,6 +87,31 @@ type MetricsCollector interface {
 	RecordMessageDropped(queueName, reason string)
 }
 
+// LeaseMetrics is an OPTIONAL extension of MetricsCollector (WS-I Phase B):
+// the publish-lease subsystem type-asserts for it, so custom collectors keep
+// working unchanged. Implemented by metrics.Collector. Wait counts are
+// diagnostic only (never a gate); the leaked counter must stay zero.
+type LeaseMetrics interface {
+	// RecordPublishLeaseWait observes one completed blocking lease wait.
+	RecordPublishLeaseWait(seconds float64)
+	// RecordPublishLeaseOversized counts an oversized (>G) lease grant.
+	RecordPublishLeaseOversized()
+	// RecordPublishLeaseOverbudgetClose counts a 506 lease-budget close.
+	RecordPublishLeaseOverbudgetClose()
+	// RecordPublishLeaseBodyStallClose counts a leased-body-stall close.
+	RecordPublishLeaseBodyStallClose()
+	// RecordPublishLeaseLeaked counts a lease recovered by PutPendingMessage.
+	RecordPublishLeaseLeaked()
+	// UpdatePublishLeaseGauges publishes the current lease gauges.
+	UpdatePublishLeaseGauges(usedBytes, budgetBytes int64, waiters int)
+}
+
+// leaseMetrics returns the MetricsCollector as a LeaseMetrics, or nil.
+func (s *Server) leaseMetrics() LeaseMetrics {
+	lm, _ := s.MetricsCollector.(LeaseMetrics)
+	return lm
+}
+
 // NoOpMetricsCollector is a metrics collector that does nothing
 type NoOpMetricsCollector struct{}
 

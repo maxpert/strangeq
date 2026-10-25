@@ -66,6 +66,13 @@ func (s *Server) shutdown(ctx context.Context) error {
 		s.Log.Warn("shutdown: listener close error (continuing)", zap.Error(err))
 	}
 
+	// WS-I: close the publish-lease limiter so any reader still parked in a
+	// blocking Reserve fails with ErrLimiterClosed (hb==0 connections have no
+	// heartbeat writer to detect a wedged peer; this is their bounded wait).
+	// Outstanding leases — including broker-held onReleased callbacks — still
+	// release normally on WAL completion.
+	s.publishLimiter().Close()
+
 	// 2. Ask every connection to close, one goroutine per connection.
 	s.Mutex.RLock()
 	conns := make([]*protocol.Connection, 0, len(s.Connections))

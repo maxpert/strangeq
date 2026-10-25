@@ -35,6 +35,9 @@ func DefaultConfig() *AMQPConfig {
 			ReaderOverflowFlowBytes:    8 << 20,  // 8 MiB: assert channel.flow(false)
 			ReaderOverflowHardCapBytes: 64 << 20, // 64 MiB: close the connection
 			ReaderBackpressureProbeMS:  5,        // 5 ms reader-backpressure probe (SQ-13)
+			// WS-I Phase B: 0 = default publish-inflight lease budget
+			// (4 × storage.WALBatchSealBytesDefault = 256 MiB).
+			PublishInflightBudgetBytes: 0,
 		},
 		Storage: interfaces.StorageConfig{
 			Path: "./data",
@@ -207,6 +210,12 @@ func (c *AMQPConfig) Validate() error {
 
 	if c.Network.ReaderBackpressureProbeMS < 0 {
 		return fmt.Errorf("reader backpressure probe interval must be non-negative: %d ms", c.Network.ReaderBackpressureProbeMS)
+	}
+
+	// WS-I Phase B: the publish-inflight lease budget is -1 (disabled), 0
+	// (default 256 MiB), or an explicit budget of at least 1 MiB.
+	if v := c.Network.PublishInflightBudgetBytes; v < -1 || (v > 0 && v < 1<<20) {
+		return fmt.Errorf("publish inflight budget must be -1 (disabled), 0 (default), or >= 1 MiB: %d", v)
 	}
 
 	// Validate storage configuration

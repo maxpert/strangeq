@@ -124,23 +124,31 @@ type Server struct {
 	generateConsumerTag func() string
 
 	// --- WS-B (append-only; see specs/WS-B-server-safety.md) ---
-	pendingHandshakes            atomic.Int64       // sockets accepted but not yet past connection.open-ok
-	headerTimeoutOverride        time.Duration      // tests; 0 → protocolHeaderTimeout
-	handshakeTimeoutOverride     time.Duration      // tests; 0 → handshakeTimeout
-	pendingLimitOverride         int64              // tests; 0 → max(64, MaxConnections/4)
-	writeTimeoutOverride         time.Duration      // tests; 0 → defaultWriteTimeout
-	closeOKTimeoutOverride       time.Duration      // tests; 0 → connectionCloseOKTimeout
-	frameQueueByteBudgetOverride int64              // tests; 0 → defaultFrameQueueByteBudget
-	runtimes                     sync.Map           // *protocol.Connection → *connRuntime
-	panics                       atomic.Int64       // exposed via PanicCount()
-	storage                      interfaces.Storage // retained from Build (§11.4)
-	ownsStorage                  bool               // builder created it (not WithStorage)
-	ownsBroker                   bool               // builder created the StorageBroker (not WithUnifiedBroker)
-	connWG                       sync.WaitGroup     // one per handleConnection (dispatchAccepted Adds)
-	shutdownOnce                 sync.Once
-	shutdownErr                  error
-	storageClosed                atomic.Bool           // set after storage.Close returns (tests/health)
-	onConnTornDown               func(rt *connRuntime) // tests only; nil in production (cold path, §13)
+	pendingHandshakes            atomic.Int64  // sockets accepted but not yet past connection.open-ok
+	headerTimeoutOverride        time.Duration // tests; 0 → protocolHeaderTimeout
+	handshakeTimeoutOverride     time.Duration // tests; 0 → handshakeTimeout
+	pendingLimitOverride         int64         // tests; 0 → max(64, MaxConnections/4)
+	writeTimeoutOverride         time.Duration // tests; 0 → defaultWriteTimeout
+	closeOKTimeoutOverride       time.Duration // tests; 0 → connectionCloseOKTimeout
+	frameQueueByteBudgetOverride int64         // tests; 0 → defaultFrameQueueByteBudget
+
+	// --- WS-I Phase B: header-time fair publish lease (append-only) ---
+	limiterStepHook func(step string) // tests only; nil in production (per-step observation)
+	leaseCreated    *atomic.Int64     // tests only; nil in production (grant counter)
+	leaseReleased   *atomic.Int64     // tests only; nil in production (release counter)
+	limiterOnce     sync.Once         // lazily builds limiter (Build or first publish)
+	limiter         *PublishLimiter   // the global publish-inflight lease (G)
+
+	runtimes       sync.Map           // *protocol.Connection → *connRuntime
+	panics         atomic.Int64       // exposed via PanicCount()
+	storage        interfaces.Storage // retained from Build (§11.4)
+	ownsStorage    bool               // builder created it (not WithStorage)
+	ownsBroker     bool               // builder created the StorageBroker (not WithUnifiedBroker)
+	connWG         sync.WaitGroup     // one per handleConnection (dispatchAccepted Adds)
+	shutdownOnce   sync.Once
+	shutdownErr    error
+	storageClosed  atomic.Bool           // set after storage.Close returns (tests/health)
+	onConnTornDown func(rt *connRuntime) // tests only; nil in production (cold path, §13)
 }
 
 // markUnsafeRecovery records that this process booted with --unsafe-recovery
@@ -506,6 +514,22 @@ func (s *Server) cleanupConnection(connection *protocol.Connection) {
 	delete(s.Connections, connection.ID)
 	s.Mutex.Unlock()
 
+	// WS-I Phase B teardown: release every publish lease this connection still
+	// owns — header leases queued for the processor, the in-flight header
+	// lease, and leases held by half-received publishes. (Broker-owned
+	// onReleased callbacks release independently on WAL completion, even
+	// though the connection is gone.) The reader and processor have already
+	// exited, so this cannot race them.
+	for _, le := range connection.LeaseFIFO.Drain() {
+		if le != nil {
+			le.Release()
+		}
+	}
+	releaseHeaderLease(connection)
+	for _, pm := range connection.PendingMessages {
+		takeLease(pm)()
+	}
+
 	if s.MetricsCollector != nil {
 		s.MetricsCollector.RecordConnectionClosed()
 	}
@@ -739,6 +763,7 @@ func (s *Server) processConnectionFrames(conn *protocol.Connection) {
 		t.Stop()
 	}
 	_ = conn.Conn.Close()
+	rt.leaseCancel() // WS-I: unblock a reader parked in a lease Reserve
 
 	// 4. Signal shutdown to every Done-select (reader hand-offs, flow sender,
 	//    heartbeat, confirm flusher, alarm/depth parks). This also unblocks
@@ -874,6 +899,12 @@ func (s *Server) readFrames(rt *connRuntime, done chan struct{}) {
 	// than grow memory without bound.
 	var pending []*protocol.Frame
 	var pendingBytes int64
+	// owed tracks leased content headers whose declared body bytes have not
+	// all been read yet (WS-I Phase B §B.3a): channel → remaining bytes +
+	// last body progress. While non-empty, the reader never blocks on the
+	// limiter (TryReserve or close), the alarm/depth parks are deferred, and
+	// the read deadline is min(hbDeadline, oldest(lastProgress)+writeTimeout).
+	owed := make(map[uint16]*owedBody)
 	// deadlineActive tracks whether a read deadline is currently set on the
 	// socket. Post-handshake the deadline is cleared, so it starts false. It only
 	// matters on hb==0 connections, where it lets us clear a stale SQ-12
@@ -1063,7 +1094,7 @@ func (s *Server) readFrames(rt *connRuntime, done chan struct{}) {
 		// The HasPublished load is short-circuited behind alarmState, so it adds no
 		// cost on the unset hot path.
 		probing := false
-		if s.alarmState.Load() != 0 && conn.HasPublished.Load() {
+		if len(owed) == 0 && s.alarmState.Load() != 0 && conn.HasPublished.Load() {
 			probing = s.parkReaderWhileAlarmed(conn)
 			// The connection may have torn down while we were parked.
 			select {
@@ -1081,7 +1112,7 @@ func (s *Server) readFrames(rt *connRuntime, done chan struct{}) {
 		// confirm tag by parking the processor mid-publish. One atomic load per
 		// iteration when unset (the common case). Skipped while burst-draining (the
 		// liveness teardown drain runs full-speed until RX empties, then re-parks).
-		if !depthDraining && conn.DepthBackpressure.Load() {
+		if !depthDraining && len(owed) == 0 && conn.DepthBackpressure.Load() {
 			if s.parkReaderWhileDepthBackpressured(conn) {
 				depthDraining = true // liveness fired: burst-drain the buffered window
 			}
@@ -1096,7 +1127,14 @@ func (s *Server) readFrames(rt *connRuntime, done chan struct{}) {
 		// toward the heartbeat-missed window (heartbeat false-close bug). hb is
 		// fixed for the connection's lifetime, so the deadlineActive bookkeeping
 		// only ever clears a stale liveness-probe deadline on an hb==0 connection.
+		//
+		// WS-I Phase B: while a leased body is owed, the deadline is the MINIMUM
+		// of the otherwise-computed deadline and oldest(lastProgress) +
+		// writeTimeout — heartbeats and frames on other channels do not extend
+		// it, so a client that stalls a leased body is closed even while keeping
+		// the connection otherwise busy.
 		hb := conn.HeartbeatSec.Load()
+		var deadline time.Time
 		switch {
 		case depthDraining:
 			// Option A teardown burst-drain: read available RX with a SHORT deadline
@@ -1104,17 +1142,14 @@ func (s *Server) readFrames(rt *connRuntime, done chan struct{}) {
 			// would block because RX is empty times out quickly and we re-park,
 			// instead of blocking here for up to 2*hb. Each successful read admits a
 			// buffered publish (→ confirmed); the timeout below exits the drain.
-			conn.Conn.SetReadDeadline(time.Now().Add(s.readerBackpressureProbeInterval()))
-			deadlineActive = true
+			deadline = time.Now().Add(s.readerBackpressureProbeInterval())
 		case hb > 0:
-			conn.Conn.SetReadDeadline(time.Now().Add(time.Duration(2*hb) * time.Second))
-			deadlineActive = true
+			deadline = time.Now().Add(time.Duration(2*hb) * time.Second)
 		case probing:
 			// Heartbeats disabled but we broke out of the alarm park to probe:
 			// bound the read so a quiet-but-alive peer does not wedge us; a dead
 			// peer surfaces as a read error (heartbeat-disabled liveness bug).
-			conn.Conn.SetReadDeadline(time.Now().Add(s.alarmParkProbeInterval()))
-			deadlineActive = true
+			deadline = time.Now().Add(s.alarmParkProbeInterval())
 		case backpressureProbed:
 			// Heartbeats disabled but we broke out of the backpressure hand-off to
 			// read one frame (SQ-13): bound the read so a quiet-but-alive backlogged
@@ -1123,7 +1158,16 @@ func (s *Server) readFrames(rt *connRuntime, done chan struct{}) {
 			// pending frames wait — and so a wedged peer with conn.Done still open
 			// is not read indefinitely. A dead/half-closed peer surfaces via EOF or
 			// a TCP-keepalive error (both non-timeout) and closes below.
-			conn.Conn.SetReadDeadline(time.Now().Add(s.readerBackpressureProbeInterval()))
+			deadline = time.Now().Add(s.readerBackpressureProbeInterval())
+		}
+		if len(owed) > 0 {
+			if od := oldestOwedProgress(owed).Add(s.writeTimeout()); deadline.IsZero() || od.Before(deadline) {
+				deadline = od
+			}
+		}
+		switch {
+		case !deadline.IsZero():
+			conn.Conn.SetReadDeadline(deadline)
 			deadlineActive = true
 		case deadlineActive:
 			// hb==0 and not probing: clear the stale probe deadline exactly once
@@ -1147,6 +1191,20 @@ func (s *Server) readFrames(rt *connRuntime, done chan struct{}) {
 					// hb>0 close below): a depth-drain timeout is expected, not a death.
 					depthDraining = false
 					continue
+				}
+				if len(owed) > 0 && !time.Now().Before(oldestOwedProgress(owed).Add(s.writeTimeout())) {
+					// WS-I Phase B: a leased body made no progress within
+					// writeTimeout of its last body byte. This is a body stall,
+					// NOT a heartbeat death: close the connection; teardown
+					// releases every lease it owns.
+					if lm := s.leaseMetrics(); lm != nil {
+						lm.RecordPublishLeaseBodyStallClose()
+					}
+					s.Log.Warn("leased publish body stalled; closing connection",
+						zap.String("connection_id", conn.ID),
+						zap.Int("owed_channels", len(owed)))
+					conn.Closed.Store(true)
+					return
 				}
 				if hb > 0 {
 					s.Log.Info("heartbeat missed, closing dead connection",
@@ -1209,6 +1267,17 @@ func (s *Server) readFrames(rt *connRuntime, done chan struct{}) {
 				return
 			}
 			continue
+		}
+
+		// WS-I Phase B: header-time lease. A content-header frame reserves its
+		// declared body bytes (+framing) BEFORE any body frame is read and
+		// before the confirm tag exists; a body frame records owed progress.
+		if frame.Type == protocol.FrameHeader {
+			if !s.leaseForHeaderFrame(rt, frame, owed) {
+				return
+			}
+		} else if frame.Type == protocol.FrameBody {
+			s.trackBodyProgress(frame, owed)
 		}
 
 		// Enqueue for processFrames. Try a non-blocking direct hand-off only when
@@ -1289,6 +1358,14 @@ func (s *Server) processFrames(rt *connRuntime, done chan struct{}) {
 				continue
 			}
 
+			// WS-I Phase B: pair the lease the reader reserved for this header
+			// BEFORE any gate, so every discard arm below can release it. FIFO
+			// order equals frame order (the reader's pending buffer and
+			// FrameQueue both preserve read order).
+			if frame.Type == protocol.FrameHeader {
+				conn.HeaderLease = conn.LeaseFIFO.Pop()
+			}
+
 			// Capture the error-classification context before processFrame: it
 			// may transfer frame ownership (AckQueue hand-off) or we pool it
 			// right after — either way the next owner can overwrite the frame
@@ -1309,6 +1386,7 @@ func (s *Server) processFrames(rt *connRuntime, done chan struct{}) {
 					fc.classID, fc.methodID)
 				s.releaseFrameBudget(conn, cost)
 				protocol.PutFrame(frame)
+				releaseHeaderLease(conn) // WS-I: discard arm
 				if s.handleFrameError(rt, fc, err, true) {
 					return
 				}
@@ -1321,6 +1399,7 @@ func (s *Server) processFrames(rt *connRuntime, done chan struct{}) {
 				if s.discardWhileClosing(rt, frame) {
 					s.releaseFrameBudget(conn, cost)
 					protocol.PutFrame(frame)
+					releaseHeaderLease(conn) // WS-I: discard arm
 					continue
 				}
 			}
@@ -1330,6 +1409,9 @@ func (s *Server) processFrames(rt *connRuntime, done chan struct{}) {
 			if pooled {
 				protocol.PutFrame(frame)
 			}
+			// WS-I: the header path transfers a live lease into the pending
+			// message (this is then a no-op); an error arm leaves it here.
+			releaseHeaderLease(conn)
 			if err != nil {
 				if s.handleFrameError(rt, fc, err, true) {
 					return

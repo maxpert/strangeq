@@ -117,6 +117,17 @@ type Collector struct {
 
 	// BuildInfo is the constant-1 build identity gauge.
 	BuildInfo *prometheus.GaugeVec
+
+	// WS-I Phase B publish-lease metrics (amqp_publish_lease_*).
+	PublishLeaseUsedBytes             prometheus.Gauge
+	PublishLeaseBudgetBytes           prometheus.Gauge
+	PublishLeaseWaiters               prometheus.Gauge
+	PublishLeaseWaitsTotal            prometheus.Counter
+	PublishLeaseOversizedTotal        prometheus.Counter
+	PublishLeaseOverbudgetClosesTotal prometheus.Counter
+	PublishLeaseBodyStallClosesTotal  prometheus.Counter
+	PublishLeaseLeakedTotal           prometheus.Counter
+	PublishLeaseWaitSeconds           prometheus.Histogram
 }
 
 // NewCollector creates a new metrics collector with all Prometheus metrics
@@ -454,7 +465,79 @@ func NewCollector(namespace string) *Collector {
 			Name:      "build_info",
 			Help:      "Build identity; the value is always 1",
 		}, []string{"version", "commit", "go_version"}),
+
+		PublishLeaseUsedBytes: promauto.NewGauge(prometheus.GaugeOpts{
+			Namespace: namespace,
+			Name:      "publish_lease_used_bytes",
+			Help:      "Declared publish body bytes (+framing) currently leased (WS-I)",
+		}),
+		PublishLeaseBudgetBytes: promauto.NewGauge(prometheus.GaugeOpts{
+			Namespace: namespace,
+			Name:      "publish_lease_budget_bytes",
+			Help:      "Publish-inflight lease budget G (WS-I)",
+		}),
+		PublishLeaseWaiters: promauto.NewGauge(prometheus.GaugeOpts{
+			Namespace: namespace,
+			Name:      "publish_lease_waiters",
+			Help:      "Connections currently queued for a publish lease (WS-I)",
+		}),
+		PublishLeaseWaitsTotal: promauto.NewCounter(prometheus.CounterOpts{
+			Namespace: namespace,
+			Name:      "publish_lease_waits_total",
+			Help:      "Blocking publish-lease waits (WS-I; diagnostic, never gated)",
+		}),
+		PublishLeaseOversizedTotal: promauto.NewCounter(prometheus.CounterOpts{
+			Namespace: namespace,
+			Name:      "publish_lease_oversized_total",
+			Help:      "Oversized (>G) publish leases granted at used==0 (WS-I)",
+		}),
+		PublishLeaseOverbudgetClosesTotal: promauto.NewCounter(prometheus.CounterOpts{
+			Namespace: namespace,
+			Name:      "publish_lease_overbudget_closes_total",
+			Help:      "Connections closed with 506 because a nested header could not be leased (WS-I)",
+		}),
+		PublishLeaseBodyStallClosesTotal: promauto.NewCounter(prometheus.CounterOpts{
+			Namespace: namespace,
+			Name:      "publish_lease_body_stall_closes_total",
+			Help:      "Connections closed for no leased-body progress within writeTimeout (WS-I)",
+		}),
+		PublishLeaseLeakedTotal: promauto.NewCounter(prometheus.CounterOpts{
+			Namespace: namespace,
+			Name:      "publish_lease_leaked_total",
+			Help:      "Publish leases recovered by PutPendingMessage instead of a proper release (WS-I; must stay 0)",
+		}),
+		PublishLeaseWaitSeconds: promauto.NewHistogram(prometheus.HistogramOpts{
+			Namespace: namespace,
+			Name:      "publish_lease_wait_seconds",
+			Help:      "Time spent blocked waiting for a publish lease (WS-I)",
+			Buckets:   prometheus.ExponentialBuckets(0.0001, 10, 7),
+		}),
 	}
+}
+
+// RecordPublishLeaseWait observes one completed blocking lease wait.
+func (c *Collector) RecordPublishLeaseWait(seconds float64) {
+	c.PublishLeaseWaitsTotal.Inc()
+	c.PublishLeaseWaitSeconds.Observe(seconds)
+}
+
+// RecordPublishLeaseOversized counts one oversized (>G) lease grant.
+func (c *Collector) RecordPublishLeaseOversized() { c.PublishLeaseOversizedTotal.Inc() }
+
+// RecordPublishLeaseOverbudgetClose counts one 506 lease-budget close.
+func (c *Collector) RecordPublishLeaseOverbudgetClose() { c.PublishLeaseOverbudgetClosesTotal.Inc() }
+
+// RecordPublishLeaseBodyStallClose counts one leased-body-stall close.
+func (c *Collector) RecordPublishLeaseBodyStallClose() { c.PublishLeaseBodyStallClosesTotal.Inc() }
+
+// RecordPublishLeaseLeaked counts one lease recovered by PutPendingMessage.
+func (c *Collector) RecordPublishLeaseLeaked() { c.PublishLeaseLeakedTotal.Inc() }
+
+// UpdatePublishLeaseGauges publishes the current lease gauges.
+func (c *Collector) UpdatePublishLeaseGauges(usedBytes, budgetBytes int64, waiters int) {
+	c.PublishLeaseUsedBytes.Set(float64(usedBytes))
+	c.PublishLeaseBudgetBytes.Set(float64(budgetBytes))
+	c.PublishLeaseWaiters.Set(float64(waiters))
 }
 
 // RecordAuthFailure increments the failed-authentication counter for reason.

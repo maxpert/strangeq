@@ -67,6 +67,12 @@ network:
   # TCP write buffer size (bytes), default 256 KiB
   writebuffersize: 262144
 
+  # Publish-inflight lease budget (bytes): bounds DECLARED publish body bytes
+  # (plus fixed framing) in flight between the content-header read and
+  # durability/return/teardown (WS-I). 0 = default (4 x WAL batch seal =
+  # 256 MiB); -1 = disabled; any other value must be >= 1 MiB.
+  publishinflightbudgetbytes: 0
+
 # ============================================================================
 # Storage Configuration
 # ============================================================================

@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -44,6 +45,13 @@ type connRuntime struct {
 	closingCount    atomic.Int32 // fast-path gate: 0 ⇒ no channel is closing
 
 	liveGoroutines atomic.Int32 // test observability (§13)
+
+	// leaseCtx bounds a reader's blocking publish-lease Reserve (WS-I Phase
+	// B): leaseCancel is called by writeLocked's error path, by connection
+	// teardown step 3, and by finishConnection, so a dead connection never
+	// leaves its reader parked in the limiter.
+	leaseCtx    context.Context
+	leaseCancel context.CancelFunc
 }
 
 func (rt *connRuntime) releaseHandshakeSlot() {
@@ -77,6 +85,7 @@ func (rt *connRuntime) clearChannelClosing(id uint16) {
 // newConnRuntime creates and registers the runtime for c (handleConnection path).
 func (s *Server) newConnRuntime(c *protocol.Connection, slot *handshakeSlot) *connRuntime {
 	rt := &connRuntime{conn: c, slot: slot, torndown: make(chan struct{})}
+	rt.leaseCtx, rt.leaseCancel = context.WithCancel(context.Background())
 	s.runtimes.Store(c, rt)
 	return rt
 }
@@ -89,6 +98,12 @@ func (s *Server) runtimeFor(c *protocol.Connection) *connRuntime {
 	if rt, ok := s.runtimes.Load(c); ok {
 		return rt.(*connRuntime)
 	}
-	rt, _ := s.runtimes.LoadOrStore(c, &connRuntime{conn: c, torndown: make(chan struct{})})
+	rt, _ := s.runtimes.LoadOrStore(c, newBareConnRuntime(c))
 	return rt.(*connRuntime)
+}
+
+func newBareConnRuntime(c *protocol.Connection) *connRuntime {
+	rt := &connRuntime{conn: c, torndown: make(chan struct{})}
+	rt.leaseCtx, rt.leaseCancel = context.WithCancel(context.Background())
+	return rt
 }

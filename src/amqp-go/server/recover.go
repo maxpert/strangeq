@@ -59,6 +59,7 @@ func (s *Server) recoverConnection(nc net.Conn, where string) {
 // observability hook (all per-connection goroutines already joined), then
 // cleanupConnection behind its own recover, then runtime bookkeeping.
 func (s *Server) finishConnection(rt *connRuntime) {
+	rt.leaseCancel() // WS-I: unblock a reader parked in a lease Reserve (idempotent)
 	if s.onConnTornDown != nil {
 		s.onConnTornDown(rt)
 	}
