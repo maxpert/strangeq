@@ -2701,7 +2701,57 @@ func (b *StorageBroker) ValidatePublishTarget(exchangeName string) error {
 	return nil
 }
 
+// PublishMessageAdmitted is the NON-BLOCKING transient publish admission path
+// (WS-I review): it routes and checks every target queue's StopCh + high-water
+// mark BEFORE storing anything. If any target is at/over HWM, NOTHING is
+// stored and that target's gate is returned for reader-level backpressure; the
+// caller retries after the queue drains. When every target is admitted, the
+// publish stores synchronously (never WaitForCapacity: every target was under
+// HWM at admission; a concurrent publisher crossing HWM in the race window is
+// the same bounded overshoot the async durable path allows).
+func (b *StorageBroker) PublishMessageAdmitted(exchangeName, routingKey string, message *protocol.Message) (protocol.DepthGate, error) {
+	exchange, err := b.storage.GetExchange(exchangeName)
+	if err != nil {
+		if errors.Is(err, interfaces.ErrExchangeNotFound) {
+			return nil, errNoExchange(exchangeName)
+		}
+		return nil, err
+	}
+	if exchange.Internal {
+		return nil, semErr("cannot publish to internal "+exchangeRS(exchangeName), ErrExchangeInternal)
+	}
+
+	rs := acquireRouteScratch()
+	defer releaseRouteScratch(rs)
+	if err := b.routeMessage(exchange, routingKey, message, rs); err != nil {
+		return nil, err
+	}
+	if len(rs.queues) == 0 {
+		if message.Mandatory {
+			return nil, ErrNoRoute
+		}
+		return nil, nil
+	}
+
+	for _, queueName := range rs.queues {
+		queueState := b.getOrCreateQueueState(queueName)
+		select {
+		case <-queueState.StopCh():
+			return nil, fmt.Errorf("queue '%s': %w", queueName, ErrQueueClosed)
+		default:
+		}
+		if queueState.AtHighWaterMark() {
+			return queueState, nil // NOT admitted: nothing stored
+		}
+	}
+	return nil, b.publishMessage(exchangeName, routingKey, message, false)
+}
+
 func (b *StorageBroker) PublishMessage(exchangeName, routingKey string, message *protocol.Message) error {
+	return b.publishMessage(exchangeName, routingKey, message, true)
+}
+
+func (b *StorageBroker) publishMessage(exchangeName, routingKey string, message *protocol.Message, waitForCapacity bool) error {
 	// Get exchange (lock-free)
 	exchange, err := b.storage.GetExchange(exchangeName)
 	if err != nil {
@@ -2761,8 +2811,18 @@ func (b *StorageBroker) PublishMessage(exchangeName, routingKey string, message 
 	for i, queueName := range targetQueues {
 		queueState := b.getOrCreateQueueState(queueName)
 
-		if !queueState.WaitForCapacity(queueState.StopCh()) {
-			return fmt.Errorf("queue '%s' closed during backpressure wait: %w", queueName, ErrQueueClosed)
+		if waitForCapacity {
+			if !queueState.WaitForCapacity(queueState.StopCh()) {
+				return fmt.Errorf("queue '%s' closed during backpressure wait: %w", queueName, ErrQueueClosed)
+			}
+		} else {
+			// Non-blocking admission (PublishMessageAdmitted): the HWM check
+			// already ran before ANY store; only teardown is re-checked here.
+			select {
+			case <-queueState.StopCh():
+				return fmt.Errorf("queue '%s' closed during backpressure wait: %w", queueName, ErrQueueClosed)
+			default:
+			}
 		}
 
 		// SQ-11 max-length: one policy load per target queue (nil => no policy

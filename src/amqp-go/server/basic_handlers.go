@@ -493,7 +493,51 @@ func (s *Server) processCompleteMessage(conn *protocol.Connection, channelID uin
 	var err error
 	var durableInflight bool
 	var backpressure protocol.DepthGate
-	if confirmTag > 0 || message.DeliveryMode == 2 {
+	if message.DeliveryMode != 2 {
+		// TRANSIENT publish (confirm mode or not). WS-I: two-party retention
+		// (the lease releases when the broker part AND this function's wire
+		// writes are both done); and with a NonBlockingPublisher broker the
+		// publish is never parked behind WaitForCapacity HOLDING its lease.
+		r := release
+		release = noopRelease
+		jr := newJoinRelease(r)
+		defer jr.serverDone()
+		if np, ok := s.Broker.(NonBlockingPublisher); ok {
+			for {
+				gate, perr := np.PublishMessageAdmitted(message.Exchange, message.RoutingKey, message)
+				if perr != nil || gate == nil {
+					jr.brokerDone()
+					err = perr
+					break
+				}
+				// NOT admitted (a target queue is at/over HWM): release the
+				// lease BEFORE waiting — never hold it across a queue-capacity
+				// wait. The bytes behind the wait are transient
+				// queue-residency, bounded separately (§B.1: not covered by
+				// the lease), and the reader depth gate paces the producer.
+				jr.releaseNow()
+				if !conn.DepthBackpressure.Load() && !conn.HasActiveConsumer() {
+					conn.SetDepthGate(gate)
+				}
+				if !s.waitForGateDrain(conn, gate) {
+					// Teardown mid-wait: the publish is dropped (it was never
+					// confirmed, so the client must republish).
+					return nil
+				}
+			}
+		} else {
+			// A custom broker without non-blocking admission (only reachable
+			// with the lease disabled — Build rejects it otherwise).
+			err = s.Broker.PublishMessage(message.Exchange, message.RoutingKey, message)
+			jr.brokerDone()
+		}
+	} else {
+		// DURABLE publish: the broker owns the lease from here on (onReleased
+		// fires exactly once after all accepted copies complete, or
+		// synchronously on a no-route/error return — even after the
+		// connection is gone). TWO-PARTY retention: the lease releases only
+		// when the broker AND this function's wire writes (basic.return /
+		// nack / confirm) are both done.
 		var onDurable func(error)
 		if confirmTag > 0 {
 			cc := confirmCh
@@ -508,19 +552,11 @@ func (s *Server) processCompleteMessage(conn *protocol.Connection, channelID uin
 				}
 			}
 		}
-		// WS-I: the broker owns the lease from here on (onReleased fires
-		// exactly once after all accepted copies complete, or synchronously on
-		// a transient/no-route/error return — even after the connection is
-		// gone).
 		r := release
 		release = noopRelease
-		durableInflight, backpressure, err = s.Broker.PublishMessageAsyncConfirm(message.Exchange, message.RoutingKey, message, onDurable, r)
-	} else {
-		// WS-I: transient synchronous publish — release when it returns.
-		r := release
-		release = noopRelease
-		err = s.Broker.PublishMessage(message.Exchange, message.RoutingKey, message)
-		r()
+		jr := newJoinRelease(r)
+		defer jr.serverDone()
+		durableInflight, backpressure, err = s.Broker.PublishMessageAsyncConfirm(message.Exchange, message.RoutingKey, message, onDurable, jr.brokerDone)
 	}
 
 	// Iteration 2 (option A): arm queue-depth reader backpressure. The async

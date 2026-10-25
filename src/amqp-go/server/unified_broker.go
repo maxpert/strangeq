@@ -102,3 +102,21 @@ type UnifiedBroker interface {
 
 	UpdateConsumerPrefetch(consumerID string, prefetchCount uint16)
 }
+
+// NonBlockingPublisher is an OPTIONAL UnifiedBroker extension (WS-I review):
+// the production broker implements it. PublishMessageAdmitted routes a
+// transient publish and, BEFORE storing anything, checks every target queue's
+// StopCh + high-water mark: if any target is at/over HWM, NOTHING is stored
+// and that target's gate is returned (the caller applies reader backpressure
+// and retries after the queue drains — the frame processor NEVER parks in
+// WaitForCapacity, so ACK diversion on a mixed connection stays live). When
+// every target is admitted, the publish stores synchronously (bounded
+// overshoot only, exactly as the async durable path).
+//
+// Build REJECTS a custom broker lacking this interface when the
+// publish-inflight lease is enabled (PublishInflightBudgetBytes != -1): with
+// the lease active, a parking transient publish would hold leased bytes
+// behind queue backpressure, defeating the bound.
+type NonBlockingPublisher interface {
+	PublishMessageAdmitted(exchangeName, routingKey string, message *protocol.Message) (backpressure protocol.DepthGate, err error)
+}

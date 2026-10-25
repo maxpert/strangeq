@@ -317,6 +317,16 @@ func (p *panicBroker) DeclareQueue(name string, durable, autoDelete, exclusive b
 	return p.UnifiedBroker.DeclareQueue(name, durable, autoDelete, exclusive, arguments)
 }
 
+// PublishMessageAdmitted forwards non-blocking admission (WS-I) to the
+// wrapped broker when it supports it, so Build's lease-enabled broker check
+// passes for panic-injection test servers.
+func (p *panicBroker) PublishMessageAdmitted(exchangeName, routingKey string, message *protocol.Message) (protocol.DepthGate, error) {
+	if np, ok := p.UnifiedBroker.(NonBlockingPublisher); ok {
+		return np.PublishMessageAdmitted(exchangeName, routingKey, message)
+	}
+	return nil, p.UnifiedBroker.PublishMessage(exchangeName, routingKey, message)
+}
+
 func (p *panicBroker) AcknowledgeMessage(consumerID string, deliveryTag uint64, multiple bool) error {
 	if p.ackPanic.Load() {
 		panic("panicBroker: AcknowledgeMessage")

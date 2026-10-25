@@ -358,6 +358,17 @@ func (b *ServerBuilder) Build() (*Server, error) {
 	// Create and attach lifecycle manager
 	server.Lifecycle = NewLifecycleManager(server, b.config)
 
+	// WS-I Phase B: with the publish-inflight lease enabled, the broker MUST
+	// support non-blocking transient admission — otherwise a transient
+	// publish parked in WaitForCapacity would hold leased bytes behind queue
+	// backpressure, defeating the bound. (PublishInflightBudgetBytes = -1
+	// disables the lease and this requirement.)
+	if b.config.PublishInflightBudget() > 0 {
+		if _, ok := unifiedBroker.(NonBlockingPublisher); !ok {
+			return nil, fmt.Errorf("publish inflight budget is enabled but the configured broker lacks NonBlockingPublisher (PublishMessageAdmitted); set network.publishinflightbudgetbytes: -1 to disable the lease")
+		}
+	}
+
 	// WS-I Phase B: build the publish-inflight lease limiter (it is otherwise
 	// built lazily on the first publish — building it here wires the metrics
 	// and the budget gauge at startup).

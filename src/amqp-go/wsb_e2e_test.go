@@ -368,6 +368,12 @@ func (p *rootPanicBroker) DeclareQueue(name string, durable, autoDelete, exclusi
 	return p.UnifiedBroker.DeclareQueue(name, durable, autoDelete, exclusive, arguments)
 }
 
+// PublishMessageAdmitted forwards non-blocking admission (WS-I) so Build's
+// lease-enabled broker check passes for this panic-injection server.
+func (p *rootPanicBroker) PublishMessageAdmitted(exchangeName, routingKey string, message *protocol.Message) (protocol.DepthGate, error) {
+	return p.UnifiedBroker.(server.NonBlockingPublisher).PublishMessageAdmitted(exchangeName, routingKey, message)
+}
+
 // TestPanicRecoveryWSB: a panic in a connection goroutine is recovered — the
 // connection dies, PanicCount increments, and the broker keeps serving.
 func TestPanicRecoveryWSB(t *testing.T) {

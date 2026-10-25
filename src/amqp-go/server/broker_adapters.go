@@ -62,6 +62,12 @@ func (a *StorageBrokerAdapter) PublishMessage(exchangeName, routingKey string, m
 	return a.broker.PublishMessage(exchangeName, routingKey, message)
 }
 
+// PublishMessageAdmitted routes the transient publish through the broker's
+// non-blocking admission path. See NonBlockingPublisher.
+func (a *StorageBrokerAdapter) PublishMessageAdmitted(exchangeName, routingKey string, message *protocol.Message) (protocol.DepthGate, error) {
+	return a.broker.PublishMessageAdmitted(exchangeName, routingKey, message)
+}
+
 // PublishMessageAsyncConfirm routes a durable/publisher-confirm publish through
 // the broker's async-completion path (deferred visibility + WAL group-commit
 // fsync completion). See UnifiedBroker.PublishMessageAsyncConfirm.

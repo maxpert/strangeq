@@ -82,6 +82,12 @@ type wedgingBroker struct {
 	waiting atomic.Bool
 }
 
+// PublishMessageAdmitted forwards to the wrapped broker so Build's
+// lease-enabled NonBlockingPublisher check passes.
+func (w *wedgingBroker) PublishMessageAdmitted(exchangeName, routingKey string, message *protocol.Message) (protocol.DepthGate, error) {
+	return w.UnifiedBroker.(NonBlockingPublisher).PublishMessageAdmitted(exchangeName, routingKey, message)
+}
+
 func (w *wedgingBroker) PublishMessageAsyncConfirm(exchangeName, routingKey string, message *protocol.Message, onDurable func(error), onReleased func()) (bool, protocol.DepthGate, error) {
 	w.once.Do(func() {
 		w.waiting.Store(true)
@@ -177,6 +183,12 @@ type panicUnregisterBroker struct {
 
 func (p *panicUnregisterBroker) UnregisterConsumer(consumerID string) error {
 	panic("panicUnregisterBroker: UnregisterConsumer")
+}
+
+// PublishMessageAdmitted forwards to the wrapped broker so Build's
+// lease-enabled NonBlockingPublisher check passes.
+func (p *panicUnregisterBroker) PublishMessageAdmitted(exchangeName, routingKey string, message *protocol.Message) (protocol.DepthGate, error) {
+	return p.UnifiedBroker.(NonBlockingPublisher).PublishMessageAdmitted(exchangeName, routingKey, message)
 }
 
 func TestLease_CleanupPanicCannotLeakLeases(t *testing.T) {

@@ -180,6 +180,49 @@ func (rs *readerState) oldestProgress() time.Time {
 	return oldest
 }
 
+// joinRelease is the WS-I two-party publish-lease retention (review item 5):
+// the lease releases only when BOTH the broker part (onReleased — for a
+// durable publish, WAL completion; for a synchronous path, the broker call's
+// return) AND the server part (the deferred completion of
+// processCompleteMessage, covering basic.return/nack/error wire writes) are
+// done. The release fires exactly once; duplicate signals are ignored.
+type joinRelease struct {
+	bits atomic.Int32 // 1 = brokerDone, 2 = serverDone
+	fn   func()
+}
+
+func newJoinRelease(fn func()) *joinRelease { return &joinRelease{fn: fn} }
+
+func (j *joinRelease) bit(b int32) {
+	if j == nil || j.fn == nil {
+		return
+	}
+	for {
+		old := j.bits.Load()
+		if old == 3 {
+			return // already released — duplicate signals ignored
+		}
+		if j.bits.CompareAndSwap(old, old|b) {
+			if old|b == 3 {
+				j.fn()
+			}
+			return
+		}
+	}
+}
+
+// brokerDone marks the broker part complete (wired as onReleased).
+func (j *joinRelease) brokerDone() { j.bit(1) }
+
+// serverDone marks the server part complete (deferred over the publish's
+// return/nack/error wire writes).
+func (j *joinRelease) serverDone() { j.bit(2) }
+
+// releaseNow forces both parts (used when the publish leaves the lease's
+// scope WITHOUT waiting for either party — e.g. a transient publish that
+// waits on queue capacity: no lease is ever held across such a wait).
+func (j *joinRelease) releaseNow() { j.bit(3) }
+
 // takeLease nil-safely transfers the publish lease out of pm: it sets
 // pm.Lease = nil and returns the lease's pre-bound ReleaseFunc, or the shared
 // noopRelease when there was none. A second take returns noopRelease.
@@ -320,6 +363,23 @@ func (s *Server) leaseForHeaderFrame(rt *connRuntime, frame *protocol.Frame, rs 
 		// completes at the header). A disabled limiter skips owed tracking
 		// entirely (the pre-WS-I baseline).
 		rs.addOwed(frame.Channel, bodySize)
+	}
+	return true
+}
+
+// waitForGateDrain waits (processor-side) for a depth gate to drop below the
+// high-water mark, or for the connection to die. Polling on the reader
+// backpressure probe interval; never blocks the reader itself.
+func (s *Server) waitForGateDrain(conn *protocol.Connection, gate protocol.DepthGate) bool {
+	t := time.NewTimer(s.readerBackpressureProbeInterval())
+	defer t.Stop()
+	for gate.AtHighWaterMark() {
+		select {
+		case <-conn.Done:
+			return false
+		case <-t.C:
+			t.Reset(s.readerBackpressureProbeInterval())
+		}
 	}
 	return true
 }
