@@ -65,8 +65,8 @@ func (a *StorageBrokerAdapter) PublishMessage(exchangeName, routingKey string, m
 // PublishMessageAsyncConfirm routes a durable/publisher-confirm publish through
 // the broker's async-completion path (deferred visibility + WAL group-commit
 // fsync completion). See UnifiedBroker.PublishMessageAsyncConfirm.
-func (a *StorageBrokerAdapter) PublishMessageAsyncConfirm(exchangeName, routingKey string, message *protocol.Message, onDurable func(error)) (bool, protocol.DepthGate, error) {
-	return a.broker.PublishMessageAsyncConfirm(exchangeName, routingKey, message, onDurable)
+func (a *StorageBrokerAdapter) PublishMessageAsyncConfirm(exchangeName, routingKey string, message *protocol.Message, onDurable func(error), onReleased func()) (bool, protocol.DepthGate, error) {
+	return a.broker.PublishMessageAsyncConfirm(exchangeName, routingKey, message, onDurable, onReleased)
 }
 
 // PublishMessageTx routes a transactional publish through the atomic storage

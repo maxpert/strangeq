@@ -94,7 +94,7 @@ func TestAsyncRejectPublish_NoOvershoot(t *testing.T) {
 			defer wg.Done()
 			_, _, err := b.PublishMessageAsyncConfirm("", "q",
 				&protocol.Message{Exchange: "", RoutingKey: "q", Body: []byte(fmt.Sprintf("m%d", i)), DeliveryMode: 2},
-				func(error) {})
+				func(error) {}, nil)
 			if err == ErrMaxLengthExceeded {
 				refused.Add(1)
 			} else if err == nil {
@@ -142,7 +142,7 @@ func TestAsyncRejectPublish_Bytes_NoOvershoot(t *testing.T) {
 			defer wg.Done()
 			_, _, err := b.PublishMessageAsyncConfirm("", "qb",
 				&protocol.Message{Exchange: "", RoutingKey: "qb", Body: body, DeliveryMode: 2},
-				func(error) {})
+				func(error) {}, nil)
 			if err == ErrMaxLengthExceeded {
 				refused.Add(1)
 			} else if err == nil {
@@ -176,7 +176,7 @@ func TestRejectPublish_EnqueueFailureReleasesReservation(t *testing.T) {
 	// Fail the first enqueue AFTER admission reserved the slot.
 	gs.failAsync.Store(true)
 	_, _, err := b.PublishMessageAsyncConfirm("", "qe",
-		&protocol.Message{Exchange: "", RoutingKey: "qe", Body: []byte("boom"), DeliveryMode: 2}, nil)
+		&protocol.Message{Exchange: "", RoutingKey: "qe", Body: []byte("boom"), DeliveryMode: 2}, nil, nil)
 	require.Error(t, err, "the injected enqueue error surfaces")
 	gs.failAsync.Store(false)
 
@@ -185,7 +185,7 @@ func TestRejectPublish_EnqueueFailureReleasesReservation(t *testing.T) {
 
 	// The next publish is admitted (the queue is not wedged at the cap).
 	_, _, err = b.PublishMessageAsyncConfirm("", "qe",
-		&protocol.Message{Exchange: "", RoutingKey: "qe", Body: []byte("ok"), DeliveryMode: 2}, func(error) {})
+		&protocol.Message{Exchange: "", RoutingKey: "qe", Body: []byte("ok"), DeliveryMode: 2}, func(error) {}, nil)
 	require.NoError(t, err)
 	gs.releaseAll()
 	require.Eventually(t, func() bool { return qs.WaitingCount() == 1 }, 5*time.Second, time.Millisecond)
@@ -206,10 +206,10 @@ func TestRejectPublish_FrontierOutOfOrder_NoOvershoot(t *testing.T) {
 
 	// Admit t1 and t2 (completions held).
 	_, _, err := b.PublishMessageAsyncConfirm("", "qo",
-		&protocol.Message{Exchange: "", RoutingKey: "qo", Body: []byte("m1"), DeliveryMode: 2}, func(error) {})
+		&protocol.Message{Exchange: "", RoutingKey: "qo", Body: []byte("m1"), DeliveryMode: 2}, func(error) {}, nil)
 	require.NoError(t, err)
 	_, _, err = b.PublishMessageAsyncConfirm("", "qo",
-		&protocol.Message{Exchange: "", RoutingKey: "qo", Body: []byte("m2"), DeliveryMode: 2}, func(error) {})
+		&protocol.Message{Exchange: "", RoutingKey: "qo", Body: []byte("m2"), DeliveryMode: 2}, func(error) {}, nil)
 	require.NoError(t, err)
 	require.Equal(t, 2, gs.heldCount())
 
@@ -223,7 +223,7 @@ func TestRejectPublish_FrontierOutOfOrder_NoOvershoot(t *testing.T) {
 
 	// Third admission must be REFUSED even though WaitingCount()==0.
 	_, _, err = b.PublishMessageAsyncConfirm("", "qo",
-		&protocol.Message{Exchange: "", RoutingKey: "qo", Body: []byte("m3"), DeliveryMode: 2}, func(error) {})
+		&protocol.Message{Exchange: "", RoutingKey: "qo", Body: []byte("m3"), DeliveryMode: 2}, func(error) {}, nil)
 	assert.Equal(t, ErrMaxLengthExceeded, err, "pending reservations survive out-of-order completion")
 
 	// Complete t1: both transfer; a new publish is admitted again.

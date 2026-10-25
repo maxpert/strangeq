@@ -43,7 +43,7 @@ func TestAsyncConfirm_NotVisibleBeforeDurable(t *testing.T) {
 	msg := &protocol.Message{Body: []byte("durable"), RoutingKey: "dq", DeliveryMode: 2}
 	durableInflight, _, perr := b.PublishMessageAsyncConfirm("", "dq", msg, func(error) {
 		fired.Add(1)
-	})
+	}, nil)
 	require.NoError(t, perr)
 	assert.True(t, durableInflight, "a routed durable publish must report durableInflight=true")
 
@@ -101,7 +101,7 @@ func TestAsyncConfirm_TransientIsSynchronousAndVisible(t *testing.T) {
 	msg := &protocol.Message{Body: []byte("transient"), RoutingKey: "tq", DeliveryMode: 1}
 	durableInflight, _, perr := b.PublishMessageAsyncConfirm("", "tq", msg, func(error) {
 		t.Fatal("onDurable must not be invoked by the broker on the transient/sync path")
-	})
+	}, nil)
 	require.NoError(t, perr)
 	assert.False(t, durableInflight, "a transient publish must report durableInflight=false")
 	assert.Equal(t, uint32(1), b.GetQueueReadyCount("tq"), "transient message is visible synchronously")
@@ -150,7 +150,7 @@ func TestAsyncConfirm_AtHWMAdmitsWithoutParkAndReportsBackpressure(t *testing.T)
 	go func() {
 		_, bp, perr := b.PublishMessageAsyncConfirm("", "bpq", &protocol.Message{
 			Body: []byte("durable"), RoutingKey: "bpq", DeliveryMode: 2,
-		}, func(error) {})
+		}, func(error) {}, nil)
 		done <- result{bp, perr}
 	}()
 
@@ -192,7 +192,7 @@ func TestAsyncConfirm_FanoutFiresOnceAfterAllCopies(t *testing.T) {
 
 	var fired atomic.Int32
 	msg := &protocol.Message{Body: []byte("fanout"), RoutingKey: "", DeliveryMode: 2}
-	durableInflight, _, perr := b.PublishMessageAsyncConfirm("fx", "", msg, func(error) { fired.Add(1) })
+	durableInflight, _, perr := b.PublishMessageAsyncConfirm("fx", "", msg, func(error) { fired.Add(1) }, nil)
 	require.NoError(t, perr)
 	assert.True(t, durableInflight)
 
@@ -319,7 +319,7 @@ func TestAsyncConfirm_MultiPublisherNotVisibleBeforeDurable(t *testing.T) {
 					if e == nil {
 						confirmed.Add(1)
 					}
-				})
+				}, nil)
 				require.NoError(t, perr)
 			}
 		}()
@@ -383,7 +383,7 @@ func TestFrontier_ConcurrentDurableTransientNoRace(t *testing.T) {
 				if e == nil {
 					confirmed.Add(1)
 				}
-			})
+			}, nil)
 		}
 	}()
 	// Transient producer to the same (now frontier-active) queue.
@@ -549,7 +549,7 @@ func TestAsyncConfirm_FanoutConfirmOnlyAfterAllCopies(t *testing.T) {
 	durableInflight, _, perr := b.PublishMessageAsyncConfirm("fx2", "", msg, func(err error) {
 		fired.Add(1)
 		confirmResult <- err
-	})
+	}, nil)
 	require.NoError(t, perr)
 	require.True(t, durableInflight)
 
@@ -662,7 +662,7 @@ func TestFrontier_EnqueueErrorDoesNotWedgeQueue(t *testing.T) {
 	// First durable publish: StoreMessageAsync fails after the frontier reserve.
 	fs.failStoreAsync.Store(true)
 	_, _, perr := b.PublishMessageAsyncConfirm("", "wedge-q",
-		&protocol.Message{RoutingKey: "wedge-q", Body: []byte("boom"), DeliveryMode: 2}, nil)
+		&protocol.Message{RoutingKey: "wedge-q", Body: []byte("boom"), DeliveryMode: 2}, nil, nil)
 	require.Error(t, perr, "the injected enqueue error must surface")
 	fs.failStoreAsync.Store(false)
 
@@ -670,7 +670,7 @@ func TestFrontier_EnqueueErrorDoesNotWedgeQueue(t *testing.T) {
 	confirmed := make(chan error, 1)
 	_, _, perr = b.PublishMessageAsyncConfirm("", "wedge-q",
 		&protocol.Message{RoutingKey: "wedge-q", Body: []byte("ok"), DeliveryMode: 2},
-		func(e error) { confirmed <- e })
+		func(e error) { confirmed <- e }, nil)
 	require.NoError(t, perr)
 	select {
 	case e := <-confirmed:
@@ -739,7 +739,7 @@ func TestAsyncConfirm_DropHeadDeadLetterFromCompletionNoDeadlock(t *testing.T) {
 	confirmed := make(chan error, n)
 	for i := 0; i < n; i++ {
 		msg := &protocol.Message{RoutingKey: "main-c1", Body: []byte("payload"), DeliveryMode: 2}
-		_, _, perr := b.PublishMessageAsyncConfirm("", "main-c1", msg, func(e error) { confirmed <- e })
+		_, _, perr := b.PublishMessageAsyncConfirm("", "main-c1", msg, func(e error) { confirmed <- e }, nil)
 		require.NoError(t, perr)
 	}
 
@@ -781,7 +781,7 @@ func TestCrash_ConfirmedImpliesRecoverable(t *testing.T) {
 		body := fmt.Sprintf("msg-%04d", i)
 		bodies[body] = false
 		msg := &protocol.Message{RoutingKey: "cq", Body: []byte(body), DeliveryMode: 2}
-		durableInflight, _, perr := b1.PublishMessageAsyncConfirm("", "cq", msg, func(e error) { confirmed <- e })
+		durableInflight, _, perr := b1.PublishMessageAsyncConfirm("", "cq", msg, func(e error) { confirmed <- e }, nil)
 		require.NoError(t, perr)
 		require.True(t, durableInflight)
 	}

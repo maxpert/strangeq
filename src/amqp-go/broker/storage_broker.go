@@ -2908,6 +2908,43 @@ func (a *publishConfirmAgg) report(err error) {
 	}
 }
 
+// retentionAgg is the per-publish fan-in that fires onReleased EXACTLY ONCE,
+// after every accepted durable copy of a message has completed (in either
+// direction) across the normal, partial-fanout-reject, enqueue-error, shared
+// StopCh/WAL-close, no-route, transient and teardown paths (WS-I Phase B). It
+// mirrors publishConfirmAgg's setup guard: remaining starts at 1 (the guard,
+// dropped by the caller's defer on EVERY return) plus 1 per accepted copy;
+// the transition-to-zero fires onReleased. Because every copy's addN runs
+// before its enqueue and the guard is held until the function returns, a
+// completion that fires synchronously inside the enqueue call can never
+// release early.
+type retentionAgg struct {
+	remaining  atomic.Int32
+	onReleased func()
+}
+
+func newRetentionAgg(onReleased func()) *retentionAgg {
+	if onReleased == nil {
+		onReleased = func() {} // a nil callback is safe on every path
+	}
+	a := &retentionAgg{onReleased: onReleased}
+	a.remaining.Store(1) // setup guard
+	return a
+}
+
+// addN registers k accepted copies. MUST run before those copies' WAL writes
+// are enqueued, so a completion firing immediately can never drive remaining
+// to zero before every copy has been counted.
+func (a *retentionAgg) addN(k int32) { a.remaining.Add(k) }
+
+// doneN settles k copies (or the setup guard). The transition-to-zero fires
+// onReleased once.
+func (a *retentionAgg) doneN(k int32) {
+	if a.remaining.Add(-k) == 0 {
+		a.onReleased()
+	}
+}
+
 // PublishMessageAsyncConfirm is the async-completion publish path for durable
 // and/or publisher-confirm messages. It mirrors PublishMessage's routing,
 // delivery-tag assignment, no-route, and SQ-11 reject-publish admission — all
@@ -2927,7 +2964,20 @@ func (a *publishConfirmAgg) report(err error) {
 // ErrMaxLengthExceeded, onDurable is never invoked (the caller settles via its
 // existing error handling); durable copies already enqueued to accepted targets
 // still become visible on their fsync, but the confirm is nacked.
-func (b *StorageBroker) PublishMessageAsyncConfirm(exchangeName, routingKey string, message *protocol.Message, onDurable func(error)) (durableInflight bool, backpressure protocol.DepthGate, err error) {
+//
+// onReleased (WS-I Phase B) is the publish-lease retention callback: it fires
+// EXACTLY ONCE — after every accepted durable copy completed (in either
+// direction), or synchronously on the transient / no-route / error paths — and
+// always after onDurable when both fire. A nil onReleased is treated as a
+// no-op. The caller transfers lease ownership to the broker by passing it;
+// the broker releases it even if the connection is gone by completion time.
+func (b *StorageBroker) PublishMessageAsyncConfirm(exchangeName, routingKey string, message *protocol.Message, onDurable func(error), onReleased func()) (durableInflight bool, backpressure protocol.DepthGate, err error) {
+	// The retention guard is dropped on EVERY return below; copies counted
+	// into ret before then settle via their completions (or enqueue-error
+	// doneN), so onReleased fires exactly once.
+	ret := newRetentionAgg(onReleased)
+	defer ret.doneN(1)
+
 	// Transient publishes take the byte-for-byte-unchanged synchronous path.
 	// There is no durability barrier, so the confirm (if any) is settled
 	// synchronously by the caller (durableInflight=false).
@@ -2988,7 +3038,7 @@ func (b *StorageBroker) PublishMessageAsyncConfirm(exchangeName, routingKey stri
 	// byte-for-byte as today.
 	if len(targetQueues) >= 2 && len(message.Body) >= b.sharedBodyThreshold() {
 		if sdw, ok := b.storage.(sharedDurableWriter); ok {
-			return b.fanoutSharedAsyncConfirm(sdw, agg, message, targetQueues)
+			return b.fanoutSharedAsyncConfirm(sdw, agg, ret, message, targetQueues)
 		}
 	}
 
@@ -3093,9 +3143,11 @@ func (b *StorageBroker) PublishMessageAsyncConfirm(exchangeName, routingKey stri
 				}
 			}
 			agg.report(cerr)
+			ret.doneN(1)
 		}
 
 		agg.addCopy() // count BEFORE enqueue so an immediate completion can't underflow
+		ret.addN(1)   // retention: count this accepted copy BEFORE its enqueue
 		if serr := adw.StoreMessageAsync(queueName, storeMsg, completion); serr != nil {
 			// Enqueue failed (e.g. WAL unavailable): the completion will NOT fire,
 			// so RELEASE the frontier slot we reserved for this tag — otherwise it
@@ -3105,6 +3157,7 @@ func (b *StorageBroker) PublishMessageAsyncConfirm(exchangeName, routingKey stri
 			// (§7). The aggregator is abandoned (guard never dropped => onDurable
 			// never fires). Propagate the failure synchronously.
 			queueState.FrontierComplete(msgID, false)
+			ret.doneN(1) // retention: this copy settles via the enqueue error
 			return false, nil, fmt.Errorf("failed to store durable message to queue '%s': %w", queueName, serr)
 		}
 	}
@@ -3133,7 +3186,7 @@ func (b *StorageBroker) PublishMessageAsyncConfirm(exchangeName, routingKey stri
 // frontier + max-length accounting exactly like the per-queue completion, so
 // consumer-visibility/confirm semantics are identical; only the durable byte
 // layout differs. The publishConfirmAgg fans the N completions into one confirm.
-func (b *StorageBroker) fanoutSharedAsyncConfirm(sdw sharedDurableWriter, agg *publishConfirmAgg, message *protocol.Message, targetQueues []string) (bool, protocol.DepthGate, error) {
+func (b *StorageBroker) fanoutSharedAsyncConfirm(sdw sharedDurableWriter, agg *publishConfirmAgg, ret *retentionAgg, message *protocol.Message, targetQueues []string) (bool, protocol.DepthGate, error) {
 	var backpressure protocol.DepthGate
 	rejected := false
 
@@ -3224,6 +3277,7 @@ func (b *StorageBroker) fanoutSharedAsyncConfirm(sdw sharedDurableWriter, agg *p
 				}
 			}
 			agg.report(cerr)
+			ret.doneN(1)
 		}
 
 		agg.addCopy() // count BEFORE enqueue so an immediate completion can't underflow
@@ -3236,6 +3290,10 @@ func (b *StorageBroker) fanoutSharedAsyncConfirm(sdw sharedDurableWriter, agg *p
 	}
 
 	if len(subs) > 0 {
+		// Retention: count EVERY accepted sub immediately before the shared
+		// enqueue, so a completion firing synchronously inside StoreSharedAsync
+		// can never release early (the caller's setup guard is still held).
+		ret.addN(int32(len(subs)))
 		if serr := sdw.StoreSharedAsync(subs); serr != nil {
 			// Enqueue failed: no completion will fire, so release every reserved
 			// frontier slot (else the per-queue frontiers wedge, M1). The aggregator
@@ -3243,6 +3301,7 @@ func (b *StorageBroker) fanoutSharedAsyncConfirm(sdw sharedDurableWriter, agg *p
 			for _, r := range reserved {
 				r.qs.FrontierComplete(r.tag, false)
 			}
+			ret.doneN(int32(len(subs))) // retention: every sub settles via the error
 			return false, nil, fmt.Errorf("failed to store shared durable message: %w", serr)
 		}
 	}

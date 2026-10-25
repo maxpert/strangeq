@@ -477,7 +477,9 @@ func (s *Server) processCompleteMessage(conn *protocol.Connection, channelID uin
 				}
 			}
 		}
-		durableInflight, backpressure, err = s.Broker.PublishMessageAsyncConfirm(message.Exchange, message.RoutingKey, message, onDurable)
+		// WS-I Phase B: onReleased is wired in the lease-transfer commit; nil
+		// until then (treated as a no-op by the broker).
+		durableInflight, backpressure, err = s.Broker.PublishMessageAsyncConfirm(message.Exchange, message.RoutingKey, message, onDurable, nil)
 	} else {
 		err = s.Broker.PublishMessage(message.Exchange, message.RoutingKey, message)
 	}

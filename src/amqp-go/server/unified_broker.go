@@ -38,7 +38,13 @@ type UnifiedBroker interface {
 	// producer, keeping the durable queue small + ring-resident). The publish is
 	// still admitted (it always durablizes + confirms); the processor is never
 	// parked, so the confirm tag is never stranded. nil means capacity headroom.
-	PublishMessageAsyncConfirm(exchangeName, routingKey string, message *protocol.Message, onDurable func(error)) (durableInflight bool, backpressure protocol.DepthGate, err error)
+	//
+	// onReleased (WS-I Phase B) is the publish-lease retention callback: it
+	// fires EXACTLY ONCE — after every accepted durable copy completed, or
+	// synchronously on the transient / no-route / error paths — and after
+	// onDurable when both fire. nil is treated as a no-op. The broker owns the
+	// lease from this call on, releasing it even after the connection is gone.
+	PublishMessageAsyncConfirm(exchangeName, routingKey string, message *protocol.Message, onDurable func(error), onReleased func()) (durableInflight bool, backpressure protocol.DepthGate, err error)
 
 	// Consumer operations. Every consumerID below is the BROKER-INTERNAL
 	// consumer identity (protocol.Consumer.ID), never the client-visible
