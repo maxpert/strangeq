@@ -30,24 +30,33 @@ func TestLease_TxCommitParkDrainsQueuedLeases(t *testing.T) {
 		return srv.Broker.(*StorageBrokerAdapter).broker.GetQueueReadyCount("sltx-q") == 1
 	}, 30*time.Second, time.Millisecond)
 
+	// Baseline AFTER the fill settles: the fill publish's lease is created
+	// AND released by now (transient two-party join), so both counters are
+	// equal; count everything else relative to this.
+	require.Eventually(t, func() bool {
+		return created.Load() == released.Load() && created.Load() > 0
+	}, 30*time.Second, time.Millisecond, "the fill publish's lease must settle")
+	createdBase := created.Load()
+	releasedBase := released.Load()
+
 	a := dialRaw(t, addr)
 	a.handshake("guest", "guest", 4, 0)
 	a.openChannel(1)
 	a.send(1, 90, 10, []byte{}) // tx.select
 	a.expectMethodCh(1, 90, 11) // tx.select-ok
 	leaseSendPublish(t, a, 1, "", "sltx-q", leaseBody(64), true)
-	require.Eventually(t, func() bool { return created.Load() == 1 && released.Load() == 1 },
-		30*time.Second, time.Millisecond, "the tx publish's lease releases at buffer time")
+	require.Eventually(t, func() bool {
+		return created.Load() == createdBase+1 && released.Load() == releasedBase+1
+	}, 30*time.Second, time.Millisecond, "the tx publish's lease releases at buffer time")
 
 	// The commit parks the processor in the target queue's capacity wait.
 	a.send(1, 90, 20, []byte{}) // tx.commit
 
 	// Queue two more publishes behind the parked commit: their header leases
 	// are granted and sit in the LeaseFIFO (the processor never reaches them).
-	// (The fill publish + the tx publish account for the first two created.)
 	leaseSendPublish(t, a, 1, "", "sltx-q", leaseBody(64), true)
 	leaseSendPublish(t, a, 1, "", "sltx-q", leaseBody(64), true)
-	require.Eventually(t, func() bool { return created.Load() == 4 }, 30*time.Second, time.Millisecond,
+	require.Eventually(t, func() bool { return created.Load() == createdBase+3 }, 30*time.Second, time.Millisecond,
 		"both queued publishes must be leased")
 	assert.Equal(t, 2*leaseBytes(64, 131072), leaseUsed(srv))
 
@@ -55,7 +64,7 @@ func TestLease_TxCommitParkDrainsQueuedLeases(t *testing.T) {
 	// drains the queued leases immediately.
 	_ = a.c.Close()
 	require.Eventually(t, func() bool {
-		return released.Load() == 4 && leaseUsed(srv) == 0
+		return released.Load() == releasedBase+3 && leaseUsed(srv) == 0
 	}, 30*time.Second, time.Millisecond,
 		"queued leases release at teardown step 3 while the commit is still parked")
 
