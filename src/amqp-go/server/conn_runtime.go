@@ -52,6 +52,26 @@ type connRuntime struct {
 	// leaves its reader parked in the limiter.
 	leaseCtx    context.Context
 	leaseCancel context.CancelFunc
+
+	// rs is the reader goroutine's state (pending hand-off buffer + owed
+	// leased-body progress). pending/pendingBytes are reader-owned; owed is
+	// ALSO cleared by the processor on a server-initiated channel close
+	// (owedMu).
+	rs readerState
+
+	// procSeq counts frames the processor has finished (readers use it for
+	// the lease-wait stall guard: a wait with queued content but no
+	// processor progress for writeTimeout is a wedge).
+	procSeq atomic.Int64
+
+	// leasesRevoked is set at teardown step 3: after it, the processor
+	// discards header/body frames (releasing their budget + lease) instead
+	// of admitting unleased content.
+	leasesRevoked atomic.Bool
+	// leasesDrainOnce guards the once-only connection-lease drain in
+	// cleanupConnection (separate from leasesRevoked: the REVOCATION tells
+	// the processor to discard; the DRAIN releases whatever is left).
+	leasesDrainOnce sync.Once
 }
 
 func (rt *connRuntime) releaseHandshakeSlot() {
@@ -73,6 +93,10 @@ func (rt *connRuntime) markChannelClosing(id uint16) (first bool) {
 		return false
 	}
 	rt.closingCount.Add(1)
+	// A channel that starts closing never completes an in-flight leased body:
+	// its frames are discarded by the closing gate, so the owed entry must go
+	// (else the owed deadline would kill the whole connection).
+	rt.rs.clearOwed(id)
 	return true
 }
 

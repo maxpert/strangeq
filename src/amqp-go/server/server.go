@@ -439,6 +439,28 @@ func (s *Server) handleConnection(conn net.Conn) {
 // cancels consumers, closes channels, cleans up transaction state, and
 // removes the connection from the server's connection map.
 func (s *Server) cleanupConnection(connection *protocol.Connection) {
+	// WS-I Phase B: release connection-owned publish leases FIRST, ONCE
+	// (leasesRevoked was set at teardown step 3 — this drain is once-only),
+	// BEFORE any channel lock or broker call below, so a panic/deadlock later
+	// in this function can never leak budget. Broker-owned transferred leases
+	// are untouched (they release on WAL completion, even after the
+	// connection is gone). The reader and processor have already exited, so
+	// this cannot race them.
+	if rt, ok := s.runtimes.Load(connection); ok {
+		s.revokeAndDrainConnectionLeases(rt.(*connRuntime))
+	} else {
+		// Bare-connection unit tests (no registered runtime): drain directly.
+		for _, le := range connection.LeaseFIFO.Drain() {
+			if le != nil {
+				le.Release()
+			}
+		}
+		releaseHeaderLease(connection)
+		for _, pm := range connection.PendingMessages {
+			takeLease(pm)()
+		}
+	}
+
 	// Clean up on connection close - iterate all channels and cancel consumers
 	connection.Channels.Range(func(key, value interface{}) bool {
 		channel := value.(*protocol.Channel)
@@ -513,22 +535,6 @@ func (s *Server) cleanupConnection(connection *protocol.Connection) {
 	s.Mutex.Lock()
 	delete(s.Connections, connection.ID)
 	s.Mutex.Unlock()
-
-	// WS-I Phase B teardown: release every publish lease this connection still
-	// owns — header leases queued for the processor, the in-flight header
-	// lease, and leases held by half-received publishes. (Broker-owned
-	// onReleased callbacks release independently on WAL completion, even
-	// though the connection is gone.) The reader and processor have already
-	// exited, so this cannot race them.
-	for _, le := range connection.LeaseFIFO.Drain() {
-		if le != nil {
-			le.Release()
-		}
-	}
-	releaseHeaderLease(connection)
-	for _, pm := range connection.PendingMessages {
-		takeLease(pm)()
-	}
 
 	if s.MetricsCollector != nil {
 		s.MetricsCollector.RecordConnectionClosed()
@@ -764,6 +770,10 @@ func (s *Server) processConnectionFrames(conn *protocol.Connection) {
 	}
 	_ = conn.Conn.Close()
 	rt.leaseCancel() // WS-I: unblock a reader parked in a lease Reserve
+	// WS-I: from here on the processor discards (never admits) header/body
+	// content; connection-owned leases are drained in cleanupConnection after
+	// the joins (revokeAndDrainConnectionLeases is once-only).
+	rt.leasesRevoked.Store(true)
 
 	// 4. Signal shutdown to every Done-select (reader hand-offs, flow sender,
 	//    heartbeat, confirm flusher, alarm/depth parks). This also unblocks
@@ -897,14 +907,12 @@ func (s *Server) readFrames(rt *connRuntime, done chan struct{}) {
 	// drains; if it exceeds the hard ReaderOverflowHardCapBytes cap (a client
 	// ignoring flow, or a pure-publish flood) we close the connection rather
 	// than grow memory without bound.
-	var pending []*protocol.Frame
-	var pendingBytes int64
-	// owed tracks leased content headers whose declared body bytes have not
-	// all been read yet (WS-I Phase B §B.3a): channel → remaining bytes +
-	// last body progress. While non-empty, the reader never blocks on the
-	// limiter (TryReserve or close), the alarm/depth parks are deferred, and
-	// the read deadline is min(hbDeadline, oldest(lastProgress)+writeTimeout).
-	owed := make(map[uint16]*owedBody)
+	// rs (on the connRuntime) holds the pending hand-off buffer and the owed
+	// leased-body progress (WS-I Phase B §B.3a): while a leased body is owed,
+	// the reader never blocks on the limiter (TryReserve or close), the
+	// alarm/depth parks are deferred, and the read deadline is
+	// min(hbDeadline, oldest(lastProgress)+writeTimeout).
+	rs := &rt.rs
 	// deadlineActive tracks whether a read deadline is currently set on the
 	// socket. Post-handshake the deadline is cleared, so it starts false. It only
 	// matters on hb==0 connections, where it lets us clear a stale SQ-12
@@ -988,11 +996,11 @@ func (s *Server) readFrames(rt *connRuntime, done chan struct{}) {
 	for {
 		// Opportunistically hand buffered frames to processFrames whenever it
 		// has drained space. Non-blocking: never wait on a full FrameQueue.
-		for len(pending) > 0 {
+		for len(rs.pending) > 0 {
 			// Capture Size before the send: once processFrames receives the
 			// frame it may pool it, and the recycled frame can be overwritten
 			// while we still hold the stale reference.
-			head := pending[0]
+			head := rs.pending[0]
 			headSize := int64(head.Size)
 			headCost := frameCost(head)
 			// §9: "budget exhausted" behaves exactly like "channel full".
@@ -1002,9 +1010,9 @@ func (s *Server) readFrames(rt *connRuntime, done chan struct{}) {
 			conn.FrameQueueBytes.Add(headCost)
 			select {
 			case conn.FrameQueue <- head:
-				pendingBytes -= headSize
-				pending[0] = nil
-				pending = pending[1:]
+				rs.pendingBytes -= headSize
+				rs.pending[0] = nil
+				rs.pending = rs.pending[1:]
 				continue
 			case <-conn.Done:
 				conn.FrameQueueBytes.Add(-headCost) // rollback: not handed off
@@ -1014,9 +1022,9 @@ func (s *Server) readFrames(rt *connRuntime, done chan struct{}) {
 			}
 			break
 		}
-		if len(pending) == 0 {
-			pending = nil // release backing array once fully drained
-			pendingBytes = 0
+		if len(rs.pending) == 0 {
+			rs.pending = nil // release backing array once fully drained
+			rs.pendingBytes = 0
 			// Backlog cleared: lift the earlier flow-off signal so the client
 			// may resume publishing.
 			if flowPaused {
@@ -1044,10 +1052,10 @@ func (s *Server) readFrames(rt *connRuntime, done chan struct{}) {
 		// consume-staleness deadlocks. The reader still never blocks on a socket
 		// write or the WriteMutex — only on this one channel send.
 		backpressureProbed := false
-		if len(pending) > 0 {
+		if len(rs.pending) > 0 {
 			// Capture Size before the send: processFrames may pool the frame the
 			// instant it receives it (mirrors the opportunistic drain above).
-			head := pending[0]
+			head := rs.pending[0]
 			headSize := int64(head.Size)
 			headCost := frameCost(head)
 			// §9: an exhausted byte budget makes the hand-off channel never-ready
@@ -1064,9 +1072,9 @@ func (s *Server) readFrames(rt *connRuntime, done chan struct{}) {
 				// Add after the send: a transient negative is harmless
 				// (frameBudgetAllows always admits q <= 0).
 				conn.FrameQueueBytes.Add(headCost)
-				pendingBytes -= headSize
-				pending[0] = nil
-				pending = pending[1:]
+				rs.pendingBytes -= headSize
+				rs.pending[0] = nil
+				rs.pending = rs.pending[1:]
 				continue
 			case <-conn.FrameBudgetWake:
 				backpressureProbe.Stop()
@@ -1094,7 +1102,7 @@ func (s *Server) readFrames(rt *connRuntime, done chan struct{}) {
 		// The HasPublished load is short-circuited behind alarmState, so it adds no
 		// cost on the unset hot path.
 		probing := false
-		if len(owed) == 0 && s.alarmState.Load() != 0 && conn.HasPublished.Load() {
+		if rs.owedLen() == 0 && s.alarmState.Load() != 0 && conn.HasPublished.Load() {
 			probing = s.parkReaderWhileAlarmed(conn)
 			// The connection may have torn down while we were parked.
 			select {
@@ -1112,7 +1120,7 @@ func (s *Server) readFrames(rt *connRuntime, done chan struct{}) {
 		// confirm tag by parking the processor mid-publish. One atomic load per
 		// iteration when unset (the common case). Skipped while burst-draining (the
 		// liveness teardown drain runs full-speed until RX empties, then re-parks).
-		if !depthDraining && len(owed) == 0 && conn.DepthBackpressure.Load() {
+		if !depthDraining && rs.owedLen() == 0 && conn.DepthBackpressure.Load() {
 			if s.parkReaderWhileDepthBackpressured(conn) {
 				depthDraining = true // liveness fired: burst-drain the buffered window
 			}
@@ -1160,8 +1168,8 @@ func (s *Server) readFrames(rt *connRuntime, done chan struct{}) {
 			// a TCP-keepalive error (both non-timeout) and closes below.
 			deadline = time.Now().Add(s.readerBackpressureProbeInterval())
 		}
-		if len(owed) > 0 {
-			if od := oldestOwedProgress(owed).Add(s.writeTimeout()); deadline.IsZero() || od.Before(deadline) {
+		if rs.owedLen() > 0 {
+			if od := rs.oldestProgress().Add(s.writeTimeout()); deadline.IsZero() || od.Before(deadline) {
 				deadline = od
 			}
 		}
@@ -1192,18 +1200,11 @@ func (s *Server) readFrames(rt *connRuntime, done chan struct{}) {
 					depthDraining = false
 					continue
 				}
-				if len(owed) > 0 && !time.Now().Before(oldestOwedProgress(owed).Add(s.writeTimeout())) {
+				if rs.owedLen() > 0 && !time.Now().Before(rs.oldestProgress().Add(s.writeTimeout())) {
 					// WS-I Phase B: a leased body made no progress within
 					// writeTimeout of its last body byte. This is a body stall,
-					// NOT a heartbeat death: close the connection; teardown
-					// releases every lease it owns.
-					if lm := s.leaseMetrics(); lm != nil {
-						lm.RecordPublishLeaseBodyStallClose()
-					}
-					s.Log.Warn("leased publish body stalled; closing connection",
-						zap.String("connection_id", conn.ID),
-						zap.Int("owed_channels", len(owed)))
-					conn.Closed.Store(true)
+					// NOT a heartbeat death.
+					s.bodyStallClose(conn, rs)
 					return
 				}
 				if hb > 0 {
@@ -1241,6 +1242,15 @@ func (s *Server) readFrames(rt *connRuntime, done chan struct{}) {
 
 		s.bytesReceived.Add(int64(frame.Size))
 
+		// WS-I Phase B: enforce the owed-body deadline on EVERY read frame,
+		// not just via the socket read deadline — the socket deadline only
+		// bounds BLOCKING reads, so a client streaming non-progress frames
+		// (e.g. zero-length body frames) would otherwise NEVER trip it.
+		if rs.owedLen() > 0 && !time.Now().Before(rs.oldestProgress().Add(s.writeTimeout())) {
+			s.bodyStallClose(conn, rs)
+			return
+		}
+
 		// Divert basic.ack/nack/reject straight to the ACK processor,
 		// bypassing FrameQueue and the (potentially publish-blocked)
 		// processFrames goroutine. A basic.publish that hits queue
@@ -1273,11 +1283,16 @@ func (s *Server) readFrames(rt *connRuntime, done chan struct{}) {
 		// declared body bytes (+framing) BEFORE any body frame is read and
 		// before the confirm tag exists; a body frame records owed progress.
 		if frame.Type == protocol.FrameHeader {
-			if !s.leaseForHeaderFrame(rt, frame, owed) {
+			if !s.leaseForHeaderFrame(rt, frame, rs) {
 				return
 			}
 		} else if frame.Type == protocol.FrameBody {
-			s.trackBodyProgress(frame, owed)
+			rs.trackBody(frame)
+		} else if frame.Type == protocol.FrameMethod && frame.Channel != 0 && len(frame.Payload) >= 4 &&
+			frame.Payload[0] == 0 && frame.Payload[1] == 20 && (frame.Payload[3] == 40 || frame.Payload[3] == 41) {
+			// A channel close / close-ok ends any owed leased body on it: its
+			// remaining body frames are discarded by the closing gate.
+			rs.clearOwed(frame.Channel)
 		}
 
 		// Enqueue for processFrames. Try a non-blocking direct hand-off only when
@@ -1286,7 +1301,7 @@ func (s *Server) readFrames(rt *connRuntime, done chan struct{}) {
 		// FrameQueue is full, buffer instead; the reader must never block here or
 		// acks stall behind it.
 		cost := frameCost(frame)
-		if len(pending) == 0 && s.frameBudgetAllows(conn, cost) {
+		if len(rs.pending) == 0 && s.frameBudgetAllows(conn, cost) {
 			conn.FrameQueueBytes.Add(cost)
 			select {
 			case conn.FrameQueue <- frame:
@@ -1300,15 +1315,15 @@ func (s *Server) readFrames(rt *connRuntime, done chan struct{}) {
 				conn.FrameQueueBytes.Add(-cost)
 			}
 		}
-		pending = append(pending, frame)
-		pendingBytes += int64(frame.Size)
+		rs.pending = append(rs.pending, frame)
+		rs.pendingBytes += int64(frame.Size)
 
 		// Hard cap: a client ignoring flow, or flooding publishes while never
 		// consuming, must not grow reader memory without bound. Close it.
-		if hardCap > 0 && pendingBytes > hardCap {
+		if hardCap > 0 && rs.pendingBytes > hardCap {
 			s.Log.Warn("reader overflow exceeded hard cap; closing connection",
 				zap.String("connection_id", conn.ID),
-				zap.Int64("pending_bytes", pendingBytes),
+				zap.Int64("pending_bytes", rs.pendingBytes),
 				zap.Int64("hard_cap_bytes", hardCap))
 			if s.MetricsCollector != nil {
 				s.MetricsCollector.RecordConnectionError("reader_overflow")
@@ -1322,12 +1337,12 @@ func (s *Server) readFrames(rt *connRuntime, done chan struct{}) {
 		// Best-effort, delivered by the flow-sender goroutine so the reader
 		// itself never blocks on the write (or on the WriteMutex). A client that
 		// ignores the signal keeps growing the backlog into the hard cap above.
-		if !flowPaused && flowLimit > 0 && pendingBytes >= flowLimit {
+		if !flowPaused && flowLimit > 0 && rs.pendingBytes >= flowLimit {
 			flowPaused = true
 			requestFlow(false)
 			s.Log.Info("reader overflow: requesting channel.flow(false)",
 				zap.String("connection_id", conn.ID),
-				zap.Int64("pending_bytes", pendingBytes))
+				zap.Int64("pending_bytes", rs.pendingBytes))
 		}
 	}
 }
@@ -1345,6 +1360,7 @@ func (s *Server) processFrames(rt *connRuntime, done chan struct{}) {
 				s.Log.Info("Frame queue closed", zap.String("connection_id", conn.ID))
 				return
 			}
+			rt.procSeq.Add(1) // lease-wait stall guard: one tick per dequeued frame
 
 			// §9: capture the budget cost immediately (before processFrame can
 			// pool the frame) and release it on EVERY path that finishes with
@@ -1353,6 +1369,19 @@ func (s *Server) processFrames(rt *connRuntime, done chan struct{}) {
 			cost := frameCost(frame)
 
 			if frame.Type == protocol.FrameHeartbeat {
+				s.releaseFrameBudget(conn, cost)
+				protocol.PutFrame(frame)
+				continue
+			}
+
+			// WS-I: once leases are revoked (teardown), header/body content is
+			// NEVER admitted unleased: discard it, releasing its budget and
+			// its paired lease. Method frames (close/close-ok) still process.
+			if rt.leasesRevoked.Load() && (frame.Type == protocol.FrameHeader || frame.Type == protocol.FrameBody) {
+				if frame.Type == protocol.FrameHeader {
+					conn.HeaderLease = conn.LeaseFIFO.Pop()
+					releaseHeaderLease(conn)
+				}
 				s.releaseFrameBudget(conn, cost)
 				protocol.PutFrame(frame)
 				continue

@@ -88,6 +88,13 @@ func (q *LeaseQueue) Drain() []Releaser {
 	return out
 }
 
+// Len returns the number of queued leases.
+func (q *LeaseQueue) Len() int {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	return len(q.items)
+}
+
 // Connection represents an AMQP connection
 type Connection struct {
 	ID   string

@@ -3,6 +3,8 @@ package server
 import (
 	"encoding/binary"
 	"fmt"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	amqperrors "github.com/maxpert/amqp-go/errors"
@@ -96,11 +98,86 @@ func (s *Server) buildLimiterHooks(l *PublishLimiter) *LimiterHooks {
 	}
 }
 
-// owedBody is the reader-local progress tracker for one leased header whose
-// body bytes have not all been read yet (spec §B.3a).
+// readerState is the reader goroutine's working state (WS-I Phase B), living
+// on the connRuntime so the processor can clear owed entries on a
+// server-initiated channel close. pending/pendingBytes are READER-OWNED (no
+// lock); owed is guarded by owedMu; owedCount is the lock-free owed==0 check
+// for the reader's hot loop.
+type readerState struct {
+	pending      []*protocol.Frame
+	pendingBytes int64
+
+	owedMu    sync.Mutex
+	owed      map[uint16]owedBody // values, not pointers
+	owedCount atomic.Int32
+}
+
+// owedBody is the progress tracker for one leased header whose body bytes
+// have not all been read yet (spec §B.3a).
 type owedBody struct {
 	remaining    uint64
 	lastProgress time.Time
+}
+
+func (rs *readerState) owedLen() int { return int(rs.owedCount.Load()) }
+
+func (rs *readerState) addOwed(channel uint16, bodySize uint64) {
+	rs.owedMu.Lock()
+	if rs.owed == nil {
+		rs.owed = make(map[uint16]owedBody)
+	}
+	rs.owed[channel] = owedBody{remaining: bodySize, lastProgress: time.Now()}
+	rs.owedCount.Store(int32(len(rs.owed)))
+	rs.owedMu.Unlock()
+}
+
+func (rs *readerState) clearOwed(channel uint16) {
+	rs.owedMu.Lock()
+	delete(rs.owed, channel)
+	rs.owedCount.Store(int32(len(rs.owed)))
+	rs.owedMu.Unlock()
+}
+
+// trackBody records read progress against the owed leased body on the frame's
+// channel. Heartbeats, frames on other channels, and ZERO-LENGTH body frames
+// do NOT count: only positive body bytes extend the owed deadline. Exact
+// completion removes the entry; overrun is rejected downstream by the
+// existing processor check (the entry is removed either way).
+func (rs *readerState) trackBody(frame *protocol.Frame) {
+	if rs.owedCount.Load() == 0 {
+		return
+	}
+	n := uint64(len(frame.Payload))
+	if n == 0 {
+		return // zero-length body frames are never progress
+	}
+	rs.owedMu.Lock()
+	ob, ok := rs.owed[frame.Channel]
+	if ok {
+		if n >= ob.remaining {
+			delete(rs.owed, frame.Channel)
+		} else {
+			ob.remaining -= n
+			ob.lastProgress = time.Now()
+			rs.owed[frame.Channel] = ob
+		}
+		rs.owedCount.Store(int32(len(rs.owed)))
+	}
+	rs.owedMu.Unlock()
+}
+
+// oldestProgress returns the oldest lastProgress across owed bodies; the owed
+// read deadline is oldest + writeTimeout.
+func (rs *readerState) oldestProgress() time.Time {
+	rs.owedMu.Lock()
+	defer rs.owedMu.Unlock()
+	var oldest time.Time
+	for _, ob := range rs.owed {
+		if oldest.IsZero() || ob.lastProgress.Before(oldest) {
+			oldest = ob.lastProgress
+		}
+	}
+	return oldest
 }
 
 // takeLease nil-safely transfers the publish lease out of pm: it sets
@@ -140,15 +217,23 @@ func frameMaxForLease(conn *protocol.Connection) uint32 {
 // leaseForHeaderFrame applies the WS-I Phase B header-time lease rule for a
 // just-read content-header frame and returns whether the reader may continue
 // (the frame is enqueued normally then). A false return means the reader must
-// exit AT ONCE: either the wait was cancelled (teardown / write failure /
-// limiter close), or a nested header could not be leased and the connection
-// is being closed with 506 — the nested content is never admitted.
+// exit AT ONCE: the wait was aborted (teardown / limiter close / processor
+// stall), or a nested header could not be leased and the connection is being
+// closed with 506 — the nested content is never admitted.
 //
 // Pairing contract: on a true return EXACTLY one entry (lease or nil) has
 // been pushed to conn.LeaseFIFO for this frame, so the processor's Pop pairs
 // 1:1 with enqueued header frames.
-func (s *Server) leaseForHeaderFrame(rt *connRuntime, frame *protocol.Frame, owed map[uint16]*owedBody) bool {
+func (s *Server) leaseForHeaderFrame(rt *connRuntime, frame *protocol.Frame, rs *readerState) bool {
 	conn := rt.conn
+
+	// While the connection is closing, never reserve and NEVER wait: pair a
+	// nil lease (the closing gate discards the frame) and keep reading so
+	// the client's close-ok is seen.
+	if rt.connClosing.Load() {
+		conn.LeaseFIFO.Push(nil)
+		return true
+	}
 
 	// Decode the declared body size from payload bytes [4:12] (class-id,
 	// weight, then body-size). A short payload — or a declared size over
@@ -173,47 +258,56 @@ func (s *Server) leaseForHeaderFrame(rt *connRuntime, frame *protocol.Frame, owe
 	limiter := s.publishLimiter()
 
 	var lease *Lease
-	if len(owed) == 0 {
-		// No earlier leased body is still unread: a blocking Reserve is
-		// allowed. The wait is bounded by leaseCtx (write failure / teardown),
-		// the heartbeat writer (hb > 0), WAL progress, or limiter.Close.
+	if rs.owedLen() == 0 {
+		// No earlier leased body is still unread: a blocking wait is allowed.
+		// It is bounded by leaseCtx (write failure / teardown / connection
+		// close), the heartbeat writer (hb > 0), WAL progress, the
+		// processor-stall guard, or limiter.Close.
 		if s.limiterStepHook != nil {
 			s.limiterStepHook("reserve-wait:" + conn.ID)
 		}
-		le, err := limiter.Reserve(rt.leaseCtx, conn.ID, bytes)
-		if s.limiterStepHook != nil {
-			s.limiterStepHook("reserve-return:" + conn.ID)
-		}
+		le, wait, err := limiter.Begin(conn.ID, bytes)
 		if err != nil {
-			// Teardown or limiter close: exit without enqueueing the frame.
-			// The FIFO gets NO entry (the processor never sees this frame);
-			// outstanding leases release at teardown.
+			if s.limiterStepHook != nil {
+				s.limiterStepHook("reserve-return:" + conn.ID)
+			}
 			protocol.PutFrame(frame)
 			return false
+		}
+		if wait != nil {
+			var ok bool
+			le, ok = s.waitForHeaderLease(rt, frame.Channel, wait, rs)
+			if s.limiterStepHook != nil {
+				s.limiterStepHook("reserve-return:" + conn.ID)
+			}
+			if !ok {
+				protocol.PutFrame(frame)
+				return false
+			}
+			if le == nil {
+				// connClosing: pair a nil lease and keep reading close-ok.
+				conn.LeaseFIFO.Push(nil)
+				return true
+			}
+		} else if s.limiterStepHook != nil {
+			s.limiterStepHook("reserve-return:" + conn.ID)
 		}
 		lease = le
 	} else {
 		// An earlier leased body is still unread: non-barging TryReserve only.
 		le, ok := limiter.TryReserve(conn.ID, bytes)
 		if !ok {
+			if limiter.Closed() {
+				// Shutdown raced us — exit quietly (NOT an overbudget close).
+				protocol.PutFrame(frame)
+				return false
+			}
 			// Close the connection promptly with 506; the nested content is
 			// NEVER admitted unleased. Teardown releases the FIFO, the
 			// HeaderLease and the pending-message leases.
-			if lm := s.leaseMetrics(); lm != nil {
-				lm.RecordPublishLeaseOverbudgetClose()
-			}
-			channel := frame.Channel
-			s.Log.Warn("publish lease budget exhausted while body owed; closing connection",
-				zap.String("connection_id", conn.ID),
-				zap.Uint16("channel", channel),
-				zap.Uint16("owed_channels", uint16(len(owed))))
-			s.goConn(rt, "lease-close", func() {
-				_ = s.connectionError(conn, amqperrors.ResourceError,
-					fmt.Sprintf("RESOURCE_ERROR - publish lease budget exhausted while body owed on channel %d", channel),
-					60, 40)
-				conn.Closed.Store(true)
-				_ = conn.Conn.Close()
-			})
+			s.leaseClose506(rt, frame.Channel,
+				fmt.Sprintf("RESOURCE_ERROR - publish lease budget exhausted while body owed on channel %d", frame.Channel),
+				"publish lease budget exhausted while body owed; closing connection", rs.owedLen())
 			protocol.PutFrame(frame)
 			return false
 		}
@@ -221,41 +315,128 @@ func (s *Server) leaseForHeaderFrame(rt *connRuntime, frame *protocol.Frame, owe
 	}
 
 	conn.LeaseFIFO.Push(lease)
-	if bodySize > 0 {
+	if bodySize > 0 && !limiter.disabled() {
 		// bodySize == 0 takes the lease but owes nothing (the message
-		// completes at the header).
-		owed[frame.Channel] = &owedBody{remaining: bodySize, lastProgress: time.Now()}
+		// completes at the header). A disabled limiter skips owed tracking
+		// entirely (the pre-WS-I baseline).
+		rs.addOwed(frame.Channel, bodySize)
 	}
 	return true
 }
 
-// trackBodyProgress records read progress against the owed leased body on the
-// frame's channel. Heartbeats and frames on other channels do NOT count (the
-// owed deadline is only extended by body bytes on the owing channel).
-func (s *Server) trackBodyProgress(frame *protocol.Frame, owed map[uint16]*owedBody) {
-	ob, ok := owed[frame.Channel]
-	if !ok {
-		return
-	}
-	n := uint64(len(frame.Payload))
-	if n >= ob.remaining {
-		// Overrun (more body bytes than declared) is rejected downstream by
-		// the existing processor check; the owed entry is done either way.
-		delete(owed, frame.Channel)
-		return
-	}
-	ob.remaining -= n
-	ob.lastProgress = time.Now()
+// revokeAndDrainConnectionLeases releases every publish lease the connection
+// still owns — header leases queued for the processor, the in-flight header
+// lease, and leases held by half-received publishes. Once-only (the
+// leasesRevoked flag also tells the processor to discard further header/body
+// content instead of admitting it unleased). Broker-owned transferred leases
+// are NOT touched: they release independently on WAL completion.
+func (s *Server) revokeAndDrainConnectionLeases(rt *connRuntime) {
+	conn := rt.conn
+	rt.leasesDrainOnce.Do(func() {
+		for _, le := range conn.LeaseFIFO.Drain() {
+			if le != nil {
+				le.Release()
+			}
+		}
+		releaseHeaderLease(conn)
+		for _, pm := range conn.PendingMessages {
+			takeLease(pm)()
+		}
+	})
 }
 
-// oldestOwedProgress returns the oldest lastProgress across owed bodies; the
-// owed read deadline is oldest + writeTimeout.
-func oldestOwedProgress(owed map[uint16]*owedBody) time.Time {
-	var oldest time.Time
-	for _, ob := range owed {
-		if oldest.IsZero() || ob.lastProgress.Before(oldest) {
-			oldest = ob.lastProgress
+// bodyStallClose closes a connection whose leased publish body made no
+// progress within writeTimeout of its last body byte. This is a body stall,
+// NOT a heartbeat death: the close is accounted separately and teardown
+// releases every lease the connection owns.
+func (s *Server) bodyStallClose(conn *protocol.Connection, rs *readerState) {
+	if lm := s.leaseMetrics(); lm != nil {
+		lm.RecordPublishLeaseBodyStallClose()
+	}
+	s.Log.Warn("leased publish body stalled; closing connection",
+		zap.String("connection_id", conn.ID),
+		zap.Int("owed_channels", rs.owedLen()))
+	conn.Closed.Store(true)
+}
+
+// leaseClose506 makes a best-effort connection.close 506 under writeTimeout,
+// then closes the socket; the reader returns at once.
+func (s *Server) leaseClose506(rt *connRuntime, channel uint16, wireReason, logReason string, owedChannels int) {
+	conn := rt.conn
+	if lm := s.leaseMetrics(); lm != nil {
+		lm.RecordPublishLeaseOverbudgetClose()
+	}
+	s.Log.Warn(logReason,
+		zap.String("connection_id", conn.ID),
+		zap.Uint16("channel", channel),
+		zap.Int("owed_channels", owedChannels))
+	s.goConn(rt, "lease-close", func() {
+		_ = s.connectionError(conn, amqperrors.ResourceError, wireReason, 60, 40)
+		conn.Closed.Store(true)
+		_ = conn.Conn.Close()
+	})
+}
+
+// waitForHeaderLease waits for a queued lease reservation WITHOUT reading the
+// socket. While waiting it keeps the SQ-13 hand-off alive: buffered (pending)
+// frames are handed to processFrames whenever the frame budget allows, so a
+// full FrameQueue plus a parked processor can never wedge behind the wait.
+// Returns (lease, true) on grant, (nil, true) when the connection is closing
+// (the caller pairs a nil lease and keeps reading close-ok), or (_, false)
+// when the reader must exit (teardown, limiter close, or a processor stall).
+func (s *Server) waitForHeaderLease(rt *connRuntime, channel uint16, wait *LeaseWait, rs *readerState) (*Lease, bool) {
+	conn := rt.conn
+	stall := time.NewTimer(s.writeTimeout())
+	defer stall.Stop()
+	seq := rt.procSeq.Load()
+	for {
+		// Hand pending[0] to the processor whenever the frame budget allows.
+		var q chan *protocol.Frame
+		var head *protocol.Frame
+		var headCost int64
+		if len(rs.pending) > 0 {
+			head = rs.pending[0]
+			headCost = frameCost(head)
+			if s.frameBudgetAllows(conn, headCost) {
+				q = conn.FrameQueue
+			}
+		}
+		select {
+		case q <- head:
+			conn.FrameQueueBytes.Add(headCost)
+			rs.pendingBytes -= int64(head.Size)
+			rs.pending[0] = nil
+			rs.pending = rs.pending[1:]
+			continue
+		case g := <-wait.C():
+			if g.err != nil {
+				return nil, false
+			}
+			return g.lease, true
+		case <-conn.FrameBudgetWake:
+			continue // re-evaluate the budget
+		case <-rt.leaseCtx.Done():
+			wait.Cancel()
+			if rt.connClosing.Load() {
+				return nil, true // closing: pair nil, keep reading close-ok
+			}
+			return nil, false
+		case <-conn.Done:
+			wait.Cancel()
+			return nil, false
+		case <-stall.C:
+			if rt.procSeq.Load() == seq && (len(rs.pending) > 0 || conn.LeaseFIFO.Len() > 0 || len(conn.FrameQueue) > 0) {
+				// PROCESSOR STALL: content is queued but the processor made
+				// no progress for a whole writeTimeout — the wait can never
+				// complete. Cancel it and close with 506.
+				wait.Cancel()
+				s.leaseClose506(rt, channel,
+					fmt.Sprintf("RESOURCE_ERROR - publish lease wait stalled (no processor progress) on channel %d", channel),
+					"publish lease wait stalled: no processor progress; closing connection", rs.owedLen())
+				return nil, false
+			}
+			seq = rt.procSeq.Load()
+			stall.Reset(s.writeTimeout())
 		}
 	}
-	return oldest
 }

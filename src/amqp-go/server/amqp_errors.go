@@ -110,6 +110,11 @@ func (s *Server) failConnection(rt *connRuntime, code uint16, text string, class
 		return
 	}
 	rt.closeHandshakeStarted.Store(true)
+	// WS-I: unblock a reader parked in a lease wait — the connection is
+	// closing; the reader pairs nil leases from here and keeps reading so the
+	// client's close-ok is seen (covers BOTH branches below: the close frame
+	// sent, or the socket already dead).
+	rt.leaseCancel()
 	conn := rt.conn
 	if rt.handshakeDone.Load() {
 		// Durable confirms are real; deliver them before the close (best-effort).
