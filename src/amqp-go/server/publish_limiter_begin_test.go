@@ -98,18 +98,12 @@ func TestLimiter_BeginAndLeaseWaitCancel(t *testing.T) {
 				_, _, w := l.Stats()
 				return w == 1
 			}, 30*time.Second, time.Millisecond)
+			// Cancel races the grant triggered by a's release. Either the
+			// cancel removes the waiter first (C never delivers — the caller
+			// must NOT read it after Cancel) or the grant is delivered and
+			// Cancel drains + releases it. Both end at used == 0, waiters == 0.
 			go wait.Cancel()
-			a.Release() // grants b, racing the cancel
-			select {
-			case g := <-wait.C():
-				// The grant was delivered BEFORE the cancel took the mutex:
-				// Cancel must have released it (used back to 0).
-				if g.lease != nil {
-					g.lease.Release()
-				}
-			case <-time.After(30 * time.Second):
-				t.Fatal("wait never resolved")
-			}
+			a.Release()
 			require.Eventually(t, func() bool {
 				used, _, w := l.Stats()
 				return used == 0 && w == 0

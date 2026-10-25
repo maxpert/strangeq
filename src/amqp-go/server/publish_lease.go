@@ -460,9 +460,13 @@ func (s *Server) waitForHeaderLease(rt *connRuntime, channel uint16, wait *Lease
 		// Hand pending[0] to the processor whenever the frame budget allows.
 		var q chan *protocol.Frame
 		var head *protocol.Frame
-		var headCost int64
+		var headSize, headCost int64
 		if len(rs.pending) > 0 {
 			head = rs.pending[0]
+			// Capture Size+cost BEFORE the send: once the processor receives
+			// the frame it may pool it, and the recycled frame can be
+			// overwritten while we still hold the reference.
+			headSize = int64(head.Size)
 			headCost = frameCost(head)
 			if s.frameBudgetAllows(conn, headCost) {
 				q = conn.FrameQueue
@@ -471,7 +475,7 @@ func (s *Server) waitForHeaderLease(rt *connRuntime, channel uint16, wait *Lease
 		select {
 		case q <- head:
 			conn.FrameQueueBytes.Add(headCost)
-			rs.pendingBytes -= int64(head.Size)
+			rs.pendingBytes -= headSize
 			rs.pending[0] = nil
 			rs.pending = rs.pending[1:]
 			continue
