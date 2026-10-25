@@ -771,7 +771,7 @@ func TestLease_MalformedHeaderNilLease(t *testing.T) {
 // SL-10: the channel-max and closing-gate discards release the header lease.
 func TestLease_DiscardGatesRelease(t *testing.T) {
 	t.Run("channel-max gate", func(t *testing.T) {
-		_, addr, created, released, _ := leaseServer(t, 0, nil, nil)
+		srv, addr, created, released, _ := leaseServer(t, 0, nil, nil)
 		r := dialRaw(t, addr)
 		r.handshake("guest", "guest", 1, 0) // channel_max = 1
 		r.openChannel(1)
@@ -780,11 +780,16 @@ func TestLease_DiscardGatesRelease(t *testing.T) {
 
 		// Publish on channel 2 (> channel_max): method + header are both
 		// discarded by the §6.3 gate; the header's lease must be released.
+		// (If the processor's 530 close beats the reader's header reserve,
+		// the header pairs a nil lease instead — created == 0 — also correct;
+		// the channel-max discard arm itself is covered deterministically by
+		// the closing-gate sub-test.)
 		leaseSendPublish(t, r, 2, "", "sl10-q", leaseBody(1024), true)
 		r.expectConnectionClose(530) // NOT_ALLOWED - channel exceeds channel_max
 		require.Eventually(t, func() bool {
-			return created.Load() == 1 && released.Load() == 1
-		}, 30*time.Second, time.Millisecond, "the channel-max discard arm must release the lease")
+			c, rel := created.Load(), released.Load()
+			return c == rel && c <= 1 && leaseUsed(srv) == 0
+		}, 30*time.Second, time.Millisecond, "no lease may leak on the channel-max discard path")
 	})
 
 	t.Run("closing gate", func(t *testing.T) {
