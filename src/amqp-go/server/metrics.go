@@ -102,8 +102,22 @@ type LeaseMetrics interface {
 	RecordPublishLeaseBodyStallClose()
 	// RecordPublishLeaseLeaked counts a lease recovered by PutPendingMessage.
 	RecordPublishLeaseLeaked()
-	// UpdatePublishLeaseGauges publishes the current lease gauges.
+}
+
+// LeaseGaugeObserver is an OPTIONAL hook-driven gauge sink (WS-I review):
+// called on every grant/release transition with the fresh values. Test probes
+// implement it for exact per-step assertions; the production collector uses
+// scrape-time GaugeFuncs instead (see LeaseStatsBinder).
+type LeaseGaugeObserver interface {
 	UpdatePublishLeaseGauges(usedBytes, budgetBytes int64, waiters int)
+}
+
+// LeaseStatsBinder is implemented by the production collector: the server
+// binds the limiter's Stats function at limiter creation so the
+// amqp_publish_lease_* gauges are read AT SCRAPE TIME (never stale) and the
+// budget gauge initializes immediately.
+type LeaseStatsBinder interface {
+	BindPublishLeaseStats(stats func() (used, budget int64, waiters int))
 }
 
 // leaseMetrics returns the MetricsCollector as a LeaseMetrics, or nil.

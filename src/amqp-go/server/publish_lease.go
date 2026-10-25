@@ -43,9 +43,16 @@ func (s *Server) publishLimiter() *PublishLimiter {
 		l := NewPublishLimiter(budget)
 		l.hooks = s.buildLimiterHooks(l)
 		s.limiter = l
-		// Wire the PutPendingMessage lease-leak recovery counter (process-wide
-		// hook; last server wins — harmless for multi-server tests). Resolved
-		// at call time so a collector installed after Build still reports.
+		// Bind the scrape-time GaugeFuncs to the limiter's Stats (the budget
+		// gauge initializes from the first scrape).
+		if b, ok := s.MetricsCollector.(LeaseStatsBinder); ok {
+			b.BindPublishLeaseStats(l.Stats)
+		}
+		// Wire the PutPendingMessage lease-leak recovery counter. NOTE: the
+		// protocol-level hook is PROCESS-WIDE (last server to build a limiter
+		// wins) — acceptable because production runs one server per process
+		// and the counter's contract is "must stay zero". Resolved at call
+		// time so a collector installed after Build still reports.
 		protocol.SetLeaseLeakReporter(func() {
 			if lm := s.leaseMetrics(); lm != nil {
 				lm.RecordPublishLeaseLeaked()
@@ -77,11 +84,11 @@ func (s *Server) buildLimiterHooks(l *PublishLimiter) *LimiterHooks {
 			if c := s.leaseCreated; c != nil {
 				c.Add(1)
 			}
-			if lm := s.leaseMetrics(); lm != nil {
-				if oversized {
-					lm.RecordPublishLeaseOversized()
-				}
-				lm.UpdatePublishLeaseGauges(used, l.budget, waiters)
+			if lm := s.leaseMetrics(); lm != nil && oversized {
+				lm.RecordPublishLeaseOversized()
+			}
+			if gob, ok := s.MetricsCollector.(LeaseGaugeObserver); ok {
+				gob.UpdatePublishLeaseGauges(used, l.budget, waiters)
 			}
 			if h := s.limiterStepHook; h != nil {
 				h("grant:" + connID)
@@ -91,8 +98,8 @@ func (s *Server) buildLimiterHooks(l *PublishLimiter) *LimiterHooks {
 			if c := s.leaseReleased; c != nil {
 				c.Add(1)
 			}
-			if lm := s.leaseMetrics(); lm != nil {
-				lm.UpdatePublishLeaseGauges(used, l.budget, waiters)
+			if gob, ok := s.MetricsCollector.(LeaseGaugeObserver); ok {
+				gob.UpdatePublishLeaseGauges(used, l.budget, waiters)
 			}
 		},
 	}

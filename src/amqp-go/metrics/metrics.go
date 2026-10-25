@@ -1,6 +1,8 @@
 package metrics
 
 import (
+	"sync/atomic"
+
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
 )
@@ -118,16 +120,22 @@ type Collector struct {
 	// BuildInfo is the constant-1 build identity gauge.
 	BuildInfo *prometheus.GaugeVec
 
-	// WS-I Phase B publish-lease metrics (amqp_publish_lease_*).
-	PublishLeaseUsedBytes             prometheus.Gauge
-	PublishLeaseBudgetBytes           prometheus.Gauge
-	PublishLeaseWaiters               prometheus.Gauge
+	// WS-I Phase B publish-lease metrics (amqp_publish_lease_*). The three
+	// gauges are GaugeFuncs reading the bound limiter Stats AT SCRAPE TIME
+	// (never stale); bind via BindPublishLeaseStats.
+	PublishLeaseUsedBytes             prometheus.GaugeFunc
+	PublishLeaseBudgetBytes           prometheus.GaugeFunc
+	PublishLeaseWaiters               prometheus.GaugeFunc
 	PublishLeaseWaitsTotal            prometheus.Counter
 	PublishLeaseOversizedTotal        prometheus.Counter
 	PublishLeaseOverbudgetClosesTotal prometheus.Counter
 	PublishLeaseBodyStallClosesTotal  prometheus.Counter
 	PublishLeaseLeakedTotal           prometheus.Counter
 	PublishLeaseWaitSeconds           prometheus.Histogram
+
+	// publishLeaseStats points at the binding the GaugeFunc closures read
+	// (nil func → zero gauges). Set once by BindPublishLeaseStats.
+	publishLeaseStats *atomic.Value
 }
 
 // NewCollector creates a new metrics collector with all Prometheus metrics
@@ -136,7 +144,12 @@ func NewCollector(namespace string) *Collector {
 		namespace = "amqp"
 	}
 
-	return &Collector{
+	// The lease GaugeFuncs read the bound limiter Stats at scrape time;
+	// leaseStats is the shared cell the closures and BindPublishLeaseStats
+	// both use.
+	leaseStats := &atomic.Value{}
+
+	c := &Collector{
 		// Connection metrics
 		ConnectionsTotal: promauto.NewGauge(prometheus.GaugeOpts{
 			Namespace: namespace,
@@ -466,20 +479,38 @@ func NewCollector(namespace string) *Collector {
 			Help:      "Build identity; the value is always 1",
 		}, []string{"version", "commit", "go_version"}),
 
-		PublishLeaseUsedBytes: promauto.NewGauge(prometheus.GaugeOpts{
+		PublishLeaseUsedBytes: promauto.NewGaugeFunc(prometheus.GaugeOpts{
 			Namespace: namespace,
 			Name:      "publish_lease_used_bytes",
 			Help:      "Declared publish body bytes (+framing) currently leased (WS-I)",
+		}, func() float64 {
+			if fn, ok := leaseStats.Load().(func() (int64, int64, int)); ok && fn != nil {
+				used, _, _ := fn()
+				return float64(used)
+			}
+			return 0
 		}),
-		PublishLeaseBudgetBytes: promauto.NewGauge(prometheus.GaugeOpts{
+		PublishLeaseBudgetBytes: promauto.NewGaugeFunc(prometheus.GaugeOpts{
 			Namespace: namespace,
 			Name:      "publish_lease_budget_bytes",
 			Help:      "Publish-inflight lease budget G (WS-I)",
+		}, func() float64 {
+			if fn, ok := leaseStats.Load().(func() (int64, int64, int)); ok && fn != nil {
+				_, budget, _ := fn()
+				return float64(budget)
+			}
+			return 0
 		}),
-		PublishLeaseWaiters: promauto.NewGauge(prometheus.GaugeOpts{
+		PublishLeaseWaiters: promauto.NewGaugeFunc(prometheus.GaugeOpts{
 			Namespace: namespace,
 			Name:      "publish_lease_waiters",
 			Help:      "Connections currently queued for a publish lease (WS-I)",
+		}, func() float64 {
+			if fn, ok := leaseStats.Load().(func() (int64, int64, int)); ok && fn != nil {
+				_, _, waiters := fn()
+				return float64(waiters)
+			}
+			return 0
 		}),
 		PublishLeaseWaitsTotal: promauto.NewCounter(prometheus.CounterOpts{
 			Namespace: namespace,
@@ -513,6 +544,8 @@ func NewCollector(namespace string) *Collector {
 			Buckets:   prometheus.ExponentialBuckets(0.0001, 10, 7),
 		}),
 	}
+	c.publishLeaseStats = leaseStats
+	return c
 }
 
 // RecordPublishLeaseWait observes one completed blocking lease wait.
@@ -533,11 +566,11 @@ func (c *Collector) RecordPublishLeaseBodyStallClose() { c.PublishLeaseBodyStall
 // RecordPublishLeaseLeaked counts one lease recovered by PutPendingMessage.
 func (c *Collector) RecordPublishLeaseLeaked() { c.PublishLeaseLeakedTotal.Inc() }
 
-// UpdatePublishLeaseGauges publishes the current lease gauges.
-func (c *Collector) UpdatePublishLeaseGauges(usedBytes, budgetBytes int64, waiters int) {
-	c.PublishLeaseUsedBytes.Set(float64(usedBytes))
-	c.PublishLeaseBudgetBytes.Set(float64(budgetBytes))
-	c.PublishLeaseWaiters.Set(float64(waiters))
+// BindPublishLeaseStats binds the limiter Stats function the lease GaugeFuncs
+// read at scrape time, and initializes the budget gauge. Called once by the
+// server when the publish limiter is created.
+func (c *Collector) BindPublishLeaseStats(stats func() (used, budget int64, waiters int)) {
+	c.publishLeaseStats.Store(stats)
 }
 
 // RecordAuthFailure increments the failed-authentication counter for reason.

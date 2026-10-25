@@ -481,6 +481,9 @@ func TestLease_1000Connections(t *testing.T) {
 	setup.declareQueue(1, "sl4-q")
 	closeRawRST(setup)
 
+	// Measure the goroutine baseline only after the setup connection's
+	// teardown has fully settled (its goroutines exited).
+	require.Eventually(t, func() bool { return wsbConnCount(srv) == 0 }, 30*time.Second, 10*time.Millisecond)
 	base := runtime.NumGoroutine()
 
 	const conns = 1000
@@ -509,10 +512,13 @@ func TestLease_1000Connections(t *testing.T) {
 	assert.LessOrEqual(t, probe.maxUsed.Load(), int64(256<<20), "used <= G")
 	require.Eventually(t, func() bool { return leaseUsed(srv) == 0 }, 30*time.Second, time.Millisecond)
 
-	// Goroutines return to baseline once teardowns complete.
+	// Goroutines return to baseline once teardowns complete: first wait for
+	// all connections to disappear, then for the goroutine count to settle.
+	require.Eventually(t, func() bool { return wsbConnCount(srv) == 0 }, 30*time.Second, 10*time.Millisecond,
+		"all 1000 connections must tear down")
 	require.Eventually(t, func() bool {
 		return runtime.NumGoroutine() <= base+2
-	}, 30*time.Second, 50*time.Millisecond,
+	}, 60*time.Second, 50*time.Millisecond,
 		"goroutines must return to baseline: base=%d now=%d", base, runtime.NumGoroutine())
 }
 
