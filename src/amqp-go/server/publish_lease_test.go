@@ -1455,6 +1455,20 @@ func TestLease_TakeLeaseNilSafeAndPutAsserts(t *testing.T) {
 		assert.Equal(t, int64(1), n.Load(), "tx releases at AddOperation")
 	})
 
+	t.Run("tx invalid exchange", func(t *testing.T) {
+		srv, conn, frameCh := newSrvConn(t)
+		require.NoError(t, srv.handleTxSelect(conn, 1, []byte{}))
+		drainFrame(t, frameCh)
+		var n atomic.Int64
+		pm := makeDurablePendingMessage("no-such-exchange", "k", "b")
+		pm.Lease = &countingReleaser{releases: &n}
+		err := srv.processCompleteMessage(conn, 1, pm)
+		drainFrame(t, frameCh) // channel.close from the 404
+		require.Error(t, err, "the tx-arm exchange validation must fail before buffering")
+		assert.Nil(t, pm.Lease)
+		assert.Equal(t, int64(1), n.Load(), "the defer releases on the validation early return")
+	})
+
 	t.Run("async durable releases on completion", func(t *testing.T) {
 		release := gateWALFsync(t)
 		srv, conn, frameCh := newSrvConn(t)
