@@ -1080,6 +1080,7 @@ func TestLease_NestedHeaderOverBudgetCloses(t *testing.T) {
 	x.openChannel(1)
 	x.declareQueue(1, "sl15-q")
 	leaseConfirmSelect(t, x, 1)
+	x.openChannel(2) // ch2 is legal; its header must be stopped by the 506, not by an unopened-channel error
 	leaseSendMethod(t, x, 1, "", "sl15-q", false)
 	leaseSendHeader(t, x, 1, 600<<10, true, "")
 	leaseSendBody(t, x, 1, leaseBody(100<<10)) // 500 KiB still owed
@@ -1542,9 +1543,11 @@ func TestLease_ParksDeferredWhileOwed(t *testing.T) {
 	require.Eventually(t, func() bool { return len(conn.FrameQueue) >= 3 }, 30*time.Second, time.Millisecond,
 		"the reader keeps reading while a leased body is owed (no park)")
 
-	// Final body bytes: owed clears.
+	// Final body bytes: owed clears. Wait until the reader has enqueued ALL
+	// five frames (method, header, 3×body) — at 4 the last 200 bytes could
+	// still be owed, and the (correctly deferred) park has not engaged yet.
 	w(&protocol.Frame{Type: protocol.FrameBody, Channel: 1, Size: 200, Payload: make([]byte, 200)})
-	require.Eventually(t, func() bool { return len(conn.FrameQueue) >= 4 }, 30*time.Second, time.Millisecond)
+	require.Eventually(t, func() bool { return len(conn.FrameQueue) >= 5 }, 30*time.Second, time.Millisecond)
 
 	// Now the alarm park engages: a further frame is NOT read.
 	queued := len(conn.FrameQueue)
