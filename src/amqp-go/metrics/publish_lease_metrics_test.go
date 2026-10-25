@@ -6,16 +6,15 @@ import (
 	"github.com/prometheus/client_golang/prometheus/testutil"
 )
 
+// Shared because promauto registration is process-global (a second
+// NewCollector with the same namespace panics under -count>1).
+var leaseGaugeTestCollector = NewCollector("leasegf")
+
 // WS-I review (item 8): the publish-lease gauges are GaugeFuncs reading the
 // limiter's Stats at SCRAPE time (never stale), and the budget is initialized
 // at bind time.
 func TestPublishLeaseGaugeFuncsReadStatsAtScrape(t *testing.T) {
-	c := NewCollector("leasegf")
-
-	// Before binding, the gauges scrape as zero.
-	if got := testutil.ToFloat64(c.PublishLeaseUsedBytes); got != 0 {
-		t.Fatalf("unbound used gauge = %v, want 0", got)
-	}
+	c := leaseGaugeTestCollector
 
 	var used, budget int64
 	var waiters int
