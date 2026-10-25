@@ -42,54 +42,54 @@ func (s *Server) publishLimiter() *PublishLimiter {
 		l.hooks = s.buildLimiterHooks(l)
 		s.limiter = l
 		// Wire the PutPendingMessage lease-leak recovery counter (process-wide
-		// hook; last server wins — harmless for multi-server tests).
-		if lm := s.leaseMetrics(); lm != nil {
-			protocol.SetLeaseLeakReporter(lm.RecordPublishLeaseLeaked)
-		}
+		// hook; last server wins — harmless for multi-server tests). Resolved
+		// at call time so a collector installed after Build still reports.
+		protocol.SetLeaseLeakReporter(func() {
+			if lm := s.leaseMetrics(); lm != nil {
+				lm.RecordPublishLeaseLeaked()
+			}
+		})
 	})
 	return s.limiter
 }
 
 // buildLimiterHooks wires the limiter's observation callbacks to metrics and
-// the test-only step hook and created/released counters. Nil when nothing is
-// wired (production zero-cost).
+// the test-only step hook and created/released counters. The hooks consult
+// the server fields AT CALL TIME: they are set before Start (production:
+// during Build) and never change while traffic flows, so the reads are
+// stable; the per-call nil checks keep the production cost at a few branches
+// per grant/release.
 func (s *Server) buildLimiterHooks(l *PublishLimiter) *LimiterHooks {
-	lm := s.leaseMetrics()
-	stepHook := s.limiterStepHook
-	created, released := s.leaseCreated, s.leaseReleased
-	if lm == nil && stepHook == nil && created == nil && released == nil {
-		return nil
-	}
 	return &LimiterHooks{
 		BeforeReserve: func(connID string, bytes int64) {
-			if stepHook != nil {
-				stepHook("reserve:" + connID)
+			if h := s.limiterStepHook; h != nil {
+				h("reserve:" + connID)
 			}
 		},
 		OnWait: func(d time.Duration) {
-			if lm != nil {
+			if lm := s.leaseMetrics(); lm != nil {
 				lm.RecordPublishLeaseWait(d.Seconds())
 			}
 		},
 		OnGrant: func(connID string, bytes int64, oversized bool, used int64, waiters int) {
-			if created != nil {
-				created.Add(1)
+			if c := s.leaseCreated; c != nil {
+				c.Add(1)
 			}
-			if lm != nil {
+			if lm := s.leaseMetrics(); lm != nil {
 				if oversized {
 					lm.RecordPublishLeaseOversized()
 				}
 				lm.UpdatePublishLeaseGauges(used, l.budget, waiters)
 			}
-			if stepHook != nil {
-				stepHook("grant:" + connID)
+			if h := s.limiterStepHook; h != nil {
+				h("grant:" + connID)
 			}
 		},
 		OnRelease: func(bytes int64, used int64, waiters int) {
-			if released != nil {
-				released.Add(1)
+			if c := s.leaseReleased; c != nil {
+				c.Add(1)
 			}
-			if lm != nil {
+			if lm := s.leaseMetrics(); lm != nil {
 				lm.UpdatePublishLeaseGauges(used, l.budget, waiters)
 			}
 		},

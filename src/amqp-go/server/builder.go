@@ -358,6 +358,11 @@ func (b *ServerBuilder) Build() (*Server, error) {
 	// Create and attach lifecycle manager
 	server.Lifecycle = NewLifecycleManager(server, b.config)
 
+	// WS-I Phase B: build the publish-inflight lease limiter (it is otherwise
+	// built lazily on the first publish — building it here wires the metrics
+	// and the budget gauge at startup).
+	_ = server.publishLimiter()
+
 	// Always perform recovery (storage is always persistent)
 	recoveryManager := NewRecoveryManager(storageImpl, unifiedBroker, logger.(*ZapLoggerAdapter).logger)
 
