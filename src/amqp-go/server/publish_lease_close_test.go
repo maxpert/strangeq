@@ -88,12 +88,12 @@ func (w *wedgingBroker) PublishMessageAdmitted(exchangeName, routingKey string, 
 	return w.UnifiedBroker.(NonBlockingPublisher).PublishMessageAdmitted(exchangeName, routingKey, message)
 }
 
-func (w *wedgingBroker) PublishMessageAsyncConfirm(exchangeName, routingKey string, message *protocol.Message, onDurable func(error), onReleased func()) (bool, protocol.DepthGate, error) {
+func (w *wedgingBroker) PublishMessageAsyncConfirm(exchangeName, routingKey string, message *protocol.Message, onDurable func(error), leaseDone protocol.PublishLeaseToken) (bool, protocol.DepthGate, error) {
 	w.once.Do(func() {
 		w.waiting.Store(true)
 		<-w.gate
 	})
-	return w.UnifiedBroker.PublishMessageAsyncConfirm(exchangeName, routingKey, message, onDurable, onReleased)
+	return w.UnifiedBroker.PublishMessageAsyncConfirm(exchangeName, routingKey, message, onDurable, leaseDone)
 }
 
 // SL-23 (Opus): with the processor wedged mid-publish and content queued, a

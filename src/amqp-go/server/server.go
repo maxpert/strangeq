@@ -450,14 +450,15 @@ func (s *Server) cleanupConnection(connection *protocol.Connection) {
 		s.revokeAndDrainConnectionLeases(rt.(*connRuntime))
 	} else {
 		// Bare-connection unit tests (no registered runtime): drain directly.
-		for _, le := range connection.LeaseFIFO.Drain() {
-			if le != nil {
-				le.Release()
-			}
+		for _, t := range connection.LeaseFIFO.Drain() {
+			t.Abort()
 		}
 		releaseHeaderLease(connection)
 		for _, pm := range connection.PendingMessages {
-			takeLease(pm)()
+			if pm != nil {
+				pm.LeaseToken.Abort()
+				pm.LeaseToken = protocol.PublishLeaseToken{}
+			}
 		}
 	}
 

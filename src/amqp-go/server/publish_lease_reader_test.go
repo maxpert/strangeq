@@ -80,15 +80,15 @@ func TestLease_PendingHandoffDuringLeaseWait(t *testing.T) {
 
 	// Release msg1's lease → the wait grants → the header is enqueued LAST
 	// (ordering preserved).
-	le := conn.LeaseFIFO.Pop()
-	require.NotNil(t, le)
-	le.Release()
+	tok := conn.LeaseFIFO.Pop()
+	require.True(t, tok.Valid())
+	tok.Abort()
 	h2 := drain()
 	assert.Equal(t, byte(protocol.FrameHeader), h2.Type, "h2 enqueued after m2 (order preserved)")
 	protocol.PutFrame(h2)
-	le2 := conn.LeaseFIFO.Pop()
-	require.NotNil(t, le2)
-	le2.Release()
+	tok2 := conn.LeaseFIFO.Pop()
+	require.True(t, tok2.Valid())
+	tok2.Abort()
 }
 
 // Item 6 (Sol): a zero-length body frame is NOT progress: it neither

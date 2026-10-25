@@ -6,9 +6,11 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/maxpert/amqp-go/protocol"
 )
 
-// WS-I Phase B: header-time fair publish lease.
+// WS-I Phase B (generational tokens): header-time fair publish lease.
 //
 // The PublishLimiter bounds exactly one quantity: DECLARED publish body bytes
 // plus fixed framing, reserved when the content-header frame is read and held
@@ -18,54 +20,139 @@ import (
 // oversized exception granted only at used == 0. Invariant: used <= G outside
 // that one oversized lease.
 //
-// The limiter NEVER does I/O: grant and release are short mutex sections, so
-// Lease.Release is safe to call from the WAL batch-writer goroutine (A4).
+// ZERO steady-state allocation: granted leases are slots in lazily-grown pages
+// owned by the limiter (protocol.PublishLeaseToken carries {slotRef, gen} by
+// value). The old per-publish &Lease{} + joinRelease{} + defer-closure
+// allocations are gone; the two-party retention (serverDone AND brokerDone)
+// lives in slot bits, and every signal re-validates the token generation so a
+// recycled slot is immune to late duplicate signals (ABA defense).
+//
+// The limiter NEVER does I/O: the join signal paths are lock-free atomics and
+// only the final free takes the mutex, so LeaseAbort/LeaseBrokerDone are safe
+// to call from the WAL batch-writer goroutine (A4).
 
 // ErrLimiterClosed is returned by Reserve (and reported to queued waiters)
-// after Close. Outstanding leases still release normally.
+// after Close. Outstanding tokens still release normally.
 var ErrLimiterClosed = errors.New("publish limiter closed")
 
-// noopRelease is the shared no-op release function: the disabled limiter and
-// every nil-lease path return it instead of allocating a closure.
-var noopRelease = func() {}
+// token/lifecycle state constants (package-visible for tests).
+const (
+	tokenStateFree = iota
+	tokenStateConnection
+	tokenStateTransferred
+)
 
-// disabledLease is the single shared lease handed out by a disabled limiter
-// (budget <= 0). Its ReleaseFunc is noopRelease, so the whole disabled path is
-// allocation-free.
-var disabledLease = &Lease{fn: noopRelease}
+const (
+	leaseBitServer uint32 = 1
+	leaseBitBroker uint32 = 2
+)
 
-// Lease is one granted reservation of bytes against a PublishLimiter. Release
-// is idempotent and nil-safe. The release function is pre-bound once at grant
-// (fn) so ReleaseFunc never allocates.
-type Lease struct {
-	l        *PublishLimiter
-	bytes    int64
-	released atomic.Bool
-	fn       func()
+// leaseSlotsPageBits: slots are allocated 2^12 per page; page arrays never
+// move or shrink after creation, so slot pointers stay valid for the lifetime
+// of the limiter.
+const leaseSlotsPageBits = 12
+const leaseSlotsPerPage = 1 << leaseSlotsPageBits
+
+// pooledLease is one slot in the limiter's page pool. It implements
+// protocol.leaseTokenOps (exported methods — asserted from protocol token
+// values) with a generation-validated state machine. Per-publish allocation:
+// zero.
+type pooledLease struct {
+	l     *PublishLimiter
+	idx   uint32 // global slot index (pageShift|offset), fixed at allocation
+	bytes int64
+	gen   atomic.Uint32 // bumped to a fresh value when the slot returns FREE
+	state atomic.Int32  // tokenState*
+	bits  atomic.Uint32 // leaseBitServer|leaseBitBroker
 }
 
-// releaseOnce performs the idempotent release; nil-safe and safe for
-// concurrent use.
-func (le *Lease) releaseOnce() {
-	if le == nil {
+// LeaseAbort aborts the lease from server-side ownership (teardown or error
+// path). Generation-checked; idempotent.
+func (p *pooledLease) LeaseAbort(gen uint32) {
+	if p.gen.Load() != gen {
+		return // stale signal into a reused slot lifetime
+	}
+	p.abortLim()
+}
+
+func (p *pooledLease) abortLim() {
+	for {
+		st := p.state.Load()
+		switch st {
+		case tokenStateFree:
+			return
+		case tokenStateConnection, tokenStateTransferred:
+			if p.state.CompareAndSwap(st, tokenStateFree) {
+				p.l.freeSlot(p)
+				return
+			}
+		default:
+			return
+		}
+	}
+}
+
+// LeaseTransfer moves ownership to the broker/WAL completion machinery: the
+// lease may now only be freed by the serverDone+brokerDone join (or a
+// teardown Abort). Idempotent.
+func (p *pooledLease) LeaseTransfer(gen uint32) {
+	if p.gen.Load() != gen {
 		return
 	}
-	if le.released.CompareAndSwap(false, true) && le.l != nil {
-		le.l.release(le.bytes)
+	p.state.CompareAndSwap(tokenStateConnection, tokenStateTransferred)
+}
+
+// LeaseServerDone signals the server-side wire-write part is done.
+func (p *pooledLease) LeaseServerDone(gen uint32) { p.done(gen, leaseBitServer) }
+
+// LeaseBrokerDone signals every accepted durable copy is complete (or a
+// synchronous path finished / was refused).
+func (p *pooledLease) LeaseBrokerDone(gen uint32) { p.done(gen, leaseBitBroker) }
+
+// LeaseServerFinish is the deferred processCompleteMessage completion: server
+// part done; then, when the lease was never transferred (still CONNECTION),
+// abort it — the server-side early-return path.
+func (p *pooledLease) LeaseServerFinish(gen uint32) {
+	p.done(gen, leaseBitServer)
+	if p.gen.Load() != gen {
+		return // freed by done() or already recycled: nothing to abort
+	}
+	if st := p.state.Load(); st == tokenStateConnection {
+		p.abortLim()
 	}
 }
 
-// Release returns the lease's bytes to the limiter, granting waiters from the
-// head of the FIFO while the grant rule holds. Idempotent; nil-safe.
-func (le *Lease) Release() { le.releaseOnce() }
-
-// ReleaseFunc returns the lease's pre-bound release function, or the shared
-// noopRelease for a nil/disabled lease. Never allocates.
-func (le *Lease) ReleaseFunc() func() {
-	if le == nil || le.fn == nil {
-		return noopRelease
+func (p *pooledLease) done(gen uint32, bit uint32) {
+	if p.gen.Load() != gen {
+		return
 	}
-	return le.fn
+	for {
+		if p.state.Load() == tokenStateFree {
+			return
+		}
+		old := p.bits.Load()
+		if old&bit != 0 {
+			return // duplicate signal from the same side: no-op
+		}
+		if !p.bits.CompareAndSwap(old, old|bit) {
+			continue
+		}
+		if old|bit == leaseBitServer|leaseBitBroker {
+			// Both sides done: free exactly once (state CAS; an Abort that won
+			// the race already freed it — then state is FREE and we no-op).
+			for {
+				st := p.state.Load()
+				if st == tokenStateFree {
+					return
+				}
+				if p.state.CompareAndSwap(st, tokenStateFree) {
+					p.l.freeSlot(p)
+					return
+				}
+			}
+		}
+		return
+	}
 }
 
 // LimiterHooks are optional observation callbacks. Nil in production unless
@@ -96,8 +183,8 @@ type limiterWaiter struct {
 }
 
 type limiterGrant struct {
-	lease *Lease
-	err   error
+	tok protocol.PublishLeaseToken
+	err error
 }
 
 // PublishLimiter is the global publish-body byte lease (WS-I Phase B).
@@ -105,18 +192,27 @@ type PublishLimiter struct {
 	mu     sync.Mutex
 	budget int64
 	used   int64
-	fifo   []*limiterWaiter
+	// waiter ring: FIFO of queued Reserve requests, bounded backing array
+	// (grows only when a fully-full ring pushes again — bounded by the max
+	// concurrent waiters ever; never drifts forward under churn).
+	ring   []*limiterWaiter
+	head   int
+	count  int
 	closed bool
 	// waitingConns enforces the one-waiter-per-connection debug assertion:
 	// each connection has exactly one reader goroutine, so a second queued
 	// Reserve for the same connID is a bug.
 	waitingConns map[string]struct{}
 	hooks        *LimiterHooks
+
+	// slot pool (paged, never shrunk)
+	pages    [][]*pooledLease // page>> == leaseSlotsPerPage
+	freeList []uint32         // LIFO of free slot indices (under mu)
 }
 
 // NewPublishLimiter returns a limiter granting up to budget bytes of
 // in-flight publish bodies. budget <= 0 disables the limiter: Reserve and
-// TryReserve always succeed with the shared disabledLease and never allocate.
+// TryReserve always succeed with the zero token and never allocate.
 func NewPublishLimiter(budget int64) *PublishLimiter {
 	return &PublishLimiter{budget: budget, waitingConns: make(map[string]struct{})}
 }
@@ -131,40 +227,120 @@ func (l *PublishLimiter) canGrantLocked(bytes int64) bool {
 	return l.used+bytes <= l.budget || (bytes > l.budget && l.used == 0)
 }
 
-// newLeaseLocked mints a lease for a grant decided under mu.
-func (l *PublishLimiter) newLeaseLocked(connID string, bytes int64) *Lease {
-	le := &Lease{l: l, bytes: bytes}
-	le.fn = le.releaseOnce
-	if l.hooks != nil && l.hooks.OnGrant != nil {
-		l.hooks.OnGrant(connID, bytes, bytes > l.budget, l.used, len(l.fifo))
+// claimSlotLocked pops a free slot (growing the pool by one page when
+// exhausted) and prepares it for a grant. Returns the slot ready to receive
+// the state transition (still FREE) and its index.
+func (l *PublishLimiter) claimSlotLocked(bytes int64) *pooledLease {
+	if len(l.freeList) == 0 {
+		l.growPageLocked()
 	}
-	return le
+	idx := l.freeList[len(l.freeList)-1]
+	l.freeList = l.freeList[:len(l.freeList)-1]
+	page := idx >> leaseSlotsPageBits
+	off := idx & (leaseSlotsPerPage - 1)
+	slot := l.pages[page][off]
+	slot.bytes = bytes
+	return slot
+}
+
+func (l *PublishLimiter) growPageLocked() {
+	base := uint32(len(l.pages)) << leaseSlotsPageBits
+	page := make([]*pooledLease, leaseSlotsPerPage)
+	for i := range page {
+		slot := &pooledLease{l: l, idx: base | uint32(i)}
+		slot.gen.Store(1) // zero token {0,0} can never alias a real slot
+		page[i] = slot
+		l.freeList = append(l.freeList, slot.idx)
+	}
+	l.pages = append(l.pages, page)
 }
 
 // grantLocked grants waiters from the head of the FIFO while the grant rule
 // holds. Strict FIFO: a later waiter that would fit is never granted ahead of
 // a blocked head (no barging).
 func (l *PublishLimiter) grantLocked() {
-	for len(l.fifo) > 0 {
-		h := l.fifo[0]
+	for l.count > 0 {
+		h := l.ring[l.head]
 		if !l.canGrantLocked(h.bytes) {
 			return
 		}
-		l.fifo[0] = nil
-		l.fifo = l.fifo[1:]
+		l.ringPopLocked()
 		delete(l.waitingConns, h.connID)
 		l.used += h.bytes
+		tok := l.grantWaiterLocked(h.connID, h.bytes)
 		h.granted = true
-		h.ch <- limiterGrant{lease: l.newLeaseLocked(h.connID, h.bytes)}
+		h.ch <- limiterGrant{tok: tok}
+	}
+}
+
+// grantWaiterLocked performs the used-accounted grant for a decided request
+// (also used by TryReserve and immediate Begin grants).
+func (l *PublishLimiter) grantWaiterLocked(connID string, bytes int64) protocol.PublishLeaseToken {
+	slot := l.claimSlotLocked(bytes)
+	tok := protocol.LeaseTokenOf(slot, slot.gen.Load())
+	slot.state.Store(tokenStateConnection)
+	if l.hooks != nil && l.hooks.OnGrant != nil {
+		l.hooks.OnGrant(connID, bytes, bytes > l.budget, l.used, l.count)
+	}
+	return tok
+}
+
+func (l *PublishLimiter) ringPushLocked(w *limiterWaiter) {
+	if l.count == len(l.ring) {
+		// Grow the ring: bounded by the max concurrent waiters ever seen.
+		capacity := len(l.ring) * 2
+		if capacity == 0 {
+			capacity = 1
+		}
+		nb := make([]*limiterWaiter, capacity)
+		for i := 0; i < l.count; i++ {
+			nb[i] = l.ring[(l.head+i)%len(l.ring)]
+		}
+		l.ring = nb
+		l.head = 0
+	}
+	l.ring[(l.head+l.count)%len(l.ring)] = w
+	l.count++
+}
+
+func (l *PublishLimiter) ringPopLocked() {
+	l.ring[l.head] = nil
+	l.head = (l.head + 1) % len(l.ring)
+	l.count--
+	if l.count == 0 {
+		l.head = 0
+		// Keep len(l.ring) as-is: bounded capacity, reused in place.
+	}
+}
+
+// freeSlot returns a slot to the pool, returns its bytes to the budget,
+// promotes granted waiters, and fires OnRelease exactly once per ticket.
+func (l *PublishLimiter) freeSlot(p *pooledLease) {
+	l.mu.Lock()
+	l.used -= p.bytes
+	// Fresh generation BEFORE the recycle: any signal carrying the old gen
+	// becomes a no-op from this point on.
+	releasedBytes := p.bytes
+	p.bits.Store(0)
+	p.gen.Add(1)
+	p.bytes = 0
+	l.freeList = append(l.freeList, p.idx)
+	if !l.closed {
+		l.grantLocked()
+	}
+	used, waiters := l.used, l.count
+	l.mu.Unlock()
+	if l.hooks != nil && l.hooks.OnRelease != nil {
+		l.hooks.OnRelease(releasedBytes, used, waiters)
 	}
 }
 
 // LeaseWait is a queued reservation returned by Begin. C delivers the
 // resolution (a grant, or ErrLimiterClosed after Close). Cancel is idempotent
 // and grant/cancel race safe: if the grant was already delivered it is
-// drained and released; otherwise the waiter is removed from the FIFO, the
-// per-connection waiting marker is cleared, and the next waiter is promoted
-// if it now fits.
+// drained and aborted; otherwise the waiter is removed from the ring FIFO,
+// the per-connection waiting marker is cleared, and the next waiter is
+// promoted if it now fits.
 type LeaseWait struct {
 	l    *PublishLimiter
 	w    *limiterWaiter
@@ -185,18 +361,22 @@ func (lw *LeaseWait) Cancel() {
 	l.mu.Lock()
 	if w.granted {
 		// The grant raced the cancellation and is already delivered: take it
-		// and release it so the bytes come back and the next waiter promotes.
+		// and abort it so the bytes come back and the next waiter promotes.
 		l.mu.Unlock()
-		if g := <-w.ch; g.lease != nil {
-			g.lease.Release()
+		if g := <-w.ch; g.err == nil {
+			g.tok.Abort()
 		}
 		return
 	}
-	for i, x := range l.fifo {
-		if x == w {
-			copy(l.fifo[i:], l.fifo[i+1:])
-			l.fifo[len(l.fifo)-1] = nil
-			l.fifo = l.fifo[:len(l.fifo)-1]
+	for i := 0; i < l.count; i++ {
+		idx := (l.head + i) % len(l.ring)
+		if l.ring[idx] == w {
+			copy(l.ring[idx:], l.ring[idx+1:])
+			l.ring[(l.head+l.count-1)%len(l.ring)] = nil
+			l.count--
+			if idx == l.head && l.count == 0 {
+				l.head = 0
+			}
 			break
 		}
 	}
@@ -209,13 +389,13 @@ func (lw *LeaseWait) Cancel() {
 	l.mu.Unlock()
 }
 
-// Begin starts a reservation. On an immediate grant it returns (lease, nil,
-// nil); otherwise (nil, wait, nil) and the wait resolves via LeaseWait.C.
+// Begin starts a reservation. On an immediate grant it returns (token, nil,
+// nil); otherwise (zero, wait, nil) and the wait resolves via LeaseWait.C.
 // After Close it returns ErrLimiterClosed. A disabled limiter returns the
-// shared disabledLease and never allocates.
-func (l *PublishLimiter) Begin(connID string, bytes int64) (*Lease, *LeaseWait, error) {
+// zero token and never allocates.
+func (l *PublishLimiter) Begin(connID string, bytes int64) (protocol.PublishLeaseToken, *LeaseWait, error) {
 	if l.disabled() {
-		return disabledLease, nil, nil
+		return protocol.PublishLeaseToken{}, nil, nil
 	}
 	l.mu.Lock()
 	if l.hooks != nil && l.hooks.BeforeReserve != nil {
@@ -223,13 +403,13 @@ func (l *PublishLimiter) Begin(connID string, bytes int64) (*Lease, *LeaseWait, 
 	}
 	if l.closed {
 		l.mu.Unlock()
-		return nil, nil, ErrLimiterClosed
+		return protocol.PublishLeaseToken{}, nil, ErrLimiterClosed
 	}
-	if len(l.fifo) == 0 && l.canGrantLocked(bytes) {
+	if l.count == 0 && l.canGrantLocked(bytes) {
 		l.used += bytes
-		le := l.newLeaseLocked(connID, bytes)
+		tok := l.grantWaiterLocked(connID, bytes)
 		l.mu.Unlock()
-		return le, nil, nil
+		return tok, nil, nil
 	}
 	if _, dup := l.waitingConns[connID]; dup {
 		l.mu.Unlock()
@@ -237,18 +417,18 @@ func (l *PublishLimiter) Begin(connID string, bytes int64) (*Lease, *LeaseWait, 
 	}
 	w := &limiterWaiter{connID: connID, bytes: bytes, ch: make(chan limiterGrant, 1)}
 	l.waitingConns[connID] = struct{}{}
-	l.fifo = append(l.fifo, w)
+	l.ringPushLocked(w)
 	l.mu.Unlock()
-	return nil, &LeaseWait{l: l, w: w}, nil
+	return protocol.PublishLeaseToken{}, &LeaseWait{l: l, w: w}, nil
 }
 
 // Reserve blocks until bytes are granted, ctx is cancelled, or the limiter is
 // closed. Grants are strict FIFO across connections: a Reserve that cannot be
 // granted immediately queues behind every earlier waiter.
-func (l *PublishLimiter) Reserve(ctx context.Context, connID string, bytes int64) (*Lease, error) {
-	le, wait, err := l.Begin(connID, bytes)
-	if le != nil || err != nil {
-		return le, err
+func (l *PublishLimiter) Reserve(ctx context.Context, connID string, bytes int64) (protocol.PublishLeaseToken, error) {
+	tok, wait, err := l.Begin(connID, bytes)
+	if err != nil || tok.Valid() || wait == nil {
+		return tok, err
 	}
 	start := time.Now()
 	select {
@@ -256,49 +436,34 @@ func (l *PublishLimiter) Reserve(ctx context.Context, connID string, bytes int64
 		if l.hooks != nil && l.hooks.OnWait != nil {
 			l.hooks.OnWait(time.Since(start))
 		}
-		return g.lease, g.err
+		return g.tok, g.err
 	case <-ctx.Done():
 		wait.Cancel()
 		if l.hooks != nil && l.hooks.OnWait != nil {
 			l.hooks.OnWait(time.Since(start))
 		}
-		return nil, ctx.Err()
+		return protocol.PublishLeaseToken{}, ctx.Err()
 	}
 }
 
 // TryReserve grants only if the FIFO is EMPTY and the grant rule holds: it
 // never jumps a queued waiter. The second result is false when no grant was
 // made (including after Close).
-func (l *PublishLimiter) TryReserve(connID string, bytes int64) (*Lease, bool) {
+func (l *PublishLimiter) TryReserve(connID string, bytes int64) (protocol.PublishLeaseToken, bool) {
 	if l.disabled() {
-		return disabledLease, true
+		return protocol.PublishLeaseToken{}, true
 	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	if l.closed || len(l.fifo) > 0 || !l.canGrantLocked(bytes) {
-		return nil, false
+	if l.closed || l.count > 0 || !l.canGrantLocked(bytes) {
+		return protocol.PublishLeaseToken{}, false
 	}
 	l.used += bytes
-	return l.newLeaseLocked(connID, bytes), true
-}
-
-// release returns bytes and grants from the head while the rule holds. After
-// Close, outstanding leases still decrement used but nothing new is granted.
-func (l *PublishLimiter) release(bytes int64) {
-	l.mu.Lock()
-	l.used -= bytes
-	if !l.closed {
-		l.grantLocked()
-	}
-	used, waiters := l.used, len(l.fifo)
-	l.mu.Unlock()
-	if l.hooks != nil && l.hooks.OnRelease != nil {
-		l.hooks.OnRelease(bytes, used, waiters)
-	}
+	return l.grantWaiterLocked(connID, bytes), true
 }
 
 // Close fails every queued waiter and every later Reserve/TryReserve with
-// ErrLimiterClosed. Leases already outstanding still release normally.
+// ErrLimiterClosed. Outstanding tokens still release normally.
 func (l *PublishLimiter) Close() {
 	if l == nil {
 		return
@@ -309,10 +474,13 @@ func (l *PublishLimiter) Close() {
 		return
 	}
 	l.closed = true
-	for _, w := range l.fifo {
+	for i := 0; i < l.count; i++ {
+		w := l.ring[(l.head+i)%len(l.ring)]
 		w.ch <- limiterGrant{err: ErrLimiterClosed}
 	}
-	l.fifo = nil
+	l.ring = nil
+	l.head = 0
+	l.count = 0
 	l.waitingConns = make(map[string]struct{})
 }
 
@@ -324,7 +492,7 @@ func (l *PublishLimiter) Stats() (used, budget int64, waiters int) {
 	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	return l.used, l.budget, len(l.fifo)
+	return l.used, l.budget, l.count
 }
 
 // Closed reports whether the limiter has been closed: a false TryReserve can
@@ -351,4 +519,27 @@ func leaseBytes(bodySize uint64, frameMax uint32) int64 {
 	}
 	frames := (bodySize + perFrame - 1) / perFrame
 	return int64(bodySize + frames*72 + 512)
+}
+
+// ---- test hooks ----
+
+func (l *PublishLimiter) tokenStateForTest(tok protocol.PublishLeaseToken) int {
+	return int(tok.State())
+}
+
+func (p *pooledLease) LeaseState() int32 { return p.state.Load() }
+
+func (l *PublishLimiter) fifoCapForTest() int {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.ring == nil {
+		return 0
+	}
+	return len(l.ring)
+}
+
+func (l *PublishLimiter) slotPagesForTest() int {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return len(l.pages)
 }

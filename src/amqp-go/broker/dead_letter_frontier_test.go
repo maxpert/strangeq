@@ -93,7 +93,7 @@ func TestFrontierFlip_DeadLetterSibling_NoStrand(t *testing.T) {
 	}
 	dm := &protocol.Message{RoutingKey: target, Body: []byte("d"), DeliveryMode: 2}
 	headBeforeGatedReserve := qs.Head()
-	_, _, err = b.PublishMessageAsyncConfirm("", target, dm, confirmCB, nil)
+	_, _, err = b.PublishMessageAsyncConfirm("", target, dm, confirmCB, protocol.PublishLeaseToken{})
 	require.NoError(t, err)
 	// The precondition that actually matters, and the one this comment states:
 	// the gated durable tag is RESERVED but not yet visible, so head must not

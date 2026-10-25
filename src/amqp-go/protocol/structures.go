@@ -39,62 +39,6 @@ type DepthGate interface {
 	AtHighWaterMark() bool
 }
 
-// Releaser is the minimal ownership interface for a WS-I Phase B publish
-// lease (server.PublishLimiter; protocol may not import server). Release is
-// idempotent and nil-safe; ReleaseFunc returns the pre-bound release function
-// (a shared no-op for a nil/disabled lease) so a transfer never allocates.
-type Releaser interface {
-	Release()
-	ReleaseFunc() func()
-}
-
-// LeaseQueue is a small mutex-guarded FIFO pairing each content-header frame
-// with the publish lease the reader reserved for it (WS-I Phase B). The
-// reader Pushes (once per enqueued header frame, nil for a malformed/oversized
-// header), the processor Pops on dequeue, and connection teardown Drains the
-// rest. FIFO order equals frame order because the reader enqueues headers in
-// read order.
-type LeaseQueue struct {
-	mu    sync.Mutex
-	items []Releaser
-}
-
-// Push appends one lease (nil allowed) to the FIFO.
-func (q *LeaseQueue) Push(r Releaser) {
-	q.mu.Lock()
-	q.items = append(q.items, r)
-	q.mu.Unlock()
-}
-
-// Pop removes and returns the oldest queued lease, or nil when empty.
-func (q *LeaseQueue) Pop() Releaser {
-	q.mu.Lock()
-	defer q.mu.Unlock()
-	if len(q.items) == 0 {
-		return nil
-	}
-	r := q.items[0]
-	q.items[0] = nil
-	q.items = q.items[1:]
-	return r
-}
-
-// Drain removes and returns every queued lease in FIFO order (teardown).
-func (q *LeaseQueue) Drain() []Releaser {
-	q.mu.Lock()
-	defer q.mu.Unlock()
-	out := q.items
-	q.items = nil
-	return out
-}
-
-// Len returns the number of queued leases.
-func (q *LeaseQueue) Len() int {
-	q.mu.Lock()
-	defer q.mu.Unlock()
-	return len(q.items)
-}
-
 // Connection represents an AMQP connection
 type Connection struct {
 	ID   string
@@ -127,15 +71,15 @@ type Connection struct {
 	FrameBudgetWake chan struct{}
 	// LeaseFIFO pairs each enqueued content-header frame with the publish
 	// lease the reader reserved for it (WS-I Phase B): the reader Pushes one
-	// entry per header frame it hands to FrameQueue (nil for a malformed or
-	// over-MaxMessageSize header, which the processor rejects without a
-	// lease) and the processor Pops on dequeue. Connection teardown Drains
-	// and releases the remainder.
-	LeaseFIFO LeaseQueue
-	// HeaderLease holds the lease paired with the header frame the processor
+	// entry per header frame it hands to FrameQueue (zero token for a
+	// malformed or over-MaxMessageSize header, which the processor rejects
+	// without a lease) and the processor Pops on dequeue. Connection teardown
+	// Drains and aborts the remainder.
+	LeaseFIFO TokenQueue
+	// HeaderLease holds the token paired with the header frame the processor
 	// is currently handling. PROCESSOR-OWNED: written before processFrame and
-	// released+cleared after it (and on every discard arm), so no lock.
-	HeaderLease Releaser
+	// aborted+cleared after it (and on every discard arm), so no lock.
+	HeaderLease PublishLeaseToken
 	AckQueue    chan *Frame   // Buffer ACK/NACK/Reject frames for the ack worker goroutine
 	Done        chan struct{} // Closed during connection teardown to unblock goroutines waiting on AckQueue
 	ConfirmWake chan struct{} // SQ-5: capacity-1 poke channel for the publisher-confirm flusher goroutine
@@ -907,13 +851,13 @@ type PendingMessage struct {
 	BodySize uint64
 	Received uint64 // How much of the body has been received so far
 	Channel  *Channel
-	// Lease is the WS-I Phase B publish-inflight reservation covering the
+	// LeaseToken is the WS-I Phase B publish-inflight reservation covering the
 	// declared body bytes. Ownership: paired with the header frame at read
 	// time, transferred to this PendingMessage by the header processor, and
-	// taken (nil-safe takeLease) at processCompleteMessage entry or released
-	// at teardown. PutPendingMessage ASSERTS it is nil: the lease must
-	// already be released or transferred by then.
-	Lease Releaser
+	// taken (copied out and zeroed) at processCompleteMessage entry or aborted
+	// at teardown. PutPendingMessage ASSERTS it is invalid (zeroed): the lease
+	// must already be aborted or transferred by then.
+	LeaseToken PublishLeaseToken
 }
 
 // Consumer represents a message consumer

@@ -187,66 +187,17 @@ func (rs *readerState) oldestProgress() time.Time {
 	return oldest
 }
 
-// joinRelease is the WS-I two-party publish-lease retention (review item 5):
-// the lease releases only when BOTH the broker part (onReleased — for a
-// durable publish, WAL completion; for a synchronous path, the broker call's
-// return) AND the server part (the deferred completion of
-// processCompleteMessage, covering basic.return/nack/error wire writes) are
-// done. The release fires exactly once; duplicate signals are ignored.
-type joinRelease struct {
-	bits atomic.Int32 // 1 = brokerDone, 2 = serverDone
-	fn   func()
-}
+// joinRelease/takeLease are REMOVED (generational tokens): the two-party
+// retention (serverDone AND brokerDone) lives in slot bits on the pooled
+// lease (publish_limiter.go); PendingMessage carries the token value.
 
-func newJoinRelease(fn func()) *joinRelease { return &joinRelease{fn: fn} }
-
-func (j *joinRelease) bit(b int32) {
-	if j == nil || j.fn == nil {
-		return
-	}
-	for {
-		old := j.bits.Load()
-		if old == 3 {
-			return // already released — duplicate signals ignored
-		}
-		if j.bits.CompareAndSwap(old, old|b) {
-			if old|b == 3 {
-				j.fn()
-			}
-			return
-		}
-	}
-}
-
-// brokerDone marks the broker part complete (wired as onReleased).
-func (j *joinRelease) brokerDone() { j.bit(1) }
-
-// serverDone marks the server part complete (deferred over the publish's
-// return/nack/error wire writes).
-func (j *joinRelease) serverDone() { j.bit(2) }
-
-// takeLease nil-safely transfers the publish lease out of pm: it sets
-// pm.Lease = nil and returns the lease's pre-bound ReleaseFunc, or the shared
-// noopRelease when there was none. A second take returns noopRelease.
-func takeLease(pm *protocol.PendingMessage) func() {
-	if pm == nil || pm.Lease == nil {
-		return noopRelease
-	}
-	fn := pm.Lease.ReleaseFunc()
-	pm.Lease = nil
-	if fn == nil {
-		return noopRelease
-	}
-	return fn
-}
-
-// releaseHeaderLease releases a leftover processor-owned HeaderLease (a header
-// that was discarded or errored before its lease transferred to a
+// releaseHeaderLease aborts a leftover processor-owned header lease token (a
+// header that was discarded or errored before its lease transferred to a
 // PendingMessage) and clears the slot.
 func releaseHeaderLease(conn *protocol.Connection) {
-	if conn.HeaderLease != nil {
-		conn.HeaderLease.Release()
-		conn.HeaderLease = nil
+	if t := conn.HeaderLease; t.Valid() {
+		t.Abort()
+		conn.HeaderLease = protocol.PublishLeaseToken{}
 	}
 }
 
@@ -273,10 +224,10 @@ func (s *Server) leaseForHeaderFrame(rt *connRuntime, frame *protocol.Frame, rs 
 	conn := rt.conn
 
 	// While the connection is closing, never reserve and NEVER wait: pair a
-	// nil lease (the closing gate discards the frame) and keep reading so
+	// zero token (the closing gate discards the frame) and keep reading so
 	// the client's close-ok is seen.
 	if rt.connClosing.Load() {
-		conn.LeaseFIFO.Push(nil)
+		conn.LeaseFIFO.Push(protocol.PublishLeaseToken{})
 		return true
 	}
 
@@ -295,14 +246,14 @@ func (s *Server) leaseForHeaderFrame(rt *connRuntime, frame *protocol.Frame, rs 
 		valid = s.Config == nil || bodySize <= uint64(s.Config.Server.MaxMessageSize)
 	}
 	if !valid {
-		conn.LeaseFIFO.Push(nil)
+		conn.LeaseFIFO.Push(protocol.PublishLeaseToken{})
 		return true
 	}
 
 	bytes := leaseBytes(bodySize, frameMaxForLease(conn))
 	limiter := s.publishLimiter()
 
-	var lease *Lease
+	var lease protocol.PublishLeaseToken
 	if rs.owedLen() == 0 {
 		// No earlier leased body is still unread: a blocking wait is allowed.
 		// It is bounded by leaseCtx (write failure / teardown / connection
@@ -329,9 +280,9 @@ func (s *Server) leaseForHeaderFrame(rt *connRuntime, frame *protocol.Frame, rs 
 				protocol.PutFrame(frame)
 				return false
 			}
-			if le == nil {
-				// connClosing: pair a nil lease and keep reading close-ok.
-				conn.LeaseFIFO.Push(nil)
+			if !le.Valid() {
+				// connClosing: pair a zero (no-op) lease and keep reading close-ok.
+				conn.LeaseFIFO.Push(protocol.PublishLeaseToken{})
 				return true
 			}
 		} else if s.limiterStepHook != nil {
@@ -348,7 +299,7 @@ func (s *Server) leaseForHeaderFrame(rt *connRuntime, frame *protocol.Frame, rs 
 				return false
 			}
 			// Close the connection promptly with 506; the nested content is
-			// NEVER admitted unleased. Teardown releases the FIFO, the
+			// NEVER admitted unleased. Teardown aborts the FIFO, the
 			// HeaderLease and the pending-message leases.
 			s.leaseClose506(rt, frame.Channel,
 				fmt.Sprintf("RESOURCE_ERROR - publish lease budget exhausted while body owed on channel %d", frame.Channel),
@@ -369,16 +320,15 @@ func (s *Server) leaseForHeaderFrame(rt *connRuntime, frame *protocol.Frame, rs 
 	return true
 }
 
-// drainLeaseFIFO releases every lease still queued for the processor.
+// drainLeaseFIFO aborts every lease still queued for the processor (the zero
+// token is a no-op).
 func drainLeaseFIFO(conn *protocol.Connection) {
-	for _, le := range conn.LeaseFIFO.Drain() {
-		if le != nil {
-			le.Release()
-		}
+	for _, t := range conn.LeaseFIFO.Drain() {
+		t.Abort()
 	}
 }
 
-// revokeAndDrainConnectionLeases releases every publish lease the connection
+// revokeAndDrainConnectionLeases aborts every publish lease the connection
 // still owns — header leases queued for the processor, the in-flight header
 // lease, and leases held by half-received publishes. Once-only (the
 // leasesRevoked flag also tells the processor to discard further header/body
@@ -390,7 +340,10 @@ func (s *Server) revokeAndDrainConnectionLeases(rt *connRuntime) {
 		drainLeaseFIFO(conn)
 		releaseHeaderLease(conn)
 		for _, pm := range conn.PendingMessages {
-			takeLease(pm)()
+			if pm != nil && pm.LeaseToken.Valid() {
+				pm.LeaseToken.Abort()
+				pm.LeaseToken = protocol.PublishLeaseToken{}
+			}
 		}
 	})
 }
@@ -431,10 +384,10 @@ func (s *Server) leaseClose506(rt *connRuntime, channel uint16, wireReason, logR
 // socket. While waiting it keeps the SQ-13 hand-off alive: buffered (pending)
 // frames are handed to processFrames whenever the frame budget allows, so a
 // full FrameQueue plus a parked processor can never wedge behind the wait.
-// Returns (lease, true) on grant, (nil, true) when the connection is closing
-// (the caller pairs a nil lease and keeps reading close-ok), or (_, false)
+// Returns (token, true) on grant, (zero, true) when the connection is closing
+// (the caller pairs a zero token and keeps reading close-ok), or (_, false)
 // when the reader must exit (teardown, limiter close, or a processor stall).
-func (s *Server) waitForHeaderLease(rt *connRuntime, channel uint16, wait *LeaseWait, rs *readerState) (*Lease, bool) {
+func (s *Server) waitForHeaderLease(rt *connRuntime, channel uint16, wait *LeaseWait, rs *readerState) (protocol.PublishLeaseToken, bool) {
 	conn := rt.conn
 	// Record exactly one wait (with its duration) on every return path.
 	// Immediate grants never reach here, so they are never counted.
@@ -472,20 +425,20 @@ func (s *Server) waitForHeaderLease(rt *connRuntime, channel uint16, wait *Lease
 			continue
 		case g := <-wait.C():
 			if g.err != nil {
-				return nil, false
+				return protocol.PublishLeaseToken{}, false
 			}
-			return g.lease, true
+			return g.tok, true
 		case <-conn.FrameBudgetWake:
 			continue // re-evaluate the budget
 		case <-rt.leaseCtx.Done():
 			wait.Cancel()
 			if rt.connClosing.Load() {
-				return nil, true // closing: pair nil, keep reading close-ok
+				return protocol.PublishLeaseToken{}, true // closing: pair nil, keep reading close-ok
 			}
-			return nil, false
+			return protocol.PublishLeaseToken{}, false
 		case <-conn.Done:
 			wait.Cancel()
-			return nil, false
+			return protocol.PublishLeaseToken{}, false
 		case <-stall.C:
 			if rt.procSeq.Load() == seq && (len(rs.pending) > 0 || conn.LeaseFIFO.Len() > 0 || len(conn.FrameQueue) > 0) {
 				// PROCESSOR STALL: content is queued but the processor made
@@ -495,7 +448,7 @@ func (s *Server) waitForHeaderLease(rt *connRuntime, channel uint16, wait *Lease
 				s.leaseClose506(rt, channel,
 					fmt.Sprintf("RESOURCE_ERROR - publish lease wait stalled (no processor progress) on channel %d", channel),
 					"publish lease wait stalled: no processor progress; closing connection", rs.owedLen())
-				return nil, false
+				return protocol.PublishLeaseToken{}, false
 			}
 			seq = rt.procSeq.Load()
 			stall.Reset(s.writeTimeout())

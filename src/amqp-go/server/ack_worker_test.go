@@ -123,11 +123,9 @@ func (b *ackTestBroker) PublishMessage(exchangeName, routingKey string, message 
 // PublishMessageAsyncConfirm is unused by the ack tests (they never publish on a
 // confirm/durable path); mirror PublishMessage's blocking behavior and settle
 // the confirm synchronously so the interface is satisfied.
-func (b *ackTestBroker) PublishMessageAsyncConfirm(exchangeName, routingKey string, message *protocol.Message, onDurable func(error), onReleased func()) (bool, protocol.DepthGate, error) {
+func (b *ackTestBroker) PublishMessageAsyncConfirm(exchangeName, routingKey string, message *protocol.Message, onDurable func(error), leaseDone protocol.PublishLeaseToken) (bool, protocol.DepthGate, error) {
 	err := b.PublishMessage(exchangeName, routingKey, message)
-	if onReleased != nil {
-		onReleased() // synchronous path: release before return
-	}
+	leaseDone.BrokerDone() // synchronous path: settle before return (zero token no-ops)
 	return false, nil, err
 }
 

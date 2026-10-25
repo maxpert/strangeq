@@ -220,7 +220,7 @@ func runOneFrontierFlipQueue(t *testing.T, mode string, gateOpen *atomic.Bool, r
 				_ = b.PublishMessage("", qname, m)
 			} else {
 				m := &protocol.Message{RoutingKey: qname, Body: []byte("d"), DeliveryMode: 2}
-				_, _, _ = b.PublishMessageAsyncConfirm("", qname, m, confirmCB, nil)
+				_, _, _ = b.PublishMessageAsyncConfirm("", qname, m, confirmCB, protocol.PublishLeaseToken{})
 			}
 		}
 	}()
@@ -234,7 +234,7 @@ func runOneFrontierFlipQueue(t *testing.T, mode string, gateOpen *atomic.Bool, r
 			for i := 0; i < flipTransientMsgsPerGoro; i++ {
 				if mode == "durable" {
 					m := &protocol.Message{RoutingKey: qname, Body: []byte("d"), DeliveryMode: 2}
-					_, _, _ = b.PublishMessageAsyncConfirm("", qname, m, confirmCB, nil)
+					_, _, _ = b.PublishMessageAsyncConfirm("", qname, m, confirmCB, protocol.PublishLeaseToken{})
 				} else {
 					m := &protocol.Message{RoutingKey: qname, Body: []byte("x"), DeliveryMode: 1}
 					_ = b.PublishMessage("", qname, m)

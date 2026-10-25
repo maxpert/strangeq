@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/maxpert/amqp-go/protocol"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -68,8 +69,8 @@ func TestLimiter_FIFOAndBudgetInvariant(t *testing.T) {
 
 	rng := rand.New(rand.NewSource(1))
 	type grantItem struct {
-		id string
-		le *Lease
+		id  string
+		tok protocol.PublishLeaseToken
 	}
 	grantCh := make(chan grantItem)
 	var wg sync.WaitGroup
@@ -89,8 +90,8 @@ func TestLimiter_FIFOAndBudgetInvariant(t *testing.T) {
 		}
 	drained:
 		if len(held) > 0 && rng.Intn(100) < 40 {
-			held[0].le.Release()
-			held[0].le = nil
+			held[0].tok.Abort()
+			held[0].tok = protocol.PublishLeaseToken{}
 			held = held[1:]
 			continue
 		}
@@ -110,7 +111,7 @@ func TestLimiter_FIFOAndBudgetInvariant(t *testing.T) {
 			if err != nil {
 				return
 			}
-			grantCh <- grantItem{id: id, le: le}
+			grantCh <- grantItem{id: id, tok: le}
 		}(connID, bytes)
 		got := gate.admit(t)
 		require.Equal(t, connID, got, "arrival order must match the schedule")
@@ -121,7 +122,7 @@ func TestLimiter_FIFOAndBudgetInvariant(t *testing.T) {
 	// wg.Wait() returns every granted lease has been received (and released)
 	// by this loop.
 	for _, g := range held {
-		g.le.Release()
+		g.tok.Abort()
 	}
 	held = nil
 	done := make(chan struct{})
@@ -129,7 +130,7 @@ func TestLimiter_FIFOAndBudgetInvariant(t *testing.T) {
 	for {
 		select {
 		case g := <-grantCh:
-			g.le.Release()
+			g.tok.Abort()
 		case <-done:
 			goto finished
 		}
@@ -158,7 +159,7 @@ func TestLimiter_NoBarging(t *testing.T) {
 	gate := newLimiterArrivalGate()
 	l.hooks = &LimiterHooks{BeforeReserve: gate.hook}
 
-	bDone := make(chan *Lease, 1)
+	bDone := make(chan protocol.PublishLeaseToken, 1)
 	go func() {
 		le, err := l.Reserve(ctx, "b", 3)
 		if err == nil {
@@ -167,7 +168,7 @@ func TestLimiter_NoBarging(t *testing.T) {
 	}()
 	require.Equal(t, "b", gate.admit(t))
 
-	cDone := make(chan *Lease, 1)
+	cDone := make(chan protocol.PublishLeaseToken, 1)
 	go func() {
 		le, err := l.Reserve(ctx, "c", 1)
 		if err == nil {
@@ -183,7 +184,7 @@ func TestLimiter_NoBarging(t *testing.T) {
 	default:
 	}
 
-	a.Release() // used=0 → b granted (3)
+	a.Abort() // used=0 → b granted (3)
 	<-bDone
 	// c still waits: 3+1 <= 10 actually fits now — b holds 3, so c is granted.
 	<-cDone
@@ -204,7 +205,7 @@ func TestLimiter_OversizedSerialized(t *testing.T) {
 	gate := newLimiterArrivalGate()
 	l.hooks = &LimiterHooks{BeforeReserve: gate.hook}
 
-	bDone := make(chan *Lease, 1)
+	bDone := make(chan protocol.PublishLeaseToken, 1)
 	go func() {
 		if le, err := l.Reserve(ctx, "b", 20); err == nil { // oversized
 			bDone <- le
@@ -212,7 +213,7 @@ func TestLimiter_OversizedSerialized(t *testing.T) {
 	}()
 	require.Equal(t, "b", gate.admit(t))
 
-	cDone := make(chan *Lease, 1)
+	cDone := make(chan protocol.PublishLeaseToken, 1)
 	go func() {
 		if le, err := l.Reserve(ctx, "c", 5); err == nil {
 			cDone <- le
@@ -230,7 +231,7 @@ func TestLimiter_OversizedSerialized(t *testing.T) {
 	_, ok := l.TryReserve("t", 1)
 	assert.False(t, ok)
 
-	a.Release() // used=0 → b (oversized) granted
+	a.Abort() // used=0 → b (oversized) granted
 	bLease := <-bDone
 	used, _, _ := l.Stats()
 	assert.Equal(t, int64(20), used, "oversized lease may exceed G only from used==0")
@@ -246,12 +247,12 @@ func TestLimiter_OversizedSerialized(t *testing.T) {
 
 	// Releasing the oversized lease grants the next waiter; oversized grants
 	// are globally serial.
-	bLease.Release()
+	bLease.Abort()
 	cLease := <-cDone
 	used, _, _ = l.Stats()
 	assert.Equal(t, int64(5), used)
 
-	dDone := make(chan *Lease, 1)
+	dDone := make(chan protocol.PublishLeaseToken, 1)
 	go func() {
 		if le, err := l.Reserve(ctx, "d", 20); err == nil { // second oversized
 			dDone <- le
@@ -263,11 +264,11 @@ func TestLimiter_OversizedSerialized(t *testing.T) {
 		t.Fatal("second oversized grant while used != 0")
 	default:
 	}
-	cLease.Release()
+	cLease.Abort()
 	dLease := <-dDone // now used==0, so the oversized grant proceeds
 	used, _, _ = l.Stats()
 	assert.Equal(t, int64(20), used)
-	dLease.Release()
+	dLease.Abort()
 	used, _, waiters := l.Stats()
 	assert.Equal(t, int64(0), used)
 	assert.Equal(t, 0, waiters)
@@ -306,7 +307,7 @@ func TestLimiter_CancelWhileWaitingAndRacingGrant(t *testing.T) {
 		_, err := l.Reserve(b2Ctx, "b2", 6)
 		b2Err <- err
 	}()
-	cDone := make(chan *Lease, 1)
+	cDone := make(chan protocol.PublishLeaseToken, 1)
 	go func() {
 		if le, err := l.Reserve(ctx, "c", 5); err == nil {
 			cDone <- le
@@ -318,13 +319,13 @@ func TestLimiter_CancelWhileWaitingAndRacingGrant(t *testing.T) {
 	}, 30*time.Second, time.Millisecond)
 
 	b2Cancel()
-	a.Release() // grants b2 (racing the cancel) or c directly
+	a.Abort() // grants b2 (racing the cancel) or c directly
 	require.ErrorIs(t, <-b2Err, context.Canceled)
 	cLease := <-cDone // the 6 bytes must have come back for c (6+5 > 10)
 	used, _, w := l.Stats()
 	assert.Equal(t, int64(5), used, "a racing grant must return its bytes")
 	assert.Equal(t, 0, w)
-	cLease.Release()
+	cLease.Abort()
 	used, _, _ = l.Stats()
 	assert.Equal(t, int64(0), used)
 }
@@ -336,17 +337,18 @@ func TestLimiter_ReleaseIdempotent(t *testing.T) {
 
 	le, err := l.Reserve(context.Background(), "a", 5)
 	require.NoError(t, err)
-	le.Release()
-	le.Release()
-	le.ReleaseFunc()()
-	le.ReleaseFunc()()
+	le.Abort()
+	le.Abort()
+	le.Abort()
+	le.Abort()
 	used, _, _ := l.Stats()
 	assert.Equal(t, int64(0), used, "double release must not drive used negative")
 
-	var nilLease *Lease
-	nilLease.Release()       // must not panic
-	nilLease.ReleaseFunc()() // noopRelease
-	assert.NotNil(t, nilLease.ReleaseFunc(), "ReleaseFunc of a nil lease is noopRelease, never nil")
+	var zero protocol.PublishLeaseToken
+	zero.Abort() // must not panic
+	zero.Abort() // idempotent
+	assert.False(t, zero.Valid(), "the zero token is never valid")
+	assert.Equal(t, tokenStateFree, l.tokenStateForTest(zero), "the zero token is always FREE")
 }
 
 // L-6: 1000 waiters (one per connection), each granted once in FIFO order;
@@ -382,7 +384,7 @@ func TestLimiter_1000ConnRoundRobin(t *testing.T) {
 			if err != nil {
 				return
 			}
-			le.Release()
+			le.Abort()
 		}()
 		require.Equal(t, id, gate.admit(t))
 	}
@@ -411,7 +413,7 @@ func TestLimiter_DisabledNeverBlocks(t *testing.T) {
 				t.Errorf("disabled limiter returned error: %v", err)
 				return
 			}
-			le.ReleaseFunc()()
+			le.Abort()
 		}
 	}()
 	select {
@@ -447,7 +449,7 @@ func TestLimiter_CloseFailsWaiters(t *testing.T) {
 	assert.ErrorIs(t, err, ErrLimiterClosed)
 	_, ok := l.TryReserve("d", 1)
 	assert.False(t, ok)
-	a.Release() // outstanding lease still releases normally
+	a.Abort() // outstanding lease still releases normally
 	used, _, _ := l.Stats()
 	assert.Equal(t, int64(0), used)
 }
@@ -469,7 +471,7 @@ func TestLimiter_ConcurrentRace(t *testing.T) {
 				if err != nil {
 					return
 				}
-				le.Release()
+				le.Abort()
 			}
 		}(g)
 	}
@@ -520,7 +522,7 @@ func TestLimiter_TryReserveNonBarging(t *testing.T) {
 
 	a, err := l.Reserve(ctx, "a", 8)
 	require.NoError(t, err)
-	defer a.Release()
+	defer a.Abort()
 
 	// Queue a waiter so the FIFO is non-empty.
 	bDone := make(chan error, 1)
@@ -548,11 +550,11 @@ func TestLimiter_TryReserveNonBarging(t *testing.T) {
 	// Oversized at used != 0 → false.
 	_, ok = l2.TryReserve("y", 20)
 	assert.False(t, ok)
-	x.Release()
+	x.Abort()
 	// Oversized at used == 0 with an empty FIFO → true.
 	y, ok := l2.TryReserve("y", 20)
 	require.True(t, ok, "oversized TryReserve must grant at used==0 with an empty FIFO")
-	y.Release()
+	y.Abort()
 	used, _, _ := l2.Stats()
 	assert.Equal(t, int64(0), used)
 }
@@ -562,7 +564,7 @@ func TestLimiter_TryReserveNonBarging(t *testing.T) {
 func TestLimiter_CloseOutstandingReleaseNormally(t *testing.T) {
 	l := NewPublishLimiter(1 << 20)
 	ctx := context.Background()
-	leases := make([]*Lease, 3)
+	leases := make([]protocol.PublishLeaseToken, 3)
 	for i := range leases {
 		le, err := l.Reserve(ctx, fmt.Sprintf("c%d", i), 1000)
 		require.NoError(t, err)
@@ -570,7 +572,7 @@ func TestLimiter_CloseOutstandingReleaseNormally(t *testing.T) {
 	}
 	l.Close()
 	for i, le := range leases {
-		le.Release()
+		le.Abort()
 		used, _, _ := l.Stats()
 		assert.Equal(t, int64(2000-1000*i), used, "outstanding leases must still release after Close")
 	}
@@ -580,7 +582,7 @@ func TestLimiter_CloseOutstandingReleaseNormally(t *testing.T) {
 	assert.False(t, ok)
 }
 
-// L-13: the disabled limiter allocates nothing on Reserve + ReleaseFunc + call.
+// L-13: the disabled limiter allocates nothing on Reserve/TryReserve + Abort.
 func TestLimiter_DisabledZeroAlloc(t *testing.T) {
 	l := NewPublishLimiter(0) // budget <= 0 → disabled
 	ctx := context.Background()
@@ -589,7 +591,7 @@ func TestLimiter_DisabledZeroAlloc(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		le.ReleaseFunc()()
+		le.Abort()
 	})
 	assert.Equal(t, float64(0), allocs, "disabled limiter must be allocation-free")
 
@@ -598,7 +600,7 @@ func TestLimiter_DisabledZeroAlloc(t *testing.T) {
 		if !ok {
 			t.Fatal("disabled TryReserve must always grant")
 		}
-		le.ReleaseFunc()()
+		le.Abort()
 	})
 	assert.Equal(t, float64(0), allocs, "disabled TryReserve must be allocation-free")
 }

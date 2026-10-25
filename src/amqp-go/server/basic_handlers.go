@@ -163,10 +163,13 @@ func (s *Server) handleBasicPublish(conn *protocol.Connection, channelID uint16,
 
 	// Store the pending message for this channel. A client violating the
 	// protocol with a second basic.publish before the previous content
-	// completed displaces the old entry: release its lease so budget is never
+	// completed displaces the old entry: abort its lease so budget is never
 	// lost (the displaced message itself is dropped, as before).
 	if old := conn.PendingMessages[channelID]; old != nil {
-		takeLease(old)()
+		if t := old.LeaseToken; t.Valid() {
+			t.Abort()
+			old.LeaseToken = protocol.PublishLeaseToken{}
+		}
 	}
 	conn.PendingMessages[channelID] = pendingMsg
 
@@ -220,15 +223,15 @@ func (s *Server) processHeaderFrame(conn *protocol.Connection, frame *protocol.F
 	}
 
 	// WS-I Phase B: the header parsed and the declared size is admissible —
-	// transfer the lease the reader paired with this frame into the pending
-	// message (processCompleteMessage takes it from there). The error arms
-	// ABOVE leave it in conn.HeaderLease for the processor's discard release.
-	// A protocol-violating second header on the same channel displaces the
-	// previous lease — release it so budget is never lost.
-	if pendingMsg.Lease != nil {
-		pendingMsg.Lease.Release()
+	// transfer the lease token the reader paired with this frame into the
+	// pending message (processCompleteMessage takes it from there). The error
+	// arms ABOVE leave it in conn.HeaderLease for the processor's discard
+	// release. A protocol-violating second header on the same channel
+	// displaces the previous lease — abort it so budget is never lost.
+	if t := pendingMsg.LeaseToken; t.Valid() {
+		t.Abort()
 	}
-	pendingMsg.Lease, conn.HeaderLease = conn.HeaderLease, nil
+	pendingMsg.LeaseToken, conn.HeaderLease = conn.HeaderLease, protocol.PublishLeaseToken{}
 
 	// Leave pendingMsg.Body nil here. The allocation decision is deferred to the
 	// FIRST body frame (processBodyFrame): a body that arrives in a single frame
@@ -368,13 +371,15 @@ func (s *Server) processBodyFrame(conn *protocol.Connection, frame *protocol.Fra
 
 // processCompleteMessage processes a message that has been fully received (method + header + body)
 func (s *Server) processCompleteMessage(conn *protocol.Connection, channelID uint16, pendingMsg *protocol.PendingMessage) error {
-	// WS-I Phase B: take the publish lease OUT of the pending message at entry
-	// and release it on EVERY early return via this structural defer. Each
-	// transfer site below sets r := release; release = noopRelease before
-	// handing r over (tx buffer, broker onReleased) or calling it inline
-	// (transient), so the lease is released exactly once.
-	release := takeLease(pendingMsg)
-	defer func() { release() }()
+	// WS-I Phase B (generational tokens): take the publish lease token out of
+	// the pending message at entry. The single open-coded defer marks the
+	// server part done; if the lease was never transferred (every early
+	// return below) that same call also ABORTS it. Transfer sites call
+	// Transfer() before handing ownership onward, so the lease is released
+	// exactly once.
+	token := pendingMsg.LeaseToken
+	pendingMsg.LeaseToken = protocol.PublishLeaseToken{}
+	defer token.ServerFinish()
 
 	// SQ-12: mark this connection as a publisher so the reader-pause applies to
 	// it (consumer-only connections are never paused). Load-guarded so it is a
@@ -473,10 +478,8 @@ func (s *Server) processCompleteMessage(conn *protocol.Connection, channelID uin
 		}
 		// WS-I: tx bytes leave G once the publish is buffered (tx staging has
 		// no byte bound today, spec §B.1).
-		r := release
-		release = noopRelease
 		err := txm.AddOperation(channelID, op)
-		r()
+		token.Abort()
 		return err
 	}
 
@@ -501,14 +504,11 @@ func (s *Server) processCompleteMessage(conn *protocol.Connection, channelID uin
 		// and returns the gate for SUBSEQUENT producer-only reader
 		// backpressure; a mixed connection's reader is never parked, so its
 		// ACK diversion stays live.
-		r := release
-		release = noopRelease
-		jr := newJoinRelease(r)
-		defer jr.serverDone()
+		token.Transfer()
 		if np, ok := s.Broker.(NonBlockingPublisher); ok {
 			var gate protocol.DepthGate
 			gate, err = np.PublishMessageAdmitted(message.Exchange, message.RoutingKey, message)
-			jr.brokerDone()
+			token.BrokerDone()
 			if err == nil && gate != nil && !conn.DepthBackpressure.Load() && !conn.HasActiveConsumer() {
 				conn.SetDepthGate(gate)
 			}
@@ -516,12 +516,12 @@ func (s *Server) processCompleteMessage(conn *protocol.Connection, channelID uin
 			// A custom broker without non-blocking admission (only reachable
 			// with the lease disabled — Build rejects it otherwise).
 			err = s.Broker.PublishMessage(message.Exchange, message.RoutingKey, message)
-			jr.brokerDone()
+			token.BrokerDone()
 		}
 	} else {
-		// DURABLE publish: the broker owns the lease from here on (onReleased
-		// fires exactly once after all accepted copies complete, or
-		// synchronously on a no-route/error return — even after the
+		// DURABLE publish: the broker owns the lease from here on
+		// (BrokerDone signals exactly once after all accepted copies complete,
+		// or synchronously on a no-route/error return — even after the
 		// connection is gone). TWO-PARTY retention: the lease releases only
 		// when the broker AND this function's wire writes (basic.return /
 		// nack / confirm) are both done.
@@ -539,11 +539,8 @@ func (s *Server) processCompleteMessage(conn *protocol.Connection, channelID uin
 				}
 			}
 		}
-		r := release
-		release = noopRelease
-		jr := newJoinRelease(r)
-		defer jr.serverDone()
-		durableInflight, backpressure, err = s.Broker.PublishMessageAsyncConfirm(message.Exchange, message.RoutingKey, message, onDurable, jr.brokerDone)
+		token.Transfer()
+		durableInflight, backpressure, err = s.Broker.PublishMessageAsyncConfirm(message.Exchange, message.RoutingKey, message, onDurable, token)
 	}
 
 	// Iteration 2 (option A): arm queue-depth reader backpressure. The async

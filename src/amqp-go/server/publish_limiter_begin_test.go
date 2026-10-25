@@ -18,14 +18,14 @@ func TestLimiter_CancelPromotesNextWaiter(t *testing.T) {
 
 	a, err := l.Reserve(ctx, "a", 6) // used=6
 	require.NoError(t, err)
-	defer a.Release()
+	defer a.Abort()
 
 	bLease, bWait, err := l.Begin("b", 5) // 6+5 > 10: waits
 	require.NoError(t, err)
-	require.Nil(t, bLease)
+	require.False(t, bLease.Valid())
 	cLease, cWait, err := l.Begin("c", 4) // waits behind b (no barging)
 	require.NoError(t, err)
-	require.Nil(t, cLease)
+	require.False(t, cLease.Valid())
 
 	require.Eventually(t, func() bool {
 		_, _, w := l.Stats()
@@ -37,7 +37,7 @@ func TestLimiter_CancelPromotesNextWaiter(t *testing.T) {
 	select {
 	case g := <-cWait.C():
 		require.NoError(t, g.err)
-		require.NotNil(t, g.lease, "the cancelled head's bytes must promote c")
+		require.True(t, g.tok.Valid(), "the cancelled head's bytes must promote c")
 	case <-time.After(30 * time.Second):
 		t.Fatal("c was not promoted after the head waiter cancelled")
 	}
@@ -54,9 +54,9 @@ func TestLimiter_BeginAndLeaseWaitCancel(t *testing.T) {
 		defer l.Close()
 		le, wait, err := l.Begin("a", 5)
 		require.NoError(t, err)
-		require.NotNil(t, le)
+		require.True(t, le.Valid())
 		assert.Nil(t, wait)
-		le.Release()
+		le.Abort()
 	})
 
 	t.Run("cancel before grant removes the waiter", func(t *testing.T) {
@@ -64,11 +64,11 @@ func TestLimiter_BeginAndLeaseWaitCancel(t *testing.T) {
 		defer l.Close()
 		a, err := l.Reserve(context.Background(), "a", 10)
 		require.NoError(t, err)
-		defer a.Release()
+		defer a.Abort()
 
 		le, wait, err := l.Begin("b", 5)
 		require.NoError(t, err)
-		require.Nil(t, le)
+		require.False(t, le.Valid())
 		require.NotNil(t, wait)
 		require.Eventually(t, func() bool {
 			_, _, w := l.Stats()
@@ -93,7 +93,7 @@ func TestLimiter_BeginAndLeaseWaitCancel(t *testing.T) {
 			require.NoError(t, err)
 			le, wait, err := l.Begin("b", 6)
 			require.NoError(t, err)
-			require.Nil(t, le)
+			require.False(t, le.Valid())
 			require.Eventually(t, func() bool {
 				_, _, w := l.Stats()
 				return w == 1
@@ -103,7 +103,7 @@ func TestLimiter_BeginAndLeaseWaitCancel(t *testing.T) {
 			// must NOT read it after Cancel) or the grant is delivered and
 			// Cancel drains + releases it. Both end at used == 0, waiters == 0.
 			go wait.Cancel()
-			a.Release()
+			a.Abort()
 			require.Eventually(t, func() bool {
 				used, _, w := l.Stats()
 				return used == 0 && w == 0
@@ -131,7 +131,7 @@ func TestLimiter_ClosedDistinguishableFromOverbudget(t *testing.T) {
 	_, ok := l.TryReserve("b", 5)
 	assert.False(t, ok, "overbudget")
 	assert.False(t, l.Closed(), "not closed — an overbudget refusal")
-	a.Release()
+	a.Abort()
 	l.Close()
 	_, ok = l.TryReserve("b", 1)
 	assert.False(t, ok)

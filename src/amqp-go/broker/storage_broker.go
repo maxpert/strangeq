@@ -2937,17 +2937,20 @@ func (b *StorageBroker) publishMessage(exchangeName, routingKey string, message 
 // after every durable copy of a message has crossed the WAL group-commit fsync
 // barrier. remaining starts at 1 (a setup guard dropped after the routing loop)
 // plus 1 per enqueued durable copy; the transition-to-zero fires onDurable with
-// the first error seen (nil on full success). The guard prevents a premature
-// fire if an early copy's fsync completes before later copies are enqueued.
+// the first error seen (nil on full success) and signals the publish lease
+// (leaseDone.BrokerDone) once. The guard prevents a premature fire if an early
+// copy's fsync completes before later copies are enqueued.
 type publishConfirmAgg struct {
 	remaining atomic.Int32
 	onDurable func(error)
 	errOnce   sync.Once
 	err       error
+	leaseDone protocol.PublishLeaseToken
+	durableOff atomic.Bool // abandoned: no onDurable may fire anymore
 }
 
-func newPublishConfirmAgg(onDurable func(error)) *publishConfirmAgg {
-	a := &publishConfirmAgg{onDurable: onDurable}
+func newPublishConfirmAgg(onDurable func(error), leaseDone protocol.PublishLeaseToken) *publishConfirmAgg {
+	a := &publishConfirmAgg{onDurable: onDurable, leaseDone: leaseDone}
 	a.remaining.Store(1) // setup guard
 	return a
 }
@@ -2966,47 +2969,51 @@ func (a *publishConfirmAgg) report(err error) {
 	if err != nil {
 		a.errOnce.Do(func() { a.err = err })
 	}
-	if a.remaining.Add(-1) == 0 && a.onDurable != nil {
-		a.onDurable(a.err)
+	// Decrement first; decide at the zero transition whether onDurable may
+	// fire. Checking durableOff AFTER the decrement (rather than before) makes
+	// the abandoned case robust by construction: an abandon() that has already
+	// moved remaining past zero can never race a report() into firing
+	// onDurable, because the atomic total order of remaining.Add guarantees
+	// the zero transition is claimed by exactly one side. BrokerDone always
+	// fires at zero — the lease settles exactly once.
+	if a.remaining.Add(-1) == 0 {
+		if !a.durableOff.Load() && a.onDurable != nil {
+			a.onDurable(a.err)
+		}
+		a.leaseDone.BrokerDone()
 	}
 }
 
-// retentionAgg is the per-publish fan-in that fires onReleased EXACTLY ONCE,
-// after every accepted durable copy of a message has completed (in either
-// direction) across the normal, partial-fanout-reject, enqueue-error, shared
-// StopCh/WAL-close, no-route, transient and teardown paths (WS-I Phase B). It
-// mirrors publishConfirmAgg's setup guard: remaining starts at 1 (the guard,
-// dropped by the caller's defer on EVERY return) plus 1 per accepted copy;
-// the transition-to-zero fires onReleased. Because every copy's addN runs
-// before its enqueue and the guard is held until the function returns, a
-// completion that fires synchronously inside the enqueue call can never
-// release early.
-type retentionAgg struct {
-	remaining  atomic.Int32
-	onReleased func()
-}
-
-func newRetentionAgg(onReleased func()) *retentionAgg {
-	if onReleased == nil {
-		onReleased = func() {} // a nil callback is safe on every path
-	}
-	a := &retentionAgg{onReleased: onReleased}
-	a.remaining.Store(1) // setup guard
-	return a
-}
-
-// addN registers k accepted copies. MUST run before those copies' WAL writes
-// are enqueued, so a completion firing immediately can never drive remaining
-// to zero before every copy has been counted.
-func (a *retentionAgg) addN(k int32) { a.remaining.Add(k) }
-
-// doneN settles k copies (or the setup guard). The transition-to-zero fires
-// onReleased once.
-func (a *retentionAgg) doneN(k int32) {
-	if a.remaining.Add(-k) == 0 {
-		a.onReleased()
+// abandon drops the setup guard on an aborted publish (reject-publish tail,
+// mid-fanout StopCh/WAL-close). Old behavior preserved exactly: onDurable never
+// fires from this point on, while the lease settles exactly once the outstanding
+// accepted copies complete (or immediately when none were ever enqueued).
+func (a *publishConfirmAgg) abandon() {
+	a.durableOff.Store(true)
+	if a.remaining.Add(-1) == 0 {
+		a.leaseDone.BrokerDone()
 	}
 }
+
+// abandonStranded is abandon() for a failed ENQUEUE: on top of the setup
+// guard, `stranded` already-counted copies will never report because their
+// durable writes were never handed to the backend (the synchronous error
+// contract of StoreMessageAsync/StoreSharedAsync: an error return means the
+// completions were never registered). They are released HERE, so the lease
+// settles once the copies enqueued to other targets complete (or immediately
+// when no copy ever reached the backend). onDurable is disabled forever,
+// exactly as abandon(). Fires BrokerDone exactly once (decrement total equals
+// the counted total).
+func (a *publishConfirmAgg) abandonStranded(stranded int) {
+	a.durableOff.Store(true)
+	if a.remaining.Add(int32(-1 - stranded)) == 0 {
+		a.leaseDone.BrokerDone()
+	}
+}
+
+// retentionAgg is REMOVED (generational tokens): the lease fan-in lives in
+// publishConfirmAgg (leaseDone.BrokerDone on the transition-to-zero) for the
+// multi-copy fanout paths, and is a direct signal on the single-copy path.
 
 // PublishMessageAsyncConfirm is the async-completion publish path for durable
 // and/or publisher-confirm messages. It mirrors PublishMessage's routing,
@@ -3028,23 +3035,23 @@ func (a *retentionAgg) doneN(k int32) {
 // existing error handling); durable copies already enqueued to accepted targets
 // still become visible on their fsync, but the confirm is nacked.
 //
-// onReleased (WS-I Phase B) is the publish-lease retention callback: it fires
-// EXACTLY ONCE — after every accepted durable copy completed (in either
-// direction), or synchronously on the transient / no-route / error paths — and
-// always after onDurable when both fire. A nil onReleased is treated as a
-// no-op. The caller transfers lease ownership to the broker by passing it;
-// the broker releases it even if the connection is gone by completion time.
-func (b *StorageBroker) PublishMessageAsyncConfirm(exchangeName, routingKey string, message *protocol.Message, onDurable func(error), onReleased func()) (durableInflight bool, backpressure protocol.DepthGate, err error) {
-	// The retention guard is dropped on EVERY return below; copies counted
-	// into ret before then settle via their completions (or enqueue-error
-	// doneN), so onReleased fires exactly once.
-	ret := newRetentionAgg(onReleased)
-	defer ret.doneN(1)
+// leaseDone (WS-I Phase B, generational tokens) is the publish-lease retention
+// handle: BrokerDone fires EXACTLY ONCE — after every accepted durable copy
+// completed (in either direction), or synchronously on the transient / no-route
+// / error paths — and always after onDurable when both fire. A zero token
+// (disabled limiter) is a no-op. The caller transfers lease ownership to the
+// broker by passing it; the broker releases it even if the connection is gone
+// by completion time.
+func (b *StorageBroker) PublishMessageAsyncConfirm(exchangeName, routingKey string, message *protocol.Message, onDurable func(error), leaseDone protocol.PublishLeaseToken) (durableInflight bool, backpressure protocol.DepthGate, err error) {
+	// Generational tokens: there is no retention aggregator on the
+	// single-copy path; every return below signals leaseDone.BrokerDone()
+	// exactly once (the zero token from a disabled limiter is a no-op).
 
 	// Transient publishes take the byte-for-byte-unchanged synchronous path.
 	// There is no durability barrier, so the confirm (if any) is settled
 	// synchronously by the caller (durableInflight=false).
 	if message.DeliveryMode != 2 {
+		leaseDone.BrokerDone()
 		return false, nil, b.PublishMessage(exchangeName, routingKey, message)
 	}
 
@@ -3054,11 +3061,13 @@ func (b *StorageBroker) PublishMessageAsyncConfirm(exchangeName, routingKey stri
 	// gets the pipelined async path below.
 	adw, ok := b.storage.(asyncDurableWriter)
 	if !ok {
+		leaseDone.BrokerDone()
 		return false, nil, b.PublishMessage(exchangeName, routingKey, message)
 	}
 
 	exchange, err := b.storage.GetExchange(exchangeName)
 	if err != nil {
+		leaseDone.BrokerDone()
 		if errors.Is(err, interfaces.ErrExchangeNotFound) {
 			return false, nil, errNoExchange(exchangeName)
 		}
@@ -3066,6 +3075,7 @@ func (b *StorageBroker) PublishMessageAsyncConfirm(exchangeName, routingKey stri
 	}
 	// §11 (R11): publishing DIRECTLY to an internal exchange is refused (403).
 	if exchange.Internal {
+		leaseDone.BrokerDone()
 		return false, nil, semErr("cannot publish to internal "+exchangeRS(exchangeName), ErrExchangeInternal)
 	}
 
@@ -3078,11 +3088,13 @@ func (b *StorageBroker) PublishMessageAsyncConfirm(exchangeName, routingKey stri
 	rs := acquireRouteScratch()
 	defer releaseRouteScratch(rs)
 	if err := b.routeMessage(exchange, routingKey, message, rs); err != nil {
+		leaseDone.BrokerDone()
 		return false, nil, err
 	}
 	targetQueues := rs.queues
 
 	if len(targetQueues) == 0 {
+		leaseDone.BrokerDone()
 		if message.Mandatory {
 			return false, nil, ErrNoRoute
 		}
@@ -3090,8 +3102,16 @@ func (b *StorageBroker) PublishMessageAsyncConfirm(exchangeName, routingKey stri
 		return false, nil, nil
 	}
 
-	agg := newPublishConfirmAgg(onDurable)
 	rejected := false
+
+	// Generational tokens: the confirm/lease fan-in exists only on the
+	// multi-copy paths; the single-copy hot path (every single-queue durable
+	// publish, incl. all benchmark workloads) signals onDurable and the lease
+	// DIRECTLY from the copy's completion — zero per-publish aggregators.
+	var agg *publishConfirmAgg // nil on the single-copy fast path
+	if len(targetQueues) > 1 {
+		agg = newPublishConfirmAgg(onDurable, leaseDone)
+	}
 
 	// ITER5 shared-body gate: a durable fan-out to >=2 queues with a large body
 	// routes its N durable writes through ONE fused BodyBlock+refs unit (body on
@@ -3101,7 +3121,7 @@ func (b *StorageBroker) PublishMessageAsyncConfirm(exchangeName, routingKey stri
 	// byte-for-byte as today.
 	if len(targetQueues) >= 2 && len(message.Body) >= b.sharedBodyThreshold() {
 		if sdw, ok := b.storage.(sharedDurableWriter); ok {
-			return b.fanoutSharedAsyncConfirm(sdw, agg, ret, message, targetQueues)
+			return b.fanoutSharedAsyncConfirm(sdw, agg, message, targetQueues)
 		}
 	}
 
@@ -3122,6 +3142,16 @@ func (b *StorageBroker) PublishMessageAsyncConfirm(exchangeName, routingKey stri
 		// was deleted out from under us.
 		select {
 		case <-queueState.StopCh():
+			// Enqueued copies' completions still fire and settle the lease after
+			// them (onDurable stays quiet exactly as before). In the multi-copy
+			// branch, copies enqueued to earlier targets may already be accepted;
+			// abandon() drops the guard and disables onDurable, and the lease
+			// settles once those outstanding copies complete (or here if none).
+			if agg != nil {
+				agg.abandon()
+			} else {
+				leaseDone.BrokerDone()
+			}
 			return false, nil, fmt.Errorf("queue '%s': %w", queueName, ErrQueueClosed)
 		default:
 		}
@@ -3205,22 +3235,38 @@ func (b *StorageBroker) PublishMessageAsyncConfirm(exchangeName, routingKey stri
 					b.enqueueMaxLenTrim(qs, qn, pol)
 				}
 			}
-			agg.report(cerr)
-			ret.doneN(1)
+			if agg != nil {
+				agg.report(cerr)
+			} else {
+				// Single-copy fast path: no fan-in; the lease joins this copy's
+				// own completion.
+				if onDurable != nil {
+					onDurable(cerr)
+				}
+				leaseDone.BrokerDone()
+			}
 		}
 
-		agg.addCopy() // count BEFORE enqueue so an immediate completion can't underflow
-		ret.addN(1)   // retention: count this accepted copy BEFORE its enqueue
+		if agg != nil {
+			agg.addCopy() // count BEFORE enqueue so an immediate completion can't underflow
+		}
 		if serr := adw.StoreMessageAsync(queueName, storeMsg, completion); serr != nil {
 			// Enqueue failed (e.g. WAL unavailable): the completion will NOT fire,
 			// so RELEASE the frontier slot we reserved for this tag — otherwise it
 			// stays pending forever and wedges the per-queue frontier, blocking all
 			// later publishes to this queue (M1). real=false advances head past it
 			// without counting it ready AND releases its reject-publish reservation
-			// (§7). The aggregator is abandoned (guard never dropped => onDurable
-			// never fires). Propagate the failure synchronously.
+			// (§7). The aggregator is abandoned: the failed copy's addCopy is
+			// stranded HERE (its completion will never fire), while copies
+			// already enqueued to other targets settle the lease when they
+			// complete. Propagate the failure synchronously.
 			queueState.FrontierComplete(msgID, false)
-			ret.doneN(1) // retention: this copy settles via the enqueue error
+			if agg != nil {
+				agg.abandonStranded(1) // guard + the failed copy's never-reporting count
+			} else {
+				// Single-copy fast path: the lease settles with the failed enqueue.
+				leaseDone.BrokerDone()
+			}
 			return false, nil, fmt.Errorf("failed to store durable message to queue '%s': %w", queueName, serr)
 		}
 	}
@@ -3230,13 +3276,22 @@ func (b *StorageBroker) PublishMessageAsyncConfirm(exchangeName, routingKey stri
 		// accepted targets are enqueued and will become visible on their fsync,
 		// but the publisher confirm is nacked by the caller. The setup guard is
 		// deliberately NOT dropped, so onDurable never fires for a nacked publish.
+		// The lease still settles after the accepted copies (abandon) — or here
+		// on the single-copy fast path.
+		if agg != nil {
+			agg.abandon()
+		} else {
+			leaseDone.BrokerDone()
+		}
 		return false, nil, ErrMaxLengthExceeded
 	}
 
-	// Drop the setup guard. remaining is now (#durable copies) >= 1, so onDurable
-	// fires only once the last copy's fsync completes (asynchronously). Never
-	// fires synchronously here.
-	agg.report(nil)
+	if agg != nil {
+		// Drop the setup guard. remaining is now (#durable copies) >= 1, so onDurable
+		// fires only once the last copy's fsync completes (asynchronously). Never
+		// fires synchronously here. The lease joins the same fan-in.
+		agg.report(nil)
+	}
 	return true, backpressure, nil
 }
 
@@ -3249,7 +3304,7 @@ func (b *StorageBroker) PublishMessageAsyncConfirm(exchangeName, routingKey stri
 // frontier + max-length accounting exactly like the per-queue completion, so
 // consumer-visibility/confirm semantics are identical; only the durable byte
 // layout differs. The publishConfirmAgg fans the N completions into one confirm.
-func (b *StorageBroker) fanoutSharedAsyncConfirm(sdw sharedDurableWriter, agg *publishConfirmAgg, ret *retentionAgg, message *protocol.Message, targetQueues []string) (bool, protocol.DepthGate, error) {
+func (b *StorageBroker) fanoutSharedAsyncConfirm(sdw sharedDurableWriter, agg *publishConfirmAgg, message *protocol.Message, targetQueues []string) (bool, protocol.DepthGate, error) {
 	var backpressure protocol.DepthGate
 	rejected := false
 
@@ -3272,6 +3327,10 @@ func (b *StorageBroker) fanoutSharedAsyncConfirm(sdw sharedDurableWriter, agg *p
 			for _, r := range reserved {
 				r.qs.FrontierComplete(r.tag, false)
 			}
+			// The confirm fan-in is abandoned: every counted copy is stranded
+			// HERE (the shared writes were never handed to the backend, so no
+			// completion will ever fire) — the lease settles immediately.
+			agg.abandonStranded(len(subs))
 			return false, nil, fmt.Errorf("queue '%s': %w", queueName, ErrQueueClosed)
 		default:
 		}
@@ -3340,7 +3399,6 @@ func (b *StorageBroker) fanoutSharedAsyncConfirm(sdw sharedDurableWriter, agg *p
 				}
 			}
 			agg.report(cerr)
-			ret.doneN(1)
 		}
 
 		agg.addCopy() // count BEFORE enqueue so an immediate completion can't underflow
@@ -3353,18 +3411,16 @@ func (b *StorageBroker) fanoutSharedAsyncConfirm(sdw sharedDurableWriter, agg *p
 	}
 
 	if len(subs) > 0 {
-		// Retention: count EVERY accepted sub immediately before the shared
-		// enqueue, so a completion firing synchronously inside StoreSharedAsync
-		// can never release early (the caller's setup guard is still held).
-		ret.addN(int32(len(subs)))
 		if serr := sdw.StoreSharedAsync(subs); serr != nil {
 			// Enqueue failed: no completion will fire, so release every reserved
-			// frontier slot (else the per-queue frontiers wedge, M1). The aggregator
-			// is abandoned (guard never dropped => onDurable never fires).
+			// frontier slot (else the per-queue frontiers wedge, M1). The
+			// aggregator is abandoned: every counted copy is stranded HERE (the
+			// synchronous error contract means the completions were never
+			// registered) — the lease settles immediately.
 			for _, r := range reserved {
 				r.qs.FrontierComplete(r.tag, false)
 			}
-			ret.doneN(int32(len(subs))) // retention: every sub settles via the error
+			agg.abandonStranded(len(subs))
 			return false, nil, fmt.Errorf("failed to store shared durable message: %w", serr)
 		}
 	}
@@ -3372,7 +3428,9 @@ func (b *StorageBroker) fanoutSharedAsyncConfirm(sdw sharedDurableWriter, agg *p
 	if rejected {
 		// A reject-publish target refused the message. Accepted copies are enqueued
 		// and will become visible on their fsync, but the confirm is nacked by the
-		// caller. The setup guard is deliberately NOT dropped (onDurable never fires).
+		// caller. onDurable never fires; the lease settles after the accepted
+		// copies (the old retention-aggregator defer).
+		agg.abandon()
 		return false, nil, ErrMaxLengthExceeded
 	}
 

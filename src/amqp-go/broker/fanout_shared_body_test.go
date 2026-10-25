@@ -77,7 +77,7 @@ func TestSharedBody_FanoutWritesBodyOnce(t *testing.T) {
 		if e == nil {
 			atomic.AddInt32(&confirms, 1)
 		}
-	}, nil)
+	}, protocol.PublishLeaseToken{})
 	require.NoError(t, err)
 	require.True(t, di, "a routed durable fan-out reports durableInflight")
 
@@ -120,7 +120,7 @@ func TestSharedBody_FanoutBelowThresholdInlined(t *testing.T) {
 		if e == nil {
 			atomic.AddInt32(&confirms, 1)
 		}
-	}, nil)
+	}, protocol.PublishLeaseToken{})
 	require.NoError(t, err)
 	require.True(t, di)
 	require.Eventually(t, func() bool { return atomic.LoadInt32(&confirms) == 1 }, 5*time.Second, 5*time.Millisecond)
@@ -150,7 +150,7 @@ func TestSharedBody_SingleQueueDurableNotShared(t *testing.T) {
 		if e == nil {
 			atomic.AddInt32(&confirms, 1)
 		}
-	}, nil)
+	}, protocol.PublishLeaseToken{})
 	require.NoError(t, err)
 	require.True(t, di)
 	require.Eventually(t, func() bool { return atomic.LoadInt32(&confirms) == 1 }, 5*time.Second, 5*time.Millisecond)

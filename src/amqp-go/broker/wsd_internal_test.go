@@ -41,7 +41,7 @@ func TestInternal_PublishRejected_E2EBindingAllowed(t *testing.T) {
 	assert.True(t, errors.Is(err, ErrExchangeInternal), "%v", err)
 	assert.Contains(t, err.Error(), "cannot publish to internal exchange 'ix' in vhost '/'")
 
-	_, _, err = b.PublishMessageAsyncConfirm("ix", "k", &protocol.Message{Exchange: "ix", RoutingKey: "k", Body: []byte("d"), DeliveryMode: 2}, nil, nil)
+	_, _, err = b.PublishMessageAsyncConfirm("ix", "k", &protocol.Message{Exchange: "ix", RoutingKey: "k", Body: []byte("d"), DeliveryMode: 2}, nil, protocol.PublishLeaseToken{})
 	require.Error(t, err)
 	assert.True(t, errors.Is(err, ErrExchangeInternal), "%v", err)
 

@@ -255,7 +255,7 @@ func GetPendingMessage() *PendingMessage {
 	m.BodySize = 0
 	m.Received = 0
 	m.Channel = nil
-	m.Lease = nil
+	m.LeaseToken = PublishLeaseToken{}
 	return m
 }
 
@@ -269,15 +269,16 @@ func GetPendingMessage() *PendingMessage {
 // body on the next pool Get. The same rule applies to Header (aliased via
 // ContentHeader), Method, and Channel — nil references only, never reuse.
 func PutPendingMessage(m *PendingMessage) {
-	// WS-I Phase B: the lease MUST already be released or transferred (nil).
-	// Returning a leased PendingMessage to the pool would strand the leased
-	// bytes forever: under the test-armed flag this panics; in production the
-	// lease is released and the leak reported so budget is never lost.
-	if m.Lease != nil {
+	// WS-I Phase B: the lease MUST already be aborted or transferred (zero
+	// token). Returning a leased PendingMessage to the pool would strand the
+	// leased bytes forever: under the test-armed flag this panics; in
+	// production the lease is aborted and the leak reported so budget is
+	// never lost.
+	if m.LeaseToken.Valid() {
 		if leaseLeakPanicForTest.Load() {
-			panic("PutPendingMessage with a non-nil Lease: the publish lease must be released or transferred first")
+			panic("PutPendingMessage with a live lease token: the publish lease must be aborted or transferred first")
 		}
-		m.Lease.Release()
+		m.LeaseToken.Abort()
 		reportLeaseLeak()
 	}
 	m.Method = nil
@@ -286,7 +287,7 @@ func PutPendingMessage(m *PendingMessage) {
 	m.BodySize = 0
 	m.Received = 0
 	m.Channel = nil
-	m.Lease = nil
+	m.LeaseToken = PublishLeaseToken{}
 	pendingMessagePool.Put(m)
 }
 

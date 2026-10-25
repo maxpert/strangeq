@@ -726,10 +726,10 @@ func TestLease_TxPublishReleasedAtBuffer(t *testing.T) {
 
 	var releases atomic.Int64
 	pm := makeDurablePendingMessage("", "sl8-q", "tx-body")
-	pm.Lease = &countingReleaser{releases: &releases}
+	pm.LeaseToken = countingToken(&releases)
 	require.NoError(t, srv.processCompleteMessage(conn, 1, pm))
 	assert.Equal(t, int64(1), releases.Load(), "tx publish must release its lease at AddOperation")
-	assert.Nil(t, pm.Lease)
+	assert.False(t, pm.LeaseToken.Valid())
 
 	// Hold essentially all of G elsewhere; the commit must still proceed (tx
 	// staging and the tx WAL write are not lease-bounded).
@@ -737,7 +737,7 @@ func TestLease_TxPublishReleasedAtBuffer(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, srv.handleTxCommit(conn, 1, nil))
 	drainFrame(t, frameCh) // tx.commit-ok
-	holder.Release()
+	holder.Abort()
 }
 
 // --- SL-9 ------------------------------------------------------------------
@@ -972,8 +972,8 @@ func TestLease_DeadlineAfterWait(t *testing.T) {
 
 	// Release the first lease (no processor is running; the FIFO holds it).
 	le := conn.LeaseFIFO.Pop()
-	require.NotNil(t, le)
-	le.Release()
+	require.True(t, le.Valid())
+	le.Abort()
 
 	<-clientDone // body2 was read → the loop set a fresh deadline first
 
@@ -1397,33 +1397,107 @@ func TestLease_MultiChannel20And1000Connections(t *testing.T) {
 
 // --- SL-18 -----------------------------------------------------------------
 
-// countingReleaser is a test Releaser that counts every Release call (a
-// double-release is caught, unlike the idempotent production Lease).
-type countingReleaser struct {
+// countingLeaseSink observes release firings through the generational-token
+// ops surface. It mirrors the pooled slot's join state machine faithfully
+// (CONNECTION -> TRANSFERRED -> FREE on serverDone+brokerDone, Abort from
+// either state, ServerFinish = serverDone then abort-if-never-transferred) so
+// a test can assert lease SEMANTICS — budget released exactly once — without
+// a real limiter.
+type countingLeaseSink struct {
 	releases *atomic.Int64
+	mu       sync.Mutex
+	state    int32
+	server   bool
+	broker   bool
 }
 
-func (c *countingReleaser) Release()            { c.releases.Add(1) }
-func (c *countingReleaser) ReleaseFunc() func() { return c.Release }
+func (c *countingLeaseSink) LeaseAbort(uint32) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.state == tokenStateFree {
+		return
+	}
+	c.state = tokenStateFree
+	c.releases.Add(1)
+}
 
-// SL-18: takeLease nil-safety, exactly-once on every processCompleteMessage
-// arm, and the PutPendingMessage non-nil-lease assertion.
-func TestLease_TakeLeaseNilSafeAndPutAsserts(t *testing.T) {
-	t.Run("takeLease nil-safe", func(t *testing.T) {
-		takeLease(nil)() // nil pm → noopRelease
-		pm := &protocol.PendingMessage{}
-		takeLease(pm)() // nil lease → noopRelease
+func (c *countingLeaseSink) LeaseTransfer(uint32) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.state == tokenStateConnection {
+		c.state = tokenStateTransferred
+	}
+}
+
+func (c *countingLeaseSink) LeaseServerDone(uint32) { c.done(true) }
+func (c *countingLeaseSink) LeaseBrokerDone(uint32) { c.done(false) }
+
+func (c *countingLeaseSink) LeaseServerFinish(uint32) {
+	c.done(true)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.state == tokenStateConnection { // never transferred: server-side abort
+		c.state = tokenStateFree
+		c.releases.Add(1)
+	}
+}
+
+func (c *countingLeaseSink) LeaseState() int32 {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.state
+}
+
+func (c *countingLeaseSink) done(server bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.state == tokenStateFree {
+		return
+	}
+	if server {
+		if c.server {
+			return
+		}
+		c.server = true
+	} else {
+		if c.broker {
+			return
+		}
+		c.broker = true
+	}
+	if c.server && c.broker {
+		c.state = tokenStateFree
+		c.releases.Add(1)
+	}
+}
+
+func countingToken(n *atomic.Int64) protocol.PublishLeaseToken {
+	return protocol.LeaseTokenOf(&countingLeaseSink{releases: n, state: tokenStateConnection}, 1)
+}
+
+// SL-18: zero-token nil-safety, exactly-once release on every
+// processCompleteMessage arm, and the PutPendingMessage live-token assertion.
+func TestLease_TokenNilSafeAndPutAsserts(t *testing.T) {
+	t.Run("zero token nil-safe", func(t *testing.T) {
+		var zero protocol.PublishLeaseToken
+		zero.Abort()        // no-op
+		zero.ServerFinish() // no-op
+		zero.BrokerDone()   // no-op
+		assert.Equal(t, tokenStateFree, int(zero.State()))
+
 		var n atomic.Int64
-		pm.Lease = &countingReleaser{releases: &n}
-		f1 := takeLease(pm)
-		assert.Nil(t, pm.Lease, "takeLease must clear pm.Lease")
-		f2 := takeLease(pm) // second take → noop
-		f1()
-		f2()
+		pm := &protocol.PendingMessage{}
+		pm.LeaseToken = countingToken(&n)
+		tok := pm.LeaseToken
+		pm.LeaseToken = protocol.PublishLeaseToken{}
+		assert.False(t, pm.LeaseToken.Valid(), "taking the token must clear pm.LeaseToken")
+		tok.Abort()
+		tok.Abort() // duplicate abort is a no-op
 		assert.Equal(t, int64(1), n.Load(), "exactly one release")
+		assert.Equal(t, int32(tokenStateFree), tok.State())
 	})
 
-	// processCompleteMessage arms: each leaves Lease == nil and releases
+	// processCompleteMessage arms: each leaves LeaseToken invalid and releases
 	// exactly once.
 	newSrvConn := func(t *testing.T) (*Server, *protocol.Connection, chan *protocol.Frame) {
 		srv := newTransactionTestServer(t)
@@ -1447,9 +1521,9 @@ func TestLease_TakeLeaseNilSafeAndPutAsserts(t *testing.T) {
 		pm := makeDurablePendingMessage("", "q", "b")
 		pm.Header.PropertyFlags |= protocol.FlagUserID
 		pm.Header.UserID = "intruder"
-		pm.Lease = &countingReleaser{releases: &n}
+		pm.LeaseToken = countingToken(&n)
 		_ = srv.processCompleteMessage(conn, 1, pm)
-		assert.Nil(t, pm.Lease)
+		assert.False(t, pm.LeaseToken.Valid())
 		assert.Equal(t, int64(1), n.Load())
 	})
 
@@ -1460,9 +1534,9 @@ func TestLease_TakeLeaseNilSafeAndPutAsserts(t *testing.T) {
 		drainFrame(t, frameCh)
 		var n atomic.Int64
 		pm := makeDurablePendingMessage("", "sl18-txq", "b")
-		pm.Lease = &countingReleaser{releases: &n}
+		pm.LeaseToken = countingToken(&n)
 		require.NoError(t, srv.processCompleteMessage(conn, 1, pm))
-		assert.Nil(t, pm.Lease)
+		assert.False(t, pm.LeaseToken.Valid())
 		assert.Equal(t, int64(1), n.Load(), "tx releases at AddOperation")
 	})
 
@@ -1472,11 +1546,11 @@ func TestLease_TakeLeaseNilSafeAndPutAsserts(t *testing.T) {
 		drainFrame(t, frameCh)
 		var n atomic.Int64
 		pm := makeDurablePendingMessage("no-such-exchange", "k", "b")
-		pm.Lease = &countingReleaser{releases: &n}
+		pm.LeaseToken = countingToken(&n)
 		err := srv.processCompleteMessage(conn, 1, pm)
 		drainFrame(t, frameCh) // channel.close from the 404
 		require.Error(t, err, "the tx-arm exchange validation must fail before buffering")
-		assert.Nil(t, pm.Lease)
+		assert.False(t, pm.LeaseToken.Valid())
 		assert.Equal(t, int64(1), n.Load(), "the defer releases on the validation early return")
 	})
 
@@ -1489,9 +1563,9 @@ func TestLease_TakeLeaseNilSafeAndPutAsserts(t *testing.T) {
 		}
 		var n atomic.Int64
 		pm := makeDurablePendingMessage("", "sl18-dq", "b")
-		pm.Lease = &countingReleaser{releases: &n}
+		pm.LeaseToken = countingToken(&n)
 		require.NoError(t, srv.processCompleteMessage(conn, 1, pm))
-		assert.Nil(t, pm.Lease, "the broker owns the lease now")
+		assert.False(t, pm.LeaseToken.Valid(), "the broker owns the lease now")
 		assert.Equal(t, int64(0), n.Load(), "not released before durability")
 		release()
 		require.Eventually(t, func() bool { return n.Load() == 1 }, 30*time.Second, time.Millisecond)
@@ -1502,9 +1576,9 @@ func TestLease_TakeLeaseNilSafeAndPutAsserts(t *testing.T) {
 		declare(t, srv, conn, frameCh, "sl18-tq")
 		var n atomic.Int64
 		pm := makePendingMessage("", "sl18-tq", "b") // DeliveryMode 0 → transient
-		pm.Lease = &countingReleaser{releases: &n}
+		pm.LeaseToken = countingToken(&n)
 		require.NoError(t, srv.processCompleteMessage(conn, 1, pm))
-		assert.Nil(t, pm.Lease)
+		assert.False(t, pm.LeaseToken.Valid())
 		assert.Equal(t, int64(1), n.Load())
 	})
 
@@ -1512,9 +1586,9 @@ func TestLease_TakeLeaseNilSafeAndPutAsserts(t *testing.T) {
 		srv, conn, _ := newSrvConn(t)
 		var n atomic.Int64
 		pm := makeDurablePendingMessage("", "no-such-queue", "b")
-		pm.Lease = &countingReleaser{releases: &n}
+		pm.LeaseToken = countingToken(&n)
 		require.NoError(t, srv.processCompleteMessage(conn, 1, pm))
-		assert.Nil(t, pm.Lease)
+		assert.False(t, pm.LeaseToken.Valid())
 		assert.Equal(t, int64(1), n.Load())
 	})
 
@@ -1522,16 +1596,16 @@ func TestLease_TakeLeaseNilSafeAndPutAsserts(t *testing.T) {
 		srv, conn, _ := newSrvConn(t)
 		var n atomic.Int64
 		pm := makeDurablePendingMessage("no-such-exchange", "k", "b")
-		pm.Lease = &countingReleaser{releases: &n}
+		pm.LeaseToken = countingToken(&n)
 		err := srv.processCompleteMessage(conn, 1, pm)
 		require.Error(t, err)
-		assert.Nil(t, pm.Lease)
+		assert.False(t, pm.LeaseToken.Valid())
 		assert.Equal(t, int64(1), n.Load())
 	})
 
-	t.Run("PutPendingMessage with a non-nil lease panics under the armed flag", func(t *testing.T) {
+	t.Run("PutPendingMessage with a live lease token panics under the armed flag", func(t *testing.T) {
 		pm := protocol.GetPendingMessage()
-		pm.Lease = &countingReleaser{releases: &atomic.Int64{}}
+		pm.LeaseToken = countingToken(&atomic.Int64{})
 		require.Panics(t, func() { protocol.PutPendingMessage(pm) })
 		// Disarmed: the lease is released and the leak reported, never lost.
 		protocol.SetLeaseLeakPanicForTest(false)
@@ -1541,7 +1615,7 @@ func TestLease_TakeLeaseNilSafeAndPutAsserts(t *testing.T) {
 		defer protocol.SetLeaseLeakReporter(nil)
 		var n atomic.Int64
 		pm2 := protocol.GetPendingMessage()
-		pm2.Lease = &countingReleaser{releases: &n}
+		pm2.LeaseToken = countingToken(&n)
 		require.NotPanics(t, func() { protocol.PutPendingMessage(pm2) })
 		assert.Equal(t, int64(1), n.Load(), "production path releases the lease")
 		assert.Equal(t, int64(1), leaks.Load(), "and reports the leak")

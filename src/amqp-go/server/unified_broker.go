@@ -4,6 +4,13 @@ import "github.com/maxpert/amqp-go/protocol"
 
 // UnifiedBroker defines the interface that both broker implementations must satisfy
 // This allows the Server to work with either the original in-memory broker or the storage-backed broker
+// leaseDone (WS-I Phase B, generational tokens) is the publish-lease
+// retention handle: the broker signals LeaseDone.BrokerDone() EXACTLY ONCE —
+// after every accepted durable copy completed (in either direction), or
+// synchronously on the transient / no-route / error paths — and always after
+// onDurable when both fire. A zero token (disabled limiter) is a no-op. The
+// caller transfers lease ownership to the broker by passing it; the broker
+// signals it even if the connection is gone by completion time.
 type UnifiedBroker interface {
 	// Exchange operations
 	DeclareExchange(name, exchangeType string, durable, autoDelete, internal bool, arguments map[string]interface{}) error
@@ -39,12 +46,13 @@ type UnifiedBroker interface {
 	// still admitted (it always durablizes + confirms); the processor is never
 	// parked, so the confirm tag is never stranded. nil means capacity headroom.
 	//
-	// onReleased (WS-I Phase B) is the publish-lease retention callback: it
-	// fires EXACTLY ONCE — after every accepted durable copy completed, or
-	// synchronously on the transient / no-route / error paths — and after
-	// onDurable when both fire. nil is treated as a no-op. The broker owns the
-	// lease from this call on, releasing it even after the connection is gone.
-	PublishMessageAsyncConfirm(exchangeName, routingKey string, message *protocol.Message, onDurable func(error), onReleased func()) (durableInflight bool, backpressure protocol.DepthGate, err error)
+	// leaseDone (WS-I Phase B, generational tokens): the broker signals
+	// leaseDone.BrokerDone() EXACTLY ONCE — after every accepted durable
+	// copy completed, or synchronously on the transient / no-route / error
+	// paths — and after onDurable when both fire. The zero token (disabled
+	// limiter) is a no-op. The broker owns the lease from this call on,
+	// signaling it even after the connection is gone.
+	PublishMessageAsyncConfirm(exchangeName, routingKey string, message *protocol.Message, onDurable func(error), leaseDone protocol.PublishLeaseToken) (durableInflight bool, backpressure protocol.DepthGate, err error)
 
 	// Consumer operations. Every consumerID below is the BROKER-INTERNAL
 	// consumer identity (protocol.Consumer.ID), never the client-visible
