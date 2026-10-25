@@ -381,6 +381,13 @@ type QueueWAL struct {
 	pipelineBatches []*stagedBatch
 }
 
+// WALBatchSealBytesDefault is the default byte-based WAL batch seal (64 MiB):
+// the stager stops adding requests to a batch once its serialization buffer
+// reaches this size. Exported for the WS-I Phase B publish-inflight lease,
+// whose default budget G is 4 × WALBatchSealBytesDefault = 256 MiB (a batch in
+// fsync, a staging batch, and slack).
+const WALBatchSealBytesDefault = 64 << 20 // 64 MiB
+
 // Package tunables for the WS-C roll/retry machinery. Unexported vars so
 // tests can shrink them; every test that mutates one restores it with
 // t.Cleanup and mutates it before the first write (the values are read under
@@ -398,7 +405,9 @@ var (
 	// record larger than the seal forms its own batch. Test-shrinkable like
 	// the roll backoff vars; a test that shrinks it must do so before the
 	// manager is created (the stager reads it outside every lock).
-	walBatchSealBytes = 64 << 20 // 64 MiB
+	// Initialised from the exported WALBatchSealBytesDefault (WS-I Phase B:
+	// the default publish-inflight lease budget is 4× that constant).
+	walBatchSealBytes = WALBatchSealBytesDefault
 )
 
 // walPipelineBatchCount is the exact number of stagedBatch objects per
