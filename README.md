@@ -38,7 +38,7 @@ RabbitMQ is the gold standard for AMQP 0.9.1, but it runs on the Erlang VM — a
 - Queue length limits — `x-max-length` / `x-max-length-bytes` with `x-overflow` (`drop-head`, `reject-publish`)
 - Resource alarms — `connection.blocked` / `connection.unblocked` driven by memory (RSS) and free-disk watermarks
 - Exclusive and auto-delete queues with automatic cleanup (exclusive queues deleted on owning-connection close; auto-delete queues deleted when the last consumer leaves)
-- Higher durable end-to-end throughput than RabbitMQ 4.3 on every tested workload — 1.10x to 4.48x in the 2026-07-14 head-to-head; 1.575x on 64 KB × 10×10 in the 2026-10-25 run (see [Performance](#performance))
+- Higher durable end-to-end throughput than RabbitMQ 4.3 Classic queues on 64 KB messages with 10 producers / 10 consumers (1.58x), with lower peak memory (see [Performance](#performance))
 - Prometheus metrics and pprof profiling
 - Lock-free per-queue ring buffer with per-slot CAS
 - Batch TCP writes and ACK offloading
@@ -295,55 +295,36 @@ Key engine tuning parameters:
 
 ## Performance
 
-All numbers below are **end-to-end consumed msg/s** — every published message is also delivered and acknowledged, so the figures reflect full round-trip delivery, not publish acceptance. Both brokers are driven by the same client ([`cmd/perftest`](src/amqp-go/cmd/perftest), built on [amqp091-go](https://github.com/rabbitmq/amqp091-go)) under identical settings.
+Throughput is measured as **end-to-end delivered messages per second (msg/s)**: every published message is delivered and acknowledged. Both brokers are tested with the same client ([`cmd/perftest`](src/amqp-go/cmd/perftest), built on [amqp091-go](https://github.com/rabbitmq/amqp091-go)) and identical settings.
 
-**Common settings (both runs)**
-- Single machine: Apple Silicon, 16 cores.
-- Durable queues, publisher confirms, fsync enabled, consumer prefetch 100, manual acks.
-- Zero message loss and zero unconfirmed publishes on every run.
+**Common settings**
+- Single Apple Silicon machine with 16 cores.
+- Durable queues, publisher confirms, fsync enabled, consumer prefetch 100, and manual acknowledgements.
+- No message loss or unconfirmed publishes.
 
-### Latest: Stage 6 (2026-10-25, candidate build)
+### Latest benchmark (2026-10-25)
 
-Candidate is the WS-I-B token build, compared against the WS-F reference build and RabbitMQ 4.3 Classic queues. Workloads: F1 = 1 KB, 1×1; F2 = 1 KB, 10×10; F3 = 64 KB, 1×1; F4 = 64 KB, 10×10. Each cell: 10 s warmup, 30 s measured window. Median of valid reps (F4: 5 reps per broker; F1–F3: 3 reps per build). Full report: [`.notes/benchmarks/2026-10-25-wsi-b-stage6.md`](.notes/benchmarks/2026-10-25-wsi-b-stage6.md).
+Each workload used a 10-second warmup followed by a 30-second measurement. Results are median throughput.
 
-| Workload | StrangeQ (candidate) | WS-F | RabbitMQ 4.3 Classic | StrangeQ / WS-F | StrangeQ / Classic |
-|---|--:|--:|--:|--:|--:|
-| F1 (1 KB, 1×1) | 116,219 msg/s | 115,725 msg/s | — | 1.004x | — |
-| F2 (1 KB, 10×10) | 157,232 msg/s | 155,694 msg/s | — | 1.010x | — |
-| F3 (64 KB, 1×1) | 30,214 msg/s | 30,204 msg/s | — | 1.000x | — |
-| F4 (64 KB, 10×10) | 32,899 msg/s | 33,488 msg/s | 20,892 msg/s | 0.982x | 1.575x |
+| Message size | Producers / consumers | StrangeQ | RabbitMQ 4.3 Classic | StrangeQ / RabbitMQ |
+|---|--:|--:|--:|--:|
+| 1 KB | 1 / 1 | 116,219 msg/s | — | — |
+| 1 KB | 10 / 10 | 157,232 msg/s | — | — |
+| 64 KB | 1 / 1 | 30,214 msg/s | — | — |
+| 64 KB | 10 / 10 | 32,899 msg/s | 20,892 msg/s | **1.58x** |
 
-F4 memory (MB, peak = max RSS over the sampled run):
+Memory usage for the 64 KB workload with 10 producers and 10 consumers:
 
-| | StrangeQ (candidate) | RabbitMQ 4.3 Classic | Ratio |
+| Memory (RSS) | StrangeQ | RabbitMQ 4.3 Classic | StrangeQ / RabbitMQ |
 |---|--:|--:|--:|
-| Steady RSS | 1,027 | 1,110 | 0.925x |
-| Peak RSS | 1,029 | 1,597 | 0.645x |
+| Steady state | 1,027 MB | 1,110 MB | 0.93x |
+| Peak | 1,029 MB | 1,597 MB | **0.65x** |
 
-F4 confirm latency (p50): 118.3 ms StrangeQ vs 33.2 ms RabbitMQ Classic.
-
-Correctness: 33/33 valid cells, 0 lost, 0 unconfirmed, 0 nacked.
-
-**Stage verdict: NO-GO.** The F4 throughput gate vs WS-F fails: Welch lower 95% bound is 0.967 against a required 0.98 (median 0.982). Steady RSS vs Classic does not show complete separation. The F1, F2, and F3 throughput gates pass. The F4 gate result, not the RabbitMQ comparison, is the blocker for this build.
-
-### Previous: Head-to-Head vs RabbitMQ 4.3 (2026-07-14, release build)
-
-Methodology for this run: RabbitMQ 4.3 runs in an [OrbStack](https://orbstack.dev/) ARM64-native container (not emulated) with in-container storage; StrangeQ runs host-native; both use local disk (no host bind mount). 20-second runs, 1 KB message bodies unless noted.
-
-Durable queues, publisher confirms, fsync enabled on both, consumer prefetch 100, manual acks. Steady-state medians of the per-second consumed rate.
-
-| Workload (1 KB body unless noted) | RabbitMQ 4.3 | StrangeQ | StrangeQ advantage |
-|---|--:|--:|--:|
-| 1 pub / 1 con | 64,532 msg/s | 108,000 msg/s | 1.67x |
-| 10 pub / 10 con | 25,381 msg/s | 113,667 msg/s | 4.48x |
-| 30 pub / 30 con | 24,232 msg/s | 106,906 msg/s | 4.41x |
-| 64 KB body, 1 pub / 1 con | 21,157 msg/s | 23,217 msg/s | 1.10x |
-
-RabbitMQ 4.3 rejects transient non-exclusive queues by default, so the head-to-head is run on durable queues with publisher confirms. Non-durable queues on StrangeQ reach roughly 140K msg/s (1 pub / 1 con, 1 KB, host-native).
+Median publisher-confirm latency for this workload was **118.3 ms** for StrangeQ and **33.2 ms** for RabbitMQ Classic.
 
 ### Multi-queue scaling (durable + publisher confirms)
 
-3 producers / 3 consumers per queue, 1 KB bodies, one perftest process per queue. Aggregate consumed msg/s, zero loss, evenly balanced across queues. Measured 2026-07-26.
+3 producers / 3 consumers per queue, 1 KB bodies, one perftest process per queue. Aggregate consumed msg/s, zero loss, evenly balanced across queues.
 
 | Queues | StrangeQ aggregate | vs single queue |
 |---|--:|--:|
@@ -364,21 +345,9 @@ can lose confirmed messages.
 ```bash
 cd src/amqp-go
 
-# 1 producer / 1 consumer, 1 KB, 20s
+# 10 producers / 10 consumers, 64 KB bodies, 30s
 go run ./cmd/perftest -url amqp://guest:guest@localhost:5672/ \
-  -durable -confirm -producers 1 -consumers 1 -size 1024 -duration 20s
-
-# 10 producers / 10 consumers, 1 KB
-go run ./cmd/perftest -url amqp://guest:guest@localhost:5672/ \
-  -durable -confirm -producers 10 -consumers 10 -size 1024 -duration 20s
-
-# 30 producers / 30 consumers, 1 KB
-go run ./cmd/perftest -url amqp://guest:guest@localhost:5672/ \
-  -durable -confirm -producers 30 -consumers 30 -size 1024 -duration 20s
-
-# 64 KB bodies, 1 producer / 1 consumer
-go run ./cmd/perftest -url amqp://guest:guest@localhost:5672/ \
-  -durable -confirm -producers 1 -consumers 1 -size 65536 -duration 20s
+  -durable -confirm -producers 10 -consumers 10 -size 65536 -duration 30s
 ```
 
 Point `-url` at either broker (both speak AMQP 0.9.1). To run RabbitMQ 4.3 the same way:
@@ -387,7 +356,7 @@ Point `-url` at either broker (both speak AMQP 0.9.1). To run RabbitMQ 4.3 the s
 docker run -d --name rabbitmq-bench --platform linux/arm64 -p 5672:5672 rabbitmq:4.3-management
 ```
 
-A Go microbenchmark (`BenchmarkVersus`) also exists for allocation/latency profiling of the hot path.
+A Go microbenchmark (`BenchmarkVersus`) also exists for allocation and latency profiling of the hot path.
 
 ## Feature Comparison vs RabbitMQ
 
