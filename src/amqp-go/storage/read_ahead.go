@@ -190,7 +190,7 @@ func (qw *QueueWAL) collectBatchFrom(file *os.File, queueName string, filePositi
 		}
 	}
 	chunk := make([]byte, want)
-	n, err := file.ReadAt(chunk, filePosition)
+	n, err := walReadAt(file, chunk, filePosition)
 	if err != nil && !errors.Is(err, io.EOF) {
 		return nil, err
 	}

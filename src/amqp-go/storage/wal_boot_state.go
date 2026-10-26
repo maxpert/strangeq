@@ -290,50 +290,83 @@ func indexWALFile(fileNum uint64, path string) (inv *segmentInventory, hasShared
 	return inv, hasSharedBody, nil
 }
 
-// peekRecordInventory reads only the structural prefix needed by the physical
-// index, avoiding a full protocol.Message allocation for every boot record.
-func peekRecordInventory(payload []byte) (queueName string, offset uint64, bodyRef int64, ok bool) {
-	bodyRef = -1
+// walPayloadLayout describes the structural prefix of a v4 message payload
+// (the bytes AFTER the one-byte record-type tag).
+type walPayloadLayout struct {
+	// queueName is the queue the record belongs to.
+	queueName string
+	// offset is the delivery tag the record carries.
+	offset uint64
+	// bodyRef is the file-relative position of the referenced BodyBlock, or
+	// -1 when the record carries its body inline.
+	bodyRef int64
+	// locatorOff is the offset of the 8-byte body locator WITHIN the payload,
+	// or -1 when the record carries its body inline.
+	locatorOff int
+	// ok is false when the payload is malformed.
+	ok bool
+}
+
+// parseWalPayload walks the structural prefix of a v4 message payload: the
+// presence bitmap, the queue name, the delivery tag, the exchange, the
+// routing key, the delivery mode and the body arm.
+//
+// It is the SINGLE walk of that grammar. The boot-time physical index
+// (peekRecordInventory) and the compaction's locator remapping both go
+// through it, so the two can never disagree about where a body locator lives.
+func parseWalPayload(payload []byte) walPayloadLayout {
+	var out walPayloadLayout
+	out.bodyRef = -1
+	out.locatorOff = -1
 	if len(payload) < 3 {
-		return "", 0, bodyRef, false
+		return out
 	}
 	qlen := int(payload[2])
 	pos := 3 + qlen
 	if pos+8 > len(payload) {
-		return "", 0, bodyRef, false
+		return out
 	}
-	queueName = string(payload[3 : 3+qlen])
-	offset = binary.BigEndian.Uint64(payload[pos : pos+8])
+	out.queueName = string(payload[3 : 3+qlen])
+	out.offset = binary.BigEndian.Uint64(payload[pos : pos+8])
 	pos += 8
 	// exchange and routing-key short strings, delivery mode, body kind
 	for range 2 {
 		if pos >= len(payload) {
-			return "", 0, bodyRef, false
+			return out
 		}
 		n := int(payload[pos])
 		pos += 1 + n
 		if pos > len(payload) {
-			return "", 0, bodyRef, false
+			return out
 		}
 	}
 	if pos+2 > len(payload) {
-		return "", 0, bodyRef, false
+		return out
 	}
 	pos++ // delivery mode
 	kind := payload[pos]
 	pos++
 	if kind == bodyKindReference {
 		if pos+2 > len(payload) {
-			return "", 0, bodyRef, false
+			return out
 		}
 		n := int(binary.BigEndian.Uint16(payload[pos : pos+2]))
 		pos += 2
 		if n != 8 || pos+8 > len(payload) {
-			return "", 0, bodyRef, false
+			return out
 		}
-		bodyRef = int64(binary.BigEndian.Uint64(payload[pos : pos+8]))
+		out.bodyRef = int64(binary.BigEndian.Uint64(payload[pos : pos+8]))
+		out.locatorOff = pos
 	}
-	return queueName, offset, bodyRef, true
+	out.ok = true
+	return out
+}
+
+// peekRecordInventory reads only the structural prefix needed by the physical
+// index, avoiding a full protocol.Message allocation for every boot record.
+func peekRecordInventory(payload []byte) (queueName string, offset uint64, bodyRef int64, ok bool) {
+	l := parseWalPayload(payload)
+	return l.queueName, l.offset, l.bodyRef, l.ok
 }
 
 // rebuildBootState restores fileNum, oldFiles and offsetIndex from what is
@@ -376,6 +409,15 @@ func (qw *QueueWAL) rebuildBootState() error {
 	var files []existingFile
 	var maxNum uint64
 	for _, e := range entries {
+		// A crash between "the compaction copy is written" and "the copy is
+		// installed" leaves a <digits>.wal.compact file behind. It is a partial
+		// duplicate of a file that still holds every record, so removing it
+		// loses nothing — and leaving it would leak one file per crash
+		// forever, because nothing else ever looks at these names.
+		if isWALCompactOrphan(e.Name()) {
+			_ = os.Remove(filepath.Join(qw.dataDir, e.Name()))
+			continue
+		}
 		if !isWALFileName(e) {
 			continue
 		}

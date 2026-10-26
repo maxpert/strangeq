@@ -32,7 +32,8 @@ import (
 // --- WAL write ------------------------------------------------------------
 
 // walWriteFn is the signature of the WAL record-append performed by
-// commitBatch's group-commit batch and writeTxAtomic's single-shot unit.
+// commitBatch's group-commit batch, writeTxAtomic's single-shot unit, and the
+// WAL compaction's copy of a record into its temporary file.
 type walWriteFn func(f *os.File, b []byte) (int, error)
 
 var walWriteHook atomic.Pointer[walWriteFn]
@@ -47,10 +48,10 @@ func walWrite(f *os.File, b []byte) (int, error) {
 }
 
 // SetWALWriteForTest installs fn as the write used by the shared-WAL
-// group-commit batch writer and the transaction slow path, and returns a
-// restore function. TEST-ONLY: it lets tests inject a short write (n < len(b)
-// with an error) or a hard write error deterministically. Production never
-// calls it.
+// group-commit batch writer, the transaction slow path, and the WAL
+// compaction's copy of a record, and returns a restore function. TEST-ONLY: it
+// lets tests inject a short write (n < len(b) with an error) or a hard write
+// error deterministically. Production never calls it.
 func SetWALWriteForTest(fn func(f *os.File, b []byte) (int, error)) (restore func()) {
 	prev := walWriteHook.Load()
 	f := walWriteFn(fn)
@@ -362,3 +363,110 @@ func SetCheckpointUnlinkForTest(fn func(path string) error) (restore func()) {
 // file still holds unacknowledged records but no segment manager is wired:
 // deleting it would destroy the only copy, so retention must keep it.
 var errNoSegmentManager = errors.New("storage: no segment manager; cannot checkpoint unacked records")
+
+// --- WAL compaction fsync -------------------------------------------------
+
+// walCompactionFsyncHook installs over the walFsyncFn type: the fsync applied
+// to a WAL compaction's temporary file before it is renamed over the
+// original.
+var walCompactionFsyncHook atomic.Pointer[walFsyncFn]
+
+// walCompactionFsync is the fsync performed on a WAL compaction's temporary
+// file. Default: fdatasyncFile — identical to the group-commit fsync, so a
+// compacted file is as durable as a written one.
+func walCompactionFsync(f *os.File) error {
+	if p := walCompactionFsyncHook.Load(); p != nil {
+		return (*p)(f)
+	}
+	return fdatasyncFile(f)
+}
+
+// SetWALCompactionFsyncForTest installs fn as the fsync used by the WAL
+// compaction before it renames its temporary file over the original.
+// TEST-ONLY: returning an error aborts the compaction before the rename, so
+// the original bytes and index stay untouched.
+func SetWALCompactionFsyncForTest(fn func(*os.File) error) (restore func()) {
+	prev := walCompactionFsyncHook.Load()
+	f := walFsyncFn(fn)
+	walCompactionFsyncHook.Store(&f)
+	return func() { walCompactionFsyncHook.Store(prev) }
+}
+
+// --- WAL compaction before install ----------------------------------------
+
+// walCompactionBeforeInstallHook observes the moment a WAL compaction has
+// finished writing its temporary file and is about to install it.
+var walCompactionBeforeInstallHook atomic.Pointer[walCompactionBeforeInstallFn]
+
+type walCompactionBeforeInstallFn func(fileNum uint64)
+
+// walCompactionBeforeInstall fires the before-install hook. TEST-ONLY
+// observability: it lets a test land an acknowledgement at the exact point
+// between "the copy is written" and "the copy is installed", with no timing.
+func walCompactionBeforeInstall(fileNum uint64) {
+	if p := walCompactionBeforeInstallHook.Load(); p != nil {
+		(*p)(fileNum)
+	}
+}
+
+// SetWALCompactionBeforeInstallForTest installs fn as the before-install
+// observer of the WAL compaction. TEST-ONLY.
+func SetWALCompactionBeforeInstallForTest(fn func(fileNum uint64)) (restore func()) {
+	prev := walCompactionBeforeInstallHook.Load()
+	f := walCompactionBeforeInstallFn(fn)
+	walCompactionBeforeInstallHook.Store(&f)
+	return func() { walCompactionBeforeInstallHook.Store(prev) }
+}
+
+// --- WAL rename -----------------------------------------------------------
+
+// walRenameHook installs over the rename performed by the WAL compaction.
+var walRenameHook atomic.Pointer[walRenameFn]
+
+type walRenameFn func(oldPath, newPath string) error
+
+// walRename renames oldPath to newPath. Default: os.Rename — atomic on every
+// supported platform, so a reader never observes a half-installed file.
+func walRename(oldPath, newPath string) error {
+	if p := walRenameHook.Load(); p != nil {
+		return (*p)(oldPath, newPath)
+	}
+	return os.Rename(oldPath, newPath)
+}
+
+// SetWALRenameForTest installs fn as the rename used by the WAL compaction.
+// TEST-ONLY: returning an error aborts the compaction BEFORE the rename, so
+// the original bytes and the original index are left exactly as they were.
+func SetWALRenameForTest(fn func(oldPath, newPath string) error) (restore func()) {
+	prev := walRenameHook.Load()
+	f := walRenameFn(fn)
+	walRenameHook.Store(&f)
+	return func() { walRenameHook.Store(prev) }
+}
+
+// --- WAL ReadAt -----------------------------------------------------------
+
+// walReadAtHook installs over the positional read used by the WAL delivery
+// path.
+var walReadAtHook atomic.Pointer[walReadAtFn]
+
+type walReadAtFn func(f *os.File, b []byte, off int64) (int, error)
+
+// walReadAt reads len(b) bytes at off. Default: os.File.ReadAt.
+func walReadAt(f *os.File, b []byte, off int64) (int, error) {
+	if p := walReadAtHook.Load(); p != nil {
+		return (*p)(f, b, off)
+	}
+	return f.ReadAt(b, off)
+}
+
+// SetWALReadAtForTest installs fn as the positional read used by the WAL
+// delivery path (record parsing, body-block reads and read-ahead). TEST-ONLY:
+// it lets a test observe WHICH offsets the delivery path reads, and assert
+// the locking discipline that read runs under.
+func SetWALReadAtForTest(fn func(f *os.File, b []byte, off int64) (int, error)) (restore func()) {
+	prev := walReadAtHook.Load()
+	f := walReadAtFn(fn)
+	walReadAtHook.Store(&f)
+	return func() { walReadAtHook.Store(prev) }
+}

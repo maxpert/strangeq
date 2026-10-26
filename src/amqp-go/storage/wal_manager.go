@@ -196,6 +196,16 @@ type WALConfig struct {
 	// zero-value WALConfig{}. Set only via WALConfigFromEngine.
 	UnsafeRecovery bool
 
+	// CompactionThreshold is the fraction of a sealed WAL file's durable bytes
+	// that must be ACKNOWLEDGED before the file is compacted (WI7). The
+	// comparison is strict: exactly this fraction does not compact.
+	//
+	// A NON-POSITIVE value means "use DefaultWALCompactionThreshold", which
+	// keeps the zero-value WALConfig as safe as its other zero-value fields
+	// (no fsync skip, no CRC skip): 0 would mean "compact as soon as one
+	// byte is dead", which is a maintenance storm, not a default.
+	CompactionThreshold float64
+
 	// SharedBodyMaxPinAge (ITER5 cold-tail hardening, §2) bounds how long a rolled
 	// WAL file that carries a shared BodyBlock may be kept out of checkpoint before
 	// it is force-re-inlined (N copies) and deleted. 0 disables the age backstop
@@ -217,6 +227,8 @@ func DefaultWALConfig() WALConfig {
 		CleanupInterval:    5 * time.Second,
 		RetentionPeriod:    0, // disabled by default
 		CheckpointInterval: 5 * time.Minute,
+
+		CompactionThreshold: DefaultWALCompactionThreshold,
 	}
 }
 
@@ -257,18 +269,29 @@ type QueueWAL struct {
 	ackBitmaps  map[string]*roaring64.Bitmap
 	bitmapMutex sync.RWMutex
 
-	// _walLayoutPad occupies the 8 bytes vacated by the dead `lastCheckpoint`
-	// field that was deleted from exactly this position. Deleting it shifted
-	// every field below by -8, which moved fileMutex out of the start of cache
-	// line 3 and into the tail of line 2, sharing that line with fileNum and
-	// fileOffset — all three touched on the committer's group-commit path. That is
-	// a hot-path layout change smuggled in by a cold-path deletion, and the
-	// zero-regression rule is measured against the layout at 60b2d21, so the
-	// layout is restored rather than re-measured. storage/wal_layout_test.go
-	// asserts the resulting offsets at runtime; if a field above this point is
-	// ever added or removed, that test fails and the change owes a single-hunk
-	// A/B rather than an assertion that it "cannot matter".
-	_walLayoutPad uint64
+	// LAYOUT BOUNDARY — read this before adding or removing a field ABOVE it.
+	//
+	// This position used to hold `_walLayoutPad uint64`, an 8-byte placeholder
+	// occupying the bytes vacated by the dead `lastCheckpoint` field. Deleting
+	// that field shifted every field below by -8, which moved fileMutex out of
+	// the start of cache line 3 and into the tail of line 2, sharing that line
+	// with fileNum and fileOffset — all three touched on the committer's
+	// group-commit path. That is a hot-path layout change smuggled in by a
+	// cold-path deletion, and the zero-regression rule is measured against the
+	// layout at 60b2d21, so the layout is restored rather than re-measured.
+	//
+	// The placeholder is GONE because those 8 bytes are now held by
+	// WALConfig.CompactionThreshold, which grew WALConfig by exactly 8 bytes
+	// (the WAL tier's byte-ratio compaction threshold, WI7). The growth and
+	// the removal are both above `currentFile`, so the group-commit hot group's
+	// offsets are byte-for-byte the ones measured at 60b2d21 (64-bit,
+	// sync.Mutex == 8 bytes) and no A/B is owed.
+	//
+	// The invariant: the TOTAL number of bytes between `cfg` and `currentFile`
+	// must not change. storage/wal_layout_test.go asserts the resulting
+	// offsets at runtime; if a field above this point is ever added or removed,
+	// that test fails and the change owes a single-hunk A/B rather than an
+	// assertion that it "cannot matter".
 
 	// Current active file
 	currentFile             *os.File
@@ -580,6 +603,15 @@ type walFileInfo struct {
 	// writes them under Lock, and performCheckpoint copies checkpointed out
 	// under the RLock of its map snapshot (walCheckpointTarget) instead of
 	// reading it in its unlocked loop body. ---
+
+	// compactionAttempted guards ONE compaction attempt per file (WI7). It is
+	// claimed with a compare-and-swap, so two concurrent maintenance passes
+	// cannot compact the same file twice, and it is RESET after a successful
+	// compaction so a file that accumulates more dead bytes later can be
+	// compacted again. A FAILED attempt leaves it set: compaction reads and
+	// rewrites a whole file, so retrying a file that cannot be compacted would
+	// repeat that cost on every tick forever.
+	compactionAttempted atomic.Bool
 
 	// durableSize is the number of bytes known durable and intact. -1 (the
 	// inherited value set by rebuildBootState) means the whole file.
@@ -1463,7 +1495,7 @@ func (wm *WALManager) SetSegmentManager(sm *SegmentManager) {}
 
 // performCheckpoint is a no-op stub retained for test compatibility.
 // Checkpoint copying has been removed (segstore v1). This will be deleted in WI8.
-func (qw *QueueWAL) performCheckpoint() {}// forceCheckpointFile, and every existing test of RecoverFromWAL — as "did
+func (qw *QueueWAL) performCheckpoint() {} // forceCheckpointFile, and every existing test of RecoverFromWAL — as "did
 // something go wrong". Handing them a non-nil error for a torn tail, which is
 // the ordinary state of a WAL after any unclean shutdown, would make the
 // normal case look like a failure. The benign classification still exists and
@@ -3427,6 +3459,10 @@ func (qw *QueueWAL) cleanupLoop() {
 		select {
 		case <-ticker.C:
 			qw.tryReclaimOldFiles()
+			// Compaction maintenance runs DIRECTLY on the cleanup tick: it is
+			// the same maintenance pass, and a second ticker would only let
+			// the two disagree about which files they are working on.
+			qw.tryCompactOldFiles()
 		case <-qw.stopChan:
 			return
 		}
@@ -3678,7 +3714,7 @@ func (qw *QueueWAL) readMessageAtPosition(queueName string, fileNum uint64, file
 func (qw *QueueWAL) parseMessageAt(file *os.File, queueName string, filePosition int64, expectedOffset uint64) (*protocol.Message, error) {
 	// Read CRC + length in a single ReadAt (8 bytes at filePosition)
 	header := make([]byte, 8)
-	_, err := file.ReadAt(header, filePosition)
+	_, err := walReadAt(file, header, filePosition)
 	if err != nil {
 		return nil, err
 	}
@@ -3688,7 +3724,7 @@ func (qw *QueueWAL) parseMessageAt(file *os.File, queueName string, filePosition
 
 	// Read data portion in a single ReadAt (dataLen bytes at filePosition+8)
 	data := make([]byte, dataLen)
-	_, err = file.ReadAt(data, filePosition+8)
+	_, err = walReadAt(file, data, filePosition+8)
 	if err != nil {
 		return nil, err
 	}
@@ -3762,14 +3798,14 @@ func (qw *QueueWAL) parseMessageAt(file *os.File, queueName string, filePosition
 // positional read path (readMessageAtPosition) and the sequential fallback.
 func readBodyBlockAt(file *os.File, position int64) ([]byte, error) {
 	header := make([]byte, 8)
-	if _, err := file.ReadAt(header, position); err != nil {
+	if _, err := walReadAt(file, header, position); err != nil {
 		return nil, err
 	}
 	crc := binary.BigEndian.Uint32(header[0:4])
 	dataLen := binary.BigEndian.Uint32(header[4:8])
 
 	data := make([]byte, dataLen)
-	if _, err := file.ReadAt(data, position+8); err != nil {
+	if _, err := walReadAt(file, data, position+8); err != nil {
 		return nil, err
 	}
 

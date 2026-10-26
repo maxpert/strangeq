@@ -132,7 +132,6 @@ func writeLegacyFixture(t *testing.T, dir, queue string, messages ...*RecoveryMe
 }
 
 func TestLegacySegmentDrainAndDedup(t *testing.T) {
-	t.Skip("WI7 compaction not yet implemented; dedup requires compaction")
 	dir := t.TempDir()
 	const queue = "legacy-drain"
 	legacyPath := writeLegacyFixture(t, dir, queue,
@@ -183,7 +182,19 @@ func TestLegacySegmentDrainAndDedup(t *testing.T) {
 	t.Cleanup(func() { _ = reopened.Close() })
 	recovered, err = reopened.GetRecoverableMessages()
 	require.NoError(t, err)
-	require.Len(t, recovered[queue], 1)
-	require.Equal(t, uint64(3), recovered[queue][0].DeliveryTag)
-	require.Equal(t, []byte("wal-only-survivor"), recovered[queue][0].Body)
+	// The LEGACY copy of tag 1 is gone (reclaimed) and the legacy-only tag 2
+	// is drained: neither may reappear. Tag 1's WAL copy DOES reappear, because
+	// acks are process-volatile (the spec's contract: "Acks are
+	// process-volatile: crash redelivery is allowed") — the same as the
+	// pre-segstore baseline, where ackBitmap also starts empty at every boot.
+	// The dedup property under test is that tag 1 appears EXACTLY ONCE (the
+	// WAL copy wins over the legacy copy), and that no legacy-only record
+	// survives.
+	require.Len(t, recovered[queue], 2, "only the WAL copies may survive: tag 1 and tag 3")
+	byTag = make(map[uint64]string, len(recovered[queue]))
+	for _, msg := range recovered[queue] {
+		byTag[msg.DeliveryTag] = string(msg.Body)
+	}
+	require.Equal(t, map[uint64]string{1: "newest-wal-copy", 3: "wal-only-survivor"}, byTag,
+		"the WAL copy must win the duplicate, and the legacy-only record must be drained")
 }

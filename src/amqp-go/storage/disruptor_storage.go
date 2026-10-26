@@ -128,6 +128,12 @@ func WALConfigFromEngine(ec interfaces.EngineConfig) WALConfig {
 	if ec.SharedBodyMaxPinAgeMS > 0 {
 		cfg.SharedBodyMaxPinAge = time.Duration(ec.SharedBodyMaxPinAgeMS) * time.Millisecond
 	}
+	// Only a POSITIVE engine value overrides the default: 0 would mean
+	// "compact as soon as anything is dead", which is not what an unset
+	// engine threshold means.
+	if ec.CompactionThreshold > 0 {
+		cfg.CompactionThreshold = ec.CompactionThreshold
+	}
 	return cfg
 }
 
