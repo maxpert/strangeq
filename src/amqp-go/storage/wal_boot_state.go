@@ -129,7 +129,7 @@ func indexWALFile(fileNum uint64, path string) (inv *segmentInventory, hasShared
 	if err != nil {
 		return inv, false, err
 	}
-	inv.durableBytes = fileSize
+	inv.durableBytes.Store(fileSize)
 	if _, err := file.Seek(dataStart, io.SeekStart); err != nil {
 		return inv, false, err
 	}
@@ -140,11 +140,17 @@ func indexWALFile(fileNum uint64, path string) (inv *segmentInventory, hasShared
 	inTx := false
 	var txEpoch uint64
 	var txBytes int64
+	// txUnreadable counts the bytes of the records inside the open
+	// transaction that this build cannot interpret (a newer format's
+	// record). They are protected — counted as live — only if the
+	// transaction COMMITS; a discarded transaction's bytes are dead.
+	var txUnreadable int64
 	var txRecords []*segmentRecord
 
 	discardTx := func() {
 		inv.deadBytes.Add(txBytes)
 		txBytes = 0
+		txUnreadable = 0
 		txRecords = txRecords[:0]
 		inTx = false
 	}
@@ -153,7 +159,11 @@ func indexWALFile(fileNum uint64, path string) (inv *segmentInventory, hasShared
 			r.committed = true
 			inv.addRecord(r)
 		}
+		if txUnreadable > 0 {
+			inv.unacked.Add(txUnreadable)
+		}
 		txBytes = 0
+		txUnreadable = 0
 		txRecords = txRecords[:0]
 		inTx = false
 	}
@@ -247,15 +257,33 @@ func indexWALFile(fileNum uint64, path string) (inv *segmentInventory, hasShared
 			}
 
 		case WALRecordTypeMessage:
-			queueName, offset, bodyRef, ok := peekRecordInventory(payload)
-			if !ok {
+			// THE SAME GRAMMAR THE SCAN USES. The index and the scan must
+			// never disagree about a record's queue name, delivery tag or
+			// body locator: when they did, a record could be indexed but
+			// never scanned, and recovery dropped it silently.
+			layout := parseWalPayload(payload)
+			if !layout.ok {
+				if layout.newerFormat {
+					// DURABLE DATA THIS BUILD CANNOT INTERPRET. It is not
+					// indexed (nothing can serve it), but its bytes are
+					// counted as LIVE so the file can never be reclaimed —
+					// and never compacted — while they are on disk: a newer
+					// build could still read them, and deleting them would
+					// be a silent loss of confirmed durable data.
+					if inTx {
+						txUnreadable += recordBytes
+					} else {
+						inv.unacked.Add(recordBytes)
+					}
+				}
 				if inTx {
 					txBytes += recordBytes
-				} else {
+				} else if !layout.newerFormat {
 					inv.deadBytes.Add(recordBytes)
 				}
 				continue
 			}
+			queueName, offset, bodyRef := layout.queueName, layout.offset, layout.bodyRef
 			r := &segmentRecord{
 				pos:       recordPos{segmentID: fileNum, position: curRecStart},
 				queueName: queueName, deliveryTag: offset,
@@ -292,18 +320,51 @@ func indexWALFile(fileNum uint64, path string) (inv *segmentInventory, hasShared
 
 // walPayloadLayout describes the structural prefix of a v4 message payload
 // (the bytes AFTER the one-byte record-type tag).
+//
+// IT IS THE OUTPUT OF THE SINGLE GRAMMAR WALK (parseWalPayload). Every field
+// here is read by that one walk, so the boot-time physical index and the
+// recovery scan cannot disagree about where a field is.
 type walPayloadLayout struct {
+	// flags is the payload's presence bitmap (the u16 that opens the payload).
+	flags uint16
 	// queueName is the queue the record belongs to.
 	queueName string
 	// offset is the delivery tag the record carries.
 	offset uint64
+	// exchange and routingKey are the record's routing fields.
+	exchange   string
+	routingKey string
+	// deliveryMode is the record's delivery mode.
+	deliveryMode uint8
+	// bodyKind is the inline|reference discriminator byte.
+	bodyKind uint8
 	// bodyRef is the file-relative position of the referenced BodyBlock, or
 	// -1 when the record carries its body inline.
 	bodyRef int64
-	// locatorOff is the offset of the 8-byte body locator WITHIN the payload,
-	// or -1 when the record carries its body inline.
+	// locatorOff is the offset of the body locator WITHIN the payload, or
+	// -1 when the record carries its body inline.
 	locatorOff int
-	// ok is false when the payload is malformed.
+	// refLen is the length of the reference locator, or -1 when the record
+	// carries its body inline.
+	refLen int
+	// bodyOff is the offset of the inline body WITHIN the payload, or -1
+	// when the record does not carry an inline body.
+	bodyOff int
+	// bodyLen is the length of the inline body, or -1.
+	bodyLen int
+	// end is the offset WITHIN the payload just past the structural prefix:
+	// the byte the first optional field starts at.
+	end int
+	// newerFormat is true when the record is DURABLE DATA THIS BUILD CANNOT
+	// INTERPRET: either the reserved continuation bit is set (a future
+	// format appended a second flags word, so nothing after the flags word
+	// can be trusted), or the body kind is one this build does not know.
+	//
+	// Such a record must never be reclaimed (its bytes are still durable
+	// data a newer build could read) and must never be dropped without a
+	// fault (this build cannot serve it).
+	newerFormat bool
+	// ok is false when the payload is malformed, or when it is newerFormat.
 	ok bool
 }
 
@@ -311,14 +372,39 @@ type walPayloadLayout struct {
 // presence bitmap, the queue name, the delivery tag, the exchange, the
 // routing key, the delivery mode and the body arm.
 //
-// It is the SINGLE walk of that grammar. The boot-time physical index
-// (peekRecordInventory) and the compaction's locator remapping both go
-// through it, so the two can never disagree about where a body locator lives.
+// IT IS THE SINGLE WALK OF THAT GRAMMAR. The boot-time physical index
+// (indexWALFile), the compaction's locator remapping and the recovery scan
+// (parseMessagePayload) all go through it, so they cannot disagree about the
+// queue name, the delivery tag, the body kind or where a body locator lives.
+//
+// WHAT IT REFUSES, AND WHY:
+//
+//   - A payload with the reserved CONTINUATION bit set. The bit means a
+//     future format appended a second flags word; this build does not know
+//     where that word sits, so NOTHING after the flags word — not the queue
+//     name, not the delivery tag, not the body — can be trusted. The record
+//     is marked newerFormat: it is durable data this build cannot interpret,
+//     and it must not be reclaimed nor dropped silently.
+//   - A payload whose body kind this build does not know. Same treatment: a
+//     future body arm is durable data, not garbage.
+//   - A truncated or malformed payload. That is garbage (dead bytes), which
+//     is what the caller has always done with it.
+//
+// Every read is bounds-checked against len(payload); a short read returns
+// ok=false rather than panicking or slicing out of bounds.
 func parseWalPayload(payload []byte) walPayloadLayout {
 	var out walPayloadLayout
 	out.bodyRef = -1
 	out.locatorOff = -1
+	out.refLen = -1
+	out.bodyOff = -1
+	out.bodyLen = -1
 	if len(payload) < 3 {
+		return out
+	}
+	out.flags = binary.BigEndian.Uint16(payload[0:2])
+	if out.flags&msgFlagContinuation != 0 {
+		out.newerFormat = true
 		return out
 	}
 	qlen := int(payload[2])
@@ -329,44 +415,59 @@ func parseWalPayload(payload []byte) walPayloadLayout {
 	out.queueName = string(payload[3 : 3+qlen])
 	out.offset = binary.BigEndian.Uint64(payload[pos : pos+8])
 	pos += 8
-	// exchange and routing-key short strings, delivery mode, body kind
-	for range 2 {
-		if pos >= len(payload) {
-			return out
-		}
-		n := int(payload[pos])
-		pos += 1 + n
-		if pos > len(payload) {
-			return out
-		}
+	// exchange and routing key, both u8-length-prefixed short strings.
+	var ok bool
+	if out.exchange, pos, ok = readShort(payload, pos); !ok {
+		return out
+	}
+	if out.routingKey, pos, ok = readShort(payload, pos); !ok {
+		return out
 	}
 	if pos+2 > len(payload) {
 		return out
 	}
-	pos++ // delivery mode
-	kind := payload[pos]
+	out.deliveryMode = payload[pos]
 	pos++
-	if kind == bodyKindReference {
+	out.bodyKind = payload[pos]
+	pos++
+	switch out.bodyKind {
+	case bodyKindInline:
+		if pos+4 > len(payload) {
+			return out
+		}
+		bodyLen := int(binary.BigEndian.Uint32(payload[pos : pos+4]))
+		pos += 4
+		if bodyLen < 0 || pos+bodyLen > len(payload) {
+			return out
+		}
+		out.bodyOff = pos
+		out.bodyLen = bodyLen
+		pos += bodyLen
+	case bodyKindReference:
 		if pos+2 > len(payload) {
 			return out
 		}
 		n := int(binary.BigEndian.Uint16(payload[pos : pos+2]))
 		pos += 2
+		// The locator of a body reference is EIGHT bytes: the referenced
+		// BodyBlock's file-relative offset. Any other length is not a
+		// record this build can resolve.
 		if n != 8 || pos+8 > len(payload) {
 			return out
 		}
-		out.bodyRef = int64(binary.BigEndian.Uint64(payload[pos : pos+8]))
 		out.locatorOff = pos
+		out.refLen = n
+		out.bodyRef = int64(binary.BigEndian.Uint64(payload[pos : pos+8]))
+		pos += n
+	default:
+		// A body kind this build does not know: a future format's arm. The
+		// record is durable data this build cannot interpret.
+		out.newerFormat = true
+		return out
 	}
+	out.end = pos
 	out.ok = true
 	return out
-}
-
-// peekRecordInventory reads only the structural prefix needed by the physical
-// index, avoiding a full protocol.Message allocation for every boot record.
-func peekRecordInventory(payload []byte) (queueName string, offset uint64, bodyRef int64, ok bool) {
-	l := parseWalPayload(payload)
-	return l.queueName, l.offset, l.bodyRef, l.ok
 }
 
 // rebuildBootState restores fileNum, oldFiles and offsetIndex from what is

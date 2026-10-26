@@ -170,11 +170,24 @@ func queueSegPath(t *testing.T, sm *SegmentManager, queue string) string {
 	return qs.currentSegment.path
 }
 
-// TestSyncDir_FailureOnCreate_FailsRollAndCheckpoint (TDD test 17): a failed
+// TestSyncDir_FailureOnCreate_FailsRollAndSegmentCreate (TDD test 17): a failed
 // directory fsync at file creation fails the operation (and removes the file)
 // rather than proceeding with a possibly-non-durable directory entry.
-func TestSyncDir_FailureOnCreate_FailsRollAndCheckpoint(t *testing.T) {
-	t.Run("segment create: checkpoint fails, WAL kept, no .seg left", func(t *testing.T) {
+//
+// SEGSTORE V1 RE-POINT. The failure used to be produced by the checkpoint: the
+// checkpoint copied WAL records into a segment, and a failed dir fsync at that
+// creation aborted the copy. Checkpoint copying is gone — the WAL tier owns
+// durability and nothing moves records out of it — so the guard is now driven
+// through the path that still CREATES segment files: opening a queue's
+// segments. That path is live at boot (recovering a legacy queue's directory
+// opens its first segment) and it is the same createSegmentFileLocked call the
+// checkpoint used to reach, with the same contract: a failed dir fsync removes
+// the half-created file and fails the operation.
+//
+// The WAL is still the tier that owns the durable copy, so "the WAL is kept"
+// is now the statement that a failed segment creation costs the data nothing.
+func TestSyncDir_FailureOnCreate_FailsRollAndSegmentCreate(t *testing.T) {
+	t.Run("segment create: dir fsync fails, the create fails, WAL kept, no .seg left", func(t *testing.T) {
 		dir := t.TempDir()
 		wm, err := NewWALManagerWithConfig(dir, coldTailWALConfig())
 		require.NoError(t, err)
@@ -182,7 +195,6 @@ func TestSyncDir_FailureOnCreate_FailsRollAndCheckpoint(t *testing.T) {
 		sm, err := NewSegmentManager(dir)
 		require.NoError(t, err)
 		t.Cleanup(func() { _ = sm.Close() })
-		wm.SetSegmentManager(sm)
 
 		require.NoError(t, wm.Write("q", &protocol.Message{
 			Exchange: "amq.direct", RoutingKey: "q", Body: []byte("dirsync-fail"), DeliveryMode: 2, DeliveryTag: 1,
@@ -193,7 +205,15 @@ func TestSyncDir_FailureOnCreate_FailsRollAndCheckpoint(t *testing.T) {
 		require.NoError(t, sw.rollFile())
 		sw.fileMutex.Unlock()
 
+		// The queue's segment directory and its ownership marker are put in
+		// place BEFORE the fault is armed, so the failure lands exactly where
+		// the guard is: the SEGMENT FILE's creation. The marker's own atomic
+		// write syncs the same directory, so arming the fault earlier would
+		// fail the MARKER write instead and never reach the segment create.
 		queueDir := filepath.Join(dir, "segments", "q")
+		require.NoError(t, os.MkdirAll(queueDir, 0755))
+		require.NoError(t, writeSegmentDirMarker(queueDir, "q"))
+
 		restore := SetSyncDirForTest(func(d string) error {
 			if d == queueDir {
 				return syscall.EIO
@@ -202,10 +222,20 @@ func TestSyncDir_FailureOnCreate_FailsRollAndCheckpoint(t *testing.T) {
 		})
 		defer restore()
 
-		sw.performCheckpoint()
+		// Opening the queue's segments creates its first segment file, and the
+		// directory fsync of that creation fails.
+		_, err = sm.getOrCreateQueueSegments("q")
+		require.Error(t, err,
+			"a failed directory fsync at segment creation must fail the operation instead of "+
+				"proceeding with a possibly-non-durable directory entry")
+		// GUARD THE GUARD: the failure must have landed on the SEGMENT FILE's
+		// creation — the site this test is about — and not on some other step of
+		// opening the queue. createSegmentFileLocked reports exactly this.
+		require.Contains(t, err.Error(), "segment dir fsync",
+			"the failure did not land on the segment file's creation: %v", err)
 
-		// The checkpoint failed at segment creation: WAL kept, and no .seg
-		// file was left behind in the queue dir.
+		// The segment create failed: the WAL is kept, and no .seg file was left
+		// behind in the queue dir.
 		_, serr := os.Stat(walPath)
 		require.False(t, os.IsNotExist(serr), "the WAL file must be kept when the segment dir fsync fails")
 		entries, derr := os.ReadDir(queueDir)
@@ -215,11 +245,21 @@ func TestSyncDir_FailureOnCreate_FailsRollAndCheckpoint(t *testing.T) {
 				"no .seg file may survive a failed dir fsync (found %s)", e.Name())
 		}
 
-		// Once the fault clears, the retry succeeds end-to-end.
+		// Once the fault clears, the retry succeeds end-to-end: the segment
+		// file is created and its directory entry made durable.
 		restore()
-		sw.performCheckpoint()
-		_, serr = os.Stat(walPath)
-		require.True(t, os.IsNotExist(serr), "the retry must unlink the WAL file")
+		qs, err := sm.getOrCreateQueueSegments("q")
+		require.NoError(t, err, "the retry must succeed once the fault clears")
+		require.NotNil(t, qs)
+		entries, derr = os.ReadDir(queueDir)
+		require.NoError(t, derr)
+		segFound := false
+		for _, e := range entries {
+			if strings.HasSuffix(e.Name(), SegmentFileExtension) {
+				segFound = true
+			}
+		}
+		require.True(t, segFound, "the retry must create the segment file")
 	})
 
 	t.Run("WAL roll: roll fails, WAL stays writable, retry succeeds", func(t *testing.T) {

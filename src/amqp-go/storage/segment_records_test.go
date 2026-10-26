@@ -33,7 +33,7 @@ func TestSegmentInventoryWriteAndRoll(t *testing.T) {
 	inv := qw.currentInv
 	require.NotNil(t, inv)
 	require.True(t, inv.valid)
-	require.Equal(t, int64(WALHeaderSize+len(encoded)), inv.durableBytes)
+	require.Equal(t, int64(WALHeaderSize+len(encoded)), inv.durableBytes.Load())
 	require.Equal(t, int64(len(encoded)), inv.unacked.Load())
 	require.Zero(t, inv.deadBytes.Load())
 	r := inv.records[int64(WALHeaderSize)]
@@ -49,7 +49,7 @@ func TestSegmentInventoryWriteAndRoll(t *testing.T) {
 	require.NoError(t, qw.rollFile())
 	qw.fileMutex.Unlock()
 	require.Empty(t, qw.currentInv.records)
-	require.Equal(t, int64(WALHeaderSize), qw.currentInv.durableBytes)
+	require.Equal(t, int64(WALHeaderSize), qw.currentInv.durableBytes.Load())
 	sealed := qw.oldFiles[oldNum]
 	require.NotNil(t, sealed)
 	require.Same(t, inv, sealed.inv)
@@ -84,7 +84,7 @@ func TestSegmentInventoryBootCommittedOnly(t *testing.T) {
 	require.NotNil(t, inv)
 	require.True(t, inv.valid)
 	require.Len(t, inv.records, 1)
-	require.Equal(t, committedBytes+int64(len(torn)), inv.durableBytes)
+	require.Equal(t, committedBytes+int64(len(torn)), inv.durableBytes.Load())
 	require.Equal(t, int64(len(torn)), inv.deadBytes.Load())
 	var live *segmentRecord
 	for _, r := range inv.records {
@@ -183,7 +183,7 @@ func TestSegmentInventoryLegacyLoad(t *testing.T) {
 	require.Equal(t, int64(len(encoded)), r.bytes)
 	require.Equal(t, int64(-1), r.bodyRef)
 	require.True(t, r.committed)
-	require.Equal(t, int64(len(encoded)+len(torn)), inv.durableBytes)
+	require.Equal(t, int64(len(encoded)+len(torn)), inv.durableBytes.Load())
 	require.Equal(t, int64(len(encoded)), inv.unacked.Load())
 	require.Equal(t, int64(len(torn)), inv.deadBytes.Load())
 	require.Equal(t, int64(8+binary.BigEndian.Uint32(encoded[4:8])), r.bytes)

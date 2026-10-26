@@ -88,7 +88,7 @@ func TestSegstoreCompactionThresholdStrict(t *testing.T) {
 
 	inv := qw.oldFiles[fileNum].inv
 	dead := inv.deadBytes.Load()
-	durable := inv.durableBytes
+	durable := inv.durableBytes.Load()
 	require.Equal(t, 2*dead, durable,
 		"the fixture must put exactly 50%% of the file's durable bytes dead (dead=%d durable=%d)", dead, durable)
 
@@ -102,7 +102,7 @@ func TestSegstoreCompactionThresholdStrict(t *testing.T) {
 	// One more acknowledgement pushes the file strictly above the threshold.
 	wm.Acknowledge("q", 3)
 	inv = qw.oldFiles[fileNum].inv
-	require.Greater(t, float64(inv.deadBytes.Load()), 0.5*float64(inv.durableBytes),
+	require.Greater(t, float64(inv.deadBytes.Load()), 0.5*float64(inv.durableBytes.Load()),
 		"the fixture must now be strictly above the threshold")
 
 	qw.tryCompactOldFiles()

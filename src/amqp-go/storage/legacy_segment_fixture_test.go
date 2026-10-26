@@ -48,7 +48,7 @@ func writeLegacyBatchForTest(sm *SegmentManager, queueName string, messages []*R
 			bodyRef:     -1,
 			committed:   true,
 		})
-		seg.inv.durableBytes += int64(len(record))
+		seg.inv.durableBytes.Add(int64(len(record)))
 		seg.fileSize.Add(int64(n))
 		seg.messageCount.Add(1)
 		if seg.minOffset == 0 || rm.Offset < seg.minOffset {

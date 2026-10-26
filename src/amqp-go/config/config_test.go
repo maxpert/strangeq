@@ -32,6 +32,18 @@ func TestDefaultConfig(t *testing.T) {
 	assert.Equal(t, int64(60000), config.Network.HeartbeatIntervalMS,
 		"HeartbeatIntervalMS should be 60s by default")
 
+	// Hot cache budgets. The per-queue budget is 64 MiB: the hot cache
+	// REPLACES the 64K-message ring, whose 80% spill threshold is 52,428
+	// messages. A 16 MiB per-queue budget holds only ~25.4k messages at the
+	// current charge formula, i.e. LESS than the ring it replaces, so the
+	// FIFO consumer's next target was evicted and every read became a cold
+	// read. The global budget stays at 256 MiB and must stay >= the
+	// per-queue budget.
+	assert.Equal(t, int64(64*1024*1024), config.Engine.HotCacheQueueBytes,
+		"HotCacheQueueBytes should be 64 MiB per queue")
+	assert.Equal(t, int64(256*1024*1024), config.Engine.HotCacheGlobalBytes,
+		"HotCacheGlobalBytes should be 256 MiB globally")
+
 	// Test validation passes
 	err := config.Validate()
 	assert.NoError(t, err)
@@ -135,6 +147,42 @@ func TestConfigValidation(t *testing.T) {
 			name: "invalid max channels",
 			modify: func(c *AMQPConfig) {
 				c.Server.MaxChannelsPerConnection = 0
+			},
+			wantErr: true,
+		},
+		{
+			name: "hot cache queue bytes at the 64 MiB maximum",
+			modify: func(c *AMQPConfig) {
+				c.Engine.HotCacheQueueBytes = 64 * 1024 * 1024
+			},
+			wantErr: false,
+		},
+		{
+			name: "hot cache queue bytes above the 64 MiB maximum",
+			modify: func(c *AMQPConfig) {
+				c.Engine.HotCacheQueueBytes = 64*1024*1024 + 1
+			},
+			wantErr: true,
+		},
+		{
+			name: "hot cache queue bytes below the 1 MiB minimum",
+			modify: func(c *AMQPConfig) {
+				c.Engine.HotCacheQueueBytes = 1024*1024 - 1
+			},
+			wantErr: true,
+		},
+		{
+			name: "hot cache global bytes below the per-queue budget",
+			modify: func(c *AMQPConfig) {
+				c.Engine.HotCacheQueueBytes = 64 * 1024 * 1024
+				c.Engine.HotCacheGlobalBytes = 32 * 1024 * 1024
+			},
+			wantErr: true,
+		},
+		{
+			name: "hot cache global bytes above the 256 MiB maximum",
+			modify: func(c *AMQPConfig) {
+				c.Engine.HotCacheGlobalBytes = 256*1024*1024 + 1
 			},
 			wantErr: true,
 		},

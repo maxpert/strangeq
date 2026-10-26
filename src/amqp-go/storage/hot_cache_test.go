@@ -73,6 +73,144 @@ func TestHotCacheQueueAndGlobalBounds(t *testing.T) {
 	})
 }
 
+// TestHotCacheQueueAdmissionIsQueueLocal pins the per-queue/global budget
+// split. A queue's admission must NEVER evict another queue's ready messages:
+// the two budgets are separate resources, and satisfying a per-queue budget out
+// of the global LRU lets one busy queue starve an unrelated queue (a FIFO
+// consumer whose next target was evicted has to take a cold read).
+//
+// The shape is deliberately discriminating: the queue whose budget is full
+// ("qa") is NOT the global LRU tail ("qb" is), so a global-LRU eviction
+// removes a FOREIGN queue's entry while a queue-local eviction removes the
+// oldest entry of the queue being admitted. The global budget is deliberately
+// generous here, so it can never be the reason an entry leaves.
+func TestHotCacheQueueAdmissionIsQueueLocal(t *testing.T) {
+	t.Run("a queue's admission never evicts ANOTHER queue's backed entry while the global budget is not exceeded", func(t *testing.T) {
+		// Same queue-name length => identical charge for both queues.
+		chargeA := cacheCharge("qa", hotCacheTestMessage(1))
+		chargeB := cacheCharge("qb", hotCacheTestMessage(1))
+		if chargeA != chargeB {
+			t.Fatalf("test queue charges differ: %d != %d", chargeA, chargeB)
+		}
+		charge := chargeA
+
+		// Each queue holds 2 entries; the global budget holds 8, so the global
+		// budget is never the binding constraint in this test.
+		cache := newHotCache(2*charge, 8*charge)
+
+		if !cache.Put("qb", hotCacheTestMessage(1), true) {
+			t.Fatal("qb/1 was not admitted")
+		}
+		if !cache.Put("qa", hotCacheTestMessage(1), true) {
+			t.Fatal("qa/1 was not admitted")
+		}
+		if !cache.Put("qa", hotCacheTestMessage(2), true) {
+			t.Fatal("qa/2 was not admitted")
+		}
+
+		// qa is now full (2 entries == its budget). The next qa admission must
+		// evict qa's own least recently used entry.
+		if !cache.Put("qa", hotCacheTestMessage(3), true) {
+			t.Fatal("qa/3 was not admitted after a queue-local eviction")
+		}
+
+		if _, _, ok := cache.Get("qb", 1); !ok {
+			t.Fatal("qb/1 was evicted by qa's admission: a queue's admission must " +
+				"never evict another queue's backed entry while the global budget is not exceeded")
+		}
+		if _, _, ok := cache.Get("qa", 1); ok {
+			t.Fatal("qa/1 survived: it was qa's least recently used entry and must be the victim")
+		}
+		for _, tag := range []uint64{2, 3} {
+			if _, _, ok := cache.Get("qa", tag); !ok {
+				t.Fatalf("qa/%d should remain cached", tag)
+			}
+		}
+		if got := cache.Count("qa"); got != 2 {
+			t.Fatalf("Count(qa) = %d, want 2", got)
+		}
+		if got := cache.Count("qb"); got != 1 {
+			t.Fatalf("Count(qb) = %d, want 1", got)
+		}
+		if cache.globalUsed != 3*charge {
+			t.Fatalf("globalUsed = %d, want %d: the global budget was not exceeded, "+
+				"so no cross-queue eviction was warranted", cache.globalUsed, 3*charge)
+		}
+		if cache.queueUsed["qa"] != 2*charge || cache.queueUsed["qb"] != charge {
+			t.Fatalf("per-queue accounting = qa %d qb %d, want %d/%d",
+				cache.queueUsed["qa"], cache.queueUsed["qb"], 2*charge, charge)
+		}
+	})
+}
+
+// TestHotCacheEntryIdentityIsOwnedByEntry pins the entry's ownership of its
+// own identity. The cache hands out the LIVE message pointer, so a caller that
+// mutates message.DeliveryTag after admission must not be able to change which
+// map key the entry occupies: the entry owns its tag, and every identity
+// operation (delete, range ordering) uses the owned tag, never the mutable
+// message field.
+func TestHotCacheEntryIdentityIsOwnedByEntry(t *testing.T) {
+	t.Run("mutating the handed-out message's delivery tag does not orphan the entry", func(t *testing.T) {
+		charge := cacheCharge("q", hotCacheTestMessage(1))
+		cache := newHotCache(charge, charge)
+		msg := hotCacheTestMessage(1)
+		if !cache.Put("q", msg, false) {
+			t.Fatal("Put failed")
+		}
+
+		// The caller mutates the message it was handed.
+		msg.DeliveryTag = 9999
+
+		if !cache.Delete("q", 1) {
+			t.Fatal("Delete by the admitted tag failed")
+		}
+		if got := cache.Count("q"); got != 0 {
+			t.Fatalf("Count(q) = %d after deleting by the admitted tag, want 0 "+
+				"(the entry stayed in the queue map under its original key)", got)
+		}
+		if cache.queueUsed["q"] != 0 || cache.globalUsed != 0 {
+			t.Fatalf("byte accounting after delete = queue %d global %d, want 0/0",
+				cache.queueUsed["q"], cache.globalUsed)
+		}
+
+		// The byte accounting really returned to zero: the budget binds again
+		// at exactly one transient entry (transient entries are never eviction
+		// victims, so a leaked charge shows up as a rejected admission).
+		if !cache.Put("q", hotCacheTestMessage(2), false) {
+			t.Fatal("re-admission after delete failed: the byte accounting did not return to zero")
+		}
+		if cache.Put("q", hotCacheTestMessage(3), false) {
+			t.Fatal("budget did not bind after re-admission: the byte accounting drifted low")
+		}
+	})
+
+	t.Run("Range orders by the admitted tag, not by the mutated message field", func(t *testing.T) {
+		charge := cacheCharge("q", hotCacheTestMessage(1))
+		cache := newHotCache(4*charge, 4*charge)
+		m1 := hotCacheTestMessage(1)
+		m2 := hotCacheTestMessage(2)
+		m3 := hotCacheTestMessage(3)
+		for _, m := range []*protocol.Message{m1, m2, m3} {
+			if !cache.Put("q", m, true) {
+				t.Fatalf("Put(%d) failed", m.DeliveryTag)
+			}
+		}
+
+		// Mutate the middle entry: sorting by the message field would move it
+		// to the end of the range.
+		m2.DeliveryTag = 9999
+
+		got := cache.Range("q", 0, ^uint64(0))
+		if len(got) != 3 {
+			t.Fatalf("Range returned %d messages, want 3", len(got))
+		}
+		if got[0] != m1 || got[1] != m2 || got[2] != m3 {
+			t.Fatalf("Range order = [%p %p %p], want [%p %p %p] (admitted tag order)",
+				got[0], got[1], got[2], m1, m2, m3)
+		}
+	})
+}
+
 func TestHotCachePinnedTransient(t *testing.T) {
 	t.Run("transient entries are never eviction victims", func(t *testing.T) {
 		charge := cacheCharge("q", hotCacheTestMessage(1))

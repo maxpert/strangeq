@@ -180,7 +180,11 @@ func NewDisruptorStorageWithEngineConfig(dataDir string, engineCfg interfaces.En
 
 	hotCacheQueueBytes := engineCfg.HotCacheQueueBytes
 	if hotCacheQueueBytes <= 0 {
-		hotCacheQueueBytes = 16 * 1024 * 1024 // 16 MiB
+		// The shipped default. The per-queue ready set must not be SMALLER
+		// than the 52,428-message ring it replaces: an LRU evicts the OLDEST
+		// entry, which is exactly a FIFO consumer's next target, so a
+		// too-small ready set turns nearly every read into a cold read.
+		hotCacheQueueBytes = 64 * 1024 * 1024 // 64 MiB
 	}
 	hotCacheGlobalBytes := engineCfg.HotCacheGlobalBytes
 	if hotCacheGlobalBytes <= 0 {
@@ -363,11 +367,26 @@ func (ds *DisruptorStorage) GetMessage(queueName string, deliveryTag uint64) (*p
 		return nil, interfaces.ErrMessageNotFound
 	}
 
-	admitted := ds.hot.Put(queueName, msg, true)
+	// A COLD READ DOES NOT ADMIT THE MESSAGE INTO THE HOT CACHE.
+	//
+	// The hot cache holds PUBLISHED messages, and GetQueueMessages /
+	// GetQueueMessageCount are hot-resident operations over exactly that set
+	// (WI3: "Range/count methods remain hot-resident operations AS TODAY" —
+	// the legacy ring only ever held published records). Admitting a cold read
+	// would make the queue's REPORTED MESSAGE COUNT report reads: the TTL
+	// reaper probes every ready tag on every sweep
+	// (broker/queue_reaper.go, reapTTLSweep), and each probe would insert a
+	// durable record into the cache and inflate the count it then reports.
+	// The admitted entry was also an eviction victim (backed=true), so a read
+	// could displace a published message that was still resident.
+	//
+	// The acknowledgement re-check below is unaffected by dropping the
+	// admission: it asks the WAL whether the tag was acknowledged between the
+	// tier read and now, and needs no cache state to do it. (The old code
+	// admitted first and then deleted the admitted entry again when the tag
+	// turned out to be acknowledged — the delete existed only to undo the
+	// admission, and the admission is what is being removed.)
 	if ds.wal != nil && ds.wal.IsAcknowledged(queueName, deliveryTag) {
-		if admitted {
-			ds.hot.Delete(queueName, deliveryTag)
-		}
 		return nil, interfaces.ErrMessageNotFound
 	}
 	return msg, nil
@@ -523,7 +542,6 @@ func (ds *DisruptorStorage) purgeQueueRange(queueName string, minTag, maxTag uin
 		return 0
 	}
 	unique := make(map[uint64]struct{})
-	hotMessages := ds.hot.Range(queueName, minTag, maxTag)
 	if ds.wal != nil {
 		for _, tag := range ds.wal.PurgeQueue(queueName, minTag, maxTag) {
 			unique[tag] = struct{}{}
@@ -534,11 +552,14 @@ func (ds *DisruptorStorage) purgeQueueRange(queueName string, minTag, maxTag uin
 			unique[tag] = struct{}{}
 		}
 	}
-	for _, message := range hotMessages {
-		if message != nil && ds.hot.Delete(queueName, message.DeliveryTag) {
-			unique[message.DeliveryTag] = struct{}{}
-		}
+	// The hot tier is settled by the ENTRY'S OWNED TAG. The message the cache
+	// hands out is the live pointer, so its DeliveryTag field can be mutated
+	// after admission; settling by that field would delete the wrong key and
+	// report the wrong tag set.
+	for _, tag := range ds.hot.TagsInRange(queueName, minTag, maxTag) {
+		unique[tag] = struct{}{}
 	}
+	ds.hot.DeleteRange(queueName, minTag, maxTag)
 	return len(unique)
 }
 

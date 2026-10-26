@@ -1,5 +1,46 @@
 package storage
 
+// TEST-ONLY READ-AHEAD INTERNALS.
+//
+// WI3 retired the delivery use of the read-ahead buffer and the per-queue
+// readAheadBuffer: the hot cache replaced it, and the queue's hot cache is
+// where a published message lives now. The machinery that fed it stayed
+// behind in read_ahead.go with NO production caller:
+//
+//	readAheadBuffer            -> no reference anywhere in the module
+//	WALManager.ReadBatch        -> no production caller
+//	QueueWAL.readMessageBatch   -> reachable only through WALManager.ReadBatch
+//	QueueWAL.collectBatchFrom   -> reachable only through readMessageBatch
+//
+// The production file was DELETED (that is the point of this move): the hot
+// cache is the only read cache the broker has, and shipping a second,
+// unreferenced read path in the production binary is exactly the orphaned
+// machinery the review flagged.
+//
+// The three functions below survive ONLY because four storage test files
+// still drive them as INSTRUMENTS:
+//
+//	wal_ack_read_branch_test.go      -> WALManager.ReadBatch  (probes whether
+//	                                     an offsetIndex entry exists)
+//	wal_ack_read_deadlock_test.go     -> WALManager.ReadBatch  (a concurrent
+//	                                     reader storm)
+//	wal_old_file_handle_test.go       -> QueueWAL.readMessageBatch (recovery
+//	                                     from a closed-under-us old file handle)
+//	read_ahead_fault_test.go          -> QueueWAL.collectBatchFrom (the durable
+//	                                     end bound and the blank-header stop)
+//
+// Those test files belong to other workstreams, so their code is preserved
+// byte-for-byte HERE — as test-only code — instead of being edited or
+// deleted from under them. A method may be declared in a _test.go file, so
+// these three keep their exact signatures and every existing test keeps
+// compiling and running unchanged.
+//
+// When the owners of those four test files retire their use of the read-ahead
+// probe, this file and the four call sites can be deleted together.
+//
+// The readAheadChunkSize / readAheadMaxEntries constants live here for the
+// same reason: they were only ever used by the code below.
+
 import (
 	"encoding/binary"
 	"errors"
@@ -7,7 +48,6 @@ import (
 	"hash/crc32"
 	"io"
 	"os"
-	"sync"
 
 	"github.com/maxpert/amqp-go/protocol"
 )
@@ -16,70 +56,6 @@ const (
 	readAheadChunkSize  = 256 * 1024
 	readAheadMaxEntries = 64
 )
-
-type readAheadBuffer struct {
-	mu         sync.Mutex
-	messages   map[uint64]*protocol.Message
-	batchReads int
-}
-
-func newReadAheadBuffer() *readAheadBuffer {
-	return &readAheadBuffer{
-		messages: make(map[uint64]*protocol.Message),
-	}
-}
-
-func (b *readAheadBuffer) get(tag uint64) (*protocol.Message, bool) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	msg, ok := b.messages[tag]
-	return msg, ok
-}
-
-// put takes OWNERSHIP of messages. Once handed over, the caller must not read or
-// write that map again except through this type's methods — remove() mutates it
-// in place on every acknowledgement, so an unsynchronised access by the caller is
-// a data race.
-func (b *readAheadBuffer) put(messages map[uint64]*protocol.Message) {
-	b.mu.Lock()
-	b.messages = messages
-	b.batchReads++
-	b.mu.Unlock()
-}
-
-// remove drops a single tag from the buffer.
-//
-// This is the cache's ack invalidation and it is load-bearing.
-// DisruptorStorage.GetMessage consults this buffer BEFORE the WAL, and a
-// readMessageBatch fills it with up to readAheadMaxEntries tags at once — so
-// without this an acknowledged message keeps being served from here, bypassing
-// the WAL's own ack gate entirely. broker/queue_reaper.go reapTTLSweep probes
-// acked tags on every sweep and relies on getting nothing back; a cache hit
-// there re-expires and re-dead-letters the same record without bound.
-func (b *readAheadBuffer) remove(tag uint64) {
-	b.mu.Lock()
-	delete(b.messages, tag)
-	b.mu.Unlock()
-}
-
-func (b *readAheadBuffer) len() int {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	return len(b.messages)
-}
-
-func (b *readAheadBuffer) has(tag uint64) bool {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	_, ok := b.messages[tag]
-	return ok
-}
-
-func (b *readAheadBuffer) batchReadCount() int {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	return b.batchReads
-}
 
 func (wm *WALManager) ReadBatch(queueName string, startOffset uint64) (map[uint64]*protocol.Message, error) {
 	wm.mu.RLock()

@@ -293,52 +293,98 @@ func TestSharedBody_GCDoesNotFreeInflightBody(t *testing.T) {
 	assert.Equal(t, body, m.Body)
 }
 
-// TestSharedBody_CheckpointReInlinesBody (spec test #6): with the age backstop
-// forced, a shared fan-out whose refs are all unacked is checkpointed — the WAL
-// file is deleted and each queue holds a self-contained INLINE segment record
-// (no reference), body readable from segments.
-func TestSharedBody_CheckpointReInlinesBody(t *testing.T) {
+// TestSharedBody_CompactionKeepsOneBodyCopy (spec test #6, re-pointed).
+//
+// SEGSTORE V1 RE-POINT. This test used to force the age backstop and assert
+// that the CHECKPOINT re-inlined the shared body: the WAL file was deleted and
+// each queue held its own INLINE copy — the N-copy blowup, documented as the
+// backstop's degradation. Checkpoint copying is gone (nothing moves records out
+// of the WAL any more), so the re-inline path does not exist and the degradation
+// it documented cannot be produced.
+//
+// The rewrite path that IS live is WAL COMPACTION (WI7): it rewrites a sealed
+// WAL file with only its committed, unacknowledged records, and it is the one
+// place where a shared body could still blow up into N copies. So the guard
+// this test inherits is the same one — a shared body stays ONE copy on disk —
+// asserted against the mechanism that could break it, and with a STRONGER
+// outcome than the old test could assert: the block is copied once, every
+// surviving reference still resolves it, and no inline copy is produced.
+func TestSharedBody_CompactionKeepsOneBodyCopy(t *testing.T) {
 	tmpDir := t.TempDir()
 	cfg := coldTailWALConfig()
-	cfg.SharedBodyMaxPinAge = time.Nanosecond // backstop fires immediately -> re-inline
+	// A tiny threshold so that acknowledging a few references makes the sealed
+	// file eligible for the rewrite. The shared body dominates the file's bytes,
+	// so the references alone can never reach a half-dead ratio; the threshold
+	// only decides WHEN the rewrite happens, never what it does.
+	cfg.CompactionThreshold = 0.001
 	wm, err := NewWALManagerWithConfig(tmpDir, cfg)
 	require.NoError(t, err)
 	defer wm.Close()
-
-	sm, err := NewSegmentManager(tmpDir)
-	require.NoError(t, err)
-	defer sm.Close()
-	wm.SetSegmentManager(sm)
 
 	const K = 4
 	body := sharedTestBody(8192)
 	queues := queuesN(K)
 	require.NoError(t, writeSharedSync(t, wm, body, queues, 1))
-	sharedFile := firstWALFile(t, tmpDir)
+	sharedFile := firstWALFile(t, tmpDir) // the rolled shared-body file
 
-	time.Sleep(2 * time.Millisecond) // ensure age > SharedBodyMaxPinAge
-	wm.sharedWAL.performCheckpoint()
+	before, err := WALRecordCountsForTest(tmpDir)
+	require.NoError(t, err)
+	require.Equal(t, 1, before.BodyBlocks, "the fan-out must start with exactly one body copy")
+	require.Equal(t, K, before.RefBodies, "the fan-out must start with K references")
+	require.Equal(t, 0, before.InlineBodies, "the fan-out must start with no inline copy")
 
-	_, err = os.Stat(sharedFile)
-	assert.True(t, os.IsNotExist(err), "backstop re-inlines then deletes the WAL file")
+	// Acknowledge HALF of the references; TWO stay live. Two, not one: the
+	// N-copy blowup this test guards is "one body copy per surviving
+	// reference", so a single survivor could not see it.
+	acked := []uint64{1, 2}
+	ackAndWait(t, wm, acked)
 
-	// Each queue now has an INLINE segment record readable from segments.
-	for i, q := range queues {
-		m, rerr := sm.Read(q, uint64(1+i))
-		require.NoError(t, rerr, "queue %s must have a re-inlined segment record", q)
-		assert.Equal(t, body, m.Body)
+	// ACT: the rewrite.
+	wm.sharedWAL.tryCompactOldFiles()
+
+	// The rewrite must NOT have blown the body up into N copies.
+	after, err := WALRecordCountsForTest(tmpDir)
+	require.NoError(t, err)
+	assert.Equal(t, 1, after.BodyBlocks,
+		"the shared body must survive the rewrite as ONE copy, not one copy per surviving reference")
+	assert.Equal(t, 0, after.InlineBodies,
+		"the rewrite must not inline the body into every surviving reference")
+	assert.Equal(t, 2, after.RefBodies,
+		"both unacknowledged references must survive the rewrite (the rewrite did not happen otherwise)")
+
+	// Every surviving reference still resolves the shared body: the block was
+	// copied once and each locator remapped to its new position.
+	for _, i := range []int{2, 3} {
+		m, rerr := wm.Read(queues[i], uint64(1+i))
+		require.NoError(t, rerr, "queue %s must still be readable after the rewrite", queues[i])
+		assert.Equal(t, body, m.Body, "the surviving reference must still resolve the shared body")
 	}
+
+	// The rewritten file is still on disk: the rewrite reclaims space inside the
+	// file, it does not drop the live record.
+	_, serr := os.Stat(sharedFile)
+	require.NoError(t, serr, "the rewritten WAL file must still exist")
 }
 
-// TestSharedBody_ColdTailStaysOneCopyAcrossCheckpoint (spec test #12, CEO #1):
-// with the hardening ON (no age backstop), an all-unacked shared fan-out is NOT
-// checkpointed — the body stays as ONE copy in the WAL. Acking all refs then
-// reclaims the whole file. A second subtest forces the backstop and documents
-// the honest N-copy re-inline degradation.
-func TestSharedBody_ColdTailStaysOneCopyAcrossCheckpoint(t *testing.T) {
-	t.Run("hardening-on-body-survives-as-one-copy", func(t *testing.T) {
+// TestSharedBody_ColdTailStaysOneCopyAcrossMaintenance (spec test #12, CEO #1,
+// re-pointed): a shared fan-out whose references are all unacked holds the
+// body as ONE copy in the WAL — never N copies — and the file is reclaimed
+// whole once every reference is acknowledged.
+//
+// SEGSTORE V1 RE-POINT. The checkpoint is gone, so the maintenance this test
+// exercises is the WAL tier's own: the compaction sweep that rewrites a sealed
+// file and the reclaim sweep that unlinks a fully acknowledged one. The
+// property under test is unchanged and still live: an unacknowledged
+// reference PINS the shared body (and the file that holds it), and the body is
+// never multiplied.
+func TestSharedBody_ColdTailStaysOneCopyAcrossMaintenance(t *testing.T) {
+	t.Run("unacked-ref-pins-one-copy-across-maintenance", func(t *testing.T) {
 		tmpDir := t.TempDir()
-		cfg := coldTailWALConfig() // SharedBodyMaxPinAge == 0 -> skip forever
+		cfg := coldTailWALConfig()
+		// A tiny threshold so that the acknowledged references make the sealed
+		// file eligible for the rewrite (the shared body dominates the file's
+		// bytes, so the references alone can never reach a half-dead ratio).
+		cfg.CompactionThreshold = 0.001
 		wm, err := NewWALManagerWithConfig(tmpDir, cfg)
 		require.NoError(t, err)
 		defer wm.Close()
@@ -354,60 +400,52 @@ func TestSharedBody_ColdTailStaysOneCopyAcrossCheckpoint(t *testing.T) {
 		require.NoError(t, writeSharedSync(t, wm, body, queues, 1))
 		sharedFile := firstWALFile(t, tmpDir)
 
-		// Ack NONE; checkpoint several times.
-		for i := 0; i < 3; i++ {
-			wm.sharedWAL.performCheckpoint()
+		// Acknowledge HALF the references; two stay live and pin the file.
+		ackAndWait(t, wm, []uint64{1, 2})
+
+		// MAINTENANCE: the rewrite sweep and the reclaim sweep both run.
+		wm.sharedWAL.tryCompactOldFiles()
+		wm.sharedWAL.tryReclaimOldFiles()
+
+		// (a) the file is NOT reclaimed — a live reference still needs it,
+		// (b) the body is still exactly ONE copy, (c) no copy per reference.
+		_, err = os.Stat(sharedFile)
+		require.NoError(t, err, "a shared-body file with a live reference must not be reclaimed")
+		counts, err := WALRecordCountsForTest(tmpDir)
+		require.NoError(t, err)
+		assert.Equal(t, 1, counts.BodyBlocks, "still exactly one body copy on disk")
+		assert.Equal(t, 0, counts.InlineBodies, "no N-copy blowup happened")
+
+		// The live references still resolve the shared body.
+		for _, i := range []int{2, 3} {
+			m, rerr := wm.Read(queues[i], uint64(1+i))
+			require.NoError(t, rerr, "queue %s must still resolve the shared body", queues[i])
+			assert.Equal(t, body, m.Body)
 		}
 
-		// (a) file NOT deleted, (b) NO segment records written, (c) still exactly
-		// ONE body copy (the BodyBlock).
-		_, err = os.Stat(sharedFile)
-		require.NoError(t, err, "a shared-body file must be skipped by checkpoint (§2)")
+		// (d) the WAL tier never copies records into the legacy segment tier.
 		for i, q := range queues {
 			_, rerr := sm.Read(q, uint64(1+i))
 			assert.Error(t, rerr, "no segment record must be written for %s", q)
 		}
-		counts, err := WALRecordCountsForTest(tmpDir)
-		require.NoError(t, err)
-		assert.Equal(t, 1, counts.BodyBlocks, "still exactly one body copy on disk")
-		assert.Equal(t, 0, counts.InlineBodies, "no N-copy re-inline happened")
 
-		// (d) ack all K -> whole-file reclaim.
-		offs := []uint64{1, 2, 3, 4}
-		ackAndWait(t, wm, offs)
+		// (e) ack the LIVE references -> whole-file reclaim. The two already
+		// acknowledged ones are gone from the index: the rewrite dropped them,
+		// which is why only the live ones are acknowledged here.
+		ackAndWait(t, wm, []uint64{3, 4})
 		wm.sharedWAL.tryReclaimOldFiles()
 		_, err = os.Stat(sharedFile)
 		assert.True(t, os.IsNotExist(err), "reclaimed whole once all refs ack")
 	})
 
 	t.Run("backstop-degrades-to-n-inline-copies", func(t *testing.T) {
-		tmpDir := t.TempDir()
-		cfg := coldTailWALConfig()
-		cfg.SharedBodyMaxPinAge = time.Nanosecond
-		wm, err := NewWALManagerWithConfig(tmpDir, cfg)
-		require.NoError(t, err)
-		defer wm.Close()
-
-		sm, err := NewSegmentManager(tmpDir)
-		require.NoError(t, err)
-		defer sm.Close()
-		wm.SetSegmentManager(sm)
-
-		const K = 3
-		body := sharedTestBody(8192)
-		queues := queuesN(K)
-		require.NoError(t, writeSharedSync(t, wm, body, queues, 1))
-		sharedFile := firstWALFile(t, tmpDir)
-
-		time.Sleep(2 * time.Millisecond)
-		wm.sharedWAL.performCheckpoint()
-
-		_, err = os.Stat(sharedFile)
-		assert.True(t, os.IsNotExist(err), "backstop re-inlines + deletes the WAL file")
-		for i, q := range queues {
-			m, rerr := sm.Read(q, uint64(1+i))
-			require.NoError(t, rerr)
-			assert.Equal(t, body, m.Body, "each queue now holds its own inline copy (documented degradation)")
-		}
+		// The age backstop re-inlined the shared body into N inline copies
+		// through the checkpoint path, and this subtest documented that
+		// degradation. That path is gone: nothing copies WAL records into
+		// segments any more, so the degradation cannot be produced. The
+		// guarantee that SURVIVED — a shared body is never multiplied — is
+		// asserted against the live rewrite path in
+		// TestSharedBody_CompactionKeepsOneBodyCopy.
+		t.Skip("checkpoint copying removed in segstore v1")
 	})
 }

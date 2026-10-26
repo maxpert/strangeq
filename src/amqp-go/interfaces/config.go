@@ -301,7 +301,12 @@ type EngineConfig struct {
 
 	// HotCacheQueueBytes is the per-queue byte budget for the in-memory hot
 	// cache that serves recent messages without disk reads. 0 (default) maps to
-	// 16 MiB. Range: [1, 16] MiB.
+	// 64 MiB. Range: [1, 64] MiB.
+	//
+	// The default is sized so the ready set is not SMALLER than the 64K-message
+	// ring the hot cache replaces (80% spill threshold = 52,428 messages): a
+	// smaller budget makes the LRU evict the FIFO consumer's next target, which
+	// turns every read into a cold read.
 	HotCacheQueueBytes int64 `json:"hot_cache_queue_bytes"`
 
 	// HotCacheGlobalBytes is the global byte budget shared across all queues

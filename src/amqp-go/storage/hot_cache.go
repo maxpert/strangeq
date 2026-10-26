@@ -11,6 +11,11 @@ import (
 
 // hotCache is a byte-bounded collection of per-queue message maps with one
 // global LRU. The front of lru is the most recently used entry.
+//
+// TWO budgets, TWO victim pools. The per-queue budget is satisfied out of
+// THAT queue's backed entries and the global budget out of the global LRU;
+// they are never satisfied out of the same pool, so a queue's admission can
+// never cost an unrelated queue its ready messages.
 type hotCache struct {
 	mu sync.Mutex
 
@@ -23,11 +28,24 @@ type hotCache struct {
 }
 
 type hotCacheEntry struct {
-	queue   string
+	queue string
+	// tag is the entry's OWNED identity: the delivery tag the entry was
+	// admitted under. The cache hands out the live message pointer, so a
+	// caller can mutate message.DeliveryTag after admission; every identity
+	// operation (map key, deletion, range ordering) MUST use this field and
+	// never the mutable message field.
+	tag     uint64
 	message *protocol.Message
 	charge  int64
 	backed  bool
 	lru     *list.Element
+}
+
+// hotCacheRangeEntry pairs a message with the tag it was admitted under so
+// Range can order by the owned identity instead of the mutable message field.
+type hotCacheRangeEntry struct {
+	tag     uint64
+	message *protocol.Message
 }
 
 func newHotCache(queueBytes, globalBytes int64) *hotCache {
@@ -43,6 +61,9 @@ func newHotCache(queueBytes, globalBytes int64) *hotCache {
 // Put admits m if both byte budgets can be satisfied. Existing tags retain
 // their original message and charge; a durable completion can only upgrade
 // their backed state.
+//
+// The per-queue budget is satisfied from that queue's own backed entries and
+// the global budget from the global LRU; see evictBackedLRULocked.
 func (c *hotCache) Put(queue string, m *protocol.Message, backed bool) bool {
 	if m == nil {
 		return false
@@ -64,8 +85,23 @@ func (c *hotCache) Put(queue string, m *protocol.Message, backed bool) bool {
 		return false
 	}
 
-	for c.queueUsed[queue]+charge > c.queueBytes || c.globalUsed+charge > c.globalBytes {
-		if !c.evictBackedLRULocked() {
+	// The two budgets are SEPARATE resources and are satisfied separately.
+	//
+	// The per-queue budget is satisfied out of THAT QUEUE's backed entries
+	// only: evicting an unrelated queue's ready message to make room for this
+	// queue's admission is a cross-queue starvation bug (the evicted queue's
+	// FIFO consumer then has to take a cold read for its next target).
+	//
+	// The global budget is satisfied out of the global LRU, which is the only
+	// place where a cross-queue eviction is legitimate: the cache as a whole
+	// is over its budget.
+	for c.queueUsed[queue]+charge > c.queueBytes {
+		if !c.evictBackedLRULocked(queue) {
+			return false
+		}
+	}
+	for c.globalUsed+charge > c.globalBytes {
+		if !c.evictBackedLRULocked("") {
 			return false
 		}
 	}
@@ -77,12 +113,13 @@ func (c *hotCache) Put(queue string, m *protocol.Message, backed bool) bool {
 	}
 	entry := &hotCacheEntry{
 		queue:   queue,
+		tag:     m.DeliveryTag,
 		message: m,
 		charge:  charge,
 		backed:  backed,
 	}
 	entry.lru = c.lru.PushFront(entry)
-	entries[m.DeliveryTag] = entry
+	entries[entry.tag] = entry
 	c.queueUsed[queue] += charge
 	c.globalUsed += charge
 	return true
@@ -123,15 +160,22 @@ func (c *hotCache) Range(queue string, minTag, maxTag uint64) []*protocol.Messag
 	defer c.mu.Unlock()
 
 	entries := c.queues[queue]
-	result := make([]*protocol.Message, 0, len(entries))
+	tagged := make([]hotCacheRangeEntry, 0, len(entries))
 	for tag, entry := range entries {
 		if tag >= minTag && tag <= maxTag {
-			result = append(result, entry.message)
+			tagged = append(tagged, hotCacheRangeEntry{tag: tag, message: entry.message})
 		}
 	}
-	sort.Slice(result, func(i, j int) bool {
-		return result[i].DeliveryTag < result[j].DeliveryTag
+	// Order by the MAP KEY (the tag the entry was admitted under), never by
+	// the message's mutable DeliveryTag field: a caller that mutated the
+	// handed-out message must not be able to reorder the queue's ready set.
+	sort.Slice(tagged, func(i, j int) bool {
+		return tagged[i].tag < tagged[j].tag
 	})
+	result := make([]*protocol.Message, 0, len(tagged))
+	for _, entry := range tagged {
+		result = append(result, entry.message)
+	}
 	return result
 }
 
@@ -154,6 +198,32 @@ func (c *hotCache) DeleteRange(queue string, minTag, maxTag uint64) int {
 	return removed
 }
 
+// TagsInRange returns the tags this cache holds for the queue within
+// [minTag, maxTag], sorted ascending.
+//
+// IT REPORTS THE ENTRY'S OWNED TAG, never the DeliveryTag field of the
+// message the cache hands out: a caller may mutate that field after
+// admission, and a purge that settled entries by it would delete the wrong
+// key (or nothing) and would report the wrong tag set.
+func (c *hotCache) TagsInRange(queue string, minTag, maxTag uint64) []uint64 {
+	if minTag > maxTag {
+		return nil
+	}
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	tags := make([]uint64, 0, len(c.queues[queue]))
+	for tag := range c.queues[queue] {
+		if tag < minTag || tag > maxTag {
+			continue
+		}
+		tags = append(tags, tag)
+	}
+	sort.Slice(tags, func(i, j int) bool { return tags[i] < tags[j] })
+	return tags
+}
+
 func (c *hotCache) Count(queue string) int {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -162,9 +232,17 @@ func (c *hotCache) Count(queue string) int {
 
 // evictBackedLRULocked removes the least recently used backed entry. Pinned
 // transient entries are skipped and remain resident.
-func (c *hotCache) evictBackedLRULocked() bool {
+//
+// A non-empty queue restricts the victims to THAT queue's entries: satisfying
+// a per-queue budget must never cost an unrelated queue its ready messages.
+// An empty queue selects the global LRU, which is the only legitimate source
+// of a cross-queue eviction (the cache as a whole is over its global budget).
+func (c *hotCache) evictBackedLRULocked(queue string) bool {
 	for element := c.lru.Back(); element != nil; element = element.Prev() {
 		entry := element.Value.(*hotCacheEntry)
+		if queue != "" && entry.queue != queue {
+			continue
+		}
 		if entry.backed {
 			c.removeLocked(entry)
 			return true
@@ -175,7 +253,10 @@ func (c *hotCache) evictBackedLRULocked() bool {
 
 func (c *hotCache) removeLocked(entry *hotCacheEntry) {
 	entries := c.queues[entry.queue]
-	delete(entries, entry.message.DeliveryTag)
+	// Delete by the OWNED tag: the message handed out to callers is live and
+	// its DeliveryTag field may have been mutated since admission, which
+	// would otherwise delete the wrong key and orphan the entry.
+	delete(entries, entry.tag)
 	c.queueUsed[entry.queue] -= entry.charge
 	c.globalUsed -= entry.charge
 	c.lru.Remove(entry.lru)

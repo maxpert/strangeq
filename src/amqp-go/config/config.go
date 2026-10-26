@@ -110,10 +110,10 @@ func DefaultConfig() *AMQPConfig {
 			DepthHighWMOverride:   0,     // 0 = compute HWM from ring size × spill % (default)
 
 			// Write-Ahead Log (WAL)
-			WALBatchSize:      1000,              // 1,000 messages per batch
-			WALBatchTimeoutMS: 5,                 // retained for compatibility; flushing is drain-then-flush, not timer-gated
-			WALFileSize:       64 * 1024 * 1024,  // 64 MB per WAL file (segstore v1)
-			WALChannelBuffer:  10000,             // 10K buffered requests
+			WALBatchSize:      1000,             // 1,000 messages per batch
+			WALBatchTimeoutMS: 5,                // retained for compatibility; flushing is drain-then-flush, not timer-gated
+			WALFileSize:       64 * 1024 * 1024, // 64 MB per WAL file (segstore v1)
+			WALChannelBuffer:  10000,            // 10K buffered requests
 
 			// Segment Storage (Cold Path)
 			SegmentSize:                 64 * 1024 * 1024, // 64 MB per segment (segstore v1)
@@ -122,7 +122,14 @@ func DefaultConfig() *AMQPConfig {
 			CompactionIntervalMS:        1800000,          // 30 minutes
 
 			// Hot Cache (Segstore v1)
-			HotCacheQueueBytes:  16 * 1024 * 1024, // 16 MiB per queue
+			//
+			// The per-queue budget is 64 MiB because the hot cache REPLACES the
+			// 64K-message ring, whose 80% spill threshold is 52,428 messages.
+			// A 16 MiB per-queue budget holds only ~25.4k messages at the
+			// current charge formula -- LESS than the ring it replaces -- so
+			// the LRU evicted the FIFO consumer's next target and every read
+			// became a cold read. The global budget stays at 256 MiB.
+			HotCacheQueueBytes:  64 * 1024 * 1024,  // 64 MiB per queue
 			HotCacheGlobalBytes: 256 * 1024 * 1024, // 256 MiB global
 
 			// Consumer Delivery
@@ -277,8 +284,8 @@ func (c *AMQPConfig) Validate() error {
 	// Hot cache validation (segstore v1)
 	if c.Engine.HotCacheQueueBytes != 0 {
 		qb := c.Engine.HotCacheQueueBytes
-		if qb < 1*1024*1024 || qb > 16*1024*1024 {
-			return fmt.Errorf("hot cache queue bytes must be between 1 and 16 MiB: %d", qb)
+		if qb < 1*1024*1024 || qb > 64*1024*1024 {
+			return fmt.Errorf("hot cache queue bytes must be between 1 and 64 MiB: %d", qb)
 		}
 	}
 	if c.Engine.HotCacheGlobalBytes != 0 {

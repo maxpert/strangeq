@@ -37,6 +37,6 @@ func TestP3_DefaultsWhenConfigZero(t *testing.T) {
 	ds, err := NewDisruptorStorageWithEngineConfig(t.TempDir(), interfaces.EngineConfig{})
 	require.NoError(t, err)
 	defer ds.Close()
-	require.EqualValues(t, 16*1024*1024, ds.hot.queueBytes)
+	require.EqualValues(t, 64*1024*1024, ds.hot.queueBytes)
 	require.EqualValues(t, 256*1024*1024, ds.hot.globalBytes)
 }

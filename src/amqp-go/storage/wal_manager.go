@@ -164,12 +164,16 @@ type WALConfig struct {
 	// gates flushing: the batch writer flushes as soon as writeChan is drained
 	// (drain-then-flush group commit), so a lone synchronous writer is never
 	// stalled waiting for a batch ticker. See batchWriterLoop.
-	BatchTimeout       time.Duration
-	FileSize           int64
-	ChannelBuffer      int
-	CleanupInterval    time.Duration
-	RetentionPeriod    time.Duration // for time-based retention
-	CheckpointInterval time.Duration // how often WAL checkpoints old files to segments
+	BatchTimeout    time.Duration
+	FileSize        int64
+	ChannelBuffer   int
+	CleanupInterval time.Duration
+	RetentionPeriod time.Duration // for time-based retention
+	// CheckpointInterval is RETAINED FOR CONFIGURATION COMPATIBILITY ONLY.
+	// Checkpoint copying (WAL -> segments) was removed in segstore v1 (WI8):
+	// nothing copies records out of the WAL any more, so this interval no
+	// longer schedules anything. DELETE IT WITH THE CHECKPOINT-ERA CONFIG.
+	CheckpointInterval time.Duration
 
 	// SyncDisabled, when true, skips the group-commit fdatasync in
 	// commitBatch (the async publish durability barrier). Zero value (false)
@@ -206,14 +210,16 @@ type WALConfig struct {
 	// byte is dead", which is a maintenance storm, not a default.
 	CompactionThreshold float64
 
-	// SharedBodyMaxPinAge (ITER5 cold-tail hardening, §2) bounds how long a rolled
-	// WAL file that carries a shared BodyBlock may be kept out of checkpoint before
-	// it is force-re-inlined (N copies) and deleted. 0 disables the age backstop
-	// and relies on RetentionPeriod (which, if also 0, imposes no age bound — a
-	// permanently-unacked reference then pins its BodyBlock file, holding exactly
-	// ONE body copy, never the N-copy blowup). When >0, performCheckpoint stops
-	// skipping a shared-body file once it is older than this and re-inlines it via
-	// the normal checkpoint path.
+	// SharedBodyMaxPinAge (ITER5 cold-tail hardening, §2) used to bound how long
+	// a rolled WAL file that carries a shared BodyBlock was kept out of
+	// CHECKPOINTING before it was force-re-inlined (N copies) and deleted.
+	//
+	// CHECKPOINTING IS GONE (segstore v1, WI8): nothing copies records out of
+	// the WAL any more, so a shared body is never re-inlined and this field has
+	// NO EFFECT on the write, reclaim or compaction paths — a shared body
+	// survives as ONE copy because nothing copies it out at all. The field is
+	// retained (and still plumbed from the engine configuration) so existing
+	// configuration keeps parsing; DELETE IT WITH THE CHECKPOINT-ERA CONFIG.
 	SharedBodyMaxPinAge time.Duration
 }
 
@@ -306,10 +312,14 @@ type QueueWAL struct {
 	// least one BodyBlock record. It is set under fileMutex by commitBatch when a
 	// batch carrying a fused shared unit is successfully written, restored on a
 	// failed write/fsync, and captured into walFileInfo.hasSharedBody
-	// (then reset) by rollFile. performCheckpoint skips a rolled file with this set
-	// so a shared body survives as ONE copy across arbitrarily many checkpoints
-	// (until all refs ack -> whole-file reclaim, or the SharedBodyMaxPinAge backstop
-	// fires). Guarded by fileMutex (always held in commitBatch and rollFile).
+	// (then reset) by rollFile.
+	//
+	// IT WAS READ BY THE CHECKPOINT PASS, which skipped a rolled file carrying a
+	// shared body so the body survived as ONE copy across arbitrarily many
+	// checkpoints (until all refs ack -> whole-file reclaim). CHECKPOINTING IS
+	// GONE (segstore v1, WI8) and this flag has no reader left: the body
+	// survives because nothing copies it out at all. Guarded by fileMutex
+	// (always held in commitBatch and rollFile).
 	currentFileHasSharedBody bool
 
 	// Old inactive files
@@ -589,20 +599,22 @@ type walFileInfo struct {
 	offsets   *roaring64.Bitmap // actual message offsets in this file
 	createdAt time.Time         // when this file was rolled (for retention)
 	// hasSharedBody (ITER5 §2) is true iff this rolled file carries at least one
-	// BodyBlock record. performCheckpoint skips such files (keeping the body as
-	// ONE copy) unless the SharedBodyMaxPinAge backstop forces re-inline.
+	// BodyBlock record. The CHECKPOINT PASS used to skip such files (keeping the
+	// body as ONE copy) unless the SharedBodyMaxPinAge backstop forced a
+	// re-inline; CHECKPOINTING IS GONE (segstore v1, WI8), so this flag records
+	// what the file holds and nothing more.
 	hasSharedBody bool
 	inv           *segmentInventory
 
 	// --- WS-C (C1/C2/C5) durability bookkeeping, appended below the pinned
 	// fields. durableSize and damagedTail are written once, at roll time,
 	// before the entry is published under oldFilesMutex, so any read through
-	// the published entry is ordered by construction. checkpointed and
-	// retentionFailLogged are MUTATED after publication and are therefore
-	// only ever accessed under oldFilesMutex: tryReclaimOldFiles reads and
-	// writes them under Lock, and performCheckpoint copies checkpointed out
-	// under the RLock of its map snapshot (walCheckpointTarget) instead of
-	// reading it in its unlocked loop body. ---
+	// the published entry is ordered by construction.
+	//
+	// The `checkpointed` and `retentionFailLogged` flags that used to be
+	// MUTATED after publication are GONE with the checkpoint pass (segstore v1,
+	// WI8): nothing copies records out of a WAL file any more, and the
+	// retention sweep only unlinks fully acknowledged files. ---
 
 	// compactionAttempted guards ONE compaction attempt per file (WI7). It is
 	// claimed with a compare-and-swap, so two concurrent maintenance passes
@@ -617,8 +629,8 @@ type walFileInfo struct {
 	// inherited value set by rebuildBootState) means the whole file.
 	durableSize int64
 	// damagedTail is true when bytes beyond durableSize are a nacked partial
-	// batch that could not be truncated. The file is still checkpointed (up
-	// to durableSize) and unlinked once that succeeds.
+	// batch that could not be truncated. The file stays readable up to
+	// durableSize and is unlinked once it is fully acknowledged.
 	damagedTail bool
 }
 
@@ -996,7 +1008,7 @@ func (qw *QueueWAL) repairAfterFailedWriteLocked(pre int64, op string, cause err
 func (qw *QueueWAL) poisonLocked(cause error) {
 	qw.poisoned = cause
 	qw.degraded = true
-	qw.logError("WAL file diverged after a failed write and could not be repaired; rolling it away (the file stays readable and is checkpointed only up to its durable end)",
+	qw.logError("WAL file diverged after a failed write and could not be repaired; rolling it away (the file stays readable only up to its durable end)",
 		interfaces.LogField{Key: "error", Value: cause.Error()},
 		interfaces.LogField{Key: "file", Value: qw.currentFile.Name()})
 }
@@ -1191,7 +1203,7 @@ func (qw *QueueWAL) writeTxAtomic(records []*RecoveryMessage) error {
 		inv = newSegmentInventory(startPos)
 		qw.currentInv = inv
 	}
-	inv.durableBytes += int64(n)
+	inv.durableBytes.Add(int64(n))
 	qw.offsetIndexMutex.Lock()
 	for i, rec := range records {
 		r := &segmentRecord{
@@ -1386,6 +1398,15 @@ func (wm *WALManager) RecoverFromWAL() ([]*RecoveryMessage, error) {
 
 	winners := make(map[recordKey]*RecoveryMessage)
 	var faults []error
+	// identified holds every record the scan RECOGNIZED but could not serve.
+	// The index/scan comparison below needs it: a record the scan found and
+	// REPORTED is not a disagreement, while a record the scan never mentions
+	// while the boot index holds it IS one.
+	identified := map[recordKey]bool{}
+	// quarantined holds the file numbers whose scan was fatal. The records
+	// the boot index holds in such a file are already accounted for by that
+	// file's own fatal fault.
+	quarantined := map[uint64]bool{}
 
 	// Get list of all WAL files
 	sharedDir := filepath.Join(wm.dataDir, "shared")
@@ -1407,7 +1428,7 @@ func (wm *WALManager) RecoverFromWAL() ([]*RecoveryMessage, error) {
 		}
 
 		filePath := filepath.Join(sharedDir, file.Name())
-		messages, serr := wm.sharedWAL.scanWALFile(filePath)
+		res, serr := wm.sharedWAL.scanWALFileDetailed(filePath, -1)
 		if serr != nil {
 			fault := classifyWALScanError(filePath, serr)
 			faults = append(faults, fault)
@@ -1416,17 +1437,27 @@ func (wm *WALManager) RecoverFromWAL() ([]*RecoveryMessage, error) {
 				// nothing is taken from it — but every other file in the
 				// directory is still scanned, still enumerated, and still
 				// recovered. See the function doc.
+				if num, ok := parseWALFileNum(file.Name()); ok {
+					quarantined[num] = true
+				}
 				continue
 			}
-			if messages == nil {
-				continue
-			}
+		}
+		if res == nil {
+			continue
+		}
+		// The scan's own faults: a torn tail (benign) and the records it could
+		// not serve (degraded). They are reported here rather than swallowed,
+		// so a durable record the scan could not load is never a silent loss.
+		faults = append(faults, res.faults...)
+		for key := range res.unloadable {
+			identified[key] = true
 		}
 
 		// Select the newest physical copy before considering acknowledgement.
 		// Filtering each copy independently could revive an older duplicate after
 		// the winning copy had been settled.
-		for _, msg := range messages {
+		for _, msg := range res.messages {
 			key := recordKey{queueName: msg.QueueName, deliveryTag: msg.Offset}
 			if current := winners[key]; current == nil || recordPositionNewer(msg.pos, current.pos) {
 				winners[key] = msg
@@ -1437,11 +1468,43 @@ func (wm *WALManager) RecoverFromWAL() ([]*RecoveryMessage, error) {
 	recoveredMessages := make([]*RecoveryMessage, 0, len(winners))
 	qw := wm.sharedWAL
 	qw.offsetIndexMutex.RLock()
+
+	// THE TWO READERS OF THE SAME BYTES MUST AGREE.
+	//
+	// The boot index (indexWALFile) and this scan (scanWALFile) both walk
+	// every record of every WAL file, and they used to be TWO GRAMMARS: the
+	// index accepted a record the scan refused (a payload with the reserved
+	// continuation bit set, or a body kind the scan did not know), so the
+	// record was INDEXED — its key and its position were in the index — but
+	// never SCANNED. The old code then dropped it with a bare `continue` on
+	// the position mismatch: a CONFIRMED DURABLE RECORD, SILENTLY GONE.
+	//
+	// A disagreement is now a CLASSIFIED DegradedFault. The record is still
+	// served whenever serving it is safe; the fault is what makes the
+	// disagreement VISIBLE to an operator instead of silent.
+	scannedPos := make(map[recordKey]recordPos, len(winners))
+	for key, msg := range winners {
+		scannedPos[key] = msg.pos
+	}
+
+	// The disagreements are counted PER FILE, so a directory holding a million
+	// of them produces one fault per file instead of a million faults.
+	mismatchCount := map[uint64]int{}
+	mismatchExample := map[uint64]string{}
+	missingCount := map[uint64]int{}
+	missingExample := map[uint64]string{}
+
 	for key, msg := range winners {
 		winner := qw.offsetIndex[key]
 		if winner != nil && winner.pos != msg.pos {
 			// The index knows a DIFFERENT copy of this key, so the scanned copy
-			// is the older one: never revive it as a fallback.
+			// is not the newest one: never revive it as a fallback. The
+			// disagreement is REPORTED (it used to be a silent continue).
+			fileNum := msg.pos.segmentID
+			mismatchCount[fileNum]++
+			if _, ok := mismatchExample[fileNum]; !ok {
+				mismatchExample[fileNum] = fmt.Sprintf("%s/%d", key.queueName, key.deliveryTag)
+			}
 			continue
 		}
 		if winner == nil {
@@ -1458,7 +1521,43 @@ func (wm *WALManager) RecoverFromWAL() ([]*RecoveryMessage, error) {
 			recoveredMessages = append(recoveredMessages, msg)
 		}
 	}
+
+	// The other direction: a record the boot index holds that the scan never
+	// produced. The index is built from the SAME files this scan reads, so a
+	// key the index holds and that neither the scan's winners nor the scan's
+	// unloadable set mention is a record one of the two readers dropped.
+	for key, winner := range qw.offsetIndex {
+		if quarantined[winner.pos.segmentID] {
+			// That file's own fatal fault already accounts for its records.
+			continue
+		}
+		if _, ok := scannedPos[key]; ok {
+			// The scan produced a copy of this key; any disagreement about
+			// WHICH copy was reported above.
+			continue
+		}
+		if identified[key] {
+			// The scan found this record and REPORTED it as unloadable (its
+			// own fault covers it).
+			continue
+		}
+		fileNum := winner.pos.segmentID
+		missingCount[fileNum]++
+		if _, ok := missingExample[fileNum]; !ok {
+			missingExample[fileNum] = fmt.Sprintf("%s/%d", key.queueName, key.deliveryTag)
+		}
+	}
 	qw.offsetIndexMutex.RUnlock()
+
+	for fileNum, count := range mismatchCount {
+		faults = append(faults, walIndexScanDisagreementFault(sharedDir, fileNum, count, mismatchExample[fileNum],
+			"the boot index holds a different physical copy of these records than the recovery scan read"))
+	}
+	for fileNum, count := range missingCount {
+		faults = append(faults, walIndexScanDisagreementFault(sharedDir, fileNum, count, missingExample[fileNum],
+			"the boot index holds these records but the recovery scan did not read them from any WAL file"))
+	}
+
 	sort.Slice(recoveredMessages, func(i, j int) bool {
 		if recoveredMessages[i].QueueName != recoveredMessages[j].QueueName {
 			return recoveredMessages[i].QueueName < recoveredMessages[j].QueueName
@@ -1466,6 +1565,21 @@ func (wm *WALManager) RecoverFromWAL() ([]*RecoveryMessage, error) {
 		return recoveredMessages[i].Offset < recoveredMessages[j].Offset
 	})
 	return recoveredMessages, joinFaults(faults)
+}
+
+// walIndexScanDisagreementFault reports a disagreement between the two
+// readers of the same WAL bytes: the boot-time physical index and the
+// recovery scan.
+//
+// It is DEGRADED, not fatal: the disagreement is bounded and nameable (it is
+// counted and exemplified here), the rest of the directory is still
+// recovered, and the records that CAN be served still are.
+func walIndexScanDisagreementFault(sharedDir string, fileNum uint64, count int, example, what string) error {
+	path := filepath.Join(sharedDir, fmt.Sprintf("%020d%s", fileNum, WALFileExtension))
+	return interfaces.DegradedFault("wal-scan", path,
+		fmt.Sprintf("%d durable record(s) in this file are read differently by the boot index and the recovery scan: %s (first: %s)", count, what, example),
+		"the affected records are confirmed durable data whose recovery this boot cannot vouch for; every OTHER record in this file, and every record in every OTHER WAL file in the directory, is still recovered",
+		nil)
 }
 
 // classifyWALScanError turns a raw scan error into a classified fault. Errors
@@ -1496,22 +1610,13 @@ func classifyWALScanError(filePath string, err error) error {
 // an operator.
 //
 // BENIGN FAULTS ARE NOT RETURNED. "Benign" means "proceeds silently", and this
-// package's error returns are read by callers — performCheckpoint,
-
-// SetSegmentManager is a no-op stub retained for test compatibility.
-// Checkpoint copying has been removed (segstore v1); segments are drained
-// independently. This will be deleted in WI8.
-func (wm *WALManager) SetSegmentManager(sm *SegmentManager) {}
-
-// performCheckpoint is a no-op stub retained for test compatibility.
-// Checkpoint copying has been removed (segstore v1). This will be deleted in WI8.
-func (qw *QueueWAL) performCheckpoint() {} // forceCheckpointFile, and every existing test of RecoverFromWAL — as "did
-// something go wrong". Handing them a non-nil error for a torn tail, which is
-// the ordinary state of a WAL after any unclean shutdown, would make the
-// normal case look like a failure. The benign classification still exists and
-// is still produced at the site that knows the semantics; it simply has no
-// consumer inside storage, which has no logger. Plumbing benign faults to one
-// is logged for Step 7.
+// package's error returns are read by callers — every existing test of
+// RecoverFromWAL — as "did something go wrong". Handing them a non-nil error
+// for a torn tail, which is the ordinary state of a WAL after any unclean
+// shutdown, would make the normal case look like a failure. The benign
+// classification still exists and is still produced at the site that knows
+// the semantics; it simply has no consumer inside storage, which has no
+// logger. Plumbing benign faults to one is logged for Step 7.
 func joinFaults(faults []error) error {
 	gating := faults[:0:0]
 	for _, f := range faults {
@@ -1523,6 +1628,22 @@ func joinFaults(faults []error) error {
 		return nil
 	}
 	return errors.Join(gating...)
+}
+
+// SetSegmentManager is a no-op: the WAL no longer copies records into
+// segments, so there is nothing for it to hand over.
+//
+// Legacy no-op. Checkpoint copying was removed in segstore v1 (WI8); this stub exists only until the checkpoint-era tests are deleted. DELETE WITH THOSE TESTS.
+func (wm *WALManager) SetSegmentManager(sm *SegmentManager) {
+	// Legacy no-op. Checkpoint copying was removed in segstore v1 (WI8); this stub exists only until the checkpoint-era tests are deleted. DELETE WITH THOSE TESTS.
+}
+
+// performCheckpoint is a no-op: the WAL no longer copies records into
+// segments, so there is nothing to checkpoint.
+//
+// Legacy no-op. Checkpoint copying was removed in segstore v1 (WI8); this stub exists only until the checkpoint-era tests are deleted. DELETE WITH THOSE TESTS.
+func (qw *QueueWAL) performCheckpoint() {
+	// Legacy no-op. Checkpoint copying was removed in segstore v1 (WI8); this stub exists only until the checkpoint-era tests are deleted. DELETE WITH THOSE TESTS.
 }
 
 // walBlankRecordHeader reports whether an 8-byte record header is all zeros.
@@ -1594,6 +1715,41 @@ func walNothingIntelligibleFollows(f *os.File, from, limit int64) bool {
 	}
 }
 
+// walScanResult is what ONE WAL file's scan produced.
+//
+// IT EXISTS SO THAT A RECORD THE SCAN COULD NOT SERVE IS NEVER LOST
+// SILENTLY. A record that is durable, identified and yet unservable — a
+// body reference whose BodyBlock is missing, a payload this build cannot
+// interpret — is REPORTED (a classified fault) instead of being skipped by a
+// bare `continue`.
+type walScanResult struct {
+	// messages are the records the scan read AND could serve.
+	messages []*RecoveryMessage
+	// unloadable maps a record the scan IDENTIFIED but could not serve to
+	// the reason. It is what tells "the scan dropped a record the boot index
+	// knows" (a disagreement between two readers of the same bytes, which
+	// is a fault) apart from "the scan found the record and reported it as
+	// unloadable" (which the scan already reported).
+	unloadable map[recordKey]string
+	// faults are the classified faults the scan produced.
+	faults []error
+}
+
+// walScanCounter counts one class of unservable record in a file, so that a
+// file holding a MILLION unreadable records produces ONE fault instead of a
+// million of them.
+type walScanCounter struct {
+	count    int
+	examples []string
+}
+
+func (c *walScanCounter) add(example string) {
+	c.count++
+	if len(c.examples) < 3 {
+		c.examples = append(c.examples, example)
+	}
+}
+
 // scanWALFile scans a single WAL file and returns all messages. It is
 // scanWALFileUpTo with no bound (the file's real EOF).
 //
@@ -1607,6 +1763,9 @@ func walNothingIntelligibleFollows(f *os.File, from, limit int64) bool {
 //   - CRC failure with nothing intelligible after it -> BENIGN torn tail
 //   - a zero-filled region running to EOF                -> BENIGN torn tail
 //   - short read at the tail                             -> BENIGN torn tail
+//   - a durable record this build cannot interpret, or a body reference whose
+//     BodyBlock is missing -> DEGRADED: the record is confirmed durable data
+//     that this boot does not recover, and the operator is told
 //
 // WHY THE TORN TAIL IS BENIGN RATHER THAN DEGRADED (changed in Step 3-fix; it
 // was Degraded, which gated the boot). A partial trailing record was never
@@ -1617,7 +1776,8 @@ func walNothingIntelligibleFollows(f *os.File, from, limit int64) bool {
 // (ref-rabbitmq.md §1.6). Requiring --unsafe-recovery after a power loss makes
 // the safe path the annoying one, which is how operators end up running with
 // the flag permanently set. Degraded is reserved for the abandonment of data
-// that WAS confirmed — a quarantined unreadable file.
+// that WAS confirmed — a quarantined unreadable file, a record that could not
+// be loaded.
 //
 // It returns the messages it did parse ALONGSIDE any fault, so a degraded or
 // benign outcome keeps its partial data; only a fatal outcome discards it.
@@ -1627,12 +1787,40 @@ func (qw *QueueWAL) scanWALFile(filePath string) ([]*RecoveryMessage, error) {
 
 // scanWALFileUpTo scans a single WAL file up to limit bytes (-1 = whole
 // file). WS-C C1 §3.11: a rolled file whose tail holds a nacked partial batch
-// that could not be truncated (damagedTail) is checkpointed by scanning ONLY
-// [0, durableSize) — the garbage is never read and goes away with the unlink.
+// that could not be truncated (damagedTail) is scanned ONLY up to its durable
+// end — the garbage is never read and goes away with the unlink.
 // The bound is the scan's EOF: a record that would cross it is a torn tail
 // (benign), and walNothingIntelligibleFollows treats bytes beyond it as
 // ignorable.
 func (qw *QueueWAL) scanWALFileUpTo(filePath string, limit int64) ([]*RecoveryMessage, error) {
+	res, err := qw.scanWALFileDetailed(filePath, limit)
+	if err != nil {
+		return nil, err
+	}
+	return res.messages, joinScanFaults(res.faults)
+}
+
+// joinScanFaults joins the faults one file's scan produced. Unlike the
+// package's joinFaults it KEEPS the benign ones: they are the observable
+// proof that a torn tail was seen and classified, and the scan's own
+// contract is to report them.
+func joinScanFaults(faults []error) error {
+	if len(faults) == 0 {
+		return nil
+	}
+	return errors.Join(faults...)
+}
+
+// scanWALFileDetailed is the scan itself. It is scanWALFileUpTo plus the
+// bookkeeping recovery needs: which records were IDENTIFIED but could not be
+// served, and every fault the scan produced (not only the last one).
+//
+// A non-nil error means the file could not be interpreted at all (FATAL —
+// the file is quarantined and nothing is taken from it). Every other fault
+// is returned inside the result, ALONGSIDE the records the scan did read.
+func (qw *QueueWAL) scanWALFileDetailed(filePath string, limit int64) (*walScanResult, error) {
+	res := &walScanResult{unloadable: map[recordKey]string{}}
+
 	file, err := os.Open(filePath)
 	if err != nil {
 		return nil, err
@@ -1651,7 +1839,6 @@ func (qw *QueueWAL) scanWALFileUpTo(filePath string, limit int64) ([]*RecoveryMe
 	if limit >= 0 && fileSize > limit {
 		fileSize = limit
 	}
-	var scanFault error
 
 	// Detect the file-level header and start parsing records after it. ITER4 is a
 	// clean break: only v4 files are accepted; a non-v4 or headerless (pre-v4)
@@ -1690,6 +1877,11 @@ func (qw *QueueWAL) scanWALFileUpTo(filePath string, limit int64) ([]*RecoveryMe
 	bodyByOffset := map[uint64][]byte{}
 	recStart := dataStart
 
+	// The two classes of durable record the scan cannot serve. They are counted
+	// (not listed one by one) so that a file with a million of them produces one
+	// fault, not a million.
+	var unreadable, missingBlock walScanCounter
+
 	for {
 		// Read CRC (4) + length (4) + data (dataLen). io.ReadFull makes the byte
 		// accounting exact so recStart stays synchronized with the record grammar
@@ -1699,8 +1891,8 @@ func (qw *QueueWAL) scanWALFileUpTo(filePath string, limit int64) ([]*RecoveryMe
 		hdr := make([]byte, 8)
 		if _, err := io.ReadFull(reader, hdr); err != nil {
 			if errors.Is(err, io.ErrUnexpectedEOF) {
-				scanFault = interfaces.BenignFault("wal-scan", filePath,
-					fmt.Sprintf("truncated record header at byte offset %d; the trailing partial record was never fsynced, so no publisher was confirmed for it", recStart))
+				res.faults = append(res.faults, interfaces.BenignFault("wal-scan", filePath,
+					fmt.Sprintf("truncated record header at byte offset %d; the trailing partial record was never fsynced, so no publisher was confirmed for it", recStart)))
 			}
 			break
 		}
@@ -1711,8 +1903,8 @@ func (qw *QueueWAL) scanWALFileUpTo(filePath string, limit int64) ([]*RecoveryMe
 			// A zero region starting exactly on a record boundary. See
 			// walBlankRecordHeader: the write path cannot produce this.
 			if walNothingIntelligibleFollows(file, recStart, fileSize) {
-				scanFault = interfaces.BenignFault("wal-scan", filePath,
-					fmt.Sprintf("zero-filled tail from byte offset %d to end of file (%d bytes); those blocks never reached the platter, so nothing in them was ever fsynced or confirmed", recStart, fileSize-recStart))
+				res.faults = append(res.faults, interfaces.BenignFault("wal-scan", filePath,
+					fmt.Sprintf("zero-filled tail from byte offset %d to end of file (%d bytes); those blocks never reached the platter, so nothing in them was ever fsynced or confirmed", recStart, fileSize-recStart)))
 				break
 			}
 			return nil, interfaces.FatalFault("wal-scan", filePath,
@@ -1724,8 +1916,8 @@ func (qw *QueueWAL) scanWALFileUpTo(filePath string, limit int64) ([]*RecoveryMe
 		data := make([]byte, dataLen)
 		if _, err := io.ReadFull(reader, data); err != nil {
 			if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
-				scanFault = interfaces.BenignFault("wal-scan", filePath,
-					fmt.Sprintf("truncated record body at byte offset %d; the trailing partial record was never fsynced, so no publisher was confirmed for it", recStart))
+				res.faults = append(res.faults, interfaces.BenignFault("wal-scan", filePath,
+					fmt.Sprintf("truncated record body at byte offset %d; the trailing partial record was never fsynced, so no publisher was confirmed for it", recStart)))
 			}
 			break
 		}
@@ -1753,8 +1945,8 @@ func (qw *QueueWAL) scanWALFileUpTo(filePath string, limit int64) ([]*RecoveryMe
 				}
 				// TAIL. Drop this record only and stop; nothing intelligible
 				// follows it (Ra's is_last_record/3).
-				scanFault = interfaces.BenignFault("wal-scan", filePath,
-					fmt.Sprintf("the last intelligible record in this file (byte offset %d) failed its CRC32 check and nothing but zeros follows it — a torn write; it was never fsynced, so no publisher was confirmed for it", curRecStart))
+				res.faults = append(res.faults, interfaces.BenignFault("wal-scan", filePath,
+					fmt.Sprintf("the last intelligible record in this file (byte offset %d) failed its CRC32 check and nothing but zeros follows it — a torn write; it was never fsynced, so no publisher was confirmed for it", curRecStart)))
 				break
 			}
 		}
@@ -1799,22 +1991,59 @@ func (qw *QueueWAL) scanWALFileUpTo(filePath string, limit int64) ([]*RecoveryMe
 			bodyByOffset[uint64(curRecStart)] = body
 
 		default: // WALRecordTypeMessage
-			recoveryMsg, ok := deserializeMessagePayload(payload)
-			if !ok {
+			// THE SAME GRAMMAR THE BOOT INDEX USES (parseWalPayload). The
+			// index and the scan must agree about every record's queue name,
+			// delivery tag and body locator: when they did not, a record could
+			// be indexed but never scanned, and recovery dropped it silently.
+			layout := parseWalPayload(payload)
+			if !layout.ok {
+				// A DURABLE RECORD THIS BUILD CANNOT SERVE. It is not garbage:
+				// its bytes passed their CRC, so a publisher was confirmed for
+				// it. It is reported, never skipped in silence.
+				reason := "its payload is malformed"
+				if layout.newerFormat {
+					reason = "it was written in a format this build cannot interpret (the reserved continuation bit is set, or its body kind is unknown to this build)"
+				}
+				unreadable.add(fmt.Sprintf("byte offset %d", curRecStart))
+				_ = reason
 				continue
 			}
+			msg, mok := buildMessageFromLayout(payload, layout)
+			if !mok {
+				// The structural prefix parsed but the optional fields did
+				// not: the record is IDENTIFIED but not servable.
+				key := recordKey{queueName: layout.queueName, deliveryTag: layout.offset}
+				res.unloadable[key] = "its optional properties could not be read"
+				unreadable.add(fmt.Sprintf("%s/%d", key.queueName, key.deliveryTag))
+				continue
+			}
+			recoveryMsg := &RecoveryMessage{
+				QueueName: layout.queueName,
+				Offset:    layout.offset,
+				Message:   msg,
+			}
+			// A recovered message is a redelivery (a redelivery after a
+			// restart); the live positional read path clears that flag.
+			recoveryMsg.Message.Redelivered = true
 			recoveryMsg.pos = recordPos{segmentID: fileNum, position: curRecStart}
 			// Resolve a body reference against the per-file block map. On a hit,
 			// materialize Body and clear BodyRef so the recovered message is a
 			// self-contained inline message (checkpoint re-inlines it; segments
-			// never carry a reference). On a miss (a torn unit whose block was lost)
-			// skip the record defensively — at-least-once still holds because a
-			// torn-tail unit's fsync never completed, so the publisher never got a
-			// confirm and re-publish recreates it.
+			// never carry a reference).
+			//
+			// ON A MISS the record is NOT silently skipped any more. The old
+			// `continue` dropped a CONFIRMED durable message and reported the
+			// boot successful; worse, the boot index still held the record, so
+			// the file's inventory kept unacked > 0 and the file could never
+			// be reclaimed. The miss is now a classified fault: the operator
+			// is told that a durable record exists whose body does not.
 			if len(recoveryMsg.Message.BodyRef) == 8 {
 				loc := binary.BigEndian.Uint64(recoveryMsg.Message.BodyRef)
 				body, found := bodyByOffset[loc]
 				if !found {
+					key := recordKey{queueName: layout.queueName, deliveryTag: layout.offset}
+					res.unloadable[key] = "the body block it references is not in this file"
+					missingBlock.add(fmt.Sprintf("%s/%d", key.queueName, key.deliveryTag))
 					continue
 				}
 				recoveryMsg.Message.Body = body
@@ -1830,7 +2059,20 @@ func (qw *QueueWAL) scanWALFileUpTo(filePath string, limit int64) ([]*RecoveryMe
 
 	// EOF with a transaction still open: the Commit marker was never durable,
 	// so these operations are uncommitted and must not be applied.
-	return messages, scanFault
+	if unreadable.count > 0 {
+		res.faults = append(res.faults, interfaces.DegradedFault("wal-scan", filePath,
+			fmt.Sprintf("%d durable message record(s) in this file could not be interpreted by this build and are not recovered (first: %s)", unreadable.count, unreadable.examples[0]),
+			"every one of those records is confirmed durable data that this boot does not recover; every OTHER record in this file, and every record in every OTHER WAL file in the directory, is still recovered",
+			nil))
+	}
+	res.messages = messages
+	if missingBlock.count > 0 {
+		res.faults = append(res.faults, interfaces.DegradedFault("wal-scan", filePath,
+			fmt.Sprintf("%d durable message record(s) in this file reference a body block that is not in this file and are not recovered (first: %s)", missingBlock.count, missingBlock.examples[0]),
+			"every one of those records is confirmed durable data whose body this boot cannot find; their file also cannot be reclaimed while they are unacknowledged; every OTHER record in this file, and every record in every OTHER WAL file in the directory, is still recovered",
+			nil))
+	}
+	return res, nil
 }
 
 // createSharedWAL creates the single shared WAL for all queues
@@ -2241,11 +2483,22 @@ func (qw *QueueWAL) commitBatch(sb *stagedBatch) {
 		inv = newSegmentInventory(base)
 		qw.currentInv = inv
 	}
-	inv.durableBytes += int64(n)
+	inv.durableBytes.Add(int64(n))
+	qw.offsetIndexMutex.Lock()
+	// Register the batch's shared BodyBlocks BEFORE the records that reference
+	// them: addRecord looks a block up by position to seed its reference
+	// count, so the block must already be in the inventory when its reference
+	// record is indexed.
+	//
+	// The registration happens UNDER offsetIndexMutex because the readers that
+	// settle a record (Acknowledge/PurgeQueue -> markAck) look blocks up in
+	// the SAME map while holding only the read lock: a write outside the lock
+	// would race that read (concurrent map read and map write). No I/O happens
+	// under the lock - the bytes were written and fsynced above, so durability
+	// is unchanged and there is nothing to roll back.
 	for _, block := range sb.blocks {
 		inv.addBlock(base+block.relPos, block.bytes)
 	}
-	qw.offsetIndexMutex.Lock()
 	for i, req := range sb.reqs {
 		if sb.relPos[i] < 0 {
 			continue
@@ -2941,66 +3194,57 @@ func deserializeMessagePayload(payload []byte) (*RecoveryMessage, bool) {
 // bounds, so a torn tail (the record already passed CRC, so this is defensive) is
 // skipped cleanly. The body is aliased zero-copy into the CRC-checked payload, as
 // before. It does NOT set Redelivered (the caller decides).
+//
+// THE STRUCTURAL PREFIX IS WALKED BY parseWalPayload — THE SAME WALK the
+// boot-time physical index uses. The two used to be SEPARATE grammars that
+// could disagree about the very fields that identify a record:
+//
+//   - parseWalPayload ignored the reserved continuation bit and accepted ANY
+//     body kind, while this decoder refused both.
+//   - A record in that class was therefore INDEXED (the boot index held its
+//     key and its position) but never SCANNED, so the recovery scan produced
+//     no copy of it and RecoverFromWAL dropped a CONFIRMED DURABLE RECORD
+//     without a word — the `continue` on the index/scan position mismatch was
+//     silent.
+//
+// One walk, one answer: the queue name, the delivery tag, the body kind and
+// the body locator now come from the same code for both readers, so the two
+// cannot disagree about them. What this decoder adds on top of the shared
+// walk is the part the index does not need: the full protocol.Message,
+// including the optional fields that follow the structural prefix.
 func parseMessagePayload(payload []byte) (queueName string, offset uint64, m *protocol.Message, ok bool) {
-	pos := 0
-	if pos+2 > len(payload) {
+	layout := parseWalPayload(payload)
+	if !layout.ok {
 		return "", 0, nil, false
 	}
-	flags := binary.BigEndian.Uint16(payload[pos : pos+2])
-	pos += 2
-	// A set continuation bit means a future format wrote a second flags word this
-	// build does not understand — refuse rather than misparse.
-	if flags&msgFlagContinuation != 0 {
+	msg, ok := buildMessageFromLayout(payload, layout)
+	if !ok {
 		return "", 0, nil, false
 	}
+	return layout.queueName, layout.offset, msg, true
+}
 
-	qn, pos, ok := readShort(payload, pos)
-	if !ok {
-		return "", 0, nil, false
-	}
-	if pos+8 > len(payload) {
-		return "", 0, nil, false
-	}
-	off := binary.BigEndian.Uint64(payload[pos : pos+8])
-	pos += 8
-	exchange, pos, ok := readShort(payload, pos)
-	if !ok {
-		return "", 0, nil, false
-	}
-	routingKey, pos, ok := readShort(payload, pos)
-	if !ok {
-		return "", 0, nil, false
-	}
-	if pos+1 > len(payload) {
-		return "", 0, nil, false
-	}
-	deliveryMode := payload[pos]
-	pos++
-	if pos+1 > len(payload) {
-		return "", 0, nil, false
-	}
-	bodyKind := payload[pos]
-	pos++
-
+// buildMessageFromLayout builds the protocol.Message of a v4 message record
+// from a structural prefix THAT HAS ALREADY BEEN WALKED, plus the optional
+// fields that follow it.
+//
+// It is the second half of parseMessagePayload, split out so that the
+// recovery scan can walk the structural prefix ONCE (with the same walk the
+// boot index uses) and then build the message from it, instead of walking
+// the same bytes twice through two grammars.
+func buildMessageFromLayout(payload []byte, layout walPayloadLayout) (*protocol.Message, bool) {
+	ok := true
 	msg := &protocol.Message{
-		Exchange:     exchange,
-		RoutingKey:   routingKey,
-		DeliveryMode: deliveryMode,
-		DeliveryTag:  off,
+		Exchange:     layout.exchange,
+		RoutingKey:   layout.routingKey,
+		DeliveryMode: layout.deliveryMode,
+		DeliveryTag:  layout.offset,
 	}
 
-	switch bodyKind {
+	switch layout.bodyKind {
 	case bodyKindInline:
-		if pos+4 > len(payload) {
-			return "", 0, nil, false
-		}
-		bodyLen := binary.BigEndian.Uint32(payload[pos : pos+4])
-		pos += 4
-		if int(bodyLen) < 0 || pos+int(bodyLen) > len(payload) {
-			return "", 0, nil, false
-		}
-		msg.Body = payload[pos : pos+int(bodyLen)] // zero-copy alias into CRC-checked payload
-		pos += int(bodyLen)
+		// The body is aliased zero-copy into the CRC-checked payload.
+		msg.Body = payload[layout.bodyOff : layout.bodyOff+layout.bodyLen]
 	case bodyKindReference:
 		// ITER5 seam. Read the opaque locator into msg.BodyRef and FALL THROUGH to
 		// parse the optional fields exactly like the inline arm, returning ok=true
@@ -3010,39 +3254,31 @@ func parseMessagePayload(payload []byte) (queueName string, offset uint64, m *pr
 		// resolves it with a second ReadAt against the co-located BodyBlock. This is
 		// forward-only and safe — no shipped build emits a 0x01 arm, so the ok=true
 		// behavior is observable only for ITER5-written files.
-		if pos+2 > len(payload) {
-			return "", 0, nil, false
-		}
-		refLen := binary.BigEndian.Uint16(payload[pos : pos+2])
-		pos += 2
-		if pos+int(refLen) > len(payload) {
-			return "", 0, nil, false
-		}
-		msg.BodyRef = payload[pos : pos+int(refLen)]
-		pos += int(refLen)
-	default:
-		return "", 0, nil, false // unknown body kind
+		msg.BodyRef = payload[layout.locatorOff : layout.locatorOff+layout.refLen]
 	}
+
+	pos := layout.end
+	flags := layout.flags
 
 	// Optional fields in the same canonical order appendMessagePayload writes them.
 	if flags&msgFlagContentType != 0 {
 		if msg.ContentType, pos, ok = readShort(payload, pos); !ok {
-			return "", 0, nil, false
+			return nil, false
 		}
 	}
 	if flags&msgFlagContentEncoding != 0 {
 		if msg.ContentEncoding, pos, ok = readShort(payload, pos); !ok {
-			return "", 0, nil, false
+			return nil, false
 		}
 	}
 	if flags&msgFlagHeaders != 0 {
 		if pos+4 > len(payload) {
-			return "", 0, nil, false
+			return nil, false
 		}
 		tblLen := int(binary.BigEndian.Uint32(payload[pos : pos+4]))
 		end := pos + 4 + tblLen
 		if tblLen < 0 || end > len(payload) {
-			return "", 0, nil, false
+			return nil, false
 		}
 		// An empty decoded table normalizes to nil Headers so a headers-less
 		// message reconstructs identically regardless of how it was written.
@@ -3053,67 +3289,67 @@ func parseMessagePayload(payload []byte) (queueName string, offset uint64, m *pr
 	}
 	if flags&msgFlagPriority != 0 {
 		if pos+1 > len(payload) {
-			return "", 0, nil, false
+			return nil, false
 		}
 		msg.Priority = payload[pos]
 		pos++
 	}
 	if flags&msgFlagCorrelationID != 0 {
 		if msg.CorrelationID, pos, ok = readShort(payload, pos); !ok {
-			return "", 0, nil, false
+			return nil, false
 		}
 	}
 	if flags&msgFlagReplyTo != 0 {
 		if msg.ReplyTo, pos, ok = readShort(payload, pos); !ok {
-			return "", 0, nil, false
+			return nil, false
 		}
 	}
 	if flags&msgFlagExpiration != 0 {
 		if msg.Expiration, pos, ok = readShort(payload, pos); !ok {
-			return "", 0, nil, false
+			return nil, false
 		}
 	}
 	if flags&msgFlagMessageID != 0 {
 		if msg.MessageID, pos, ok = readShort(payload, pos); !ok {
-			return "", 0, nil, false
+			return nil, false
 		}
 	}
 	if flags&msgFlagTimestamp != 0 {
 		if pos+8 > len(payload) {
-			return "", 0, nil, false
+			return nil, false
 		}
 		msg.Timestamp = binary.BigEndian.Uint64(payload[pos : pos+8])
 		pos += 8
 	}
 	if flags&msgFlagType != 0 {
 		if msg.Type, pos, ok = readShort(payload, pos); !ok {
-			return "", 0, nil, false
+			return nil, false
 		}
 	}
 	if flags&msgFlagUserID != 0 {
 		if msg.UserID, pos, ok = readShort(payload, pos); !ok {
-			return "", 0, nil, false
+			return nil, false
 		}
 	}
 	if flags&msgFlagAppID != 0 {
 		if msg.AppID, pos, ok = readShort(payload, pos); !ok {
-			return "", 0, nil, false
+			return nil, false
 		}
 	}
 	if flags&msgFlagClusterID != 0 {
 		if msg.ClusterID, pos, ok = readShort(payload, pos); !ok {
-			return "", 0, nil, false
+			return nil, false
 		}
 	}
 	if flags&msgFlagEnqueue != 0 {
 		if pos+8 > len(payload) {
-			return "", 0, nil, false
+			return nil, false
 		}
 		msg.EnqueueUnixMilli = int64(binary.BigEndian.Uint64(payload[pos : pos+8]))
 		pos += 8
 	}
 
-	return qn, off, msg, true
+	return msg, true
 }
 
 // readShort reads a shortstr (u8 length prefix + bytes) from payload at pos,

@@ -42,7 +42,11 @@ func TestSegstoreCacheMissReadsThrough(t *testing.T) {
 	assert.Equal(t, msg.Body, got.Body)
 	count, err := ds.GetQueueMessageCount(queue)
 	require.NoError(t, err)
-	assert.Equal(t, 1, count, "a successful disk read should be admitted to the hot cache")
+	// The hot cache holds PUBLISHED, hot-resident messages only. A cold read
+	// serves the durable record but must not change the reported count: the
+	// TTL reaper probes every ready tag on every sweep, and a probe that
+	// inflated the count would make the reaper see phantom queued messages.
+	assert.Zero(t, count, "a cold read must not change the reported message count")
 }
 
 func TestSegstoreTransientAdmissionFailure(t *testing.T) {
@@ -74,7 +78,7 @@ func TestSegstoreOversizedDurableDiskOnly(t *testing.T) {
 	assert.Equal(t, msg.Body, got.Body)
 }
 
-func TestSegstoreAckInvalidatesColdRepopulated(t *testing.T) {
+func TestSegstoreAckInvalidatesAfterColdRead(t *testing.T) {
 	ds := newSegstoreCacheTestStorage(t, 16*1024*1024, 256*1024*1024)
 	const queue, tag = "cold-repopulated", uint64(1)
 	msg := &protocol.Message{DeliveryTag: tag, DeliveryMode: 2, Body: []byte("cold-body")}
@@ -85,12 +89,15 @@ func TestSegstoreAckInvalidatesColdRepopulated(t *testing.T) {
 	require.NoError(t, err)
 	count, err := ds.GetQueueMessageCount(queue)
 	require.NoError(t, err)
-	require.Equal(t, 1, count, "test premise: cold read repopulates the hot cache")
+	require.Zero(t, count, "a cold read must not repopulate the hot cache")
 
 	require.NoError(t, ds.DeleteMessage(queue, tag))
 	count, err = ds.GetQueueMessageCount(queue)
 	require.NoError(t, err)
-	assert.Zero(t, count, "ack must invalidate an entry admitted by a cold read")
+	assert.Zero(t, count, "the ack must leave the count at zero")
+	// The guard: an acknowledgement that lands AFTER the tier read must make
+	// the record unservable. The re-check consults the WAL directly, so it
+	// holds whether or not the read was cached.
 	_, err = ds.GetMessage(queue, tag)
 	assert.ErrorIs(t, err, interfaces.ErrMessageNotFound)
 }

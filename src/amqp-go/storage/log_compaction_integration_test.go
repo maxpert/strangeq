@@ -359,6 +359,17 @@ func TestLogCompaction_LargeOffsetLifecycle(t *testing.T) {
 
 // TestLogCompaction_TierFallback verifies the three-tier read path:
 // Ring Buffer → WAL → Segments
+// TestLogCompaction_TierFallback walks the three read tiers: the hot cache,
+// the WAL, and the legacy segment tier.
+//
+// SEGSTORE V1 RE-POINT. Tier 3 used to be produced by the CHECKPOINT: the
+// record was copied into a segment and the WAL copy was then removed from the
+// index, so the read had to fall back to the segment tier. Checkpoint copying
+// is gone — nothing moves records out of the WAL — so the segment tier now
+// holds only LEGACY records: the ones a broker finds on disk after it upgrades
+// from the checkpointing build. The tier-3 copy is therefore written as a
+// legacy segment record instead, and the three tiers are still walked in the
+// same order against the same delivery tag.
 func TestLogCompaction_TierFallback(t *testing.T) {
 	tmpDir := t.TempDir()
 
@@ -369,14 +380,7 @@ func TestLogCompaction_TierFallback(t *testing.T) {
 		WALChannelBuffer:  5000,
 	}
 
-	ds, err := NewDisruptorStorageWithEngineConfig(tmpDir, engineCfg)
-	require.NoError(t, err)
-	require.NotNil(t, ds)
-
 	queue := "tier_test"
-	_ = ds.getOrCreateQueueHot(queue)
-
-	// Write a durable message
 	msg := &protocol.Message{
 		Exchange:     "test",
 		RoutingKey:   queue,
@@ -384,6 +388,24 @@ func TestLogCompaction_TierFallback(t *testing.T) {
 		DeliveryMode: 2,
 		DeliveryTag:  42,
 	}
+
+	// The legacy segment copy of the SAME record — the only way the segment
+	// tier holds anything now. It is written before the storage opens the
+	// directory, exactly as a broker finds it at boot.
+	writeLegacyFixture(t, tmpDir, queue, &RecoveryMessage{
+		QueueName: queue,
+		Offset:    42,
+		Message:   msg,
+	})
+
+	ds, err := NewDisruptorStorageWithEngineConfig(tmpDir, engineCfg)
+	require.NoError(t, err)
+	require.NotNil(t, ds)
+	defer func() { _ = ds.Close() }()
+
+	_ = ds.getOrCreateQueueHot(queue)
+
+	// Write a durable message
 	err = ds.StoreMessage(queue, msg)
 	require.NoError(t, err)
 	time.Sleep(50 * time.Millisecond)
@@ -401,11 +423,10 @@ func TestLogCompaction_TierFallback(t *testing.T) {
 	require.NoError(t, err, "should fall back to WAL when not in ring buffer")
 	assert.Equal(t, []byte("tier-fallback-message"), readMsg.Body)
 
-	// Force WAL roll and checkpoint to push to segments
-	ds.wal.sharedWAL.fileMutex.Lock()
-	ds.wal.sharedWAL.rollFile()
-	ds.wal.sharedWAL.fileMutex.Unlock()
-	ds.wal.sharedWAL.performCheckpoint()
+	// The segment tier learns the queue the way it does at boot: the legacy
+	// directory is attributed and opened by the recovery pass.
+	_, err = ds.segments.RecoverFromSegments()
+	require.NoError(t, err)
 
 	// Remove from WAL offset index to force segment fallback
 	ds.wal.sharedWAL.offsetIndexMutex.Lock()
@@ -417,6 +438,4 @@ func TestLogCompaction_TierFallback(t *testing.T) {
 	readMsg, err = ds.GetMessage(queue, 42)
 	require.NoError(t, err, "should fall back to segments when not in ring buffer or WAL")
 	assert.Equal(t, []byte("tier-fallback-message"), readMsg.Body)
-
-	ds.Close()
 }

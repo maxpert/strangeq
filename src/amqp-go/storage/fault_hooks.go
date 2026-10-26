@@ -1,7 +1,6 @@
 package storage
 
 import (
-	"errors"
 	"fmt"
 	"os"
 	"sync/atomic"
@@ -332,13 +331,13 @@ func SetSyncDirForTest(fn func(dir string) error) (restore func()) {
 
 // --- WAL unlink ------------------------------------------------------------
 
-// walUnlinkFn is the signature of the WAL file unlink performed after its
-// records are durably checkpointed to segments.
+// walUnlinkFn is the signature of the WAL file unlink performed by the
+// reclaim sweep, once every record the file holds is acknowledged.
 type walUnlinkFn func(path string) error
 
 var walUnlinkHook atomic.Pointer[walUnlinkFn]
 
-// walUnlink unlinks a checkpointed WAL file through the hookable seam.
+// walUnlink unlinks a fully acknowledged WAL file through the hookable seam.
 // Default: os.Remove.
 func walUnlink(path string) error {
 	if p := walUnlinkHook.Load(); p != nil {
@@ -348,21 +347,20 @@ func walUnlink(path string) error {
 }
 
 // SetCheckpointUnlinkForTest installs fn as the unlink performed on a WAL
-// file whose records are durably checkpointed. TEST-ONLY: the hook runs after
-// every CheckpointBatch succeeded and before the unlink, so a test can block
-// in it (to inspect state) or return an error to simulate a crash or an
-// unlink failure at exactly that point.
+// file whose every record is acknowledged. TEST-ONLY: the hook runs before
+// the unlink, so a test can block in it (to inspect state) or return an error
+// to simulate an unlink failure at exactly that point.
+//
+// THE NAME IS LEGACY: it says "checkpoint" because the unlink used to
+// follow a checkpoint copy into the segments. Checkpoint copying was removed
+// in segstore v1 (WI8) and the unlink now follows the reclaim sweep.
+// RENAME IT WHEN THE CHECKPOINT-ERA TESTS ARE DELETED.
 func SetCheckpointUnlinkForTest(fn func(path string) error) (restore func()) {
 	prev := walUnlinkHook.Load()
 	f := walUnlinkFn(fn)
 	walUnlinkHook.Store(&f)
 	return func() { walUnlinkHook.Store(prev) }
 }
-
-// errNoSegmentManager is returned by forceCheckpointFile when an expired WAL
-// file still holds unacknowledged records but no segment manager is wired:
-// deleting it would destroy the only copy, so retention must keep it.
-var errNoSegmentManager = errors.New("storage: no segment manager; cannot checkpoint unacked records")
 
 // --- WAL compaction fsync -------------------------------------------------
 

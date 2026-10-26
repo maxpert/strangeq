@@ -708,6 +708,20 @@ func segSealCount(t *testing.T, sm *SegmentManager, queueName string) int {
 	return len(qs.sealedSegments)
 }
 
+// segSealCountNow reports the sealed-segment count WITHOUT failing the test.
+// It is safe to call from a helper goroutine (require.* must not run off the
+// test goroutine, because it calls t.FailNow).
+func segSealCountNow(sm *SegmentManager, queueName string) int {
+	val, ok := sm.queueSegments.Load(queueName)
+	if !ok {
+		return 0
+	}
+	qs := val.(*QueueSegments)
+	qs.sealedMutex.RLock()
+	defer qs.sealedMutex.RUnlock()
+	return len(qs.sealedSegments)
+}
+
 // TestSegmentSeal_HandleSwapIsAtomicUnderTheSegmentLock gates half (b) of
 // review-4 B-3 — the half the fixture above does NOT detect (arm B).
 //
@@ -745,6 +759,10 @@ func TestSegmentSeal_HandleSwapIsAtomicUnderTheSegmentLock(t *testing.T) {
 	// the reverted sealer instead of a handful of hits in 300K reads.
 	const duration = 3 * time.Second
 	const minSeals = 100
+	// How long the run may be EXTENDED, past `duration`, to reach the
+	// minSeals premise on a loaded machine. The test still races for the
+	// whole of this window; only the stop condition moves.
+	const sealPremiseHardCap = 30 * time.Second
 
 	dataDir := t.TempDir()
 	cfg := segTestConfig()
@@ -824,6 +842,25 @@ func TestSegmentSeal_HandleSwapIsAtomicUnderTheSegmentLock(t *testing.T) {
 	}
 
 	time.Sleep(duration)
+	// The PREMISE of this test is "enough seals happened", NOT "the machine was
+	// idle". A loaded CI box seals fewer than minSeals times in `duration`, and
+	// failing the premise there would fail the suite without exercising the
+	// race at all. So the run CONTINUES past `duration` until the premise
+	// actually holds, bounded by a hard cap so a genuinely broken sealer can
+	// never hang the suite.
+	runOver := make(chan struct{})
+	go func() {
+		defer close(runOver)
+		cap := time.Now().Add(sealPremiseHardCap)
+		for time.Now().Before(cap) {
+			if segSealCountNow(sm, queueName) >= minSeals {
+				return
+			}
+			time.Sleep(20 * time.Millisecond)
+		}
+		stop.Store(true)
+	}()
+	<-runOver
 	stop.Store(true)
 	wg.Wait()
 

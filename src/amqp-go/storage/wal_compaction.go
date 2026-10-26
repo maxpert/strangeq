@@ -166,7 +166,7 @@ func (qw *QueueWAL) compactOldFile(fileNum uint64) error {
 	if threshold <= 0 {
 		threshold = DefaultWALCompactionThreshold
 	}
-	if !(float64(inv.deadBytes.Load()) > threshold*float64(inv.durableBytes)) {
+	if !(float64(inv.deadBytes.Load()) > threshold*float64(inv.durableBytes.Load())) {
 		return nil
 	}
 	// Claim the attempt with a compare-and-swap, so two concurrent
@@ -362,7 +362,7 @@ func (qw *QueueWAL) compactOldFile(fileNum uint64) error {
 
 	// Publish the new layout. The bytes on disk have already changed, so the
 	// index MUST describe the new layout even if the directory fsync failed.
-	newInv.durableBytes = writeOff
+	newInv.durableBytes.Store(writeOff)
 	info.inv = newInv
 	info.durableSize = writeOff
 	info.damagedTail = false

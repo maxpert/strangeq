@@ -977,6 +977,19 @@ func (qs *QueueSegments) batchAckLoop() {
 // acknowledgeInSegment settles every physical duplicate. Each lookup and
 // markAck runs under that SegmentFile's read lock, so a queued ACK re-resolves
 // the current post-compaction inventory instead of using a saved position.
+//
+// THE COST OF ONE ACK. The lookup resolves the tag through the inventory's
+// TAG INDEX, so it visits the copies of that one tag and not the records of
+// the segment. It used to walk every record of the segment under that
+// segment's read lock - ~200k records at a 64 MiB segment - which blocked
+// reads and compaction of the segment for the whole walk.
+//
+// A SEGMENT WITHOUT AN INVENTORY settles nothing. The old code advanced
+// seg.deletedCount by one in that case, without settling anything, so the
+// legacy counter and inv.deadBytes/inv.unacked disagreed about how much of
+// the segment was dead. recordsForTag handles a nil inventory by returning
+// nothing, so the counters now agree: nothing is settled and nothing is
+// counted.
 func (qs *QueueSegments) acknowledgeInSegment(offset uint64) bool {
 	won := false
 	ackSegment := func(seg *SegmentFile) {
@@ -985,16 +998,11 @@ func (qs *QueueSegments) acknowledgeInSegment(offset uint64) bool {
 		}
 		seg.mutex.RLock()
 		settled := 0
-		if seg.inv != nil {
-			for _, r := range seg.inv.records {
-				if r.deliveryTag == offset && r.markAck() {
-					won = true
-					settled++
-				}
+		for _, r := range seg.inv.recordsForTag(offset) {
+			if r.markAck() {
+				won = true
+				settled++
 			}
-		} else if _, exists := seg.index[offset]; exists {
-			// Compatibility for synthetic legacy fixtures without an inventory.
-			settled = 1
 		}
 		seg.mutex.RUnlock()
 		if settled > 0 {
@@ -1019,6 +1027,17 @@ func (qs *QueueSegments) acknowledgeInSegment(offset uint64) bool {
 
 // PurgeQueue synchronously acknowledges every legacy physical copy in the
 // inclusive tag band and returns newly settled logical tags exactly once.
+//
+// THE COST OF A PURGE. The band is collected in ONE pass over each segment's
+// tag index, and each tag in the band is then settled through that same
+// index, so a purge of k tags over n records costs O(n + k) and not O(n*k).
+// It used to collect the band with a full pass over every record and then
+// call applyAck per tag, and each applyAck walked every segment again: the
+// same segment was walked k+1 times per purge, under its read lock.
+//
+// Every copy of a tag is settled (applyAck resolves the copies of the tag in
+// every segment), and a tag is returned only if this purge won at least one
+// of them, so the returned list is unique and sorted.
 func (sm *SegmentManager) PurgeQueue(queueName string, minTag, maxTag uint64) []uint64 {
 	if minTag > maxTag {
 		return nil
@@ -1034,12 +1053,8 @@ func (sm *SegmentManager) PurgeQueue(queueName string, minTag, maxTag uint64) []
 			return
 		}
 		seg.mutex.RLock()
-		if seg.inv != nil {
-			for _, record := range seg.inv.records {
-				if record.deliveryTag >= minTag && record.deliveryTag <= maxTag {
-					tags[record.deliveryTag] = struct{}{}
-				}
-			}
+		for _, tag := range seg.inv.tagsInBand(minTag, maxTag) {
+			tags[tag] = struct{}{}
 		}
 		seg.mutex.RUnlock()
 	}
@@ -1474,7 +1489,7 @@ func (qs *QueueSegments) createSegmentFileLocked() (*SegmentFile, *SegmentIndex,
 			path:       path,
 			file:       f,
 			index:      make(map[uint64]int64),
-			inv:        newSegmentInventory(0),
+			inv:        newSegmentInventoryWithTagIndex(0),
 		}, &SegmentIndex{entries: make(map[uint64]int64)}, nil
 	}
 	return nil, nil, fmt.Errorf("could not create a segment file in %s: 16 consecutive name collisions", qs.dataDir)
@@ -1627,9 +1642,9 @@ func (qs *QueueSegments) tryCompaction() {
 		if segment.compactionBlocked.Load() {
 			continue
 		}
-		if segment.inv != nil && segment.inv.valid && segment.inv.durableBytes > 0 {
+		if segment.inv != nil && segment.inv.valid && segment.inv.durableBytes.Load() > 0 {
 			fullyAcked := segment.inv.unacked.Load() == 0
-			deletionRatio := float64(segment.inv.deadBytes.Load()) / float64(segment.inv.durableBytes)
+			deletionRatio := float64(segment.inv.deadBytes.Load()) / float64(segment.inv.durableBytes.Load())
 			if fullyAcked || deletionRatio > qs.cfg.CompactionThreshold {
 				segmentsToCompact = append(segmentsToCompact, segment)
 			}
@@ -1770,7 +1785,10 @@ func (qs *QueueSegments) compactSegment(segment *SegmentFile) error {
 
 	// Write non-deleted messages to new segment
 	newIndex := make(map[uint64]int64)
-	newInv := newSegmentInventory(0)
+	// The compacted segment's inventory carries the tag index too: it is
+	// rebuilt through the same addRecord path, so a segment that has been
+	// compacted resolves an ACK through the index like any other.
+	newInv := newSegmentInventoryWithTagIndex(0)
 	var newPosition int64
 	var copyErr error
 
@@ -1867,7 +1885,7 @@ func (qs *QueueSegments) compactSegment(segment *SegmentFile) error {
 			}
 		}
 	}
-	newInv.durableBytes = newPosition
+	newInv.durableBytes.Store(newPosition)
 	segment.inv = newInv
 	segment.messageCount.Store(uint64(len(newIndex)))
 	segment.deletedCount.Store(0)
@@ -2034,7 +2052,7 @@ func (qs *QueueSegments) loadSegmentFile(segmentNum uint64, segPath string) erro
 	fileSize := stat.Size()
 
 	index := make(map[uint64]int64)
-	inv := newSegmentInventory(fileSize)
+	inv := newSegmentInventoryWithTagIndex(fileSize)
 	var minOffset, maxOffset uint64
 	var messageCount uint64
 	var pos int64

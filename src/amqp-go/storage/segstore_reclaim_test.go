@@ -283,7 +283,7 @@ func TestLegacySegmentCompactionUsesDeadBytes(t *testing.T) {
 		seg.messageCount.Store(0)
 		seg.deletedCount.Store(0)
 		before := seg.fileSize.Load()
-		require.Greater(t, float64(seg.inv.deadBytes.Load()), 0.5*float64(seg.inv.durableBytes))
+		require.Greater(t, float64(seg.inv.deadBytes.Load()), 0.5*float64(seg.inv.durableBytes.Load()))
 
 		qs.tryCompaction()
 		require.Less(t, seg.fileSize.Load(), before)
@@ -312,7 +312,7 @@ func TestLegacySegmentCompactionUsesDeadBytes(t *testing.T) {
 		seg.messageCount.Store(3)
 		seg.deletedCount.Store(2)
 		before := seg.fileSize.Load()
-		require.Less(t, float64(seg.inv.deadBytes.Load()), 0.5*float64(seg.inv.durableBytes))
+		require.Less(t, float64(seg.inv.deadBytes.Load()), 0.5*float64(seg.inv.durableBytes.Load()))
 
 		qs.tryCompaction()
 		require.Equal(t, before, seg.fileSize.Load())
