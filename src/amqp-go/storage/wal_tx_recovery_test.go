@@ -117,7 +117,6 @@ func TestWALRecovery_LargeBodyCrashBitIdentity(t *testing.T) {
 // across a crash. With v2 markers the scanner buffers records after a Begin and
 // only emits them on a matching Commit, so a Begin-without-Commit is dropped.
 func TestWALRecovery_IgnoresUncommittedTransaction(t *testing.T) {
-	t.Skip("pre-existing segstore regression, tracked separately")
 	dir := t.TempDir()
 
 	wm, err := NewWALManager(dir)
