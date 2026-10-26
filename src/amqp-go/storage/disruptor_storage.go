@@ -32,12 +32,7 @@ type DisruptorStorage struct {
 	queues   sync.Map
 	queuesMu sync.Mutex
 
-	ringBufferSize int
-	spillThreshold uint64
-
-	// Hot cache (segstore v1) — byte-bounded, replaces ring buffer in WI2/WI3
-	hotCacheQueueBytes  int64
-	hotCacheGlobalBytes int64
+	hot           *hotCache
 	metadataStore *PersistentMetadataStore
 	wal           *WALManager
 	segments      *SegmentManager
@@ -94,12 +89,10 @@ type DisruptorStorage struct {
 	dataDir string
 }
 
-type QueueRing struct {
-	name      string
-	ring      *AtomicRing
-	ack       *AckCursor
-	readAhead *readAheadBuffer
-	closed    atomic.Bool
+type QueueHot struct {
+	name   string
+	ack    *AckCursor
+	closed atomic.Bool
 }
 
 func NewDisruptorStorage() (*DisruptorStorage, error) {
@@ -179,28 +172,6 @@ func NewDisruptorStorageWithEngineConfig(dataDir string, engineCfg interfaces.En
 	}
 	dataDir = abs
 
-	ringBufferSize := engineCfg.RingBufferSize
-	if ringBufferSize <= 0 {
-		ringBufferSize = DefaultRingBufferSize
-	}
-	spillPercent := engineCfg.SpillThresholdPercent
-	if spillPercent <= 0 {
-		spillPercent = DefaultSpillThresholdPercent
-	}
-
-	// Round up to power of two (segstore v1: retain legacy ring as depth-HWM input)
-	if ringBufferSize > 0 && (ringBufferSize&(ringBufferSize-1)) != 0 {
-		// round up
-		ringBufferSize--
-		ringBufferSize |= ringBufferSize >> 1
-		ringBufferSize |= ringBufferSize >> 2
-		ringBufferSize |= ringBufferSize >> 4
-		ringBufferSize |= ringBufferSize >> 8
-		ringBufferSize |= ringBufferSize >> 16
-		ringBufferSize++
-	}
-
-	// Hot cache config (segstore v1) — stored for WI2
 	hotCacheQueueBytes := engineCfg.HotCacheQueueBytes
 	if hotCacheQueueBytes <= 0 {
 		hotCacheQueueBytes = 16 * 1024 * 1024 // 16 MiB
@@ -227,20 +198,13 @@ func NewDisruptorStorageWithEngineConfig(dataDir string, engineCfg interfaces.En
 		return nil, fmt.Errorf("failed to create segment manager: %w", err)
 	}
 
-	if walManager != nil && segmentManager != nil {
-		walManager.SetSegmentManager(segmentManager)
-	}
-
 	return &DisruptorStorage{
-		ringBufferSize:      ringBufferSize,
-		spillThreshold:      uint64(ringBufferSize) * uint64(spillPercent) / 100,
-		hotCacheQueueBytes:  hotCacheQueueBytes,
-		hotCacheGlobalBytes: hotCacheGlobalBytes,
-		metadataStore:       metadataStore,
-		wal:                 walManager,
-		segments:            segmentManager,
-		transactions:        make(map[string]*interfaces.Transaction),
-		dataDir:             dataDir,
+		hot:           newHotCache(hotCacheQueueBytes, hotCacheGlobalBytes),
+		metadataStore: metadataStore,
+		wal:           walManager,
+		segments:      segmentManager,
+		transactions:  make(map[string]*interfaces.Transaction),
+		dataDir:       dataDir,
 	}, nil
 }
 
@@ -254,30 +218,28 @@ func (ds *DisruptorStorage) SetMetrics(metrics StorageMetrics) {
 	}
 }
 
-func (ds *DisruptorStorage) getQueueRing(queueName string) *QueueRing {
+func (ds *DisruptorStorage) getQueueHot(queueName string) *QueueHot {
 	if val, ok := ds.queues.Load(queueName); ok {
-		return val.(*QueueRing)
+		return val.(*QueueHot)
 	}
 	return nil
 }
 
-func (ds *DisruptorStorage) getOrCreateQueueRing(queueName string) *QueueRing {
+func (ds *DisruptorStorage) getOrCreateQueueHot(queueName string) *QueueHot {
 	if ring, ok := ds.queues.Load(queueName); ok {
-		return ring.(*QueueRing)
+		return ring.(*QueueHot)
 	}
 
 	ds.queuesMu.Lock()
 	defer ds.queuesMu.Unlock()
 
 	if ring, ok := ds.queues.Load(queueName); ok {
-		return ring.(*QueueRing)
+		return ring.(*QueueHot)
 	}
 
-	ring := &QueueRing{
-		name:      queueName,
-		ring:      NewAtomicRing(ds.ringBufferSize),
-		ack:       NewAckCursor(),
-		readAhead: newReadAheadBuffer(),
+	ring := &QueueHot{
+		name: queueName,
+		ack:  NewAckCursor(),
 	}
 
 	ds.queues.Store(queueName, ring)
@@ -285,21 +247,10 @@ func (ds *DisruptorStorage) getOrCreateQueueRing(queueName string) *QueueRing {
 }
 
 func (ds *DisruptorStorage) LoadMessageFromRecovery(queueName string, message *protocol.Message) error {
-	ring := ds.getOrCreateQueueRing(queueName)
-
-	if ring.ring.Count() >= ds.spillThreshold {
-		return nil
+	queue := ds.getOrCreateQueueHot(queueName)
+	if ds.hot.Put(queueName, message, true) {
+		queue.ack.OnPublish(message.DeliveryTag)
 	}
-
-	_, spilled, err := ring.ring.Store(message.DeliveryTag, message)
-	if err != nil {
-		return err
-	}
-	if spilled {
-		return nil
-	}
-
-	ring.ack.OnPublish(message.DeliveryTag)
 	return nil
 }
 
@@ -308,99 +259,48 @@ func (ds *DisruptorStorage) StoreMessage(queueName string, message *protocol.Mes
 		return fmt.Errorf("cannot persist durable message: WAL unavailable for queue %s", queueName)
 	}
 
-	ring := ds.getOrCreateQueueRing(queueName)
-
-	if ds.wal != nil && message.DeliveryMode == 2 {
+	queue := ds.getOrCreateQueueHot(queueName)
+	if message.DeliveryMode == 2 {
 		if err := ds.wal.Write(queueName, message, message.DeliveryTag); err != nil {
 			return fmt.Errorf("failed to write durable message to WAL: %w", err)
 		}
-	}
-
-	if ds.wal != nil && ring.ring.Count() > ds.spillThreshold {
-		if message.DeliveryMode != 2 {
-			if err := ds.wal.Write(queueName, message, message.DeliveryTag); err != nil {
-				return fmt.Errorf("failed to spill transient message to WAL: %w", err)
-			}
+		if ds.hot.Put(queueName, message, true) {
+			queue.ack.OnPublish(message.DeliveryTag)
 		}
 		return nil
 	}
 
-	_, spilled, err := ring.ring.Store(message.DeliveryTag, message)
-	if err != nil {
-		return fmt.Errorf("failed to store message in ring: %w", err)
-	}
-	if spilled {
-		if message.DeliveryMode != 2 && ds.wal != nil {
-			if err := ds.wal.Write(queueName, message, message.DeliveryTag); err != nil {
-				return fmt.Errorf("failed to spill transient message to WAL: %w", err)
-			}
-			return nil
-		}
-		if ds.wal == nil {
-			return fmt.Errorf("ring full and WAL unavailable for queue %s", queueName)
-		}
+	if ds.hot.Put(queueName, message, false) {
+		queue.ack.OnPublish(message.DeliveryTag)
 		return nil
 	}
-
-	ring.ack.OnPublish(message.DeliveryTag)
+	if ds.wal == nil {
+		return fmt.Errorf("hot cache admission failed and WAL unavailable for queue %s", queueName)
+	}
+	if err := ds.wal.Write(queueName, message, message.DeliveryTag); err != nil {
+		return fmt.Errorf("failed to spill transient message to WAL: %w", err)
+	}
 	return nil
 }
 
-// StoreMessageAsync is the async-completion sibling of StoreMessage for the
-// durable publish path (DeliveryMode==2). It enqueues the durable WAL write via
-// WriteAsync (never blocking the caller on the fsync) and reports the fsync
-// completion through onDurable.
-//
-// ring.Store is DEFERRED into the WAL completion (iteration 2, frontier design):
-// on fsync SUCCESS the message is made ring-resident just before onDurable runs
-// — and the broker advances consumer-visibility (its per-queue frontier) only
-// from onDurable, AFTER this ring store, so a consumer that claims the tag the
-// instant it becomes visible always finds it (no stranding). On fsync ERROR the
-// ring store is skipped, so a non-durable tag is NEVER ring-resident: when the
-// frontier advances past it, its claim GetMessage-misses and it is gap-skipped,
-// never delivered (no stale-slot delivery of a nacked message). Deferral is safe
-// precisely because the frontier never exposes a tag before its own completion,
-// which is why the earlier "ring.Store synchronous" condition is no longer
-// needed. Over the spill threshold a durable message is WAL-only, as in
-// StoreMessage. onDurable fires exactly once, after the fsync.
+// StoreMessageAsync durably writes before making the message visible through
+// the hot cache and completion callback. A failed completion never admits it.
 func (ds *DisruptorStorage) StoreMessageAsync(queueName string, message *protocol.Message, onDurable func(error)) error {
 	if ds.wal == nil {
 		return fmt.Errorf("cannot persist durable message: WAL unavailable for queue %s", queueName)
 	}
-
-	ring := ds.getOrCreateQueueRing(queueName)
-
+	queue := ds.getOrCreateQueueHot(queueName)
 	ds.wal.WriteAsync(queueName, message, message.DeliveryTag, func(err error) {
-		if err == nil {
-			// Durable: make the message ring-resident BEFORE onDurable advances
-			// the frontier. Spill decision as in StoreMessage (over the threshold
-			// the durable message is WAL-only and read back via wal.Read). ring
-			// ops are lock-free CAS — safe on the WAL batch-writer goroutine.
-			if ring.ring.Count() <= ds.spillThreshold {
-				if _, spilled, serr := ring.ring.Store(message.DeliveryTag, message); serr == nil && !spilled {
-					ring.ack.OnPublish(message.DeliveryTag)
-				}
-			}
+		if err == nil && ds.hot.Put(queueName, message, true) {
+			queue.ack.OnPublish(message.DeliveryTag)
 		}
 		onDurable(err)
 	})
 	return nil
 }
 
-// StoreSharedAsync is the ITER5 fused sibling of StoreMessageAsync for a durable
-// fan-out of one large body to N>=2 queues. It routes the N durable writes
-// through a SINGLE WAL group-commit unit (one BodyBlock carrying the body once +
-// N reference records, one fsync), instead of N full-body StoreMessageAsync
-// writes. Each sub's per-copy completion performs THAT queue's ring-residency +
-// spill decision exactly as StoreMessageAsync's completion does, then invokes the
-// sub's OnDurable (the broker's per-copy visibility/confirm step) — so a fan-out
-// of N copies drives N ordinary completions, and correctness/visibility are
-// identical to the per-queue path; only the durable byte layout differs.
-//
-// The shared body is every sub's Message.Body (the broker shares one Body slice
-// across fan-out copies), taken from the first sub. Completions run on the shared
-// WAL batch-writer goroutine and must be non-blocking (invariant A4), which the
-// broker's completions honor.
+// StoreSharedAsync shares one durable body write across a fan-out. Each
+// completion performs only cache admission before reporting durability.
 func (ds *DisruptorStorage) StoreSharedAsync(subs []interfaces.SharedDurableSub) error {
 	if ds.wal == nil {
 		return fmt.Errorf("cannot persist durable message: WAL unavailable")
@@ -412,7 +312,7 @@ func (ds *DisruptorStorage) StoreSharedAsync(subs []interfaces.SharedDurableSub)
 	body := subs[0].Message.Body
 	walSubs := make([]sharedSub, len(subs))
 	for i := range subs {
-		ring := ds.getOrCreateQueueRing(subs[i].QueueName)
+		queue := ds.getOrCreateQueueHot(subs[i].QueueName)
 		msg := subs[i].Message
 		onDurable := subs[i].OnDurable
 		walSubs[i] = sharedSub{
@@ -420,14 +320,8 @@ func (ds *DisruptorStorage) StoreSharedAsync(subs []interfaces.SharedDurableSub)
 			offset:    msg.DeliveryTag,
 			message:   msg,
 			onDone: func(err error) {
-				if err == nil {
-					// Ring-residency BEFORE the broker advances this queue's
-					// visibility, mirroring StoreMessageAsync exactly.
-					if ring.ring.Count() <= ds.spillThreshold {
-						if _, spilled, serr := ring.ring.Store(msg.DeliveryTag, msg); serr == nil && !spilled {
-							ring.ack.OnPublish(msg.DeliveryTag)
-						}
-					}
+				if err == nil && ds.hot.Put(queue.name, msg, true) {
+					queue.ack.OnPublish(msg.DeliveryTag)
 				}
 				onDurable(err)
 			},
@@ -437,137 +331,67 @@ func (ds *DisruptorStorage) StoreSharedAsync(subs []interfaces.SharedDurableSub)
 }
 
 func (ds *DisruptorStorage) GetMessage(queueName string, deliveryTag uint64) (*protocol.Message, error) {
-	ring := ds.getQueueRing(queueName)
-	if ring == nil {
+	queue := ds.getQueueHot(queueName)
+	if queue == nil {
 		return nil, interfaces.ErrQueueNotFound
 	}
-
-	// The RING is self-gating and is therefore read first, UNGATED: DeleteMessage
-	// and DeleteMessageIfPresent remove the tag from the ring BEFORE they
-	// acknowledge either durable tier, so a ring hit means no acknowledgement has
-	// been issued through this layer. Keeping the gate off the warm path is
-	// deliberate — the ring is the only tier a warm read touches.
-	if msg, ok := ring.ring.LoadByTag(deliveryTag); ok {
+	if msg, _, ok := ds.hot.Get(queueName, deliveryTag); ok {
 		return msg, nil
 	}
-
-	// THE ACKNOWLEDGEMENT GATE, covering every COLD tier at once.
-	//
-	// Below this line the answer can come from the read-ahead buffer, the WAL's
-	// O(1) index, the WAL's sequential scan, or a segment. All four are gated
-	// here, once, because this is the only layer that sees all four and the only
-	// layer that holds NO tier lock while asking.
-	//
-	// Per-tier gating cannot do this job. The tiers disagree about what "acked"
-	// means: WALManager.Acknowledge records synchronously, while the segment
-	// tier's bitmap is written by batchAckLoop on a 10ms ticker, so a segment
-	// gate is blind for up to one tick after every ack — and queue_reaper's
-	// reapTTLSweep acknowledges a tag and re-probes it inside the same sweep,
-	// landing in that window by construction. Worse, a WAL gate that correctly
-	// refuses is precisely what ROUTES the probe on to the segment tier, because
-	// a tier error here means "try the next one". One gate above all four
-	// consults ONE set with ONE latency and never asks which tier is answering.
-	if ds.wal != nil && ds.wal.IsAcknowledged(deliveryTag) {
+	if ds.wal != nil && ds.wal.IsAcknowledged(queueName, deliveryTag) {
 		return nil, interfaces.ErrMessageNotFound
 	}
 
 	var msg *protocol.Message
-
-	if ring.readAhead != nil {
-		if m, ok := ring.readAhead.get(deliveryTag); ok {
+	if ds.wal != nil {
+		if m, err := ds.wal.Read(queueName, deliveryTag); err == nil {
 			msg = m
 		}
 	}
-
-	if msg == nil && ds.wal != nil {
-		if ring.readAhead != nil {
-			if batch, err := ds.wal.ReadBatch(queueName, deliveryTag); err == nil && len(batch) > 0 {
-				// Take our own answer BEFORE publishing the map. put() hands
-				// ownership of `batch` to the buffer, after which it may only be
-				// touched under the buffer's lock — remove() deletes from it on
-				// every acknowledgement. Reading batch[...] after put() is an
-				// unsynchronised access to a map another goroutine is mutating.
-				m, ok := batch[deliveryTag]
-				ring.readAhead.put(batch)
-				if ok {
-					msg = m
-				}
-			}
-		}
-		if msg == nil {
-			if m, err := ds.wal.Read(queueName, deliveryTag); err == nil {
-				msg = m
-			}
-		}
-	}
-
 	if msg == nil && ds.segments != nil {
 		if m, err := ds.segments.Read(queueName, deliveryTag); err == nil {
 			msg = m
 		}
 	}
-
 	if msg == nil {
 		return nil, interfaces.ErrMessageNotFound
 	}
 
-	// RE-VALIDATE. The gate above and the tier read below it are not atomic, so
-	// an acknowledgement landing while the cold read was in flight would
-	// otherwise be served. Re-asking narrows that window to the bitmap lookup
-	// itself, and costs one uncontended RLock on the cold path only.
-	if ds.wal != nil && ds.wal.IsAcknowledged(deliveryTag) {
+	admitted := ds.hot.Put(queueName, msg, true)
+	if ds.wal != nil && ds.wal.IsAcknowledged(queueName, deliveryTag) {
+		if admitted {
+			ds.hot.Delete(queueName, deliveryTag)
+		}
 		return nil, interfaces.ErrMessageNotFound
 	}
-
 	return msg, nil
 }
 
 func (ds *DisruptorStorage) DeleteMessage(queueName string, deliveryTag uint64) error {
-	ring := ds.getQueueRing(queueName)
-	if ring == nil {
+	queue := ds.getQueueHot(queueName)
+	if queue == nil {
 		return interfaces.ErrQueueNotFound
 	}
-
-	// Check if message is in the ring and whether it's durable.
-	// Durable messages (DeliveryMode=2) are always written to WAL on publish,
-	// so they need WAL ack regardless. Transient messages only need WAL ack
-	// if they were spilled (not in ring).
-	msg, foundInRing := ring.ring.LoadByTag(deliveryTag)
-	isDurable := foundInRing && msg.DeliveryMode == 2
-
-	ring.ring.Delete(deliveryTag)
-
-	// Invalidate the read-ahead cache unconditionally. GetMessage consults it
-	// before the WAL, so leaving an acknowledged tag there keeps serving it no
-	// matter what the WAL decides.
-	if ring.readAhead != nil {
-		ring.readAhead.remove(deliveryTag)
+	msg, backed, foundHot := ds.hot.Get(queueName, deliveryTag)
+	ds.hot.Delete(queueName, deliveryTag)
+	if !foundHot || msg.DeliveryMode == 2 || backed {
+		ds.ackColdTiers(queueName, deliveryTag)
 	}
-
-	if !foundInRing || isDurable {
-		if ds.wal != nil {
-			ds.wal.Acknowledge(queueName, deliveryTag)
-		}
-		if ds.segments != nil {
-			ds.segments.Acknowledge(queueName, deliveryTag)
-		}
-	}
-
 	return nil
 }
 
 // DeleteMessageIfPresent removes a message and reports whether THIS call won
-// the RING removal — AtomicRing.Delete's CAS result only (the legacy
-// contract). New callers that account queue depth MUST use
+// the hot-cache removal — hotCache.Delete's unique-winner result only (the
+// legacy resident-only contract). New callers that account queue depth MUST use
 // DeleteMessageIfPresentDetailed: a spilled (WAL/segment-only) tag wins its
 // removal through the detailed cold path but reports false here.
 func (ds *DisruptorStorage) DeleteMessageIfPresent(queueName string, deliveryTag uint64) (bool, error) {
 	removed, resident, err := ds.DeleteMessageIfPresentDetailed(queueName, deliveryTag)
-	return removed && resident, err // legacy contract: ring-CAS result only
+	return removed && resident, err // legacy contract: resident removal only
 }
 
 // coldRemovalShards serialises DeleteMessageIfPresentDetailed per tag so that
-// concurrent removers of the same tag — ring-resident OR spilled — observe
+// concurrent removers of the same tag — hot-resident OR cold — observe
 // exactly one winner. Package-level so no DisruptorStorage field (and no
 // layout pin) changes. Taken only here; never while holding any WAL/segment lock.
 var coldRemovalShards [64]sync.Mutex
@@ -575,8 +399,8 @@ var coldRemovalShards [64]sync.Mutex
 // DeleteMessageIfPresentDetailed removes a ready message and reports whether
 // THIS call is the unique remover of a message that was actually present.
 //
-//	removed=true,  wasResident=true : won the ring CAS
-//	removed=false, wasResident=true : lost the ring CAS to a concurrent remover
+//	removed=true,  wasResident=true : won the hot-cache delete
+//	removed=false, wasResident=true : lost the hot-cache delete to a concurrent remover
 //	removed=true,  wasResident=false: message was WAL/segment-only (spilled or
 //	                                  recovered), present and not yet acked;
 //	                                  this call acknowledged it
@@ -586,37 +410,29 @@ var coldRemovalShards [64]sync.Mutex
 // Callers decrement queue depth iff removed. Acknowledgement of WAL/segment
 // tiers mirrors DeleteMessage.
 func (ds *DisruptorStorage) DeleteMessageIfPresentDetailed(queueName string, deliveryTag uint64) (removed, wasResident bool, err error) {
-	ring := ds.getQueueRing(queueName)
-	if ring == nil {
+	queue := ds.getQueueHot(queueName)
+	if queue == nil {
 		return false, false, interfaces.ErrQueueNotFound
 	}
-	// The stripe lock spans the ring path too: a durable ring winner deletes
-	// the slot and then acks the WAL; without the lock, a loser could reach
-	// the cold path in between, find the WAL record unacked, and double-remove.
 	mu := &coldRemovalShards[deliveryTag&63]
 	mu.Lock()
 	defer mu.Unlock()
 
-	if msg, ok := ring.ring.LoadByTag(deliveryTag); ok {
-		won := ring.ring.Delete(deliveryTag)
-		if ring.readAhead != nil {
-			ring.readAhead.remove(deliveryTag)
-		}
-		if won && msg.DeliveryMode == 2 {
+	if msg, backed, ok := ds.hot.Get(queueName, deliveryTag); ok {
+		won := ds.hot.Delete(queueName, deliveryTag)
+		if won && (msg.DeliveryMode == 2 || backed) {
 			ds.ackColdTiers(queueName, deliveryTag)
 		}
 		return won, true, nil
 	}
-	if ds.wal != nil && ds.wal.IsAcknowledged(deliveryTag) {
+	if ds.wal != nil && ds.wal.IsAcknowledged(queueName, deliveryTag) {
 		return false, false, nil
 	}
-	m, gerr := ds.GetMessage(queueName, deliveryTag) // ring miss → cold tiers, ack-gated
+	m, gerr := ds.GetMessage(queueName, deliveryTag)
 	if gerr != nil || m == nil {
 		return false, false, nil
 	}
-	if ring.readAhead != nil {
-		ring.readAhead.remove(deliveryTag)
-	}
+	ds.hot.Delete(queueName, deliveryTag)
 	ds.ackColdTiers(queueName, deliveryTag)
 	return true, false, nil
 }
@@ -633,12 +449,12 @@ func (ds *DisruptorStorage) ackColdTiers(queueName string, deliveryTag uint64) {
 }
 
 func (ds *DisruptorStorage) RegisterConsumerCursor(queueName string, consumerTag string) {
-	ring := ds.getOrCreateQueueRing(queueName)
+	ring := ds.getOrCreateQueueHot(queueName)
 	ring.ack.OnConsumerRegister(consumerTag)
 }
 
 func (ds *DisruptorStorage) UnregisterConsumerCursor(queueName string, consumerTag string) {
-	ring := ds.getQueueRing(queueName)
+	ring := ds.getQueueHot(queueName)
 	if ring == nil {
 		return
 	}
@@ -646,7 +462,7 @@ func (ds *DisruptorStorage) UnregisterConsumerCursor(queueName string, consumerT
 }
 
 func (ds *DisruptorStorage) DeliverToConsumer(queueName string, consumerTag string, deliveryTag uint64) {
-	ring := ds.getQueueRing(queueName)
+	ring := ds.getQueueHot(queueName)
 	if ring == nil {
 		return
 	}
@@ -654,7 +470,7 @@ func (ds *DisruptorStorage) DeliverToConsumer(queueName string, consumerTag stri
 }
 
 func (ds *DisruptorStorage) AckFromConsumer(queueName string, consumerTag string, deliveryTag uint64) {
-	ring := ds.getQueueRing(queueName)
+	ring := ds.getQueueHot(queueName)
 	if ring == nil {
 		return
 	}
@@ -662,7 +478,7 @@ func (ds *DisruptorStorage) AckFromConsumer(queueName string, consumerTag string
 }
 
 func (ds *DisruptorStorage) NackFromConsumer(queueName string, consumerTag string, deliveryTag uint64) {
-	ring := ds.getQueueRing(queueName)
+	ring := ds.getQueueHot(queueName)
 	if ring == nil {
 		return
 	}
@@ -670,7 +486,7 @@ func (ds *DisruptorStorage) NackFromConsumer(queueName string, consumerTag strin
 }
 
 func (ds *DisruptorStorage) GetMinAckCursor(queueName string) uint64 {
-	ring := ds.getQueueRing(queueName)
+	ring := ds.getQueueHot(queueName)
 	if ring == nil {
 		return 0
 	}
@@ -678,48 +494,73 @@ func (ds *DisruptorStorage) GetMinAckCursor(queueName string) uint64 {
 }
 
 func (ds *DisruptorStorage) GetQueueMessages(queueName string) ([]*protocol.Message, error) {
-	ring := ds.getQueueRing(queueName)
+	ring := ds.getQueueHot(queueName)
 	if ring == nil {
 		return nil, interfaces.ErrQueueNotFound
 	}
-	return ring.ring.GetAll(), nil
+	return ds.hot.Range(queueName, 0, ^uint64(0)), nil
 }
 
 func (ds *DisruptorStorage) GetQueueMessageCount(queueName string) (int, error) {
-	ring := ds.getQueueRing(queueName)
+	ring := ds.getQueueHot(queueName)
 	if ring == nil {
 		return 0, interfaces.ErrQueueNotFound
 	}
-	return int(ring.ring.Count()), nil
+	return ds.hot.Count(queueName), nil
+}
+
+// purgeQueueRange settles the hot and both cold tiers and counts each logical
+// delivery tag once, even when it has multiple physical copies or resides in
+// more than one tier. Caller has verified that the queue exists.
+func (ds *DisruptorStorage) purgeQueueRange(queueName string, minTag, maxTag uint64) int {
+	if minTag > maxTag {
+		return 0
+	}
+	unique := make(map[uint64]struct{})
+	hotMessages := ds.hot.Range(queueName, minTag, maxTag)
+	if ds.wal != nil {
+		for _, tag := range ds.wal.PurgeQueue(queueName, minTag, maxTag) {
+			unique[tag] = struct{}{}
+		}
+	}
+	if ds.segments != nil {
+		for _, tag := range ds.segments.PurgeQueue(queueName, minTag, maxTag) {
+			unique[tag] = struct{}{}
+		}
+	}
+	for _, message := range hotMessages {
+		if message != nil && ds.hot.Delete(queueName, message.DeliveryTag) {
+			unique[message.DeliveryTag] = struct{}{}
+		}
+	}
+	return len(unique)
 }
 
 func (ds *DisruptorStorage) PurgeQueue(queueName string, minTag, maxTag uint64) (int, error) {
-	ring := ds.getQueueRing(queueName)
-	if ring == nil {
+	if ds.getQueueHot(queueName) == nil {
 		return 0, interfaces.ErrQueueNotFound
 	}
-	return ring.ring.DeleteRange(minTag, maxTag), nil
+	return ds.purgeQueueRange(queueName, minTag, maxTag), nil
 }
 
 func (ds *DisruptorStorage) GetMessageRange(queueName string, startTag, endTag uint64) ([]*protocol.Message, error) {
-	ring := ds.getQueueRing(queueName)
+	ring := ds.getQueueHot(queueName)
 	if ring == nil {
 		return nil, interfaces.ErrQueueNotFound
 	}
-	return ring.ring.GetRange(startTag, endTag), nil
+	return ds.hot.Range(queueName, startTag, endTag), nil
 }
 
 func (ds *DisruptorStorage) DeleteMessageRange(queueName string, startTag, endTag uint64) error {
-	ring := ds.getQueueRing(queueName)
-	if ring == nil {
+	if ds.getQueueHot(queueName) == nil {
 		return interfaces.ErrQueueNotFound
 	}
-	ring.ring.DeleteRange(startTag, endTag)
+	ds.purgeQueueRange(queueName, startTag, endTag)
 	return nil
 }
 
 func (ds *DisruptorStorage) GetUnackedCount(queueName, consumerTag string) (int, error) {
-	ring := ds.getQueueRing(queueName)
+	ring := ds.getQueueHot(queueName)
 	if ring == nil {
 		return 0, interfaces.ErrQueueNotFound
 	}
@@ -727,7 +568,7 @@ func (ds *DisruptorStorage) GetUnackedCount(queueName, consumerTag string) (int,
 }
 
 func (ds *DisruptorStorage) GetUnackedTags(queueName, consumerTag string) ([]uint64, error) {
-	ring := ds.getQueueRing(queueName)
+	ring := ds.getQueueHot(queueName)
 	if ring == nil {
 		return nil, interfaces.ErrQueueNotFound
 	}
@@ -770,7 +611,7 @@ func (ds *DisruptorStorage) StoreQueue(queue *protocol.Queue) error {
 	if err := ds.metadataStore.StoreQueue(queue); err != nil {
 		return err
 	}
-	_ = ds.getOrCreateQueueRing(queue.Name)
+	_ = ds.getOrCreateQueueHot(queue.Name)
 	return nil
 }
 
@@ -783,9 +624,9 @@ func (ds *DisruptorStorage) GetQueue(name string) (*protocol.Queue, error) {
 
 func (ds *DisruptorStorage) DeleteQueue(name string) error {
 	if val, ok := ds.queues.LoadAndDelete(name); ok {
-		ring := val.(*QueueRing)
-		ring.ring.Close()
+		ring := val.(*QueueHot)
 		ring.closed.Store(true)
+		ds.hot.DeleteRange(name, 0, ^uint64(0))
 	}
 
 	if ds.metadataStore != nil {
@@ -1302,9 +1143,8 @@ func (ds *DisruptorStorage) ExecuteAtomic(operations func(txnStorage interfaces.
 
 func (ds *DisruptorStorage) Close() error {
 	ds.queues.Range(func(_, value interface{}) bool {
-		ring := value.(*QueueRing)
+		ring := value.(*QueueHot)
 		if !ring.closed.Load() {
-			ring.ring.Close()
 			ring.closed.Store(true)
 		}
 		return true

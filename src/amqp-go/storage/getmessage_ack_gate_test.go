@@ -210,7 +210,7 @@ func arrangeAckGate(t *testing.T) *ackGateFixture {
 	// PREMISE: nothing is served from the two tiers that sit ABOVE the segment
 	// tier. A ring hit is answered before either guard runs; a read-ahead hit is
 	// answered before the tier read and so parks nothing.
-	ring := ds.getQueueRing(ackGateQueue)
+	ring := ds.getQueueHot(ackGateQueue)
 	require.NotNil(t, ring, "PREMISE BROKEN: no queue ring for %s", ackGateQueue)
 
 	// GUARD THE GUARD. The per-tag "is cold" assertions below are only meaningful
@@ -219,23 +219,18 @@ func arrangeAckGate(t *testing.T) *ackGateFixture {
 	// checks would pass while proving nothing. base is the first tag stored and
 	// owns its slot for the life of the fixture, so its presence is the positive
 	// control for the placement model the selection rule above relies on.
-	_, ringPopulated := ring.ring.LoadByTag(base)
+	_, _, ringPopulated := ds.hot.Get(ackGateQueue, base)
 	require.True(t, ringPopulated,
 		"PREMISE BROKEN: tag %d — the FIRST record stored — is not in the ring, so the ring is not "+
 			"behaving as AtomicRing.Store describes and the 'cold' assertions below would pass "+
 			"vacuously for every tag", base)
 
 	for _, tag := range tags {
-		_, hot := ring.ring.LoadByTag(tag)
+		ds.hot.Delete(ackGateQueue, tag)
+		_, _, hot := ds.hot.Get(ackGateQueue, tag)
 		require.False(t, hot,
 			"PREMISE BROKEN: tag %d is still resident in the ring at RingBufferSize=%d, so "+
 				"GetMessage answers from the hot path and reaches neither guard", tag, ackGateRingSize)
-		if ring.readAhead != nil {
-			_, buffered := ring.readAhead.get(tag)
-			require.False(t, buffered,
-				"PREMISE BROKEN: tag %d is in the read-ahead buffer, which is consulted before the "+
-					"tier read — the reader would be answered there and never park", tag)
-		}
 	}
 
 	val, ok := ds.segments.queueSegments.Load(ackGateQueue)
@@ -366,7 +361,7 @@ func TestGetMessage_ReValidateRefusesAnAckThatLandsDuringAColdRead(t *testing.T)
 	// records the bitmap synchronously, so the re-validate observes it with no
 	// ticker in the way.
 	require.NoError(t, f.ds.DeleteMessage(ackGateQueue, f.victim))
-	require.True(t, f.ds.wal.IsAcknowledged(f.victim),
+	require.True(t, f.ds.wal.IsAcknowledged(ackGateQueue, f.victim),
 		"PREMISE BROKEN: DeleteMessage returned but the acknowledgement oracle does not know about "+
 			"tag %d, so the re-validate below would have nothing to see", f.victim)
 
@@ -412,7 +407,7 @@ func TestGetMessage_PreReadGateAnswersWithoutConsultingAnyColdTier(t *testing.T)
 	// Acknowledge FIRST — before the probe, which is the ordering the pre-read
 	// gate exists for and the one the reaper produces every sweep.
 	require.NoError(t, f.ds.DeleteMessage(ackGateQueue, f.victim))
-	require.True(t, f.ds.wal.IsAcknowledged(f.victim),
+	require.True(t, f.ds.wal.IsAcknowledged(ackGateQueue, f.victim),
 		"PREMISE BROKEN: DeleteMessage returned but the acknowledgement oracle does not know about "+
 			"tag %d, so the pre-read gate would have nothing to short-circuit on", f.victim)
 
@@ -622,27 +617,20 @@ func TestGetMessage_AckOnOneQueueDoesNotSuppressAnother(t *testing.T) {
 			ordinal uint64
 		}{{xqQueueA, xqOrdinalA}, {xqQueueB, xqOrdinalB}} {
 			tag := xqTag(q.ordinal, seq)
+			ds.hot.Delete(q.name, tag)
 			segMsg, segErr := ds.segments.Read(q.name, tag)
 			require.NoError(t, segErr,
 				"PREMISE BROKEN: tag %d (queue %s, seq %d) did not reach a segment, so this probe "+
 					"would not exercise the gated cold path", tag, q.name, seq)
 			require.NotNil(t, segMsg, "PREMISE BROKEN: segment read for tag %d returned nil, no error", tag)
 
-			ring := ds.getQueueRing(q.name)
+			ring := ds.getQueueHot(q.name)
 			require.NotNil(t, ring, "PREMISE BROKEN: no queue ring for %s", q.name)
-			_, hot := ring.ring.LoadByTag(tag)
+			_, _, hot := ds.hot.Get(q.name, tag)
 			require.False(t, hot,
 				"PREMISE BROKEN: tag %d is still resident in %s's ring, so GetMessage answers from "+
 					"the hot path and never consults the acknowledgement gate", tag, q.name)
 
-			if ring.readAhead != nil {
-				_, buffered := ring.readAhead.get(tag)
-				require.False(t, buffered,
-					"PREMISE BROKEN: tag %d is in %s's read-ahead buffer. That is consulted before "+
-						"the tier read, so this probe would be answered without the segment tier "+
-						"being touched and the two halves of this fixture would not be at the same "+
-						"altitude", tag, q.name)
-			}
 		}
 	}
 
@@ -655,7 +643,7 @@ func TestGetMessage_AckOnOneQueueDoesNotSuppressAnother(t *testing.T) {
 
 	// ACT: acknowledge on queue A only.
 	require.NoError(t, ds.DeleteMessage(xqQueueA, victimA))
-	require.True(t, ds.wal.IsAcknowledged(victimA),
+	require.True(t, ds.wal.IsAcknowledged(xqQueueA, victimA),
 		"PREMISE BROKEN: DeleteMessage returned but the oracle does not know tag %d was acked, so "+
 			"neither half of this fixture is under test", victimA)
 

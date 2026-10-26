@@ -41,7 +41,7 @@ func TestSegmentPreservesMetadata(t *testing.T) {
 
 	// Write message to segment via CheckpointBatch (the normal write path)
 	msgs := []*RecoveryMessage{{Message: original, Offset: 42, QueueName: "test-queue"}}
-	if err := sm.CheckpointBatch("test-queue", msgs); err != nil {
+	if err := writeLegacyBatchForTest(sm, "test-queue", msgs); err != nil {
 		t.Fatalf("CheckpointBatch failed: %v", err)
 	}
 
@@ -83,7 +83,7 @@ func TestSegmentEmptyExchangeAndRoutingKey(t *testing.T) {
 	}
 
 	msgs := []*RecoveryMessage{{Message: original, Offset: 1, QueueName: "test-queue"}}
-	if err := sm.CheckpointBatch("test-queue", msgs); err != nil {
+	if err := writeLegacyBatchForTest(sm, "test-queue", msgs); err != nil {
 		t.Fatalf("CheckpointBatch failed: %v", err)
 	}
 
@@ -115,7 +115,7 @@ func TestSegmentRoundtripMultipleMessages(t *testing.T) {
 	for _, m := range messages {
 		recoveryMsgs = append(recoveryMsgs, &RecoveryMessage{Message: m, Offset: m.DeliveryTag, QueueName: "test-queue"})
 	}
-	if err := sm.CheckpointBatch("test-queue", recoveryMsgs); err != nil {
+	if err := writeLegacyBatchForTest(sm, "test-queue", recoveryMsgs); err != nil {
 		t.Fatalf("CheckpointBatch failed: %v", err)
 	}
 
@@ -150,7 +150,7 @@ func TestCheckpointBatchFsyncsSegment(t *testing.T) {
 	}
 
 	msgs := []*RecoveryMessage{{Message: msg, Offset: 1, QueueName: "ckpt-queue"}}
-	if err := sm.CheckpointBatch("ckpt-queue", msgs); err != nil {
+	if err := writeLegacyBatchForTest(sm, "ckpt-queue", msgs); err != nil {
 		t.Fatalf("CheckpointBatch failed: %v", err)
 	}
 

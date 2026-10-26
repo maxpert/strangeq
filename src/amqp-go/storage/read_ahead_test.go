@@ -38,65 +38,9 @@ func publishDurableMessages(t *testing.T, storage *DisruptorStorage, queueName s
 }
 
 func clearRingForWALFallback(storage *DisruptorStorage, queueName string, n int) {
-	ring := storage.getQueueRing(queueName)
 	for i := 0; i < n; i++ {
-		ring.ring.Delete(uint64(i))
+		storage.hot.Delete(queueName, uint64(i))
 	}
-}
-
-func TestReadAhead_PopulatesOnFirstMiss(t *testing.T) {
-	tmpDir := t.TempDir()
-	storage := newReadAheadTestStorage(t, tmpDir, 64)
-	defer storage.Close()
-
-	require.NoError(t, storage.StoreQueue(&protocol.Queue{Name: "q", Durable: true}))
-	publishDurableMessages(t, storage, "q", 200)
-	clearRingForWALFallback(storage, "q", 200)
-
-	ring := storage.getQueueRing("q")
-
-	msg, err := storage.GetMessage("q", 0)
-	require.NoError(t, err)
-	require.NotNil(t, msg)
-	assert.Equal(t, []byte("msg-0"), msg.Body)
-
-	assert.Equal(t, 1, ring.readAhead.batchReadCount())
-	assert.Equal(t, readAheadMaxEntries, ring.readAhead.len())
-
-	for i := 1; i < readAheadMaxEntries; i++ {
-		assert.True(t, ring.readAhead.has(uint64(i)),
-			"tag %d should be in read-ahead buffer", i)
-	}
-
-	for i := 1; i < readAheadMaxEntries; i++ {
-		msg, err := storage.GetMessage("q", uint64(i))
-		require.NoError(t, err)
-		assert.Equal(t, []byte(fmt.Sprintf("msg-%d", i)), msg.Body)
-	}
-
-	assert.Equal(t, 1, ring.readAhead.batchReadCount(),
-		"subsequent reads should be served from buffer, no new batch reads")
-}
-
-func TestReadAhead_RingHitSkipsReadAhead(t *testing.T) {
-	tmpDir := t.TempDir()
-	storage := newReadAheadTestStorage(t, tmpDir, 1024)
-	defer storage.Close()
-
-	require.NoError(t, storage.StoreQueue(&protocol.Queue{Name: "q", Durable: true}))
-	publishDurableMessages(t, storage, "q", 200)
-
-	ring := storage.getQueueRing("q")
-
-	for i := 0; i < 200; i++ {
-		msg, err := storage.GetMessage("q", uint64(i))
-		require.NoError(t, err)
-		assert.Equal(t, []byte(fmt.Sprintf("msg-%d", i)), msg.Body)
-	}
-
-	assert.Equal(t, 0, ring.readAhead.batchReadCount(),
-		"read-ahead should never fire when all messages are ring-resident")
-	assert.Equal(t, 0, ring.readAhead.len())
 }
 
 func TestReadAhead_CorrectMessageContent(t *testing.T) {
@@ -122,115 +66,6 @@ func TestReadAhead_CorrectMessageContent(t *testing.T) {
 		assert.Equal(t, fmt.Sprintf("unique-body-%d", i), string(msg.Body),
 			"body mismatch for tag %d", i)
 	}
-}
-
-func TestReadAhead_EvictionOnNonSequential(t *testing.T) {
-	tmpDir := t.TempDir()
-	storage := newReadAheadTestStorage(t, tmpDir, 64)
-	defer storage.Close()
-
-	require.NoError(t, storage.StoreQueue(&protocol.Queue{Name: "q", Durable: true}))
-	publishDurableMessages(t, storage, "q", 200)
-	clearRingForWALFallback(storage, "q", 200)
-
-	ring := storage.getQueueRing("q")
-
-	_, err := storage.GetMessage("q", 0)
-	require.NoError(t, err)
-	assert.Equal(t, 1, ring.readAhead.batchReadCount())
-	assert.True(t, ring.readAhead.has(0))
-
-	msg, err := storage.GetMessage("q", 150)
-	require.NoError(t, err)
-	assert.Equal(t, []byte("msg-150"), msg.Body)
-	assert.Equal(t, 2, ring.readAhead.batchReadCount(),
-		"non-sequential access should trigger a new batch read")
-
-	assert.False(t, ring.readAhead.has(0),
-		"old buffer should be evicted by the new batch")
-	assert.True(t, ring.readAhead.has(150),
-		"new buffer should contain the requested tag")
-}
-
-func TestReadAhead_SequentialConsumeAmortisesBatchReads(t *testing.T) {
-	tmpDir := t.TempDir()
-	storage := newReadAheadTestStorage(t, tmpDir, 64)
-	defer storage.Close()
-
-	require.NoError(t, storage.StoreQueue(&protocol.Queue{Name: "q", Durable: true}))
-
-	const numMsgs = 2000
-	maxRecordBytes := 0
-	for i := 0; i < numMsgs; i++ {
-		msg := &protocol.Message{
-			Body:         []byte(fmt.Sprintf("msg-%d", i)),
-			DeliveryMode: 2,
-			DeliveryTag:  uint64(i),
-		}
-		record, err := appendMessageRecord(nil, "q", msg, uint64(i), false)
-		require.NoError(t, err)
-		maxRecordBytes = max(maxRecordBytes, len(record))
-		require.NoError(t, storage.StoreMessage("q", msg))
-	}
-	ring := storage.getQueueRing("q")
-	require.NotNil(t, ring.readAhead,
-		"fixture premise broken: the queue has no read-ahead buffer")
-	clearRingForWALFallback(storage, "q", numMsgs)
-	require.Zero(t, ring.ring.Count(),
-		"fixture premise broken: clearing the ring left %d resident messages, so GetMessage can bypass read-ahead",
-		ring.ring.Count())
-
-	maxEntryBatchBytes := readAheadMaxEntries * maxRecordBytes
-	require.Less(t, maxEntryBatchBytes, readAheadChunkSize,
-		"fixture premise broken: %d entries can occupy %d bytes at the fixture's largest serialized record size (%d), so the %d-byte chunk bound can bind before the entry-count bound",
-		readAheadMaxEntries, maxEntryBatchBytes, maxRecordBytes, readAheadChunkSize)
-
-	wal := storage.wal.sharedWAL
-	wal.offsetIndexMutex.RLock()
-	walFiles := make(map[uint64]struct{})
-	missingOffsets := 0
-	for i := 0; i < numMsgs; i++ {
-		location, ok := wal.offsetIndex[uint64(i)]
-		if !ok {
-			missingOffsets++
-			continue
-		}
-		walFiles[location.fileNum] = struct{}{}
-	}
-	wal.offsetIndexMutex.RUnlock()
-	require.Zero(t, missingOffsets,
-		"fixture premise broken: %d fixture messages are missing from the WAL index",
-		missingOffsets)
-	require.Len(t, walFiles, 1,
-		"fixture premise broken: %d messages span %d WAL files, so ceil(%d/%d) cannot be the batch count",
-		numMsgs, len(walFiles), numMsgs, readAheadMaxEntries)
-
-	wantBatches := (numMsgs + readAheadMaxEntries - 1) / readAheadMaxEntries
-	require.Less(t, wantBatches, numMsgs,
-		"fixture premise broken: readAheadMaxEntries=%d allows no amortisation; the exact count would self-consistently accept one WAL read per message",
-		readAheadMaxEntries)
-
-	first, err := storage.GetMessage("q", 0)
-	require.NoError(t, err)
-	require.NotNil(t, first)
-	require.Equal(t, []byte("msg-0"), first.Body)
-
-	firstBatchEntries := ring.readAhead.len()
-	require.Equal(t, readAheadMaxEntries, firstBatchEntries,
-		"fixture premise broken: the entry-count bound did not bind before the %d-byte chunk bound; the first batch buffered %d entries, want %d",
-		readAheadChunkSize, firstBatchEntries, readAheadMaxEntries)
-
-	for i := 1; i < numMsgs; i++ {
-		msg, err := storage.GetMessage("q", uint64(i))
-		require.NoError(t, err)
-		require.NotNil(t, msg)
-		require.Equal(t, []byte(fmt.Sprintf("msg-%d", i)), msg.Body)
-	}
-
-	gotBatches := ring.readAhead.batchReadCount()
-	require.Equal(t, wantBatches, gotBatches,
-		"read-ahead did not amortise WAL reads: %d sequential GetMessage calls used %d batches; want ceil(%d/%d)=%d",
-		numMsgs, gotBatches, numMsgs, readAheadMaxEntries, wantBatches)
 }
 
 // TestReadAhead_ResolvesSharedBodyRefs exercises the ITER5 shared-body path
@@ -283,22 +118,15 @@ func TestReadAhead_ResolvesSharedBodyRefs(t *testing.T) {
 	}
 
 	for _, q := range queues {
-		ring := storage.getQueueRing(q)
 		for b := 0; b < numUnits; b++ {
-			ring.ring.Delete(base[q] + uint64(b))
+			storage.hot.Delete(q, base[q]+uint64(b))
 		}
 	}
-
-	ring := storage.getQueueRing("qa")
-	startBatchReads := ring.readAhead.batchReadCount()
 
 	msg, err := storage.GetMessage("qa", base["qa"])
 	require.NoError(t, err)
 	assert.Equal(t, body, msg.Body, "shared body must be resolved from BodyBlock")
 	assert.Nil(t, msg.BodyRef, "BodyRef must be cleared after resolution")
-
-	assert.Equal(t, startBatchReads+1, ring.readAhead.batchReadCount(),
-		"first miss should trigger a read-ahead batch read")
 
 	for b := 1; b < numUnits; b++ {
 		msg, err := storage.GetMessage("qa", base["qa"]+uint64(b))
@@ -384,7 +212,7 @@ func TestReadAhead_CorruptBodyBlockSkipsMessage(t *testing.T) {
 	corruptFirstBodyBlock(t, tmpDir)
 
 	for i, q := range queues {
-		storage.getQueueRing(q).ring.Delete(uint64(i))
+		storage.hot.Delete(q, uint64(i))
 	}
 
 	msg, err := storage.GetMessage("qa", 0)

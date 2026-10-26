@@ -64,10 +64,9 @@ func TestStoreMessage_DurableWithoutWAL_ReturnsError(t *testing.T) {
 	// Construct a DisruptorStorage with wal==nil directly (simulates a degraded state
 	// that should now be impossible via the public constructor, but tests the defense).
 	ds := &DisruptorStorage{
-		ringBufferSize: DefaultRingBufferSize,
-		spillThreshold: uint64(DefaultRingBufferSize) * uint64(DefaultSpillThresholdPercent) / 100,
-		transactions:   make(map[string]*interfaces.Transaction),
-		dataDir:        t.TempDir(),
+		hot:          newHotCache(16*1024*1024, 256*1024*1024),
+		transactions: make(map[string]*interfaces.Transaction),
+		dataDir:      t.TempDir(),
 	}
 
 	msg := &protocol.Message{
@@ -85,10 +84,9 @@ func TestStoreMessage_DurableWithoutWAL_ReturnsError(t *testing.T) {
 // messages can still be stored when WAL is nil — only durable messages are rejected.
 func TestStoreMessage_TransientWithoutWAL_StillWorks(t *testing.T) {
 	ds := &DisruptorStorage{
-		ringBufferSize: DefaultRingBufferSize,
-		spillThreshold: uint64(DefaultRingBufferSize) * uint64(DefaultSpillThresholdPercent) / 100,
-		transactions:   make(map[string]*interfaces.Transaction),
-		dataDir:        t.TempDir(),
+		hot:          newHotCache(16*1024*1024, 256*1024*1024),
+		transactions: make(map[string]*interfaces.Transaction),
+		dataDir:      t.TempDir(),
 	}
 
 	msg := &protocol.Message{

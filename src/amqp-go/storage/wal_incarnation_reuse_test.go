@@ -10,7 +10,7 @@ package storage
 //
 // The consequence these tests pin: when the reopened file eventually rolls,
 // rollFile registers it in oldFiles carrying ONLY this incarnation's offset
-// bitmap, so tryDeleteOldFiles evaluates "every message in this file is acked"
+// bitmap, so tryReclaimOldFiles evaluates "every message in this file is acked"
 // against a set that does not contain the previous incarnation's records — and
 // os.Remove()s a file full of confirmed, unacknowledged durable messages.
 //
@@ -24,7 +24,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/RoaringBitmap/roaring/roaring64"
 	"github.com/stretchr/testify/require"
 
 	"github.com/maxpert/amqp-go/protocol"
@@ -164,32 +163,24 @@ func recoverableOffsets(t *testing.T, dir, queue string) map[uint64]bool {
 	return found
 }
 
-// waitForAcksApplied waits until the cleanup goroutine has folded every offset
-// in `offsets` into the ack bitmap. Acknowledge() is asynchronous (it posts to
-// ackChan), so without this the test would be racing the very state it is about
-// to evaluate. This is a one-sided liveness bound with generous headroom, not a
-// rate: it decides only how long the test is willing to wait.
+// waitForAcksApplied retains the old test hook's name, but acknowledgement is
+// now synchronous. Verify the physical records rather than a cleanup goroutine.
 func waitForAcksApplied(t *testing.T, wal *WALManager, offsets []uint64) {
 	t.Helper()
-	deadline := time.Now().Add(30 * time.Second)
-	for {
-		missing := 0
-		wal.sharedWAL.bitmapMutex.RLock()
-		for _, off := range offsets {
-			if !wal.sharedWAL.ackBitmap.Contains(off) {
-				missing++
+	wal.sharedWAL.offsetIndexMutex.RLock()
+	defer wal.sharedWAL.offsetIndexMutex.RUnlock()
+	for _, off := range offsets {
+		found := false
+		for key, copies := range wal.sharedWAL.recordCopies {
+			if key.deliveryTag != off {
+				continue
+			}
+			for _, r := range copies {
+				found = true
+				require.True(t, r.acked.Load(), "physical copy for tag %d is not acknowledged", off)
 			}
 		}
-		wal.sharedWAL.bitmapMutex.RUnlock()
-		if missing == 0 {
-			return
-		}
-		if time.Now().After(deadline) {
-			t.Fatalf("PREMISE BROKEN: %d of %d acknowledgements were still not applied to the "+
-				"WAL ack bitmap after 30s; the reclamation path this test drives is gated on "+
-				"that bitmap, so the test would be evaluating an unformed state", missing, len(offsets))
-		}
-		time.Sleep(5 * time.Millisecond)
+		require.True(t, found, "no physical copy found for tag %d", off)
 	}
 }
 
@@ -281,7 +272,7 @@ func TestWALIncarnation_PriorIncarnationRecordsSurviveReclamation(t *testing.T) 
 	waitForAcksApplied(t, b.wal, bOffsets)
 
 	// Drive reclamation deterministically instead of waiting for the ticker.
-	b.wal.sharedWAL.tryDeleteOldFiles()
+	b.wal.sharedWAL.tryReclaimOldFiles()
 	filesAfterCleanup := walFilesOnDisk(t, b.sharedDir)
 	b.close()
 
@@ -308,7 +299,7 @@ func TestWALIncarnation_PriorIncarnationRecordsSurviveReclamation(t *testing.T) 
 // precondition of the reclamation decision itself, one level below the
 // end-to-end test above.
 //
-// Contract: tryDeleteOldFiles may physically remove a WAL file only when EVERY
+// Contract: tryReclaimOldFiles may physically remove a WAL file only when EVERY
 // record actually present in that file is acknowledged. The production
 // predicate tests `info.offsets ⊆ ackBitmap`, where info.offsets is whatever
 // currentFileOffsets happened to accumulate during THIS incarnation — so the
@@ -347,12 +338,9 @@ func TestWALIncarnation_ReclaimedFileHeldOnlyAckedRecords(t *testing.T) {
 
 	qw := b.wal.sharedWAL
 	qw.oldFilesMutex.Lock()
-	qw.bitmapMutex.RLock()
 	for _, info := range qw.oldFiles {
 		inspected++
-		allAcked := info.offsets != nil &&
-			info.offsets.GetCardinality() > 0 &&
-			roaring64.And(info.offsets, qw.ackBitmap).GetCardinality() == info.offsets.GetCardinality()
+		allAcked := info.inv != nil && info.inv.valid && len(info.inv.records) > 0 && info.inv.unacked.Load() == 0
 		if !allAcked {
 			continue
 		}
@@ -362,7 +350,8 @@ func TestWALIncarnation_ReclaimedFileHeldOnlyAckedRecords(t *testing.T) {
 		}
 		v := verdict{path: filepath.Base(info.path), inventory: len(records)}
 		for _, rec := range records {
-			if !qw.ackBitmap.Contains(rec.Offset) {
+			r := info.inv.records[rec.pos.position]
+			if r == nil || !r.acked.Load() {
 				v.unacked = append(v.unacked, rec.Offset)
 			}
 		}
@@ -370,7 +359,6 @@ func TestWALIncarnation_ReclaimedFileHeldOnlyAckedRecords(t *testing.T) {
 			wouldDeleteWithUnacked = append(wouldDeleteWithUnacked, v)
 		}
 	}
-	qw.bitmapMutex.RUnlock()
 	qw.oldFilesMutex.Unlock()
 
 	require.NotZero(t, inspected,
@@ -380,7 +368,7 @@ func TestWALIncarnation_ReclaimedFileHeldOnlyAckedRecords(t *testing.T) {
 		"holding unacked records: %d (%+v)", inspected, len(wouldDeleteWithUnacked), wouldDeleteWithUnacked)
 
 	require.Empty(t, wouldDeleteWithUnacked,
-		"UNSOUND RECLAMATION: tryDeleteOldFiles would physically delete %d WAL file(s) it "+
+		"UNSOUND RECLAMATION: tryReclaimOldFiles would physically delete %d WAL file(s) it "+
 			"judged fully acknowledged, each of which still contains unacknowledged durable "+
 			"records: %+v", len(wouldDeleteWithUnacked), wouldDeleteWithUnacked)
 }
@@ -406,7 +394,7 @@ func TestWALIncarnation_SingleIncarnationReclamationControl(t *testing.T) {
 	}
 	offsets := in.fillUntilRoll(incarnationLaterQueue, 3_000_000)
 	waitForAcksApplied(t, in.wal, offsets)
-	in.wal.sharedWAL.tryDeleteOldFiles()
+	in.wal.sharedWAL.tryReclaimOldFiles()
 	in.close()
 
 	after := recoverableOffsets(t, dir, incarnationCanaryQueue)
@@ -460,7 +448,7 @@ func TestWALIncarnation_UnackedRolledFileIsNotReclaimedControl(t *testing.T) {
 		"FIXTURE DEAD: no WAL files were found on disk, so comparing the directory before and "+
 			"after reclamation compares nothing. This check exists because the first draft of "+
 			"this test read the wrong directory and reported a green PASS on [] == [].")
-	in.wal.sharedWAL.tryDeleteOldFiles()
+	in.wal.sharedWAL.tryReclaimOldFiles()
 	after := walFilesOnDisk(t, in.sharedDir)
 
 	t.Logf("CONTROL (nothing acked): WAL files before reclamation %v, after %v", before, after)

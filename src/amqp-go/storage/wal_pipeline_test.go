@@ -588,12 +588,12 @@ func TestWALPipeline_CompletionsStrictlyOrderedAndCovered(t *testing.T) {
 						// durable end observed by the hook.
 						sw := wm.sharedWAL
 						sw.offsetIndexMutex.RLock()
-						loc, ok := sw.offsetIndex[off]
+						loc, ok := sw.offsetIndex[recordKey{queueName: "q", deliveryTag: off}]
 						sw.offsetIndexMutex.RUnlock()
 						if assert.True(t, ok, "offset %d must be indexed when its completion fires", off) {
-							assert.LessOrEqual(t, loc.filePosition+recLen, durableEnd.Load(),
+							assert.LessOrEqual(t, loc.pos.position+recLen, durableEnd.Load(),
 								"offset %d (pos %d, len %d) must be covered by the durable end %d when its completion fires",
-								off, loc.filePosition, recLen, durableEnd.Load())
+								off, loc.pos.position, recLen, durableEnd.Load())
 						}
 						done <- struct{}{}
 					})

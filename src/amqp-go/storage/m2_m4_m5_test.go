@@ -110,7 +110,7 @@ func TestM2_BatchSegmentAck(t *testing.T) {
 		}
 	}
 
-	if err := sm.CheckpointBatch("test-batch-ack", msgs); err != nil {
+	if err := writeLegacyBatchForTest(sm, "test-batch-ack", msgs); err != nil {
 		t.Fatalf("CheckpointBatch: %v", err)
 	}
 
@@ -173,7 +173,7 @@ func TestM5_BatchCheckpointWrites(t *testing.T) {
 	}
 
 	// Batch write all messages
-	if err := sm.CheckpointBatch("test-batch-write", msgs); err != nil {
+	if err := writeLegacyBatchForTest(sm, "test-batch-write", msgs); err != nil {
 		t.Fatalf("CheckpointBatch: %v", err)
 	}
 
@@ -226,7 +226,7 @@ func TestM5_BatchCheckpointWithRollover(t *testing.T) {
 	}
 
 	// Batch write — should trigger rollover
-	err = sm.CheckpointBatch("test-rollover", msgs)
+	err = writeLegacyBatchForTest(sm, "test-rollover", msgs)
 	require.NoError(t, err, "CheckpointBatch with rollover should succeed")
 
 	// Read back all messages across both segments

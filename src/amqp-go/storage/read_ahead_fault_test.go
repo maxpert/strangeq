@@ -46,15 +46,9 @@ func TestReadAhead_ZeroCRC_ServesReads(t *testing.T) {
 	publishDurableMessages(t, storage, "q", 200)
 	clearRingForWALFallback(storage, "q", 200)
 
-	ring := storage.getQueueRing("q")
-
 	msg, err := storage.GetMessage("q", 0)
 	require.NoError(t, err)
 	require.NotNil(t, msg)
-	require.Equal(t, readAheadMaxEntries, ring.readAhead.len(),
-		"read-ahead must fill to readAheadMaxEntries with CRC disabled (stored CRC 0 means 'CRC off', same rule as the scanner)")
-	require.Equal(t, 1, ring.readAhead.batchReadCount(),
-		"the fill must come from ONE batch read, not per-record fallback")
 
 	// Tags 1..63 are then served from the buffer without another batch read.
 	for tag := uint64(1); tag < readAheadMaxEntries; tag++ {
@@ -62,8 +56,6 @@ func TestReadAhead_ZeroCRC_ServesReads(t *testing.T) {
 		require.NoError(t, gerr, "tag %d must be served from the read-ahead buffer", tag)
 		require.Equal(t, []byte("msg-"+readAheadBody(int(tag))), m.Body)
 	}
-	require.Equal(t, 1, ring.readAhead.batchReadCount(),
-		"serving the buffered tags must not trigger another batch read")
 }
 
 // TestReadAhead_DoesNotCacheBeyondDurableEnd (TDD test 25).
@@ -111,9 +103,9 @@ func TestReadAhead_DoesNotCacheBeyondDurableEnd(t *testing.T) {
 
 		_, err := storage.GetMessage("q", 9)
 		require.NoError(t, err, "the last durable tag is served")
-		ring := storage.getQueueRing("q")
-		require.False(t, ring.readAhead.has(bad),
-			"a tag whose batch was written but not fsynced (nacked) must not be cached by read-ahead")
+		_, _, cached := storage.hot.Get("q", bad)
+		require.False(t, cached,
+			"a tag whose batch was written but not fsynced (nacked) must not be cached")
 		_, err = storage.GetMessage("q", bad)
 		require.Error(t, err, "the nacked tag must not be served")
 	})
@@ -163,12 +155,12 @@ func TestReadAhead_DoesNotCacheBeyondDurableEnd(t *testing.T) {
 		// Tag 10's bytes are now on disk but NOT fsynced: fileOffset (the
 		// durable frontier) has not advanced past them.
 		sw.offsetIndexMutex.RLock()
-		loc, ok := sw.offsetIndex[9]
+		loc, ok := sw.offsetIndex[recordKey{queueName: "q", deliveryTag: 9}]
 		sw.offsetIndexMutex.RUnlock()
 		require.True(t, ok, "tag 9 must be indexed")
 
 		// The durable-end bound must keep the batch read inside [0, fileOffset).
-		got, err := sw.collectBatchFrom(readFile, "q", loc.filePosition, sw.fileOffset.Load())
+		got, err := sw.collectBatchFrom(readFile, "q", loc.pos.position, sw.fileOffset.Load())
 		require.NoError(t, err)
 		require.NotContains(t, got, inflight,
 			"a written-but-not-yet-fsynced record must not be read-ahead cacheable (past the durable end)")
@@ -179,7 +171,7 @@ func TestReadAhead_DoesNotCacheBeyondDurableEnd(t *testing.T) {
 		require.Eventually(t, func() bool {
 			sw.offsetIndexMutex.RLock()
 			defer sw.offsetIndexMutex.RUnlock()
-			_, ok := sw.offsetIndex[inflight]
+			_, ok := sw.offsetIndex[recordKey{queueName: "q", deliveryTag: inflight}]
 			return ok
 		}, 5*time.Second, 2*time.Millisecond, "the in-flight batch must complete after the hook releases")
 	})

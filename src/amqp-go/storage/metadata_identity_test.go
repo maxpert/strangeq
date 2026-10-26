@@ -260,7 +260,7 @@ func TestStoragePath_ArtifactPathsAreAbsoluteAtShippedDefaults(t *testing.T) {
 
 	// And a real fault carries it. A queue name that cannot be a path element
 	// forces a generated directory, whose Degraded fault names a full path.
-	require.NoError(t, ds.segments.CheckpointBatch("../nope", segTestMessages("../nope", []uint64{1})))
+	require.NoError(t, writeLegacyBatchForTest(ds.segments, "../nope", segTestMessages("../nope", []uint64{1})))
 	val, ok := ds.segments.queueSegments.Load("../nope")
 	require.True(t, ok)
 	require.True(t, filepath.IsAbs(val.(*QueueSegments).dataDir),

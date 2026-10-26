@@ -12,13 +12,13 @@ package storage
 //	    inside that scope.
 //	        edge: oldFileCacheMutex -> bitmapMutex
 //
-//	QueueWAL.tryDeleteOldFiles holds bitmapMutex.RLock via defer and calls
+//	QueueWAL.tryReclaimOldFiles holds bitmapMutex.RLock via defer and calls
 //	    closeOldFileHandle, which takes oldFileCacheMutex.Lock() unconditionally —
 //	    whether or not that fileNum is actually cached.
 //	        edge: bitmapMutex -> oldFileCacheMutex
 //
 //	WALManager.Acknowledge takes bitmapMutex.Lock() on the CALLER's goroutine, so
-//	    a pending writer can coexist with tryDeleteOldFiles' read lock. This is
+//	    a pending writer can coexist with tryReclaimOldFiles' read lock. This is
 //	    the leg that closes the cycle.
 //
 // THE INTERLEAVING:
@@ -40,7 +40,7 @@ package storage
 //	ackers   wm.Acknowledge in a loop over a DISJOINT set of offsets, supplying
 //	         both the bitmapMutex.Lock writer traffic and, as whole files become
 //	         fully acknowledged, the allAcked reclaims that make
-//	         tryDeleteOldFiles reach closeOldFileHandle.
+//	         tryReclaimOldFiles reach closeOldFileHandle.
 //	cleaner  the shipped cleanupLoop, at CleanupInterval=1ms.
 //
 // The read set and the ack set are disjoint BY FILE and this is load-bearing:
@@ -73,7 +73,7 @@ package storage
 //
 //	readMessageBatch  blocked in  sync.(*RWMutex).RLock   (bitmapMutex)
 //	Acknowledge       blocked in  sync.(*RWMutex).Lock    (bitmapMutex)
-//	tryDeleteOldFiles blocked in  sync.(*RWMutex).Lock    (oldFileCacheMutex,
+//	tryReclaimOldFiles blocked in  sync.(*RWMutex).Lock    (oldFileCacheMutex,
 //	                                                       via closeOldFileHandle)
 
 import (
@@ -94,7 +94,7 @@ import (
 const (
 	deadlockQueue = "deadlock.q"
 	// Small files so a few hundred records produce many rolled files: every
-	// reclaim of a fully-acked one is another chance for tryDeleteOldFiles to
+	// reclaim of a fully-acked one is another chance for tryReclaimOldFiles to
 	// reach closeOldFileHandle while a reader holds oldFileCacheMutex.RLock.
 	deadlockWALFileSize = 4 * 1024
 	deadlockRecords     = 2000
@@ -262,7 +262,7 @@ func TestWALAckReadDeadlock_ColdReadVersusAckVersusReclaim(t *testing.T) {
 
 	require.GreaterOrEqual(t, rolledFiles, 10,
 		"PREMISE BROKEN: only %d rolled WAL file(s) at FileSize=%d after %d records. The cycle "+
-			"needs tryDeleteOldFiles to actually RECLAIM files (that is the only path to "+
+			"needs tryReclaimOldFiles to actually RECLAIM files (that is the only path to "+
 			"closeOldFileHandle), and reclaims require whole files to become fully acknowledged",
 		rolledFiles, deadlockWALFileSize, deadlockRecords)
 	require.NotEmpty(t, readOffsets,
@@ -270,7 +270,7 @@ func TestWALAckReadDeadlock_ColdReadVersusAckVersusReclaim(t *testing.T) {
 			"read target and readMessageBatch's cache-hit path is never exercised")
 	require.NotEmpty(t, ackOffsets,
 		"PREMISE BROKEN: no offsets outside the highest rolled file, so no file can become "+
-			"fully acknowledged and tryDeleteOldFiles never reaches closeOldFileHandle")
+			"fully acknowledged and tryReclaimOldFiles never reaches closeOldFileHandle")
 
 	// ---- PREMISE: a cold read of that file genuinely SUCCEEDS and populates
 	//      the handle cache, so subsequent reads take the cache-HIT path.
@@ -421,7 +421,7 @@ func TestWALAckReadDeadlock_ColdReadVersusAckVersusReclaim(t *testing.T) {
 			"leg that closes the cycle was barely driven", acks.Load())
 	require.Less(t, remaining, rolledFiles,
 		"PREMISE BROKEN: no rolled WAL file was reclaimed during the storm, so "+
-			"tryDeleteOldFiles never reached closeOldFileHandle and the cycle's second edge "+
+			"tryReclaimOldFiles never reached closeOldFileHandle and the cycle's second edge "+
 			"was never taken. A green here says nothing about the deadlock")
 }
 
@@ -445,7 +445,7 @@ func failWedged(t *testing.T, wedged *atomic.Bool, elapsed time.Duration, reads,
 
 	readBatch := countBlockedIn(dump, "readMessageBatch")
 	acknowledge := countBlockedIn(dump, "Acknowledge")
-	reclaim := countBlockedIn(dump, "tryDeleteOldFiles")
+	reclaim := countBlockedIn(dump, "tryReclaimOldFiles")
 
 	signature := "F1 SIGNATURE MATCHED"
 	if readBatch == 0 || acknowledge == 0 || reclaim == 0 {
@@ -456,9 +456,9 @@ func failWedged(t *testing.T, wedged *atomic.Bool, elapsed time.Duration, reads,
 	t.Fatalf("DEADLOCK: %s.\n"+
 		"  storm elapsed: %s; ReadBatch attempts %d (%d succeeded); Acknowledge %d\n"+
 		"  %s: goroutines blocked in sync.RWMutex — readMessageBatch=%d, Acknowledge=%d, "+
-		"tryDeleteOldFiles=%d\n"+
+		"tryReclaimOldFiles=%d\n"+
 		"  Expected F1 frames: readMessageBatch on bitmapMutex.RLock, Acknowledge on "+
-		"bitmapMutex.Lock, tryDeleteOldFiles on oldFileCacheMutex.Lock via closeOldFileHandle.\n"+
+		"bitmapMutex.Lock, tryReclaimOldFiles on oldFileCacheMutex.Lock via closeOldFileHandle.\n"+
 		"  Full dump: %s",
 		why, elapsed, reads, readOK, acks, signature, readBatch, acknowledge, reclaim, dumpPath)
 }

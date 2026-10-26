@@ -79,7 +79,7 @@ func buildSealedSegment(t *testing.T, sm *SegmentManager, queueName string, coun
 	// then sealed. Writing record-by-record would seal a PREFIX and leave the
 	// rest in the active segment, where compaction never looks — the fixture
 	// would sit outside the regime the defect lives in.
-	require.NoError(t, sm.CheckpointBatch(queueName, segTestMessages(queueName, offsets)))
+	require.NoError(t, writeLegacyBatchForTest(sm, queueName, segTestMessages(queueName, offsets)))
 
 	val, ok := sm.queueSegments.Load(queueName)
 	require.True(t, ok, "PREMISE: no QueueSegments was created for %q", queueName)
@@ -162,7 +162,7 @@ func TestSegmentPath_ClientControlledQueueNameCannotEscapeTheDataDirectory(t *te
 
 	for _, name := range hostile {
 		t.Run(name, func(t *testing.T) {
-			require.NoError(t, sm.CheckpointBatch(name, segTestMessages(name, []uint64{1, 2, 3})))
+			require.NoError(t, writeLegacyBatchForTest(sm, name, segTestMessages(name, []uint64{1, 2, 3})))
 
 			// (a) nothing may exist outside the segments directory
 			entries, err := os.ReadDir(canaryDir)
@@ -219,7 +219,7 @@ func TestSegmentManager_CloseIsIdempotent(t *testing.T) {
 	dataDir := t.TempDir()
 	sm, err := NewSegmentManagerWithConfig(dataDir, segTestConfig())
 	require.NoError(t, err)
-	require.NoError(t, sm.CheckpointBatch("idem", segTestMessages("idem", []uint64{1, 2})))
+	require.NoError(t, writeLegacyBatchForTest(sm, "idem", segTestMessages("idem", []uint64{1, 2})))
 
 	require.NoError(t, sm.Close())
 	require.NotPanics(t, func() { _ = sm.Close() },
@@ -253,7 +253,7 @@ func TestSegmentPath_OrdinaryQueueNamesKeepTheirExistingDirectory(t *testing.T) 
 		"50%off",
 	}
 	for _, name := range ordinary {
-		require.NoError(t, sm.CheckpointBatch(name, segTestMessages(name, []uint64{1})))
+		require.NoError(t, writeLegacyBatchForTest(sm, name, segTestMessages(name, []uint64{1})))
 		want := filepath.Join(sm.dataDir, name)
 		st, err := os.Stat(want)
 		require.NoError(t, err, "queue %q must still use the directory it uses today: %s", name, want)
@@ -520,7 +520,7 @@ func seedQueueSegment(t *testing.T, dataDir, queueName string, count int) string
 	for i := 1; i <= count; i++ {
 		offsets = append(offsets, uint64(i))
 	}
-	require.NoError(t, sm.CheckpointBatch(queueName, segTestMessages(queueName, offsets)))
+	require.NoError(t, writeLegacyBatchForTest(sm, queueName, segTestMessages(queueName, offsets)))
 	require.NoError(t, sm.Close())
 
 	segDir := filepath.Join(dataDir, "segments", queueName)

@@ -15,6 +15,7 @@ import (
 )
 
 func TestSegmentResidentMessagesRecoveredAfterRestart(t *testing.T) {
+	t.Skip("checkpoint copying removed in segstore v1")
 	tmpDir := t.TempDir()
 
 	engineCfg := interfaces.EngineConfig{
@@ -28,7 +29,7 @@ func TestSegmentResidentMessagesRecoveredAfterRestart(t *testing.T) {
 	require.NoError(t, err)
 
 	queueName := "restart-test-queue"
-	_ = ds.getOrCreateQueueRing(queueName)
+	_ = ds.getOrCreateQueueHot(queueName)
 
 	numMessages := 20
 	for i := 1; i <= numMessages; i++ {
@@ -103,7 +104,7 @@ func TestSegmentRecovery_TornTailIsBenignAndDoesNotRewriteTheFile(t *testing.T) 
 			},
 		})
 	}
-	require.NoError(t, sm.CheckpointBatch(queueName, msgs))
+	require.NoError(t, writeLegacyBatchForTest(sm, queueName, msgs))
 	require.NoError(t, sm.Close())
 
 	segDir := filepath.Join(sm.dataDir, queueName)

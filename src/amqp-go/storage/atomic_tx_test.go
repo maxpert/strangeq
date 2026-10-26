@@ -56,7 +56,7 @@ func durableWALCount(t *testing.T, ds *DisruptorStorage, queueName string) int {
 func TestExecuteAtomic_RollsBackAllOpsOnMidBatchFailure(t *testing.T) {
 	ds := atomicTestStorage(t)
 	queueName := "atomic-rollback-q"
-	_ = ds.getOrCreateQueueRing(queueName)
+	_ = ds.getOrCreateQueueHot(queueName)
 
 	injected := errors.New("injected mid-transaction operation failure")
 
@@ -88,7 +88,7 @@ func TestExecuteAtomic_RollsBackAllOpsOnMidBatchFailure(t *testing.T) {
 func TestExecuteAtomic_CommitAppliesAllOps(t *testing.T) {
 	ds := atomicTestStorage(t)
 	queueName := "atomic-commit-q"
-	_ = ds.getOrCreateQueueRing(queueName)
+	_ = ds.getOrCreateQueueHot(queueName)
 
 	err := ds.ExecuteAtomic(func(txn interfaces.Storage) error {
 		require.NoError(t, txn.StoreMessage(queueName, &protocol.Message{
@@ -122,7 +122,7 @@ func TestExecuteAtomic_CommitAppliesAllOps(t *testing.T) {
 func TestExecuteAtomic_SettlementsRolledBackOnFailure(t *testing.T) {
 	ds := atomicTestStorage(t)
 	queueName := "atomic-settle-q"
-	_ = ds.getOrCreateQueueRing(queueName)
+	_ = ds.getOrCreateQueueHot(queueName)
 
 	// Seed one durable message (outside any transaction).
 	require.NoError(t, ds.StoreMessage(queueName, &protocol.Message{

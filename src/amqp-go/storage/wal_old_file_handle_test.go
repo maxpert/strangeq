@@ -124,16 +124,16 @@ func newRolledWAL(t *testing.T) *rolledWAL {
 			"to read back through the old-file path", rolled)
 
 	sw.offsetIndexMutex.RLock()
-	loc, ok := sw.offsetIndex[offset]
+	loc, ok := sw.offsetIndex[recordKey{queueName: oldHandleQueue, deliveryTag: offset}]
 	sw.offsetIndexMutex.RUnlock()
 	require.True(t, ok,
 		"PREMISE BROKEN: offset %d has no offsetIndex entry, so the production read path could not "+
 			"reach it either", offset)
-	require.Equal(t, fileNum, loc.fileNum,
+	require.Equal(t, fileNum, loc.pos.segmentID,
 		"PREMISE BROKEN: the offsetIndex places offset %d in file %d, not the rolled file %d it was "+
-			"selected from", offset, loc.fileNum, fileNum)
+			"selected from", offset, loc.pos.segmentID, fileNum)
 
-	r.wm, r.sw, r.fileNum, r.path, r.offset, r.position = wm, sw, fileNum, path, offset, loc.filePosition
+	r.wm, r.sw, r.fileNum, r.path, r.offset, r.position = wm, sw, fileNum, path, offset, loc.pos.position
 	return r
 }
 
@@ -193,7 +193,7 @@ func TestGetOldFileHandle_ReleasesTheCacheLockBeforeReturning(t *testing.T) {
 		"getOldFileHandle returned while STILL HOLDING oldFileCacheMutex. The caller then holds "+
 			"that lock across its ReadAt and across anything else it does with the handle — which "+
 			"is edge 4 of the F1 cycle: readMessageBatch takes bitmapMutex.RLock inside that scope "+
-			"while tryDeleteOldFiles holds bitmapMutex.RLock and waits for oldFileCacheMutex.Lock")
+			"while tryReclaimOldFiles holds bitmapMutex.RLock and waits for oldFileCacheMutex.Lock")
 }
 
 // TestClosedOldFileHandle_ReadAtYieldsTypedErrClosed asserts the PLATFORM

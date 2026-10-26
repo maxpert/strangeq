@@ -70,11 +70,12 @@ func (in *walIncarnation) writeBody(queue string, offset uint64, body string) {
 func indexedFileNum(qw *QueueWAL, tag uint64) (uint64, bool) {
 	qw.offsetIndexMutex.RLock()
 	defer qw.offsetIndexMutex.RUnlock()
-	loc, ok := qw.offsetIndex[tag]
-	if !ok {
-		return 0, false
+	for key, loc := range qw.offsetIndex {
+		if key.deliveryTag == tag {
+			return loc.pos.segmentID, true
+		}
 	}
-	return loc.fileNum, true
+	return 0, false
 }
 
 // ---------------------------------------------------------------------------
@@ -141,7 +142,7 @@ func TestAmbiguousTag_ReadPathReturnsTheNewestRecord(t *testing.T) {
 	in.wal.Acknowledge(ambiguousQueue, tag)
 	waitForAcksApplied(t, in.wal, []uint64{tag})
 	in.wal.sharedWAL.bitmapMutex.RLock()
-	acked := in.wal.sharedWAL.ackBitmap.Contains(tag)
+	acked := in.wal.sharedWAL.ackBitmaps[ambiguousQueue].Contains(tag)
 	in.wal.sharedWAL.bitmapMutex.RUnlock()
 	t.Logf("RESULT (c) a single Acknowledge(tag=%d) marks the tag acked=%v — it cannot "+
 		"distinguish which of the two records it cancels", tag, acked)
@@ -302,8 +303,7 @@ func TestAmbiguousTag_RealAckPathProducesTheStaleReadState(t *testing.T) {
 
 	// THE ONLY ACTION: a real acknowledgement through the production API.
 	in.wal.Acknowledge(ambiguousQueue, tag)
-	waitForIndexEntryGone(t, qw, tag)
-	t.Logf("PREMISE: the production ack path removed offsetIndex[%d] (no hand editing)", tag)
+	t.Logf("PREMISE: the production ack path synchronously installed the read gate")
 
 	// The reaper's probe, at the layer where the answer is decided.
 	msg, err := qw.readMessage(ambiguousQueue, tag)
@@ -371,19 +371,17 @@ func TestCrossFileIndexEviction_CostIsAWrongPayloadNotASlowRead(t *testing.T) {
 	// checkpoint does. Done directly so the test measures the READ, not the
 	// route that caused the miss.
 	qw.offsetIndexMutex.Lock()
-	delete(qw.offsetIndex, tag)
+	for key := range qw.offsetIndex {
+		if key.deliveryTag == tag {
+			delete(qw.offsetIndex, key)
+			delete(qw.recordCopies, key)
+		}
+	}
 	qw.offsetIndexMutex.Unlock()
 
 	msg, err := qw.readMessage(ambiguousQueue, tag)
-	require.NoError(t, err, "the record is physically present; a read error is a third outcome")
+	require.Error(t, err, "an index miss is an error; the ambiguous sequential fallback was removed")
+	require.Nil(t, msg)
 	t.Logf("RESULT: with the index entry evicted and %d oldFiles entry/entries carrying tag %d, "+
-		"readMessage returned body=%q", decoyFiles, tag, string(msg.Body))
-
-	require.Equal(t, "NEW", string(msg.Body),
-		"WRONG PAYLOAD: after the index entry for tag %d was evicted, the sequential fallback "+
-			"returned a PREVIOUS record's bytes (%q) instead of the current incarnation's "+
-			"record (NEW). readMessageSequential iterates oldFiles in Go map order and returns "+
-			"the first file whose bitmap contains the offset, so with an ambiguous tag it can "+
-			"answer with either record. That is cross-incarnation payload corruption, not a "+
-			"slow read", tag, string(msg.Body))
+		"readMessage refused the ambiguous lookup instead of returning an older payload", decoyFiles, tag)
 }

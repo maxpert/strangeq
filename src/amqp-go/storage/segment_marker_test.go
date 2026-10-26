@@ -154,7 +154,7 @@ func TestSegmentMarker_ZeroLengthMarkerCannotStrandACheckpointedQueue(t *testing
 	const queueName = "orders"
 	for i := uint64(1); i <= 3; i++ {
 		msg := &protocol.Message{Exchange: "ex", RoutingKey: "rk", Body: []byte("payload")}
-		require.NoError(t, sm.Write(queueName, msg, i))
+		require.NoError(t, writeLegacyForTest(sm, queueName, msg, i))
 	}
 	require.NoError(t, sm.Close())
 
@@ -463,7 +463,7 @@ func TestSegmentMarker_EmptyNameCreatesNoDirectoryAndLeaksNone(t *testing.T) {
 		"PREMISE: the segments root must start empty or this fixture proves nothing")
 
 	// One attempt: the fault must be true when it says nothing was modified.
-	cerr := sm.CheckpointBatch("", segTestMessages("", []uint64{1000}))
+	cerr := writeLegacyBatchForTest(sm, "", segTestMessages("", []uint64{1000}))
 	require.Error(t, cerr)
 	require.Empty(t, segmentDirEntries(t, segRoot),
 		"the empty-name refusal created a directory on disk; the guard is downstream of "+
@@ -471,7 +471,7 @@ func TestSegmentMarker_EmptyNameCreatesNoDirectoryAndLeaksNone(t *testing.T) {
 
 	// Many attempts: the retry shape performCheckpoint actually produces.
 	for i := 0; i < 70; i++ {
-		require.Error(t, sm.CheckpointBatch("", segTestMessages("", []uint64{uint64(2000 + i)})))
+		require.Error(t, writeLegacyBatchForTest(sm, "", segTestMessages("", []uint64{uint64(2000 + i)})))
 	}
 	require.Empty(t, segmentDirEntries(t, segRoot),
 		"repeated empty-name checkpoints leaked directories; each retry probed one candidate "+

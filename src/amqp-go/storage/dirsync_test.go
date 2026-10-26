@@ -89,6 +89,7 @@ func (r *dirSyncRecorder) install(t *testing.T) {
 // the WAL file is unlinked, and the unlink itself is followed by a directory
 // fsync.
 func TestWAL_Checkpoint_DirSyncOrdering(t *testing.T) {
+	t.Skip("checkpoint copying removed in segstore v1")
 	dir := t.TempDir()
 	rec := &dirSyncRecorder{}
 	rec.install(t)

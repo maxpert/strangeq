@@ -45,7 +45,7 @@ func TestLogCompaction_FullLifecycle(t *testing.T) {
 
 	// === Step 2: Write durable messages across 3 queues ===
 	for _, queue := range queues {
-		_ = ds.getOrCreateQueueRing(queue)
+		_ = ds.getOrCreateQueueHot(queue)
 		for i := 1; i <= messagesPerQueue; i++ {
 			msg := &protocol.Message{
 				Exchange:     "amq.direct",
@@ -122,7 +122,7 @@ func TestLogCompaction_FullLifecycle(t *testing.T) {
 	// === Step 7: Verify segment compaction triggers ===
 	// Write more messages and ACK a majority to trigger segment compaction
 	segQueue := "compaction_test"
-	_ = ds.getOrCreateQueueRing(segQueue)
+	_ = ds.getOrCreateQueueHot(segQueue)
 
 	for i := uint64(1); i <= 50; i++ {
 		msg := &protocol.Message{
@@ -205,10 +205,9 @@ func TestLogCompaction_FullLifecycle(t *testing.T) {
 	ds2.Close()
 }
 
-// TestLogCompaction_RetentionWithCheckpoint tests that time-based retention
-// correctly force-checkpoints messages to segments before deleting expired
-// WAL files, and that those messages survive a restart.
-func TestLogCompaction_RetentionWithCheckpoint(t *testing.T) {
+// TestLogCompaction_RetentionKeepsUnacked proves that expiry neither
+// force-checkpoints nor deletes unacknowledged WAL records.
+func TestLogCompaction_RetentionKeepsUnacked(t *testing.T) {
 	tmpDir := t.TempDir()
 
 	engineCfg := interfaces.EngineConfig{
@@ -256,28 +255,32 @@ func TestLogCompaction_RetentionWithCheckpoint(t *testing.T) {
 	// Wait for retention to expire
 	time.Sleep(200 * time.Millisecond)
 
-	// Trigger cleanup — should force-checkpoint and delete
-	wm.sharedWAL.tryDeleteOldFiles()
+	wm.sharedWAL.oldFilesMutex.RLock()
+	oldCount := len(wm.sharedWAL.oldFiles)
+	wm.sharedWAL.oldFilesMutex.RUnlock()
+	wm.sharedWAL.tryReclaimOldFiles()
 
 	wm.sharedWAL.oldFilesMutex.RLock()
 	remaining := len(wm.sharedWAL.oldFiles)
 	wm.sharedWAL.oldFilesMutex.RUnlock()
-	assert.Equal(t, 0, remaining, "all expired files should be deleted")
+	assert.Equal(t, oldCount, remaining, "expiry must not delete unacknowledged files")
 
-	// Verify force-checkpointed messages are readable from segments
-	checkpointedCount := 0
 	for i := uint64(1); i <= 30; i++ {
 		queue := "queue_a"
 		if i > 15 {
 			queue = "queue_b"
 		}
-		_, err := sm.Read(queue, i)
-		if err == nil {
-			checkpointedCount++
-		}
+		_, err := wm.Read(queue, i)
+		require.NoError(t, err)
+		_, err = sm.Read(queue, i)
+		require.Error(t, err, "retention must not checkpoint just to time-delete")
+		wm.Acknowledge(queue, i)
 	}
-	assert.Greater(t, checkpointedCount, 0,
-		"force-checkpointed messages should be readable from segments")
+	wm.sharedWAL.tryReclaimOldFiles()
+	wm.sharedWAL.oldFilesMutex.RLock()
+	remaining = len(wm.sharedWAL.oldFiles)
+	wm.sharedWAL.oldFilesMutex.RUnlock()
+	assert.Zero(t, remaining, "acknowledgement permits whole-file reclaim")
 
 	wm.Close()
 	sm.Close()
@@ -343,7 +346,7 @@ func TestLogCompaction_LargeOffsetLifecycle(t *testing.T) {
 		wm.Acknowledge("large_queue", baseOffset+i)
 	}
 	time.Sleep(100 * time.Millisecond)
-	wm.sharedWAL.tryDeleteOldFiles()
+	wm.sharedWAL.tryReclaimOldFiles()
 
 	wm.sharedWAL.oldFilesMutex.RLock()
 	assert.Equal(t, 0, len(wm.sharedWAL.oldFiles),
@@ -371,7 +374,7 @@ func TestLogCompaction_TierFallback(t *testing.T) {
 	require.NotNil(t, ds)
 
 	queue := "tier_test"
-	_ = ds.getOrCreateQueueRing(queue)
+	_ = ds.getOrCreateQueueHot(queue)
 
 	// Write a durable message
 	msg := &protocol.Message{
@@ -391,8 +394,7 @@ func TestLogCompaction_TierFallback(t *testing.T) {
 	assert.Equal(t, []byte("tier-fallback-message"), readMsg.Body)
 
 	// Clear ring buffer to force WAL fallback
-	ring := ds.getQueueRing(queue)
-	ring.ring.Delete(42)
+	ds.hot.Delete(queue, 42)
 
 	// Tier 2: Read from WAL (ring buffer cleared)
 	readMsg, err = ds.GetMessage(queue, 42)
@@ -407,7 +409,8 @@ func TestLogCompaction_TierFallback(t *testing.T) {
 
 	// Remove from WAL offset index to force segment fallback
 	ds.wal.sharedWAL.offsetIndexMutex.Lock()
-	delete(ds.wal.sharedWAL.offsetIndex, 42)
+	delete(ds.wal.sharedWAL.offsetIndex, recordKey{queueName: queue, deliveryTag: 42})
+	delete(ds.wal.sharedWAL.recordCopies, recordKey{queueName: queue, deliveryTag: 42})
 	ds.wal.sharedWAL.offsetIndexMutex.Unlock()
 
 	// Tier 3: Read from segments (ring buffer + WAL cleared)

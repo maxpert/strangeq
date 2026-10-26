@@ -26,7 +26,7 @@ func TestSegment_DeletedCountIncrement(t *testing.T) {
 			Body:        []byte("test message"),
 			DeliveryTag: i,
 		}
-		err := sm.Write(queueName, msg, i)
+		err := writeLegacyForTest(sm, queueName, msg, i)
 		require.NoError(t, err)
 	}
 
@@ -81,7 +81,7 @@ func TestSegment_CompactionTriggers(t *testing.T) {
 			Body:        []byte("test message for compaction"),
 			DeliveryTag: i,
 		}
-		err := sm.Write(queueName, msg, i)
+		err := writeLegacyForTest(sm, queueName, msg, i)
 		require.NoError(t, err)
 	}
 
@@ -150,7 +150,7 @@ func TestSegment_CompactionPreservesUnacked(t *testing.T) {
 			Body:        []byte("unacked message body"),
 			DeliveryTag: i,
 		}
-		err := sm.Write(queueName, msg, i)
+		err := writeLegacyForTest(sm, queueName, msg, i)
 		require.NoError(t, err)
 	}
 
@@ -224,7 +224,7 @@ func TestSegment_RolloverDuringWrite(t *testing.T) {
 	go func() {
 		for i := uint64(1); i <= 10; i++ {
 			msg := &protocol.Message{Body: []byte("x")}
-			if err := sm.Write("rollover_queue", msg, i); err != nil {
+			if err := writeLegacyForTest(sm, "rollover_queue", msg, i); err != nil {
 				done <- err
 				return
 			}
@@ -264,7 +264,7 @@ func TestSegment_DeletedCountNotIncrementedWithoutFix(t *testing.T) {
 			Body:        []byte("test"),
 			DeliveryTag: i,
 		}
-		err := sm.Write(queueName, msg, i)
+		err := writeLegacyForTest(sm, queueName, msg, i)
 		require.NoError(t, err)
 	}
 

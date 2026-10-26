@@ -293,7 +293,7 @@ func TestSegment_AllProperties_RoundTrip(t *testing.T) {
 
 	deathTime := time.Unix(1720000005, 0).UTC()
 	msg := allPropertiesMessage(deathTime)
-	require.NoError(t, sm.Write("segq", msg, 7))
+	require.NoError(t, writeLegacyForTest(sm, "segq", msg, 7))
 
 	// In-process read.
 	got, err := sm.Read("segq", 7)
@@ -329,9 +329,9 @@ func TestSegment_AllProperties_SurviveCompaction(t *testing.T) {
 	deathTime := time.Unix(1720000006, 0).UTC()
 	// Write 5 messages; #1 carries all properties (the survivor we check).
 	survivor := allPropertiesMessage(deathTime)
-	require.NoError(t, sm.Write("cq", survivor, 1))
+	require.NoError(t, writeLegacyForTest(sm, "cq", survivor, 1))
 	for i := uint64(2); i <= 5; i++ {
-		require.NoError(t, sm.Write("cq", &protocol.Message{Body: []byte("filler"), DeliveryMode: 1}, i))
+		require.NoError(t, writeLegacyForTest(sm, "cq", &protocol.Message{Body: []byte("filler"), DeliveryMode: 1}, i))
 	}
 
 	val, ok := sm.queueSegments.Load("cq")

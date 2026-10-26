@@ -122,7 +122,7 @@ func TestWALFileNum_ReclamationNeverRemovesTheHighestNumberedFile(t *testing.T) 
 	defer in.close()
 
 	// A survivor: one unacknowledged record pins the file it lands in, so that
-	// file can never satisfy tryDeleteOldFiles' all-acked predicate.
+	// file can never satisfy tryReclaimOldFiles' all-acked predicate.
 	in.write(filenumSurvivorQueue, 101, "survivor")
 
 	// Roll twice. Roll 1 retires the file holding the survivor; roll 2 retires a
@@ -144,7 +144,7 @@ func TestWALFileNum_ReclamationNeverRemovesTheHighestNumberedFile(t *testing.T) 
 			"test's whole question is whether the MAXIMUM can be reclaimed",
 		activeBefore, before)
 
-	in.wal.sharedWAL.tryDeleteOldFiles()
+	in.wal.sharedWAL.tryReclaimOldFiles()
 
 	after := walFileNumsOnDisk(t, in.sharedDir)
 	var reclaimed []uint64
@@ -242,7 +242,7 @@ func TestWALFileNum_NoIncarnationReopensAUsedStem(t *testing.T) {
 			}
 		}
 
-		in.wal.sharedWAL.tryDeleteOldFiles()
+		in.wal.sharedWAL.tryReclaimOldFiles()
 		onDisk := walFileNumsOnDisk(t, in.sharedDir)
 		t.Logf("BOOT %d: opened stem %d; after churn+reclamation files on disk = %v (max=%d); "+
 			"stems used so far = %d", boot, opened, onDisk, maxOf(onDisk), len(used))

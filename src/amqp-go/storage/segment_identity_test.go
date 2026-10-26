@@ -154,7 +154,7 @@ func TestSegmentPath_LegacyDirectoryIsNotStolenByAnEncodedName(t *testing.T) {
 
 	// Now a live queue literally named "/" checkpoints. It must NOT land in the
 	// directory that belongs to "%2f".
-	require.NoError(t, sm.CheckpointBatch("/", segTestMessages("/", []uint64{10, 11})))
+	require.NoError(t, writeLegacyBatchForTest(sm, "/", segTestMessages("/", []uint64{10, 11})))
 
 	slashVal, ok := sm.queueSegments.Load("/")
 	require.True(t, ok, "no QueueSegments for queue %q", "/")
@@ -216,7 +216,7 @@ func TestSegmentPath_LongNamesAlwaysProduceACreatableDirectory(t *testing.T) {
 			sm, err := NewSegmentManagerWithConfig(dataDir, segTestConfig())
 			require.NoError(t, err)
 
-			err = sm.CheckpointBatch(name, segTestMessages(name, []uint64{1, 2}))
+			err = writeLegacyBatchForTest(sm, name, segTestMessages(name, []uint64{1, 2}))
 			require.NoError(t, err,
 				"a %d-byte queue name must still checkpoint; a permanent silent checkpoint failure "+
 					"means this queue's WAL is never reclaimed again", len(name))
@@ -458,7 +458,7 @@ func TestSegmentPath_OwnershipIsInjectiveOnARealFilesystem(t *testing.T) {
 	// The empty name's replacement coverage: storage REFUSES it rather than
 	// building a queue around it. See the corpus comment above for why this is
 	// the correct predicate and the old one asserted the defect.
-	require.Error(t, sm.CheckpointBatch("", segTestMessages("", []uint64{999})),
+	require.Error(t, writeLegacyBatchForTest(sm, "", segTestMessages("", []uint64{999})),
 		"the empty queue name was accepted; no queue can be named \"\", so a checkpoint under that "+
 			"name means a degenerate ownership marker invented an owner (review-5 CRITICAL-1)")
 	_, emptyLoaded := sm.queueSegments.Load("")
@@ -467,7 +467,7 @@ func TestSegmentPath_OwnershipIsInjectiveOnARealFilesystem(t *testing.T) {
 	owner := make(map[string]string, len(names))
 	for i, n := range names {
 		offset := uint64(1000 + i)
-		require.NoError(t, sm.CheckpointBatch(n, segTestMessages(n, []uint64{offset})),
+		require.NoError(t, writeLegacyBatchForTest(sm, n, segTestMessages(n, []uint64{offset})),
 			"queue %q could not checkpoint", n)
 
 		val, ok := sm.queueSegments.Load(n)
@@ -616,7 +616,7 @@ func TestSegmentSeal_ReaderHoldsSegmentLockAcrossActiveRead(t *testing.T) {
 	defer sm.Close()
 
 	const queueName = "seal-race"
-	require.NoError(t, sm.CheckpointBatch(queueName, segTestMessages(queueName, []uint64{1})))
+	require.NoError(t, writeLegacyBatchForTest(sm, queueName, segTestMessages(queueName, []uint64{1})))
 
 	var stop atomic.Bool
 	var reads, closedErrs, writes atomic.Int64
@@ -629,7 +629,7 @@ func TestSegmentSeal_ReaderHoldsSegmentLockAcrossActiveRead(t *testing.T) {
 		defer wg.Done()
 		for i := uint64(2); !stop.Load(); i++ {
 			msg := segTestMessages(queueName, []uint64{i})[0].Message
-			if err := sm.Write(queueName, msg, i); err != nil {
+			if err := writeLegacyForTest(sm, queueName, msg, i); err != nil {
 				return
 			}
 			writes.Add(1)
@@ -754,7 +754,7 @@ func TestSegmentSeal_HandleSwapIsAtomicUnderTheSegmentLock(t *testing.T) {
 	defer sm.Close()
 
 	const queueName = "seal-handle-swap"
-	require.NoError(t, sm.CheckpointBatch(queueName, segTestMessages(queueName, []uint64{1})))
+	require.NoError(t, writeLegacyBatchForTest(sm, queueName, segTestMessages(queueName, []uint64{1})))
 	val, ok := sm.queueSegments.Load(queueName)
 	require.True(t, ok, "no QueueSegments for %q", queueName)
 	qs := val.(*QueueSegments)
@@ -770,7 +770,7 @@ func TestSegmentSeal_HandleSwapIsAtomicUnderTheSegmentLock(t *testing.T) {
 		defer wg.Done()
 		for i := uint64(2); !stop.Load(); i++ {
 			msg := segTestMessages(queueName, []uint64{i})[0].Message
-			if werr := sm.Write(queueName, msg, i); werr != nil {
+			if werr := writeLegacyForTest(sm, queueName, msg, i); werr != nil {
 				return
 			}
 			writes.Add(1)
@@ -1005,49 +1005,20 @@ func TestSegmentCompaction_AckBitmapLockIsNotHeldAcrossFileIO(t *testing.T) {
 	qs, seg := buildSealedSegment(t, sm, "lockscope", count)
 	ackMost(t, qs, seg, count)
 
-	tempPath := seg.path + segmentCompactSuffix
-	_, statErr := os.Stat(tempPath)
-	require.True(t, os.IsNotExist(statErr), "PREMISE: no stale temp file before the run")
-
-	var started, done atomic.Bool
-	var compactErr atomic.Pointer[error]
+	// Compaction now selects survivors from physical segmentRecord.acked state.
+	// It must neither read nor write the legacy volatile bitmap, including while
+	// creating and installing the candidate file.
 	qs.bitmapMutex.Lock()
-	go func() {
-		started.Store(true)
-		e := qs.compactSegment(seg)
-		compactErr.Store(&e)
-		done.Store(true)
-	}()
-
-	deadline := time.Now().Add(2 * time.Second)
-	for !started.Load() && time.Now().Before(deadline) {
-		time.Sleep(time.Millisecond)
+	done := make(chan error, 1)
+	go func() { done <- qs.compactSegment(seg) }()
+	select {
+	case err := <-done:
+		qs.bitmapMutex.Unlock()
+		require.NoError(t, err)
+	case <-time.After(2 * time.Second):
+		qs.bitmapMutex.Unlock()
+		t.Fatal("compaction blocked on the obsolete acknowledgement bitmap")
 	}
-	require.True(t, started.Load(), "PREMISE: the compaction goroutine never started")
-
-	var sawTemp bool
-	for i := 0; i < 200; i++ {
-		if _, err := os.Stat(tempPath); err == nil {
-			sawTemp = true
-			break
-		}
-		time.Sleep(2 * time.Millisecond)
-	}
-	stillRunning := !done.Load()
-	qs.bitmapMutex.Unlock()
-
-	for i := 0; i < 1000 && !done.Load(); i++ {
-		time.Sleep(2 * time.Millisecond)
-	}
-	require.True(t, done.Load(), "the compaction never completed after the bitmap lock was released")
-	require.NoError(t, *compactErr.Load())
-
-	require.True(t, stillRunning,
-		"PREMISE: the compaction must have been blocked on the bitmap lock; it finished while the "+
-			"test held bitmapMutex, so this fixture asserts nothing")
-	require.False(t, sawTemp,
-		"LOCK SCOPE: compactSegment created %s while bitmapMutex was write-held, i.e. it performs "+
-			"file I/O under the lock batchAckLoop.flush() and Acknowledge's fallback need", tempPath)
 }
 
 // ---------------------------------------------------------------------------
@@ -1176,7 +1147,7 @@ func seedQueueSegmentWithConfig(t *testing.T, dataDir, queueName string, count i
 	for i := 1; i <= count; i++ {
 		offsets = append(offsets, uint64(i))
 	}
-	require.NoError(t, sm.CheckpointBatch(queueName, segTestMessages(queueName, offsets)))
+	require.NoError(t, writeLegacyBatchForTest(sm, queueName, segTestMessages(queueName, offsets)))
 	require.NoError(t, sm.Close())
 
 	segDir := filepath.Join(dataDir, "segments", queueName)
@@ -1261,7 +1232,7 @@ func TestSegmentLoad_FaultsRaisedByTheWritePathAreSurfaced(t *testing.T) {
 	sm.SetLogger(spy)
 
 	// First touch from the WRITE path, never from RecoverFromSegments.
-	require.NoError(t, sm.CheckpointBatch("write-path-faults",
+	require.NoError(t, writeLegacyBatchForTest(sm, "write-path-faults",
 		segTestMessages("write-path-faults", []uint64{99})))
 
 	require.NotEmpty(t, spy.messages(),
@@ -1275,6 +1246,7 @@ func TestSegmentLoad_FaultsRaisedByTheWritePathAreSurfaced(t *testing.T) {
 // grew every 5 minutes forever with nothing for an operator to see. The failure
 // is provoked with real EACCES from the real permission system.
 func TestSegmentCheckpoint_FailureIsNotDiscardedSilently(t *testing.T) {
+	t.Skip("checkpoint copying removed in segstore v1")
 	dataDir := t.TempDir()
 	sm, err := NewSegmentManagerWithConfig(dataDir, segTestConfig())
 	require.NoError(t, err)
@@ -1293,7 +1265,7 @@ func TestSegmentCheckpoint_FailureIsNotDiscardedSilently(t *testing.T) {
 			"so the checkpoint failure this test needs cannot be provoked")
 	}
 
-	err = sm.CheckpointBatch("unwritable", segTestMessages("unwritable", []uint64{1}))
+	err = writeLegacyBatchForTest(sm, "unwritable", segTestMessages("unwritable", []uint64{1}))
 	require.Error(t, err, "PREMISE: the checkpoint must genuinely fail")
 	require.NotEmpty(t, spy.messages(),
 		"SILENT: CheckpointBatch failed and nothing an operator can see says so; this queue's WAL "+

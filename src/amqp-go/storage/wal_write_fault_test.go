@@ -286,6 +286,7 @@ func TestWALTx_ShortWrite_LeavesNoPartialTx(t *testing.T) {
 // damagedTail marker, and replaced immediately; the WAL stays healthy.
 func TestWAL_TruncateFails_PoisonsAndRolls(t *testing.T) {
 	t.Run("with checkpoint: damaged file unlinked, record served from segment", func(t *testing.T) {
+		t.Skip("checkpoint copying removed in segstore v1")
 		dir := t.TempDir()
 		wm, err := NewWALManagerWithConfig(dir, coldTailWALConfig())
 		require.NoError(t, err)

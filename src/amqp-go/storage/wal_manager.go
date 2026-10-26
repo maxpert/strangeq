@@ -9,6 +9,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -23,7 +24,7 @@ const (
 	// WAL settings
 	DefaultWALBatchSize    = 1000                  // Messages per batch
 	DefaultWALBatchTimeout = 10 * time.Millisecond // Legacy batch flush timeout (no longer gates flushing; see WALConfig.BatchTimeout)
-	DefaultWALFileSize     = 64 * 1024 * 1024     // 64 MB per WAL file (segstore v1)
+	DefaultWALFileSize     = 64 * 1024 * 1024      // 64 MB per WAL file (segstore v1)
 	WALFileExtension       = ".wal"
 
 	// maxRetainedWALBatchBytes bounds how large EACH of the pipelined group
@@ -251,8 +252,9 @@ type QueueWAL struct {
 	writeChan chan *writeRequest // Buffered channel for lock-free writes
 	ackChan   chan *ackRequest   // Buffered channel for ACKs (queue+offset)
 
-	// ACK tracking
-	ackBitmap   *roaring64.Bitmap
+	// ACK tracking is volatile and scoped by queue. The bitmaps are read gates
+	// only; physical segmentRecord.acked state drives accounting/reclamation.
+	ackBitmaps  map[string]*roaring64.Bitmap
 	bitmapMutex sync.RWMutex
 
 	// _walLayoutPad occupies the 8 bytes vacated by the dead `lastCheckpoint`
@@ -295,14 +297,11 @@ type QueueWAL struct {
 	oldFileCache      map[uint64]*os.File
 	oldFileCacheMutex sync.RWMutex
 
-	// Offset index for O(1) lookups (Phase 6D: Fix consumer bottleneck)
-	// Maps offset → (fileNum, filePosition) for fast reads
-	offsetIndex      map[uint64]*offsetLocation
+	// Physical record index. offsetIndex publishes the newest copy for a
+	// logical queue/tag; recordCopies retains every physical position.
+	offsetIndex      map[recordKey]*segmentRecord
+	recordCopies     map[recordKey]map[recordPos]*segmentRecord
 	offsetIndexMutex sync.RWMutex
-
-	// Segment manager for checkpointing
-	segmentMgr      *SegmentManager
-	segmentMgrMutex sync.RWMutex
 
 	// Metrics collector
 	metrics WALMetrics
@@ -353,6 +352,10 @@ type QueueWAL struct {
 	// backoff, degraded transitions). nil = silent. Wired by
 	// WALManager.SetLogger.
 	logger atomicLogger
+
+	// currentInv is the active file's physical-record inventory. Appended after
+	// the pinned hot-path layout; it becomes walFileInfo.inv on roll.
+	currentInv *segmentInventory
 
 	// --- WS-F phase 1: pipelined group commit. Appended AFTER logger (the
 	// last field the pre-pipeline layout pinned), never above txEpoch, so
@@ -416,17 +419,14 @@ var (
 // allocation bounded.
 const walPipelineBatchCount = 2
 
-// offsetLocation tracks where an offset lives in the WAL
-type offsetLocation struct {
-	fileNum      uint64
-	filePosition int64
-}
-
 // sharedIndexEntry records where a fused shared unit's reference record landed
 // so the committer can populate the offset index for it post-fsync (the
 // BodyBlock record itself is never indexed). See commitBatch.
 type sharedIndexEntry struct {
-	offset uint64
+	queueName string
+	offset    uint64
+	bytes     int64
+	bodyRef   int64
 	// filePosition is the position RELATIVE to the staged buffer's start
 	// while the batch is owned by the stager (WS-F §1.1); commitBatch binds
 	// it to an absolute file position (base + filePosition) under
@@ -462,7 +462,8 @@ type stagedBatch struct {
 	// relPos[i] is reqs[i]'s record start RELATIVE to buf[0]; -1 = the
 	// request was not written (a per-record serialize failure, or a fused
 	// shared unit, which is indexed via sharedRel instead).
-	relPos []int64
+	relPos      []int64
+	recordBytes []int64
 	// serErr, when non-nil, carries a per-request serialization error
 	// (index i, kept len-aligned with reqs) that overrides the batch error
 	// for that request's completion. Lazily allocated on the first failure,
@@ -472,6 +473,7 @@ type stagedBatch struct {
 	// sharedRel collects the reference records of fused shared units
 	// (filePosition RELATIVE, bound at commit).
 	sharedRel []sharedIndexEntry
+	blocks    []stagedBodyBlock
 	// refPatch records every shared-unit BodyRef locator to bind at commit:
 	// the stager wrote the block's buf-RELATIVE position into the locator
 	// bytes; the committer patches base+blockRel in and recomputes the
@@ -500,6 +502,11 @@ type stagedBatch struct {
 // at append time, so a layout change cannot silently drift it.
 type refPatch struct {
 	recStart, recEnd, locAt, blockRel int
+}
+
+type stagedBodyBlock struct {
+	relPos int64
+	bytes  int64
 }
 
 type writeRequest struct {
@@ -562,13 +569,14 @@ type walFileInfo struct {
 	// BodyBlock record. performCheckpoint skips such files (keeping the body as
 	// ONE copy) unless the SharedBodyMaxPinAge backstop forces re-inline.
 	hasSharedBody bool
+	inv           *segmentInventory
 
 	// --- WS-C (C1/C2/C5) durability bookkeeping, appended below the pinned
 	// fields. durableSize and damagedTail are written once, at roll time,
 	// before the entry is published under oldFilesMutex, so any read through
 	// the published entry is ordered by construction. checkpointed and
 	// retentionFailLogged are MUTATED after publication and are therefore
-	// only ever accessed under oldFilesMutex: tryDeleteOldFiles reads and
+	// only ever accessed under oldFilesMutex: tryReclaimOldFiles reads and
 	// writes them under Lock, and performCheckpoint copies checkpointed out
 	// under the RLock of its map snapshot (walCheckpointTarget) instead of
 	// reading it in its unlocked loop body. ---
@@ -580,13 +588,6 @@ type walFileInfo struct {
 	// batch that could not be truncated. The file is still checkpointed (up
 	// to durableSize) and unlinked once that succeeds.
 	damagedTail bool
-	// checkpointed is true once every unacked record in [0, durableSize) has
-	// been durably copied to a segment, so only the unlink remains.
-	// Access discipline: oldFilesMutex only (see the block comment above).
-	checkpointed bool
-	// retentionFailLogged throttles the retention keep-ERROR to once per file
-	// per failure streak. Access discipline: oldFilesMutex only.
-	retentionFailLogged bool
 }
 
 // NewWALManager creates a new WAL manager with shared WAL using default config
@@ -614,25 +615,6 @@ func NewWALManagerWithConfig(dataDir string, cfg WALConfig) (*WALManager, error)
 	wm.sharedWAL = sharedWAL
 
 	return wm, nil
-}
-
-// SetSegmentManager sets the segment manager for checkpointing
-func (wm *WALManager) SetSegmentManager(segmentMgr *SegmentManager) {
-	wm.mu.Lock()
-	defer wm.mu.Unlock()
-
-	if wm.sharedWAL != nil {
-		wm.sharedWAL.segmentMgrMutex.Lock()
-		wm.sharedWAL.segmentMgr = segmentMgr
-		wm.sharedWAL.segmentMgrMutex.Unlock()
-	}
-}
-
-// getSegmentMgr returns the segment manager (thread-safe)
-func (qw *QueueWAL) getSegmentMgr() *SegmentManager {
-	qw.segmentMgrMutex.RLock()
-	defer qw.segmentMgrMutex.RUnlock()
-	return qw.segmentMgr
 }
 
 // SetMetrics sets the metrics collector for the WAL manager
@@ -1107,6 +1089,7 @@ func (qw *QueueWAL) writeTxAtomic(records []*RecoveryMessage) error {
 	// record each message record's start position for the offset index.
 	buf := serializeTxMarker(WALTxMarkerBegin, epoch, qw.cfg.CRCDisabled)
 	positions := make([]int64, len(records))
+	recordBytes := make([]int64, len(records))
 	for i, rec := range records {
 		positions[i] = startPos + int64(len(buf))
 		recBytes, serErr := qw.serializeMessageVersioned(rec.QueueName, rec.Message, rec.Offset)
@@ -1116,6 +1099,7 @@ func (qw *QueueWAL) writeTxAtomic(records []*RecoveryMessage) error {
 			// the all-or-nothing guarantee holds and no corrupt record is emitted.
 			return fmt.Errorf("WAL transaction serialize failed: %w", serErr)
 		}
+		recordBytes[i] = int64(len(recBytes))
 		buf = append(buf, recBytes...)
 	}
 	buf = append(buf, serializeTxMarker(WALTxMarkerCommit, epoch, qw.cfg.CRCDisabled)...)
@@ -1170,12 +1154,21 @@ func (qw *QueueWAL) writeTxAtomic(records []*RecoveryMessage) error {
 
 	// Durable: publish the records to the offset index and current-file offset
 	// set so they are readable/ackable exactly like batch-written messages.
+	inv := qw.currentInv
+	if inv == nil {
+		inv = newSegmentInventory(startPos)
+		qw.currentInv = inv
+	}
+	inv.durableBytes += int64(n)
 	qw.offsetIndexMutex.Lock()
 	for i, rec := range records {
-		qw.offsetIndex[rec.Offset] = &offsetLocation{
-			fileNum:      currentFileNum,
-			filePosition: positions[i],
+		r := &segmentRecord{
+			pos:       recordPos{segmentID: currentFileNum, position: positions[i]},
+			queueName: rec.QueueName, deliveryTag: rec.Offset,
+			bytes: recordBytes[i], bodyRef: -1, committed: true,
 		}
+		inv.addRecord(r)
+		qw.indexRecordLocked(r)
 	}
 	qw.offsetIndexMutex.Unlock()
 
@@ -1194,7 +1187,8 @@ func (qw *QueueWAL) writeTxAtomic(records []*RecoveryMessage) error {
 	return nil
 }
 
-// Acknowledge marks a message as ACKed
+// Acknowledge marks a message as ACKed. The read gate is updated before the
+// physical copies are settled, and both are complete when this method returns.
 func (wm *WALManager) Acknowledge(queueName string, offset uint64) {
 	wm.mu.RLock()
 	sw := wm.sharedWAL
@@ -1203,61 +1197,95 @@ func (wm *WALManager) Acknowledge(queueName string, offset uint64) {
 		return
 	}
 
-	// Record the acknowledgement SYNCHRONOUSLY, before handing the index cleanup
-	// to cleanupLoop.
-	//
-	// The cleanup is asynchronous, and it used to carry the bitmap update with it.
-	// That left a window — Acknowledge has returned, but cleanupLoop has not run —
-	// in which the ack was recorded NOWHERE: ackBitmap did not have it yet and
-	// offsetIndex still did, so readMessage's O(1) fast path served the
-	// acknowledged record and no gate could see it. The window widens exactly when
-	// the machine is busy and cleanupLoop is starved, which is when it matters.
-	// broker/queue_reaper.go reapTTLSweep acknowledges a tag and re-probes it
-	// within the same sweep, so it lands in that window by construction.
-	//
-	// Doing it here means that once Acknowledge returns, every read path observes
-	// the ack, whatever cleanupLoop has or has not done yet. Total bitmapMutex
-	// traffic is unchanged — one Lock per ack either way; this only moves it off
-	// the cleanup goroutine onto the caller.
 	sw.bitmapMutex.Lock()
-	sw.ackBitmap.Add(offset)
+	if sw.ackBitmaps == nil {
+		sw.ackBitmaps = make(map[string]*roaring64.Bitmap)
+	}
+	bitmap := sw.ackBitmaps[queueName]
+	if bitmap == nil {
+		bitmap = roaring64.New()
+		sw.ackBitmaps[queueName] = bitmap
+	}
+	bitmap.Add(offset)
 	sw.bitmapMutex.Unlock()
 
-	// Send to ACK channel (blocking with stopChan to prevent silent drops)
-	select {
-	case sw.ackChan <- &ackRequest{
-		queueName: queueName,
-		offset:    offset,
-	}:
-	case <-sw.stopChan:
-		// WAL is shutting down, discard ACK
+	key := recordKey{queueName: queueName, deliveryTag: offset}
+	sw.offsetIndexMutex.RLock()
+	for _, r := range sw.recordCopies[key] {
+		r.markAck()
 	}
+	sw.offsetIndexMutex.RUnlock()
 }
 
-// IsAcknowledged reports whether THIS INCARNATION has acknowledged the offset.
-//
-// It is the single acknowledgement oracle for the storage layer's read path, and
-// it takes bitmapMutex WHILE HOLDING NOTHING ELSE — no file handle, no index, no
-// old-file lock. That is what keeps it out of every lock cycle in this package,
-// and it is the property to preserve if this ever moves: the value is what makes
-// it correct, the lock depth is what makes it safe.
-//
-// It answers only for THIS incarnation. ackBitmap starts empty at every boot
-// (see wal_boot_state.go), so a false here means "this process has not acked it",
-// never "nobody ever did". Callers must fail toward SERVING on false — a
-// redelivery is recoverable and AMQP models it, whereas refusing a live durable
-// record loses confirmed data silently.
-func (wm *WALManager) IsAcknowledged(offset uint64) bool {
+// PurgeQueue acknowledges every physical copy of each WAL record in the
+// inclusive queue/tag band. It returns each logical tag for which this call won
+// at least one previously-unacknowledged physical copy, at most once.
+func (wm *WALManager) PurgeQueue(queueName string, minTag, maxTag uint64) []uint64 {
+	if minTag > maxTag {
+		return nil
+	}
 	wm.mu.RLock()
 	sw := wm.sharedWAL
 	wm.mu.RUnlock()
 	if sw == nil {
-		return false
+		return nil
 	}
-	sw.bitmapMutex.RLock()
-	acked := sw.ackBitmap.Contains(offset)
-	sw.bitmapMutex.RUnlock()
+
+	var newlyAcked, gated []uint64
+	sw.offsetIndexMutex.RLock()
+	for key, copies := range sw.recordCopies {
+		if key.queueName != queueName || key.deliveryTag < minTag || key.deliveryTag > maxTag {
+			continue
+		}
+		gated = append(gated, key.deliveryTag)
+		won := false
+		for _, record := range copies {
+			if record.markAck() {
+				won = true
+			}
+		}
+		if won {
+			newlyAcked = append(newlyAcked, key.deliveryTag)
+		}
+	}
+	sw.offsetIndexMutex.RUnlock()
+
+	// bitmapMutex is leaf-only: update the volatile read gate after releasing
+	// the physical-index lock, matching the lock contract of Acknowledge.
+	sw.bitmapMutex.Lock()
+	if sw.ackBitmaps == nil {
+		sw.ackBitmaps = make(map[string]*roaring64.Bitmap)
+	}
+	bitmap := sw.ackBitmaps[queueName]
+	if bitmap == nil {
+		bitmap = roaring64.New()
+		sw.ackBitmaps[queueName] = bitmap
+	}
+	for _, tag := range gated {
+		bitmap.Add(tag)
+	}
+	sw.bitmapMutex.Unlock()
+
+	sort.Slice(newlyAcked, func(i, j int) bool { return newlyAcked[i] < newlyAcked[j] })
+	return newlyAcked
+}
+
+// isAcknowledged is the leaf-only, queue-scoped read gate. Acknowledgement is
+// process-volatile: an empty map after boot deliberately permits redelivery.
+func (qw *QueueWAL) isAcknowledged(queueName string, offset uint64) bool {
+	qw.bitmapMutex.RLock()
+	bitmap := qw.ackBitmaps[queueName]
+	acked := bitmap != nil && bitmap.Contains(offset)
+	qw.bitmapMutex.RUnlock()
 	return acked
+}
+
+// IsAcknowledged reports whether THIS INCARNATION acknowledged queueName/tag.
+func (wm *WALManager) IsAcknowledged(queueName string, offset uint64) bool {
+	wm.mu.RLock()
+	sw := wm.sharedWAL
+	wm.mu.RUnlock()
+	return sw != nil && sw.isAcknowledged(queueName, offset)
 }
 
 // Read reads a message from shared WAL by queue+offset
@@ -1289,6 +1317,7 @@ type RecoveryMessage struct {
 	QueueName string
 	Message   *protocol.Message
 	Offset    uint64
+	pos       recordPos
 }
 
 // RecoverFromWAL scans all WAL files and returns unacknowledged messages
@@ -1323,7 +1352,7 @@ func (wm *WALManager) RecoverFromWAL() ([]*RecoveryMessage, error) {
 			"every durable message in the WAL directory is abandoned", nil)
 	}
 
-	var recoveredMessages []*RecoveryMessage
+	winners := make(map[recordKey]*RecoveryMessage)
 	var faults []error
 
 	// Get list of all WAL files
@@ -1362,19 +1391,38 @@ func (wm *WALManager) RecoverFromWAL() ([]*RecoveryMessage, error) {
 			}
 		}
 
-		// Filter out acknowledged messages
+		// Select the newest physical copy before considering acknowledgement.
+		// Filtering each copy independently could revive an older duplicate after
+		// the winning copy had been settled.
 		for _, msg := range messages {
-			wm.sharedWAL.bitmapMutex.RLock()
-			isAcked := wm.sharedWAL.ackBitmap.Contains(msg.Offset)
-			wm.sharedWAL.bitmapMutex.RUnlock()
-
-			if !isAcked {
-				// Message not acknowledged - needs redelivery
-				recoveredMessages = append(recoveredMessages, msg)
+			key := recordKey{queueName: msg.QueueName, deliveryTag: msg.Offset}
+			if current := winners[key]; current == nil || recordPositionNewer(msg.pos, current.pos) {
+				winners[key] = msg
 			}
 		}
 	}
 
+	recoveredMessages := make([]*RecoveryMessage, 0, len(winners))
+	qw := wm.sharedWAL
+	qw.offsetIndexMutex.RLock()
+	for key, msg := range winners {
+		winner := qw.offsetIndex[key]
+		if winner == nil || winner.pos != msg.pos {
+			// The scanned copy is older than the indexed winner (or its file was
+			// already reclaimed); never revive it as a fallback.
+			continue
+		}
+		if !winner.acked.Load() {
+			recoveredMessages = append(recoveredMessages, msg)
+		}
+	}
+	qw.offsetIndexMutex.RUnlock()
+	sort.Slice(recoveredMessages, func(i, j int) bool {
+		if recoveredMessages[i].QueueName != recoveredMessages[j].QueueName {
+			return recoveredMessages[i].QueueName < recoveredMessages[j].QueueName
+		}
+		return recoveredMessages[i].Offset < recoveredMessages[j].Offset
+	})
 	return recoveredMessages, joinFaults(faults)
 }
 
@@ -1407,7 +1455,15 @@ func classifyWALScanError(filePath string, err error) error {
 //
 // BENIGN FAULTS ARE NOT RETURNED. "Benign" means "proceeds silently", and this
 // package's error returns are read by callers — performCheckpoint,
-// forceCheckpointFile, and every existing test of RecoverFromWAL — as "did
+
+// SetSegmentManager is a no-op stub retained for test compatibility.
+// Checkpoint copying has been removed (segstore v1); segments are drained
+// independently. This will be deleted in WI8.
+func (wm *WALManager) SetSegmentManager(sm *SegmentManager) {}
+
+// performCheckpoint is a no-op stub retained for test compatibility.
+// Checkpoint copying has been removed (segstore v1). This will be deleted in WI8.
+func (qw *QueueWAL) performCheckpoint() {}// forceCheckpointFile, and every existing test of RecoverFromWAL — as "did
 // something go wrong". Handing them a non-nil error for a torn tail, which is
 // the ordinary state of a WAL after any unclean shutdown, would make the
 // normal case look like a failure. The benign classification still exists and
@@ -1571,6 +1627,7 @@ func (qw *QueueWAL) scanWALFileUpTo(filePath string, limit int64) ([]*RecoveryMe
 	}
 
 	var messages []*RecoveryMessage
+	fileNum, _ := parseWALFileNum(filepath.Base(filePath))
 
 	// Transaction-boundary state (SQ-8). Message records that appear between a
 	// Begin marker and its matching Commit marker are buffered and only emitted
@@ -1704,6 +1761,7 @@ func (qw *QueueWAL) scanWALFileUpTo(filePath string, limit int64) ([]*RecoveryMe
 			if !ok {
 				continue
 			}
+			recoveryMsg.pos = recordPos{segmentID: fileNum, position: curRecStart}
 			// Resolve a body reference against the per-file block map. On a hit,
 			// materialize Body and clear BodyRef so the recovered message is a
 			// self-contained inline message (checkpoint re-inlines it; segments
@@ -1747,11 +1805,12 @@ func (wm *WALManager) createSharedWAL() (*QueueWAL, error) {
 		cfg:                wm.cfg,
 		writeChan:          make(chan *writeRequest, wm.cfg.ChannelBuffer),
 		ackChan:            make(chan *ackRequest, wm.cfg.ChannelBuffer),
-		ackBitmap:          roaring64.New(),
+		ackBitmaps:         make(map[string]*roaring64.Bitmap),
 		currentFileOffsets: roaring64.New(),
 		oldFiles:           make(map[uint64]*walFileInfo),
 		oldFileCache:       make(map[uint64]*os.File),
-		offsetIndex:        make(map[uint64]*offsetLocation), // Phase 6D: Offset index for O(1) reads
+		offsetIndex:        make(map[recordKey]*segmentRecord),
+		recordCopies:       make(map[recordKey]map[recordPos]*segmentRecord),
 		stopChan:           make(chan struct{}),
 		// WS-F phase 1: the pipelined group-commit hand-off. commitCh is
 		// unbuffered by design (see the QueueWAL field comment); free's
@@ -1776,14 +1835,12 @@ func (wm *WALManager) createSharedWAL() (*QueueWAL, error) {
 	}
 
 	// Start background goroutines (single set for all queues!)
-	// WS-F phase 1: four goroutines — the stager (batchWriterLoop) and the
-	// committer (walCommitLoop) of the pipelined group-commit writer, plus
-	// cleanup and checkpoint. close() waits on all of them (D5).
-	wal.wg.Add(4)
+	// WS-F phase 1: three goroutines — the stager (batchWriterLoop), the
+	// committer (walCommitLoop), and cleanup. close() waits on all of them (D5).
+	wal.wg.Add(3)
 	go wal.batchWriterLoop()
 	go wal.walCommitLoop()
 	go wal.cleanupLoop()
-	go wal.checkpointLoop()
 
 	return wal, nil
 }
@@ -2137,23 +2194,38 @@ func (qw *QueueWAL) commitBatch(sb *stagedBatch) {
 	// when a completion advances a message's visibility (async path), a woken
 	// consumer's wal.Read finds the record. Records that failed to serialize
 	// (relPos[i] < 0) were never written, so they are not indexed.
+	inv := qw.currentInv
+	if inv == nil {
+		inv = newSegmentInventory(base)
+		qw.currentInv = inv
+	}
+	inv.durableBytes += int64(n)
+	for _, block := range sb.blocks {
+		inv.addBlock(base+block.relPos, block.bytes)
+	}
 	qw.offsetIndexMutex.Lock()
 	for i, req := range sb.reqs {
 		if sb.relPos[i] < 0 {
 			continue
 		}
-		qw.offsetIndex[req.offset] = &offsetLocation{
-			fileNum:      currentFileNum,
-			filePosition: base + sb.relPos[i],
+		r := &segmentRecord{
+			pos:       recordPos{segmentID: currentFileNum, position: base + sb.relPos[i]},
+			queueName: req.queueName, deliveryTag: req.offset,
+			bytes: sb.recordBytes[i], bodyRef: -1, committed: true,
 		}
+		inv.addRecord(r)
+		qw.indexRecordLocked(r)
 	}
 	// Fused shared-unit reference records (never the BodyBlock itself). Empty on
 	// the no-unit hot path, so this loop is a zero-cost no-op there.
 	for _, e := range sb.sharedRel {
-		qw.offsetIndex[e.offset] = &offsetLocation{
-			fileNum:      currentFileNum,
-			filePosition: base + e.filePosition,
+		r := &segmentRecord{
+			pos:       recordPos{segmentID: currentFileNum, position: base + e.filePosition},
+			queueName: e.queueName, deliveryTag: e.offset,
+			bytes: e.bytes, bodyRef: base + e.bodyRef, committed: true,
 		}
+		inv.addRecord(r)
+		qw.indexRecordLocked(r)
 	}
 	qw.offsetIndexMutex.Unlock()
 
@@ -2215,15 +2287,18 @@ func (sb *stagedBatch) add(req *writeRequest, crcDisabled bool) {
 		sb.serErr = append(sb.serErr, nil)
 	}
 	sb.relPos = append(sb.relPos, 0)
+	sb.recordBytes = append(sb.recordBytes, 0)
 
 	if req.unit == nil {
 		recStart := len(sb.buf)
 		sb.relPos[i] = int64(recStart) // position relative to buf[0]
 		var e error
 		sb.buf, e = appendMessageRecord(sb.buf, req.queueName, req.message, req.offset, crcDisabled)
+		sb.recordBytes[i] = int64(len(sb.buf) - recStart)
 		if e != nil {
 			sb.buf = sb.buf[:recStart] // discard the failed record's partial bytes
 			sb.relPos[i] = -1
+			sb.recordBytes[i] = 0
 			if sb.serErr == nil {
 				sb.serErr = make([]error, len(sb.reqs))
 			}
@@ -2246,6 +2321,7 @@ func (sb *stagedBatch) add(req *writeRequest, crcDisabled bool) {
 	unitStart := len(sb.buf)
 	blockRel := unitStart // the block's position relative to buf[0]
 	sb.buf = appendBodyBlockRecord(sb.buf, u.fanoutHint, u.body, crcDisabled)
+	blockBytes := int64(len(sb.buf) - unitStart)
 
 	// The locator is staged as the RELATIVE block position and patched to
 	// base+blockRel by commitBatch (§1.2), so a roll, a repair or an
@@ -2275,7 +2351,10 @@ func (sb *stagedBatch) add(req *writeRequest, crcDisabled bool) {
 			unitErr = e
 			break
 		}
-		sb.sharedRel = append(sb.sharedRel, sharedIndexEntry{offset: sub.offset, filePosition: subRel})
+		sb.sharedRel = append(sb.sharedRel, sharedIndexEntry{
+			queueName: sub.queueName, offset: sub.offset, filePosition: subRel,
+			bytes: int64(len(sb.buf) - recStart), bodyRef: int64(blockRel),
+		})
 		sb.refPatch = append(sb.refPatch, refPatch{
 			recStart: recStart,
 			recEnd:   len(sb.buf),
@@ -2296,6 +2375,7 @@ func (sb *stagedBatch) add(req *writeRequest, crcDisabled bool) {
 		sb.serErr[i] = unitErr
 		return
 	}
+	sb.blocks = append(sb.blocks, stagedBodyBlock{relPos: int64(blockRel), bytes: blockBytes})
 	sb.hasShared = true
 }
 
@@ -2380,7 +2460,9 @@ func (sb *stagedBatch) reset() {
 	}
 	sb.serErr = nil
 	sb.relPos = sb.relPos[:0]
+	sb.recordBytes = sb.recordBytes[:0]
 	sb.sharedRel = sb.sharedRel[:0]
+	sb.blocks = sb.blocks[:0]
 	sb.refPatch = sb.refPatch[:0]
 	sb.hasShared = false
 }
@@ -3045,6 +3127,10 @@ func (qw *QueueWAL) rollFile() error {
 	// against the committer that sets the flag.
 	sharedBody := qw.currentFileHasSharedBody
 	qw.currentFileHasSharedBody = false
+	sealedInv := qw.currentInv
+	if sealedInv == nil {
+		sealedInv = newSegmentInventory(qw.fileOffset.Load())
+	}
 
 	// Move current read handle to old file cache (it's already open, no need to reopen)
 	if qw.currentReadFile != nil {
@@ -3067,6 +3153,7 @@ func (qw *QueueWAL) rollFile() error {
 		hasSharedBody: sharedBody,
 		durableSize:   qw.fileOffset.Load(),
 		damagedTail:   qw.poisoned != nil,
+		inv:           sealedInv,
 	}
 	qw.oldFilesMutex.Unlock()
 
@@ -3082,6 +3169,7 @@ func (qw *QueueWAL) rollFile() error {
 	qw.currentFile = w
 	qw.currentReadFile = r
 	qw.fileOffset.Store(size)
+	qw.currentInv = newSegmentInventory(size)
 	qw.poisoned = nil
 	qw.degraded = false
 	qw.rollBackoff = 0
@@ -3291,6 +3379,7 @@ func (qw *QueueWAL) openNextFile() error {
 	qw.currentFile = w
 	qw.currentReadFile = r
 	qw.fileOffset.Store(size)
+	qw.currentInv = newSegmentInventory(size)
 	return nil
 }
 
@@ -3326,7 +3415,8 @@ func walFileDataStart(f *os.File) (dataStart int64, err error) {
 	return int64(WALHeaderSize), nil
 }
 
-// cleanupLoop processes ACKs and deletes old WAL files
+// cleanupLoop periodically reclaims old WAL files. Acknowledgement is wholly
+// synchronous and never deletes read-index entries.
 func (qw *QueueWAL) cleanupLoop() {
 	defer qw.wg.Done()
 
@@ -3335,229 +3425,112 @@ func (qw *QueueWAL) cleanupLoop() {
 
 	for {
 		select {
-		case ack := <-qw.ackChan:
-			// Clean up offset index (Phase 6D).
-			//
-			// The ackBitmap update does NOT happen here — WALManager.Acknowledge
-			// does it synchronously before enqueuing, so that no window exists in
-			// which the ack has been issued but is visible to no read path. See the
-			// note there; moving it was the fix for a residual re-delivery that only
-			// appeared when this goroutine was starved.
-			//
-			// Keying by offset alone is sound ACROSS QUEUES — a delivery tag is
-			// (queueOrdinal << 44) | perQueueSeq, so no two queues mint the same
-			// value. It is NOT sound across INCARNATIONS: a non-durable queue that
-			// is redeclared after a restart reclaims its ordinal with perQueueSeq
-			// back at zero and re-mints a band of tags whose previous-incarnation
-			// records are still physically on disk. So one entry here can name two
-			// records, and this delete cannot tell which one it cancels — which is
-			// why the read path resolves the ambiguity positionally (current file
-			// before oldFiles) rather than trusting the key.
-			qw.offsetIndexMutex.Lock()
-			delete(qw.offsetIndex, ack.offset)
-			qw.offsetIndexMutex.Unlock()
-
 		case <-ticker.C:
-			qw.tryDeleteOldFiles()
-
+			qw.tryReclaimOldFiles()
 		case <-qw.stopChan:
 			return
 		}
 	}
 }
 
-// tryDeleteOldFiles deletes WAL files where all messages are ACKed, or where
-// the retention period has expired — in the latter case ONLY after the file's
-// unacked records are durably checkpointed to segments (WS-C C5: retention
-// never wins over durability; an expired file that cannot be checkpointed is
-// kept and the ERROR log says why, at the cost of disk growth).
-func (qw *QueueWAL) tryDeleteOldFiles() {
+// tryReclaimOldFiles reclaims sealed WAL files whose valid physical inventory
+// has no unacknowledged records. Retention time never authorizes deletion:
+// unacknowledged data remains until it is acknowledged, regardless of age.
+func (qw *QueueWAL) tryReclaimOldFiles() {
+	// The index lock excludes sealed readers through their ReadAt and prevents a
+	// late acknowledgement from acquiring a copy while its file is reclaimed.
+	qw.offsetIndexMutex.Lock()
 	qw.oldFilesMutex.Lock()
-	defer qw.oldFilesMutex.Unlock()
-
-	qw.bitmapMutex.RLock()
-	defer qw.bitmapMutex.RUnlock()
 
 	unlinkedAny := false
 	for fileNum, info := range qw.oldFiles {
-		// Check if all actual message offsets in this file are ACKed.
-		// Uses bitmap intersection: file offsets ⊆ ackBitmap iff |file ∩ ack| == |file|.
-		//
-		// What makes this sound, and did not hold before rebuildBootState:
-		// info.offsets is now the COMPLETE physical inventory of the file (for a
-		// pre-existing file it is rebuilt by scanning the file, and it is nil —
-		// hence never all-acked — when that scan failed). A file whose records
-		// this process merely never saw can no longer be judged fully
-		// acknowledged and destroyed. Acknowledgement itself is NOT durable
-		// (see wal_boot_state.go), so ackBitmap holds this incarnation's acks
-		// only and an inherited file is reclaimable only once this process has
-		// re-delivered and re-acked every record in it.
-		allAcked := info.offsets != nil &&
-			info.offsets.GetCardinality() > 0 &&
-			roaring64.And(info.offsets, qw.ackBitmap).GetCardinality() == info.offsets.GetCardinality()
-
-		// Check time-based retention
-		expired := qw.cfg.RetentionPeriod > 0 &&
-			!info.createdAt.IsZero() &&
-			time.Since(info.createdAt) > qw.cfg.RetentionPeriod
-
-		if allAcked {
-			if err := walUnlink(info.path); err == nil || errors.Is(err, fs.ErrNotExist) {
-				unlinkedAny = true
-				qw.closeOldFileHandle(fileNum)
-				delete(qw.oldFiles, fileNum)
-			} else {
-				qw.logError("fully-acknowledged WAL file could not be unlinked; it stays registered and the next sweep retries",
-					interfaces.LogField{Key: "path", Value: info.path},
-					interfaces.LogField{Key: "error", Value: err.Error()})
-			}
-		} else if expired {
-			// Force-checkpoint unACKed messages to segments BEFORE deletion,
-			// and only delete when that succeeded. checkpointed (set by
-			// performCheckpoint or a previous successful sweep) means the copy
-			// is already durable and only the unlink remains.
-			if !info.checkpointed {
-				if err := qw.forceCheckpointFile(info); err != nil {
-					if !info.retentionFailLogged {
-						info.retentionFailLogged = true
-						qw.logError("retention: expired WAL file kept because its unacked records could not be checkpointed; disk use grows until this is fixed",
-							interfaces.LogField{Key: "path", Value: info.path},
-							interfaces.LogField{Key: "error", Value: err.Error()})
-					}
-					continue
-				}
-				info.retentionFailLogged = false
-				info.checkpointed = true
-			}
-			if err := walUnlink(info.path); err == nil || errors.Is(err, fs.ErrNotExist) {
-				unlinkedAny = true
-				qw.closeOldFileHandle(fileNum)
-				delete(qw.oldFiles, fileNum)
-			} else {
-				qw.logError("expired WAL file checkpointed but could not be unlinked; it stays registered and the next sweep retries only the unlink",
-					interfaces.LogField{Key: "path", Value: info.path},
-					interfaces.LogField{Key: "error", Value: err.Error()})
-			}
+		// oldFiles normally contains sealed files only. Keep the explicit active
+		// guard so a malformed registration can never make the writer's file a
+		// reclaim candidate.
+		if fileNum == qw.fileNum.Load() || info.inv == nil || !info.inv.valid ||
+			info.inv.unacked.Load() != 0 {
+			continue
 		}
+
+		// Readers of sealed files hold offsetIndexMutex.RLock through ReadAt, so
+		// no cached descriptor is in use here. If unlink fails the registration
+		// and every index entry remain intact; the handle is lazily reopened for
+		// the next read and the next sweep retries the unlink.
+		qw.closeOldFileHandle(fileNum)
+		if err := walUnlink(info.path); err != nil && !errors.Is(err, fs.ErrNotExist) {
+			qw.logError("fully-acknowledged WAL file could not be unlinked; it stays registered and indexed for retry",
+				interfaces.LogField{Key: "path", Value: info.path},
+				interfaces.LogField{Key: "error", Value: err.Error()})
+			continue
+		}
+
+		for _, record := range info.inv.records {
+			qw.unindexRecordLocked(record)
+		}
+		delete(qw.oldFiles, fileNum)
+		unlinkedAny = true
 	}
 
-	// C4: make this sweep's unlinks durable (once per tick that unlinked
-	// anything). Not a correctness barrier — a resurrected file is collapsed
-	// by the recovery dedup — so a failure is only logged.
+	qw.oldFilesMutex.Unlock()
+	qw.offsetIndexMutex.Unlock()
+
+	// Make this sweep's directory mutations durable exactly once. The reclaim
+	// is already complete in memory even if this barrier fails; only fully acked
+	// bytes could reappear after a crash, so the failure cannot invalidate it.
 	if unlinkedAny {
-		if serr := syncDir(qw.dataDir); serr != nil {
-			qw.logWarn("WAL directory fsync after retention unlink failed; the space is not reclaimed durably yet and the next sweep retries",
+		if err := syncDir(qw.dataDir); err != nil {
+			qw.logWarn("WAL directory fsync after reclaim failed; completed reclaim remains valid, but its directory mutations are not durable yet",
 				interfaces.LogField{Key: "dir", Value: qw.dataDir},
-				interfaces.LogField{Key: "error", Value: serr.Error()})
+				interfaces.LogField{Key: "error", Value: err.Error()})
 		}
 	}
 }
 
-// forceCheckpointFile checkpoints an expired WAL file's unACKed messages to
-// segments before deletion. WS-C C5: retention NEVER wins over durability —
-// an error return means the file MUST be kept (its unacked records could not
-// be durably copied, or there is no segment manager to copy them to), and the
-// caller keeps it. A file with nothing unacked deletes losslessly with or
-// without segments, so that case returns nil.
-//
-// NOTE: Caller must hold bitmapMutex (RLock) and oldFilesMutex (Lock). The
-// segment I/O performed under those locks blocks Acknowledge during a
-// retention checkpoint; that is a pre-existing condition recorded as a
-// follow-up (spec §15), deliberately not changed here.
-func (qw *QueueWAL) forceCheckpointFile(info *walFileInfo) error {
-	// A degraded or benign scan fault (torn tail, tail CRC failure) still
-	// yields every intact record before the damage, and those records must
-	// still be checkpointed — bailing on any non-nil error would pin the file
-	// forever. Only a fatal fault, which means the file cannot be interpreted
-	// at all, aborts (and keeps the file). The scan is bounded at the durable
-	// end (C1 §3.11).
-	messages, err := qw.scanWALFileUpTo(info.path, info.durableSize)
-	if err != nil && interfaces.OutcomeOf(err) == interfaces.RecoveryFatal {
-		return fmt.Errorf("retention: WAL file unreadable: %w", err)
-	}
-
-	// Group unACKed messages by queue
-	byQueue := make(map[string][]*RecoveryMessage)
-	for _, msg := range messages {
-		if !qw.ackBitmap.Contains(msg.Offset) {
-			byQueue[msg.QueueName] = append(byQueue[msg.QueueName], msg)
-		}
-	}
-	if len(byQueue) == 0 {
-		return nil // nothing unacked: deleting loses nothing
-	}
-
-	segMgr := qw.getSegmentMgr()
-	if segMgr == nil {
-		return errNoSegmentManager
-	}
-	for queueName, queueMsgs := range byQueue {
-		if err := segMgr.CheckpointBatch(queueName, queueMsgs); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-// readMessage reads a message from shared WAL by queue+offset
-// Phase 6D: Uses O(1) offset index instead of sequential scan
-// queueName is used for validation (entries include queue name in shared WAL)
+// readMessage resolves the newest physical copy. A sealed-file lookup keeps
+// offsetIndexMutex.RLock through every ReadAt so index/layout replacement cannot
+// race it; the active-file arm releases the index before acquiring fileMutex.
 func (qw *QueueWAL) readMessage(queueName string, offset uint64) (*protocol.Message, error) {
-	// An offset this incarnation has ACKNOWLEDGED is not a live message, and the
-	// gate belongs HERE rather than in the sequential fallback alone: the ack
-	// deletes the offsetIndex entry asynchronously, so for as long as that entry
-	// survives the O(1) path below answers the probe and never reaches the scan.
-	//
-	// broker/queue_reaper.go reapTTLSweep probes acked tags on every sweep by
-	// design and documents the expectation that they read back empty. When they do
-	// not it re-expires and re-dead-letters the same record without bound, and its
-	// tail-advance loop, which breaks on any non-nil message, never moves past the
-	// tag.
-	//
-	// The gate suppresses only on POSITIVE evidence that the record is dead, and
-	// that direction is load-bearing. An unacked record is never refused: a
-	// redelivery is recoverable and AMQP 0-9-1 models it, whereas refusing to serve
-	// a live durable record loses confirmed data silently. RecoverFromWAL and
-	// performCheckpoint already filter against this same bitmap; the read path was
-	// the only consumer that did not.
-	//
-	// THE PREMISE THAT MAKES THAT SAFE, STATED BECAUSE IT IS SCHEDULED TO BECOME
-	// FALSE: ackBitmap is monotone WITHIN AN INCARNATION and starts EMPTY at every
-	// boot — acknowledgement is not persisted (wal_boot_state.go rebuildBootState:
-	// "It restores no acknowledgement state"; broker/queue_dispatch.go states the
-	// same as THE UNWRITTEN PREMISE). So an entry here can only have been put there
-	// by this process, for a record this process served, and the gate cannot
-	// suppress a record it never acked.
-	//
-	// WHAT FALSIFIES IT: durable acknowledgement (item 18). Once an ack set seeds
-	// this bitmap at boot, "monotone within an incarnation" silently becomes
-	// "monotone ACROSS incarnations", which is a strictly stronger claim that
-	// nobody has proved — and the error direction INVERTS. A redeclared queue
-	// re-mints a tag band (broker re-uses the ordinal with perQueueSeq at zero), so
-	// an inherited ack entry would match the LIVE record on a re-minted tag and this
-	// gate would refuse to serve it: silent loss of confirmed durable data, exactly
-	// the direction the paragraph above says it avoids. Whoever lands durable acks
-	// must make this gate incarnation-aware BEFORE seeding the bitmap at boot.
-	qw.bitmapMutex.RLock()
-	acked := qw.ackBitmap.Contains(offset)
-	qw.bitmapMutex.RUnlock()
-	if acked {
+	if qw.isAcknowledged(queueName, offset) {
 		return nil, fmt.Errorf("message not in WAL")
 	}
 
-	// Check offset index first (Phase 6D: O(1) lookup!)
-	qw.offsetIndexMutex.RLock()
-	location, ok := qw.offsetIndex[offset]
-	qw.offsetIndexMutex.RUnlock()
+	key := recordKey{queueName: queueName, deliveryTag: offset}
+	for {
+		qw.offsetIndexMutex.RLock()
+		location, ok := qw.offsetIndex[key]
+		if !ok {
+			qw.offsetIndexMutex.RUnlock()
+			return nil, fmt.Errorf("message not in WAL")
+		}
+		if location.pos.segmentID == qw.fileNum.Load() {
+			qw.offsetIndexMutex.RUnlock()
+			qw.fileMutex.Lock()
+			if location.pos.segmentID != qw.fileNum.Load() {
+				// It rolled between the atomic check and fileMutex. Retry through
+				// the sealed arm with the index lock held through ReadAt.
+				qw.fileMutex.Unlock()
+				continue
+			}
+			file := qw.currentReadFile
+			qw.fileMutex.Unlock()
+			if file == nil {
+				return nil, fmt.Errorf("WAL current read file not open for fileNum %d", location.pos.segmentID)
+			}
+			return qw.parseMessageAt(file, queueName, location.pos.position, offset)
+		}
 
-	if ok {
-		// Fast path: Use index to jump directly to message location
-		return qw.readMessageAtPosition(queueName, location.fileNum, location.filePosition, offset)
+		var msg *protocol.Message
+		err := qw.withOldFileHandle(location.pos.segmentID, func(file *os.File) error {
+			var perr error
+			msg, perr = qw.parseMessageAt(file, queueName, location.pos.position, offset)
+			return perr
+		})
+		qw.offsetIndexMutex.RUnlock()
+		if err != nil {
+			return nil, err
+		}
+		return msg, nil
 	}
-
-	// Fallback: Sequential scan for messages not yet indexed (rare)
-	// This handles the case where index isn't populated yet
-	return qw.readMessageSequential(queueName, offset)
 }
 
 // oldFileReadAttempts bounds the retry in withOldFileHandle. Two: one to
@@ -3980,212 +3953,6 @@ func (qw *QueueWAL) readMessageFromFile(queueName string, filePath string, offse
 		}
 
 		// Not the right message, continue scanning
-	}
-}
-
-// checkpointLoop periodically checkpoints old WAL files to segments
-func (qw *QueueWAL) checkpointLoop() {
-	defer qw.wg.Done()
-
-	// Use CheckpointInterval from WALConfig directly — avoids a race where
-	// segmentMgr is nil at goroutine start (it's set later via SetSegmentManager).
-	ticker := time.NewTicker(qw.cfg.CheckpointInterval)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ticker.C:
-			qw.performCheckpoint()
-
-		case <-qw.stopChan:
-			// Final checkpoint before exit
-			qw.performCheckpoint()
-			return
-		}
-	}
-}
-
-// sharedBodyBackstopFired reports whether a skipped shared-body file has aged
-// past SharedBodyMaxPinAge and must now be re-inlined + deleted (§2). When the
-// knob is 0 the backstop is disabled and reclaim relies on all-ack (whole-file)
-// or RetentionPeriod (tryDeleteOldFiles). A permanently-unacked reference then
-// pins its file — holding exactly ONE body copy, never the N-copy blowup.
-func (qw *QueueWAL) sharedBodyBackstopFired(info *walFileInfo) bool {
-	return qw.cfg.SharedBodyMaxPinAge > 0 &&
-		!info.createdAt.IsZero() &&
-		time.Since(info.createdAt) > qw.cfg.SharedBodyMaxPinAge
-}
-
-// walCheckpointTarget is performCheckpoint's RLock-guarded snapshot of one
-// old file: the shared info pointer plus the fields that are MUTATED after
-// publication (checkpointed) or that the loop must not re-read unlocked
-// (durableSize, copied belt-and-braces), both taken under the same
-// oldFilesMutex.RLock that snapshots the map. The loop body then never reads
-// a field the cleanup goroutine may be writing under oldFilesMutex.Lock.
-type walCheckpointTarget struct {
-	info         *walFileInfo
-	checkpointed bool
-	durableSize  int64
-}
-
-// performCheckpoint moves messages from old WAL files to segments.
-// Only operates on old/rolled files — never touches the current active file.
-// For each old file: scan messages, filter out ACKed ones, write unACKed
-// messages to segments, then delete the WAL file and clean up the offset index.
-//
-// WS-C C2/C4: a WAL file is unlinked ONLY after every CheckpointBatch for its
-// unacked records returned nil — and nil now means written-in-full +
-// fdatasynced + directory-entry-durable (see CheckpointBatch). The
-// checkpointed flag records that state, so a pass that could not unlink (a
-// crash between fsync and unlink, or an unlink error) retries ONLY the unlink
-// on the next pass instead of re-writing the records. A multi-queue
-// checkpoint that fails part-way keeps the WAL file; the retry may rewrite a
-// queue that already succeeded, which the recovery-time dedup (C8) collapses.
-func (qw *QueueWAL) performCheckpoint() {
-	segMgr := qw.getSegmentMgr()
-	if segMgr == nil {
-		return
-	}
-
-	// Snapshot old files to avoid holding the lock during I/O. The MUTABLE
-	// flag (and the durable end, belt-and-braces) is copied under the same
-	// RLock: tryDeleteOldFiles (the cleanup goroutine) writes checkpointed
-	// under oldFilesMutex.Lock, so reading it from the loop body without this
-	// snapshot is a data race even though the flag only ever flips
-	// false→true. Everything else on walFileInfo is written once, before the
-	// entry is published under oldFilesMutex, so reading it through the
-	// snapshot-published pointer is ordered by construction.
-	qw.oldFilesMutex.RLock()
-	filesToCheckpoint := make(map[uint64]*walCheckpointTarget, len(qw.oldFiles))
-	for num, info := range qw.oldFiles {
-		filesToCheckpoint[num] = &walCheckpointTarget{
-			info:         info,
-			checkpointed: info.checkpointed,
-			durableSize:  info.durableSize,
-		}
-	}
-	qw.oldFilesMutex.RUnlock()
-
-	if len(filesToCheckpoint) == 0 {
-		return
-	}
-
-	unlinkedAny := false
-	for fileNum, target := range filesToCheckpoint {
-		info := target.info
-		// ITER5 cold-tail hardening (§2): a rolled file that carries a shared
-		// BodyBlock is SKIPPED (left in oldFiles), so the shared body survives as
-		// ONE copy across arbitrarily many checkpoints — reclaimed whole by
-		// tryDeleteOldFiles once all its refs ack, instead of re-inlining into N
-		// segment copies now. The SharedBodyMaxPinAge backstop overrides the skip
-		// once the file is old enough, re-inlining via the path below (severing all
-		// external refs before delete — no premature free). tryDeleteOldFiles is
-		// unaffected: whole-file reclaim on all-ack still applies.
-		if info.hasSharedBody && !qw.sharedBodyBackstopFired(info) {
-			continue
-		}
-
-		if !target.checkpointed {
-			// Scan the WAL file. See forceCheckpointFile: only a FATAL scan fault
-			// aborts; a torn tail still has every earlier record intact and they
-			// must reach a segment or the file can never be reclaimed. The scan is
-			// bounded at the file's durable end (C1 §3.11): a damaged tail (a
-			// nacked partial batch that could not be truncated) is never read and
-			// goes away with the unlink.
-			messages, err := qw.scanWALFileUpTo(info.path, target.durableSize)
-			if err != nil && interfaces.OutcomeOf(err) == interfaces.RecoveryFatal {
-				continue
-			}
-
-			// Group unACKed messages by queue
-			byQueue := make(map[string][]*RecoveryMessage)
-			qw.bitmapMutex.RLock()
-			for _, msg := range messages {
-				if !qw.ackBitmap.Contains(msg.Offset) {
-					byQueue[msg.QueueName] = append(byQueue[msg.QueueName], msg)
-				}
-			}
-			qw.bitmapMutex.RUnlock()
-
-			// Write unACKed messages to segments
-			checkpointOK := true
-			for queueName, queueMsgs := range byQueue {
-				if err := segMgr.CheckpointBatch(queueName, queueMsgs); err != nil {
-					checkpointOK = false
-					break
-				}
-			}
-
-			if !checkpointOK {
-				// WAL kept; the next pass retries the whole file. Queues that
-				// already succeeded get rewritten (duplicates, collapsed at
-				// recovery by the C8 dedup).
-				continue
-			}
-
-			// Every batch durably succeeded: only the unlink remains. The flag
-			// is written under oldFilesMutex.Lock — the same lock
-			// tryDeleteOldFiles reads and writes it under, and the same lock
-			// this pass's own snapshot copied it under.
-			qw.oldFilesMutex.Lock()
-			info.checkpointed = true
-			qw.oldFilesMutex.Unlock()
-		}
-
-		// Delete WAL file and clean up. walUnlink is the hookable seam whose
-		// default is os.Remove (TEST-ONLY faults: a blocked hook inspects the
-		// state between fsync and unlink; an error simulates a crash there).
-		// A file whose unlink fails stays registered; the next pass retries
-		// ONLY the unlink (checkpointed is already set).
-		if err := walUnlink(info.path); err != nil && !errors.Is(err, fs.ErrNotExist) {
-			qw.logError("checkpointed WAL file could not be unlinked; it stays registered and the next pass retries only the unlink",
-				interfaces.LogField{Key: "path", Value: info.path},
-				interfaces.LogField{Key: "error", Value: err.Error()})
-			continue
-		}
-		unlinkedAny = true
-		qw.closeOldFileHandle(fileNum)
-
-		// Remove from oldFiles map
-		qw.oldFilesMutex.Lock()
-		delete(qw.oldFiles, fileNum)
-		qw.oldFilesMutex.Unlock()
-
-		// Clean up offset index entries for this file's offsets.
-		//
-		// Delete ONLY entries that actually point at the file being reclaimed. The
-		// bare delete-by-offset-value this replaces could not tell two records
-		// apart when they shared an offset, and they can: the WAL is globally
-		// tag-keyed with no queue discriminator, and a non-durable queue that is
-		// redeclared after a restart reclaims its ordinal with perQueueSeq back at
-		// zero, re-minting a tag band whose previous-incarnation records are still
-		// on disk. Reclaiming the old file then evicted the LIVE record's entry,
-		// dropping a current, unacknowledged, confirmed durable message off the
-		// O(1) path and onto the sequential scan.
-		if info.offsets != nil {
-			qw.offsetIndexMutex.Lock()
-			it := info.offsets.Iterator()
-			for it.HasNext() {
-				offset := it.Next()
-				if loc, ok := qw.offsetIndex[offset]; ok && loc.fileNum == fileNum {
-					delete(qw.offsetIndex, offset)
-				}
-			}
-			qw.offsetIndexMutex.Unlock()
-		}
-	}
-
-	// C4: make the unlinks durable (once per pass that unlinked anything).
-	// Not a correctness requirement — if a crash undoes an unlink, the WAL
-	// file comes back next to its segment copy and the recovery dedup (WAL
-	// wins + C8) collapses it — but it bounds replay work and frees the space
-	// for real, which is why a failure is only logged.
-	if unlinkedAny {
-		if serr := syncDir(qw.dataDir); serr != nil {
-			qw.logWarn("WAL directory fsync after checkpoint unlink failed; the space is not reclaimed durably yet and the next pass retries",
-				interfaces.LogField{Key: "dir", Value: qw.dataDir},
-				interfaces.LogField{Key: "error", Value: serr.Error()})
-		}
 	}
 }
 

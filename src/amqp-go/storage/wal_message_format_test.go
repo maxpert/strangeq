@@ -276,7 +276,7 @@ func TestSegment_MessageExtensions_RoundTrip(t *testing.T) {
 		Expiration: "45000", EnqueueUnixMilli: 424242,
 		Headers: sampleXDeathHeaders(deathTime),
 	}
-	require.NoError(t, sm.Write("segq", msg, 7))
+	require.NoError(t, writeLegacyForTest(sm, "segq", msg, 7))
 
 	// In-process read.
 	got, err := sm.Read("segq", 7)

@@ -23,22 +23,38 @@ func coldTailWALConfig() WALConfig {
 	return cfg
 }
 
-// ackAndWait acks each offset and blocks until the WAL's ackBitmap reflects them.
+// ackAndWait acknowledges every physical queue/tag copy and waits for the
+// queue-scoped read gates. Production acknowledgement is synchronous; the
+// physical lookup keeps this shared-body fixture from using a global tag gate.
 func ackAndWait(t testing.TB, wm *WALManager, offsets []uint64) {
 	t.Helper()
 	for _, off := range offsets {
-		wm.Acknowledge("", off)
-	}
-	require.Eventually(t, func() bool {
-		wm.sharedWAL.bitmapMutex.RLock()
-		defer wm.sharedWAL.bitmapMutex.RUnlock()
-		for _, off := range offsets {
-			if !wm.sharedWAL.ackBitmap.Contains(off) {
-				return false
+		wm.sharedWAL.offsetIndexMutex.RLock()
+		queues := make([]string, 0, 1)
+		for key := range wm.sharedWAL.recordCopies {
+			if key.deliveryTag == off {
+				queues = append(queues, key.queueName)
 			}
 		}
-		return true
-	}, 3*time.Second, 2*time.Millisecond, "ack bitmap did not reflect acks")
+		wm.sharedWAL.offsetIndexMutex.RUnlock()
+		require.NotEmpty(t, queues, "no physical record for tag %d", off)
+		for _, queueName := range queues {
+			wm.Acknowledge(queueName, off)
+		}
+	}
+	for _, off := range offsets {
+		wm.sharedWAL.offsetIndexMutex.RLock()
+		for key, copies := range wm.sharedWAL.recordCopies {
+			if key.deliveryTag != off {
+				continue
+			}
+			require.True(t, wm.IsAcknowledged(key.queueName, off))
+			for _, r := range copies {
+				require.True(t, r.acked.Load())
+			}
+		}
+		wm.sharedWAL.offsetIndexMutex.RUnlock()
+	}
 }
 
 // walRecordBoundaries returns the file-relative start offset of every record in
@@ -103,7 +119,7 @@ func TestSharedBody_RefcountZeroReclaimsSpace(t *testing.T) {
 		offsets[i] = uint64(1 + i)
 	}
 	ackAndWait(t, wm, offsets)
-	wm.sharedWAL.tryDeleteOldFiles()
+	wm.sharedWAL.tryReclaimOldFiles()
 
 	_, err = os.Stat(sharedFile)
 	assert.True(t, os.IsNotExist(err), "the shared-body file must be unlinked once all refs are acked")
@@ -126,7 +142,7 @@ func TestSharedBody_PartialAckRetainsBody(t *testing.T) {
 
 	// Ack the first K-1; leave the last unacked.
 	ackAndWait(t, wm, []uint64{1, 2, 3})
-	wm.sharedWAL.tryDeleteOldFiles()
+	wm.sharedWAL.tryReclaimOldFiles()
 
 	_, err = os.Stat(sharedFile)
 	require.NoError(t, err, "file must NOT be deleted while one ref is unacked (no premature free)")
@@ -138,7 +154,7 @@ func TestSharedBody_PartialAckRetainsBody(t *testing.T) {
 
 	// Ack the last ref -> reclaim.
 	ackAndWait(t, wm, []uint64{uint64(K)})
-	wm.sharedWAL.tryDeleteOldFiles()
+	wm.sharedWAL.tryReclaimOldFiles()
 	_, err = os.Stat(sharedFile)
 	assert.True(t, os.IsNotExist(err), "file reclaimed after the final ref is acked")
 }
@@ -267,7 +283,7 @@ func TestSharedBody_GCDoesNotFreeInflightBody(t *testing.T) {
 	}
 	ackAndWait(t, wm, acked)
 	for i := 0; i < 200; i++ {
-		wm.sharedWAL.tryDeleteOldFiles()
+		wm.sharedWAL.tryReclaimOldFiles()
 	}
 	<-done
 
@@ -359,7 +375,7 @@ func TestSharedBody_ColdTailStaysOneCopyAcrossCheckpoint(t *testing.T) {
 		// (d) ack all K -> whole-file reclaim.
 		offs := []uint64{1, 2, 3, 4}
 		ackAndWait(t, wm, offs)
-		wm.sharedWAL.tryDeleteOldFiles()
+		wm.sharedWAL.tryReclaimOldFiles()
 		_, err = os.Stat(sharedFile)
 		assert.True(t, os.IsNotExist(err), "reclaimed whole once all refs ack")
 	})

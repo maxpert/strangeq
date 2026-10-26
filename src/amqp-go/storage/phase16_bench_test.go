@@ -34,7 +34,7 @@ func BenchmarkMultiQueueConcurrentPublish(b *testing.B) {
 	queues := make([]string, 10)
 	for i := 0; i < 10; i++ {
 		queues[i] = fmt.Sprintf("bench_queue_%d", i)
-		ds.getOrCreateQueueRing(queues[i])
+		ds.getOrCreateQueueHot(queues[i])
 	}
 
 	var tag atomic.Uint64
@@ -72,7 +72,7 @@ func BenchmarkSingleQueueConcurrentPublish(b *testing.B) {
 	defer ds.Close()
 
 	queueName := "single_queue"
-	ds.getOrCreateQueueRing(queueName)
+	ds.getOrCreateQueueHot(queueName)
 
 	var tag atomic.Uint64
 
@@ -150,7 +150,7 @@ func BenchmarkGetMessageRingBuffer(b *testing.B) {
 	defer ds.Close()
 
 	queueName := "get_bench_queue"
-	ds.getOrCreateQueueRing(queueName)
+	ds.getOrCreateQueueHot(queueName)
 
 	// Pre-populate ring buffer with transient messages
 	numMessages := 1000
@@ -190,7 +190,7 @@ func BenchmarkDeleteMessage(b *testing.B) {
 	defer ds.Close()
 
 	queueName := "delete_bench_queue"
-	ds.getOrCreateQueueRing(queueName)
+	ds.getOrCreateQueueHot(queueName)
 
 	// Pre-populate
 	numMessages := 1000
@@ -227,7 +227,7 @@ func BenchmarkConcurrentGetAndDelete(b *testing.B) {
 	defer ds.Close()
 
 	queueName := "concurrent_bench_queue"
-	ds.getOrCreateQueueRing(queueName)
+	ds.getOrCreateQueueHot(queueName)
 
 	// Pre-populate
 	numMessages := 10000
@@ -289,7 +289,7 @@ func BenchmarkSegmentWriteReadWithMetadata(b *testing.B) {
 		}
 		recoveryMsgs = append(recoveryMsgs, &RecoveryMessage{Message: m, Offset: uint64(i + 1), QueueName: "bench_queue"})
 	}
-	if err := sm.CheckpointBatch("bench_queue", recoveryMsgs); err != nil {
+	if err := writeLegacyBatchForTest(sm, "bench_queue", recoveryMsgs); err != nil {
 		b.Fatal(err)
 	}
 

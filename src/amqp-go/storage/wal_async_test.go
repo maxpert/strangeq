@@ -199,9 +199,7 @@ func TestStoreMessageAsync_NotRetrievableBeforeFsync(t *testing.T) {
 
 	// fsync gated: NOT durable ⇒ NOT retrievable. ring has no entry, and
 	// GetMessage misses (ring miss + WAL index not yet populated).
-	ring := ds.getQueueRing("guard-q")
-	require.NotNil(t, ring, "queue ring must exist after StoreMessageAsync")
-	_, ok := ring.ring.LoadByTag(tag)
+	_, _, ok := ds.hot.Get("guard-q", tag)
 	assert.False(t, ok, "durable message must NOT be ring-resident before its fsync (deferred ring.Store, A3)")
 	_, gerr := ds.GetMessage("guard-q", tag)
 	assert.Error(t, gerr, "durable message must NOT be retrievable before its fsync (A3)")
@@ -436,9 +434,7 @@ func TestStoreMessageAsync_FsyncErrorNoRingStore(t *testing.T) {
 		t.Fatal("onDurable never fired")
 	}
 
-	ring := ds.getQueueRing("err-q")
-	require.NotNil(t, ring)
-	_, ok := ring.ring.LoadByTag(tag)
+	_, _, ok := ds.hot.Get("err-q", tag)
 	assert.False(t, ok, "an fsync-errored durable message must NEVER be ring-resident (no stale slot)")
 	_, gerr := ds.GetMessage("err-q", tag)
 	assert.Error(t, gerr, "an fsync-errored durable message must not be retrievable")

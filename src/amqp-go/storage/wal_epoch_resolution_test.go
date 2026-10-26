@@ -67,10 +67,10 @@ func resolveEpochLikeCandidateC(t *testing.T, qw *QueueWAL, tag uint64) epochRes
 	var r epochResolution
 
 	qw.offsetIndexMutex.RLock()
-	loc, ok := qw.offsetIndex[tag]
+	loc, ok := qw.offsetIndex[recordKey{queueName: epochResolutionQueue, deliveryTag: tag}]
 	if ok {
 		r.indexed = true
-		r.fileNum = loc.fileNum
+		r.fileNum = loc.pos.segmentID
 	}
 	qw.offsetIndexMutex.RUnlock()
 
@@ -362,7 +362,7 @@ func TestCandidateC_OffsetIndexIsRebuiltOnlyFromSurvivingWALFiles(t *testing.T) 
 	// Re-add the entry by hand, defeating (a) completely: whatever
 	// performCheckpoint removed is now back.
 	e1.wal.sharedWAL.offsetIndexMutex.Lock()
-	e1.wal.sharedWAL.offsetIndex[probe] = &offsetLocation{fileNum: 1, filePosition: 0}
+	e1.wal.sharedWAL.offsetIndex[recordKey{queueName: epochResolutionQueue, deliveryTag: probe}] = &segmentRecord{pos: recordPos{segmentID: 1, position: 0}}
 	e1.wal.sharedWAL.offsetIndexMutex.Unlock()
 
 	restored := resolveEpochLikeCandidateC(t, e1.wal.sharedWAL, probe)

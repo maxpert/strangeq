@@ -92,74 +92,68 @@ func (wm *WALManager) ReadBatch(queueName string, startOffset uint64) (map[uint6
 }
 
 func (qw *QueueWAL) readMessageBatch(queueName string, startOffset uint64) (map[uint64]*protocol.Message, error) {
-	qw.offsetIndexMutex.RLock()
-	location, ok := qw.offsetIndex[startOffset]
-	qw.offsetIndexMutex.RUnlock()
-	if !ok {
-		return nil, fmt.Errorf("offset %d not in WAL index", startOffset)
-	}
-
+	key := recordKey{queueName: queueName, deliveryTag: startOffset}
 	var messages map[uint64]*protocol.Message
-	var limit int64
-	collect := func(file *os.File) error {
-		var cerr error
-		messages, cerr = qw.collectBatchFrom(file, queueName, location.filePosition, limit)
-		return cerr
+	for {
+		qw.offsetIndexMutex.RLock()
+		location, ok := qw.offsetIndex[key]
+		if !ok {
+			qw.offsetIndexMutex.RUnlock()
+			return nil, fmt.Errorf("offset %d not in WAL index", startOffset)
+		}
+
+		var limit int64
+		collect := func(file *os.File) error {
+			var cerr error
+			messages, cerr = qw.collectBatchFrom(file, queueName, location.pos.position, limit)
+			return cerr
+		}
+
+		if location.pos.segmentID == qw.fileNum.Load() {
+			// Active reads never acquire fileMutex while holding the index lock.
+			qw.offsetIndexMutex.RUnlock()
+			qw.fileMutex.Lock()
+			if location.pos.segmentID != qw.fileNum.Load() {
+				qw.fileMutex.Unlock()
+				continue
+			}
+			file := qw.currentReadFile
+			limit = qw.fileOffset.Load()
+			qw.fileMutex.Unlock()
+			if file == nil {
+				return nil, fmt.Errorf("WAL current read file not open for fileNum %d", location.pos.segmentID)
+			}
+			if err := collect(file); err != nil {
+				return nil, err
+			}
+		} else {
+			// Sealed reads retain the index read lock through ReadAt and body reads.
+			qw.oldFilesMutex.RLock()
+			info, registered := qw.oldFiles[location.pos.segmentID]
+			limit = -1
+			if registered {
+				limit = info.durableSize
+			}
+			qw.oldFilesMutex.RUnlock()
+			err := qw.withOldFileHandle(location.pos.segmentID, collect)
+			qw.offsetIndexMutex.RUnlock()
+			if err != nil {
+				return nil, err
+			}
+		}
+		break
 	}
 
-	qw.fileMutex.Lock()
-	currentFileNum := qw.fileNum.Load()
-	if location.fileNum == currentFileNum {
-		file := qw.currentReadFile
-		// C7: the durable frontier. fileOffset is advanced only after a
-		// successful fsync (I4), so bytes past it are in flight or belong to
-		// a nacked batch — read-ahead must not cache or serve them.
-		limit = qw.fileOffset.Load()
-		qw.fileMutex.Unlock()
-		if file == nil {
-			return nil, fmt.Errorf("WAL current read file not open for fileNum %d", location.fileNum)
-		}
-		if err := collect(file); err != nil {
-			return nil, err
-		}
-	} else {
-		qw.fileMutex.Unlock()
-		// C7: a rolled file's read-ahead is bounded at its durable end
-		// (durableSize, captured at roll); an inherited file (-1) is bounded
-		// by nothing because it was never damaged by this incarnation.
-		qw.oldFilesMutex.RLock()
-		info, registered := qw.oldFiles[location.fileNum]
-		limit = -1
-		if registered {
-			limit = info.durableSize
-		}
-		qw.oldFilesMutex.RUnlock()
-		// The old-file handle comes from a cache that no longer holds its lock
-		// across this read, so the handle can be closed under us. That surfaces
-		// as os.ErrClosed and withOldFileHandle retries it against a fresh one.
-		if err := qw.withOldFileHandle(location.fileNum, collect); err != nil {
-			return nil, err
-		}
-	}
-
-	// Drop acknowledged records before they are returned OR cached. The caller
-	// (DisruptorStorage.GetMessage) both answers the probe from this map and feeds
-	// it straight into the read-ahead buffer, so an acked record surviving here is
-	// served immediately AND re-poisons the cache for every later sweep. The
-	// offsetIndex entry that admitted us above is deleted asynchronously, so it is
-	// still present for a moment after the ack and cannot be relied on to filter.
-	qw.bitmapMutex.RLock()
+	// The queue-scoped volatile bitmap is a read gate only, and is touched with
+	// no index/file lock held.
 	for offset := range messages {
-		if qw.ackBitmap.Contains(offset) {
+		if qw.isAcknowledged(queueName, offset) {
 			delete(messages, offset)
 		}
 	}
-	qw.bitmapMutex.RUnlock()
-
 	if len(messages) == 0 {
 		return nil, fmt.Errorf("no messages found in read-ahead for offset %d", startOffset)
 	}
-
 	return messages, nil
 }
 

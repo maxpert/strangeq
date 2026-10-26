@@ -52,7 +52,7 @@ func TestRetention_CheckpointFailure_KeepsWAL(t *testing.T) {
 	})
 
 	time.Sleep(100 * time.Millisecond) // expire
-	sw.tryDeleteOldFiles()
+	sw.tryReclaimOldFiles()
 
 	_, serr := os.Stat(walPath)
 	require.False(t, os.IsNotExist(serr), "an expired file whose checkpoint FAILED must be kept")
@@ -61,17 +61,21 @@ func TestRetention_CheckpointFailure_KeepsWAL(t *testing.T) {
 	sw.oldFilesMutex.RUnlock()
 	require.True(t, registered, "the expired file must stay registered in oldFiles")
 
-	// Fault cleared: the next sweep checkpoints durably and THEN deletes.
+	// Even with the segment fault cleared, expiry alone still cannot copy and
+	// delete unacknowledged records. The WAL remains their readable source.
 	restore()
-	sw.tryDeleteOldFiles()
+	sw.tryReclaimOldFiles()
 	_, serr = os.Stat(walPath)
-	require.True(t, os.IsNotExist(serr), "once the checkpoint succeeds the expired file is deleted")
-
+	require.NoError(t, serr)
 	for off := uint64(1); off <= n; off++ {
-		msg, rerr := sm.Read("q", off)
-		require.NoError(t, rerr, "unacked offset %d must be served from the segment", off)
+		msg, rerr := wm.Read("q", off)
+		require.NoError(t, rerr, "unacked offset %d must remain readable from the WAL", off)
 		require.NotEmpty(t, msg.Body)
+		wm.Acknowledge("q", off)
 	}
+	sw.tryReclaimOldFiles()
+	_, serr = os.Stat(walPath)
+	require.True(t, os.IsNotExist(serr), "the file is reclaimed after every record is acked")
 }
 
 // TestRetention_NilSegmentManager_KeepsUnackedWAL (TDD test 20): with no
@@ -101,7 +105,7 @@ func TestRetention_NilSegmentManager_KeepsUnackedWAL(t *testing.T) {
 	sw.fileMutex.Unlock()
 
 	time.Sleep(100 * time.Millisecond) // expire
-	sw.tryDeleteOldFiles()
+	sw.tryReclaimOldFiles()
 
 	// Unacked records + no segment manager: the file is kept.
 	_, serr := os.Stat(walPath)
@@ -119,10 +123,10 @@ func TestRetention_NilSegmentManager_KeepsUnackedWAL(t *testing.T) {
 	require.Eventually(t, func() bool {
 		sw.bitmapMutex.RLock()
 		defer sw.bitmapMutex.RUnlock()
-		return sw.ackBitmap.GetCardinality() == n
+		return sw.ackBitmaps["q"].GetCardinality() == n
 	}, 3*time.Second, 2*time.Millisecond, "ack bitmap did not register acks")
 
-	sw.tryDeleteOldFiles()
+	sw.tryReclaimOldFiles()
 	_, serr = os.Stat(walPath)
 	require.True(t, os.IsNotExist(serr), "a fully-acknowledged file is deleted through allAcked even without a segment manager")
 }

@@ -30,7 +30,7 @@ import (
 //     oldFiles was empty, currentFileOffsets was empty — so its delivery tag was
 //     claimable and unreadable and the dispatch plane silently gap-skipped it.
 //   - C-2: when the reopened file rolled, rollFile registered it in oldFiles with
-//     ONLY this incarnation's offsets, so tryDeleteOldFiles judged it fully acked
+//     ONLY this incarnation's offsets, so tryReclaimOldFiles judged it fully acked
 //     and os.Remove()d a file full of confirmed, unacknowledged durable records.
 //
 // rebuildBootState fixes the cause rather than either symptom: it enumerates the
@@ -103,68 +103,74 @@ func parseWALFileNum(name string) (uint64, bool) {
 	return n, true
 }
 
-// walRecordIndexEntry is one indexed message record: the offset it carries and
-// the file-relative byte position of its record header.
-type walRecordIndexEntry struct {
-	offset   uint64
-	position int64
-}
-
-// indexWALFile performs a framing-level scan of one WAL file and reports where
-// each message record lives, without deserializing message payloads.
-//
-// It is deliberately NOT scanWALFile: the boot index needs (offset, position)
-// pairs and a shared-body flag, not materialized protocol.Messages, and paying
-// for full property decode + body copies of every record on disk at startup
-// would make boot cost proportional to the whole WAL in allocations as well as
-// I/O. The record grammar walked here is byte-for-byte the one scanWALFile
-// walks (CRC + length framing, per-record type tag, v4 payload prefix), so the
-// two cannot disagree about record boundaries.
-//
-// IT APPLIES THE SAME THREE-WAY CLASSIFICATION AS scanWALFile, and that is
-// load-bearing rather than tidy. rebuildBootState runs at storage CONSTRUCTION
-// and refuses there, before RecoverFromWAL ever runs — so if this walk silently
-// skipped a bad-CRC record (which it did), a directory with one unparseable
-// file AND one interior CRC failure produced a refusal naming only the first.
-// The refusal message states that its artifact list is complete; that claim is
-// only true if every fault class is enumerated in the same pass.
-//
-// A torn tail (short read, zero-filled tail, or a CRC failure with nothing
-// intelligible after it) ends the scan with no error, exactly as in
-// scanWALFile: the trailing partial record was never fsynced, so no publisher
-// was ever told it was durable.
-func indexWALFile(path string) (entries []walRecordIndexEntry, hasSharedBody bool, err error) {
+// indexWALFile builds the complete physical inventory of one WAL file. It
+// shares scanWALFile's transaction rule: message records become live only when
+// a matching Commit is present. Discarded uncommitted records and a torn tail
+// are dead bytes, never live records.
+func indexWALFile(fileNum uint64, path string) (inv *segmentInventory, hasSharedBody bool, err error) {
+	inv = newSegmentInventory(0)
+	defer func() {
+		if err != nil {
+			inv.valid = false
+		}
+	}()
 	file, err := os.Open(path)
 	if err != nil {
-		return nil, false, err
+		return inv, false, err
 	}
 	defer file.Close()
+	stat, err := file.Stat()
+	if err != nil {
+		return inv, false, err
+	}
+	fileSize := stat.Size()
 
 	dataStart, err := walFileDataStart(file)
 	if err != nil {
-		return nil, false, err
+		return inv, false, err
 	}
+	inv.durableBytes = fileSize
 	if _, err := file.Seek(dataStart, io.SeekStart); err != nil {
-		return nil, false, err
+		return inv, false, err
 	}
 
 	recStart := dataStart
+	durableEnd := dataStart
 	hdr := make([]byte, 8)
+	inTx := false
+	var txEpoch uint64
+	var txBytes int64
+	var txRecords []*segmentRecord
+
+	discardTx := func() {
+		inv.deadBytes.Add(txBytes)
+		txBytes = 0
+		txRecords = txRecords[:0]
+		inTx = false
+	}
+	commitTx := func() {
+		for _, r := range txRecords {
+			r.committed = true
+			inv.addRecord(r)
+		}
+		txBytes = 0
+		txRecords = txRecords[:0]
+		inTx = false
+	}
+
 	for {
 		if _, rerr := io.ReadFull(file, hdr); rerr != nil {
 			break
 		}
 		crc := binary.BigEndian.Uint32(hdr[0:4])
 		dataLen := binary.BigEndian.Uint32(hdr[4:8])
+		recordBytes := int64(8) + int64(dataLen)
 
-		// A zero-filled region is the end of this file's data, not a run of
-		// zero-length records — see walBlankRecordHeader. Walking it 8 bytes at
-		// a time would also make boot cost proportional to the zeroed tail.
 		if walBlankRecordHeader(crc, dataLen) {
 			if walNothingIntelligibleFollows(file, recStart, -1) {
 				break
 			}
-			return nil, false, interfaces.FatalFault("wal-open", path,
+			return inv, false, interfaces.FatalFault("wal-open", path,
 				fmt.Sprintf("a zero-filled region begins at byte offset %d and is FOLLOWED BY MORE DATA before end of file; this file cannot be interpreted", recStart),
 				"every durable message in this WAL file is abandoned; the file is left on disk untouched, and every OTHER WAL file in the directory is still recovered",
 				nil)
@@ -176,7 +182,7 @@ func indexWALFile(path string) (entries []walRecordIndexEntry, hasSharedBody boo
 		}
 
 		curRecStart := recStart
-		recStart += 8 + int64(dataLen)
+		recStart += recordBytes
 
 		if crc != 0 {
 			h := crc32.NewIEEE()
@@ -184,45 +190,150 @@ func indexWALFile(path string) (entries []walRecordIndexEntry, hasSharedBody boo
 			h.Write(data)
 			if crc != h.Sum32() {
 				if walNothingIntelligibleFollows(file, recStart, -1) {
-					break // torn tail: drop it and stop, nothing real follows
+					recStart = curRecStart // the whole bad tail record is dead
+					break
 				}
-				return nil, false, interfaces.FatalFault("wal-open", path,
+				return inv, false, interfaces.FatalFault("wal-open", path,
 					fmt.Sprintf("the record at byte offset %d failed its CRC32 check and is NOT the last record in the file — real data follows it; this file cannot be interpreted", curRecStart),
 					"every durable message in this WAL file is abandoned, including any that follow the damaged record and are themselves intact; every OTHER WAL file in the directory is still recovered",
 					nil)
 			}
 		}
 
+		durableEnd = recStart
 		recType, payload := recordTypeAndPayload(data)
 		switch recType {
+		case WALRecordTypeTxBoundary:
+			if len(payload) < walTxMarkerPayloadLen {
+				if inTx {
+					txBytes += recordBytes
+				} else {
+					inv.deadBytes.Add(recordBytes)
+				}
+				continue
+			}
+			kind := payload[0]
+			epoch := binary.BigEndian.Uint64(payload[1:9])
+			switch kind {
+			case WALTxMarkerBegin:
+				if inTx {
+					discardTx()
+				}
+				inTx = true
+				txEpoch = epoch
+				txBytes = recordBytes
+			case WALTxMarkerCommit:
+				if inTx && epoch == txEpoch {
+					commitTx()
+				} else {
+					if inTx {
+						discardTx()
+					}
+					inv.deadBytes.Add(recordBytes)
+				}
+			default:
+				if inTx {
+					txBytes += recordBytes
+				} else {
+					inv.deadBytes.Add(recordBytes)
+				}
+			}
+
 		case WALRecordTypeBodyBlock:
 			hasSharedBody = true
+			inv.addBlock(curRecStart, recordBytes)
+			if inTx {
+				txBytes += recordBytes
+			}
+
 		case WALRecordTypeMessage:
-			if offset, ok := peekRecordOffset(payload); ok {
-				entries = append(entries, walRecordIndexEntry{offset: offset, position: curRecStart})
+			queueName, offset, bodyRef, ok := peekRecordInventory(payload)
+			if !ok {
+				if inTx {
+					txBytes += recordBytes
+				} else {
+					inv.deadBytes.Add(recordBytes)
+				}
+				continue
+			}
+			r := &segmentRecord{
+				pos:       recordPos{segmentID: fileNum, position: curRecStart},
+				queueName: queueName, deliveryTag: offset,
+				bytes: recordBytes, bodyRef: bodyRef,
+			}
+			if inTx {
+				txBytes += recordBytes
+				txRecords = append(txRecords, r)
+			} else {
+				r.committed = true
+				inv.addRecord(r)
+			}
+		default:
+			if inTx {
+				txBytes += recordBytes
+			} else {
+				inv.deadBytes.Add(recordBytes)
 			}
 		}
 	}
-	return entries, hasSharedBody, nil
+	if inTx {
+		discardTx()
+	}
+	// A body block with no surviving committed reference is physical garbage.
+	// Its bytes are separate from transaction message bytes in the WAL format.
+	for _, block := range inv.blocks {
+		if block.refs.Load() == 0 {
+			inv.deadBytes.Add(block.bytes)
+		}
+	}
+	inv.deadBytes.Add(fileSize - durableEnd)
+	return inv, hasSharedBody, nil
 }
 
-// peekRecordOffset reads just the offset out of a v4 message payload.
-//
-// Layout (see appendMessagePayload, which is the single writer of this prefix):
-//
-//	[flags u16][queue u8-len + bytes][offset u64][...]
-//
-// Everything after the offset is irrelevant to the index, so it is not parsed.
-func peekRecordOffset(payload []byte) (uint64, bool) {
+// peekRecordInventory reads only the structural prefix needed by the physical
+// index, avoiding a full protocol.Message allocation for every boot record.
+func peekRecordInventory(payload []byte) (queueName string, offset uint64, bodyRef int64, ok bool) {
+	bodyRef = -1
 	if len(payload) < 3 {
-		return 0, false
+		return "", 0, bodyRef, false
 	}
 	qlen := int(payload[2])
 	pos := 3 + qlen
 	if pos+8 > len(payload) {
-		return 0, false
+		return "", 0, bodyRef, false
 	}
-	return binary.BigEndian.Uint64(payload[pos : pos+8]), true
+	queueName = string(payload[3 : 3+qlen])
+	offset = binary.BigEndian.Uint64(payload[pos : pos+8])
+	pos += 8
+	// exchange and routing-key short strings, delivery mode, body kind
+	for range 2 {
+		if pos >= len(payload) {
+			return "", 0, bodyRef, false
+		}
+		n := int(payload[pos])
+		pos += 1 + n
+		if pos > len(payload) {
+			return "", 0, bodyRef, false
+		}
+	}
+	if pos+2 > len(payload) {
+		return "", 0, bodyRef, false
+	}
+	pos++ // delivery mode
+	kind := payload[pos]
+	pos++
+	if kind == bodyKindReference {
+		if pos+2 > len(payload) {
+			return "", 0, bodyRef, false
+		}
+		n := int(binary.BigEndian.Uint16(payload[pos : pos+2]))
+		pos += 2
+		if n != 8 || pos+8 > len(payload) {
+			return "", 0, bodyRef, false
+		}
+		bodyRef = int64(binary.BigEndian.Uint64(payload[pos : pos+8]))
+	}
+	return queueName, offset, bodyRef, true
 }
 
 // rebuildBootState restores fileNum, oldFiles and offsetIndex from what is
@@ -233,7 +344,7 @@ func peekRecordOffset(payload []byte) (uint64, bool) {
 // rest of the type, not for a race that can occur here).
 //
 // A file whose header or grammar cannot be walked is still registered in
-// oldFiles — with a NIL offset bitmap, which makes tryDeleteOldFiles' allAcked
+// oldFiles — with a NIL offset bitmap, which makes tryReclaimOldFiles' allAcked
 // predicate false by construction, so an unreadable file can never be reclaimed
 // on the strength of an inventory we do not have.
 //
@@ -289,12 +400,14 @@ func (qw *QueueWAL) rebuildBootState() error {
 		// durableSize -1 marks an inherited file: its whole content is
 		// presumed intact (it was not damaged by a handled write error in
 		// THIS incarnation), so checkpoints scan it whole (WS-C C1 §3.11).
-		info := &walFileInfo{path: f.path, durableSize: -1}
+		info := &walFileInfo{path: f.path, durableSize: -1, inv: newSegmentInventory(0)}
+		info.inv.valid = false
 		if st, serr := os.Stat(f.path); serr == nil {
 			info.createdAt = st.ModTime()
 		}
 
-		recs, hasSharedBody, ierr := indexWALFile(f.path)
+		inv, hasSharedBody, ierr := indexWALFile(f.num, f.path)
+		info.inv = inv
 		if ierr != nil {
 			// Unreadable/foreign/unsupported-version file: keep it, but with no
 			// inventory, so nothing can conclude it is fully acknowledged.
@@ -305,9 +418,9 @@ func (qw *QueueWAL) rebuildBootState() error {
 		info.hasSharedBody = hasSharedBody
 
 		offsets := roaring64.New()
-		for _, rec := range recs {
-			offsets.Add(rec.offset)
-			qw.offsetIndex[rec.offset] = &offsetLocation{fileNum: f.num, filePosition: rec.position}
+		for _, rec := range inv.records {
+			offsets.Add(rec.deliveryTag)
+			qw.indexRecordLocked(rec)
 		}
 		info.offsets = offsets
 		qw.oldFiles[f.num] = info

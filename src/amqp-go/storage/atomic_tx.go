@@ -84,15 +84,15 @@ func (s *txStagingStorage) commit() error {
 		}
 	}
 
-	// Phase 2 — in-memory ring state. Durable messages are already in the WAL
-	// (via WriteTxAtomic above), so they only need to be inserted into the ring
-	// (mirroring StoreMessage minus its per-message WAL write). Transient
-	// messages take the normal StoreMessage path (ring, with spill-to-WAL).
+	// Phase 2 — in-memory cache state. Durable messages are already in the WAL
+	// (via WriteTxAtomic above), so they only need cache admission (mirroring
+	// StoreMessage minus its per-message WAL write). Transient messages take
+	// the normal StoreMessage path, including WAL spill on admission failure.
 	for i := range s.stores {
 		st := &s.stores[i]
 		if st.message.DeliveryMode == 2 && ds.wal != nil {
-			if err := ds.insertDurableIntoRing(st.queueName, st.message); err != nil {
-				return fmt.Errorf("atomic transaction commit failed applying ring state: %w", err)
+			if err := ds.insertDurableIntoCache(st.queueName, st.message); err != nil {
+				return fmt.Errorf("atomic transaction commit failed applying cache state: %w", err)
 			}
 			continue
 		}
@@ -111,29 +111,13 @@ func (s *txStagingStorage) commit() error {
 	return nil
 }
 
-// insertDurableIntoRing places an already-WAL-durable message into its queue
-// ring. It mirrors the ring-handling half of StoreMessage (spill awareness
-// included) but performs NO WAL write, since the message was already persisted
-// as part of the atomic transaction unit.
-func (ds *DisruptorStorage) insertDurableIntoRing(queueName string, message *protocol.Message) error {
-	ring := ds.getOrCreateQueueRing(queueName)
-
-	// Ring already over the spill threshold: leave the message in the WAL only
-	// (it is read on demand), exactly as StoreMessage would.
-	if ring.ring.Count() > ds.spillThreshold {
-		return nil
+// insertDurableIntoCache admits an already-WAL-durable message without doing
+// any further I/O. Oversized or inadmissible messages remain available in WAL.
+func (ds *DisruptorStorage) insertDurableIntoCache(queueName string, message *protocol.Message) error {
+	queue := ds.getOrCreateQueueHot(queueName)
+	if ds.hot.Put(queueName, message, true) {
+		queue.ack.OnPublish(message.DeliveryTag)
 	}
-
-	_, spilled, err := ring.ring.Store(message.DeliveryTag, message)
-	if err != nil {
-		return fmt.Errorf("failed to store message in ring: %w", err)
-	}
-	if spilled {
-		// Spilled out of the ring; the WAL copy is authoritative.
-		return nil
-	}
-
-	ring.ack.OnPublish(message.DeliveryTag)
 	return nil
 }
 

@@ -18,10 +18,10 @@ import (
 func newSmallRingStorage(t *testing.T) *DisruptorStorage {
 	t.Helper()
 	ds, err := NewDisruptorStorageWithEngineConfig(t.TempDir(), interfaces.EngineConfig{
-		RingBufferSize:        16,
-		SpillThresholdPercent: 50,
-		WALBatchSize:          1000,
-		WALBatchTimeoutMS:     10,
+		HotCacheQueueBytes:  6 * 600,
+		HotCacheGlobalBytes: 6 * 600,
+		WALBatchSize:        1000,
+		WALBatchTimeoutMS:   10,
 	})
 	require.NoError(t, err)
 	t.Cleanup(func() { ds.Close() })
@@ -46,10 +46,8 @@ func spillTags(t *testing.T, ds *DisruptorStorage, queue string, n int) (residen
 	for i := 1; i <= n; i++ {
 		storeDurable(t, ds, queue, uint64(i))
 	}
-	ring := ds.getQueueRing(queue)
-	require.NotNil(t, ring)
 	for i := 1; i <= n; i++ {
-		if _, ok := ring.ring.LoadByTag(uint64(i)); ok {
+		if _, _, ok := ds.hot.Get(queue, uint64(i)); ok {
 			resident = append(resident, uint64(i))
 		} else {
 			spilled = append(spilled, uint64(i))
@@ -108,7 +106,7 @@ func TestDeleteIfPresentDetailed_Outcomes(t *testing.T) {
 	assert.False(t, wasResident)
 
 	// Durable ring win acks the WAL.
-	assert.True(t, ds.wal.IsAcknowledged(resident[0]), "durable ring win must ack the WAL")
+	assert.True(t, ds.wal.IsAcknowledged("q", resident[0]), "durable ring win must ack the WAL")
 
 	// Legacy wrapper keeps its contract: ring-CAS result only.
 	ds2 := newSmallRingStorage(t)
@@ -137,12 +135,8 @@ func TestDeleteIfPresentDetailed_ConcurrentSpilledExactlyOnce(t *testing.T) {
 		// Keep every iteration's tag WAL-only: a fresh durable store past the
 		// spill threshold is WAL-only by construction.
 		storeDurable(t, ds, "q", tag)
-		ring := ds.getQueueRing("q")
-		if _, ok := ring.ring.LoadByTag(tag); ok {
-			// Ring got drained below the threshold by nothing — delete the slot
-			// so the tag is WAL-only for this iteration.
-			ring.ring.Delete(tag)
-		}
+		// Force this iteration's durable tag to be WAL-only.
+		ds.hot.Delete("q", tag)
 
 		var wins atomic.Int64
 		var wg sync.WaitGroup
@@ -172,8 +166,7 @@ func TestDeleteIfPresentDetailed_ConcurrentRingExactlyOnce(t *testing.T) {
 
 	const tag = uint64(1)
 	storeDurable(t, ds, "q", tag)
-	ring := ds.getQueueRing("q")
-	_, ok := ring.ring.LoadByTag(tag)
+	_, _, ok := ds.hot.Get("q", tag)
 	require.True(t, ok, "test premise: tag is ring-resident")
 
 	const racers = 32
@@ -198,5 +191,5 @@ func TestDeleteIfPresentDetailed_ConcurrentRingExactlyOnce(t *testing.T) {
 	wg.Wait()
 	assert.Equal(t, int64(1), wins.Load(), "exactly one winner")
 	assert.Equal(t, int64(1), residents.Load(), "exactly one observer of ring residency")
-	assert.True(t, ds.wal.IsAcknowledged(tag))
+	assert.True(t, ds.wal.IsAcknowledged("q", tag))
 }
