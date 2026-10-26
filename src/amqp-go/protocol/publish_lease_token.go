@@ -126,8 +126,8 @@ func (t PublishLeaseToken) State() int32 {
 type TokenQueue struct {
 	mu   sync.Mutex
 	head int
-		   // items holds the queue with items[:head] logically popped (nil'd
-		   // lazily on compaction).
+	// items holds the queue with items[:head] logically popped (nil'd
+	// lazily on compaction).
 	items []PublishLeaseToken
 }
 

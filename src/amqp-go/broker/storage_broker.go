@@ -2941,11 +2941,11 @@ func (b *StorageBroker) publishMessage(exchangeName, routingKey string, message 
 // (leaseDone.BrokerDone) once. The guard prevents a premature fire if an early
 // copy's fsync completes before later copies are enqueued.
 type publishConfirmAgg struct {
-	remaining atomic.Int32
-	onDurable func(error)
-	errOnce   sync.Once
-	err       error
-	leaseDone protocol.PublishLeaseToken
+	remaining  atomic.Int32
+	onDurable  func(error)
+	errOnce    sync.Once
+	err        error
+	leaseDone  protocol.PublishLeaseToken
 	durableOff atomic.Bool // abandoned: no onDurable may fire anymore
 }
 
@@ -3006,7 +3006,7 @@ func (a *publishConfirmAgg) abandon() {
 // the counted total).
 func (a *publishConfirmAgg) abandonStranded(stranded int) {
 	a.durableOff.Store(true)
-	if a.remaining.Add(int32(-1 - stranded)) == 0 {
+	if a.remaining.Add(int32(-1-stranded)) == 0 {
 		a.leaseDone.BrokerDone()
 	}
 }
