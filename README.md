@@ -315,7 +315,7 @@ Each workload used a 10-second warmup followed by a 30-second measurement. Resul
 
 Memory usage for the 64 KB workload with 10 producers and 10 consumers:
 
-| Memory (RSS) | StrangeQ | RabbitMQ 4.3 Classic | StrangeQ / RabbitMQ |
+| Memory (RSS) | StrangeQ | RabbitMQ 4.4 Classic | StrangeQ / RabbitMQ |
 |---|--:|--:|--:|
 | Steady state | 1,027 MB | 1,110 MB | 0.93x |
 | Peak | 1,029 MB | 1,597 MB | **0.65x** |
