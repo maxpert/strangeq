@@ -104,7 +104,7 @@ func DefaultConfig() *AMQPConfig {
 			CleanupIntervalMS:        300000,   // 5 minutes
 		},
 		Engine: interfaces.EngineConfig{
-			// Ring Buffer (Hot Path)
+			// Ring Buffer (Hot Path) — retained as legacy message-count depth-HWM input
 			RingBufferSize:        65536, // 64K messages = ~6.5 MB per queue
 			SpillThresholdPercent: 80,    // Start spilling at 80% = 51,200 messages
 			DepthHighWMOverride:   0,     // 0 = compute HWM from ring size × spill % (default)
@@ -112,14 +112,18 @@ func DefaultConfig() *AMQPConfig {
 			// Write-Ahead Log (WAL)
 			WALBatchSize:      1000,              // 1,000 messages per batch
 			WALBatchTimeoutMS: 5,                 // retained for compatibility; flushing is drain-then-flush, not timer-gated
-			WALFileSize:       512 * 1024 * 1024, // 512 MB per WAL file
+			WALFileSize:       64 * 1024 * 1024,  // 64 MB per WAL file (segstore v1)
 			WALChannelBuffer:  10000,             // 10K buffered requests
 
 			// Segment Storage (Cold Path)
-			SegmentSize:                 256 * 1024 * 1024, // 256 MB per segment (4x faster compaction vs 1GB)
-			SegmentCheckpointIntervalMS: 300000,            // 5 minutes
-			CompactionThreshold:         0.5,               // Compact at 50% deleted
-			CompactionIntervalMS:        1800000,           // 30 minutes
+			SegmentSize:                 64 * 1024 * 1024, // 64 MB per segment (segstore v1)
+			SegmentCheckpointIntervalMS: 300000,           // 5 minutes
+			CompactionThreshold:         0.5,              // Compact at 50% deleted
+			CompactionIntervalMS:        1800000,          // 30 minutes
+
+			// Hot Cache (Segstore v1)
+			HotCacheQueueBytes:  16 * 1024 * 1024, // 16 MiB per queue
+			HotCacheGlobalBytes: 256 * 1024 * 1024, // 256 MiB global
 
 			// Consumer Delivery
 			ConsumerSelectTimeoutMS: 1,    // 1 millisecond (500µs rounded up)
@@ -266,10 +270,23 @@ func (c *AMQPConfig) Validate() error {
 	}
 
 	// Validate engine configuration
-	if c.Engine.RingBufferSize <= 0 || (c.Engine.RingBufferSize&(c.Engine.RingBufferSize-1)) != 0 {
-		return fmt.Errorf("ring buffer size must be a power of 2: %d", c.Engine.RingBufferSize)
+	if c.Engine.RingBufferSize <= 0 {
+		return fmt.Errorf("ring buffer size must be positive: %d", c.Engine.RingBufferSize)
 	}
 
+	// Hot cache validation (segstore v1)
+	if c.Engine.HotCacheQueueBytes != 0 {
+		qb := c.Engine.HotCacheQueueBytes
+		if qb < 1*1024*1024 || qb > 16*1024*1024 {
+			return fmt.Errorf("hot cache queue bytes must be between 1 and 16 MiB: %d", qb)
+		}
+	}
+	if c.Engine.HotCacheGlobalBytes != 0 {
+		gb := c.Engine.HotCacheGlobalBytes
+		if gb < c.Engine.HotCacheQueueBytes || gb > 256*1024*1024 {
+			return fmt.Errorf("hot cache global bytes must be between queue bytes and 256 MiB: %d", gb)
+		}
+	}
 	if c.Engine.SpillThresholdPercent <= 0 || c.Engine.SpillThresholdPercent > 100 {
 		return fmt.Errorf("spill threshold percent must be between 1-100: %d", c.Engine.SpillThresholdPercent)
 	}
@@ -408,6 +425,13 @@ func (c *AMQPConfig) Load(source string) error {
 	// telemetry.port: 0 stays 0 and is rejected.
 	if c.Telemetry.Port == 0 && !k.Exists("telemetry.port") {
 		c.Telemetry.Port = DefaultConfig().Telemetry.Port
+	}
+	// Segstore v1: seed hot-cache defaults when absent
+	if c.Engine.HotCacheQueueBytes == 0 && !k.Exists("engine.hot_cache_queue_bytes") {
+		c.Engine.HotCacheQueueBytes = DefaultConfig().Engine.HotCacheQueueBytes
+	}
+	if c.Engine.HotCacheGlobalBytes == 0 && !k.Exists("engine.hot_cache_global_bytes") {
+		c.Engine.HotCacheGlobalBytes = DefaultConfig().Engine.HotCacheGlobalBytes
 	}
 	return c.Validate()
 }

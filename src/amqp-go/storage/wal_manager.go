@@ -23,7 +23,7 @@ const (
 	// WAL settings
 	DefaultWALBatchSize    = 1000                  // Messages per batch
 	DefaultWALBatchTimeout = 10 * time.Millisecond // Legacy batch flush timeout (no longer gates flushing; see WALConfig.BatchTimeout)
-	DefaultWALFileSize     = 512 * 1024 * 1024     // 512 MB per WAL file
+	DefaultWALFileSize     = 64 * 1024 * 1024     // 64 MB per WAL file (segstore v1)
 	WALFileExtension       = ".wal"
 
 	// maxRetainedWALBatchBytes bounds how large EACH of the pipelined group

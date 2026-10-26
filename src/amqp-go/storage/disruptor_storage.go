@@ -35,6 +35,9 @@ type DisruptorStorage struct {
 	ringBufferSize int
 	spillThreshold uint64
 
+	// Hot cache (segstore v1) — byte-bounded, replaces ring buffer in WI2/WI3
+	hotCacheQueueBytes  int64
+	hotCacheGlobalBytes int64
 	metadataStore *PersistentMetadataStore
 	wal           *WALManager
 	segments      *SegmentManager
@@ -185,10 +188,27 @@ func NewDisruptorStorageWithEngineConfig(dataDir string, engineCfg interfaces.En
 		spillPercent = DefaultSpillThresholdPercent
 	}
 
-	if ringBufferSize <= 0 || (ringBufferSize&(ringBufferSize-1)) != 0 {
-		panic(fmt.Sprintf("ring buffer size must be a positive power of 2, got %d", ringBufferSize))
+	// Round up to power of two (segstore v1: retain legacy ring as depth-HWM input)
+	if ringBufferSize > 0 && (ringBufferSize&(ringBufferSize-1)) != 0 {
+		// round up
+		ringBufferSize--
+		ringBufferSize |= ringBufferSize >> 1
+		ringBufferSize |= ringBufferSize >> 2
+		ringBufferSize |= ringBufferSize >> 4
+		ringBufferSize |= ringBufferSize >> 8
+		ringBufferSize |= ringBufferSize >> 16
+		ringBufferSize++
 	}
 
+	// Hot cache config (segstore v1) — stored for WI2
+	hotCacheQueueBytes := engineCfg.HotCacheQueueBytes
+	if hotCacheQueueBytes <= 0 {
+		hotCacheQueueBytes = 16 * 1024 * 1024 // 16 MiB
+	}
+	hotCacheGlobalBytes := engineCfg.HotCacheGlobalBytes
+	if hotCacheGlobalBytes <= 0 {
+		hotCacheGlobalBytes = 256 * 1024 * 1024 // 256 MiB
+	}
 	metadataStore, err := NewPersistentMetadataStore(dataDir)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create metadata store: %w", err)
@@ -212,13 +232,15 @@ func NewDisruptorStorageWithEngineConfig(dataDir string, engineCfg interfaces.En
 	}
 
 	return &DisruptorStorage{
-		ringBufferSize: ringBufferSize,
-		spillThreshold: uint64(ringBufferSize) * uint64(spillPercent) / 100,
-		metadataStore:  metadataStore,
-		wal:            walManager,
-		segments:       segmentManager,
-		transactions:   make(map[string]*interfaces.Transaction),
-		dataDir:        dataDir,
+		ringBufferSize:      ringBufferSize,
+		spillThreshold:      uint64(ringBufferSize) * uint64(spillPercent) / 100,
+		hotCacheQueueBytes:  hotCacheQueueBytes,
+		hotCacheGlobalBytes: hotCacheGlobalBytes,
+		metadataStore:       metadataStore,
+		wal:                 walManager,
+		segments:            segmentManager,
+		transactions:        make(map[string]*interfaces.Transaction),
+		dataDir:             dataDir,
 	}, nil
 }
 

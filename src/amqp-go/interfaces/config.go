@@ -296,6 +296,19 @@ type EngineConfig struct {
 	DepthHighWMOverride uint64 `json:"depth_high_wm_override"`
 
 	// ========================================
+	// Hot Cache (Segstore v1)
+	// ========================================
+
+	// HotCacheQueueBytes is the per-queue byte budget for the in-memory hot
+	// cache that serves recent messages without disk reads. 0 (default) maps to
+	// 16 MiB. Range: [1, 16] MiB.
+	HotCacheQueueBytes int64 `json:"hot_cache_queue_bytes"`
+
+	// HotCacheGlobalBytes is the global byte budget shared across all queues
+	// for the hot cache. Must be >= HotCacheQueueBytes and <= 256 MiB.
+	// 0 (default) maps to 256 MiB.
+	HotCacheGlobalBytes int64 `json:"hot_cache_global_bytes"`
+	// ========================================
 	// Write-Ahead Log (WAL)
 	// ========================================
 

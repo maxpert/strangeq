@@ -1061,9 +1061,10 @@ func (b *StorageBroker) GetQueuePolicy(queueName string) *QueuePolicy {
 }
 
 // computeDepthHighWM derives the per-queue backpressure high-water mark from
-// the engine config: ring buffer size × spill threshold %. This is the depth
-// (head - minAckCursor) at which publishers block or spill. Falls back to
-// sensible defaults when config fields are unset.
+// the engine config: ring buffer size × spill threshold % (message-count
+// depth, not bytes). This is the depth (head - minAckCursor) at which
+// publishers block or spill. Falls back to sensible defaults when config
+// fields are unset. (segstore v1: retained as legacy depth-HWM input)
 func (b *StorageBroker) computeDepthHighWM() uint64 {
 	if b.engineConfig.DepthHighWMOverride > 0 {
 		return b.engineConfig.DepthHighWMOverride

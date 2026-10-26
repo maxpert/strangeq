@@ -25,7 +25,7 @@ import (
 
 const (
 	// Segment settings
-	DefaultSegmentSize         = 1024 * 1024 * 1024 // 1 GB per segment
+	DefaultSegmentSize         = 64 * 1024 * 1024 // 64 MB per segment (segstore v1)
 	SegmentCheckpointInterval  = 5 * time.Minute    // Checkpoint WAL to segments every 5 minutes
 	DefaultCompactionThreshold = 0.5                // Compact when >50% messages deleted
 	SegmentFileExtension       = ".seg"

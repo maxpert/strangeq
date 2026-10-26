@@ -25,10 +25,9 @@ func TestDefaultConfig(t *testing.T) {
 	assert.Equal(t, int64(5), config.Engine.WALBatchTimeoutMS,
 		"WALBatchTimeoutMS should be 5ms, was 10ms")
 
-	// SegmentSize was 1GB → now 256MB (4x faster compaction)
-	assert.Equal(t, int64(256*1024*1024), config.Engine.SegmentSize,
-		"SegmentSize should be 256MB, was 1GB")
-
+	// SegmentSize is 64MB (segstore v1)
+	assert.Equal(t, int64(64*1024*1024), config.Engine.SegmentSize,
+		"SegmentSize should be 64MB (segstore v1)")
 	// HeartbeatIntervalMS is wired into sendConnectionTune (server package)
 	assert.Equal(t, int64(60000), config.Network.HeartbeatIntervalMS,
 		"HeartbeatIntervalMS should be 60s by default")
