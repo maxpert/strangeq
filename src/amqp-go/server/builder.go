@@ -181,8 +181,7 @@ func (b *ServerBuilder) Build() (*Server, error) {
 		return nil, fmt.Errorf("invalid configuration: %w", err)
 	}
 
-	// Memory configuration removed - no longer using mailboxes
-	// TODO: Implement memory limits at disruptor/queue level
+	// Memory limits are handled at the disruptor/queue level via HWM and capacity settings
 
 	// Create logger if not provided
 	logger := b.logger

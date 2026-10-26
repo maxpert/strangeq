@@ -93,18 +93,6 @@ func isLoopbackBind(address string) bool {
 	return addr.Unmap().IsLoopback()
 }
 
-func isUnspecifiedBind(address string) bool {
-	host, _, err := net.SplitHostPort(address)
-	if err != nil {
-		host = address
-	}
-	switch host {
-	case "", "0.0.0.0", "::":
-		return true
-	}
-	return false
-}
-
 // SecurityWarnings returns one human sentence per insecure startup finding.
 // It is a pure function so the checks are unit-testable; main prints each
 // warning to stderr and logs it after Build.

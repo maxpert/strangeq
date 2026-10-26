@@ -3,7 +3,6 @@ package storage
 import (
 	"errors"
 	"fmt"
-	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -1434,20 +1433,4 @@ func (pm *PersistentMetadataStore) LoadAllMetadata() (
 // Close closes the metadata store (no-op for JSON files)
 func (pm *PersistentMetadataStore) Close() error {
 	return nil
-}
-
-// Helper to read a JSON file
-func readJSONFile(path string, v interface{}) error {
-	file, err := os.Open(path)
-	if err != nil {
-		return err
-	}
-	defer file.Close()
-
-	data, err := io.ReadAll(file)
-	if err != nil {
-		return err
-	}
-
-	return cbor.Unmarshal(data, v)
 }

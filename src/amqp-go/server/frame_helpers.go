@@ -175,19 +175,6 @@ func (s *Server) sendBasicGetEmpty(conn *protocol.Connection, channelID uint16) 
 	return s.sendMethodResponse(conn, channelID, 60, 72, method)
 }
 
-// sendBasicGetOK sends the basic.get-ok method frame (content header and body
-// frames must follow on the same channel).
-func (s *Server) sendBasicGetOK(conn *protocol.Connection, channelID uint16, deliveryTag uint64, redelivered bool, exchange, routingKey string, messageCount uint32) error {
-	method := &protocol.BasicGetOKMethod{
-		DeliveryTag:  deliveryTag,
-		Redelivered:  redelivered,
-		Exchange:     exchange,
-		RoutingKey:   routingKey,
-		MessageCount: messageCount,
-	}
-	return s.sendMethodResponse(conn, channelID, 60, 71, method)
-}
-
 // sendQueuePurgeOK sends the queue.purge-ok method frame
 func (s *Server) sendQueuePurgeOK(conn *protocol.Connection, channelID uint16, messageCount uint32) error {
 	method := &protocol.QueuePurgeOKMethod{

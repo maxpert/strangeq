@@ -112,13 +112,6 @@ func TestMaxChannelsPerConnectionEnforced(t *testing.T) {
 	assert.False(t, exists, "channel 3 should not be stored")
 }
 
-func makeChannelClosePayload() []byte {
-	payload := make([]byte, 4)
-	binary.BigEndian.PutUint16(payload[0:2], 200)
-	binary.BigEndian.PutUint16(payload[2:4], 40)
-	return payload
-}
-
 func TestSendConnectionTune_UsesConfigValues(t *testing.T) {
 	srv := newTransactionTestServer(t)
 	srv.Config.Server.MaxChannelsPerConnection = 100

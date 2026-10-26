@@ -2786,9 +2786,6 @@ func EncodeHeaderFrameForChannel(channelID uint16, classID uint16, headerData []
 	// A content header frame contains: class ID (2 bytes) + weight (2 bytes) + body size (8 bytes) +
 	// property flags (2 bytes) + properties (variable length based on property flags)
 
-	// For now, we'll create a minimal header frame
-	// In a real implementation, you'd have proper header data
-
 	return &Frame{
 		Type:    FrameHeader,
 		Channel: channelID,

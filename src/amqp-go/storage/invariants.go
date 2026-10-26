@@ -17,19 +17,11 @@ import (
 // the storage package's TestMain enables it package-wide so every test in
 // this package runs with it armed. A test that deliberately mutates a LIVE
 // active file must turn checks off locally with
-// SetStorageInvariantChecksForTest(false) and a comment.
+// storageInvariantChecks.Store(false) and a comment.
 
 // storageInvariantChecks arms the runtime offset/size invariant assertions.
 // Off by default.
 var storageInvariantChecks atomic.Bool
-
-// SetStorageInvariantChecksForTest arms or disarms the storage invariant
-// assertions and returns a restore function. TEST-ONLY.
-func SetStorageInvariantChecksForTest(on bool) (restore func()) {
-	prev := storageInvariantChecks.Load()
-	storageInvariantChecks.Store(on)
-	return func() { storageInvariantChecks.Store(prev) }
-}
 
 // assertOffsetInvariantLocked verifies WAL invariant I3. Precondition: caller
 // holds qw.fileMutex. Skipped while poisoned (the diverged file is never

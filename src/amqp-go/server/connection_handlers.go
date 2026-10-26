@@ -121,25 +121,6 @@ func (s *Server) sendConnectionOpenOK(conn *protocol.Connection) error {
 	return s.writeFrame(conn, frame)
 }
 
-// sendConnectionOpen sends the connection.open method frame
-func (s *Server) sendConnectionOpen(conn *protocol.Connection) error {
-	// Create the connection.open method
-	openMethod := &protocol.ConnectionOpenMethod{
-		VirtualHost: "/",
-		Reserved1:   "",
-		Reserved2:   0,
-	}
-
-	methodData, err := openMethod.Serialize()
-	if err != nil {
-		return fmt.Errorf("error serializing connection.open: %v", err)
-	}
-
-	frame := protocol.EncodeMethodFrame(10, 40, methodData) // 10.40 = connection.open
-
-	return s.writeFrame(conn, frame)
-}
-
 // processConnectionOpen handles the connection.open method. The caller (the
 // handshake state machine) has already verified this is 10.40; payload is the
 // method body after the 4-byte class/method prefix. Every failure sends

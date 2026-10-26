@@ -1713,7 +1713,7 @@ func (s *Server) Stop() error {
 	return nil
 }
 
-// StartWithQuitChannel starts the server and returns a quit channel that can be used to stop it
+// StartWithQuitChannel starts the server using the provided quit channel for shutdown signaling
 func (s *Server) StartWithQuitChannel(quit <-chan struct{}) error {
 	listener, err := s.createListener()
 	if err != nil {
