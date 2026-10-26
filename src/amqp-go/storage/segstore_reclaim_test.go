@@ -93,7 +93,10 @@ func TestSegstoreReclaimSkipsActiveAndInvalid(t *testing.T) {
 		wm.sharedWAL.tryReclaimOldFiles()
 		_, err = os.Stat(path)
 		require.NoError(t, err, "the active file is never reclaimable")
-		require.Contains(t, wm.sharedWAL.recordCopies, recordKey{queueName: "q", deliveryTag: 1})
+		// THE EAGER SETTLING: the acknowledged record left the physical
+		// index, so the index is NOT what pins the active file -- the file
+		// number is.
+		require.NotContains(t, wm.sharedWAL.recordCopies, recordKey{queueName: "q", deliveryTag: 1})
 	})
 
 	t.Run("invalid inventory", func(t *testing.T) {
@@ -110,12 +113,17 @@ func TestSegstoreReclaimSkipsActiveAndInvalid(t *testing.T) {
 		_, err = os.Stat(path)
 		require.NoError(t, err, "an invalid inventory must pin its file")
 		require.Contains(t, qw.oldFiles, fileNum)
-		require.Contains(t, qw.recordCopies, recordKey{queueName: "q", deliveryTag: 1})
+		// THE EAGER SETTLING: the acknowledged record left the physical
+		// index; what pins the file is its INVALID inventory, and the file
+		// stays registered so a later sweep can retry it.
+		require.NotContains(t, qw.recordCopies, recordKey{queueName: "q", deliveryTag: 1})
 	})
 }
 
 func TestSegstoreReclaimUnlinkFailureRetainsReads(t *testing.T) {
-	wm, err := NewWALManagerWithConfig(t.TempDir(), segstoreReclaimWALConfig())
+	dir := t.TempDir()
+	cfg := segstoreReclaimWALConfig()
+	wm, err := NewWALManagerWithConfig(dir, cfg)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = wm.Close() })
 	writeSegstoreReclaimRecord(t, wm, "q", 7, "retry-me")
@@ -136,21 +144,34 @@ func TestSegstoreReclaimUnlinkFailureRetainsReads(t *testing.T) {
 	qw := wm.sharedWAL
 	require.Contains(t, qw.oldFiles, fileNum)
 	key := recordKey{queueName: "q", deliveryTag: 7}
-	require.Contains(t, qw.recordCopies, key)
-	// Acks are process-volatile. Dropping the read gate models a restart and
-	// proves that a failed unlink retained both readable bytes and their index.
+	// THE EAGER SETTLING: the acknowledged record left the physical index,
+	// so the index is not what a failed unlink has to retain. What it has to
+	// retain is the FILE and its REGISTRATION, so the next sweep retries the
+	// unlink -- and the durable bytes it holds.
+	require.NotContains(t, qw.recordCopies, key)
+	require.Contains(t, qw.oldFiles, fileNum)
+
+	// Acks are process-volatile, and a RESTART is what models that: the boot
+	// rebuilds the physical index from the durable bytes. So the record is
+	// readable again after a restart -- which is exactly what proves the
+	// failed unlink retained the readable bytes.
 	qw.bitmapMutex.Lock()
 	qw.ackBitmaps["q"].Remove(7)
 	qw.bitmapMutex.Unlock()
-	msg, err := wm.Read("q", 7)
+	require.NoError(t, wm.Close())
+
+	reopened, err := NewWALManagerWithConfig(dir, cfg)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = reopened.Close() })
+	msg, err := reopened.Read("q", 7)
 	require.NoError(t, err)
 	require.Equal(t, []byte("retry-me"), msg.Body)
 
-	wm.Acknowledge("q", 7)
-	qw.tryReclaimOldFiles()
+	reopened.Acknowledge("q", 7)
+	reopened.sharedWAL.tryReclaimOldFiles()
 	_, err = os.Stat(path)
 	require.True(t, errors.Is(err, fs.ErrNotExist))
-	require.NotContains(t, qw.recordCopies, key)
+	require.NotContains(t, reopened.sharedWAL.recordCopies, key)
 }
 
 func TestSegstoreSharedBodyLastAckReclaims(t *testing.T) {
@@ -212,14 +233,18 @@ func TestSegstorePurgeColdRangeUniqueCount(t *testing.T) {
 	qw := ds.wal.sharedWAL
 	qw.offsetIndexMutex.RLock()
 	for tag := uint64(2); tag <= 5; tag++ {
+		// THE EAGER SETTLING: a purged record LEAVES the physical index, so
+		// the purge's effect is visible as the ABSENCE of the record. The
+		// volatile read gate is what says it was purged rather than never
+		// written.
 		copies := qw.recordCopies[recordKey{queueName: queue, deliveryTag: tag}]
-		require.NotEmpty(t, copies)
-		for _, record := range copies {
-			require.True(t, record.acked.Load(), "WAL tag %d copy %+v was not purged", tag, record.pos)
-		}
+		require.Empty(t, copies, "a purged WAL tag %d must leave the physical index", tag)
 	}
 	require.False(t, qw.offsetIndex[recordKey{queueName: queue, deliveryTag: 6}].acked.Load())
 	qw.offsetIndexMutex.RUnlock()
+	for tag := uint64(2); tag <= 5; tag++ {
+		require.True(t, ds.wal.IsAcknowledged(queue, tag), "purged WAL tag %d must be gated", tag)
+	}
 	value, ok := ds.segments.queueSegments.Load(queue)
 	require.True(t, ok)
 	qs := value.(*QueueSegments)
@@ -244,7 +269,13 @@ func TestSegstorePurgeColdRangeUniqueCount(t *testing.T) {
 	require.NoError(t, ds.DeleteMessageRange(queue, 7, 7))
 	_, _, hot := ds.hot.Get(queue, 7)
 	require.False(t, hot)
-	require.True(t, qw.offsetIndex[recordKey{queueName: queue, deliveryTag: 7}].acked.Load())
+	// THE EAGER SETTLING: the purged WAL record left the physical index, and
+	// the volatile read gate says it was settled.
+	qw.offsetIndexMutex.RLock()
+	_, indexed := qw.offsetIndex[recordKey{queueName: queue, deliveryTag: 7}]
+	qw.offsetIndexMutex.RUnlock()
+	require.False(t, indexed, "a purged WAL tag must leave the physical index")
+	require.True(t, ds.wal.IsAcknowledged(queue, 7), "a purged WAL tag must be gated")
 }
 
 func TestLegacySegmentCompactionUsesDeadBytes(t *testing.T) {

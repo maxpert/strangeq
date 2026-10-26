@@ -227,24 +227,47 @@ func (inv *segmentInventory) addBlock(position, bytes int64) {
 	inv.blocks[position] = &segmentBodyBlock{bytes: bytes}
 }
 
-// markAck settles this physical copy exactly once. A shared body becomes dead
-// only when its final committed reference is acknowledged.
-func (r *segmentRecord) markAck() bool {
+// markAckDetailed settles this physical copy exactly once. A shared body
+// becomes dead only when its final committed reference is acknowledged.
+//
+// It reports TWO things:
+//
+//   - settled: whether THIS call won the compare-and-swap, i.e. whether it is
+//     the call that settled the copy. A second acknowledgement of the same
+//     copy is a no-op and reports false.
+//   - blockFreed: whether the copy's body block lost its LAST reference, so
+//     the caller may drop the block from the inventory.
+//
+// THE ACCOUNTING IS EXACTLY WHAT IT WAS. The copy's bytes become dead bytes,
+// the inventory's unacknowledged total drops by them, and a shared body whose
+// final reference was acknowledged has its bytes counted as dead too. What
+// the eager settling adds is only WHAT HAPPENS TO THE MAPS afterwards (see
+// settleRecordLocked).
+func (r *segmentRecord) markAckDetailed() (settled bool, blockFreed bool) {
 	if r == nil || !r.acked.CompareAndSwap(false, true) {
-		return false
+		return false, false
 	}
 	inv := r.inv
 	if inv == nil {
-		return true
+		return true, false
 	}
 	inv.deadBytes.Add(r.bytes)
 	inv.unacked.Add(-r.bytes)
 	if r.bodyRef >= 0 {
 		if block := inv.blocks[r.bodyRef]; block != nil && block.refs.Add(-1) == 0 {
 			inv.deadBytes.Add(block.bytes)
+			blockFreed = true
 		}
 	}
-	return true
+	return true, blockFreed
+}
+
+// markAck settles this physical copy exactly once. It is the boolean form of
+// markAckDetailed, for the callers that do not need to know whether the body
+// block was freed.
+func (r *segmentRecord) markAck() bool {
+	settled, _ := r.markAckDetailed()
+	return settled
 }
 
 func recordPositionNewer(a, b recordPos) bool {
@@ -309,6 +332,120 @@ func (qw *QueueWAL) unindexRecordLocked(r *segmentRecord) {
 func (qw *QueueWAL) replaceRecordLocked(old, new *segmentRecord) {
 	qw.unindexRecordLocked(old)
 	qw.indexRecordLocked(new)
+}
+
+// ---------------------------------------------------------------------------
+// THE EAGER SETTLING.
+//
+// The WAL index (qw.offsetIndex + qw.recordCopies) used to hold a record for
+// EVERY MESSAGE EVER PUBLISHED: a record left the index only when its whole
+// WAL FILE was reclaimed, and the reclaim sweep runs on the cleanup tick
+// (default: five minutes) while a 64 MiB WAL file at F4 rolls about 28 times
+// per SECOND. So the maps grew without bound -- 861,000 live records
+// (~260 MB) after a 30 s window, all of them ALREADY ACKNOWLEDGED -- and Go's
+// GC (which targets twice the live heap) turned that into ~520 MB of extra
+// RSS. It was also a publish-path cost: every publish inserted into two
+// ever-growing maps under the index lock.
+//
+// The fix is to DROP A SETTLED RECORD EAGERLY, so the index holds the records
+// that are NOT YET ACKNOWLEDGED and is therefore bounded by the in-flight set.
+//
+// WHAT DOES NOT CHANGE:
+//
+//   - the acknowledgement STATE lives in the queue-scoped roaring64 bitmap
+//     (ackBitmaps), not in the dropped record, so it survives;
+//   - the durable bytes are not deleted: the file still holds them until the
+//     reclaim sweep unlinks it or the compaction rewrites it;
+//   - the durability contract is untouched: a publisher confirm is still
+//     sent only after the record's fdatasync.
+// ---------------------------------------------------------------------------
+
+// unindexSettledRecordLocked removes one SETTLED physical copy from the
+// global index. Caller holds the write lock.
+//
+// IT NEVER RE-POINTS THE KEY AT AN OLDER COPY.
+//
+// unindexRecordLocked does re-point it, and that is CORRECT there: a whole
+// FILE went away, so the remaining copies are the only ones left and the
+// newest of them is the right answer. It is WRONG here: the copy was
+// SETTLED, so the client acknowledged the tag, and re-pointing the key at an
+// older physical copy of the same tag would REVIVE a message the client
+// already acknowledged -- the delivery path would hand it back.
+//
+// The older copy may stay in recordCopies (so a later acknowledgement of the
+// same tag still settles it), but it must never become the offsetIndex
+// winner.
+func (qw *QueueWAL) unindexSettledRecordLocked(r *segmentRecord) {
+	if r == nil {
+		return
+	}
+	key := recordKey{queueName: r.queueName, deliveryTag: r.deliveryTag}
+	copies := qw.recordCopies[key]
+	if copies != nil {
+		delete(copies, r.pos)
+		if len(copies) == 0 {
+			delete(qw.recordCopies, key)
+		}
+	}
+	if qw.offsetIndex[key] == r {
+		delete(qw.offsetIndex, key)
+	}
+}
+
+// settleRecordLocked settles one physical copy and removes it from the
+// inventory and from the global index. Caller holds offsetIndexMutex.Lock().
+//
+// It reports whether THIS call settled the copy (i.e. whether it won the
+// compare-and-swap). Only the winner removes anything, so acknowledging the
+// same copy twice is a no-op the second time.
+//
+// THE INVENTORY IS THE AUTHORITATIVE MAP of the physical copies a file
+// holds, so the settled copy LEAVES it. The accounting does NOT: inv.unacked
+// and inv.deadBytes keep the bytes, because those two are what the reclaim
+// predicate (unacked == 0) and the compaction ratio (deadBytes / durableBytes)
+// are computed from.
+//
+// A body block whose LAST reference was settled is dropped from the inventory
+// too. It is safe: a block with no live reference has no reader, and the
+// compaction only reads the block of a record it is ABOUT TO COPY, and such a
+// record holds a reference (refs >= 1), so its block is still there.
+func (qw *QueueWAL) settleRecordLocked(r *segmentRecord) bool {
+	if r == nil {
+		return false
+	}
+	settled, blockFreed := r.markAckDetailed()
+	if !settled {
+		return false
+	}
+	if inv := r.inv; inv != nil {
+		delete(inv.records, r.pos.position)
+		if blockFreed && r.bodyRef >= 0 {
+			delete(inv.blocks, r.bodyRef)
+		}
+	}
+	qw.unindexSettledRecordLocked(r)
+	return true
+}
+
+// settleInventoryRecordLocked removes an ALREADY SETTLED record from its
+// inventory, without touching the global index. It is the settlement half of
+// settleRecordLocked, for the caller that has already settled the record and
+// only needs the inventory cleaned up (the compaction's ack transfer).
+//
+// The global index is left alone because the record was never published to it:
+// the eager settling already removed the copy it replaced.
+func settleInventoryRecordLocked(r *segmentRecord, blockFreed bool) {
+	if r == nil {
+		return
+	}
+	inv := r.inv
+	if inv == nil {
+		return
+	}
+	delete(inv.records, r.pos.position)
+	if blockFreed && r.bodyRef >= 0 {
+		delete(inv.blocks, r.bodyRef)
+	}
 }
 
 // ---------------------------------------------------------------------------

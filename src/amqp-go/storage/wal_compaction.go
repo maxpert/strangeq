@@ -185,16 +185,33 @@ func (qw *QueueWAL) compactOldFile(fileNum uint64) error {
 		}
 	}()
 
-	// The inventory's maps are immutable once published, so the live and the
-	// acknowledged records can be read without the index lock. The acked flag
-	// is atomic and may flip while we work; a flip that lands before the
-	// install is transferred below.
+	// THE CANDIDATES ARE A SNAPSHOT, TAKEN UNDER THE INDEX READ LOCK.
+	//
+	// The inventory's maps are no longer immutable once published: the eager
+	// settling removes a SETTLED record from `records` (and a body block
+	// whose last reference was settled from `blocks`), under the index WRITE
+	// lock. So they are read under the index READ lock.
+	//
+	// The COPY then runs without the lock: it is whole-file I/O, and holding
+	// the index lock across it would block the publish path for the length
+	// of the rewrite. The acked flag is atomic and may flip while the copy
+	// runs; a flip that lands before the install is transferred below.
+	//
+	// WITH THE EAGER SETTLING the acknowledged records are already GONE from
+	// the inventory, so `omitted` is empty and `live` is every record the
+	// file still holds that has not been acknowledged.
 	type candidate struct {
 		old *segmentRecord
 		rec *segmentRecord
 	}
 	var live []*candidate
 	var omitted []*segmentRecord
+	var blocks map[int64]*segmentBodyBlock
+	qw.offsetIndexMutex.RLock()
+	blocks = make(map[int64]*segmentBodyBlock, len(inv.blocks))
+	for pos, block := range inv.blocks {
+		blocks[pos] = block
+	}
 	for _, r := range inv.records {
 		if !r.committed {
 			continue
@@ -205,6 +222,7 @@ func (qw *QueueWAL) compactOldFile(fileNum uint64) error {
 		}
 		live = append(live, &candidate{old: r})
 	}
+	qw.offsetIndexMutex.RUnlock()
 	if len(live) == 0 {
 		return nil
 	}
@@ -253,6 +271,14 @@ func (qw *QueueWAL) compactOldFile(fileNum uint64) error {
 	// bytes because it covers them.
 	for _, c := range live {
 		r := c.old
+		if r.acked.Load() {
+			// SETTLED WHILE THE COPY WAS BEING MADE. Its bytes are garbage
+			// and it must not be carried over: the eager settling already
+			// removed it from the inventory and from the index, and copying
+			// it would put an acknowledged record back into the rewritten
+			// file.
+			continue
+		}
 		raw := make([]byte, r.bytes)
 		if _, err := src.ReadAt(raw, r.pos.position); err != nil {
 			return fmt.Errorf("read record at %d of %s: %w", r.pos.position, info.path, err)
@@ -265,7 +291,12 @@ func (qw *QueueWAL) compactOldFile(fileNum uint64) error {
 			// reference it.
 			newBlockPos, emitted := blockPositions[r.bodyRef]
 			if !emitted {
-				block, ok := inv.blocks[r.bodyRef]
+				// The block is read from the SNAPSHOT, not from the live
+				// inventory: a block whose last reference was settled is
+				// dropped from the inventory, but its bytes are still in the
+				// source file and the record that referenced it has already
+				// been skipped above.
+				block, ok := blocks[r.bodyRef]
 				if !ok {
 					return fmt.Errorf("record %s/%d references body block at %d which is not in the inventory of %s",
 						r.queueName, r.deliveryTag, r.bodyRef, info.path)
@@ -339,9 +370,17 @@ func (qw *QueueWAL) compactOldFile(fileNum uint64) error {
 	// A record that was copied and has since been acknowledged must NOT be
 	// published as live: it would be delivered again after a restart, because
 	// acknowledgements are process-volatile.
+	//
+	// The copy inherits the acknowledgement of the record it replaces, so it
+	// is settled in its own right, and it is NOT published: the eager
+	// settling already removed the ORIGINAL from the index, and publishing
+	// the copy would put an ACKNOWLEDGED record back into the index.
 	for _, c := range live {
-		if c.old.acked.Load() {
-			c.rec.markAck()
+		if c.rec == nil || !c.old.acked.Load() {
+			continue
+		}
+		if settled, blockFreed := c.rec.markAckDetailed(); settled {
+			settleInventoryRecordLocked(c.rec, blockFreed)
 		}
 	}
 
@@ -380,10 +419,24 @@ func (qw *QueueWAL) compactOldFile(fileNum uint64) error {
 	// The survivors move to their new positions; the records that were not
 	// copied are no longer on disk at all.
 	for _, c := range live {
+		if c.rec == nil {
+			// Settled while the copy was being made: the eager settling
+			// already removed it from the inventory and from the index, and
+			// its bytes were not carried over.
+			continue
+		}
+		if c.old.acked.Load() {
+			// Settled WHILE the copy was being written: the copy was settled
+			// above and must not be published.
+			continue
+		}
 		qw.replaceRecordLocked(c.old, c.rec)
 	}
 	for _, r := range omitted {
-		qw.unindexRecordLocked(r)
+		// An omitted record was ACKNOWLEDGED, so its tag must not fall back
+		// to an older physical copy: the settled removal never re-points the
+		// key at one.
+		qw.unindexSettledRecordLocked(r)
 	}
 
 	succeeded = true

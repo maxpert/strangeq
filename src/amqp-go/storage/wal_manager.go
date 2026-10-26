@@ -1253,12 +1253,28 @@ func (wm *WALManager) Acknowledge(queueName string, offset uint64) {
 	bitmap.Add(offset)
 	sw.bitmapMutex.Unlock()
 
+	// THE WRITE LOCK, NOT THE READ LOCK.
+	//
+	// Settling a record now REMOVES it from the physical index, so this path
+	// MUTATES qw.offsetIndex and qw.recordCopies. That is the whole point of
+	// the change: the index holds the records that are NOT YET ACKNOWLEDGED,
+	// so it is bounded by the in-flight set instead of by the number of
+	// messages ever published.
+	//
+	// The copies are snapshotted before they are settled, because settling a
+	// copy DELETES it from the map being iterated.
 	key := recordKey{queueName: queueName, deliveryTag: offset}
-	sw.offsetIndexMutex.RLock()
-	for _, r := range sw.recordCopies[key] {
-		r.markAck()
+	sw.offsetIndexMutex.Lock()
+	if copies := sw.recordCopies[key]; len(copies) > 0 {
+		snapshot := make([]*segmentRecord, 0, len(copies))
+		for _, r := range copies {
+			snapshot = append(snapshot, r)
+		}
+		for _, r := range snapshot {
+			sw.settleRecordLocked(r)
+		}
 	}
-	sw.offsetIndexMutex.RUnlock()
+	sw.offsetIndexMutex.Unlock()
 }
 
 // PurgeQueue acknowledges every physical copy of each WAL record in the
@@ -1275,16 +1291,24 @@ func (wm *WALManager) PurgeQueue(queueName string, minTag, maxTag uint64) []uint
 		return nil
 	}
 
+	// THE WRITE LOCK, NOT THE READ LOCK: settling a record removes it from
+	// the physical index (see Acknowledge). The copies of the key being
+	// iterated are the ones being settled, so they are snapshotted before
+	// they are settled.
 	var newlyAcked, gated []uint64
-	sw.offsetIndexMutex.RLock()
+	sw.offsetIndexMutex.Lock()
 	for key, copies := range sw.recordCopies {
 		if key.queueName != queueName || key.deliveryTag < minTag || key.deliveryTag > maxTag {
 			continue
 		}
 		gated = append(gated, key.deliveryTag)
 		won := false
+		snapshot := make([]*segmentRecord, 0, len(copies))
 		for _, record := range copies {
-			if record.markAck() {
+			snapshot = append(snapshot, record)
+		}
+		for _, record := range snapshot {
+			if sw.settleRecordLocked(record) {
 				won = true
 			}
 		}
@@ -1292,10 +1316,19 @@ func (wm *WALManager) PurgeQueue(queueName string, minTag, maxTag uint64) []uint
 			newlyAcked = append(newlyAcked, key.deliveryTag)
 		}
 	}
-	sw.offsetIndexMutex.RUnlock()
+	sw.offsetIndexMutex.Unlock()
 
 	// bitmapMutex is leaf-only: update the volatile read gate after releasing
 	// the physical-index lock, matching the lock contract of Acknowledge.
+	//
+	// THE ORDERING. The settled copies are already OUT of the physical index
+	// when this runs, so a tag that is purged but not yet gated is not
+	// readable (the index lookup fails) -- the read path is safe either way.
+	// The one thing the ordering exposes is a RECOVERY scan running
+	// concurrently with a purge: RecoverFromWAL consults this same bitmap
+	// (see the "unknown" set there), so a record purged microseconds earlier
+	// could still be reported by such a scan. Recovery runs at BOOT, before
+	// any purge, so the window is empty in practice.
 	sw.bitmapMutex.Lock()
 	if sw.ackBitmaps == nil {
 		sw.ackBitmaps = make(map[string]*roaring64.Bitmap)
@@ -1494,6 +1527,13 @@ func (wm *WALManager) RecoverFromWAL() ([]*RecoveryMessage, error) {
 	missingCount := map[uint64]int{}
 	missingExample := map[uint64]string{}
 
+	// unknown holds the scanned winners the index does NOT know. With the
+	// eager settling an ACKNOWLEDGED record has NO index entry at all, so
+	// this is where the settled records are. They are decided AFTER the index
+	// lock is released, because the acknowledgement state lives in the
+	// queue-scoped volatile bitmap and bitmapMutex is a leaf: it is never
+	// held while the index lock is taken.
+	var unknown []*RecoveryMessage
 	for key, msg := range winners {
 		winner := qw.offsetIndex[key]
 		if winner != nil && winner.pos != msg.pos {
@@ -1508,13 +1548,19 @@ func (wm *WALManager) RecoverFromWAL() ([]*RecoveryMessage, error) {
 			continue
 		}
 		if winner == nil {
-			// The index has no entry for this key, but the record was just read
-			// from a durable WAL file on disk (a file the boot index did not
-			// cover, or a record written after the index was built). There is no
-			// evidence it was ever acknowledged, and refusing it would lose a
-			// CONFIRMED durable record silently. Serve it: a redelivery is
-			// recoverable and AMQP models it.
-			recoveredMessages = append(recoveredMessages, msg)
+			// The index has no entry for this key. That is EITHER a record
+			// the index never knew (a file the boot index did not cover, or a
+			// record written after the index was built) OR a record that was
+			// SETTLED: the eager settling removes an acknowledged record from
+			// the index, so its absence is now evidence of an
+			// acknowledgement rather than of ignorance.
+			//
+			// The two are told apart by the volatile ack bitmap, which is
+			// this incarnation's live ack set: it is EMPTY at boot, so at
+			// boot every record still present on disk is recovered exactly
+			// as before, and a record acknowledged in THIS incarnation is
+			// not recovered a second time.
+			unknown = append(unknown, msg)
 			continue
 		}
 		if !winner.acked.Load() {
@@ -1548,6 +1594,20 @@ func (wm *WALManager) RecoverFromWAL() ([]*RecoveryMessage, error) {
 		}
 	}
 	qw.offsetIndexMutex.RUnlock()
+
+	// The acknowledgement gate for the records the index does not know. An
+	// acknowledged tag is NOT served again: the eager settling removed its
+	// record from the index, and re-serving it would re-deliver a message the
+	// client already acknowledged.
+	for _, msg := range unknown {
+		if qw.isAcknowledged(msg.QueueName, msg.Offset) {
+			continue
+		}
+		// No evidence it was ever acknowledged, and refusing it would lose a
+		// CONFIRMED durable record silently. Serve it: a redelivery is
+		// recoverable and AMQP models it.
+		recoveredMessages = append(recoveredMessages, msg)
+	}
 
 	for fileNum, count := range mismatchCount {
 		faults = append(faults, walIndexScanDisagreementFault(sharedDir, fileNum, count, mismatchExample[fileNum],
@@ -2004,8 +2064,7 @@ func (qw *QueueWAL) scanWALFileDetailed(filePath string, limit int64) (*walScanR
 				if layout.newerFormat {
 					reason = "it was written in a format this build cannot interpret (the reserved continuation bit is set, or its body kind is unknown to this build)"
 				}
-				unreadable.add(fmt.Sprintf("byte offset %d", curRecStart))
-				_ = reason
+				unreadable.add(fmt.Sprintf("byte offset %d (%s)", curRecStart, reason))
 				continue
 			}
 			msg, mok := buildMessageFromLayout(payload, layout)

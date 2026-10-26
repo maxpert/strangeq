@@ -165,11 +165,16 @@ func recoverableOffsets(t *testing.T, dir, queue string) map[uint64]bool {
 
 // waitForAcksApplied retains the old test hook's name, but acknowledgement is
 // now synchronous. Verify the physical records rather than a cleanup goroutine.
+//
+// THE EAGER SETTLING. An acknowledged record LEAVES the physical index, so
+// the copy's ABSENCE is the evidence that the acknowledgement was applied --
+// and it is STRONGER evidence than "the copy is there and its flag is set",
+// because a copy that is still indexed after its acknowledgement is exactly
+// the unbounded-growth defect this change closes.
 func waitForAcksApplied(t *testing.T, wal *WALManager, offsets []uint64) {
 	t.Helper()
-	wal.sharedWAL.offsetIndexMutex.RLock()
-	defer wal.sharedWAL.offsetIndexMutex.RUnlock()
 	for _, off := range offsets {
+		wal.sharedWAL.offsetIndexMutex.RLock()
 		found := false
 		for key, copies := range wal.sharedWAL.recordCopies {
 			if key.deliveryTag != off {
@@ -180,7 +185,9 @@ func waitForAcksApplied(t *testing.T, wal *WALManager, offsets []uint64) {
 				require.True(t, r.acked.Load(), "physical copy for tag %d is not acknowledged", off)
 			}
 		}
-		require.True(t, found, "no physical copy found for tag %d", off)
+		wal.sharedWAL.offsetIndexMutex.RUnlock()
+		require.False(t, found,
+			"an acknowledged tag must have left the physical index: tag %d is still indexed", off)
 	}
 }
 
@@ -337,10 +344,22 @@ func TestWALIncarnation_ReclaimedFileHeldOnlyAckedRecords(t *testing.T) {
 	inspected := 0
 
 	qw := b.wal.sharedWAL
+	// THE PRODUCTION PREDICATE, verbatim: a file is reclaimable when its
+	// inventory is valid and holds no unacknowledged bytes. The extra
+	// "the inventory holds at least one record" condition this test used to
+	// carry is GONE with the eager settling: a fully acknowledged file's
+	// inventory is EMPTY, so that condition would have excluded exactly the
+	// files this test exists to examine.
+	type candidate struct {
+		path    string
+		records []*RecoveryMessage
+		inv     *segmentInventory
+	}
+	var candidates []candidate
 	qw.oldFilesMutex.Lock()
 	for _, info := range qw.oldFiles {
 		inspected++
-		allAcked := info.inv != nil && info.inv.valid && len(info.inv.records) > 0 && info.inv.unacked.Load() == 0
+		allAcked := info.inv != nil && info.inv.valid && info.inv.unacked.Load() == 0
 		if !allAcked {
 			continue
 		}
@@ -348,10 +367,32 @@ func TestWALIncarnation_ReclaimedFileHeldOnlyAckedRecords(t *testing.T) {
 		if err != nil {
 			continue
 		}
-		v := verdict{path: filepath.Base(info.path), inventory: len(records)}
-		for _, rec := range records {
-			r := info.inv.records[rec.pos.position]
-			if r == nil || !r.acked.Load() {
+		candidates = append(candidates, candidate{path: info.path, records: records, inv: info.inv})
+	}
+	qw.oldFilesMutex.Unlock()
+
+	for _, c := range candidates {
+		v := verdict{path: filepath.Base(c.path), inventory: len(c.records)}
+		for _, rec := range c.records {
+			// THE EAGER SETTLING: a SETTLED record leaves the inventory, so
+			// its absence is not evidence that it was never acknowledged --
+			// the acknowledgement STATE lives in the volatile read gate, and
+			// that is what answers the question.
+			//
+			// The inventory is read UNDER THE INDEX LOCK (the eager settling
+			// mutates it) and the read gate is consulted after that lock is
+			// released (bitmapMutex is a leaf: it is never held while the
+			// index lock is taken).
+			qw.offsetIndexMutex.RLock()
+			r := c.inv.records[rec.pos.position]
+			qw.offsetIndexMutex.RUnlock()
+			if r != nil {
+				if !r.acked.Load() {
+					v.unacked = append(v.unacked, rec.Offset)
+				}
+				continue
+			}
+			if !qw.isAcknowledged(rec.QueueName, rec.Offset) {
 				v.unacked = append(v.unacked, rec.Offset)
 			}
 		}
@@ -359,7 +400,6 @@ func TestWALIncarnation_ReclaimedFileHeldOnlyAckedRecords(t *testing.T) {
 			wouldDeleteWithUnacked = append(wouldDeleteWithUnacked, v)
 		}
 	}
-	qw.oldFilesMutex.Unlock()
 
 	require.NotZero(t, inspected,
 		"PREMISE BROKEN: no rolled WAL file was available to evaluate, so this test "+

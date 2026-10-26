@@ -46,7 +46,13 @@ func TestSegmentAckIdempotent(t *testing.T) {
 	require.True(t, r.acked.Load())
 	require.Zero(t, inv.unacked.Load())
 	require.Equal(t, int64(56), inv.deadBytes.Load(), "a duplicate ACK must not charge record or body bytes twice")
-	require.Zero(t, inv.blocks[50].refs.Load())
+	// THE EAGER SETTLING: the body block's LAST reference was settled, so
+	// the block left the inventory entirely -- no live record references it
+	// any more, and the compaction only reads the block of a record it is
+	// about to copy (and such a record holds a reference).
+	_, blockPresent := inv.blocks[50]
+	require.False(t, blockPresent,
+		"a body block whose last reference was settled must leave the inventory")
 }
 
 func TestSegmentAckSettlesAllDuplicateCopies(t *testing.T) {
@@ -76,6 +82,15 @@ func TestSegmentAckBeforeIndexCleanupVisible(t *testing.T) {
 
 	require.True(t, wm.IsAcknowledged("orders", 7), "the read gate must be visible when Acknowledge returns")
 	require.False(t, wm.IsAcknowledged("payments", 7), "an ACK must be scoped to its queue")
-	require.Same(t, r, qw.offsetIndex[recordKey{queueName: "orders", deliveryTag: 7}],
-		"ACK must not asynchronously remove the physical read index")
+	// THE EAGER SETTLING. This assertion used to be the opposite one: the
+	// physical read index entry was removed ASYNCHRONOUSLY, by the cleanup
+	// goroutine, so the index held a record for every message ever published
+	// and grew without bound (~260 MB of live heap after a 30 s F4 window).
+	// A settled record now leaves the index SYNCHRONOUSLY, so the index is
+	// bounded by the in-flight set, and the read gate is visible when
+	// Acknowledge returns.
+	_, present := qw.offsetIndex[recordKey{queueName: "orders", deliveryTag: 7}]
+	require.False(t, present,
+		"an acknowledged record must leave the physical read index when Acknowledge returns")
+	require.True(t, r.acked.Load(), "the record must be settled")
 }
