@@ -38,7 +38,7 @@ RabbitMQ is the gold standard for AMQP 0.9.1, but it runs on the Erlang VM — a
 - Queue length limits — `x-max-length` / `x-max-length-bytes` with `x-overflow` (`drop-head`, `reject-publish`)
 - Resource alarms — `connection.blocked` / `connection.unblocked` driven by memory (RSS) and free-disk watermarks
 - Exclusive and auto-delete queues with automatic cleanup (exclusive queues deleted on owning-connection close; auto-delete queues deleted when the last consumer leaves)
-- Higher durable end-to-end throughput than RabbitMQ 4.3 on every tested workload — 1.10x to 4.48x head-to-head (see [Performance](#performance))
+- Higher durable end-to-end throughput than RabbitMQ 4.3 on every tested workload — 1.10x to 4.48x in the 2026-07-14 head-to-head; 1.575x on 64 KB × 10×10 in the 2026-10-25 run (see [Performance](#performance))
 - Prometheus metrics and pprof profiling
 - Lock-free per-queue ring buffer with per-slot CAS
 - Batch TCP writes and ACK offloading
@@ -287,22 +287,50 @@ and a PID file; the unit handles restart, environment, and logging.
 Key engine tuning parameters:
 - `ringbuffersize` — In-memory ring buffer per queue (must be power of 2, default 64K)
 - `spillthresholdpercent` — Ring fill % before spilling to WAL (default 80)
-- `walbatchsize` / `walbatchtimeoutms` — WAL batching for durable writes (1000 msgs / 10ms); `walbatchtimeoutms` is retained for compatibility
-- `segmentsize` — Cold storage segment file size (default 1 GB)
+- `walbatchsize` — Messages per WAL batch (default 1000)
+- `walbatchtimeoutms` — Retained for compatibility; WAL flushing is drain-then-flush, not timer-gated
+- `walfilesize` — Size of each WAL file (default 512 MB)
+- `segmentsize` — Cold storage segment file size (default 256 MB)
 - `consumermaxbatchsize` — Max messages to deliver per consumer per poll (default 100)
 
 ## Performance
 
 All numbers below are **end-to-end consumed msg/s** — every published message is also delivered and acknowledged, so the figures reflect full round-trip delivery, not publish acceptance. Both brokers are driven by the same client ([`cmd/perftest`](src/amqp-go/cmd/perftest), built on [amqp091-go](https://github.com/rabbitmq/amqp091-go)) under identical settings.
 
-**Methodology**
+**Common settings (both runs)**
 - Single machine: Apple Silicon, 16 cores.
-- RabbitMQ 4.3 runs in an [OrbStack](https://orbstack.dev/) ARM64-native container (not emulated) with in-container storage. StrangeQ runs host-native. Both use local disk (no host bind mount).
-- 20-second runs, 1 KB message bodies unless noted.
-- Durable queues, publisher confirms, fsync enabled on both, consumer prefetch 100, manual acks.
-- Figures are steady-state medians of the per-second consumed rate. Zero message loss and zero unconfirmed publishes on every run. Measured 2026-07-14.
+- Durable queues, publisher confirms, fsync enabled, consumer prefetch 100, manual acks.
+- Zero message loss and zero unconfirmed publishes on every run.
 
-### Head-to-Head vs RabbitMQ 4.3 (durable + publisher confirms)
+### Latest: Stage 6 (2026-10-25, candidate build)
+
+Candidate is the WS-I-B token build, compared against the WS-F reference build and RabbitMQ 4.3 Classic queues. Workloads: F1 = 1 KB, 1×1; F2 = 1 KB, 10×10; F3 = 64 KB, 1×1; F4 = 64 KB, 10×10. Each cell: 10 s warmup, 30 s measured window. Median of valid reps (F4: 5 reps per broker; F1–F3: 3 reps per build). Full report: [`.notes/benchmarks/2026-10-25-wsi-b-stage6.md`](.notes/benchmarks/2026-10-25-wsi-b-stage6.md).
+
+| Workload | StrangeQ (candidate) | WS-F | RabbitMQ 4.3 Classic | StrangeQ / WS-F | StrangeQ / Classic |
+|---|--:|--:|--:|--:|--:|
+| F1 (1 KB, 1×1) | 116,219 msg/s | 115,725 msg/s | — | 1.004x | — |
+| F2 (1 KB, 10×10) | 157,232 msg/s | 155,694 msg/s | — | 1.010x | — |
+| F3 (64 KB, 1×1) | 30,214 msg/s | 30,204 msg/s | — | 1.000x | — |
+| F4 (64 KB, 10×10) | 32,899 msg/s | 33,488 msg/s | 20,892 msg/s | 0.982x | 1.575x |
+
+F4 memory (MB, peak = max RSS over the sampled run):
+
+| | StrangeQ (candidate) | RabbitMQ 4.3 Classic | Ratio |
+|---|--:|--:|--:|
+| Steady RSS | 1,027 | 1,110 | 0.925x |
+| Peak RSS | 1,029 | 1,597 | 0.645x |
+
+F4 confirm latency (p50): 118.3 ms StrangeQ vs 33.2 ms RabbitMQ Classic.
+
+Correctness: 33/33 valid cells, 0 lost, 0 unconfirmed, 0 nacked.
+
+**Stage verdict: NO-GO.** The F4 throughput gate vs WS-F fails: Welch lower 95% bound is 0.967 against a required 0.98 (median 0.982). Steady RSS vs Classic does not show complete separation. The F1, F2, and F3 throughput gates pass. The F4 gate result, not the RabbitMQ comparison, is the blocker for this build.
+
+### Previous: Head-to-Head vs RabbitMQ 4.3 (2026-07-14, release build)
+
+Methodology for this run: RabbitMQ 4.3 runs in an [OrbStack](https://orbstack.dev/) ARM64-native container (not emulated) with in-container storage; StrangeQ runs host-native; both use local disk (no host bind mount). 20-second runs, 1 KB message bodies unless noted.
+
+Durable queues, publisher confirms, fsync enabled on both, consumer prefetch 100, manual acks. Steady-state medians of the per-second consumed rate.
 
 | Workload (1 KB body unless noted) | RabbitMQ 4.3 | StrangeQ | StrangeQ advantage |
 |---|--:|--:|--:|

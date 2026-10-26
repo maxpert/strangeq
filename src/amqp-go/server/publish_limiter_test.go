@@ -605,5 +605,48 @@ func TestLimiter_DisabledZeroAlloc(t *testing.T) {
 	assert.Equal(t, float64(0), allocs, "disabled TryReserve must be allocation-free")
 }
 
+func TestPooledLeaseCombinedStateAndBits(t *testing.T) {
+	t.Run("transfer preserves completion bits", func(t *testing.T) {
+		p := &pooledLease{}
+		p.gen.Store(1)
+		p.combined.Store(tokenStateConnection | combinedBitBroker)
+
+		p.LeaseTransfer(1)
+
+		assert.Equal(t, uint32(tokenStateTransferred)|combinedBitBroker, p.combined.Load())
+		assert.Equal(t, int32(tokenStateTransferred), p.LeaseState())
+	})
+
+	t.Run("final done frees and clears the combined word", func(t *testing.T) {
+		l := NewPublishLimiter(10)
+		l.used = 10
+		p := &pooledLease{l: l, bytes: 10}
+		p.gen.Store(1)
+		p.combined.Store(tokenStateTransferred | combinedBitServer)
+
+		p.LeaseBrokerDone(1)
+
+		assert.Zero(t, p.combined.Load())
+		assert.Equal(t, uint32(2), p.gen.Load())
+		used, _, _ := l.Stats()
+		assert.Zero(t, used)
+	})
+
+	t.Run("abort frees and clears the combined word", func(t *testing.T) {
+		l := NewPublishLimiter(10)
+		l.used = 10
+		p := &pooledLease{l: l, bytes: 10}
+		p.gen.Store(1)
+		p.combined.Store(tokenStateConnection | combinedBitBroker)
+
+		p.abortLim()
+
+		assert.Zero(t, p.combined.Load())
+		assert.Equal(t, uint32(2), p.gen.Load())
+		used, _, _ := l.Stats()
+		assert.Zero(t, used)
+	})
+}
+
 // compile-time guard: the limiter exposes the spec surface.
 var _ = ErrLimiterClosed

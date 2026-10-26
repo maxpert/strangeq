@@ -79,3 +79,6 @@ issues.md
 
 # SDD orchestration scratch (local only)
 .superpowers/
+
+# Local notes, specs, and reports (never checked in)
+.notes/

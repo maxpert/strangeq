@@ -47,6 +47,17 @@ const (
 	leaseBitBroker uint32 = 2
 )
 
+// A lease's lifecycle state and completion bits share one atomic word. Keeping
+// them together makes each done/abort/transfer transition a single CAS and
+// prevents the two fields from being observed at different points in time.
+const (
+	combinedStateMask uint32 = 0x3
+	combinedBitsShift        = 2
+	combinedBitServer uint32 = leaseBitServer << combinedBitsShift
+	combinedBitBroker uint32 = leaseBitBroker << combinedBitsShift
+	combinedBothBits         = combinedBitServer | combinedBitBroker
+)
+
 // leaseSlotsPageBits: slots are allocated 2^12 per page; page arrays never
 // move or shrink after creation, so slot pointers stay valid for the lifetime
 // of the limiter.
@@ -58,12 +69,11 @@ const leaseSlotsPerPage = 1 << leaseSlotsPageBits
 // values) with a generation-validated state machine. Per-publish allocation:
 // zero.
 type pooledLease struct {
-	l     *PublishLimiter
-	idx   uint32 // global slot index (pageShift|offset), fixed at allocation
-	bytes int64
-	gen   atomic.Uint32 // bumped to a fresh value when the slot returns FREE
-	state atomic.Int32  // tokenState*
-	bits  atomic.Uint32 // leaseBitServer|leaseBitBroker
+	l        *PublishLimiter
+	idx      uint32 // global slot index (pageShift|offset), fixed at allocation
+	bytes    int64
+	gen      atomic.Uint32 // bumped to a fresh value when the slot returns FREE
+	combined atomic.Uint32 // tokenState* in bits 0-1; completion bits above
 }
 
 // LeaseAbort aborts the lease from server-side ownership (teardown or error
@@ -77,12 +87,14 @@ func (p *pooledLease) LeaseAbort(gen uint32) {
 
 func (p *pooledLease) abortLim() {
 	for {
-		st := p.state.Load()
+		cur := p.combined.Load()
+		st := cur & combinedStateMask
 		switch st {
 		case tokenStateFree:
 			return
 		case tokenStateConnection, tokenStateTransferred:
-			if p.state.CompareAndSwap(st, tokenStateFree) {
+			new := (cur &^ combinedStateMask) | tokenStateFree
+			if p.combined.CompareAndSwap(cur, new) {
 				p.l.freeSlot(p)
 				return
 			}
@@ -99,7 +111,16 @@ func (p *pooledLease) LeaseTransfer(gen uint32) {
 	if p.gen.Load() != gen {
 		return
 	}
-	p.state.CompareAndSwap(tokenStateConnection, tokenStateTransferred)
+	for {
+		cur := p.combined.Load()
+		if cur&combinedStateMask != tokenStateConnection {
+			return
+		}
+		new := (cur &^ combinedStateMask) | tokenStateTransferred
+		if p.combined.CompareAndSwap(cur, new) {
+			return
+		}
+	}
 }
 
 // LeaseServerDone signals the server-side wire-write part is done.
@@ -117,7 +138,7 @@ func (p *pooledLease) LeaseServerFinish(gen uint32) {
 	if p.gen.Load() != gen {
 		return // freed by done() or already recycled: nothing to abort
 	}
-	if st := p.state.Load(); st == tokenStateConnection {
+	if p.combined.Load()&combinedStateMask == tokenStateConnection {
 		p.abortLim()
 	}
 }
@@ -126,32 +147,27 @@ func (p *pooledLease) done(gen uint32, bit uint32) {
 	if p.gen.Load() != gen {
 		return
 	}
+	shiftedBit := bit << combinedBitsShift
 	for {
-		if p.state.Load() == tokenStateFree {
+		cur := p.combined.Load()
+		if cur&combinedStateMask == tokenStateFree {
 			return
 		}
-		old := p.bits.Load()
-		if old&bit != 0 {
+		if cur&shiftedBit != 0 {
 			return // duplicate signal from the same side: no-op
 		}
-		if !p.bits.CompareAndSwap(old, old|bit) {
-			continue
+		new := cur | shiftedBit
+		if new&combinedBothBits == combinedBothBits {
+			// Both sides done: setting the bit and transitioning to FREE in one
+			// CAS ensures that exactly one signal (or Abort) performs the free.
+			new = (new &^ combinedStateMask) | tokenStateFree
 		}
-		if old|bit == leaseBitServer|leaseBitBroker {
-			// Both sides done: free exactly once (state CAS; an Abort that won
-			// the race already freed it — then state is FREE and we no-op).
-			for {
-				st := p.state.Load()
-				if st == tokenStateFree {
-					return
-				}
-				if p.state.CompareAndSwap(st, tokenStateFree) {
-					p.l.freeSlot(p)
-					return
-				}
+		if p.combined.CompareAndSwap(cur, new) {
+			if new&combinedStateMask == tokenStateFree {
+				p.l.freeSlot(p)
 			}
+			return
 		}
-		return
 	}
 }
 
@@ -278,7 +294,7 @@ func (l *PublishLimiter) grantLocked() {
 func (l *PublishLimiter) grantWaiterLocked(connID string, bytes int64) protocol.PublishLeaseToken {
 	slot := l.claimSlotLocked(bytes)
 	tok := protocol.LeaseTokenOf(slot, slot.gen.Load())
-	slot.state.Store(tokenStateConnection)
+	slot.combined.Store(tokenStateConnection)
 	if l.hooks != nil && l.hooks.OnGrant != nil {
 		l.hooks.OnGrant(connID, bytes, bytes > l.budget, l.used, l.count)
 	}
@@ -321,7 +337,7 @@ func (l *PublishLimiter) freeSlot(p *pooledLease) {
 	// Fresh generation BEFORE the recycle: any signal carrying the old gen
 	// becomes a no-op from this point on.
 	releasedBytes := p.bytes
-	p.bits.Store(0)
+	p.combined.Store(0) // state=FREE and no completion bits
 	p.gen.Add(1)
 	p.bytes = 0
 	l.freeList = append(l.freeList, p.idx)
@@ -527,7 +543,9 @@ func (l *PublishLimiter) tokenStateForTest(tok protocol.PublishLeaseToken) int {
 	return int(tok.State())
 }
 
-func (p *pooledLease) LeaseState() int32 { return p.state.Load() }
+func (p *pooledLease) LeaseState() int32 {
+	return int32(p.combined.Load() & combinedStateMask)
+}
 
 func (l *PublishLimiter) fifoCapForTest() int {
 	l.mu.Lock()
