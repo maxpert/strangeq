@@ -306,11 +306,11 @@ Throughput is measured as **end-to-end delivered messages per second (msg/s)**: 
 
 Each workload used a 10-second warmup followed by a 30-second measurement. Results are median throughput.
 
-| Message size | Producers / consumers | StrangeQ | RabbitMQ 4.3 Classic | StrangeQ / RabbitMQ |
+| Message size | Producers / consumers | StrangeQ | RabbitMQ 4.4 Classic | StrangeQ / RabbitMQ |
 |---|--:|--:|--:|--:|
-| 1 KB | 1 / 1 | 116,219 msg/s | — | — |
-| 1 KB | 10 / 10 | 157,232 msg/s | — | — |
-| 64 KB | 1 / 1 | 30,214 msg/s | — | — |
+| 1 KB | 1 / 1 | 116,219 msg/s | 81,587 msg/s | **1.42x** |
+| 1 KB | 10 / 10 | 157,232 msg/s | 53,778 msg/s | **2.92x** |
+| 64 KB | 1 / 1 | 30,214 msg/s | 31,067 msg/s | 0.97x |
 | 64 KB | 10 / 10 | 32,899 msg/s | 20,892 msg/s | **1.58x** |
 
 Memory usage for the 64 KB workload with 10 producers and 10 consumers:
