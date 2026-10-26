@@ -304,23 +304,33 @@ Throughput is measured as **end-to-end delivered messages per second (msg/s)**: 
 
 ### Latest benchmark (2026-10-25)
 
-Each workload used a 10-second warmup followed by a 30-second measurement. Results are median throughput.
+Each workload used a 10-second warmup followed by a 30-second measurement. Results are median throughput across repeated runs.
 
 | Message size | Producers / consumers | StrangeQ | RabbitMQ 4.4 Classic | StrangeQ / RabbitMQ |
 |---|--:|--:|--:|--:|
 | 1 KB | 1 / 1 | 116,219 msg/s | 81,587 msg/s | **1.42x** |
 | 1 KB | 10 / 10 | 157,232 msg/s | 53,778 msg/s | **2.92x** |
+| 1 KB | 32 / 32 | 125,279 msg/s | 44,051 msg/s | **2.84x** |
 | 64 KB | 1 / 1 | 30,214 msg/s | 31,067 msg/s | 0.97x |
 | 64 KB | 10 / 10 | 32,899 msg/s | 20,892 msg/s | **1.58x** |
+| 64 KB | 32 / 32 | 31,898 msg/s | ~24,116 msg/s (unstable) | ~1.32x |
 
-Memory usage for the 64 KB workload with 10 producers and 10 consumers:
+Memory usage (peak RSS):
 
-| Memory (RSS) | StrangeQ | RabbitMQ 4.4 Classic | StrangeQ / RabbitMQ |
+| Workload | StrangeQ | RabbitMQ 4.4 Classic | StrangeQ / RabbitMQ |
 |---|--:|--:|--:|
-| Steady state | 1,027 MB | 1,110 MB | 0.93x |
-| Peak | 1,029 MB | 1,597 MB | **0.65x** |
+| 1 KB, 1 / 1 | 55 MB | 241 MB | **0.23x** |
+| 1 KB, 10 / 10 | 341 MB | 428 MB | **0.80x** |
+| 1 KB, 32 / 32 | 457 MB | 544 MB | **0.84x** |
+| 64 KB, 1 / 1 | 498 MB | 1,121 MB | **0.44x** |
+| 64 KB, 10 / 10 | 1,029 MB | 1,597 MB | **0.65x** |
+| 64 KB, 32 / 32 | 1,066 MB | ~3,665 MB (unstable) | **0.29x** |
 
-Median publisher-confirm latency for this workload was **118.3 ms** for StrangeQ and **33.2 ms** for RabbitMQ Classic.
+Median publisher-confirm latency for the 64 KB, 10 / 10 workload was **118.3 ms** for StrangeQ and **33.2 ms** for RabbitMQ Classic.
+
+**Note on RabbitMQ 64 KB, 32 / 32:** RabbitMQ's per-second throughput on this workload swings 16-20% (CV) with min/max ratios of 0.43-0.51 — its worst second is less than half its best. All three runs were flagged invalid by the intra-cell pollution detector. StrangeQ holds steady at 4.2% CV. The instability is likely RabbitMQ's Erlang scheduler struggling to sustain 32 concurrent producers and consumers at 64 KB body size.
+
+**Memory scaling:** StrangeQ's peak RSS is driven by in-flight message data (message size x outstanding window), not connection count. Going from 10 to 32 producers at 64 KB barely changes RSS (1,029 to 1,066 MB). RabbitMQ's RSS grows with connections — from 1,121 MB (1/1) to ~3,665 MB (32/32) — likely due to per-connection Erlang process heaps.
 
 ### Multi-queue scaling (durable + publisher confirms)
 
