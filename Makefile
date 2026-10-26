@@ -4,7 +4,7 @@
 BINARY_NAME=amqp-server
 SRC_DIR=src/amqp-go
 MAIN_PKG=./cmd/amqp-server
-VERSION ?= 0.1.0-dev
+VERSION ?= 0.11.0-dev
 COMMIT  ?= $(shell git rev-parse --short HEAD 2>/dev/null || echo unknown)
 DATE    ?= $(shell date -u +%Y-%m-%dT%H:%M:%SZ)
 BUILD_DIR=build
