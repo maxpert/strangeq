@@ -1439,9 +1439,19 @@ func (wm *WALManager) RecoverFromWAL() ([]*RecoveryMessage, error) {
 	qw.offsetIndexMutex.RLock()
 	for key, msg := range winners {
 		winner := qw.offsetIndex[key]
-		if winner == nil || winner.pos != msg.pos {
-			// The scanned copy is older than the indexed winner (or its file was
-			// already reclaimed); never revive it as a fallback.
+		if winner != nil && winner.pos != msg.pos {
+			// The index knows a DIFFERENT copy of this key, so the scanned copy
+			// is the older one: never revive it as a fallback.
+			continue
+		}
+		if winner == nil {
+			// The index has no entry for this key, but the record was just read
+			// from a durable WAL file on disk (a file the boot index did not
+			// cover, or a record written after the index was built). There is no
+			// evidence it was ever acknowledged, and refusing it would lose a
+			// CONFIRMED durable record silently. Serve it: a redelivery is
+			// recoverable and AMQP models it.
+			recoveredMessages = append(recoveredMessages, msg)
 			continue
 		}
 		if !winner.acked.Load() {
