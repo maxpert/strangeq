@@ -269,7 +269,12 @@ func (qw *QueueWAL) compactOldFile(fileNum uint64) error {
 	// the file, so the copy is a byte-for-byte move of those bytes; only a
 	// body locator is patched, and the CRC is recomputed over the patched
 	// bytes because it covers them.
-	for _, c := range live {
+	//
+	// ONE ALLOCATION FOR THE WHOLE REWRITE. The rewritten records outlive the
+	// copy -- the index holds them until the message is acknowledged -- so
+	// they are allocated together, exactly as the group-commit batch does.
+	newRecs := make([]segmentRecord, len(live))
+	for i, c := range live {
 		r := c.old
 		if r.acked.Load() {
 			// SETTLED WHILE THE COPY WAS BEING MADE. Its bytes are garbage
@@ -333,14 +338,14 @@ func (qw *QueueWAL) compactOldFile(fileNum uint64) error {
 		}
 		newPos := writeOff
 		writeOff += int64(len(raw))
-		c.rec = &segmentRecord{
-			pos:         recordPos{segmentID: fileNum, position: newPos},
-			queueName:   r.queueName,
-			deliveryTag: r.deliveryTag,
-			bytes:       int64(len(raw)),
-			bodyRef:     newBodyRef,
-			committed:   true,
-		}
+		rec := &newRecs[i]
+		rec.pos = recordPos{segmentID: fileNum, position: newPos}
+		rec.queueName = r.queueName
+		rec.deliveryTag = r.deliveryTag
+		rec.bytes = int64(len(raw))
+		rec.bodyRef = newBodyRef
+		rec.committed = true
+		c.rec = rec
 		newInv.addRecord(c.rec)
 	}
 

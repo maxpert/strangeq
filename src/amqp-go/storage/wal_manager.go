@@ -332,8 +332,16 @@ type QueueWAL struct {
 
 	// Physical record index. offsetIndex publishes the newest copy for a
 	// logical queue/tag; recordCopies retains every physical position.
+	//
+	// recordCopies is a SLICE of the physical copies, not a map of them: it
+	// used to be map[recordKey]map[recordPos]*segmentRecord, a Go MAP PER
+	// PUBLISHED MESSAGE, which allocated a map header plus a bucket array
+	// (~256 bytes and two allocations) for the ONE copy the common case has
+	// and threw it away at the acknowledgement. The slice is the shape the
+	// legacy segment tier already uses (segmentInventory.byTag), and it costs
+	// ONE allocation for the copy list.
 	offsetIndex      map[recordKey]*segmentRecord
-	recordCopies     map[recordKey]map[recordPos]*segmentRecord
+	recordCopies     map[recordKey][]*segmentRecord
 	offsetIndexMutex sync.RWMutex
 
 	// Metrics collector
@@ -1205,12 +1213,18 @@ func (qw *QueueWAL) writeTxAtomic(records []*RecoveryMessage) error {
 	}
 	inv.durableBytes.Add(int64(n))
 	qw.offsetIndexMutex.Lock()
+	// ONE ALLOCATION FOR THE WHOLE TRANSACTION, for the same reason as the
+	// group-commit batch: the records outlive the call (the index holds them
+	// until the message is acknowledged), so they are allocated together.
+	recs := make([]segmentRecord, len(records))
 	for i, rec := range records {
-		r := &segmentRecord{
-			pos:       recordPos{segmentID: currentFileNum, position: positions[i]},
-			queueName: rec.QueueName, deliveryTag: rec.Offset,
-			bytes: recordBytes[i], bodyRef: -1, committed: true,
-		}
+		r := &recs[i]
+		r.pos = recordPos{segmentID: currentFileNum, position: positions[i]}
+		r.queueName = rec.QueueName
+		r.deliveryTag = rec.Offset
+		r.bytes = recordBytes[i]
+		r.bodyRef = -1
+		r.committed = true
 		inv.addRecord(r)
 		qw.indexRecordLocked(r)
 	}
@@ -2153,7 +2167,7 @@ func (wm *WALManager) createSharedWAL() (*QueueWAL, error) {
 		oldFiles:           make(map[uint64]*walFileInfo),
 		oldFileCache:       make(map[uint64]*os.File),
 		offsetIndex:        make(map[recordKey]*segmentRecord),
-		recordCopies:       make(map[recordKey]map[recordPos]*segmentRecord),
+		recordCopies:       make(map[recordKey][]*segmentRecord),
 		stopChan:           make(chan struct{}),
 		// WS-F phase 1: the pipelined group-commit hand-off. commitCh is
 		// unbuffered by design (see the QueueWAL field comment); free's
@@ -2558,28 +2572,53 @@ func (qw *QueueWAL) commitBatch(sb *stagedBatch) {
 	for _, block := range sb.blocks {
 		inv.addBlock(base+block.relPos, block.bytes)
 	}
+	//
+	// ONE ALLOCATION FOR THE WHOLE BATCH. The records used to be allocated
+	// one at a time -- one heap allocation per message, on the hot publish
+	// path -- and every one of them outlives the batch (the index holds them
+	// until the message is acknowledged). A single slice is ONE allocation per
+	// batch, and it stays alive exactly as long as the records it holds: the
+	// slice's backing array is kept alive by any pointer into it, so the
+	// lifetime is the records' lifetime, not a copy of it.
+	nrec := 0
+	for i := range sb.reqs {
+		if sb.relPos[i] >= 0 {
+			nrec++
+		}
+	}
+	recs := make([]segmentRecord, nrec)
+	k := 0
 	for i, req := range sb.reqs {
 		if sb.relPos[i] < 0 {
 			continue
 		}
-		r := &segmentRecord{
-			pos:       recordPos{segmentID: currentFileNum, position: base + sb.relPos[i]},
-			queueName: req.queueName, deliveryTag: req.offset,
-			bytes: sb.recordBytes[i], bodyRef: -1, committed: true,
-		}
+		r := &recs[k]
+		k++
+		r.pos = recordPos{segmentID: currentFileNum, position: base + sb.relPos[i]}
+		r.queueName = req.queueName
+		r.deliveryTag = req.offset
+		r.bytes = sb.recordBytes[i]
+		r.bodyRef = -1
+		r.committed = true
 		inv.addRecord(r)
 		qw.indexRecordLocked(r)
 	}
 	// Fused shared-unit reference records (never the BodyBlock itself). Empty on
 	// the no-unit hot path, so this loop is a zero-cost no-op there.
-	for _, e := range sb.sharedRel {
-		r := &segmentRecord{
-			pos:       recordPos{segmentID: currentFileNum, position: base + e.filePosition},
-			queueName: e.queueName, deliveryTag: e.offset,
-			bytes: e.bytes, bodyRef: base + e.bodyRef, committed: true,
+	if len(sb.sharedRel) > 0 {
+		sharedRecs := make([]segmentRecord, len(sb.sharedRel))
+		for i := range sb.sharedRel {
+			e := &sb.sharedRel[i]
+			r := &sharedRecs[i]
+			r.pos = recordPos{segmentID: currentFileNum, position: base + e.filePosition}
+			r.queueName = e.queueName
+			r.deliveryTag = e.offset
+			r.bytes = e.bytes
+			r.bodyRef = base + e.bodyRef
+			r.committed = true
+			inv.addRecord(r)
+			qw.indexRecordLocked(r)
 		}
-		inv.addRecord(r)
-		qw.indexRecordLocked(r)
 	}
 	qw.offsetIndexMutex.Unlock()
 

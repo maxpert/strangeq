@@ -7,7 +7,7 @@ package storage
 // two index maps:
 //
 //	qw.offsetIndex  map[recordKey]*segmentRecord              (the newest copy)
-//	qw.recordCopies map[recordKey]map[recordPos]*segmentRecord (every copy)
+//	qw.recordCopies map[recordKey][]*segmentRecord             (every copy)
 //
 // A record was removed from them ONLY when its whole WAL FILE was reclaimed,
 // and the reclaim sweep runs on the cleanup tick (default 300000 ms = five

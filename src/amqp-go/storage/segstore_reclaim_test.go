@@ -78,7 +78,7 @@ func TestSegstoreReclaimFullyAckedOnly(t *testing.T) {
 	_, copies := qw.recordCopies[recordKey{queueName: "q", deliveryTag: 2}]
 	qw.offsetIndexMutex.RUnlock()
 	require.False(t, newest, "reclaim must remove the newest-copy index entry")
-	require.False(t, copies, "reclaim must remove every physical-copy index entry")
+	require.Empty(t, copies, "reclaim must remove every physical-copy index entry")
 }
 
 func TestSegstoreReclaimSkipsActiveAndInvalid(t *testing.T) {

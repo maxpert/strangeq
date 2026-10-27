@@ -276,26 +276,76 @@ func recordPositionNewer(a, b recordPos) bool {
 
 // indexRecordLocked maintains both the newest-copy lookup and the complete
 // physical-copy inventory. Caller holds offsetIndexMutex.Lock.
+//
+// THE COPY LIST IS A SLICE, NOT A MAP.
+//
+// The copy list used to be map[recordKey]map[recordPos]*segmentRecord: a Go
+// MAP PER PUBLISHED MESSAGE. The common case is exactly ONE physical copy per
+// (queue, tag), so every message allocated a whole map header plus a bucket
+// array (~256 bytes and two allocations) to hold a single pointer, and threw
+// it away when the message was acknowledged. That was a large share of the
+// allocation churn the GC was busy with on the hot publish path.
+//
+// It is now map[recordKey][]*segmentRecord -- a slice of the physical copies
+// -- the same shape the legacy segment tier already uses
+// (segmentInventory.byTag map[uint64][]*segmentRecord). One allocation for
+// the one-element slice instead of two for a map.
+//
+// THE SEMANTICS ARE UNCHANGED:
+//
+//   - the list holds EVERY physical copy of the key;
+//   - a POSITION is published at most once: re-publishing a position (the
+//     compaction can move a copy onto a position the key already holds)
+//     REPLACES that entry instead of duplicating it -- which is what the old
+//     map's `copies[r.pos] = r` did;
+//   - the newest-copy view still points at the newest copy.
 func (qw *QueueWAL) indexRecordLocked(r *segmentRecord) {
 	if r == nil {
 		return
 	}
 	key := recordKey{queueName: r.queueName, deliveryTag: r.deliveryTag}
 	if qw.recordCopies == nil {
-		qw.recordCopies = make(map[recordKey]map[recordPos]*segmentRecord)
+		qw.recordCopies = make(map[recordKey][]*segmentRecord)
 	}
 	copies := qw.recordCopies[key]
-	if copies == nil {
-		copies = make(map[recordPos]*segmentRecord)
-		qw.recordCopies[key] = copies
+	replaced := false
+	for i := range copies {
+		if copies[i].pos == r.pos {
+			copies[i] = r
+			replaced = true
+			break
+		}
 	}
-	copies[r.pos] = r
+	if !replaced {
+		copies = append(copies, r)
+	}
+	qw.recordCopies[key] = copies
 	if qw.offsetIndex == nil {
 		qw.offsetIndex = make(map[recordKey]*segmentRecord)
 	}
 	if current := qw.offsetIndex[key]; current == nil || recordPositionNewer(r.pos, current.pos) {
 		qw.offsetIndex[key] = r
 	}
+}
+
+// removeRecordCopyLocked removes the copy at the given position from a copy
+// list and returns the shortened list.
+//
+// The list is the key's OWN backing array, so the removal is in place: the
+// survivors above the removed entry move down into it, and the returned slice
+// is the same array with a shorter length. A position that is not in the
+// list leaves it untouched.
+//
+// IT IS THE EXACT INVERSE of indexRecordLocked's "a position is published at
+// most once" rule, and it is the same in-place removal the legacy segment
+// tier's dropFromByTag already does.
+func removeRecordCopyLocked(copies []*segmentRecord, pos recordPos) []*segmentRecord {
+	for i := range copies {
+		if copies[i].pos == pos {
+			return append(copies[:i], copies[i+1:]...)
+		}
+	}
+	return copies
 }
 
 // unindexRecordLocked removes one physical copy and recomputes the newest view
@@ -307,9 +357,11 @@ func (qw *QueueWAL) unindexRecordLocked(r *segmentRecord) {
 	key := recordKey{queueName: r.queueName, deliveryTag: r.deliveryTag}
 	copies := qw.recordCopies[key]
 	if copies != nil {
-		delete(copies, r.pos)
+		copies = removeRecordCopyLocked(copies, r.pos)
 		if len(copies) == 0 {
 			delete(qw.recordCopies, key)
+		} else {
+			qw.recordCopies[key] = copies
 		}
 	}
 	if qw.offsetIndex[key] != r {
@@ -382,9 +434,11 @@ func (qw *QueueWAL) unindexSettledRecordLocked(r *segmentRecord) {
 	key := recordKey{queueName: r.queueName, deliveryTag: r.deliveryTag}
 	copies := qw.recordCopies[key]
 	if copies != nil {
-		delete(copies, r.pos)
+		copies = removeRecordCopyLocked(copies, r.pos)
 		if len(copies) == 0 {
 			delete(qw.recordCopies, key)
+		} else {
+			qw.recordCopies[key] = copies
 		}
 	}
 	if qw.offsetIndex[key] == r {

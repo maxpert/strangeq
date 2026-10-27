@@ -24,7 +24,7 @@ func newSegmentAckTestManager(records ...*segmentRecord) (*WALManager, *QueueWAL
 		ackChan:      make(chan *ackRequest, 8),
 		stopChan:     make(chan struct{}),
 		offsetIndex:  make(map[recordKey]*segmentRecord),
-		recordCopies: make(map[recordKey]map[recordPos]*segmentRecord),
+		recordCopies: make(map[recordKey][]*segmentRecord),
 	}
 	for _, r := range records {
 		qw.indexRecordLocked(r)
