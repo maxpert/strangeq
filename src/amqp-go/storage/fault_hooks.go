@@ -468,3 +468,36 @@ func SetWALReadAtForTest(fn func(f *os.File, b []byte, off int64) (int, error)) 
 	walReadAtHook.Store(&f)
 	return func() { walReadAtHook.Store(prev) }
 }
+
+// --- hot cache per-queue lock (test observer) ------------------------------
+
+// hotCacheQueueLockFn observes the PER-QUEUE lock acquisitions of the hot
+// cache. It is invoked with the queue's name AFTER that queue's own lock has
+// been taken, so a hook that blocks inside it holds that queue's lock -- and
+// only that queue's lock.
+type hotCacheQueueLockFn func(queue string)
+
+var hotCacheQueueLockHook atomic.Pointer[hotCacheQueueLockFn]
+
+// hotCacheQueueLockFire reports one per-queue lock acquisition to the
+// installed hook. A nil hook costs one atomic load, the same pattern as
+// every seam in this file; the production call sites use this wrapper so the
+// hook check never branches on anything but the atomic load.
+func hotCacheQueueLockFire(queue string) {
+	if p := hotCacheQueueLockHook.Load(); p != nil {
+		(*p)(queue)
+	}
+}
+
+// SetHotCacheQueueLockForTest installs fn as the observer of the hot cache's
+// per-queue lock acquisitions and returns a restore function. TEST-ONLY: it
+// lets a test prove that two DIFFERENT queues do not share a lock -- the
+// hook blocks inside one queue's lock while the other queue's operations
+// must still complete. Never called by production code; nil = default (no
+// observation).
+func SetHotCacheQueueLockForTest(fn func(queue string)) (restore func()) {
+	prev := hotCacheQueueLockHook.Load()
+	f := hotCacheQueueLockFn(fn)
+	hotCacheQueueLockHook.Store(&f)
+	return func() { hotCacheQueueLockHook.Store(prev) }
+}
