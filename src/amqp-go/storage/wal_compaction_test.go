@@ -842,46 +842,119 @@ func TestWAL_Retention_DisabledWhenZero(t *testing.T) {
 	assert.Equal(t, oldCount, remaining, "files should not be deleted with retention disabled")
 }
 
-// TestWAL_SequentialScan_CorrectBody keeps coverage for the sequential scanner
-// while pinning that public reads no longer fall back to it on an index miss.
-// Regression test for the readMessageFromFile missing bodyLen parse bug.
-func TestWAL_SequentialScan_CorrectBody(t *testing.T) {
-	tmpDir := t.TempDir()
+// TestWALReadPath_ExactBody keeps the coverage the sequential scanner used to
+// carry -- a body must come back BYTE-EXACT -- but on the LIVE read path
+// (WALManager.Read -> QueueWAL.readMessage -> parseMessageAt), which is the
+// only path the broker can reach.
+//
+// THE SEQUENTIAL SCANNER IS GONE. readMessageSequential / readMessageFromFile
+// had NO production caller: they were a THIRD copy of the record grammar, and
+// the bug they guarded against -- a missing bodyLen parse, which returned the
+// body's length prefix as part of the body -- could not reach the broker
+// through them. The grammar is walked ONCE now (parseWalPayload), and this
+// test pins the property on the path that is actually taken.
+//
+// WHAT A MUTATION WOULD BREAK: a bodyLen parse that dropped the four-byte
+// length word, or included it, makes the body below differ from the bytes
+// that were written. The bodies are crafted so that such a mis-parse is
+// visible: the inline body STARTS with a four-byte big-endian length word
+// that does not describe the body.
+func TestWALReadPath_ExactBody(t *testing.T) {
+	// A body whose first four bytes are a length word that does NOT describe
+	// it: a parser that mistook those bytes for the record's own length word
+	// would return a body of a different length, or a body with the word
+	// still in it.
+	expectedBody := append([]byte{0x00, 0x00, 0x7f, 0xff}, []byte("exact body content — no extra bytes")...)
 
-	wm, err := NewWALManager(tmpDir)
-	require.NoError(t, err)
-	defer wm.Close()
+	t.Run("the current file's body comes back byte-exact", func(t *testing.T) {
+		wm, err := NewWALManager(t.TempDir())
+		require.NoError(t, err)
+		t.Cleanup(func() { _ = wm.Close() })
 
-	expectedBody := []byte("exact body content — no extra bytes")
+		msg := &protocol.Message{
+			Exchange:     "test",
+			RoutingKey:   "key",
+			Body:         expectedBody,
+			DeliveryMode: 2,
+			DeliveryTag:  999,
+		}
+		require.NoError(t, wm.Write("test_queue", msg, 999))
 
-	msg := &protocol.Message{
-		Exchange:     "test",
-		RoutingKey:   "key",
-		Body:         expectedBody,
-		DeliveryMode: 2,
-		DeliveryTag:  999,
-	}
-	err = wm.Write("test_queue", msg, 999)
-	require.NoError(t, err)
+		readMsg, err := wm.Read("test_queue", 999)
+		require.NoError(t, err)
+		require.Equal(t, expectedBody, readMsg.Body,
+			"the body must exactly match the written body (no bodyLen prefix bytes, no truncation)")
+	})
 
-	// Wait for flush so offset index is populated
-	time.Sleep(50 * time.Millisecond)
+	t.Run("a rolled file's body comes back byte-exact", func(t *testing.T) {
+		wm, err := NewWALManager(t.TempDir())
+		require.NoError(t, err)
+		t.Cleanup(func() { _ = wm.Close() })
 
-	// Remove the offset from the index to force sequential scan path
-	wm.sharedWAL.offsetIndexMutex.Lock()
-	delete(wm.sharedWAL.offsetIndex, recordKey{queueName: "test_queue", deliveryTag: 999})
-	delete(wm.sharedWAL.recordCopies, recordKey{queueName: "test_queue", deliveryTag: 999})
-	wm.sharedWAL.offsetIndexMutex.Unlock()
+		msg := &protocol.Message{
+			Exchange:     "test",
+			RoutingKey:   "key",
+			Body:         expectedBody,
+			DeliveryMode: 2,
+			DeliveryTag:  999,
+		}
+		require.NoError(t, wm.Write("test_queue", msg, 999))
 
-	// Public reads refuse an ambiguous index miss; the scanner remains covered
-	// directly for its existing recovery/checkpoint callers.
-	readMsg, err := wm.Read("test_queue", 999)
-	require.Error(t, err)
-	require.Nil(t, readMsg)
-	readMsg, err = wm.sharedWAL.readMessageSequential("test_queue", 999)
-	require.NoError(t, err, "sequential scan should find the message")
-	assert.Equal(t, expectedBody, readMsg.Body,
-		"body from sequential scan must exactly match written body (no bodyLen prefix bytes)")
+		// Roll the file so the read goes through the SEALED-file arm (the
+		// old-file handle and its ReadAt), not the current-file arm.
+		qw := wm.sharedWAL
+		qw.fileMutex.Lock()
+		require.NoError(t, qw.rollFile())
+		qw.fileMutex.Unlock()
+
+		readMsg, err := wm.Read("test_queue", 999)
+		require.NoError(t, err)
+		require.Equal(t, expectedBody, readMsg.Body,
+			"the body of a record in a rolled file must exactly match the written body")
+	})
+
+	t.Run("a shared body's bytes come back byte-exact", func(t *testing.T) {
+		wm, err := NewWALManager(t.TempDir())
+		require.NoError(t, err)
+		t.Cleanup(func() { _ = wm.Close() })
+
+		body := append([]byte{0x00, 0x00, 0x7f, 0xff}, []byte("shared body — no extra bytes")...)
+		require.NoError(t, writeSharedSync(t, wm, body, []string{"shared_a", "shared_b"}, 500))
+
+		for i, queue := range []string{"shared_a", "shared_b"} {
+			readMsg, err := wm.Read(queue, uint64(500+i))
+			require.NoError(t, err)
+			require.Equal(t, body, readMsg.Body,
+				"a shared body's bytes must come back exactly (the body block's bodyLen is honoured)")
+		}
+	})
+
+	t.Run("a public read refuses an ambiguous index miss", func(t *testing.T) {
+		wm, err := NewWALManager(t.TempDir())
+		require.NoError(t, err)
+		t.Cleanup(func() { _ = wm.Close() })
+
+		msg := &protocol.Message{
+			Exchange:     "test",
+			RoutingKey:   "key",
+			Body:         expectedBody,
+			DeliveryMode: 2,
+			DeliveryTag:  999,
+		}
+		require.NoError(t, wm.Write("test_queue", msg, 999))
+
+		// Remove the offset from the index: the record is durable but no
+		// longer ADDRESSABLE, and the read path must say so rather than
+		// answer with a different record that happens to share the tag.
+		wm.sharedWAL.offsetIndexMutex.Lock()
+		delete(wm.sharedWAL.offsetIndex, recordKey{queueName: "test_queue", deliveryTag: 999})
+		delete(wm.sharedWAL.recordCopies, recordKey{queueName: "test_queue", deliveryTag: 999})
+		wm.sharedWAL.offsetIndexMutex.Unlock()
+
+		readMsg, err := wm.Read("test_queue", 999)
+		require.Error(t, err)
+		require.Nil(t, readMsg)
+	})
 }
 
 // TestWALConfigFromEngine_Defaults verifies zero EngineConfig uses defaults

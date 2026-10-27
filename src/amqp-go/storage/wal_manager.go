@@ -1729,12 +1729,16 @@ func (qw *QueueWAL) performCheckpoint() {
 // therefore not data — it is the start of a zero region, which is what a
 // kernel death leaves behind in blocks that never reached the platter.
 //
-// It exists so the FOUR walks over this grammar (scanWALFile, indexWALFile,
-// readMessageFromFile, scanWALFileRecordCounts) cannot disagree about where a
+// It exists so the walks over this grammar (scanWALFile, indexWALFile,
+// parseMessageAt, scanWALFileRecordCounts) cannot disagree about where a
 // file's data ends (canon rule 12). Before it, a zero region that happened to
 // start on a record boundary parsed as a run of zero-length zero-CRC records
 // and was reported as NO FAULT AT ALL, while the same zero region starting one
 // byte later was FATAL — review-3 named that asymmetry as the tell.
+//
+// (The sequential-scan fallback, readMessageFromFile, was a FOURTH walk and
+// had no production caller; it was deleted with its test. The live read path
+// is parseMessageAt.)
 func walBlankRecordHeader(crc, dataLen uint32) bool { return crc == 0 && dataLen == 0 }
 
 // walNothingIntelligibleFollows is Ra's is_last_record/3 (ref-rabbitmq.md
@@ -3831,6 +3835,22 @@ func (qw *QueueWAL) tryReclaimOldFiles() {
 			info.inv.unacked.Load() != 0 {
 			continue
 		}
+		// A FILE THAT HOLDS BYTES THIS BUILD CANNOT INTERPRET IS NEVER
+		// RECLAIMED.
+		//
+		// THE INVARIANT: those bytes are durable data a newer build could
+		// still read, so unlinking the file would be a silent loss of
+		// confirmed durable data -- even when every record this build CAN
+		// interpret has been acknowledged.
+		//
+		// The `unacked` accounting above already pins such a file (the
+		// uninterpretable bytes are counted as live, so `unacked` is
+		// non-zero); this explicit check states the invariant instead of
+		// relying on that coincidence, and it is the same invariant the
+		// compaction skips on (see compactOldFile).
+		if info.inv.uninterpretableBytes.Load() != 0 {
+			continue
+		}
 
 		// Readers of sealed files hold offsetIndexMutex.RLock through ReadAt, so
 		// no cached descriptor is in use here. If unlink fails the registration
@@ -4176,164 +4196,6 @@ func readBodyBlockAt(file *os.File, position int64) ([]byte, error) {
 	body := make([]byte, bodyLen)
 	copy(body, payload[8:8+int(bodyLen)])
 	return body, nil
-}
-
-// readMessageSequential does sequential scan fallback (slow, only for unindexed messages)
-func (qw *QueueWAL) readMessageSequential(queueName string, offset uint64) (*protocol.Message, error) {
-	// NOTE: the acknowledgement gate is NOT repeated here. readMessage is this
-	// function's only caller and applies it at the entry point, which strictly
-	// dominates: a gate here could not see a probe answered by the O(1) fast path.
-	// Duplicating it would be one observable written twice and no mutation could
-	// redden this copy independently.
-
-	// The CURRENT file is searched FIRST. currentFileOffsets is reset by rollFile
-	// and added to only by commitBatch for records written to the file open now, so
-	// an offset in it names a record THIS incarnation wrote to THIS file — by
-	// construction the newest record carrying that offset. Searching oldFiles ahead
-	// of it handed back a previous incarnation's payload for a live tag whenever
-	// both files carried the same offset, which this WAL permits: it is globally
-	// tag-keyed with no queue discriminator, and a redeclared queue re-mints a tag
-	// band whose records its predecessor still occupies on disk.
-	//
-	// Membership also gates out a record whose bytes reached the file but whose
-	// fsync FAILED, because commitBatch populates currentFileOffsets only AFTER a
-	// successful fsync. Such a record is in neither that set nor the index and must
-	// not be returned: the frontier advances head past its tag, so the cursor is
-	// claimed, and a raw scan would otherwise deliver a message that was nacked.
-	qw.currentFileOffsetsMutex.Lock()
-	durableInCurrent := qw.currentFileOffsets.Contains(offset)
-	qw.currentFileOffsetsMutex.Unlock()
-
-	if durableInCurrent {
-		qw.fileMutex.Lock()
-		currentPath := ""
-		if qw.currentFile != nil {
-			currentPath = qw.currentFile.Name()
-		}
-		qw.fileMutex.Unlock()
-
-		if currentPath != "" {
-			// Deliberately NOT falling back to oldFiles on failure. Membership in
-			// currentFileOffsets is a positive statement that this incarnation
-			// durably wrote this offset to the open file; if it cannot be read
-			// there, that is an integrity problem, and answering with a different
-			// record that happens to share the tag is the corruption this ordering
-			// exists to prevent.
-			return qw.readMessageFromFile(queueName, currentPath, offset)
-		}
-	}
-
-	// Not in the current file: fall back to the rolled and inherited files. This
-	// is the ordinary cold read of a record written before the last roll.
-	qw.oldFilesMutex.RLock()
-	defer qw.oldFilesMutex.RUnlock()
-
-	for _, fileInfo := range qw.oldFiles {
-		if fileInfo.offsets != nil && fileInfo.offsets.Contains(offset) {
-			// Found the file containing this offset
-			return qw.readMessageFromFile(queueName, fileInfo.path, offset)
-		}
-	}
-
-	return nil, fmt.Errorf("message not in WAL")
-}
-
-// readMessageFromFile reads a message from a specific WAL file (sequential scan for shared WAL format)
-func (qw *QueueWAL) readMessageFromFile(queueName string, filePath string, offset uint64) (*protocol.Message, error) {
-	file, err := os.Open(filePath)
-	if err != nil {
-		return nil, err
-	}
-	defer file.Close()
-
-	// Skip the file-level header before scanning records. Only v4 files are
-	// accepted; a non-v4/headerless file returns ErrUnsupportedWALVersion.
-	dataStart, err := walFileDataStart(file)
-	if err != nil {
-		return nil, err
-	}
-	if _, err := file.Seek(dataStart, io.SeekStart); err != nil {
-		return nil, err
-	}
-
-	// Sequential scan through shared WAL entries. ITER5: accumulate BodyBlock
-	// bodies keyed by their record start offset (a block always precedes any
-	// record that references it, per the co-location invariant), so a matched
-	// reference record resolves its body from the map in this same pass.
-	bodyByOffset := map[uint64][]byte{}
-	recStart := dataStart
-	for {
-		hdr := make([]byte, 8)
-		if _, err := io.ReadFull(file, hdr); err != nil {
-			return nil, err
-		}
-		crc := binary.BigEndian.Uint32(hdr[0:4])
-		dataLen := binary.BigEndian.Uint32(hdr[4:8])
-
-		if walBlankRecordHeader(crc, dataLen) {
-			// Zero-filled tail: this file's data ends here (see
-			// walBlankRecordHeader), so the offset is not in it.
-			return nil, fmt.Errorf("message not in WAL")
-		}
-
-		data := make([]byte, dataLen)
-		if _, err := io.ReadFull(file, data); err != nil {
-			return nil, err
-		}
-
-		curRecStart := recStart
-		recStart += 8 + int64(dataLen)
-
-		// Verify CRC (calculated over [length_bytes][data]). A zero stored CRC
-		// means CRC was disabled at write time — skip verification.
-		if crc != 0 {
-			h := crc32.NewIEEE()
-			h.Write(hdr[4:8])
-			h.Write(data)
-			if crc != h.Sum32() {
-				return nil, fmt.Errorf("CRC mismatch in sequential scan")
-			}
-		}
-
-		recType, payload := recordTypeAndPayload(data)
-		if recType == WALRecordTypeBodyBlock {
-			if len(payload) >= 8 {
-				bodyLen := binary.BigEndian.Uint32(payload[4:8])
-				if 8+int(bodyLen) <= len(payload) {
-					body := make([]byte, bodyLen)
-					copy(body, payload[8:8+int(bodyLen)])
-					bodyByOffset[uint64(curRecStart)] = body
-				}
-			}
-			continue
-		}
-		if recType != WALRecordTypeMessage {
-			// Transaction-boundary marker (or any non-message record): skip.
-			continue
-		}
-
-		rm, ok := deserializeMessagePayload(payload)
-		if !ok {
-			return nil, fmt.Errorf("malformed message record in sequential scan")
-		}
-
-		// Check if this is the message we're looking for
-		if rm.Offset == offset && rm.QueueName == queueName {
-			if len(rm.Message.BodyRef) == 8 {
-				loc := binary.BigEndian.Uint64(rm.Message.BodyRef)
-				body, found := bodyByOffset[loc]
-				if !found {
-					return nil, fmt.Errorf("shared body block not found for offset %d", offset)
-				}
-				rm.Message.Body = body
-				rm.Message.BodyRef = nil
-			}
-			rm.Message.Redelivered = false
-			return rm.Message, nil
-		}
-
-		// Not the right message, continue scanning
-	}
 }
 
 // close stops background goroutines and closes files.

@@ -184,11 +184,14 @@ func NewDisruptorStorageWithEngineConfig(dataDir string, engineCfg interfaces.En
 		// than the 52,428-message ring it replaces: an LRU evicts the OLDEST
 		// entry, which is exactly a FIFO consumer's next target, so a
 		// too-small ready set turns nearly every read into a cold read.
-		hotCacheQueueBytes = 64 * 1024 * 1024 // 64 MiB
+		//
+		// THIS IS THE EFFECTIVE VALUE the configuration validation compares
+		// the global budget against, so the two live in one place.
+		hotCacheQueueBytes = DefaultHotCacheQueueBytes
 	}
 	hotCacheGlobalBytes := engineCfg.HotCacheGlobalBytes
 	if hotCacheGlobalBytes <= 0 {
-		hotCacheGlobalBytes = 256 * 1024 * 1024 // 256 MiB
+		hotCacheGlobalBytes = DefaultHotCacheGlobalBytes
 	}
 	metadataStore, err := NewPersistentMetadataStore(dataDir)
 	if err != nil {

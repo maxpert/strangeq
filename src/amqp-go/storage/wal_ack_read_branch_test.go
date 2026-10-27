@@ -15,9 +15,9 @@ package storage
 //	wal.ReadBatch         -> requires an offsetIndex entry (it errors without one)
 //	wal.Read -> readMessage
 //	     fast path        -> requires an offsetIndex entry
-//	     readMessageSequential
-//	         oldFiles arm -> requires a ROLLED or INHERITED file
-//	         current arm  -> gated ONLY by currentFileOffsets.Contains(offset)
+//	     (the sequential-scan fallback that used to sit under it was REMOVED:
+//	      it had no production caller, so an index miss is now REFUSED rather
+//	      than answered by a scan that could return the wrong record)
 //	segments.Read         -> requires a checkpoint, which only moves oldFiles
 //
 // This test drives the WALManager's PUBLIC API only — Write, ReadBatch,
@@ -93,8 +93,8 @@ func TestWALReadArm_AcknowledgedRecordIsStillServedFromTheCurrentFile(t *testing
 	require.NoError(t, err)
 	require.Len(t, walFiles, 1,
 		"PREMISE BROKEN: expected exactly one WAL file for a single small write; found %d. "+
-			"With a rolled or inherited file present, readMessageSequential's oldFiles arm could "+
-			"answer and this test can no longer attribute the read by elimination", len(walFiles))
+			"With a rolled or inherited file present, more than one read arm could answer, "+
+			"and this test can no longer attribute the read by elimination", len(walFiles))
 
 	// ---- P2: the record is genuinely INDEXED before the ack -----------------
 	pre, err := wal.Read(queue, tag)
@@ -137,10 +137,9 @@ func TestWALReadArm_AcknowledgedRecordIsStillServedFromTheCurrentFile(t *testing
 	require.Error(t, err,
 		"STALE READ CONFIRMED AT THE CURRENT-FILE ARM: tag %d was acknowledged through "+
 			"WALManager.Acknowledge, its offsetIndex entry is gone (ReadBatch fails), there is "+
-			"exactly ONE WAL file so qw.oldFiles is empty and readMessageSequential's oldFiles "+
-			"loop matches nothing, and no checkpoint can have run so the segment tier is empty. "+
-			"Every arm but one is eliminated by execution, and Read still returned the "+
-			"acknowledged record (body=%q). The remaining arm is readMessageSequential's "+
+			"exactly ONE WAL file so qw.oldFiles is empty, and no checkpoint can have run so "+
+			"the segment tier is empty. Every arm but one is eliminated by execution, and Read "+
+			"still returned the acknowledged record (body=%q). The remaining arm is the "+
 			"current-file branch, gated only by currentFileOffsets.Contains(offset) — and "+
 			"currentFileOffsets is added to by commitBatch, reset only by rollFile, and NEVER "+
 			"touched by Acknowledge, which deletes from offsetIndex alone", tag, body)

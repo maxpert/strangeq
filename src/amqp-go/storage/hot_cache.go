@@ -9,6 +9,30 @@ import (
 	"github.com/maxpert/amqp-go/protocol"
 )
 
+// THE EFFECTIVE HOT-CACHE BUDGETS.
+//
+// These are the budgets the storage layer SUBSTITUTES when the engine
+// configuration leaves them unset. They are exported because the CONFIG
+// VALIDATION has to compare the EFFECTIVE budgets against each other: a
+// configuration that names a global budget smaller than the per-queue budget
+// the storage layer will actually apply makes the queue-local eviction
+// unreachable, and the global eviction the only one that ever fires.
+const (
+	// DefaultHotCacheQueueBytes is the per-queue hot-cache byte budget used
+	// when the engine configuration leaves it unset.
+	//
+	// The per-queue budget is 64 MiB because the hot cache REPLACES the
+	// 64K-message ring, whose 80% spill threshold was 52,428 ENTRIES -- an
+	// entry count, with no byte bound at all, so its capacity in bytes grew
+	// with the body size. The byte budget holds the ring's 52,428 entries
+	// only for small bodies, and that is the memory the 64 KiB rows win on.
+	DefaultHotCacheQueueBytes int64 = 64 * 1024 * 1024 // 64 MiB per queue
+
+	// DefaultHotCacheGlobalBytes is the global hot-cache byte budget used
+	// when the engine configuration leaves it unset.
+	DefaultHotCacheGlobalBytes int64 = 256 * 1024 * 1024 // 256 MiB global
+)
+
 // hotCache is a byte-bounded collection of per-queue message maps with one
 // global LRU. The front of lru is the most recently used entry.
 //
@@ -25,6 +49,34 @@ type hotCache struct {
 	queueUsed   map[string]int64
 	globalUsed  int64
 	lru         *list.List
+
+	// byMessage is the REVERSE INDEX from an admitted message pointer to the
+	// entry that admitted it.
+	//
+	// IT EXISTS BECAUSE THE MESSAGE'S DELIVERY TAG IS MUTABLE. The cache
+	// hands out the LIVE message pointer, so a caller can change
+	// message.DeliveryTag after admission, and the entry's map key is the
+	// tag the entry was ADMITTED under. A membership probe that used
+	// m.DeliveryTag would therefore miss the entry the message already
+	// occupies and admit a SECOND entry for the same message: the queue's
+	// ready set would be double-counted and the byte budget charged twice.
+	//
+	// The reverse index makes the membership test INDEPENDENT of the mutable
+	// field: a re-Put of the same pointer UPGRADES the entry it already
+	// occupies, wherever the message's tag has wandered to.
+	//
+	// It is a CACHE over `queues`, not a second source of truth: the entry
+	// itself holds the message pointer, and every removal goes through
+	// removeLocked, which deletes the reverse-index entry with it.
+	byMessage map[hotCacheMessageKey]*hotCacheEntry
+}
+
+// hotCacheMessageKey identifies the entry that admitted one message pointer
+// in one queue. The queue is part of the key because a queue's ready set is
+// its own: the same message pointer admitted in two queues is two entries.
+type hotCacheMessageKey struct {
+	queue   string
+	message *protocol.Message
 }
 
 type hotCacheEntry struct {
@@ -55,6 +107,7 @@ func newHotCache(queueBytes, globalBytes int64) *hotCache {
 		queues:      make(map[string]map[uint64]*hotCacheEntry),
 		queueUsed:   make(map[string]int64),
 		lru:         list.New(),
+		byMessage:   make(map[hotCacheMessageKey]*hotCacheEntry),
 	}
 }
 
@@ -64,6 +117,21 @@ func newHotCache(queueBytes, globalBytes int64) *hotCache {
 //
 // The per-queue budget is satisfied from that queue's own backed entries and
 // the global budget from the global LRU; see evictBackedLRULocked.
+//
+// THE MEMBERSHIP TEST IS INDEPENDENT OF THE MESSAGE'S MUTABLE FIELD. It
+// probes, in this order:
+//
+//  1. the REVERSE INDEX (byMessage): the entry that admitted THIS message
+//     pointer, whatever its delivery tag has become since. A re-Put of an
+//     admitted message UPGRADES that entry -- it does not create a second
+//     one, so the queue's ready set is not double-counted and the byte
+//     budget is not charged twice;
+//  2. the QUEUE MAP, by the tag the message CARRIES: a different pointer
+//     carrying a tag the queue already holds. That entry keeps its own
+//     message and its own charge, and only its backed state is upgraded.
+//
+// The order matters: the first probe is the one that is immune to the
+// mutation, so a mutated re-Put never reaches the tag probe.
 func (c *hotCache) Put(queue string, m *protocol.Message, backed bool) bool {
 	if m == nil {
 		return false
@@ -71,6 +139,13 @@ func (c *hotCache) Put(queue string, m *protocol.Message, backed bool) bool {
 
 	c.mu.Lock()
 	defer c.mu.Unlock()
+
+	// THE MESSAGE-IDENTITY PROBE COMES FIRST. See the doc comment above.
+	if entry := c.byMessage[hotCacheMessageKey{queue: queue, message: m}]; entry != nil {
+		entry.backed = entry.backed || backed
+		c.lru.MoveToFront(entry.lru)
+		return true
+	}
 
 	if entries := c.queues[queue]; entries != nil {
 		if entry, ok := entries[m.DeliveryTag]; ok {
@@ -120,6 +195,7 @@ func (c *hotCache) Put(queue string, m *protocol.Message, backed bool) bool {
 	}
 	entry.lru = c.lru.PushFront(entry)
 	entries[entry.tag] = entry
+	c.byMessage[hotCacheMessageKey{queue: queue, message: m}] = entry
 	c.queueUsed[queue] += charge
 	c.globalUsed += charge
 	return true
@@ -257,6 +333,10 @@ func (c *hotCache) removeLocked(entry *hotCacheEntry) {
 	// its DeliveryTag field may have been mutated since admission, which
 	// would otherwise delete the wrong key and orphan the entry.
 	delete(entries, entry.tag)
+	// The reverse index goes with the entry: a stale entry there would make a
+	// later re-Put of the removed message upgrade an entry that is no longer
+	// in the queue map.
+	delete(c.byMessage, hotCacheMessageKey{queue: entry.queue, message: entry.message})
 	c.queueUsed[entry.queue] -= entry.charge
 	c.globalUsed -= entry.charge
 	c.lru.Remove(entry.lru)

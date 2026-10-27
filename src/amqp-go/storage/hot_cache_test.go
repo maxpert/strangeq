@@ -345,3 +345,72 @@ func TestHotCacheZeroBodyEntriesBounded(t *testing.T) {
 		t.Fatalf("Count() = %d, want 3", got)
 	}
 }
+
+// TestHotCacheMutatedRePutDoesNotDuplicateEntry pins that the "already
+// present" test in Put is INDEPENDENT of the mutable message field.
+//
+// The cache hands out the LIVE message pointer, so a caller can mutate
+// message.DeliveryTag after admission. Every other identity operation in the
+// cache uses the entry's OWNED tag (the map key, the deletion, the range
+// ordering) -- but Put's membership probe used m.DeliveryTag, the MUTABLE
+// field. A mutated re-Put of the SAME pointer therefore MISSED the entry it
+// had already admitted and created a SECOND one: the queue's ready set was
+// double-counted and the byte budget was charged twice.
+//
+// WHAT A MUTATION WOULD BREAK: removing the message-identity probe from Put
+// (or looking the entry up by m.DeliveryTag again) makes Count(q) == 2 and
+// the byte accounting == 2 charges, which is exactly what the assertions
+// below forbid.
+func TestHotCacheMutatedRePutDoesNotDuplicateEntry(t *testing.T) {
+	queue := "q"
+	msg := &protocol.Message{DeliveryTag: 1, Body: []byte("body")}
+	charge := cacheCharge(queue, msg)
+	cache := newHotCache(4*charge, 4*charge)
+
+	if !cache.Put(queue, msg, false) {
+		t.Fatal("the initial Put failed")
+	}
+	if got := cache.Count(queue); got != 1 {
+		t.Fatalf("Count(%q) = %d after the initial Put, want 1", queue, got)
+	}
+
+	// The caller mutates the message it was handed and re-Puts the SAME
+	// pointer. This is a DURABLE COMPLETION of an already-admitted message:
+	// it must UPGRADE the entry, not duplicate it.
+	msg.DeliveryTag = 9999
+	if !cache.Put(queue, msg, true) {
+		t.Fatal("the re-Put of an already-admitted message failed")
+	}
+
+	if got := cache.Count(queue); got != 1 {
+		t.Fatalf("Count(%q) = %d after a mutated re-Put, want 1: the same message "+
+			"was admitted twice, so the queue's ready set is double-counted", queue, got)
+	}
+	if got := cache.queueUsed[queue]; got != charge {
+		t.Fatalf("per-queue byte accounting = %d, want %d: the same message was "+
+			"charged twice", got, charge)
+	}
+	if got := cache.globalUsed; got != charge {
+		t.Fatalf("global byte accounting = %d, want %d: the same message was "+
+			"charged twice", got, charge)
+	}
+
+	// The entry is still found under the tag it was ADMITTED under.
+	got, backed, ok := cache.Get(queue, 1)
+	if !ok {
+		t.Fatal("the entry is no longer findable under the tag it was admitted under")
+	}
+	if got != msg {
+		t.Fatalf("Get(%q, 1) returned %p, want the admitted message %p", queue, got, msg)
+	}
+	if !backed {
+		t.Fatal("the re-Put must upgrade the entry's backed state")
+	}
+
+	// And it is NOT findable under the mutated tag: the entry owns its
+	// identity.
+	if _, _, ok := cache.Get(queue, 9999); ok {
+		t.Fatal("the entry was re-keyed under the mutated delivery tag: the entry " +
+			"owns its identity and must stay under the tag it was admitted under")
+	}
+}

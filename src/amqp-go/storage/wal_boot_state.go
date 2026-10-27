@@ -160,7 +160,12 @@ func indexWALFile(fileNum uint64, path string) (inv *segmentInventory, hasShared
 			inv.addRecord(r)
 		}
 		if txUnreadable > 0 {
+			// The COMMITTED transaction's uninterpretable bytes are durable
+			// data a newer build could read: they are counted as LIVE (so
+			// the file is never reclaimed) AND counted explicitly (so the
+			// compaction skips the file). See segmentInventory.
 			inv.unacked.Add(txUnreadable)
+			inv.uninterpretableBytes.Add(txUnreadable)
 		}
 		txBytes = 0
 		txUnreadable = 0
@@ -270,10 +275,24 @@ func indexWALFile(fileNum uint64, path string) (inv *segmentInventory, hasShared
 					// and never compacted — while they are on disk: a newer
 					// build could still read them, and deleting them would
 					// be a silent loss of confirmed durable data.
+					//
+					// "COUNTED AS LIVE" IS NOT ENOUGH ON ITS OWN, and this
+					// is where the two accounting rules come apart:
+					//
+					//   - the RECLAIM sweep asks "is the file fully
+					//     acknowledged?", so counting the bytes as live
+					//     keeps the file out of the sweep;
+					//   - the COMPACTION copies the RECORDS the inventory
+					//     holds, and this record is not one of them, so a
+					//     rewrite would DELETE its bytes.
+					//
+					// The explicit counter is what makes the compaction's
+					// skip an INVARIANT rather than a coincidence.
 					if inTx {
 						txUnreadable += recordBytes
 					} else {
 						inv.unacked.Add(recordBytes)
+						inv.uninterpretableBytes.Add(recordBytes)
 					}
 				}
 				if inTx {

@@ -29,8 +29,8 @@ package storage
 // it if C is abandoned.
 //
 // The read path is what decides the COST, and it is why this is not obviously
-// only a performance question — readMessageSequential iterates oldFiles in GO
-// MAP ORDER and returns the first file whose bitmap contains the offset:
+// only a performance question — the read path USED to iterate oldFiles in GO
+// MAP ORDER and return the first file whose bitmap contained the offset:
 //
 //	for _, fileInfo := range qw.oldFiles {
 //	    if fileInfo.offsets != nil && fileInfo.offsets.Contains(offset) {
@@ -41,6 +41,12 @@ package storage
 // If two files both contain the tag and the index entry is gone, that loop can
 // return EITHER record. Returning the older one is not a slow read, it is the
 // WRONG PAYLOAD.
+//
+// THAT LOOP IS GONE. The sequential-scan fallback (readMessageSequential /
+// readMessageFromFile) had no production caller and was a THIRD copy of the
+// record grammar; it was deleted. The live read path (readMessage) answers
+// from the offset index alone, so an ambiguous key is REFUSED rather than
+// answered with the wrong payload — which is the stronger answer.
 
 import (
 	"testing"

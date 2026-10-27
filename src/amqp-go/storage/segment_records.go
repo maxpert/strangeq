@@ -71,6 +71,25 @@ type segmentInventory struct {
 	durableBytes atomic.Int64
 	unacked      atomic.Int64
 	deadBytes    atomic.Int64
+
+	// uninterpretableBytes is the number of bytes in the file that this build
+	// CANNOT INTERPRET: a message record whose payload sets the reserved
+	// continuation flag, or whose body kind this build does not know. Such a
+	// record is durable data a NEWER build could read, so it is never
+	// garbage.
+	//
+	// IT IS COUNTED SEPARATELY FROM `unacked` ON PURPOSE. `unacked` is the
+	// reclaim predicate's input ("unacked == 0" means "the file holds nothing
+	// live"), and the uninterpretable bytes DO keep a file out of the reclaim
+	// sweep. But they are not a RECORD, so the COMPACTION -- which copies the
+	// records the inventory holds -- would drop them. Counting them in a
+	// dedicated counter is what lets the compaction SKIP such a file
+	// explicitly, instead of relying on a coincidence between two accounting
+	// rules.
+	//
+	// See wal_compaction.go (compactOldFile) and wal_manager.go
+	// (tryReclaimOldFiles): both consult it.
+	uninterpretableBytes atomic.Int64
 }
 
 func newSegmentInventory(durableBytes int64) *segmentInventory {

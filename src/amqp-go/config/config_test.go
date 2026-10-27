@@ -529,3 +529,57 @@ func TestCRCTriState_EngineOverlay(t *testing.T) {
 	c.Storage.CRCCheck = &dis
 	assert.True(t, c.GetEngine().WALCRCDisabled, "crc_check:false must set WALCRCDisabled=true")
 }
+
+// TestValidateHotCacheEffectiveBudgets pins that the hot-cache budgets are
+// validated against the EFFECTIVE values -- the ones the storage layer will
+// actually apply -- and not against the RAW engine configuration.
+//
+// THE DEFECT: the validation compared the global budget against the RAW
+// per-queue value, which is 0 when the per-queue budget is unset. The storage
+// layer substitutes a 64 MiB per-queue default in that case, so
+// `hot_cache_queue_bytes: 0` with `hot_cache_global_bytes: 33554432`
+// (32 MiB) PASSED validation and produced newHotCache(64 MiB, 32 MiB): the
+// per-queue budget could never bind, the GLOBAL eviction was always the one
+// that fired, and the queue-local eviction -- the fix for the multi-queue
+// starvation -- was dead in that configuration.
+//
+// WHAT A MUTATION WOULD BREAK: comparing the raw values again (or dropping
+// the effective-value resolution) makes the 32 MiB-global / unset-per-queue
+// combination validate, and the "must be rejected" assertion below fails.
+func TestValidateHotCacheEffectiveBudgets(t *testing.T) {
+	t.Run("the shipped defaults validate", func(t *testing.T) {
+		cfg := DefaultConfig()
+		require.NoError(t, cfg.Validate(),
+			"the shipped defaults must validate: the global budget is larger than the per-queue budget")
+	})
+
+	t.Run("a 32 MiB global budget with an unset per-queue budget is rejected", func(t *testing.T) {
+		cfg := DefaultConfig()
+		// An explicit 0 is what a configuration file that sets
+		// `hot_cache_queue_bytes: 0` binds to; the storage layer then
+		// substitutes its 64 MiB default.
+		cfg.Engine.HotCacheQueueBytes = 0
+		cfg.Engine.HotCacheGlobalBytes = 32 * 1024 * 1024
+
+		err := cfg.Validate()
+		require.Error(t, err,
+			"a global budget smaller than the EFFECTIVE per-queue budget must be rejected")
+		assert.Contains(t, err.Error(), "hot cache global bytes")
+	})
+
+	t.Run("a global budget equal to the effective per-queue budget is accepted", func(t *testing.T) {
+		cfg := DefaultConfig()
+		cfg.Engine.HotCacheQueueBytes = 0
+		cfg.Engine.HotCacheGlobalBytes = 64 * 1024 * 1024
+		require.NoError(t, cfg.Validate(),
+			"a global budget equal to the effective per-queue budget is admissible")
+	})
+
+	t.Run("an explicitly set per-queue budget still bounds the global budget", func(t *testing.T) {
+		cfg := DefaultConfig()
+		cfg.Engine.HotCacheQueueBytes = 64 * 1024 * 1024
+		cfg.Engine.HotCacheGlobalBytes = 32 * 1024 * 1024
+		require.Error(t, cfg.Validate(),
+			"a global budget below the explicit per-queue budget must be rejected")
+	})
+}

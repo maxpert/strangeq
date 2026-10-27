@@ -43,6 +43,14 @@ import (
 //   - uncommitted transaction records (a torn transaction is never
 //     resurrected);
 //   - body blocks no copied record references.
+//
+// WHAT IS NEVER COMPACTED AT ALL
+//
+// A file that holds ANY byte this build cannot interpret. Such a record is
+// durable data a newer build could still read, and the copy below would drop
+// it (it is not a record the inventory holds), so the file is skipped whole --
+// its bytes are left exactly as they are. See compactOldFile and
+// segmentInventory.uninterpretableBytes.
 
 // DefaultWALCompactionThreshold is the share of a sealed WAL file's durable
 // bytes that must be acknowledged before the file is compacted. The comparison
@@ -148,6 +156,27 @@ func (qw *QueueWAL) compactOldFile(fileNum uint64) error {
 	}
 	inv := info.inv
 	if inv == nil || !inv.valid {
+		return nil
+	}
+	// A FILE THAT HOLDS BYTES THIS BUILD CANNOT INTERPRET IS NEVER COMPACTED.
+	//
+	// THE INVARIANT: a record this build cannot interpret -- a message record
+	// whose payload sets the reserved continuation flag, or whose body kind
+	// this build does not know -- is DURABLE DATA A NEWER BUILD COULD STILL
+	// READ. Deleting its bytes would be a silent loss of confirmed durable
+	// data, so such a file is left exactly as it is.
+	//
+	// WHY THE `unacked == 0` GUARD BELOW IS NOT THIS GUARD: the uninterpretable
+	// bytes are counted as LIVE (inv.unacked), so `unacked` is NON-ZERO for
+	// such a file and the "fully acknowledged?" question is answered NO --
+	// which, for a compaction, means "go ahead and rewrite the file". The
+	// rewrite copies the RECORDS the inventory holds, and the uninterpretable
+	// record is deliberately NOT indexed (nothing can serve it), so the
+	// rewrite DELETED its bytes.
+	//
+	// The explicit counter is what makes the skip an INVARIANT rather than a
+	// coincidence between two accounting rules.
+	if inv.uninterpretableBytes.Load() != 0 {
 		return nil
 	}
 	// A fully acknowledged file is unlinked by the reclaim sweep, not

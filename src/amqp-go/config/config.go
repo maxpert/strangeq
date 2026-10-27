@@ -11,6 +11,7 @@ import (
 	"github.com/knadh/koanf/providers/file"
 	"github.com/knadh/koanf/v2"
 	"github.com/maxpert/amqp-go/interfaces"
+	"github.com/maxpert/amqp-go/storage"
 	yamlv3 "gopkg.in/yaml.v3"
 )
 
@@ -123,14 +124,32 @@ func DefaultConfig() *AMQPConfig {
 
 			// Hot Cache (Segstore v1)
 			//
-			// The per-queue budget is 64 MiB because the hot cache REPLACES the
-			// 64K-message ring, whose 80% spill threshold is 52,428 messages.
-			// A 16 MiB per-queue budget holds only ~25.4k messages at the
-			// current charge formula -- LESS than the ring it replaces -- so
-			// the LRU evicted the FIFO consumer's next target and every read
-			// became a cold read. The global budget stays at 256 MiB.
-			HotCacheQueueBytes:  64 * 1024 * 1024,  // 64 MiB per queue
-			HotCacheGlobalBytes: 256 * 1024 * 1024, // 256 MiB global
+			// The per-queue budget is a BYTE budget, and it is deliberately
+			// byte-bounded rather than entry-bounded.
+			//
+			// The hot cache replaces the 64K-slot ring, whose 80% spill
+			// threshold was 52,428 ENTRIES -- an entry count, with no byte
+			// bound at all, so its capacity in bytes grew with the body size.
+			// An entry-count budget of 52,428 would therefore hold 3.3 GiB of
+			// 64 KiB bodies for ONE queue, which is exactly the memory the
+			// byte bound exists to prevent.
+			//
+			// 16 MiB was too small: at the charge formula
+			// (512 + queue + body + ...) it holds only ~25.4k messages, and
+			// the LRU evicts the OLDEST entry -- which is precisely a FIFO
+			// consumer's next target -- so nearly every read became a cold
+			// read and the durable queue's delivery rate was pinned to the
+			// fsync cadence. 64 MiB roughly doubles the resident set.
+			//
+			// The byte budget holds the ring's 52,428 entries only for small
+			// bodies: 129,553 at an empty body, 65,154 at 512 B, 52,184 at
+			// 768 B, 43,520 at 1 KiB and 14,544 at 4 KiB. At 1 KiB and above
+			// the resident set is smaller than the ring's, by design: that
+			// is the memory the 64 KiB rows win on.
+			//
+			// The global budget stays at 256 MiB.
+			HotCacheQueueBytes:  storage.DefaultHotCacheQueueBytes,  // 64 MiB per queue
+			HotCacheGlobalBytes: storage.DefaultHotCacheGlobalBytes, // 256 MiB global
 
 			// Consumer Delivery
 			ConsumerSelectTimeoutMS: 1,    // 1 millisecond (500µs rounded up)
@@ -138,7 +157,7 @@ func DefaultConfig() *AMQPConfig {
 			UnlimitedPrefetchCap:    2000, // Finite gate cap for prefetch-0 manual-ack consumers
 
 			// Background Maintenance
-			WALCleanupCheckIntervalMS: 300000, // 5 minutes
+			WALCleanupCheckIntervalMS: 5000, // 5 seconds
 		},
 	}
 }
@@ -282,6 +301,32 @@ func (c *AMQPConfig) Validate() error {
 	}
 
 	// Hot cache validation (segstore v1)
+	//
+	// THE COMPARISON IS BETWEEN THE EFFECTIVE BUDGETS.
+	//
+	// The storage layer SUBSTITUTES a default when the engine configuration
+	// leaves a budget unset (storage.DefaultHotCacheQueueBytes /
+	// storage.DefaultHotCacheGlobalBytes), so the RAW engine value is 0 in
+	// exactly the case where a default is what the broker will actually run
+	// with. Comparing the RAW values therefore let a configuration through
+	// whose GLOBAL budget is smaller than the PER-QUEUE budget the storage
+	// layer will apply -- e.g. `hot_cache_queue_bytes: 0` (unset, so 64 MiB)
+	// with `hot_cache_global_bytes: 33554432` (32 MiB). That configuration
+	// produces newHotCache(64 MiB, 32 MiB): the per-queue budget can never
+	// bind, the GLOBAL eviction is always the one that fires, and the
+	// queue-local eviction -- the fix for the multi-queue starvation -- is
+	// dead in that configuration.
+	//
+	// So the defaults are resolved FIRST and the EFFECTIVE budgets are the
+	// ones compared.
+	effectiveQueueBytes := c.Engine.HotCacheQueueBytes
+	if effectiveQueueBytes <= 0 {
+		effectiveQueueBytes = storage.DefaultHotCacheQueueBytes
+	}
+	effectiveGlobalBytes := c.Engine.HotCacheGlobalBytes
+	if effectiveGlobalBytes <= 0 {
+		effectiveGlobalBytes = storage.DefaultHotCacheGlobalBytes
+	}
 	if c.Engine.HotCacheQueueBytes != 0 {
 		qb := c.Engine.HotCacheQueueBytes
 		if qb < 1*1024*1024 || qb > 64*1024*1024 {
@@ -290,9 +335,13 @@ func (c *AMQPConfig) Validate() error {
 	}
 	if c.Engine.HotCacheGlobalBytes != 0 {
 		gb := c.Engine.HotCacheGlobalBytes
-		if gb < c.Engine.HotCacheQueueBytes || gb > 256*1024*1024 {
+		if gb > 256*1024*1024 {
 			return fmt.Errorf("hot cache global bytes must be between queue bytes and 256 MiB: %d", gb)
 		}
+	}
+	if effectiveGlobalBytes < effectiveQueueBytes {
+		return fmt.Errorf("hot cache global bytes must be at least the effective per-queue budget: global %d, per-queue %d",
+			effectiveGlobalBytes, effectiveQueueBytes)
 	}
 	if c.Engine.SpillThresholdPercent <= 0 || c.Engine.SpillThresholdPercent > 100 {
 		return fmt.Errorf("spill threshold percent must be between 1-100: %d", c.Engine.SpillThresholdPercent)
