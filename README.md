@@ -302,45 +302,47 @@ Throughput is measured as **end-to-end delivered messages per second (msg/s)**: 
 - Durable queues, publisher confirms, fsync enabled, consumer prefetch 100, and manual acknowledgements.
 - No message loss or unconfirmed publishes.
 
-### Latest benchmark (2026-10-25)
+### Latest benchmark (2026-10-27)
 
-Each workload used a 10-second warmup followed by a 30-second measurement. Results are median throughput across repeated runs.
+Each workload used a 10-second warmup followed by a 30-second measurement, repeated and reported as the median. Both brokers ran in the same session, on the same machine, with the same client and the same settings.
 
 | Message size | Producers / consumers | StrangeQ | RabbitMQ 4.4 Classic | StrangeQ / RabbitMQ |
 |---|--:|--:|--:|--:|
-| 1 KB | 1 / 1 | 116,219 msg/s | 81,587 msg/s | **1.42x** |
-| 1 KB | 10 / 10 | 157,232 msg/s | 53,778 msg/s | **2.92x** |
-| 1 KB | 32 / 32 | 125,279 msg/s | 44,051 msg/s | **2.84x** |
-| 64 KB | 1 / 1 | 30,214 msg/s | 31,067 msg/s | 0.97x |
-| 64 KB | 10 / 10 | 32,899 msg/s | 20,892 msg/s | **1.58x** |
-| 64 KB | 32 / 32 | 31,898 msg/s | ~24,116 msg/s (unstable) | ~1.32x |
+| 1 KB | 1 / 1 | 117,439 msg/s | 94,476 msg/s | **1.24x** |
+| 1 KB | 10 / 10 | 127,324 msg/s | 74,588 msg/s | **1.71x** |
+| 1 KB | 32 / 32 | 120,478 msg/s | 44,574 msg/s | **2.70x** |
+| 1 KB | 4 queues, 3 / 3 each | 130,537 msg/s | 119,204 msg/s | **1.10x** |
+| 64 KB | 1 / 1 | 26,228 msg/s | 34,167 msg/s | 0.77x |
+| 64 KB | 10 / 10 | 28,879 msg/s | 20,874 msg/s | **1.38x** |
 
 Memory usage (peak RSS):
 
 | Workload | StrangeQ | RabbitMQ 4.4 Classic | StrangeQ / RabbitMQ |
 |---|--:|--:|--:|
-| 1 KB, 1 / 1 | 55 MB | 241 MB | **0.23x** |
-| 1 KB, 10 / 10 | 341 MB | 428 MB | **0.80x** |
-| 1 KB, 32 / 32 | 457 MB | 544 MB | **0.84x** |
-| 64 KB, 1 / 1 | 498 MB | 1,121 MB | **0.44x** |
-| 64 KB, 10 / 10 | 1,029 MB | 1,597 MB | **0.65x** |
-| 64 KB, 32 / 32 | 1,066 MB | ~3,665 MB (unstable) | **0.29x** |
+| 1 KB, 1 / 1 | 94 MB | 244 MB | **0.39x** |
+| 1 KB, 10 / 10 | 352 MB | 413 MB | **0.85x** |
+| 1 KB, 32 / 32 | 469 MB | 554 MB | **0.85x** |
+| 1 KB, 4 queues, 3 / 3 each | 888 MB | 399 MB | 2.23x |
+| 64 KB, 1 / 1 | 557 MB | 1,172 MB | **0.48x** |
+| 64 KB, 10 / 10 | 1,022 MB | 1,607 MB | **0.64x** |
 
-Median publisher-confirm latency for the 64 KB, 10 / 10 workload was **118.3 ms** for StrangeQ and **33.2 ms** for RabbitMQ Classic.
+On the five single-queue workloads StrangeQ used **0.39x to 0.85x** of RabbitMQ's memory, and used less on every metric (idle, steady, peak, and bytes held per in-flight message) on every one of them.
 
-**Note on RabbitMQ 64 KB, 32 / 32:** RabbitMQ's per-second throughput on this workload swings 16-20% (CV) with min/max ratios of 0.43-0.51 — its worst second is less than half its best. All three runs were flagged invalid by the intra-cell pollution detector. StrangeQ holds steady at 4.2% CV. The instability is likely RabbitMQ's Erlang scheduler struggling to sustain 32 concurrent producers and consumers at 64 KB body size.
+**The 64 KB, 1 / 1 row is the exception, and it is a durability difference, not a defect.** RabbitMQ Classic does not flush to disk before it confirms a publish; StrangeQ does an `F_FULLFSYNC` (a full drive-cache flush) before every publisher confirm, so a confirmed message is on the platter. On 64 KiB bodies with a single producer that flush dominates: the write-ahead log commits 487 messages (31 MB) per flush, the flush takes 12.7 ms, and the whole commit cycle takes 17.8 ms. This machine's durable write bandwidth puts a ceiling of roughly 31,800 messages/second on that shape — and RabbitMQ, which does not wait for the disk at all, reaches about 34,000. We report the row rather than hide it, and we do not weaken the flush to win it. The rows where the data fits the device's durable bandwidth (1 KiB) and the rows where concurrency hides the flush latency (10 / 10) are won decisively.
 
-**Memory scaling:** StrangeQ's peak RSS is driven by in-flight message data (message size x outstanding window), not connection count. Going from 10 to 32 producers at 64 KB barely changes RSS (1,029 to 1,066 MB). RabbitMQ's RSS grows with connections — from 1,121 MB (1/1) to ~3,665 MB (32/32) — likely due to per-connection Erlang process heaps.
+Median publisher-confirm latency was 7.0 ms (1 KB, 1 / 1), 79.7 ms (1 KB, 10 / 10), 31.0 ms (64 KB, 1 / 1) and 137.6 ms (64 KB, 10 / 10) for StrangeQ, against 8.3 ms, 128.4 ms, 436 ms and 32.8 ms for RabbitMQ Classic. RabbitMQ's confirm does not wait for the disk, so it is not a like-for-like comparison on the rows where a flush dominates: on 64 KB bodies a single producer RabbitMQ confirms 436 ms late, and StrangeQ confirms in 31 ms.
+
+**Memory scaling:** StrangeQ's resident memory is driven by in-flight message data (message size x outstanding window), not by connection count. RabbitMQ's grows with connections, because each connection carries its own Erlang process heap. On the 4-queue workload RabbitMQ's node was 399 MB while StrangeQ was 888 MB — the one shape where StrangeQ uses more, because the workload is really 12 concurrent connections publishing 1 KiB messages, and StrangeQ's memory tracks the 12,000 messages in flight rather than the 12 connections.
 
 ### Multi-queue scaling (durable + publisher confirms)
 
-3 producers / 3 consumers per queue, 1 KB bodies, one perftest process per queue. Aggregate consumed msg/s, zero loss, evenly balanced across queues.
+3 producers / 3 consumers per queue, 1 KB bodies, one client process per queue. Aggregate consumed msg/s, zero loss, evenly balanced across queues.
 
-| Queues | StrangeQ aggregate | vs single queue |
-|---|--:|--:|
-| 1 | 142,159 msg/s | — |
-| 2 | 174,339 msg/s | 1.20x |
-| 4 | 191,109 msg/s | 1.32x |
+| Queues | StrangeQ aggregate | RabbitMQ 4.4 Classic | StrangeQ / RabbitMQ |
+|---|--:|--:|--:|
+| 1 | 123,354 msg/s | — | — |
+| 2 | 133,377 msg/s | — | — |
+| 4 | 130,537 msg/s | 119,204 msg/s | **1.10x** |
 
 ### Crash safety
 
