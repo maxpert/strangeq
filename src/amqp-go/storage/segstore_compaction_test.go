@@ -122,12 +122,10 @@ func TestSegstoreCompactionThresholdStrict(t *testing.T) {
 		_, err = wm.Read("q", tag)
 		require.Error(t, err, "acknowledged tag %d must not be readable after compaction", tag)
 	}
-	qw.offsetIndexMutex.RLock()
 	for _, tag := range []uint64{2, 3, 5} {
-		_, ok := qw.offsetIndex[recordKey{queueName: "q", deliveryTag: tag}]
+		_, ok := walIndexEntry(qw, recordKey{queueName: "q", deliveryTag: tag})
 		require.False(t, ok, "acknowledged tag %d must not stay in the index", tag)
 	}
-	qw.offsetIndexMutex.RUnlock()
 }
 
 // TestSegstoreCompactionPreservesLive proves a compaction keeps every
@@ -159,9 +157,7 @@ func TestSegstoreCompactionPreservesLive(t *testing.T) {
 		require.Equal(t, body, string(msg.Body))
 	}
 
-	qw.offsetIndexMutex.RLock()
-	_, ok := qw.offsetIndex[recordKey{queueName: "dead", deliveryTag: 1}]
-	qw.offsetIndexMutex.RUnlock()
+	_, ok := walIndexEntry(qw, recordKey{queueName: "dead", deliveryTag: 1})
 	require.False(t, ok, "the acknowledged record must be dropped from the index")
 
 	require.NotContains(t, string(compactionReadFile(t, path)), strings.Repeat("x", 64),
@@ -246,12 +242,14 @@ func TestSegstoreCompactionWriteFsyncRenameFaults(t *testing.T) {
 		before := compactionReadFile(t, path)
 
 		restore := SetWALRenameForTest(func(oldPath, newPath string) error {
-			// The install holds the index WRITE lock, so neither a writer
-			// nor a reader can take the lock while the rename happens.
-			require.False(t, qw.offsetIndexMutex.TryLock(),
-				"the rename must happen under the index write lock")
-			require.False(t, qw.offsetIndexMutex.TryRLock(),
-				"the rename must happen under the index write lock")
+			// The install holds EVERY SHARD's WRITE lock, so neither a writer
+			// nor a reader can take a shard's lock while the rename happens.
+			for i := range qw.indexShards {
+				require.False(t, qw.indexShards[i].mu.TryLock(),
+					"the rename must happen under the index write locks")
+				require.False(t, qw.indexShards[i].mu.TryRLock(),
+					"the rename must happen under the index write locks")
+			}
 			return errors.New("injected compaction rename fault")
 		})
 		qw.tryCompactOldFiles()
@@ -345,22 +343,26 @@ func TestSegstoreCompactionReadLayoutExclusion(t *testing.T) {
 	_, path := rollSegstoreReclaimWAL(t, wm)
 	wm.Acknowledge("dead", 1)
 
-	qw.offsetIndexMutex.RLock()
-	oldPosition := qw.offsetIndex[recordKey{queueName: "live", deliveryTag: 1}].pos.position
-	qw.offsetIndexMutex.RUnlock()
+	oldEntry, ok := walIndexEntry(qw, recordKey{queueName: "live", deliveryTag: 1})
+	require.True(t, ok, "the live record must be indexed")
+	oldPosition := oldEntry.pos.position
 	qw.tryCompactOldFiles()
 
-	qw.offsetIndexMutex.RLock()
-	newPosition := qw.offsetIndex[recordKey{queueName: "live", deliveryTag: 1}].pos.position
-	qw.offsetIndexMutex.RUnlock()
+	newEntry, ok := walIndexEntry(qw, recordKey{queueName: "live", deliveryTag: 1})
+	require.True(t, ok, "the live record must still be indexed after the compaction")
+	newPosition := newEntry.pos.position
 	require.NotEqual(t, oldPosition, newPosition, "the compacted layout must differ from the old one")
 
 	// The read must hit the NEW position, under the index read lock.
 	var seen []int64
 	restore := SetWALReadAtForTest(func(f *os.File, b []byte, off int64) (int, error) {
 		seen = append(seen, off)
-		require.False(t, qw.offsetIndexMutex.TryLock(),
-			"a delivery read must hold the index read lock, so a compaction cannot swap the layout under it")
+		// The read holds ITS SHARD's read lock through the ReadAt, so the
+		// compaction (which takes every shard's write lock) cannot swap the
+		// layout under it.
+		sh := qw.shardForTag(1)
+		require.False(t, sh.mu.TryLock(),
+			"a delivery read must hold its shard's read lock, so a compaction cannot swap the layout under it")
 		return f.ReadAt(b, off)
 	})
 	msg, err := wm.Read("live", 1)
@@ -373,10 +375,8 @@ func TestSegstoreCompactionReadLayoutExclusion(t *testing.T) {
 	// The dead record is excluded from the read layout entirely.
 	_, err = wm.Read("dead", 1)
 	require.Error(t, err)
-	qw.offsetIndexMutex.RLock()
-	_, ok := qw.offsetIndex[recordKey{queueName: "dead", deliveryTag: 1}]
-	qw.offsetIndexMutex.RUnlock()
-	require.False(t, ok)
+	_, deadIndexed := walIndexEntry(qw, recordKey{queueName: "dead", deliveryTag: 1})
+	require.False(t, deadIndexed)
 	require.NotContains(t, string(compactionReadFile(t, path)), strings.Repeat("d", 64),
 		"the excluded record's bytes must be gone from the file")
 }
@@ -458,9 +458,9 @@ func TestSegstoreCompactionSharedBodyLiveRead(t *testing.T) {
 	_, path := rollSegstoreReclaimWAL(t, wm)
 	wm.Acknowledge("dead", 1)
 
-	qw.offsetIndexMutex.RLock()
-	oldRef := qw.offsetIndex[recordKey{queueName: "live-a", deliveryTag: 1}].bodyRef
-	qw.offsetIndexMutex.RUnlock()
+	oldEntry, ok := walIndexEntry(qw, recordKey{queueName: "live-a", deliveryTag: 1})
+	require.True(t, ok, "the shared-body record must be indexed")
+	oldRef := oldEntry.bodyRef
 	require.GreaterOrEqual(t, oldRef, int64(0), "the shared-body record must carry a body reference")
 
 	qw.tryCompactOldFiles()
@@ -468,9 +468,9 @@ func TestSegstoreCompactionSharedBodyLiveRead(t *testing.T) {
 	require.NotContains(t, string(compacted), strings.Repeat("d", 64),
 		"the acknowledged bulk must be gone from the compacted file")
 
-	qw.offsetIndexMutex.RLock()
-	newRef := qw.offsetIndex[recordKey{queueName: "live-a", deliveryTag: 1}].bodyRef
-	qw.offsetIndexMutex.RUnlock()
+	newEntry, ok := walIndexEntry(qw, recordKey{queueName: "live-a", deliveryTag: 1})
+	require.True(t, ok, "the shared-body record must still be indexed")
+	newRef := newEntry.bodyRef
 	require.NotEqual(t, oldRef, newRef, "the body locator must be remapped to the block's new position")
 
 	// Every reference to the shared body still resolves to the same bytes.

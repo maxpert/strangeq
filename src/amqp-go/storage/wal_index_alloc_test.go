@@ -36,7 +36,8 @@ import (
 // the slice shape lands at ~1.0 and passes.
 func TestWALIndexUpdate_AllocatesNoMapPerMessage(t *testing.T) {
 	const n = 2000
-	qw := &QueueWAL{offsetIndex: make(map[recordKey]*segmentRecord, n)}
+	qw := &QueueWAL{}
+	qw.initIndexShards()
 	// The records themselves are allocated up front: this test is about the
 	// INDEX's per-record cost, not about the record allocation.
 	recs := make([]segmentRecord, n)
@@ -49,7 +50,7 @@ func TestWALIndexUpdate_AllocatesNoMapPerMessage(t *testing.T) {
 	var before, after runtime.MemStats
 	runtime.ReadMemStats(&before)
 	for i := 0; i < n; i++ {
-		qw.indexRecordLocked(&recs[i])
+		qw.indexRecord(&recs[i])
 	}
 	runtime.ReadMemStats(&after)
 

@@ -174,18 +174,11 @@ func recoverableOffsets(t *testing.T, dir, queue string) map[uint64]bool {
 func waitForAcksApplied(t *testing.T, wal *WALManager, offsets []uint64) {
 	t.Helper()
 	for _, off := range offsets {
-		wal.sharedWAL.offsetIndexMutex.RLock()
 		found := false
-		for key, copies := range wal.sharedWAL.recordCopies {
-			if key.deliveryTag != off {
-				continue
-			}
-			for _, r := range copies {
-				found = true
-				require.True(t, r.acked.Load(), "physical copy for tag %d is not acknowledged", off)
-			}
+		for _, r := range walIndexCopiesForTag(wal.sharedWAL, off) {
+			found = true
+			require.True(t, r.acked.Load(), "physical copy for tag %d is not acknowledged", off)
 		}
-		wal.sharedWAL.offsetIndexMutex.RUnlock()
 		require.False(t, found,
 			"an acknowledged tag must have left the physical index: tag %d is still indexed", off)
 	}
@@ -383,9 +376,7 @@ func TestWALIncarnation_ReclaimedFileHeldOnlyAckedRecords(t *testing.T) {
 			// mutates it) and the read gate is consulted after that lock is
 			// released (bitmapMutex is a leaf: it is never held while the
 			// index lock is taken).
-			qw.offsetIndexMutex.RLock()
 			r := c.inv.records[rec.pos.position]
-			qw.offsetIndexMutex.RUnlock()
 			if r != nil {
 				if !r.acked.Load() {
 					v.unacked = append(v.unacked, rec.Offset)

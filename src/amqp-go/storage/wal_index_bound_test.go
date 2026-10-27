@@ -71,11 +71,20 @@ func walIndexBoundConfig() WALConfig {
 // It reads the REAL maps under the index lock, so the bound it reports is the
 // bound the production code actually maintains.
 func walIndexCounts(qw *QueueWAL) (indexed int, copies int) {
-	qw.offsetIndexMutex.RLock()
-	defer qw.offsetIndexMutex.RUnlock()
-	indexed = len(qw.offsetIndex)
-	for _, set := range qw.recordCopies {
-		copies += len(set)
+	// THE INDEX IS SHARDED, so the counts are the SUM over every shard.
+	//
+	// What this test pins is the bound of the GLOBAL index -- the maps that
+	// hold every published key -- and not the bound of one shard: a bound
+	// measured on a single shard would be satisfied by an index that holds
+	// every record of the other 63 shards.
+	for i := range qw.indexShards {
+		sh := &qw.indexShards[i]
+		sh.mu.RLock()
+		indexed += len(sh.offset)
+		for _, set := range sh.copies {
+			copies += len(set)
+		}
+		sh.mu.RUnlock()
 	}
 	return indexed, copies
 }
@@ -167,19 +176,15 @@ func TestWALIndexBound_AckStateLivesInTheBitmap(t *testing.T) {
 
 	qw := wm.sharedWAL
 	key := recordKey{queueName: queue, deliveryTag: tag}
-	qw.offsetIndexMutex.RLock()
-	_, indexed := qw.offsetIndex[key]
-	qw.offsetIndexMutex.RUnlock()
+	_, indexed := walIndexEntry(qw, key)
 	require.True(t, indexed, "PREMISE BROKEN: the record was never indexed")
 
 	wm.Acknowledge(queue, tag)
 
 	require.True(t, wm.IsAcknowledged(queue, tag),
 		"the acknowledgement state lives in the roaring64 bitmap, so dropping the record must not drop it")
-	qw.offsetIndexMutex.RLock()
-	_, indexed = qw.offsetIndex[key]
-	copies := len(qw.recordCopies[key])
-	qw.offsetIndexMutex.RUnlock()
+	_, indexed = walIndexEntry(qw, key)
+	copies := len(walIndexCopies(qw, key))
 	require.False(t, indexed, "an acknowledged record must not stay in the newest-copy index")
 	require.Zero(t, copies, "an acknowledged record must not stay in the physical-copy index")
 }
@@ -231,10 +236,8 @@ func TestWALIndexBound_AcknowledgedTagIsNotResurrectedByAnOlderCopy(t *testing.T
 
 	qw := wm.sharedWAL
 	key := recordKey{queueName: queue, deliveryTag: tag}
-	qw.offsetIndexMutex.RLock()
-	winner := qw.offsetIndex[key]
-	copies := len(qw.recordCopies[key])
-	qw.offsetIndexMutex.RUnlock()
+	winner, _ := walIndexEntry(qw, key)
+	copies := len(walIndexCopies(qw, key))
 	require.NotNil(t, winner, "PREMISE BROKEN: the tag was never indexed")
 	require.Equal(t, 2, copies, "PREMISE BROKEN: the fixture must hold two physical copies of the tag")
 	require.NotEqual(t, oldPath, newPath, "PREMISE BROKEN: both copies landed in the same file")
@@ -242,9 +245,7 @@ func TestWALIndexBound_AcknowledgedTagIsNotResurrectedByAnOlderCopy(t *testing.T
 	// THE ACTION.
 	wm.Acknowledge(queue, tag)
 
-	qw.offsetIndexMutex.RLock()
-	_, indexed := qw.offsetIndex[key]
-	qw.offsetIndexMutex.RUnlock()
+	_, indexed := walIndexEntry(qw, key)
 	require.False(t, indexed,
 		"an acknowledged tag must have NO index entry: re-pointing it at the older physical copy "+
 			"would re-deliver a message the client already acknowledged")
@@ -349,14 +350,17 @@ func TestWALIndexBound_CompactionKeepsExactlyTheUnacknowledgedRecords(t *testing
 	}
 
 	qw := wm.sharedWAL
-	// THE EAGER SETTLING IS THE PRECONDITION of the rewrite: the sealed
-	// file's inventory holds ONLY the records that are not acknowledged, so
-	// the rewrite carries over exactly the live ones and the acknowledged
-	// ones are gone from the file rather than being filtered out of it.
+	// THE INVENTORY IS PER FILE AND BOUNDED BY THE FILE'S SIZE: it keeps
+	// the SETTLED records (the eager settling removes them from the INDEX,
+	// which is what bounds the index), and the compaction filters them out
+	// by their acked flag. So the inventory holds every physical record of
+	// the file, and the rewrite carries over exactly the unacknowledged ones
+	// -- the acknowledged ones are gone from the FILE rather than being
+	// filtered out of it.
 	inv := qw.oldFiles[fileNum].inv
 	require.NotNil(t, inv)
-	require.Len(t, inv.records, len(live),
-		"the sealed inventory must hold only the unacknowledged records")
+	require.Len(t, inv.records, len(live)+len(dead),
+		"the sealed inventory must hold every physical record of the file")
 
 	qw.tryCompactOldFiles()
 

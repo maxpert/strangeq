@@ -128,18 +128,19 @@ func TestLogCompaction_FullLifecycle(t *testing.T) {
 	for _, queue := range queues {
 		for i := 1; i <= acked; i++ {
 			key := recordKey{queueName: queue, deliveryTag: uint64(i)}
-			qw.offsetIndexMutex.RLock()
-			copies := qw.recordCopies[key]
-			_, indexed := qw.offsetIndex[key]
-			qw.offsetIndexMutex.RUnlock()
+			copies := walIndexCopies(qw, key)
+			_, indexed := walIndexEntry(qw, key)
 			require.Empty(t, copies,
 				"an acknowledged record must leave the physical index of queue %s", queue)
 			require.False(t, indexed,
 				"an acknowledged record must leave the newest-copy index of queue %s", queue)
 			// The PER-FILE INVENTORY is the compaction's copy set: a record
-			// that is still in it would be copied into the rewritten file.
+			// that is still in it AND not acknowledged would be copied into
+			// the rewritten file. A SETTLED record stays in the inventory
+			// (the inventory is per file and bounded by the file's size) but
+			// the compaction skips it, so it is not part of the copy set.
 			require.False(t, walInventoryHolds(qw, queue, uint64(i)),
-				"an acknowledged record must leave the file inventory of queue %s", queue)
+				"an acknowledged record must leave the compaction's copy set of queue %s", queue)
 			_, err := ds.wal.Read(queue, uint64(i))
 			require.Error(t, err,
 				"an acknowledged record must not be served any more (queue %s, tag %d)", queue, i)
@@ -184,8 +185,11 @@ func TestLogCompaction_FullLifecycle(t *testing.T) {
 // The per-file inventory is the COMPACTION's copy set: a record that is still
 // in it is a record the compaction would carry over into the rewritten file.
 func walInventoryHolds(qw *QueueWAL, queue string, tag uint64) bool {
-	qw.offsetIndexMutex.RLock()
-	defer qw.offsetIndexMutex.RUnlock()
+	// The CURRENT file's inventory is written by the committer under
+	// fileMutex, and a SEALED file's inventory is immutable, so the read
+	// takes fileMutex (and the old-files lock for the sealed ones).
+	qw.fileMutex.Lock()
+	defer qw.fileMutex.Unlock()
 	invs := make([]*segmentInventory, 0, len(qw.oldFiles)+1)
 	qw.oldFilesMutex.RLock()
 	for _, info := range qw.oldFiles {
@@ -199,7 +203,9 @@ func walInventoryHolds(qw *QueueWAL, queue string, tag uint64) bool {
 	}
 	for _, inv := range invs {
 		for _, r := range inv.records {
-			if r.queueName == queue && r.deliveryTag == tag {
+			// A SETTLED record stays in the inventory, but the compaction
+			// SKIPS it, so it is not part of the copy set.
+			if r.queueName == queue && r.deliveryTag == tag && !r.acked.Load() {
 				return true
 			}
 		}
@@ -358,12 +364,10 @@ func TestLogCompaction_CompactionKeepsLiveRecords(t *testing.T) {
 		_, err := wm.Read("compact", tag)
 		require.Error(t, err, "an acknowledged record must not be served after the compaction")
 	}
-	qw.offsetIndexMutex.RLock()
 	for tag := uint64(1); tag <= 9; tag++ {
-		_, ok := qw.offsetIndex[recordKey{queueName: "compact", deliveryTag: tag}]
+		_, ok := walIndexEntry(qw, recordKey{queueName: "compact", deliveryTag: tag})
 		require.False(t, ok, "an acknowledged record must not stay in the index")
 	}
-	qw.offsetIndexMutex.RUnlock()
 }
 
 // TestLogCompaction_RetentionKeepsUnacked proves that expiry neither
@@ -511,9 +515,7 @@ func TestLogCompaction_LargeOffsetLifecycle(t *testing.T) {
 	for i := uint64(0); i < 5; i++ {
 		_, err := wm.Read("large_queue", baseOffset+i)
 		require.Error(t, err, "an acknowledged large-offset record must not be served")
-		qw.offsetIndexMutex.RLock()
-		_, ok := qw.offsetIndex[recordKey{queueName: "large_queue", deliveryTag: baseOffset + i}]
-		qw.offsetIndexMutex.RUnlock()
+		_, ok := walIndexEntry(qw, recordKey{queueName: "large_queue", deliveryTag: baseOffset + i})
 		require.False(t, ok, "an acknowledged large-offset record must leave the index")
 	}
 	for i := uint64(5); i < 10; i++ {
@@ -611,10 +613,11 @@ func TestLogCompaction_TierFallback(t *testing.T) {
 	require.NoError(t, err)
 
 	// Remove from the WAL offset index to force the segment fallback.
-	ds.wal.sharedWAL.offsetIndexMutex.Lock()
-	delete(ds.wal.sharedWAL.offsetIndex, recordKey{queueName: queue, deliveryTag: 42})
-	delete(ds.wal.sharedWAL.recordCopies, recordKey{queueName: queue, deliveryTag: 42})
-	ds.wal.sharedWAL.offsetIndexMutex.Unlock()
+	shard := ds.wal.sharedWAL.shardForKey(recordKey{queueName: queue, deliveryTag: 42})
+	shard.mu.Lock()
+	delete(shard.offset, recordKey{queueName: queue, deliveryTag: 42})
+	delete(shard.copies, recordKey{queueName: queue, deliveryTag: 42})
+	shard.mu.Unlock()
 
 	// Tier 3: Read from the segments (hot cache + WAL cleared).
 	readMsg, err = ds.GetMessage(queue, 42)

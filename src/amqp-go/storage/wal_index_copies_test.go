@@ -59,9 +59,7 @@ func walCopyPositionsInInventory(inv *segmentInventory, tag uint64) []recordPos 
 
 // walCopyPositions returns the positions of the copy list of one key.
 func walCopyPositions(qw *QueueWAL, key recordKey) []recordPos {
-	qw.offsetIndexMutex.RLock()
-	defer qw.offsetIndexMutex.RUnlock()
-	copies := qw.recordCopies[key]
+	copies := walIndexCopies(qw, key)
 	out := make([]recordPos, 0, len(copies))
 	for _, c := range copies {
 		out = append(out, c.pos)
@@ -142,18 +140,19 @@ func TestWALIndexCopies_CompactionMoveKeepsExactlyThePhysicalCopies(t *testing.T
 
 	// RE-PUBLISHING A POSITION REPLACES the entry: the compaction can
 	// re-publish a position, and that must not duplicate the copy.
-	qw.offsetIndexMutex.Lock()
+	shard := qw.shardForKey(key)
+	shard.mu.Lock()
 	var republished *segmentRecord
-	for _, c := range qw.recordCopies[key] {
+	for _, c := range shard.copies[key] {
 		if c.pos == posA[0] {
 			republished = c
 			break
 		}
 	}
 	if republished != nil {
-		qw.indexRecordLocked(republished)
+		shard.indexRecordLocked(republished)
 	}
-	qw.offsetIndexMutex.Unlock()
+	shard.mu.Unlock()
 	require.NotNil(t, republished, "PREMISE BROKEN: the compacted copy is not in the list")
 	require.Len(t, walCopyPositions(qw, key), 2,
 		"re-publishing a position must REPLACE its copy, not duplicate it")
@@ -161,14 +160,14 @@ func TestWALIndexCopies_CompactionMoveKeepsExactlyThePhysicalCopies(t *testing.T
 	// REMOVING ONE COPY LEAVES THE OTHER. This is the reclaim path's
 	// unindexRecordLocked: a whole file went away, so the remaining copies
 	// are the only ones left.
-	qw.offsetIndexMutex.Lock()
-	qw.unindexRecordLocked(republished)
-	remaining := make([]recordPos, 0, len(qw.recordCopies[key]))
-	for _, c := range qw.recordCopies[key] {
+	shard.mu.Lock()
+	shard.unindexRecordLocked(republished)
+	remaining := make([]recordPos, 0, len(shard.copies[key]))
+	for _, c := range shard.copies[key] {
 		remaining = append(remaining, c.pos)
 	}
-	winner := qw.offsetIndex[key]
-	qw.offsetIndexMutex.Unlock()
+	winner := shard.offset[key]
+	shard.mu.Unlock()
 
 	require.Len(t, remaining, 1, "removing one copy must leave the other")
 	require.Equal(t, posB[0], remaining[0], "the surviving copy must be the one that was not removed")
@@ -177,12 +176,12 @@ func TestWALIndexCopies_CompactionMoveKeepsExactlyThePhysicalCopies(t *testing.T
 		"the newest-copy view must point at the newest REMAINING copy")
 
 	// REMOVING THE LAST COPY empties the list and drops the key.
-	qw.offsetIndexMutex.Lock()
-	for _, c := range qw.recordCopies[key] {
-		qw.unindexRecordLocked(c)
+	shard.mu.Lock()
+	for _, c := range shard.copies[key] {
+		shard.unindexRecordLocked(c)
 	}
-	_, stillThere := qw.recordCopies[key]
-	qw.offsetIndexMutex.Unlock()
+	_, stillThere := shard.copies[key]
+	shard.mu.Unlock()
 	require.False(t, stillThere, "the last copy's removal must drop the key")
 }
 
@@ -232,19 +231,20 @@ func TestWALIndexCopies_AcknowledgedTagIsNeverResurrectedByAnOlderCopy(t *testin
 
 	// THE ACTION: settle the NEWEST copy, the way the compaction's omission
 	// path does. The older copy is still on disk.
-	qw.offsetIndexMutex.Lock()
+	shard := qw.shardForKey(key)
+	shard.mu.Lock()
 	var newest *segmentRecord
-	for _, c := range qw.recordCopies[key] {
+	for _, c := range shard.copies[key] {
 		if newest == nil || recordPositionNewer(c.pos, newest.pos) {
 			newest = c
 		}
 	}
 	require.NotNil(t, newest, "PREMISE BROKEN: the tag was never indexed")
-	qw.unindexSettledRecordLocked(newest)
-	_, inIndex := qw.offsetIndex[key]
-	older := make([]*segmentRecord, 0, len(qw.recordCopies[key]))
-	older = append(older, qw.recordCopies[key]...)
-	qw.offsetIndexMutex.Unlock()
+	shard.unindexSettledRecordLocked(newest)
+	_, inIndex := shard.offset[key]
+	older := make([]*segmentRecord, 0, len(shard.copies[key]))
+	older = append(older, shard.copies[key]...)
+	shard.mu.Unlock()
 
 	require.False(t, inIndex,
 		"a SETTLED copy must never leave the newest-copy view pointing at an older physical copy: "+
@@ -256,10 +256,8 @@ func TestWALIndexCopies_AcknowledgedTagIsNeverResurrectedByAnOlderCopy(t *testin
 	// gone.
 	wm.Acknowledge(queue, tag)
 
-	qw.offsetIndexMutex.RLock()
-	_, inIndex = qw.offsetIndex[key]
-	copies := qw.recordCopies[key]
-	qw.offsetIndexMutex.RUnlock()
+	_, inIndex = walIndexEntry(qw, key)
+	copies := walIndexCopies(qw, key)
 	require.False(t, inIndex, "an acknowledged tag must have no newest-copy entry")
 	require.Empty(t, copies, "an acknowledged tag must have no physical copy left in the copy list")
 	require.True(t, wm.IsAcknowledged(queue, tag),

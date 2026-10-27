@@ -69,12 +69,15 @@ func (wm *WALManager) ReadBatch(queueName string, startOffset uint64) (map[uint6
 
 func (qw *QueueWAL) readMessageBatch(queueName string, startOffset uint64) (map[uint64]*protocol.Message, error) {
 	key := recordKey{queueName: queueName, deliveryTag: startOffset}
+	// THE INDEX IS SHARDED: the entry lives in the shard its delivery tag
+	// belongs to, and the read lock is THAT shard's read lock.
+	sh := qw.shardForKey(key)
 	var messages map[uint64]*protocol.Message
 	for {
-		qw.offsetIndexMutex.RLock()
-		location, ok := qw.offsetIndex[key]
+		sh.mu.RLock()
+		location, ok := sh.offset[key]
 		if !ok {
-			qw.offsetIndexMutex.RUnlock()
+			sh.mu.RUnlock()
 			return nil, fmt.Errorf("offset %d not in WAL index", startOffset)
 		}
 
@@ -87,7 +90,7 @@ func (qw *QueueWAL) readMessageBatch(queueName string, startOffset uint64) (map[
 
 		if location.pos.segmentID == qw.fileNum.Load() {
 			// Active reads never acquire fileMutex while holding the index lock.
-			qw.offsetIndexMutex.RUnlock()
+			sh.mu.RUnlock()
 			qw.fileMutex.Lock()
 			if location.pos.segmentID != qw.fileNum.Load() {
 				qw.fileMutex.Unlock()
@@ -112,7 +115,7 @@ func (qw *QueueWAL) readMessageBatch(queueName string, startOffset uint64) (map[
 			}
 			qw.oldFilesMutex.RUnlock()
 			err := qw.withOldFileHandle(location.pos.segmentID, collect)
-			qw.offsetIndexMutex.RUnlock()
+			sh.mu.RUnlock()
 			if err != nil {
 				return nil, err
 			}

@@ -123,9 +123,7 @@ func newRolledWAL(t *testing.T) *rolledWAL {
 		"PREMISE BROKEN: %d rolled file(s) but none carries a known offset, so there is no record "+
 			"to read back through the old-file path", rolled)
 
-	sw.offsetIndexMutex.RLock()
-	loc, ok := sw.offsetIndex[recordKey{queueName: oldHandleQueue, deliveryTag: offset}]
-	sw.offsetIndexMutex.RUnlock()
+	loc, ok := walIndexEntry(sw, recordKey{queueName: oldHandleQueue, deliveryTag: offset})
 	require.True(t, ok,
 		"PREMISE BROKEN: offset %d has no offsetIndex entry, so the production read path could not "+
 			"reach it either", offset)

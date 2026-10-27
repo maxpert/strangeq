@@ -7,12 +7,22 @@ import (
 )
 
 func newSegmentAckTestRecord(inv *segmentInventory, segmentID uint64, position int64, queueName string, tag uint64, bytes int64) *segmentRecord {
+	return newSegmentAckTestRecordWithBody(inv, segmentID, position, queueName, tag, bytes, -1)
+}
+
+// newSegmentAckTestRecordWithBody builds a record that references a shared
+// body block. The body reference is set BEFORE the record is added to the
+// inventory, exactly as every production path does it: the record captures
+// the block when it is added, because the acknowledgement path may not look
+// the block up in the inventory's map (the inventory is per file and shared
+// by every index shard).
+func newSegmentAckTestRecordWithBody(inv *segmentInventory, segmentID uint64, position int64, queueName string, tag uint64, bytes int64, bodyRef int64) *segmentRecord {
 	r := &segmentRecord{
 		pos:         recordPos{segmentID: segmentID, position: position},
 		queueName:   queueName,
 		deliveryTag: tag,
 		bytes:       bytes,
-		bodyRef:     -1,
+		bodyRef:     bodyRef,
 		committed:   true,
 	}
 	inv.addRecord(r)
@@ -21,23 +31,24 @@ func newSegmentAckTestRecord(inv *segmentInventory, segmentID uint64, position i
 
 func newSegmentAckTestManager(records ...*segmentRecord) (*WALManager, *QueueWAL) {
 	qw := &QueueWAL{
-		ackChan:      make(chan *ackRequest, 8),
-		stopChan:     make(chan struct{}),
-		offsetIndex:  make(map[recordKey]*segmentRecord),
-		recordCopies: make(map[recordKey][]*segmentRecord),
+		ackChan:  make(chan *ackRequest, 8),
+		stopChan: make(chan struct{}),
 	}
+	qw.initIndexShards()
 	for _, r := range records {
-		qw.indexRecordLocked(r)
+		qw.indexRecord(r)
 	}
 	return &WALManager{sharedWAL: qw}, qw
 }
 
 func TestSegmentAckIdempotent(t *testing.T) {
 	inv := newSegmentInventory(0)
-	r := newSegmentAckTestRecord(inv, 1, 10, "orders", 7, 24)
+	// THE BODY BLOCK IS REGISTERED BEFORE THE RECORD THAT REFERENCES IT,
+	// exactly as every production path does it.
 	inv.addBlock(50, 32)
-	r.bodyRef = 50
-	inv.blocks[50].refs.Store(1)
+	r := newSegmentAckTestRecordWithBody(inv, 1, 10, "orders", 7, 24, 50)
+	require.Equal(t, int64(1), inv.blocks[50].refs.Load(),
+		"the record's reference must have seeded the block's reference count")
 	wm, _ := newSegmentAckTestManager(r)
 
 	wm.Acknowledge("orders", 7)
@@ -46,13 +57,18 @@ func TestSegmentAckIdempotent(t *testing.T) {
 	require.True(t, r.acked.Load())
 	require.Zero(t, inv.unacked.Load())
 	require.Equal(t, int64(56), inv.deadBytes.Load(), "a duplicate ACK must not charge record or body bytes twice")
-	// THE EAGER SETTLING: the body block's LAST reference was settled, so
-	// the block left the inventory entirely -- no live record references it
-	// any more, and the compaction only reads the block of a record it is
-	// about to copy (and such a record holds a reference).
-	_, blockPresent := inv.blocks[50]
-	require.False(t, blockPresent,
-		"a body block whose last reference was settled must leave the inventory")
+	// THE ACCOUNTING: the body block's LAST reference was settled, so its
+	// bytes are dead -- that is what deadBytes says (24 record bytes + 32
+	// body bytes).
+	//
+	// THE BLOCK ENTRY STAYS in the inventory. The inventory is per file and
+	// is shared by every index shard, so the acknowledgement path may not
+	// mutate its maps; the block's bytes are already accounted as dead, and
+	// the compaction only reads the block of a record it is ABOUT to copy
+	// (and such a record holds a reference).
+	require.Zero(t, inv.blocks[50].refs.Load(),
+		"a body block whose last reference was settled must hold no reference")
+	require.Equal(t, int64(32), inv.blocks[50].bytes)
 }
 
 func TestSegmentAckSettlesAllDuplicateCopies(t *testing.T) {
@@ -61,7 +77,9 @@ func TestSegmentAckSettlesAllDuplicateCopies(t *testing.T) {
 	oldCopy := newSegmentAckTestRecord(oldInv, 1, 10, "orders", 7, 24)
 	newCopy := newSegmentAckTestRecord(newInv, 2, 20, "orders", 7, 24)
 	wm, qw := newSegmentAckTestManager(oldCopy, newCopy)
-	require.Same(t, newCopy, qw.offsetIndex[recordKey{queueName: "orders", deliveryTag: 7}])
+	indexed, ok := walIndexEntry(qw, recordKey{queueName: "orders", deliveryTag: 7})
+	require.True(t, ok, "the newest copy must be the published winner")
+	require.Same(t, newCopy, indexed)
 
 	wm.Acknowledge("orders", 7)
 
@@ -89,7 +107,7 @@ func TestSegmentAckBeforeIndexCleanupVisible(t *testing.T) {
 	// A settled record now leaves the index SYNCHRONOUSLY, so the index is
 	// bounded by the in-flight set, and the read gate is visible when
 	// Acknowledge returns.
-	_, present := qw.offsetIndex[recordKey{queueName: "orders", deliveryTag: 7}]
+	_, present := walIndexEntry(qw, recordKey{queueName: "orders", deliveryTag: 7})
 	require.False(t, present,
 		"an acknowledged record must leave the physical read index when Acknowledge returns")
 	require.True(t, r.acked.Load(), "the record must be settled")

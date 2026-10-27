@@ -31,6 +31,21 @@ type segmentRecord struct {
 	committed      bool
 	inv            *segmentInventory
 	acked          atomic.Bool
+
+	// bodyBlock is the shared body block this record references, captured
+	// when the record was added to its inventory.
+	//
+	// IT IS A POINTER AND NOT A LOOKUP BECAUSE THE ACKNOWLEDGEMENT PATH
+	// MUST NOT TOUCH THE INVENTORY. An inventory is PER FILE and is shared
+	// by every index shard: a file's records carry tags of many different
+	// shards, so an acknowledgement that looked the block up in the
+	// inventory's map under its own shard lock would race the committer's
+	// map write (a data race, and a map corruption at the same time).
+	//
+	// Capturing the block once, while the inventory's maps are still
+	// private to their builder, leaves the acknowledgement path touching
+	// only ATOMIC state -- exactly what it is allowed to touch.
+	bodyBlock *segmentBodyBlock
 }
 
 type segmentInventory struct {
@@ -134,13 +149,19 @@ func (inv *segmentInventory) addRecord(r *segmentRecord) {
 		inv.byTag[r.deliveryTag] = append(inv.byTag[r.deliveryTag], r)
 		inv.byTagCount++
 	}
-	if r.committed {
-		inv.unacked.Add(r.bytes)
-		if r.bodyRef >= 0 {
-			if block := inv.blocks[r.bodyRef]; block != nil {
+	if r.bodyRef >= 0 {
+		if block := inv.blocks[r.bodyRef]; block != nil {
+			// The block is captured HERE, while the inventory's maps are
+			// still private to their builder, so the acknowledgement path
+			// never has to look the map up (see segmentRecord.bodyBlock).
+			r.bodyBlock = block
+			if r.committed {
 				block.refs.Add(1)
 			}
 		}
+	}
+	if r.committed {
+		inv.unacked.Add(r.bytes)
 	}
 }
 
@@ -260,8 +281,12 @@ func (inv *segmentInventory) addBlock(position, bytes int64) {
 // THE ACCOUNTING IS EXACTLY WHAT IT WAS. The copy's bytes become dead bytes,
 // the inventory's unacknowledged total drops by them, and a shared body whose
 // final reference was acknowledged has its bytes counted as dead too. What
-// the eager settling adds is only WHAT HAPPENS TO THE MAPS afterwards (see
-// settleRecordLocked).
+// the eager settling adds is only WHAT HAPPENS TO THE INDEX afterwards (see
+// walIndexShard.settleRecordLocked).
+//
+// IT TOUCHES NO MAP OF THE INVENTORY. The inventory is per file and shared by
+// every shard, so the acknowledgement path may only read ATOMIC state from
+// it.
 func (r *segmentRecord) markAckDetailed() (settled bool, blockFreed bool) {
 	if r == nil || !r.acked.CompareAndSwap(false, true) {
 		return false, false
@@ -272,11 +297,13 @@ func (r *segmentRecord) markAckDetailed() (settled bool, blockFreed bool) {
 	}
 	inv.deadBytes.Add(r.bytes)
 	inv.unacked.Add(-r.bytes)
-	if r.bodyRef >= 0 {
-		if block := inv.blocks[r.bodyRef]; block != nil && block.refs.Add(-1) == 0 {
-			inv.deadBytes.Add(block.bytes)
-			blockFreed = true
-		}
+	// THE BLOCK IS THE ONE CAPTURED AT PUBLICATION TIME (see
+	// segmentRecord.bodyBlock), NOT A LOOKUP IN THE INVENTORY: the
+	// acknowledgement path must not touch the inventory's maps, which are
+	// shared by every shard.
+	if block := r.bodyBlock; block != nil && block.refs.Add(-1) == 0 {
+		inv.deadBytes.Add(block.bytes)
+		blockFreed = true
 	}
 	return true, blockFreed
 }
@@ -293,133 +320,30 @@ func recordPositionNewer(a, b recordPos) bool {
 	return a.segmentID > b.segmentID || (a.segmentID == b.segmentID && a.position > b.position)
 }
 
-// indexRecordLocked maintains both the newest-copy lookup and the complete
-// physical-copy inventory. Caller holds offsetIndexMutex.Lock.
+// THE INDEX MAINTENANCE ITSELF LIVES IN wal_index_shards.go, next to the
+// shard it operates on: the newest-copy map, the complete-copy map and their
+// lock are PER SHARD now, so "the index" is no longer one pair of maps behind
+// one lock but 64 pairs behind 64 locks.
 //
-// THE COPY LIST IS A SLICE, NOT A MAP.
-//
-// The copy list used to be map[recordKey]map[recordPos]*segmentRecord: a Go
-// MAP PER PUBLISHED MESSAGE. The common case is exactly ONE physical copy per
-// (queue, tag), so every message allocated a whole map header plus a bucket
-// array (~256 bytes and two allocations) to hold a single pointer, and threw
-// it away when the message was acknowledged. That was a large share of the
-// allocation churn the GC was busy with on the hot publish path.
-//
-// It is now map[recordKey][]*segmentRecord -- a slice of the physical copies
-// -- the same shape the legacy segment tier already uses
-// (segmentInventory.byTag map[uint64][]*segmentRecord). One allocation for
-// the one-element slice instead of two for a map.
-//
-// THE SEMANTICS ARE UNCHANGED:
-//
-//   - the list holds EVERY physical copy of the key;
-//   - a POSITION is published at most once: re-publishing a position (the
-//     compaction can move a copy onto a position the key already holds)
-//     REPLACES that entry instead of duplicating it -- which is what the old
-//     map's `copies[r.pos] = r` did;
-//   - the newest-copy view still points at the newest copy.
-func (qw *QueueWAL) indexRecordLocked(r *segmentRecord) {
-	if r == nil {
-		return
-	}
-	key := recordKey{queueName: r.queueName, deliveryTag: r.deliveryTag}
-	if qw.recordCopies == nil {
-		qw.recordCopies = make(map[recordKey][]*segmentRecord)
-	}
-	copies := qw.recordCopies[key]
-	replaced := false
-	for i := range copies {
-		if copies[i].pos == r.pos {
-			copies[i] = r
-			replaced = true
-			break
-		}
-	}
-	if !replaced {
-		copies = append(copies, r)
-	}
-	qw.recordCopies[key] = copies
-	if qw.offsetIndex == nil {
-		qw.offsetIndex = make(map[recordKey]*segmentRecord)
-	}
-	if current := qw.offsetIndex[key]; current == nil || recordPositionNewer(r.pos, current.pos) {
-		qw.offsetIndex[key] = r
-	}
-}
-
-// removeRecordCopyLocked removes the copy at the given position from a copy
-// list and returns the shortened list.
-//
-// The list is the key's OWN backing array, so the removal is in place: the
-// survivors above the removed entry move down into it, and the returned slice
-// is the same array with a shorter length. A position that is not in the
-// list leaves it untouched.
-//
-// IT IS THE EXACT INVERSE of indexRecordLocked's "a position is published at
-// most once" rule, and it is the same in-place removal the legacy segment
-// tier's dropFromByTag already does.
-func removeRecordCopyLocked(copies []*segmentRecord, pos recordPos) []*segmentRecord {
-	for i := range copies {
-		if copies[i].pos == pos {
-			return append(copies[:i], copies[i+1:]...)
-		}
-	}
-	return copies
-}
-
-// unindexRecordLocked removes one physical copy and recomputes the newest view
-// only when that copy was the published winner. Caller holds the write lock.
-func (qw *QueueWAL) unindexRecordLocked(r *segmentRecord) {
-	if r == nil {
-		return
-	}
-	key := recordKey{queueName: r.queueName, deliveryTag: r.deliveryTag}
-	copies := qw.recordCopies[key]
-	if copies != nil {
-		copies = removeRecordCopyLocked(copies, r.pos)
-		if len(copies) == 0 {
-			delete(qw.recordCopies, key)
-		} else {
-			qw.recordCopies[key] = copies
-		}
-	}
-	if qw.offsetIndex[key] != r {
-		return
-	}
-	delete(qw.offsetIndex, key)
-	var newest *segmentRecord
-	for _, candidate := range copies {
-		if newest == nil || recordPositionNewer(candidate.pos, newest.pos) {
-			newest = candidate
-		}
-	}
-	if newest != nil {
-		qw.offsetIndex[key] = newest
-	}
-}
-
-// replaceRecordLocked swaps a compacted physical copy under the same lock
-// protocol as index creation and removal.
-func (qw *QueueWAL) replaceRecordLocked(old, new *segmentRecord) {
-	qw.unindexRecordLocked(old)
-	qw.indexRecordLocked(new)
-}
+// THE SHARD IS CHOSEN BY THE DELIVERY TAG ALONE, so every physical copy of
+// one (queue, tag) lands in the SAME shard and a copy list never spans two
+// shards.
 
 // ---------------------------------------------------------------------------
 // THE EAGER SETTLING.
 //
-// The WAL index (qw.offsetIndex + qw.recordCopies) used to hold a record for
-// EVERY MESSAGE EVER PUBLISHED: a record left the index only when its whole
-// WAL FILE was reclaimed, and the reclaim sweep runs on the cleanup tick
-// (default: five minutes) while a 64 MiB WAL file at F4 rolls about 28 times
-// per SECOND. So the maps grew without bound -- 861,000 live records
-// (~260 MB) after a 30 s window, all of them ALREADY ACKNOWLEDGED -- and Go's
-// GC (which targets twice the live heap) turned that into ~520 MB of extra
-// RSS. It was also a publish-path cost: every publish inserted into two
-// ever-growing maps under the index lock.
+// The WAL index used to hold a record for EVERY MESSAGE EVER PUBLISHED: a
+// record left the index only when its whole WAL FILE was reclaimed, and the
+// reclaim sweep ran every five minutes while a 64 MiB WAL file at F4 rolls
+// about 28 times per SECOND. So the maps grew without bound -- 861,000 live
+// records (~260 MB) after a 30 s window, all of them ALREADY ACKNOWLEDGED --
+// and Go's GC (which targets twice the live heap) turned that into ~520 MB of
+// extra RSS.
 //
 // The fix is to DROP A SETTLED RECORD EAGERLY, so the index holds the records
 // that are NOT YET ACKNOWLEDGED and is therefore bounded by the in-flight set.
+// The removal itself is the shard's unindexSettledRecordLocked, in
+// wal_index_shards.go.
 //
 // WHAT DOES NOT CHANGE:
 //
@@ -431,82 +355,18 @@ func (qw *QueueWAL) replaceRecordLocked(old, new *segmentRecord) {
 //     sent only after the record's fdatasync.
 // ---------------------------------------------------------------------------
 
-// unindexSettledRecordLocked removes one SETTLED physical copy from the
-// global index. Caller holds the write lock.
-//
-// IT NEVER RE-POINTS THE KEY AT AN OLDER COPY.
-//
-// unindexRecordLocked does re-point it, and that is CORRECT there: a whole
-// FILE went away, so the remaining copies are the only ones left and the
-// newest of them is the right answer. It is WRONG here: the copy was
-// SETTLED, so the client acknowledged the tag, and re-pointing the key at an
-// older physical copy of the same tag would REVIVE a message the client
-// already acknowledged -- the delivery path would hand it back.
-//
-// The older copy may stay in recordCopies (so a later acknowledgement of the
-// same tag still settles it), but it must never become the offsetIndex
-// winner.
-func (qw *QueueWAL) unindexSettledRecordLocked(r *segmentRecord) {
-	if r == nil {
-		return
-	}
-	key := recordKey{queueName: r.queueName, deliveryTag: r.deliveryTag}
-	copies := qw.recordCopies[key]
-	if copies != nil {
-		copies = removeRecordCopyLocked(copies, r.pos)
-		if len(copies) == 0 {
-			delete(qw.recordCopies, key)
-		} else {
-			qw.recordCopies[key] = copies
-		}
-	}
-	if qw.offsetIndex[key] == r {
-		delete(qw.offsetIndex, key)
-	}
-}
-
-// settleRecordLocked settles one physical copy and removes it from the
-// inventory and from the global index. Caller holds offsetIndexMutex.Lock().
-//
-// It reports whether THIS call settled the copy (i.e. whether it won the
-// compare-and-swap). Only the winner removes anything, so acknowledging the
-// same copy twice is a no-op the second time.
-//
-// THE INVENTORY IS THE AUTHORITATIVE MAP of the physical copies a file
-// holds, so the settled copy LEAVES it. The accounting does NOT: inv.unacked
-// and inv.deadBytes keep the bytes, because those two are what the reclaim
-// predicate (unacked == 0) and the compaction ratio (deadBytes / durableBytes)
-// are computed from.
-//
-// A body block whose LAST reference was settled is dropped from the inventory
-// too. It is safe: a block with no live reference has no reader, and the
-// compaction only reads the block of a record it is ABOUT TO COPY, and such a
-// record holds a reference (refs >= 1), so its block is still there.
-func (qw *QueueWAL) settleRecordLocked(r *segmentRecord) bool {
-	if r == nil {
-		return false
-	}
-	settled, blockFreed := r.markAckDetailed()
-	if !settled {
-		return false
-	}
-	if inv := r.inv; inv != nil {
-		delete(inv.records, r.pos.position)
-		if blockFreed && r.bodyRef >= 0 {
-			delete(inv.blocks, r.bodyRef)
-		}
-	}
-	qw.unindexSettledRecordLocked(r)
-	return true
-}
-
 // settleInventoryRecordLocked removes an ALREADY SETTLED record from its
-// inventory, without touching the global index. It is the settlement half of
-// settleRecordLocked, for the caller that has already settled the record and
-// only needs the inventory cleaned up (the compaction's ack transfer).
+// inventory. It is the compaction's own use: the copy it carried over was
+// acknowledged while the rewrite was being written, so the copy is NOT in the
+// rewritten file and must not be in the rewritten file's inventory either.
 //
-// The global index is left alone because the record was never published to it:
-// the eager settling already removed the copy it replaced.
+// IT TOUCHES ONLY THE INVENTORY, never the index: the record was never
+// published to the index (the eager settling already removed the copy it
+// replaced), so there is nothing to unindex.
+//
+// The inventory it mutates is the compaction's OWN new inventory, which is
+// not published to anybody until the rename has been installed, so no other
+// goroutine can be looking at it.
 func settleInventoryRecordLocked(r *segmentRecord, blockFreed bool) {
 	if r == nil {
 		return

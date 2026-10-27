@@ -74,12 +74,17 @@ func (in *walIncarnation) writeBody(queue string, offset uint64, body string) {
 // indexedFileNum reports which file the offset index currently attributes a tag
 // to, if any.
 func indexedFileNum(qw *QueueWAL, tag uint64) (uint64, bool) {
-	qw.offsetIndexMutex.RLock()
-	defer qw.offsetIndexMutex.RUnlock()
-	for key, loc := range qw.offsetIndex {
-		if key.deliveryTag == tag {
-			return loc.pos.segmentID, true
+	// THE INDEX IS SHARDED: the whole index is walked, one shard at a time.
+	for i := range qw.indexShards {
+		sh := &qw.indexShards[i]
+		sh.mu.RLock()
+		for key, loc := range sh.offset {
+			if key.deliveryTag == tag {
+				sh.mu.RUnlock()
+				return loc.pos.segmentID, true
+			}
 		}
+		sh.mu.RUnlock()
 	}
 	return 0, false
 }
@@ -376,14 +381,17 @@ func TestCrossFileIndexEviction_CostIsAWrongPayloadNotASlowRead(t *testing.T) {
 	// Evict the index entry, which is exactly what an ack or a cross-file
 	// checkpoint does. Done directly so the test measures the READ, not the
 	// route that caused the miss.
-	qw.offsetIndexMutex.Lock()
-	for key := range qw.offsetIndex {
-		if key.deliveryTag == tag {
-			delete(qw.offsetIndex, key)
-			delete(qw.recordCopies, key)
+	for i := range qw.indexShards {
+		sh := &qw.indexShards[i]
+		sh.mu.Lock()
+		for key := range sh.offset {
+			if key.deliveryTag == tag {
+				delete(sh.offset, key)
+				delete(sh.copies, key)
+			}
 		}
+		sh.mu.Unlock()
 	}
-	qw.offsetIndexMutex.Unlock()
 
 	msg, err := qw.readMessage(ambiguousQueue, tag)
 	require.Error(t, err, "an index miss is an error; the ambiguous sequential fallback was removed")

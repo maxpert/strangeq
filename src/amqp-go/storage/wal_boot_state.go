@@ -582,7 +582,7 @@ func (qw *QueueWAL) rebuildBootState() error {
 		offsets := roaring64.New()
 		for _, rec := range inv.records {
 			offsets.Add(rec.deliveryTag)
-			qw.indexRecordLocked(rec)
+			qw.indexRecord(rec)
 		}
 		info.offsets = offsets
 		qw.oldFiles[f.num] = info

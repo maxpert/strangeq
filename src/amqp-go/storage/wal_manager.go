@@ -365,19 +365,33 @@ type QueueWAL struct {
 	oldFileCache      map[uint64]*os.File
 	oldFileCacheMutex sync.RWMutex
 
-	// Physical record index. offsetIndex publishes the newest copy for a
-	// logical queue/tag; recordCopies retains every physical position.
+	// Physical record index, SHARDED.
 	//
-	// recordCopies is a SLICE of the physical copies, not a map of them: it
+	// Each shard holds the newest copy of a key (shard.offset) and EVERY
+	// physical copy of it (shard.copies), behind its OWN lock. The shard is
+	// chosen by the DELIVERY TAG ALONE, so every physical copy of one
+	// (queue, tag) lands in the SAME shard and a copy list never spans two
+	// shards.
+	//
+	// The copy list is a SLICE of the physical copies, not a map of them: it
 	// used to be map[recordKey]map[recordPos]*segmentRecord, a Go MAP PER
 	// PUBLISHED MESSAGE, which allocated a map header plus a bucket array
 	// (~256 bytes and two allocations) for the ONE copy the common case has
 	// and threw it away at the acknowledgement. The slice is the shape the
 	// legacy segment tier already uses (segmentInventory.byTag), and it costs
 	// ONE allocation for the copy list.
-	offsetIndex      map[recordKey]*segmentRecord
-	recordCopies     map[recordKey][]*segmentRecord
-	offsetIndexMutex sync.RWMutex
+	//
+	// THE INDEX IS SHARDED BECAUSE THE ACKNOWLEDGEMENT PATH MUTATES IT: a
+	// settled record leaves it eagerly, so the index stays bounded by the
+	// in-flight set (the memory fix), and that needs the WRITE lock. ONE
+	// global exclusive lock saturated at ~100,000 acknowledgements per
+	// second -- the F2 mutex profile attributed 96% of the contention to
+	// WALManager.Acknowledge -> RWMutex.Unlock, and the committer queued
+	// behind the acknowledgers for the same lock, stretching the group-commit
+	// cycle from 5.9 ms to 9.9 ms.
+	//
+	// See wal_index_shards.go for the lock order.
+	indexShards [walIndexShardCount]walIndexShard
 
 	// Metrics collector
 	metrics WALMetrics
@@ -1247,7 +1261,6 @@ func (qw *QueueWAL) writeTxAtomic(records []*RecoveryMessage) error {
 		qw.currentInv = inv
 	}
 	inv.durableBytes.Add(int64(n))
-	qw.offsetIndexMutex.Lock()
 	// ONE ALLOCATION FOR THE WHOLE TRANSACTION, for the same reason as the
 	// group-commit batch: the records outlive the call (the index holds them
 	// until the message is acknowledged), so they are allocated together.
@@ -1261,9 +1274,14 @@ func (qw *QueueWAL) writeTxAtomic(records []*RecoveryMessage) error {
 		r.bodyRef = -1
 		r.committed = true
 		inv.addRecord(r)
-		qw.indexRecordLocked(r)
+		// The index is SHARDED: this publishes the record into the shard
+		// its delivery tag belongs to, taking that shard's write lock for
+		// the duration of the insert. The committer holds fileMutex (so
+		// the commits are serialized with each other) and it takes ONE
+		// shard at a time, so it never holds two shards at once and can
+		// never deadlock against a path that takes every shard.
+		qw.indexRecord(r)
 	}
-	qw.offsetIndexMutex.Unlock()
 
 	qw.currentFileOffsetsMutex.Lock()
 	for _, rec := range records {
@@ -1302,28 +1320,34 @@ func (wm *WALManager) Acknowledge(queueName string, offset uint64) {
 	bitmap.Add(offset)
 	sw.bitmapMutex.Unlock()
 
-	// THE WRITE LOCK, NOT THE READ LOCK.
+	// THE SHARD'S WRITE LOCK, NOT THE READ LOCK.
 	//
 	// Settling a record now REMOVES it from the physical index, so this path
-	// MUTATES qw.offsetIndex and qw.recordCopies. That is the whole point of
-	// the change: the index holds the records that are NOT YET ACKNOWLEDGED,
-	// so it is bounded by the in-flight set instead of by the number of
-	// messages ever published.
+	// MUTATES the index. That is the whole point of the change: the index
+	// holds the records that are NOT YET ACKNOWLEDGED, so it is bounded by
+	// the in-flight set instead of by the number of messages ever published.
 	//
-	// The copies are snapshotted before they are settled, because settling a
-	// copy DELETES it from the map being iterated.
+	// IT IS THE SHARD'S LOCK AND NOT A GLOBAL ONE. This path runs about
+	// 100,000 times per second at F2, and ONE global exclusive lock
+	// saturated it: the mutex profile attributed 96% of the contention to
+	// WALManager.Acknowledge -> RWMutex.Unlock, and the committer queued
+	// behind the acknowledgers for the same lock. The shard is chosen by the
+	// DELIVERY TAG ALONE, so the exclusive section of this path is shared
+	// with nothing but the acknowledgements of the tags in the same shard.
+	//
+	// The copies are walked BACKWARDS: settling a copy removes it from the
+	// key's copy list IN PLACE, and removing the LAST element first leaves
+	// the elements before it untouched, so the walk never reads a slot that
+	// has already been shifted.
 	key := recordKey{queueName: queueName, deliveryTag: offset}
-	sw.offsetIndexMutex.Lock()
-	if copies := sw.recordCopies[key]; len(copies) > 0 {
-		snapshot := make([]*segmentRecord, 0, len(copies))
-		for _, r := range copies {
-			snapshot = append(snapshot, r)
-		}
-		for _, r := range snapshot {
-			sw.settleRecordLocked(r)
+	sh := sw.shardForKey(key)
+	sh.mu.Lock()
+	if copies := sh.copies[key]; len(copies) > 0 {
+		for i := len(copies) - 1; i >= 0; i-- {
+			sh.settleRecordLocked(copies[i])
 		}
 	}
-	sw.offsetIndexMutex.Unlock()
+	sh.mu.Unlock()
 }
 
 // PurgeQueue acknowledges every physical copy of each WAL record in the
@@ -1341,31 +1365,42 @@ func (wm *WALManager) PurgeQueue(queueName string, minTag, maxTag uint64) []uint
 	}
 
 	// THE WRITE LOCK, NOT THE READ LOCK: settling a record removes it from
-	// the physical index (see Acknowledge). The copies of the key being
-	// iterated are the ones being settled, so they are snapshotted before
-	// they are settled.
+	// the physical index (see Acknowledge).
+	//
+	// THE SHARDS ARE WALKED ONE AT A TIME, each under its OWN write lock. The
+	// purge is a cold path, but it must not hold two shards at once: a path
+	// that takes every shard (the reclaim sweep, the compaction's install)
+	// takes them in ascending order, and a path that takes one shard at a
+	// time must not be able to deadlock against it.
+	//
+	// The copies of the key being iterated are the ones being settled, and
+	// settling one shifts the key's copy list IN PLACE, so they are
+	// snapshotted before they are settled.
 	var newlyAcked, gated []uint64
-	sw.offsetIndexMutex.Lock()
-	for key, copies := range sw.recordCopies {
-		if key.queueName != queueName || key.deliveryTag < minTag || key.deliveryTag > maxTag {
-			continue
-		}
-		gated = append(gated, key.deliveryTag)
-		won := false
-		snapshot := make([]*segmentRecord, 0, len(copies))
-		for _, record := range copies {
-			snapshot = append(snapshot, record)
-		}
-		for _, record := range snapshot {
-			if sw.settleRecordLocked(record) {
-				won = true
+	for i := range sw.indexShards {
+		sh := &sw.indexShards[i]
+		sh.mu.Lock()
+		for key, copies := range sh.copies {
+			if key.queueName != queueName || key.deliveryTag < minTag || key.deliveryTag > maxTag {
+				continue
+			}
+			gated = append(gated, key.deliveryTag)
+			won := false
+			snapshot := make([]*segmentRecord, 0, len(copies))
+			for _, record := range copies {
+				snapshot = append(snapshot, record)
+			}
+			for _, record := range snapshot {
+				if sh.settleRecordLocked(record) {
+					won = true
+				}
+			}
+			if won {
+				newlyAcked = append(newlyAcked, key.deliveryTag)
 			}
 		}
-		if won {
-			newlyAcked = append(newlyAcked, key.deliveryTag)
-		}
+		sh.mu.Unlock()
 	}
-	sw.offsetIndexMutex.Unlock()
 
 	// bitmapMutex is leaf-only: update the volatile read gate after releasing
 	// the physical-index lock, matching the lock contract of Acknowledge.
@@ -1549,7 +1584,6 @@ func (wm *WALManager) RecoverFromWAL() ([]*RecoveryMessage, error) {
 
 	recoveredMessages := make([]*RecoveryMessage, 0, len(winners))
 	qw := wm.sharedWAL
-	qw.offsetIndexMutex.RLock()
 
 	// THE TWO READERS OF THE SAME BYTES MUST AGREE.
 	//
@@ -1582,9 +1616,18 @@ func (wm *WALManager) RecoverFromWAL() ([]*RecoveryMessage, error) {
 	// lock is released, because the acknowledgement state lives in the
 	// queue-scoped volatile bitmap and bitmapMutex is a leaf: it is never
 	// held while the index lock is taken.
+	//
+	// THE INDEX IS SHARDED, so a key's entry lives in the shard its delivery
+	// tag belongs to. The scan takes THAT shard's read lock, ONE SHARD AT A
+	// TIME, and releases it before moving to the next key: the scan never
+	// holds two shards at once, so it can never deadlock against a path that
+	// takes every shard.
 	var unknown []*RecoveryMessage
 	for key, msg := range winners {
-		winner := qw.offsetIndex[key]
+		sh := qw.shardForKey(key)
+		sh.mu.RLock()
+		winner := sh.offset[key]
+		sh.mu.RUnlock()
 		if winner != nil && winner.pos != msg.pos {
 			// The index knows a DIFFERENT copy of this key, so the scanned copy
 			// is not the newest one: never revive it as a fallback. The
@@ -1621,28 +1664,32 @@ func (wm *WALManager) RecoverFromWAL() ([]*RecoveryMessage, error) {
 	// produced. The index is built from the SAME files this scan reads, so a
 	// key the index holds and that neither the scan's winners nor the scan's
 	// unloadable set mention is a record one of the two readers dropped.
-	for key, winner := range qw.offsetIndex {
-		if quarantined[winner.pos.segmentID] {
-			// That file's own fatal fault already accounts for its records.
-			continue
+	for i := range qw.indexShards {
+		sh := &qw.indexShards[i]
+		sh.mu.RLock()
+		for key, winner := range sh.offset {
+			if quarantined[winner.pos.segmentID] {
+				// That file's own fatal fault already accounts for its records.
+				continue
+			}
+			if _, ok := scannedPos[key]; ok {
+				// The scan produced a copy of this key; any disagreement about
+				// WHICH copy was reported above.
+				continue
+			}
+			if identified[key] {
+				// The scan found this record and REPORTED it as unloadable (its
+				// own fault covers it).
+				continue
+			}
+			fileNum := winner.pos.segmentID
+			missingCount[fileNum]++
+			if _, ok := missingExample[fileNum]; !ok {
+				missingExample[fileNum] = fmt.Sprintf("%s/%d", key.queueName, key.deliveryTag)
+			}
 		}
-		if _, ok := scannedPos[key]; ok {
-			// The scan produced a copy of this key; any disagreement about
-			// WHICH copy was reported above.
-			continue
-		}
-		if identified[key] {
-			// The scan found this record and REPORTED it as unloadable (its
-			// own fault covers it).
-			continue
-		}
-		fileNum := winner.pos.segmentID
-		missingCount[fileNum]++
-		if _, ok := missingExample[fileNum]; !ok {
-			missingExample[fileNum] = fmt.Sprintf("%s/%d", key.queueName, key.deliveryTag)
-		}
+		sh.mu.RUnlock()
 	}
-	qw.offsetIndexMutex.RUnlock()
 
 	// The acknowledgement gate for the records the index does not know. An
 	// acknowledged tag is NOT served again: the eager settling removed its
@@ -2205,8 +2252,6 @@ func (wm *WALManager) createSharedWAL() (*QueueWAL, error) {
 		currentFileOffsets: roaring64.New(),
 		oldFiles:           make(map[uint64]*walFileInfo),
 		oldFileCache:       make(map[uint64]*os.File),
-		offsetIndex:        make(map[recordKey]*segmentRecord),
-		recordCopies:       make(map[recordKey][]*segmentRecord),
 		stopChan:           make(chan struct{}),
 		// WS-F phase 1: the pipelined group-commit hand-off. commitCh is
 		// unbuffered by design (see the QueueWAL field comment); free's
@@ -2215,9 +2260,12 @@ func (wm *WALManager) createSharedWAL() (*QueueWAL, error) {
 		free:     make(chan *stagedBatch, walPipelineBatchCount),
 	}
 
+	// The physical index is SHARDED: every shard gets its own maps.
+	wal.initIndexShards()
+
 	// Rebuild everything the write path would otherwise be the only producer of:
 	// fileNum, oldFiles (with each pre-existing file's COMPLETE offset
-	// inventory) and offsetIndex. See
+	// inventory) and the index. See
 	// wal_boot_state.go for why this is the root cause of both C-1 and C-2.
 	// It must run BEFORE openNextFile so the first Add(1) lands past every
 	// pre-existing file instead of reopening one with O_APPEND.
@@ -2596,18 +2644,20 @@ func (qw *QueueWAL) commitBatch(sb *stagedBatch) {
 		qw.currentInv = inv
 	}
 	inv.durableBytes.Add(int64(n))
-	qw.offsetIndexMutex.Lock()
 	// Register the batch's shared BodyBlocks BEFORE the records that reference
 	// them: addRecord looks a block up by position to seed its reference
 	// count, so the block must already be in the inventory when its reference
 	// record is indexed.
 	//
-	// The registration happens UNDER offsetIndexMutex because the readers that
-	// settle a record (Acknowledge/PurgeQueue -> markAck) look blocks up in
-	// the SAME map while holding only the read lock: a write outside the lock
-	// would race that read (concurrent map read and map write). No I/O happens
-	// under the lock - the bytes were written and fsynced above, so durability
-	// is unchanged and there is nothing to roll back.
+	// NO INDEX LOCK IS HELD HERE, AND NONE IS NEEDED. The inventory's maps
+	// are PER FILE: the committer is the only writer of the CURRENT file's
+	// inventory (it holds fileMutex for the whole batch), and the readers
+	// that settle a record (Acknowledge/PurgeQueue -> markAck) touch only
+	// ATOMIC state of it -- they never look a block up in the map. A write
+	// outside a lock would therefore race nothing.
+	//
+	// No I/O happens here - the bytes were written and fsynced above, so
+	// durability is unchanged and there is nothing to roll back.
 	for _, block := range sb.blocks {
 		inv.addBlock(base+block.relPos, block.bytes)
 	}
@@ -2640,7 +2690,12 @@ func (qw *QueueWAL) commitBatch(sb *stagedBatch) {
 		r.bodyRef = -1
 		r.committed = true
 		inv.addRecord(r)
-		qw.indexRecordLocked(r)
+		// ONE SHARD AT A TIME (see the transaction path above): the committer
+		// holds fileMutex (so the commits are serialized with each other) and
+		// it never holds two shards at once, so it can never deadlock against
+		// a path that takes every shard (the reclaim sweep, the compaction's
+		// install).
+		qw.indexRecord(r)
 	}
 	// Fused shared-unit reference records (never the BodyBlock itself). Empty on
 	// the no-unit hot path, so this loop is a zero-cost no-op there.
@@ -2656,10 +2711,10 @@ func (qw *QueueWAL) commitBatch(sb *stagedBatch) {
 			r.bodyRef = base + e.bodyRef
 			r.committed = true
 			inv.addRecord(r)
-			qw.indexRecordLocked(r)
+			// ONE SHARD AT A TIME (see above).
+			qw.indexRecord(r)
 		}
 	}
-	qw.offsetIndexMutex.Unlock()
 
 	// Track offsets written to current file
 	qw.currentFileOffsetsMutex.Lock()
@@ -3871,9 +3926,15 @@ func (qw *QueueWAL) cleanupLoop() {
 // has no unacknowledged records. Retention time never authorizes deletion:
 // unacknowledged data remains until it is acknowledged, regardless of age.
 func (qw *QueueWAL) tryReclaimOldFiles() {
-	// The index lock excludes sealed readers through their ReadAt and prevents a
-	// late acknowledgement from acquiring a copy while its file is reclaimed.
-	qw.offsetIndexMutex.Lock()
+	// EVERY SHARD'S WRITE LOCK, IN ASCENDING ORDER. This is the sharded
+	// equivalent of the old single global index lock: it excludes the sealed
+	// readers through their ReadAt (so no reader is inside a file that is
+	// being unlinked) and prevents a late acknowledgement from acquiring a
+	// copy while its file is reclaimed.
+	//
+	// The lock order is shard -> oldFilesMutex, which is the order the
+	// compaction's install uses as well.
+	qw.lockAllIndexShards()
 	qw.oldFilesMutex.Lock()
 
 	unlinkedAny := false
@@ -3902,8 +3963,8 @@ func (qw *QueueWAL) tryReclaimOldFiles() {
 			continue
 		}
 
-		// Readers of sealed files hold offsetIndexMutex.RLock through ReadAt, so
-		// no cached descriptor is in use here. If unlink fails the registration
+		// Readers of sealed files hold their shard's read lock through ReadAt,
+		// so no cached descriptor is in use here. If unlink fails the registration
 		// and every index entry remain intact; the handle is lazily reopened for
 		// the next read and the next sweep retries the unlink.
 		qw.closeOldFileHandle(fileNum)
@@ -3915,14 +3976,24 @@ func (qw *QueueWAL) tryReclaimOldFiles() {
 		}
 
 		for _, record := range info.inv.records {
-			qw.unindexRecordLocked(record)
+			// EVERY SHARD'S WRITE LOCK IS HELD HERE (see the top of this
+			// function), so the shard's own lock is NOT taken again. The
+			// record's shard is chosen by its delivery tag, exactly like
+			// every other index operation.
+			//
+			// A SETTLED record is still in the inventory (the eager settling
+			// removes it from the INDEX, and the inventory is per file), and
+			// unindexing it is a no-op: a settled record is neither the
+			// published winner nor in the copy list, so it can neither be
+			// deleted nor re-point the key at an older copy.
+			qw.shardForTag(record.deliveryTag).unindexRecordLocked(record)
 		}
 		delete(qw.oldFiles, fileNum)
 		unlinkedAny = true
 	}
 
 	qw.oldFilesMutex.Unlock()
-	qw.offsetIndexMutex.Unlock()
+	qw.unlockAllIndexShards()
 
 	// Make this sweep's directory mutations durable exactly once. The reclaim
 	// is already complete in memory even if this barrier fails; only fully acked
@@ -3937,23 +4008,27 @@ func (qw *QueueWAL) tryReclaimOldFiles() {
 }
 
 // readMessage resolves the newest physical copy. A sealed-file lookup keeps
-// offsetIndexMutex.RLock through every ReadAt so index/layout replacement cannot
-// race it; the active-file arm releases the index before acquiring fileMutex.
+// its SHARD's read lock through every ReadAt so index/layout replacement
+// cannot race it; the active-file arm releases the shard before acquiring
+// fileMutex.
 func (qw *QueueWAL) readMessage(queueName string, offset uint64) (*protocol.Message, error) {
 	if qw.isAcknowledged(queueName, offset) {
 		return nil, fmt.Errorf("message not in WAL")
 	}
 
 	key := recordKey{queueName: queueName, deliveryTag: offset}
+	// The entry lives in the shard its delivery tag belongs to, so the read
+	// lock is THAT shard's read lock -- and only that shard's.
+	sh := qw.shardForKey(key)
 	for {
-		qw.offsetIndexMutex.RLock()
-		location, ok := qw.offsetIndex[key]
+		sh.mu.RLock()
+		location, ok := sh.offset[key]
 		if !ok {
-			qw.offsetIndexMutex.RUnlock()
+			sh.mu.RUnlock()
 			return nil, fmt.Errorf("message not in WAL")
 		}
 		if location.pos.segmentID == qw.fileNum.Load() {
-			qw.offsetIndexMutex.RUnlock()
+			sh.mu.RUnlock()
 			qw.fileMutex.Lock()
 			if location.pos.segmentID != qw.fileNum.Load() {
 				// It rolled between the atomic check and fileMutex. Retry through
@@ -3975,7 +4050,7 @@ func (qw *QueueWAL) readMessage(queueName string, offset uint64) (*protocol.Mess
 			msg, perr = qw.parseMessageAt(file, queueName, location.pos.position, offset)
 			return perr
 		})
-		qw.offsetIndexMutex.RUnlock()
+		sh.mu.RUnlock()
 		if err != nil {
 			return nil, err
 		}

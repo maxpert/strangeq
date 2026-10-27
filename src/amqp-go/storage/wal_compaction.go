@@ -214,21 +214,28 @@ func (qw *QueueWAL) compactOldFile(fileNum uint64) error {
 		}
 	}()
 
-	// THE CANDIDATES ARE A SNAPSHOT, TAKEN UNDER THE INDEX READ LOCK.
+	// THE CANDIDATES ARE A SNAPSHOT OF THE FILE'S INVENTORY.
 	//
-	// The inventory's maps are no longer immutable once published: the eager
-	// settling removes a SETTLED record from `records` (and a body block
-	// whose last reference was settled from `blocks`), under the index WRITE
-	// lock. So they are read under the index READ lock.
+	// NO INDEX LOCK IS HELD HERE, AND NONE IS NEEDED. The inventory belongs
+	// to ONE FILE, and this file is SEALED: the committer only ever writes
+	// the CURRENT file's inventory (it holds fileMutex for the whole batch),
+	// and the acknowledgement path touches only ATOMIC state of an inventory
+	// -- it never looks a record or a body block up in a map (see
+	// segmentRecord.bodyBlock). So the two maps below are stable for the
+	// whole sweep.
 	//
-	// The COPY then runs without the lock: it is whole-file I/O, and holding
-	// the index lock across it would block the publish path for the length
-	// of the rewrite. The acked flag is atomic and may flip while the copy
-	// runs; a flip that lands before the install is transferred below.
+	// THE COPY then runs without any lock: it is whole-file I/O, and holding
+	// a lock across it would block the publish path for the length of the
+	// rewrite. The acked flag is atomic and may flip while the copy runs; a
+	// flip that lands before the install is transferred below.
 	//
-	// WITH THE EAGER SETTLING the acknowledged records are already GONE from
-	// the inventory, so `omitted` is empty and `live` is every record the
-	// file still holds that has not been acknowledged.
+	// A SETTLED record is still IN the inventory: the eager settling removes
+	// it from the INDEX (which is what keeps the index bounded by the
+	// in-flight set), and the inventory -- which is per file and bounded by
+	// the file's size -- keeps it until the file is rewritten. So `omitted`
+	// is NOT empty, and the rewrite filters the settled records out by their
+	// acked flag: the rewritten file carries exactly the records that are
+	// not acknowledged.
 	type candidate struct {
 		old *segmentRecord
 		rec *segmentRecord
@@ -236,7 +243,6 @@ func (qw *QueueWAL) compactOldFile(fileNum uint64) error {
 	var live []*candidate
 	var omitted []*segmentRecord
 	var blocks map[int64]*segmentBodyBlock
-	qw.offsetIndexMutex.RLock()
 	blocks = make(map[int64]*segmentBodyBlock, len(inv.blocks))
 	for pos, block := range inv.blocks {
 		blocks[pos] = block
@@ -251,7 +257,6 @@ func (qw *QueueWAL) compactOldFile(fileNum uint64) error {
 		}
 		live = append(live, &candidate{old: r})
 	}
-	qw.offsetIndexMutex.RUnlock()
 	if len(live) == 0 {
 		return nil
 	}
@@ -390,8 +395,16 @@ func (qw *QueueWAL) compactOldFile(fileNum uint64) error {
 	// deterministic and needs no timing.
 	walCompactionBeforeInstall(fileNum)
 
-	qw.offsetIndexMutex.Lock()
-	defer qw.offsetIndexMutex.Unlock()
+	// EVERY SHARD'S WRITE LOCK, IN ASCENDING ORDER, AND THEN THE OLD-FILES
+	// LOCK. This is the sharded equivalent of the old single global index
+	// lock: the install renames the rewritten file over the original, so
+	// the index must not change while the bytes are being swapped, and no
+	// reader may be inside a ReadAt of the file being replaced.
+	//
+	// THE LOCK ORDER IS shard -> oldFilesMutex, the same order the reclaim
+	// sweep uses, so the two cannot deadlock.
+	qw.lockAllIndexShards()
+	defer qw.unlockAllIndexShards()
 	qw.oldFilesMutex.Lock()
 	defer qw.oldFilesMutex.Unlock()
 
@@ -464,13 +477,16 @@ func (qw *QueueWAL) compactOldFile(fileNum uint64) error {
 			// above and must not be published.
 			continue
 		}
-		qw.replaceRecordLocked(c.old, c.rec)
+		// The old copy and the new copy carry the SAME delivery tag, so
+		// they live in the SAME shard -- and every shard's write lock is
+		// held here, so the shard's own lock is NOT taken again.
+		qw.shardForTag(c.old.deliveryTag).replaceRecordLocked(c.old, c.rec)
 	}
 	for _, r := range omitted {
 		// An omitted record was ACKNOWLEDGED, so its tag must not fall back
 		// to an older physical copy: the settled removal never re-points the
 		// key at one.
-		qw.unindexSettledRecordLocked(r)
+		qw.shardForTag(r.deliveryTag).unindexSettledRecordLocked(r)
 	}
 
 	succeeded = true

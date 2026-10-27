@@ -44,7 +44,9 @@ func TestSegmentInventoryWriteAndRoll(t *testing.T) {
 	require.Equal(t, int64(len(encoded)), r.bytes)
 	require.Equal(t, int64(-1), r.bodyRef)
 	require.True(t, r.committed)
-	require.Same(t, r, qw.offsetIndex[recordKey{queueName: queue, deliveryTag: 11}])
+	indexed, ok := walIndexEntry(qw, recordKey{queueName: queue, deliveryTag: 11})
+	require.True(t, ok, "the record must be indexed")
+	require.Same(t, r, indexed)
 	qw.fileMutex.Lock()
 	require.NoError(t, qw.rollFile())
 	qw.fileMutex.Unlock()
@@ -92,7 +94,7 @@ func TestSegmentInventoryBootCommittedOnly(t *testing.T) {
 	}
 	require.Equal(t, uint64(21), live.deliveryTag)
 	require.Equal(t, live.bytes, inv.unacked.Load())
-	_, ok := reopened.sharedWAL.offsetIndex[recordKey{queueName: queue, deliveryTag: 22}]
+	_, ok := walIndexEntry(reopened.sharedWAL, recordKey{queueName: queue, deliveryTag: 22})
 	require.False(t, ok)
 }
 

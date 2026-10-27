@@ -29,31 +29,20 @@ func coldTailWALConfig() WALConfig {
 func ackAndWait(t testing.TB, wm *WALManager, offsets []uint64) {
 	t.Helper()
 	for _, off := range offsets {
-		wm.sharedWAL.offsetIndexMutex.RLock()
 		queues := make([]string, 0, 1)
-		for key := range wm.sharedWAL.recordCopies {
-			if key.deliveryTag == off {
-				queues = append(queues, key.queueName)
-			}
+		for _, c := range walIndexCopiesForTag(wm.sharedWAL, off) {
+			queues = append(queues, c.queueName)
 		}
-		wm.sharedWAL.offsetIndexMutex.RUnlock()
 		require.NotEmpty(t, queues, "no physical record for tag %d", off)
 		for _, queueName := range queues {
 			wm.Acknowledge(queueName, off)
 		}
 	}
 	for _, off := range offsets {
-		wm.sharedWAL.offsetIndexMutex.RLock()
-		for key, copies := range wm.sharedWAL.recordCopies {
-			if key.deliveryTag != off {
-				continue
-			}
-			require.True(t, wm.IsAcknowledged(key.queueName, off))
-			for _, r := range copies {
-				require.True(t, r.acked.Load())
-			}
+		for _, r := range walIndexCopiesForTag(wm.sharedWAL, off) {
+			require.True(t, wm.IsAcknowledged(r.queueName, off))
+			require.True(t, r.acked.Load())
 		}
-		wm.sharedWAL.offsetIndexMutex.RUnlock()
 	}
 }
 

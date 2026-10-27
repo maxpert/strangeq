@@ -648,9 +648,7 @@ func TestWAL_Checkpoint_OffsetIndexCleanup(t *testing.T) {
 	time.Sleep(100 * time.Millisecond)
 
 	// Check offset index has entries for old file offsets
-	wm.sharedWAL.offsetIndexMutex.RLock()
-	indexSizeBefore := len(wm.sharedWAL.offsetIndex)
-	wm.sharedWAL.offsetIndexMutex.RUnlock()
+	indexSizeBefore, _ := walIndexCounts(wm.sharedWAL)
 	require.Greater(t, indexSizeBefore, 0, "offset index should have entries")
 
 	// Trigger checkpoint
@@ -658,9 +656,7 @@ func TestWAL_Checkpoint_OffsetIndexCleanup(t *testing.T) {
 
 	// After checkpoint, offset index should have fewer entries
 	// (entries for old files removed, current file entries remain)
-	wm.sharedWAL.offsetIndexMutex.RLock()
-	indexSizeAfter := len(wm.sharedWAL.offsetIndex)
-	wm.sharedWAL.offsetIndexMutex.RUnlock()
+	indexSizeAfter, _ := walIndexCounts(wm.sharedWAL)
 
 	assert.Less(t, indexSizeAfter, indexSizeBefore,
 		"offset index should have fewer entries after checkpoint (old file offsets removed)")
@@ -946,10 +942,11 @@ func TestWALReadPath_ExactBody(t *testing.T) {
 		// Remove the offset from the index: the record is durable but no
 		// longer ADDRESSABLE, and the read path must say so rather than
 		// answer with a different record that happens to share the tag.
-		wm.sharedWAL.offsetIndexMutex.Lock()
-		delete(wm.sharedWAL.offsetIndex, recordKey{queueName: "test_queue", deliveryTag: 999})
-		delete(wm.sharedWAL.recordCopies, recordKey{queueName: "test_queue", deliveryTag: 999})
-		wm.sharedWAL.offsetIndexMutex.Unlock()
+		shard := wm.sharedWAL.shardForKey(recordKey{queueName: "test_queue", deliveryTag: 999})
+		shard.mu.Lock()
+		delete(shard.offset, recordKey{queueName: "test_queue", deliveryTag: 999})
+		delete(shard.copies, recordKey{queueName: "test_queue", deliveryTag: 999})
+		shard.mu.Unlock()
 
 		readMsg, err := wm.Read("test_queue", 999)
 		require.Error(t, err)

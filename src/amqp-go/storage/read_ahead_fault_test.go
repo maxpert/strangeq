@@ -154,9 +154,7 @@ func TestReadAhead_DoesNotCacheBeyondDurableEnd(t *testing.T) {
 
 		// Tag 10's bytes are now on disk but NOT fsynced: fileOffset (the
 		// durable frontier) has not advanced past them.
-		sw.offsetIndexMutex.RLock()
-		loc, ok := sw.offsetIndex[recordKey{queueName: "q", deliveryTag: 9}]
-		sw.offsetIndexMutex.RUnlock()
+		loc, ok := walIndexEntry(sw, recordKey{queueName: "q", deliveryTag: 9})
 		require.True(t, ok, "tag 9 must be indexed")
 
 		// The durable-end bound must keep the batch read inside [0, fileOffset).
@@ -169,9 +167,7 @@ func TestReadAhead_DoesNotCacheBeyondDurableEnd(t *testing.T) {
 		// Once the fsync releases and the batch completes, tag 10 IS readable.
 		doRelease()
 		require.Eventually(t, func() bool {
-			sw.offsetIndexMutex.RLock()
-			defer sw.offsetIndexMutex.RUnlock()
-			_, ok := sw.offsetIndex[recordKey{queueName: "q", deliveryTag: inflight}]
+			_, ok := walIndexEntry(sw, recordKey{queueName: "q", deliveryTag: inflight})
 			return ok
 		}, 5*time.Second, 2*time.Millisecond, "the in-flight batch must complete after the hook releases")
 	})
