@@ -157,7 +157,21 @@ func DefaultConfig() *AMQPConfig {
 			UnlimitedPrefetchCap:    2000, // Finite gate cap for prefetch-0 manual-ack consumers
 
 			// Background Maintenance
-			WALCleanupCheckIntervalMS: 5000, // 5 seconds
+			//
+			// The WAL RECLAIM (unlink a file whose records are all
+			// acknowledged) runs every second. Its LATENCY IS A MEMORY BOUND:
+			// a file that is not reclaimed keeps its per-file inventory alive,
+			// and at 64 KiB bodies the WAL rolls ~28 times a second, so a
+			// slow reclaim retains thousands of files' worth of inventory.
+			// The sweep itself is cheap -- it walks the old files and unlinks
+			// the fully acknowledged ones; it does not touch the acknowledged
+			// records themselves.
+			//
+			// MEASURED at 1 KiB bodies with 10 producers and 10 consumers:
+			// a 5-second interval leaves 460 MB resident, a 1-second
+			// interval 340 MB, and the throughput is the same (124,030 vs
+			// 124,526 msg/s).
+			WALCleanupCheckIntervalMS: 1000, // 1 second
 		},
 	}
 }

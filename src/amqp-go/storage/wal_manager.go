@@ -265,7 +265,7 @@ func DefaultWALConfig() WALConfig {
 		BatchTimeout:    DefaultWALBatchTimeout,
 		FileSize:        DefaultWALFileSize,
 		ChannelBuffer:   10000,
-		CleanupInterval: 5 * time.Second,
+		CleanupInterval: time.Second,
 		RetentionPeriod: 0, // disabled by default
 
 		CompactionThreshold: DefaultWALCompactionThreshold,
