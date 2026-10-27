@@ -19,7 +19,7 @@ func coldTailWALConfig() WALConfig {
 	cfg := DefaultWALConfig()
 	cfg.FileSize = 4096
 	cfg.CleanupInterval = time.Hour
-	cfg.CheckpointInterval = time.Hour
+	cfg.CompactionInterval = time.Hour
 	return cfg
 }
 

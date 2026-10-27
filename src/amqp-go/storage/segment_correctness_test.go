@@ -36,8 +36,8 @@ func segTestConfig() SegmentConfig {
 	return SegmentConfig{
 		SegmentSize:         512,
 		CompactionThreshold: 0.5,
-		CompactionInterval:  time.Hour,
 		CheckpointInterval:  time.Hour,
+		CompactionInterval:  time.Hour,
 	}
 }
 

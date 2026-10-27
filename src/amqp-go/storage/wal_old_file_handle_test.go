@@ -65,7 +65,7 @@ func newRolledWAL(t *testing.T) *rolledWAL {
 	// the file out from under an assertion and turning a real red into a
 	// scheduling story.
 	cfg.CleanupInterval = time.Hour
-	cfg.CheckpointInterval = time.Hour
+	cfg.CompactionInterval = time.Hour
 	cfg.RetentionPeriod = 0
 
 	r := &rolledWAL{}

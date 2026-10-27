@@ -185,7 +185,7 @@ func TestWALAckReadDeadlock_ColdReadVersusAckVersusReclaim(t *testing.T) {
 	// Keep performCheckpoint out of it. No segment manager is ever set on this
 	// WALManager, so performCheckpoint and forceCheckpointFile both return
 	// immediately anyway — this makes that explicit rather than incidental.
-	cfg.CheckpointInterval = time.Hour
+	cfg.CompactionInterval = time.Hour
 	cfg.RetentionPeriod = 0 // reclaim via the allAcked path, not by expiry
 
 	// wedged gates the deferred Close below and must be declared before it.

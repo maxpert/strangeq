@@ -73,7 +73,7 @@ func TestWALReadArm_AcknowledgedRecordIsStillServedFromTheCurrentFile(t *testing
 	// Long intervals so neither reclamation nor checkpointing can run during the
 	// measurement and remove the record by a route other than the one under test.
 	cfg.CleanupInterval = time.Hour
-	cfg.CheckpointInterval = time.Hour
+	cfg.CompactionInterval = time.Hour
 
 	wal, err := NewWALManagerWithConfig(dir, cfg)
 	require.NoError(t, err)

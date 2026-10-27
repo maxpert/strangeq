@@ -227,7 +227,7 @@ func TestLogCompaction_ReclaimUnlinksFullyAckedRolledFile(t *testing.T) {
 	dir := t.TempDir()
 	cfg := DefaultWALConfig()
 	cfg.CleanupInterval = time.Hour
-	cfg.CheckpointInterval = time.Hour
+	cfg.CompactionInterval = time.Hour
 
 	wm, err := NewWALManagerWithConfig(dir, cfg)
 	require.NoError(t, err)
@@ -309,7 +309,7 @@ func TestLogCompaction_CompactionKeepsLiveRecords(t *testing.T) {
 	dir := t.TempDir()
 	cfg := DefaultWALConfig()
 	cfg.CleanupInterval = time.Hour
-	cfg.CheckpointInterval = time.Hour
+	cfg.CompactionInterval = time.Hour
 
 	wm, err := NewWALManagerWithConfig(dir, cfg)
 	require.NoError(t, err)
@@ -390,7 +390,7 @@ func TestLogCompaction_RetentionKeepsUnacked(t *testing.T) {
 	walCfg := WALConfigFromEngine(engineCfg)
 	walCfg.RetentionPeriod = time.Nanosecond // already expired: no waiting
 	walCfg.CleanupInterval = time.Hour       // no background sweep
-	walCfg.CheckpointInterval = time.Hour
+	walCfg.CompactionInterval = time.Hour
 
 	wm, err := NewWALManagerWithConfig(tmpDir, walCfg)
 	require.NoError(t, err)
@@ -475,7 +475,7 @@ func TestLogCompaction_LargeOffsetLifecycle(t *testing.T) {
 	cfg := DefaultWALConfig()
 	cfg.FileSize = 1024 // Small files to force rolls
 	cfg.CleanupInterval = time.Hour
-	cfg.CheckpointInterval = time.Hour
+	cfg.CompactionInterval = time.Hour
 
 	wm, err := NewWALManagerWithConfig(tmpDir, cfg)
 	require.NoError(t, err)

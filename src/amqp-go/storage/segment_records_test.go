@@ -15,7 +15,7 @@ func inventoryTestWALConfig() WALConfig {
 	cfg.SyncDisabled = true
 	cfg.FileSize = 1 << 20
 	cfg.CleanupInterval = time.Hour
-	cfg.CheckpointInterval = time.Hour
+	cfg.CompactionInterval = time.Hour
 	return cfg
 }
 

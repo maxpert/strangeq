@@ -53,14 +53,14 @@ func incarnationWALConfig() WALConfig {
 	cfg := DefaultWALConfig()
 	cfg.FileSize = incarnationWALFileSize
 	cfg.CleanupInterval = time.Hour
-	cfg.CheckpointInterval = time.Hour
+	cfg.CompactionInterval = time.Hour
 	return cfg
 }
 
 func incarnationSegmentConfig() SegmentConfig {
 	cfg := DefaultSegmentConfig()
 	cfg.CompactionInterval = time.Hour
-	cfg.CheckpointInterval = time.Hour
+	cfg.CompactionInterval = time.Hour
 	return cfg
 }
 

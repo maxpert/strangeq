@@ -15,7 +15,7 @@ import (
 func segstoreReclaimWALConfig() WALConfig {
 	cfg := DefaultWALConfig()
 	cfg.CleanupInterval = time.Hour
-	cfg.CheckpointInterval = time.Hour
+	cfg.CompactionInterval = time.Hour
 	return cfg
 }
 

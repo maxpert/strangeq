@@ -18,7 +18,7 @@ func TestDurableConfirmUsesGroupFsync(t *testing.T) {
 	cfg.BatchSize = 4
 	cfg.ChannelBuffer = 16
 	cfg.CleanupInterval = time.Hour
-	cfg.CheckpointInterval = time.Hour
+	cfg.CompactionInterval = time.Hour
 	wm, err := NewWALManagerWithConfig(t.TempDir(), cfg)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = wm.Close() })

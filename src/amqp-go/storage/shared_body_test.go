@@ -255,7 +255,7 @@ func TestSharedBody_UnitNotSplitAcrossRoll(t *testing.T) {
 	cfg := DefaultWALConfig()
 	cfg.FileSize = 4096 // tiny: an 8 KB shared body overshoots on its own
 	cfg.CleanupInterval = time.Hour
-	cfg.CheckpointInterval = time.Hour
+	cfg.CompactionInterval = time.Hour
 	wm, err := NewWALManagerWithConfig(tmpDir, cfg)
 	require.NoError(t, err)
 	defer wm.Close()

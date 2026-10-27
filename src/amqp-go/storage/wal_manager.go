@@ -169,11 +169,40 @@ type WALConfig struct {
 	ChannelBuffer   int
 	CleanupInterval time.Duration
 	RetentionPeriod time.Duration // for time-based retention
-	// CheckpointInterval is RETAINED FOR CONFIGURATION COMPATIBILITY ONLY.
-	// Checkpoint copying (WAL -> segments) was removed in segstore v1 (WI8):
-	// nothing copies records out of the WAL any more, so this interval no
-	// longer schedules anything. DELETE IT WITH THE CHECKPOINT-ERA CONFIG.
-	CheckpointInterval time.Duration
+
+	// CompactionInterval is how often the COMPACTION maintenance runs: the
+	// byte-ratio rewrite of a rolled WAL file whose dead bytes exceed half of
+	// its durable bytes.
+	//
+	// IT IS DELIBERATELY SEPARATE FROM CleanupInterval, AND MUCH LONGER. The
+	// two maintenance passes have opposite cost profiles:
+	//
+	//   - The RECLAIM (unlink a WAL file whose records are all acknowledged)
+	//     is cheap and its LATENCY IS A MEMORY BOUND: a file that is not
+	//     reclaimed keeps its per-file inventory alive, and at 64 KiB bodies
+	//     the WAL rolls ~28 times a second, so a five-minute reclaim interval
+	//     retains thousands of files' worth of inventory. It therefore wants
+	//     to run often (CleanupInterval).
+	//
+	//   - The COMPACTION REWRITES A WHOLE FILE. At 64 KiB bodies a rolled
+	//     file is mostly dead within a second, so a compaction pass that runs
+	//     as often as the reclaim rewrites every such file -- tens of
+	//     gigabytes of extra I/O per second -- and that I/O competes with
+	//     the group-commit flush that the publisher's confirm waits for. It
+	//     therefore wants to run rarely.
+	//
+	// Running both on one tick, as they used to be, meant the reclaim was
+	// too rare (memory) or the compaction was too frequent (I/O). They are
+	// now separate.
+	//
+	// IT IS THE FIELD THAT WAS CALLED CheckpointInterval. Checkpoint copying
+	// (WAL -> segments) was removed in segstore v1 (WI8), which left the
+	// interval scheduling nothing; the compaction is the maintenance pass
+	// that replaced it. REUSING the dead field rather than adding one keeps
+	// WALConfig's size unchanged, and the QueueWAL layout invariant (the
+	// bytes between `cfg` and `currentFile` must not change) therefore still
+	// holds.
+	CompactionInterval time.Duration
 
 	// SyncDisabled, when true, skips the group-commit fdatasync in
 	// commitBatch (the async publish durability barrier). Zero value (false)
@@ -223,18 +252,24 @@ type WALConfig struct {
 	SharedBodyMaxPinAge time.Duration
 }
 
+// DefaultWALCompactionInterval is the default cadence of the COMPACTION
+// maintenance pass: 30 minutes. The compaction rewrites a whole WAL file, so
+// it is deliberately rare; the RECLAIM (which is cheap but bounds memory)
+// runs on WALConfig.CleanupInterval instead. See WALConfig.CompactionInterval.
+const DefaultWALCompactionInterval = 30 * time.Minute
+
 // DefaultWALConfig returns a WALConfig with production defaults
 func DefaultWALConfig() WALConfig {
 	return WALConfig{
-		BatchSize:          DefaultWALBatchSize,
-		BatchTimeout:       DefaultWALBatchTimeout,
-		FileSize:           DefaultWALFileSize,
-		ChannelBuffer:      10000,
-		CleanupInterval:    5 * time.Second,
-		RetentionPeriod:    0, // disabled by default
-		CheckpointInterval: 5 * time.Minute,
+		BatchSize:       DefaultWALBatchSize,
+		BatchTimeout:    DefaultWALBatchTimeout,
+		FileSize:        DefaultWALFileSize,
+		ChannelBuffer:   10000,
+		CleanupInterval: 5 * time.Second,
+		RetentionPeriod: 0, // disabled by default
 
 		CompactionThreshold: DefaultWALCompactionThreshold,
+		CompactionInterval:  DefaultWALCompactionInterval,
 	}
 }
 
@@ -3795,21 +3830,36 @@ func walFileDataStart(f *os.File) (dataStart int64, err error) {
 	return int64(WALHeaderSize), nil
 }
 
-// cleanupLoop periodically reclaims old WAL files. Acknowledgement is wholly
-// synchronous and never deletes read-index entries.
+// cleanupLoop runs the two maintenance passes on their own cadences.
+//
+// The RECLAIM unlinks WAL files whose records are all acknowledged; its
+// latency is a memory bound (see WALConfig.CompactionInterval for why the
+// two passes differ). The COMPACTION rewrites a rolled file whose dead bytes
+// exceed half of its durable bytes; it is whole-file I/O and runs far less
+// often.
+//
+// They are separate tickers rather than one, so neither pass's cadence is
+// dictated by the other's cost. They never contend for the same file: the
+// reclaim only touches files with no unacknowledged record, and the
+// compaction skips exactly those.
 func (qw *QueueWAL) cleanupLoop() {
 	defer qw.wg.Done()
 
-	ticker := time.NewTicker(qw.cfg.CleanupInterval)
-	defer ticker.Stop()
+	reclaimTicker := time.NewTicker(qw.cfg.CleanupInterval)
+	defer reclaimTicker.Stop()
+
+	compactionInterval := qw.cfg.CompactionInterval
+	if compactionInterval <= 0 {
+		compactionInterval = DefaultWALCompactionInterval
+	}
+	compactionTicker := time.NewTicker(compactionInterval)
+	defer compactionTicker.Stop()
 
 	for {
 		select {
-		case <-ticker.C:
+		case <-reclaimTicker.C:
 			qw.tryReclaimOldFiles()
-			// Compaction maintenance runs DIRECTLY on the cleanup tick: it is
-			// the same maintenance pass, and a second ticker would only let
-			// the two disagree about which files they are working on.
+		case <-compactionTicker.C:
 			qw.tryCompactOldFiles()
 		case <-qw.stopChan:
 			return

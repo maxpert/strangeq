@@ -159,7 +159,7 @@ func readDurableRecords(t *testing.T, dir, queue string) []durableRecord {
 
 	walCfg := storage.DefaultWALConfig()
 	walCfg.CleanupInterval = time.Hour
-	walCfg.CheckpointInterval = time.Hour
+	walCfg.CompactionInterval = time.Hour
 
 	segCfg := storage.DefaultSegmentConfig()
 	segCfg.CompactionInterval = time.Hour

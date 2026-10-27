@@ -125,6 +125,9 @@ func WALConfigFromEngine(ec interfaces.EngineConfig) WALConfig {
 	if ec.WALCleanupCheckIntervalMS > 0 {
 		cfg.CleanupInterval = time.Duration(ec.WALCleanupCheckIntervalMS) * time.Millisecond
 	}
+	if ec.CompactionIntervalMS > 0 {
+		cfg.CompactionInterval = time.Duration(ec.CompactionIntervalMS) * time.Millisecond
+	}
 	if ec.SharedBodyMaxPinAgeMS > 0 {
 		cfg.SharedBodyMaxPinAge = time.Duration(ec.SharedBodyMaxPinAgeMS) * time.Millisecond
 	}
