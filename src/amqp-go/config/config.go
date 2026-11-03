@@ -111,10 +111,10 @@ func DefaultConfig() *AMQPConfig {
 			DepthHighWMOverride:   0,     // 0 = compute HWM from ring size × spill % (default)
 
 			// Write-Ahead Log (WAL)
-			WALBatchSize:      1000,             // 1,000 messages per batch
-			WALBatchTimeoutMS: 5,                // retained for compatibility; flushing is drain-then-flush, not timer-gated
-			WALFileSize:       64 * 1024 * 1024, // 64 MB per WAL file (segstore v1)
-			WALChannelBuffer:  10000,            // 10K buffered requests
+			WALBatchSize:      1000,              // 1,000 messages per batch
+			WALBatchTimeoutMS: 5,                 // retained for compatibility; flushing is drain-then-flush, not timer-gated
+			WALFileSize:       512 * 1024 * 1024, // 512 MB per WAL file (segstore v1)
+			WALChannelBuffer:  10000,             // 10K buffered requests
 
 			// Segment Storage (Cold Path)
 			SegmentSize:                 64 * 1024 * 1024, // 64 MB per segment (segstore v1)
