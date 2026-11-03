@@ -19,7 +19,7 @@ import (
 // server closes it must have the wait cancelled (failConnection → leaseCancel)
 // and keep reading so the close handshake completes.
 func TestLease_GatedWaitCancelledForCloseHandshake(t *testing.T) {
-	release := gateWALFsync(t)
+	release := gateWALWrite(t)
 	srv, addr, _, _, _ := leaseServer(t, 1<<20, nil, nil)
 
 	// A: one durable publish holds the whole budget behind the gated fsync.

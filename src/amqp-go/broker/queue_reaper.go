@@ -206,6 +206,12 @@ func (b *StorageBroker) reapTTLSweep(name string, qs *QueueState, p *QueuePolicy
 
 	var expired []reapExpiredTarget
 	for tag := tail; tag < end; tag++ {
+		// A PROBE, NOT A DELIVERY: the reaper walks every ready tag on
+		// every sweep, so a read that admitted what it read would fill the
+		// hot cache with messages that are about to be expired and would
+		// inflate the count the broker reports for the queue. The probe
+		// must not admit, must not change the reported count, and must not
+		// displace a resident message.
 		msg, err := b.storage.GetMessage(name, tag)
 		if err != nil || msg == nil {
 			continue // gap (acked/reaped/never-present tag)
@@ -259,6 +265,8 @@ func (b *StorageBroker) reapTTLSweep(name string, qs *QueueState, p *QueuePolicy
 		if b.queueHasConsumers(name) {
 			break
 		}
+		// A PROBE, NOT A DELIVERY: the tail-advance check asks only
+		// "is there still a message here?". It must not admit.
 		if msg, err := b.storage.GetMessage(name, t); err == nil && msg != nil {
 			break // present, non-reaped message at the head: stop advancing
 		}

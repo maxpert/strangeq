@@ -158,6 +158,37 @@ type hotCacheQueue struct {
 	// per-queue accounting and it is guarded by mu.
 	used int64
 
+	// admissionEpoch is this queue's ADMISSION EPOCH: the counter that says
+	// "the set of messages this queue's hot cache may admit has not changed
+	// since the reader captured it".
+	//
+	// WHY IT EXISTS. The delivery reader admits what it reads (the
+	// write-through admission), and the per-tag shard lock
+	// (coldRemovalShards) makes the reader's (acknowledgement re-check +
+	// admission) atomic with the acknowledgement's (removal +
+	// acknowledgement). The RANGE REMOVAL — the range purge and the queue
+	// deletion — settles a BAND of tags in the COLD tiers, and it does NOT
+	// take that per-tag lock: it cannot, it settles many tags at once.
+	// So a reader that was between its cold read and its admission could
+	// admit a tag the range removal had just settled: the message would
+	// come back to the hot cache, be counted by the queue's reported message
+	// count, and be served from there again.
+	//
+	// THE EPOCH CLOSES THAT WINDOW. The reader captures the epoch
+	// immediately before its cold read; the range removal bumps the epoch
+	// under this queue's lock; the admission validates the captured epoch
+	// UNDER THE SAME LOCK, so an admission that raced a removal is refused.
+	//
+	// IT IS BUMPED BY EVERY RANGE REMOVAL (DeleteRange), INCLUDING AN EMPTY
+	// RANGE. An empty range is not a no-op: the in-flight reader may be
+	// about to admit a tag the just-settled band covers, and the band is
+	// settled in the COLD tiers whether or not the hot tier held a copy of
+	// it.
+	//
+	// IT IS GUARDED BY mu, so the check and the admission it guards are
+	// atomic with respect to the bump.
+	admissionEpoch uint64
+
 	// oldestBacked is the recency stamp of this queue's OLDEST BACKED
 	// entry, or 0 when the queue holds none.
 	//
@@ -180,6 +211,38 @@ type hotCacheEntry struct {
 	message *protocol.Message
 	charge  int64
 	backed  bool
+	// durable reports whether the entry's message may be SERVED.
+	//
+	// IT IS NOT THE SAME THING AS `backed`. `backed` says "this body is
+	// BACKED BY A READABLE COLD COPY IN THE WAL OR THE SEGMENT TIER, so
+	// evicting the entry is safe (the body can be read back from the cold
+	// tiers)". `durable` says "this message is in a state where handing it
+	// to a consumer is allowed".
+	//
+	// THE COLD COPY IS NOT ALWAYS THE WAL. A segment-only cold read is
+	// admitted with backed=true even though its WAL copy may already have
+	// been reclaimed: the segment tier is a cold copy too, and the body is
+	// readable from it. That is SAFE for the current eviction, readback and
+	// acknowledgement behaviour — the entry may be evicted, and the body is
+	// read back from whichever cold tier still holds it.
+	//
+	// A NOT-yet-durable entry is a DURABLE message whose WAL record has been
+	// WRITTEN but whose covering fdatasync has NOT returned yet. Such an
+	// entry must behave exactly like a message that is not in the WAL yet: it
+	// is not served (Get), not counted (Count) and not listed (Range).
+	//
+	// The write-side admission creates it (the body is in the file, so it is
+	// backed, but it is not durable yet); the DURABILITY POINT — the
+	// completion, after the covering fdatasync — marks it durable
+	// (MarkDurableEntry). A transient message (one that lives only in RAM)
+	// is durable by construction: there is nothing to fsync.
+	//
+	// IT IS AN ATOMIC because the durability point marks it WITHOUT taking
+	// the queue's lock: the completion runs on the WAL's committer
+	// goroutine, which is the broker's serialisation point for every
+	// publish, and a second queue-lock acquisition there would contend with
+	// the consumers' delivery and acknowledgement paths on the same queue.
+	durable atomic.Bool
 	lru     *list.Element
 	// lastUsed is the recency stamp of the entry's last access. It orders
 	// the queues against each other for the cross-queue eviction.
@@ -233,6 +296,45 @@ func (c *hotCache) queueStateIfPresent(queue string) *hotCacheQueue {
 	return nil
 }
 
+// captureAdmission captures the queue's ADMISSION EPOCH and its state.
+//
+// IT IS TAKEN IMMEDIATELY BEFORE A COLD READ, by the delivery reader, so the
+// admission that follows the read can prove that nothing settled the queue's
+// messages while the read was in flight (see hotCacheQueue.admissionEpoch).
+//
+// THE STATE IS CREATED IF IT DOES NOT EXIST YET, and the hot cache NEVER
+// REMOVES a queue's state, so the returned pointer is the state every later
+// operation on this queue name uses: the epoch this reader captures is the
+// epoch the range removals bump, and the removals find the state (they look
+// it up by name).
+func (c *hotCache) captureAdmission(queue string) (uint64, *hotCacheQueue) {
+	q := c.queueState(queue)
+	q.mu.Lock()
+	epoch := q.admissionEpoch
+	q.mu.Unlock()
+	return epoch, q
+}
+
+// bumpAdmissionEpoch advances the queue's admission epoch, invalidating every
+// admission that captured the old one.
+//
+// IT IS USED BY THE RANGE PURGE, BEFORE it settles the cold tiers, so a
+// reader that captured the epoch before the purge cannot admit a message the
+// purge is about to settle — not even in the window between the cold-tier
+// settlement and the hot tier's DeleteRange.
+//
+// IT IS A NO-OP FOR A QUEUE THAT HAS NO STATE: there is nothing to invalidate
+// (a reader that captured an epoch would have created the state).
+func (c *hotCache) bumpAdmissionEpoch(queue string) {
+	q := c.queueStateIfPresent(queue)
+	if q == nil {
+		return
+	}
+	q.mu.Lock()
+	q.admissionEpoch++
+	q.mu.Unlock()
+}
+
 // Put admits m if both byte budgets can be satisfied. Existing tags retain
 // their original message and charge; a durable completion can only upgrade
 // their backed state.
@@ -272,12 +374,17 @@ func (c *hotCache) Put(queue string, m *protocol.Message, backed bool) bool {
 		// THE MESSAGE-IDENTITY PROBE COMES FIRST. See the doc comment above.
 		if entry := q.byMessage[m]; entry != nil {
 			entry.backed = entry.backed || backed
+			// Put is the DURABLE admission: the message it admits is either
+			// already fsynced in the WAL or a transient message that lives
+			// only in RAM. Either way it may be served.
+			entry.durable.Store(true)
 			c.touchLocked(q, entry)
 			q.mu.Unlock()
 			return true
 		}
 		if entry, ok := q.entries[m.DeliveryTag]; ok {
 			entry.backed = entry.backed || backed
+			entry.durable.Store(true)
 			c.touchLocked(q, entry)
 			q.mu.Unlock()
 			return true
@@ -335,6 +442,7 @@ func (c *hotCache) Put(queue string, m *protocol.Message, backed bool) bool {
 			charge:  charge,
 			backed:  backed,
 		}
+		entry.durable.Store(true)
 		entry.lastUsed = c.seq.Add(1)
 		entry.lru = q.lru.PushFront(entry)
 		q.entries[entry.tag] = entry
@@ -352,7 +460,193 @@ func (c *hotCache) Put(queue string, m *protocol.Message, backed bool) bool {
 	return false
 }
 
+// PutBestEffort admits m if the byte budgets have room for it WITHOUT
+// EVICTING anything.
+//
+// It is the admission used by the two RAM-holder entry points:
+//
+//   - the publish path, the moment the WAL write returns (the bytes are in
+//     the file, so the body is re-readable and the entry is backed), and
+//   - the DELIVERY path, on a cache miss, for the message it just read back.
+//
+// IT IS NEVER CALLED BY A PROBE OR A PEEK: those reads use GetMessage, which
+// does not admit (see the F8 contract in storage/cold_read_count_test.go).
+//
+// A FAILED admission is a legitimate outcome: the message stays disk-only
+// (the documented "oversized durable publish succeeds disk-only" path) and
+// NOTHING ELSE CHANGES. In particular the admission never displaces a
+// resident message to make room for itself: the cache's budget is spent on
+// whatever is actually in use, and the eviction rules (which victim, in which
+// order) are the existing ones, driven by the callers that own them.
+//
+// DURABLE SAYS WHETHER THE ENTRY MAY BE SERVED.
+//
+//   - The publish path admits with durable=FALSE: the record's bytes are in
+//     the file, but the covering fdatasync has NOT returned yet, so the
+//     message is not durable and must not be handed to a consumer. The
+//     completion (the durability point) marks the entry durable.
+//   - The delivery path admits with durable=TRUE: the message it just read
+//     came out of the WAL's index, and the index is published only after the
+//     covering fdatasync, so a WAL read can only ever find DURABLE messages.
+//
+// The membership probes and the upgrades are the same as Put's: an already
+// admitted message is upgraded (never re-charged), and the identity probe is
+// the reverse index, so a mutated DeliveryTag cannot admit a second entry.
+func (c *hotCache) PutBestEffort(queue string, m *protocol.Message, backed bool, durable bool) bool {
+	entry, ok := c.PutBestEffortEntry(queue, m, backed, durable)
+	return ok && entry != nil
+}
+
+// PutBestEffortEntry is PutBestEffort plus the ENTRY it admitted.
+//
+// IT RETURNS THE ENTRY SO THE CALLER CAN MARK IT DURABLE LATER WITHOUT
+// TAKING THE QUEUE'S LOCK AGAIN (see MarkDurableEntry). The publish path
+// needs exactly that: the write-side admission happens on the WAL's
+// committer goroutine (the broker's serialisation point for every publish)
+// and the durability point happens in the same goroutine's completion, so a
+// second queue-lock acquisition there would contend with the consumers'
+// delivery and acknowledgement paths on the same queue.
+//
+// The returned entry is the entry the message OCCUPIES. It stays valid if
+// it is evicted in the meantime (an evicted entry is never reused), so
+// marking it durable after an eviction is a harmless no-op.
+func (c *hotCache) PutBestEffortEntry(queue string, m *protocol.Message, backed bool, durable bool) (*hotCacheEntry, bool) {
+	if m == nil {
+		return nil, false
+	}
+
+	// THE CHARGE IS COMPUTED OUTSIDE THE LOCK: it walks the message's
+	// headers, and it does not depend on the cache's state.
+	charge := cacheCharge(queue, m)
+
+	q := c.queueState(queue)
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	hotCacheQueueLockFire(q.name)
+
+	entry := c.putBestEffortLocked(q, queue, m, charge, backed, durable)
+	if entry == nil {
+		return nil, false
+	}
+	return entry, true
+}
+
+// putBestEffortLocked is the body of PutBestEffortEntry, with the queue's
+// lock ALREADY HELD.
+//
+// IT IS FACTORED OUT so the delivery path can VALIDATE its capture (the
+// queue's incarnation and the admission epoch) under the SAME lock and then
+// admit, with no window in between: a validation that happens outside the
+// lock could be invalidated by a range removal before the admission lands.
+//
+// IT DOES NOT TAKE THE LOCK AND IT MUST NOT: the caller holds it.
+func (c *hotCache) putBestEffortLocked(q *hotCacheQueue, queue string, m *protocol.Message, charge int64, backed bool, durable bool) *hotCacheEntry {
+	if entry := q.byMessage[m]; entry != nil {
+		entry.backed = entry.backed || backed
+		if durable {
+			entry.durable.Store(true)
+		}
+		c.touchLocked(q, entry)
+		return entry
+	}
+	if entry, ok := q.entries[m.DeliveryTag]; ok {
+		entry.backed = entry.backed || backed
+		if durable {
+			entry.durable.Store(true)
+		}
+		c.touchLocked(q, entry)
+		return entry
+	}
+
+	if charge > c.queueBytes || charge > c.globalBytes {
+		return nil
+	}
+	// NO ROOM, NO ADMISSION: the queue's budget is full and this admission
+	// does not evict.
+	if q.used+charge > c.queueBytes {
+		return nil
+	}
+	// The global budget is claimed with the same atomic compare-and-swap the
+	// evicting admission uses, so the total resident bytes never exceed it.
+	if !c.reserveGlobal(charge) {
+		return nil
+	}
+
+	entry := &hotCacheEntry{
+		queue:   queue,
+		tag:     m.DeliveryTag,
+		message: m,
+		charge:  charge,
+		backed:  backed,
+	}
+	if durable {
+		entry.durable.Store(true)
+	}
+	entry.lastUsed = c.seq.Add(1)
+	entry.lru = q.lru.PushFront(entry)
+	q.entries[entry.tag] = entry
+	q.byMessage[m] = entry
+	q.used += charge
+	if backed && q.oldestBacked.Load() == 0 {
+		q.oldestBacked.Store(int64(entry.lastUsed))
+	}
+	c.noteQueueUsed(queue, q.used)
+	return entry
+}
+
+// MarkDurableEntry marks the entry DURABLE: the message it holds may now be
+// served.
+//
+// IT TAKES NO LOCK. The entry's durability flag is an ATOMIC, so the
+// durability point — the completion, which runs on the WAL's committer
+// goroutine — can mark the entry without taking the queue's lock a second
+// time. That matters: the committer goroutine is the broker's serialisation
+// point for every publish, and a second queue-lock acquisition there would
+// contend with the consumers' delivery and acknowledgement paths.
+//
+// Marking an EVICTED entry is a harmless no-op: an evicted entry is never
+// reused, and it is no longer in the queue's map.
+func (c *hotCache) MarkDurableEntry(entry *hotCacheEntry) bool {
+	if entry == nil {
+		return false
+	}
+	entry.durable.Store(true)
+	return true
+}
+
+// Get returns the DURABLE entry admitted under tag.
+//
+// A NOT-yet-durable entry is NOT served: it behaves exactly like a message
+// that is not in the WAL yet (its record is written but its covering
+// fdatasync has not returned).
 func (c *hotCache) Get(queue string, tag uint64) (m *protocol.Message, backed, ok bool) {
+	q := c.queueStateIfPresent(queue)
+	if q == nil {
+		return nil, false, false
+	}
+
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	hotCacheQueueLockFire(q.name)
+
+	entry, ok := q.entries[tag]
+	if !ok {
+		return nil, false, false
+	}
+	if !entry.durable.Load() {
+		return nil, false, false
+	}
+	c.touchLocked(q, entry)
+	return entry.message, entry.backed, true
+}
+
+// GetResident returns the entry admitted under tag WHETHER OR NOT IT IS
+// DURABLE.
+//
+// It is the removal path's residency probe: a settlement must find (and
+// remove) an entry that is resident even when the entry is not yet durable,
+// because the removal is what settles the message.
+func (c *hotCache) GetResident(queue string, tag uint64) (m *protocol.Message, backed, ok bool) {
 	q := c.queueStateIfPresent(queue)
 	if q == nil {
 		return nil, false, false
@@ -391,6 +685,11 @@ func (c *hotCache) Delete(queue string, tag uint64) bool {
 	return true
 }
 
+// Range returns the DURABLE messages admitted in [minTag, maxTag], ordered by
+// the tag the entry was admitted under.
+//
+// A NOT-yet-durable entry is NOT listed: it behaves exactly like a message
+// that is not in the WAL yet.
 func (c *hotCache) Range(queue string, minTag, maxTag uint64) []*protocol.Message {
 	if minTag > maxTag {
 		return nil
@@ -407,7 +706,7 @@ func (c *hotCache) Range(queue string, minTag, maxTag uint64) []*protocol.Messag
 
 	tagged := make([]hotCacheRangeEntry, 0, len(q.entries))
 	for tag, entry := range q.entries {
-		if tag >= minTag && tag <= maxTag {
+		if tag >= minTag && tag <= maxTag && entry.durable.Load() {
 			tagged = append(tagged, hotCacheRangeEntry{tag: tag, message: entry.message})
 		}
 	}
@@ -424,11 +723,28 @@ func (c *hotCache) Range(queue string, minTag, maxTag uint64) []*protocol.Messag
 	return result
 }
 
+// DeleteRange removes the entries admitted in [minTag, maxTag] and advances
+// the queue's ADMISSION EPOCH.
+//
+// THE EPOCH IS ADVANCED ON EVERY CALL, INCLUDING AN EMPTY RANGE (a range
+// that matched no entry) and a DEGENERATE RANGE (minTag > maxTag). The
+// range removal is what settles a BAND of tags in the COLD tiers, and it
+// does not take the per-tag shard lock, so it is the range removal — not
+// the acknowledgement — that has to invalidate the deliveries racing it.
+//
+// AN EMPTY RANGE MUST ADVANCE IT TOO: the in-flight reader may be about to
+// admit a tag the just-settled band covers, and the band is settled in the
+// COLD tiers whether or not the hot tier held a copy of it. A reader that
+// captured the old epoch is refused, and the refusal needs no rollback: the
+// admission is validated BEFORE it reserves anything and before it mutates
+// anything.
+//
+// THE ORDERING IS ACCEPTABLE AND DOCUMENTED: a reader that holds the queue's
+// lock and wins the race against a deletion admits the message, and the
+// deletion's subsequent DeleteRange removes that admission. The removal and
+// the admission are serialized by this queue's lock, so exactly one of them
+// observes the other.
 func (c *hotCache) DeleteRange(queue string, minTag, maxTag uint64) int {
-	if minTag > maxTag {
-		return 0
-	}
-
 	q := c.queueStateIfPresent(queue)
 	if q == nil {
 		return 0
@@ -436,7 +752,17 @@ func (c *hotCache) DeleteRange(queue string, minTag, maxTag uint64) int {
 
 	q.mu.Lock()
 	defer q.mu.Unlock()
+
+	// THE ADMISSION EPOCH IS ADVANCED FIRST, BEFORE ANY ENTRY IS REMOVED, so
+	// a reader parked between its capture and its admission is refused even
+	// if it is admitted while this removal is running.
+	q.admissionEpoch++
+
 	hotCacheQueueLockFire(q.name)
+
+	if minTag > maxTag {
+		return 0
+	}
 
 	removed := 0
 	for tag, entry := range q.entries {
@@ -459,6 +785,9 @@ func (c *hotCache) DeleteRange(queue string, minTag, maxTag uint64) int {
 // message the cache hands out: a caller may mutate that field after
 // admission, and a purge that settled entries by it would delete the wrong
 // key (or nothing) and would report the wrong tag set.
+//
+// A NOT-yet-durable entry is NOT reported: it behaves exactly like a message
+// that is not in the WAL yet, and the WAL tier does not report it either.
 func (c *hotCache) TagsInRange(queue string, minTag, maxTag uint64) []uint64 {
 	if minTag > maxTag {
 		return nil
@@ -474,8 +803,8 @@ func (c *hotCache) TagsInRange(queue string, minTag, maxTag uint64) []uint64 {
 	hotCacheQueueLockFire(q.name)
 
 	tags := make([]uint64, 0, len(q.entries))
-	for tag := range q.entries {
-		if tag < minTag || tag > maxTag {
+	for tag, entry := range q.entries {
+		if tag < minTag || tag > maxTag || !entry.durable.Load() {
 			continue
 		}
 		tags = append(tags, tag)
@@ -484,6 +813,11 @@ func (c *hotCache) TagsInRange(queue string, minTag, maxTag uint64) []uint64 {
 	return tags
 }
 
+// Count returns the number of DURABLE entries this cache holds for the queue.
+//
+// A NOT-yet-durable entry is NOT counted: it behaves exactly like a message
+// that is not in the WAL yet, so the queue's reported message count never
+// includes a message the broker has not made durable.
 func (c *hotCache) Count(queue string) int {
 	q := c.queueStateIfPresent(queue)
 	if q == nil {
@@ -493,7 +827,13 @@ func (c *hotCache) Count(queue string) int {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	hotCacheQueueLockFire(q.name)
-	return len(q.entries)
+	count := 0
+	for _, entry := range q.entries {
+		if entry.durable.Load() {
+			count++
+		}
+	}
+	return count
 }
 
 // reserveGlobal claims charge bytes of the global budget.

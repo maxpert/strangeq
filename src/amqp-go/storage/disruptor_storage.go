@@ -1,6 +1,7 @@
 package storage
 
 import (
+	"errors"
 	"fmt"
 	"path/filepath"
 	"sync"
@@ -299,18 +300,74 @@ func (ds *DisruptorStorage) StoreMessage(queueName string, message *protocol.Mes
 	return nil
 }
 
-// StoreMessageAsync durably writes before making the message visible through
-// the hot cache and completion callback. A failed completion never admits it.
-func (ds *DisruptorStorage) StoreMessageAsync(queueName string, message *protocol.Message, onDurable func(error)) error {
+// StoreMessageAsync durably writes before making the message visible.
+//
+// THE BODY IS ADMITTED TO THE HOT CACHE AT THE WRITE, NOT AT THE COMPLETION.
+// The hot cache is a RAM HOLDER, not the visibility gate: the moment the WAL
+// write returns, the record's bytes are in the file and are re-readable by
+// this process, so the cache can take the body for delivery.
+//
+// THE ADMITTED ENTRY IS NOT YET DURABLE. The record's covering fdatasync has
+// NOT returned at the write, so the entry is admitted NOT-DURABLE: it is
+// backed (the body is in the file) but it must not be served, counted or
+// listed, exactly like a message that is not in the WAL yet. The DURABILITY
+// POINT is the completion (after the fdatasync): it marks the entry durable,
+// and only then does the queue DEPTH — the gate every consumer's claim goes
+// through — advance. So a consumer is never handed a message that is not yet
+// durable.
+//
+// A record whose fdatasync FAILS is not durable: the completion removes the
+// cache entry the write admitted, so a non-durable message is never
+// delivered from RAM.
+//
+// onWritten fires at the write (the RAM-admission point) and onDurable fires
+// after the covering fdatasync (the durability point).
+func (ds *DisruptorStorage) StoreMessageAsync(queueName string, message *protocol.Message, onWritten func(), onDurable func(error)) error {
 	if ds.wal == nil {
 		return fmt.Errorf("cannot persist durable message: WAL unavailable for queue %s", queueName)
 	}
 	queue := ds.getOrCreateQueueHot(queueName)
-	ds.wal.WriteAsync(queueName, message, message.DeliveryTag, func(err error) {
-		if err == nil && ds.hot.Put(queueName, message, true) {
-			queue.ack.OnPublish(message.DeliveryTag)
+	tag := message.DeliveryTag
+	// admitted is written by the write hook and read by the completion
+	// callback. Both run on the shared WAL committer goroutine, in that
+	// order, so the handoff needs no synchronization.
+	//
+	// entry is the hot-cache entry the write admitted. The completion marks
+	// IT durable, which takes no lock (the flag is an atomic): the
+	// committer goroutine is the broker's serialisation point for every
+	// publish, and a second queue-lock acquisition there would contend with
+	// the consumers' delivery and acknowledgement paths.
+	var entry *hotCacheEntry
+	admitted := false
+	ds.wal.WriteAsyncObserved(queueName, message, tag, func() {
+		// NOT YET DURABLE: the record's bytes are in the file, but the
+		// covering fdatasync has not returned. The entry is backed (the body
+		// is re-readable from the file) but it must not be served until the
+		// completion marks it durable.
+		var ok bool
+		entry, ok = ds.hot.PutBestEffortEntry(queueName, message, true, false)
+		admitted = ok
+		if onWritten != nil {
+			onWritten()
 		}
-		onDurable(err)
+	}, func(err error) {
+		if err == nil {
+			if admitted {
+				// THE DURABILITY POINT: the covering fdatasync returned.
+				// The entry becomes servable, and only now does the queue
+				// depth advance.
+				ds.hot.MarkDurableEntry(entry)
+				queue.ack.OnPublish(tag)
+			}
+		} else {
+			// The record is NOT durable: the body must not stay in the hot
+			// cache, or a consumer could be handed a message the broker
+			// never made durable.
+			ds.hot.Delete(queueName, tag)
+		}
+		if onDurable != nil {
+			onDurable(err)
+		}
 	})
 	return nil
 }
@@ -346,6 +403,24 @@ func (ds *DisruptorStorage) StoreSharedAsync(subs []interfaces.SharedDurableSub)
 	return ds.wal.WriteSharedAsync(walSubs, body, uint32(len(walSubs)))
 }
 
+// GetMessage reads a message WITHOUT admitting it into the hot cache.
+//
+// IT IS A PEEK. The hot cache holds PUBLISHED messages, and
+// GetQueueMessages / GetQueueMessageCount are hot-resident operations over
+// exactly that set (WI3: "Range/count methods remain hot-resident operations
+// AS TODAY" — the legacy ring only ever held published records). A read that
+// admitted what it read would turn a READ into a PUBLISH as far as the count
+// was concerned: the TTL reaper probes every ready tag on every sweep
+// (broker/queue_reaper.go, reapTTLSweep), and each probe would insert a
+// durable record into the cache and inflate the count it then reports.
+//
+// The delivery path uses GetMessageForDelivery, which DOES admit what it
+// read (the write-through admission is attributable to a CONSUMER DELIVERY,
+// not to a probe).
+//
+// The acknowledgement re-check is unaffected by the missing admission: it
+// asks the WAL whether the tag was acknowledged between the tier read and
+// now, and needs no cache state to do it.
 func (ds *DisruptorStorage) GetMessage(queueName string, deliveryTag uint64) (*protocol.Message, error) {
 	queue := ds.getQueueHot(queueName)
 	if queue == nil {
@@ -358,6 +433,223 @@ func (ds *DisruptorStorage) GetMessage(queueName string, deliveryTag uint64) (*p
 		return nil, interfaces.ErrMessageNotFound
 	}
 
+	msg, err := ds.readColdMessage(queueName, deliveryTag)
+	if err != nil {
+		return nil, err
+	}
+
+	// The acknowledgement re-check: the tag may have been acknowledged
+	// between the tier read and now. It asks the WAL whether the tag was
+	// acknowledged and needs no cache state to do it.
+	if ds.wal != nil && ds.wal.IsAcknowledged(queueName, deliveryTag) {
+		return nil, interfaces.ErrMessageNotFound
+	}
+	return msg, nil
+}
+
+// GetMessageForDelivery reads a message for a CONSUMER DELIVERY and admits
+// what it read into the hot cache (the write-through admission).
+//
+// THE ADMISSION IS ATTRIBUTABLE TO A DELIVERY. A read that is not a delivery
+// (a probe, a peek, an existence check) must not admit: the hot cache's
+// budget is spent on the working set the consumers are actually reading, and
+// the reported message count must not count a message that no consumer asked
+// for. The non-delivery reads use GetMessage, which does not admit.
+//
+// THE ADMISSION IS ATOMIC WITH THE ACKNOWLEDGEMENT. The reader takes the
+// same per-tag shard lock the acknowledgement paths take
+// (coldRemovalShards), and holds it across
+//
+//	(acknowledgement re-check + admission)
+//
+// so an acknowledgement that lands while the reader is between its read and
+// its admission can never leave an ACKNOWLEDGED tag resident in the hot
+// cache (see the ack paths: DeleteMessage and DeleteMessageIfPresentDetailed).
+//
+// NO LOCK IS HELD ACROSS THE COLD READ: the disk read happens first, and the
+// shard lock is taken only for the (check + admit).
+//
+// THE ADMISSION IS ALSO GUARDED AGAINST THE RANGE REMOVALS (the range purge
+// and the queue deletion). Those settle a BAND of tags in the COLD tiers and
+// they do NOT take the per-tag shard lock — they cannot, they settle many
+// tags at once — so a reader parked between its cold read and its admission
+// could re-admit a tag the range removal had just settled.
+//
+// So the reader CAPTURES the queue's incarnation (its QueueHot handle) and
+// the hot cache's ADMISSION EPOCH immediately before the cold read, and the
+// admission validates BOTH under the queue's own lock (see
+// putBestEffortIfCurrent). A reader whose capture is stale admits NOTHING:
+// a settled message cannot come back to the hot cache, be counted by the
+// queue's reported message count, or be served from there again.
+func (ds *DisruptorStorage) GetMessageForDelivery(queueName string, deliveryTag uint64) (*protocol.Message, error) {
+	queue := ds.getQueueHot(queueName)
+	if queue == nil {
+		return nil, interfaces.ErrQueueNotFound
+	}
+	if msg, _, ok := ds.hot.Get(queueName, deliveryTag); ok {
+		return msg, nil
+	}
+	if ds.wal != nil && ds.wal.IsAcknowledged(queueName, deliveryTag) {
+		return nil, interfaces.ErrMessageNotFound
+	}
+
+	// THE CAPTURE. The queue's incarnation and the hot cache's admission
+	// epoch are captured IMMEDIATELY BEFORE the cold read, so the admission
+	// that follows the read can tell whether the queue was swept or purged
+	// while the read was in flight.
+	//
+	// The handle is re-read here (it was already read above for the
+	// existence check) so the capture is as close to the cold read as the
+	// code allows: a queue deleted between the two reads is caught here.
+	captured := ds.getQueueHot(queueName)
+	if captured == nil {
+		return nil, interfaces.ErrQueueNotFound
+	}
+	capturedEpoch, hotQueue := ds.hot.captureAdmission(queueName)
+
+	// THE COLD READ. No lock is held across it.
+	msg, err := ds.readColdMessage(queueName, deliveryTag)
+	if err != nil {
+		return nil, err
+	}
+
+	// THE ADMISSION. The per-tag shard lock makes the (acknowledgement
+	// re-check + admission) atomic with respect to the acknowledgement
+	// paths, which take the same lock.
+	mu := &coldRemovalShards[deliveryTag&63]
+	mu.Lock()
+	defer mu.Unlock()
+
+	// The acknowledgement re-check, UNDER THE LOCK: an acknowledgement that
+	// landed while the cold read was in flight must refuse the message, and
+	// it must NOT be admitted.
+	if ds.wal != nil && ds.wal.IsAcknowledged(queueName, deliveryTag) {
+		return nil, interfaces.ErrMessageNotFound
+	}
+
+	// THE SEAM BETWEEN THE RE-CHECK AND THE ADMISSION. TEST-ONLY observer:
+	// it lets a test force an acknowledgement into exactly this window.
+	//
+	// IT RUNS WHILE THE PER-TAG SHARD LOCK IS HELD, so a hook must not take
+	// that lock itself (it would deadlock); issue the acknowledgement from
+	// another goroutine instead.
+	coldReadAdmissionFire(queueName, deliveryTag)
+
+	// THE ADMISSION IS VALIDATED BEFORE IT RESERVES ANYTHING. The admission
+	// is BEST-EFFORT: it never evicts anything to make room for itself, so
+	// a full cache simply leaves the message disk-only (the next read is a
+	// cold read again) and nothing else changes.
+	//
+	// It is backed=true: the body is BACKED BY A READABLE COLD COPY IN THE
+	// WAL OR THE SEGMENT TIER, so evicting the entry later is safe (the body
+	// can be read back from the cold tiers). A segment-only cold read is
+	// admitted with backed=true as well, even though its WAL copy may
+	// already have been reclaimed: the segment tier is a cold copy too, and
+	// that is SAFE for the current eviction, readback and acknowledgement
+	// behaviour.
+	//
+	// It is durable=TRUE: the WAL's index is published only after the
+	// covering fdatasync, so a WAL read can only ever find durable
+	// messages.
+	if err := ds.putBestEffortIfCurrent(queueName, captured, hotQueue, capturedEpoch, msg); err != nil {
+		// AN EPOCH MISMATCH IS NOT AN ERROR THE CALLER SEES: the message was
+		// read successfully, and the purge that moved the epoch may have been
+		// aimed at a DIFFERENT band, so failing the delivery would be a
+		// spurious delivery error. The message is returned, unadmitted.
+		if errors.Is(err, errStaleAdmissionEpoch) {
+			return msg, nil
+		}
+		return nil, err
+	}
+	return msg, nil
+}
+
+// errStaleAdmissionEpoch reports that the hot cache's admission epoch for the
+// queue MOVED between the delivery reader's capture and its admission.
+//
+// IT IS NOT AN ERROR THE CALLER SEES: the reader returns the message it read
+// and admits nothing (see GetMessageForDelivery).
+var errStaleAdmissionEpoch = errors.New("storage: the hot cache's admission epoch moved")
+
+// putBestEffortIfCurrent admits msg into the hot cache for queueName, but
+// ONLY IF the reader's capture is still CURRENT.
+//
+// THE CAPTURE IS (the queue's incarnation, the hot cache's admission epoch).
+// The incarnation is the queue's QueueHot handle: the hot cache keys its
+// per-queue state by NAME and never removes it, so a deleted queue's
+// successor inherits the deleted queue's state, and only the handle tells
+// the two apart. The epoch is the hot cache's per-queue admission counter,
+// which the range removals advance (see hotCacheQueue.admissionEpoch).
+//
+// THE VALIDATION AND THE ADMISSION ARE ATOMIC. The queue's lock is held
+// across both, so a range removal that starts after the validation waits for
+// the admission and then removes it (that ordering is acceptable and is
+// documented on hotCache.DeleteRange), and a range removal that finished
+// before the validation has already advanced the epoch, so the validation
+// refuses the admission.
+//
+// EVERY VALIDATION HAPPENS BEFORE ANY MUTATION: before the global
+// reservation, before the map/LRU mutation and before the accounting. A
+// refused admission therefore needs NO ROLLBACK.
+//
+// THE OUTCOMES:
+//
+//   - the epoch moved (errStaleAdmissionEpoch): the message is NOT admitted
+//     and the caller returns it to its caller WITHOUT an error — the purge
+//     may have been aimed at a different band, and failing the delivery
+//     would be a spurious delivery error;
+//   - the incarnation moved, or the queue is closed
+//     (interfaces.ErrQueueNotFound): the queue is gone (or is a different
+//     incarnation), so the delivery fails and nothing is admitted.
+func (ds *DisruptorStorage) putBestEffortIfCurrent(queueName string, captured *QueueHot, q *hotCacheQueue, epoch uint64, msg *protocol.Message) error {
+	if msg == nil {
+		return nil
+	}
+
+	// THE CHARGE IS COMPUTED OUTSIDE THE LOCK: it walks the message's
+	// headers, and it does not depend on the cache's state.
+	charge := cacheCharge(queueName, msg)
+
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	hotCacheQueueLockFire(q.name)
+
+	// THE INCARNATION CHECK COMES FIRST. A queue that was deleted (and
+	// possibly redeclared) while the read was in flight must NOT deliver the
+	// old message: the old queue's messages are settled, and the successor
+	// is a different queue.
+	//
+	// IT COMES FIRST BECAUSE A DELETION MOVES BOTH. The deletion advances
+	// the epoch (its DeleteRange) AND replaces the incarnation, so the two
+	// checks would both fail and the two outcomes would contradict each
+	// other. The incarnation is the STRONGER statement: the queue is gone,
+	// so the delivery fails with ErrQueueNotFound, while a pure purge (the
+	// incarnation is intact) is the epoch mismatch that returns the message
+	// without an error.
+	//
+	// The check is cheap (a sync.Map load) and it is done under the queue's
+	// lock, so it cannot be invalidated before the admission lands.
+	if ds.getQueueHot(queueName) != captured || captured.closed.Load() {
+		return interfaces.ErrQueueNotFound
+	}
+
+	// THE EPOCH CHECK. A range removal (the range purge, the queue deletion)
+	// advances the epoch under this very lock, so the check and the
+	// admission below are atomic with respect to it.
+	if q.admissionEpoch != epoch {
+		return errStaleAdmissionEpoch
+	}
+
+	// THE ADMISSION. Nothing was reserved and nothing was mutated yet, so a
+	// refusal above needs no rollback.
+	ds.hot.putBestEffortLocked(q, queueName, msg, charge, true, true)
+	return nil
+}
+
+// readColdMessage reads a message from the cold tiers (the WAL, then the
+// segment tier). It NEVER admits and it NEVER acknowledges: it is the read
+// half of both the peek and the delivery path.
+func (ds *DisruptorStorage) readColdMessage(queueName string, deliveryTag uint64) (*protocol.Message, error) {
 	var msg *protocol.Message
 	if ds.wal != nil {
 		if m, err := ds.wal.Read(queueName, deliveryTag); err == nil {
@@ -372,38 +664,36 @@ func (ds *DisruptorStorage) GetMessage(queueName string, deliveryTag uint64) (*p
 	if msg == nil {
 		return nil, interfaces.ErrMessageNotFound
 	}
-
-	// A COLD READ DOES NOT ADMIT THE MESSAGE INTO THE HOT CACHE.
-	//
-	// The hot cache holds PUBLISHED messages, and GetQueueMessages /
-	// GetQueueMessageCount are hot-resident operations over exactly that set
-	// (WI3: "Range/count methods remain hot-resident operations AS TODAY" —
-	// the legacy ring only ever held published records). Admitting a cold read
-	// would make the queue's REPORTED MESSAGE COUNT report reads: the TTL
-	// reaper probes every ready tag on every sweep
-	// (broker/queue_reaper.go, reapTTLSweep), and each probe would insert a
-	// durable record into the cache and inflate the count it then reports.
-	// The admitted entry was also an eviction victim (backed=true), so a read
-	// could displace a published message that was still resident.
-	//
-	// The acknowledgement re-check below is unaffected by dropping the
-	// admission: it asks the WAL whether the tag was acknowledged between the
-	// tier read and now, and needs no cache state to do it. (The old code
-	// admitted first and then deleted the admitted entry again when the tag
-	// turned out to be acknowledged — the delete existed only to undo the
-	// admission, and the admission is what is being removed.)
-	if ds.wal != nil && ds.wal.IsAcknowledged(queueName, deliveryTag) {
-		return nil, interfaces.ErrMessageNotFound
-	}
 	return msg, nil
 }
 
+// DeleteMessage removes a message from the hot cache and acknowledges it in
+// the cold tiers.
+//
+// IT TAKES THE PER-TAG SHARD LOCK, so the (hot-cache removal + cold-tier
+// acknowledgement) is ATOMIC with respect to the delivery reader's
+// (acknowledgement re-check + admission). Without it, an acknowledgement
+// could land between the reader's re-check and its admission, and the
+// reader would admit an ALREADY-ACKNOWLEDGED tag into the hot cache: it
+// would then be served from there, counted by the queue's message count,
+// and its later removal would report a win — decrementing the queue depth a
+// SECOND time for one message.
+//
+// It never holds a WAL/segment lock while taking the shard lock, and it is
+// never called with the shard lock already held (see
+// DeleteMessageIfPresentDetailed, which calls ackColdTiers directly).
 func (ds *DisruptorStorage) DeleteMessage(queueName string, deliveryTag uint64) error {
 	queue := ds.getQueueHot(queueName)
 	if queue == nil {
 		return interfaces.ErrQueueNotFound
 	}
-	msg, backed, foundHot := ds.hot.Get(queueName, deliveryTag)
+	mu := &coldRemovalShards[deliveryTag&63]
+	mu.Lock()
+	defer mu.Unlock()
+
+	// GetResident, not Get: a settlement must find an entry that is
+	// resident even when it is not yet durable.
+	msg, backed, foundHot := ds.hot.GetResident(queueName, deliveryTag)
 	ds.hot.Delete(queueName, deliveryTag)
 	if !foundHot || msg.DeliveryMode == 2 || backed {
 		ds.ackColdTiers(queueName, deliveryTag)
@@ -421,10 +711,25 @@ func (ds *DisruptorStorage) DeleteMessageIfPresent(queueName string, deliveryTag
 	return removed && resident, err // legacy contract: resident removal only
 }
 
-// coldRemovalShards serialises DeleteMessageIfPresentDetailed per tag so that
+// coldRemovalShards serialises the per-tag removal and admission so that
 // concurrent removers of the same tag — hot-resident OR cold — observe
-// exactly one winner. Package-level so no DisruptorStorage field (and no
-// layout pin) changes. Taken only here; never while holding any WAL/segment lock.
+// exactly one winner, AND so that an acknowledgement can never race an
+// admission into the hot cache.
+//
+// It is taken by:
+//
+//   - DeleteMessageIfPresentDetailed (the removal + the cold-tier
+//     acknowledgement),
+//   - DeleteMessage (the removal + the cold-tier acknowledgement), and
+//   - GetMessageForDelivery (the acknowledgement re-check + the hot-cache
+//     admission).
+//
+// The last two are what close the acknowledgement/admission window: the
+// reader's (check + admit) and the remover's (remove + acknowledge) are
+// mutually exclusive per tag, so an acknowledged tag can never be admitted.
+//
+// Package-level so no DisruptorStorage field (and no layout pin) changes.
+// Taken only here; never while holding any WAL/segment lock.
 var coldRemovalShards [64]sync.Mutex
 
 // DeleteMessageIfPresentDetailed removes a ready message and reports whether
@@ -449,7 +754,7 @@ func (ds *DisruptorStorage) DeleteMessageIfPresentDetailed(queueName string, del
 	mu.Lock()
 	defer mu.Unlock()
 
-	if msg, backed, ok := ds.hot.Get(queueName, deliveryTag); ok {
+	if msg, backed, ok := ds.hot.GetResident(queueName, deliveryTag); ok {
 		won := ds.hot.Delete(queueName, deliveryTag)
 		if won && (msg.DeliveryMode == 2 || backed) {
 			ds.ackColdTiers(queueName, deliveryTag)
@@ -459,6 +764,8 @@ func (ds *DisruptorStorage) DeleteMessageIfPresentDetailed(queueName string, del
 	if ds.wal != nil && ds.wal.IsAcknowledged(queueName, deliveryTag) {
 		return false, false, nil
 	}
+	// The cold read: GetMessage is a PEEK, so it does not admit anything —
+	// this path settles the message itself.
 	m, gerr := ds.GetMessage(queueName, deliveryTag)
 	if gerr != nil || m == nil {
 		return false, false, nil
@@ -543,10 +850,23 @@ func (ds *DisruptorStorage) GetQueueMessageCount(queueName string) (int, error) 
 // purgeQueueRange settles the hot and both cold tiers and counts each logical
 // delivery tag once, even when it has multiple physical copies or resides in
 // more than one tier. Caller has verified that the queue exists.
+//
+// IT INVALIDATES THE IN-FLIGHT DELIVERIES OF THE BAND. The purge settles a
+// BAND of tags in the cold tiers, and it does not take the per-tag shard
+// lock, so a delivery reader that is between its cold read and its admission
+// could re-admit a tag the purge has just settled. The queue's admission
+// epoch is advanced FIRST — before the cold tiers are settled — so such a
+// reader is refused, and the hot tier's DeleteRange advances it again when
+// it removes the band's entries.
 func (ds *DisruptorStorage) purgeQueueRange(queueName string, minTag, maxTag uint64) int {
 	if minTag > maxTag {
 		return 0
 	}
+	// THE EPOCH IS ADVANCED BEFORE THE COLD TIERS ARE SETTLED, so a reader
+	// that captured it before this purge cannot admit a tag this purge is
+	// about to settle — not even in the window between the cold-tier
+	// settlement and the hot tier's DeleteRange below.
+	ds.hot.bumpAdmissionEpoch(queueName)
 	unique := make(map[uint64]struct{})
 	if ds.wal != nil {
 		for _, tag := range ds.wal.PurgeQueue(queueName, minTag, maxTag) {

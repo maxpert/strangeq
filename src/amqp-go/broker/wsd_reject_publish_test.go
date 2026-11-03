@@ -25,13 +25,16 @@ type gatedAsyncStore struct {
 	failAsync atomic.Bool
 }
 
-func (g *gatedAsyncStore) StoreMessageAsync(queueName string, message *protocol.Message, onDurable func(error)) error {
+func (g *gatedAsyncStore) StoreMessageAsync(queueName string, message *protocol.Message, onWritten func(), onDurable func(error)) error {
 	if g.failAsync.Load() {
 		return fmt.Errorf("injected StoreMessageAsync failure")
 	}
 	// Ring-store synchronously (mirrors the real path's visible half).
 	if err := g.DisruptorStorage.StoreMessage(queueName, message); err != nil {
 		return err
+	}
+	if onWritten != nil {
+		onWritten()
 	}
 	g.mu.Lock()
 	g.held = append(g.held, onDurable)

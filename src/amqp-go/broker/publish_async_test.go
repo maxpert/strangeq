@@ -630,11 +630,11 @@ type flakyAsyncStore struct {
 	failStoreAsync atomic.Bool
 }
 
-func (f *flakyAsyncStore) StoreMessageAsync(queueName string, message *protocol.Message, onDurable func(error)) error {
+func (f *flakyAsyncStore) StoreMessageAsync(queueName string, message *protocol.Message, onWritten func(), onDurable func(error)) error {
 	if f.failStoreAsync.Load() {
 		return fmt.Errorf("injected StoreMessageAsync failure")
 	}
-	return f.DisruptorStorage.StoreMessageAsync(queueName, message, onDurable)
+	return f.DisruptorStorage.StoreMessageAsync(queueName, message, onWritten, onDurable)
 }
 
 // TestFrontier_EnqueueErrorDoesNotWedgeQueue (M1). A durable publish reserves a

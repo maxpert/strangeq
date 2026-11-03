@@ -31,8 +31,13 @@ import (
 // --- WAL write ------------------------------------------------------------
 
 // walWriteFn is the signature of the WAL record-append performed by
-// commitBatch's group-commit batch, writeTxAtomic's single-shot unit, and the
-// WAL compaction's copy of a record into its temporary file.
+// writeTxAtomic's single-shot unit and the WAL compaction's copy of a record
+// into its temporary file.
+//
+// The group-commit batch writer does NOT use this seam: it writes a record's
+// PIECES (the WAL-owned header and the ALIASED message body) with the vector
+// seam below (walWriteVec), so the message body is never copied into a
+// staging buffer.
 type walWriteFn func(f *os.File, b []byte) (int, error)
 
 var walWriteHook atomic.Pointer[walWriteFn]
@@ -51,11 +56,74 @@ func walWrite(f *os.File, b []byte) (int, error) {
 // compaction's copy of a record, and returns a restore function. TEST-ONLY: it
 // lets tests inject a short write (n < len(b) with an error) or a hard write
 // error deterministically. Production never calls it.
+//
+// IT ALSO INTERCEPTS THE GROUP-COMMIT BATCH WRITE. The batch writer hands the
+// kernel a record's PIECES (header + body) rather than one contiguous buffer,
+// so the legacy single-buffer hook is adapted here: the pieces are
+// concatenated and handed to fn as ONE buffer, exactly as the pre-pieces
+// writer did. Every existing fault-injection user therefore keeps seeing the
+// whole batch's bytes in a single call, and a write failure can still be
+// injected at exactly the syscall the production path performs.
 func SetWALWriteForTest(fn func(f *os.File, b []byte) (int, error)) (restore func()) {
 	prev := walWriteHook.Load()
 	f := walWriteFn(fn)
 	walWriteHook.Store(&f)
-	return func() { walWriteHook.Store(prev) }
+	prevVec := walWriteVecHook.Load()
+	g := walWriteVecFn(func(f *os.File, parts [][]byte) (int, error) {
+		if len(parts) == 1 {
+			return fn(f, parts[0])
+		}
+		total := 0
+		for _, p := range parts {
+			total += len(p)
+		}
+		buf := make([]byte, 0, total)
+		for _, p := range parts {
+			buf = append(buf, p...)
+		}
+		return fn(f, buf)
+	})
+	walWriteVecHook.Store(&g)
+	return func() {
+		walWriteHook.Store(prev)
+		walWriteVecHook.Store(prevVec)
+	}
+}
+
+// --- WAL write (vector) ----------------------------------------------------
+
+// walWriteVecFn is the signature of the WAL record-append performed by
+// commitBatch's group-commit batch: the record's PIECES written as ONE
+// contiguous byte run.
+//
+// The pieces are the record's WAL-owned header, the message's body (PASSED BY
+// REFERENCE — the WAL never copies it), and the record's optional-property
+// tail. The file layout is byte-for-byte what the single-buffer writer
+// produced: the pieces are simply handed to the kernel in order.
+type walWriteVecFn func(f *os.File, parts [][]byte) (int, error)
+
+var walWriteVecHook atomic.Pointer[walWriteVecFn]
+
+// walWriteVec writes the concatenation of parts to the WAL file f through the
+// hookable seam. Default: writevFile (one writev(2) per chunk of pieces).
+func walWriteVec(f *os.File, parts [][]byte) (int, error) {
+	if p := walWriteVecHook.Load(); p != nil {
+		return (*p)(f, parts)
+	}
+	return writevFile(f, parts)
+}
+
+// SetWALWriteVecForTest installs fn as the write used by the shared-WAL
+// group-commit batch writer, and returns a restore function. TEST-ONLY: it
+// lets a test observe the EXACT pieces the WAL hands to the kernel (so a test
+// can prove the message body is passed by reference and NOT copied) and
+// inject a write failure at exactly the syscall the production path
+// performs. Production never calls it.
+func SetWALWriteVecForTest(fn func(f *os.File, parts [][]byte) (int, error)) (restore func()) {
+	prev := walWriteVecHook.Load()
+	f := walWriteVecFn(fn)
+	walWriteVecHook.Store(&f)
+	return func() { walWriteVecHook.Store(prev) }
 }
 
 // --- WAL stager (WS-F phase 1) ----------------------------------------------
@@ -500,4 +568,40 @@ func SetHotCacheQueueLockForTest(fn func(queue string)) (restore func()) {
 	f := hotCacheQueueLockFn(fn)
 	hotCacheQueueLockHook.Store(&f)
 	return func() { hotCacheQueueLockHook.Store(prev) }
+}
+
+// --- cold read → hot-cache admission seam (test observer) --------------------
+
+// coldReadAdmissionFn observes the seam between a cold read and the hot-cache
+// admission it feeds.
+type coldReadAdmissionFn func(queue string, tag uint64)
+
+var coldReadAdmissionHook atomic.Pointer[coldReadAdmissionFn]
+
+// coldReadAdmissionFire reports the seam to the installed hook. It is called
+// by the delivery reader BETWEEN its acknowledgement re-check and its
+// hot-cache admission — the window in which an acknowledgement must not be
+// able to land.
+//
+// IT RUNS WHILE THE READER HOLDS THE PER-TAG SHARD LOCK, so a hook must not
+// take that lock itself (it would deadlock the reader): issue the
+// acknowledgement from another goroutine.
+func coldReadAdmissionFire(queue string, tag uint64) {
+	if p := coldReadAdmissionHook.Load(); p != nil {
+		(*p)(queue, tag)
+	}
+}
+
+// SetColdReadAdmissionForTest installs fn as the observer of the seam
+// between the delivery reader's acknowledgement re-check and its hot-cache
+// admission, and returns a restore function. TEST-ONLY: it lets a test force
+// the interleaving "the tag is acknowledged while the reader is between its
+// re-check and its admission" deterministically, with no race and no timing
+// dependency. Never called by production code; nil = default (no
+// observation).
+func SetColdReadAdmissionForTest(fn func(queue string, tag uint64)) (restore func()) {
+	prev := coldReadAdmissionHook.Load()
+	f := coldReadAdmissionFn(fn)
+	coldReadAdmissionHook.Store(&f)
+	return func() { coldReadAdmissionHook.Store(prev) }
 }

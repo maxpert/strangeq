@@ -547,11 +547,30 @@ type handoffSnapshot struct {
 type stagedBatch struct {
 	// reqs are the writeRequests of this batch, in enqueue order.
 	reqs []*writeRequest
-	// buf is the packed, back-to-back serialization of the batch's records.
+	// buf holds the WAL-OWNED bytes of the batch's records: every record's
+	// HEADER (its [CRC][len][type] framing plus the payload prefix) and
+	// every record's optional-property TAIL.
+	//
+	// IT DOES NOT HOLD THE MESSAGE BODIES. A body is ALIASED by the record's
+	// stagedUnit and handed to the kernel BY REFERENCE at commit time, so
+	// the batch no longer duplicates every body it carries. The bytes that
+	// land in the file are byte-for-byte what the copying writer produced:
+	// the record's header, then its body, then its tail.
 	buf []byte
-	// relPos[i] is reqs[i]'s record start RELATIVE to buf[0]; -1 = the
-	// request was not written (a per-record serialize failure, or a fused
-	// shared unit, which is indexed via sharedRel instead).
+	// units are the batch's WRITE UNITS in file order. Each unit is the set
+	// of pieces that land in the file contiguously: an ordinary record's
+	// header + body + tail, or a fused shared unit's contiguous block.
+	units []stagedUnit
+	// fileBytes is the number of file bytes staged so far — the batch's
+	// serialized size, counting the bodies the buffer does NOT hold. It is
+	// the batch's FILE-RELATIVE size, so the batch seal (walBatchSealBytes)
+	// measures exactly what it measured before (the bytes the batch will
+	// put in the file).
+	fileBytes int64
+	// relPos[i] is reqs[i]'s record start RELATIVE to the batch's file
+	// start; -1 = the request was not written (a per-record serialize
+	// failure, or a fused shared unit, which is indexed via sharedRel
+	// instead).
 	relPos      []int64
 	recordBytes []int64
 	// serErr, when non-nil, carries a per-request serialization error
@@ -599,6 +618,35 @@ type stagedBodyBlock struct {
 	bytes  int64
 }
 
+// stagedUnit is ONE write unit of a staged batch: the pieces that land in
+// the WAL file, contiguously and in file order.
+//
+// AN ORDINARY RECORD contributes three pieces: the WAL-owned HEADER (the
+// record's [CRC][len][type] framing plus the payload prefix), the message's
+// BODY (ALIASED — the WAL never copies it) and the optional-property TAIL.
+//
+// A FUSED SHARED-BODY UNIT contributes ONE contiguous piece (the BodyBlock and
+// its reference records), exactly as before: those records are patched IN
+// PLACE at commit time (the reference locator), so they must live in the
+// batch's own buffer.
+type stagedUnit struct {
+	// bufOff is the offset of this unit's WAL-owned bytes in the batch's
+	// buffer.
+	bufOff int
+	// bufLen is the number of WAL-owned bytes this unit holds: the header
+	// (headLen) followed by the optional-property tail.
+	bufLen int
+	// headLen is the length of the header piece at bufOff.
+	headLen int
+	// body is the ALIASED message body (nil for a shared unit). It is
+	// dropped the moment the unit's bytes are in the file.
+	body []byte
+	// reqIdx is the index into sb.reqs of the request this unit carries.
+	reqIdx int
+	// size is the unit's total serialized size (the file bytes it occupies).
+	size int64
+}
+
 type writeRequest struct {
 	queueName string
 	message   *protocol.Message
@@ -616,6 +664,17 @@ type writeRequest struct {
 	//     per-connection fsync stall this design removes.
 	done   chan error
 	onDone func(error)
+
+	// onWritten, when non-nil, is invoked by the committer (commitBatch)
+	// AFTER the record's bytes have been written to the WAL file (write(2)
+	// returned) but BEFORE the batch's fdatasync. It is the RAM-ADMISSION
+	// point: the body is still in RAM at that moment, so the hot cache can
+	// take it for delivery without the request having to hold the message
+	// until the (much later) fsync completion.
+	//
+	// IT MUST BE NON-BLOCKING and must never do I/O (invariant A4): it runs
+	// on the shared committer goroutine.
+	onWritten func()
 
 	// unit, when non-nil, makes this ONE writeChan item a fused shared-body unit
 	// (ITER5, §3): the stager serializes it as one BodyBlock record followed by
@@ -830,10 +889,36 @@ func (wm *WALManager) Write(queueName string, message *protocol.Message, offset 
 // (see writeRequest.onDone). The blocking writeChan send is preserved, so
 // writeChan's capacity remains the durable in-flight memory bound.
 func (wm *WALManager) WriteAsync(queueName string, message *protocol.Message, offset uint64, onDone func(error)) {
+	wm.WriteAsyncObserved(queueName, message, offset, nil, onDone)
+}
+
+// WriteAsyncObserved is WriteAsync plus an onWritten hook.
+//
+// onWritten is invoked by the committer the moment the record's bytes are in
+// the WAL file (write(2) returned) and BEFORE the batch's fdatasync. It is
+// the RAM-ADMISSION point: the body is still in RAM at that moment, so the
+// caller can take it into a cache for delivery instead of holding it until
+// the (much later) fsync completion.
+//
+// THE BODY IS RELEASED AT THE WRITE. Once the write has returned, the WAL
+// holds no reference to the message: the request keeps only the delivery tag
+// and the queue name, which is all the completion needs. The DURABILITY
+// BARRIER IS UNCHANGED: onDone still fires only after the covering
+// fdatasync returned and the record was indexed.
+func (wm *WALManager) WriteAsyncObserved(queueName string, message *protocol.Message, offset uint64, onWritten func(), onDone func(error)) {
 	wm.mu.RLock()
 	sw := wm.sharedWAL
 	wm.mu.RUnlock()
 	if sw == nil {
+		// NO WRITE HAPPENED: the WAL is closed, so the record's bytes never
+		// reached the file. The onWritten hook is the RAM-ADMISSION point
+		// ("the record's bytes are in the WAL file") and MUST NOT fire
+		// here: firing it would admit a body into the hot cache as
+		// backed=true even though there is NO WAL copy of it at all, and it
+		// would contradict the hook's own contract.
+		//
+		// The completion still fires (exactly once) with ErrWALClosed, and
+		// the CALLER settles whatever it must settle on the failure path.
 		if onDone != nil {
 			onDone(ErrWALClosed)
 		}
@@ -844,9 +929,14 @@ func (wm *WALManager) WriteAsync(queueName string, message *protocol.Message, of
 		queueName: queueName,
 		message:   message,
 		offset:    offset,
+		onWritten: onWritten,
 		onDone:    onDone,
-	}); err != nil && onDone != nil {
-		onDone(err)
+	}); err != nil {
+		// The request never reached the writer: nothing was written, so the
+		// onWritten hook must NOT fire (nothing is in the file).
+		if onDone != nil {
+			onDone(err)
+		}
 	}
 }
 
@@ -2544,12 +2634,22 @@ func (qw *QueueWAL) commitBatch(sb *stagedBatch) {
 		}
 	}
 
-	// Single write (O_APPEND makes this atomic across processes). The write
-	// goes through the walWrite hook seam (TEST-ONLY faults; default is
-	// f.Write). A short write (n < len(buf), no error) is normalised to
-	// io.ErrShortWrite: Go's os.File.Write sets it itself, but a hook may not.
-	n, err := walWrite(qw.currentFile, sb.buf)
-	if err == nil && n != len(sb.buf) {
+	// ONE write for the whole batch, in as few syscalls as the iovec limit
+	// allows (O_APPEND makes each append atomic).
+	//
+	// THE BATCH'S RECORDS ARE WRITTEN AS THEIR PIECES: the WAL-owned header,
+	// the ALIASED message body and the optional-property tail, in file order.
+	// The body is handed to the kernel BY REFERENCE — the WAL NEVER COPIES IT
+	// into a staging buffer — and the bytes that land in the file are
+	// byte-for-byte what the copying writer produced.
+	//
+	// The write goes through the walWriteVec hook seam (TEST-ONLY faults;
+	// default is writev(2)). A short write (n < the batch's size, no error)
+	// is normalised to io.ErrShortWrite: Go's os.File.Write sets it itself,
+	// but a hook may not.
+	parts := sb.writeParts()
+	n, err := walWriteVec(qw.currentFile, parts)
+	if err == nil && n != int(sb.fileBytes) {
 		err = io.ErrShortWrite
 	}
 	if err != nil {
@@ -2566,10 +2666,23 @@ func (qw *QueueWAL) commitBatch(sb *stagedBatch) {
 		qw.currentFileHasSharedBody = prevShared
 		e := qw.failBatchLocked(qw.repairAfterFailedWriteLocked(base, "write", err))
 		qw.assertOffsetInvariantLocked()
+		// The write never happened: no body reached the file, so the
+		// requests drop their message references now (the completions only
+		// need the delivery tag and the queue name).
+		sb.releaseMessages()
 		qw.fileMutex.Unlock()
 		qw.deliverCompletions(sb.reqs, sb.serErr, e)
 		return
 	}
+
+	// THE WRITE RETURNED: every record's bytes are in the file and are
+	// re-readable by this process. The body does not have to be held any
+	// longer: the onWritten hook hands it to the hot cache (the RAM holder)
+	// and the request then drops its message reference, so the WAL stops
+	// being what keeps the body alive. The DURABILITY BARRIER IS UNCHANGED:
+	// the fdatasync below still gates the index and the completions, so a
+	// publisher confirm is still sent only after the record is durable.
+	sb.releaseWrittenRequests()
 
 	// A shared body is now on the active file: mark it so rollFile can pin
 	// the file out of checkpoint (§2). Set here (not during staging) so the
@@ -2628,6 +2741,9 @@ func (qw *QueueWAL) commitBatch(sb *stagedBatch) {
 		qw.currentFileHasSharedBody = prevShared
 		e := qw.failBatchLocked(qw.repairAfterFailedWriteLocked(base, "fsync", fsyncErr))
 		qw.assertOffsetInvariantLocked()
+		// The record is NOT durable: the body must not stay in the hot
+		// cache (the completion removes the entry the write admitted).
+		sb.releaseMessages()
 		qw.fileMutex.Unlock()
 		qw.deliverCompletions(sb.reqs, sb.serErr, e)
 		return
@@ -2777,20 +2893,84 @@ func (sb *stagedBatch) add(req *writeRequest, crcDisabled bool) {
 	sb.recordBytes = append(sb.recordBytes, 0)
 
 	if req.unit == nil {
-		recStart := len(sb.buf)
-		sb.relPos[i] = int64(recStart) // position relative to buf[0]
+		// ORDINARY RECORD: the header and the optional-property tail are
+		// staged in the batch's buffer; THE BODY IS NOT COPIED. It is
+		// aliased by the record's stagedUnit and handed to the kernel BY
+		// REFERENCE when the batch is committed, so the batch never
+		// duplicates the bodies it carries.
+		recStart := sb.fileBytes // the record's FILE-relative start
+		headStart := len(sb.buf)
 		var e error
-		sb.buf, e = appendMessageRecord(sb.buf, req.queueName, req.message, req.offset, crcDisabled)
-		sb.recordBytes[i] = int64(len(sb.buf) - recStart)
+		sb.buf, e = appendMessageRecordHead(sb.buf, req.queueName, req.message, req.offset)
 		if e != nil {
-			sb.buf = sb.buf[:recStart] // discard the failed record's partial bytes
+			sb.buf = sb.buf[:headStart] // discard the failed record's partial bytes
 			sb.relPos[i] = -1
 			sb.recordBytes[i] = 0
 			if sb.serErr == nil {
 				sb.serErr = make([]error, len(sb.reqs))
 			}
 			sb.serErr[i] = e
+			return
 		}
+		headLen := len(sb.buf) - headStart
+		tailStart := len(sb.buf)
+		sb.buf, e = appendMessagePayloadTail(sb.buf, req.message)
+		if e != nil {
+			sb.buf = sb.buf[:headStart]
+			sb.relPos[i] = -1
+			sb.recordBytes[i] = 0
+			if sb.serErr == nil {
+				sb.serErr = make([]error, len(sb.reqs))
+			}
+			sb.serErr[i] = e
+			return
+		}
+		tailLen := len(sb.buf) - tailStart
+		//
+		// THE BODY UNION IS SELECTED ONCE, HERE, AND THE SELECTION IS THE
+		// ONLY ONE. The header written above (appendMessagePayloadHead)
+		// chose the arm: the REFERENCE arm (bodyKind 0x01) when the message
+		// carries a BodyRef locator, the INLINE arm (bodyKind 0x00)
+		// otherwise. The bytes that belong between the length field and the
+		// optional tail are therefore the locator for the reference arm and
+		// the body for the inline arm — and the record's length, its CRC
+		// span and its staged piece must all use THAT selection.
+		//
+		// Selecting the body here and the locator there (or vice versa)
+		// produces a record that is NOT byte-identical to what
+		// appendMessageRecord writes for the same message: with a nil Body
+		// the locator is dropped from the file and the optional fields
+		// follow the reference header; with a non-nil Body the body bytes
+		// land where the locator belongs.
+		body := req.message.Body
+		if len(req.message.BodyRef) > 0 {
+			body = req.message.BodyRef
+		}
+		// The record's length field: the type tag + the payload (prefix +
+		// body + tail). The CRC is computed over the record's own
+		// [length][data] span, which is now SPLIT around the body: the
+		// header's tail is contiguous in the batch buffer, the body is
+		// aliased, and the optional tail follows it. The CRC is therefore
+		// computed by READING the body, not by copying it.
+		dataLen := int64(1 + (headLen - 9) + len(body) + tailLen)
+		binary.BigEndian.PutUint32(sb.buf[headStart+4:headStart+8], uint32(dataLen))
+		if !crcDisabled {
+			crc := crc32.Update(0, crc32.IEEETable, sb.buf[headStart+4:tailStart])
+			crc = crc32.Update(crc, crc32.IEEETable, body)
+			crc = crc32.Update(crc, crc32.IEEETable, sb.buf[tailStart:])
+			binary.BigEndian.PutUint32(sb.buf[headStart:headStart+4], crc)
+		}
+		sb.relPos[i] = recStart
+		sb.recordBytes[i] = dataLen + 8
+		sb.units = append(sb.units, stagedUnit{
+			bufOff:  headStart,
+			bufLen:  headLen + tailLen,
+			headLen: headLen,
+			body:    body,
+			reqIdx:  i,
+			size:    dataLen + 8,
+		})
+		sb.fileBytes += dataLen + 8
 		return
 	}
 
@@ -2806,7 +2986,11 @@ func (sb *stagedBatch) add(req *writeRequest, crcDisabled bool) {
 	sb.relPos[i] = -1
 	u := req.unit
 	unitStart := len(sb.buf)
-	blockRel := unitStart // the block's position relative to buf[0]
+	// The block's FILE-relative position (the locator is patched to
+	// base+blockRel at commit time). The shared unit's bytes are
+	// CONTIGUOUS in the batch buffer, so the unit's file offset and its
+	// buffer offset stay in step for the whole unit.
+	blockRel := sb.fileBytes
 	sb.buf = appendBodyBlockRecord(sb.buf, u.fanoutHint, u.body, crcDisabled)
 	blockBytes := int64(len(sb.buf) - unitStart)
 
@@ -2822,7 +3006,9 @@ func (sb *stagedBatch) add(req *writeRequest, crcDisabled bool) {
 	for si := range u.subs {
 		sub := &u.subs[si]
 		recStart := len(sb.buf)
-		subRel := int64(recStart)
+		// The reference record's FILE-relative position (the unit's bytes
+		// are contiguous, so the buffer offset maps to the file offset).
+		subRel := sb.fileBytes + int64(recStart-unitStart)
 		// Drive the existing bodyKindReference writer arm by setting BodyRef
 		// to the 8-byte locator, then CLEAR it immediately so the caller's
 		// in-memory message stays a clean inline message (a later
@@ -2846,7 +3032,7 @@ func (sb *stagedBatch) add(req *writeRequest, crcDisabled bool) {
 			recStart: recStart,
 			recEnd:   len(sb.buf),
 			locAt:    recStart + bodyRefLocatorOffset(sub.queueName, sub.message),
-			blockRel: blockRel,
+			blockRel: int(blockRel),
 		})
 	}
 	if unitErr != nil {
@@ -2862,7 +3048,19 @@ func (sb *stagedBatch) add(req *writeRequest, crcDisabled bool) {
 		sb.serErr[i] = unitErr
 		return
 	}
-	sb.blocks = append(sb.blocks, stagedBodyBlock{relPos: int64(blockRel), bytes: blockBytes})
+	unitBytes := int64(len(sb.buf) - unitStart)
+	sb.units = append(sb.units, stagedUnit{
+		bufOff: unitStart,
+		bufLen: int(unitBytes),
+		// The shared unit's bytes are ONE contiguous piece: the header
+		// length covers the whole unit and the body is empty, so the
+		// commit writes exactly the unit's bytes.
+		headLen: int(unitBytes),
+		reqIdx:  i,
+		size:    unitBytes,
+	})
+	sb.fileBytes += unitBytes
+	sb.blocks = append(sb.blocks, stagedBodyBlock{relPos: blockRel, bytes: blockBytes})
 	sb.hasShared = true
 }
 
@@ -2873,13 +3071,78 @@ func (sb *stagedBatch) add(req *writeRequest, crcDisabled bool) {
 // degenerates to one record per batch, matching the pre-pipeline drain
 // bound (len(batch) < BatchSize never coalesced anything).
 func (sb *stagedBatch) sealed(batchSize int) bool {
-	if len(sb.buf) >= walBatchSealBytes {
+	if sb.fileBytes >= int64(walBatchSealBytes) {
 		return true
 	}
 	if batchSize > 0 {
 		return len(sb.reqs) >= batchSize
 	}
 	return len(sb.reqs) >= 1
+}
+
+// writeParts builds the batch's write pieces, in FILE ORDER: every unit
+// contributes its WAL-owned header, its ALIASED body and its optional-property
+// tail. Empty pieces are skipped.
+//
+// THE BODY IS NOT COPIED: the piece is the message's own buffer, and the
+// kernel reads it in place. The bytes that land in the file are exactly the
+// bytes the contiguous writer produced.
+func (sb *stagedBatch) writeParts() [][]byte {
+	parts := make([][]byte, 0, len(sb.units)*2)
+	for i := range sb.units {
+		u := &sb.units[i]
+		if u.headLen > 0 {
+			parts = append(parts, sb.buf[u.bufOff:u.bufOff+u.headLen])
+		}
+		if len(u.body) > 0 {
+			parts = append(parts, u.body)
+		}
+		if tailLen := u.bufLen - u.headLen; tailLen > 0 {
+			parts = append(parts, sb.buf[u.bufOff+u.headLen:u.bufOff+u.bufLen])
+		}
+	}
+	return parts
+}
+
+// releaseWrittenRequests fires every unit's onWritten hook — the RAM
+// admission point, reached the moment the record's bytes are in the file —
+// and then drops the requests' message references.
+//
+// THE BODY IS RELEASED HERE: after the write, the WAL holds no reference to
+// the message at all. The request keeps only what the completion needs (the
+// delivery tag and the queue name), so the body stops being reachable from
+// the WAL while the batch's fdatasync is still outstanding.
+func (sb *stagedBatch) releaseWrittenRequests() {
+	for i := range sb.units {
+		u := &sb.units[i]
+		if u.reqIdx < 0 || u.reqIdx >= len(sb.reqs) {
+			continue
+		}
+		req := sb.reqs[u.reqIdx]
+		if req.onWritten != nil {
+			req.onWritten()
+			req.onWritten = nil
+		}
+		req.message = nil
+	}
+	// The units hold the ALIASED bodies: drop them as well, so neither the
+	// units nor the batch's buffer can keep a body alive.
+	clear(sb.units)
+}
+
+// releaseMessages drops every request's message reference WITHOUT firing the
+// onWritten hooks. It is the failed-write path: the bytes never reached the
+// file, so nothing may be admitted to the hot cache, and no body may stay
+// reachable from the WAL.
+func (sb *stagedBatch) releaseMessages() {
+	for i := range sb.reqs {
+		if sb.reqs[i] == nil {
+			continue
+		}
+		sb.reqs[i].message = nil
+		sb.reqs[i].onWritten = nil
+	}
+	clear(sb.units)
 }
 
 // reset recycles the batch for the stager's next use. It runs on the
@@ -2952,6 +3215,12 @@ func (sb *stagedBatch) reset() {
 	sb.blocks = sb.blocks[:0]
 	sb.refPatch = sb.refPatch[:0]
 	sb.hasShared = false
+	// The units hold the ALIASED message bodies: they must go with the
+	// batch, or the bodies would stay reachable from the recycled batch
+	// long after the WAL released them.
+	clear(sb.units)
+	sb.units = sb.units[:0]
+	sb.fileBytes = 0
 }
 
 // bodyRefLocatorOffset returns the byte offset, counted from the START of a
@@ -3095,6 +3364,31 @@ func appendMessageRecord(buf []byte, queueName string, message *protocol.Message
 	return buf, nil
 }
 
+// appendMessageRecordHead serializes ONE ordinary v4 message record's HEADER
+// onto the TAIL of buf and returns the grown buffer:
+//
+//	[CRC 4][length 4][type 1][payload prefix ...][bodyLen 4]
+//
+// It is the COPY-FREE writer's half of appendMessageRecord: the message's
+// BODY is not written here (and not copied anywhere) — the caller keeps a
+// reference to it and hands it to the kernel by reference when the batch is
+// committed.
+//
+// The length and the CRC are left UNPATCHED for the caller: the length needs
+// the body's and the tail's lengths, and the CRC needs the record's whole
+// [length][data] span, which is split around the body. The contiguous writer
+// (appendMessageRecord) patches both itself.
+func appendMessageRecordHead(buf []byte, queueName string, message *protocol.Message, offset uint64) ([]byte, error) {
+	// Reserve space for CRC and length (patched by the caller, record-relative).
+	buf = append(buf, 0, 0, 0, 0) // CRC32 placeholder
+	buf = append(buf, 0, 0, 0, 0) // Length placeholder
+
+	// Per-record type tag immediately after the framing (v4 always writes it).
+	buf = append(buf, WALRecordTypeMessage)
+
+	return appendMessagePayloadHead(buf, queueName, message, offset)
+}
+
 // appendMessagePayload writes the v4 message payload onto the tail of buf and
 // returns the grown buffer. It is the SINGLE shared codec used by BOTH the WAL
 // (via appendMessageRecord) and the per-queue segments (via
@@ -3120,6 +3414,32 @@ func appendMessageRecord(buf []byte, queueName string, message *protocol.Message
 // Returns ErrShortStringOverflow (wrapped) if any shortstr property exceeds 255
 // bytes — the record is then nacked rather than silently truncated.
 func appendMessagePayload(buf []byte, queueName string, message *protocol.Message, offset uint64) ([]byte, error) {
+	buf, err := appendMessagePayloadHead(buf, queueName, message, offset)
+	if err != nil {
+		return buf, err
+	}
+	// The body. ITER4 always emits the inline arm (bodyKind 0x00); the
+	// reference arm (0x01) is the ITER5 seam and is only produced when
+	// BodyRef is set.
+	if len(message.BodyRef) > 0 {
+		buf = append(buf, message.BodyRef...)
+	} else {
+		buf = append(buf, message.Body...) // the ONE store-path body copy
+	}
+	return appendMessagePayloadTail(buf, message)
+}
+
+// appendMessagePayloadHead writes the v4 message payload's PREFIX — every
+// field that PRECEDES the body — onto the tail of buf and returns the grown
+// buffer:
+//
+//	[flags u16][queue u8-len + bytes][offset u64][exch u8-len + bytes]
+//	[rk u8-len + bytes][deliveryMode u8][bodyKind u8][bodyLen u32]
+//
+// The body union's discriminator and length live here, so the body itself
+// (the bytes between the length and the optional fields) can be written — or
+// ALIASED — separately without changing the layout.
+func appendMessagePayloadHead(buf []byte, queueName string, message *protocol.Message, offset uint64) ([]byte, error) {
 	flags := messagePresenceFlags(message)
 	buf = binary.BigEndian.AppendUint16(buf, flags)
 
@@ -3144,12 +3464,24 @@ func appendMessagePayload(buf []byte, queueName string, message *protocol.Messag
 		}
 		buf = append(buf, bodyKindReference)
 		buf = binary.BigEndian.AppendUint16(buf, uint16(len(message.BodyRef)))
-		buf = append(buf, message.BodyRef...)
 	} else {
 		buf = append(buf, bodyKindInline)
 		buf = binary.BigEndian.AppendUint32(buf, uint32(len(message.Body)))
-		buf = append(buf, message.Body...) // the ONE store-path body copy
 	}
+	return buf, nil
+}
+
+// appendMessagePayloadTail writes the OPTIONAL fields that FOLLOW the body
+// onto the tail of buf and returns the grown buffer. The optional fields are
+// written in canonical (descending flag-value) order, each gated by its
+// presence bit so an absent field costs nothing beyond its bit.
+//
+// It is the tail half of appendMessagePayload: the copy-free writer stages the
+// tail SEPARATELY from the body so the body's bytes never have to be copied
+// into the writer's buffer.
+func appendMessagePayloadTail(buf []byte, message *protocol.Message) ([]byte, error) {
+	flags := messagePresenceFlags(message)
+	var err error
 
 	// Optional fields in canonical (descending flag-value) order, each gated by
 	// its presence bit so an absent field costs nothing beyond its bit.

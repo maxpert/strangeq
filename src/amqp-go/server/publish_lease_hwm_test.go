@@ -160,7 +160,7 @@ func TestLease_TransientHWMMixedConnAckSchedule(t *testing.T) {
 // LOW1 (Opus): the lease-wait metric records exactly one wait when one header
 // waits; immediate grants are never counted.
 func TestLease_WaitMetricsRecorded(t *testing.T) {
-	release := gateWALFsync(t)
+	release := gateWALWrite(t)
 	srv, addr, _, _, probe := leaseServer(t, 1<<20, nil, nil)
 
 	r := dialRaw(t, addr)

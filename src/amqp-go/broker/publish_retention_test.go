@@ -90,15 +90,15 @@ func gateWALFsync(t *testing.T) (release func()) {
 // completions deterministically.
 type retentionStorage struct {
 	interfaces.Storage
-	storeMessageAsync func(queueName string, message *protocol.Message, onDurable func(error)) error
+	storeMessageAsync func(queueName string, message *protocol.Message, onWritten func(), onDurable func(error)) error
 	storeSharedAsync  func(subs []interfaces.SharedDurableSub) error
 }
 
-func (f *retentionStorage) StoreMessageAsync(queueName string, message *protocol.Message, onDurable func(error)) error {
+func (f *retentionStorage) StoreMessageAsync(queueName string, message *protocol.Message, onWritten func(), onDurable func(error)) error {
 	if f.storeMessageAsync != nil {
-		return f.storeMessageAsync(queueName, message, onDurable)
+		return f.storeMessageAsync(queueName, message, onWritten, onDurable)
 	}
-	return f.Storage.(asyncDurableWriter).StoreMessageAsync(queueName, message, onDurable)
+	return f.Storage.(asyncDurableWriter).StoreMessageAsync(queueName, message, onWritten, onDurable)
 }
 
 func (f *retentionStorage) StoreSharedAsync(subs []interfaces.SharedDurableSub) error {
@@ -141,8 +141,9 @@ func durableMsg(routingKey string) *protocol.Message {
 	return &protocol.Message{Body: []byte("durable-body"), RoutingKey: routingKey, DeliveryMode: 2}
 }
 
-// RB-1: a single durable copy: nothing is released before the fsync; then
-// onDurable(nil) followed by onReleased, once each, in that order.
+// RB-1: a single durable copy: the LEASE is released at the WAL WRITE (the
+// broker does not hold the body once the record's bytes are in the file),
+// while the CONFIRM (onDurable) waits for the fsync.
 func TestRetention_SingleDurableCopy(t *testing.T) {
 	release := gateWALFsync(t)
 	b, _, cleanup := newRetentionBroker(t, nil)
@@ -157,13 +158,19 @@ func TestRetention_SingleDurableCopy(t *testing.T) {
 	require.NoError(t, perr)
 	require.True(t, durableInflight)
 
-	assert.Equal(t, 0, ev.count("released"), "nothing may be released before the fsync")
+	// The WAL write has returned (the fsync is gated), so the broker does
+	// not hold the body any more and the lease is released — while the
+	// CONFIRM is still outstanding (the durability barrier is intact).
 	assert.Equal(t, 0, ev.count("durable"), "onDurable must not fire before the fsync")
+	require.Eventually(t, func() bool { return ev.count("released") == 1 }, 30*time.Second, time.Millisecond,
+		"the lease must be released at the WAL write")
+	assert.Equal(t, []string{"released"}, ev.snapshot(),
+		"the lease releases at the write, before the confirm")
 
 	release()
-	require.Eventually(t, func() bool { return ev.count("released") == 1 }, 30*time.Second, time.Millisecond)
-	assert.Equal(t, []string{"durable", "released"}, ev.snapshot(),
-		"onReleased must fire after onDurable, exactly once each")
+	require.Eventually(t, func() bool { return ev.count("durable") == 1 }, 30*time.Second, time.Millisecond)
+	assert.Equal(t, []string{"released", "durable"}, ev.snapshot(),
+		"the lease releases at the write and the confirm at the fsync, exactly once each")
 }
 
 // RB-2: transient / no-route / mandatory-ErrNoRoute: synchronous release; no
@@ -240,12 +247,13 @@ func TestRetention_PartialFanoutReject(t *testing.T) {
 	require.ErrorIs(t, perr, ErrMaxLengthExceeded)
 
 	assert.Equal(t, 0, ev.count("durable"), "a rejected publish never fires onDurable")
-	assert.Equal(t, 0, ev.count("released"), "release must wait for the 2 accepted copies")
-
-	release()
-	require.Eventually(t, func() bool { return ev.count("released") == 1 }, 30*time.Second, time.Millisecond)
+	// The lease is released once the 2 accepted copies are WRITTEN (the
+	// broker does not hold their bodies any more).
+	require.Eventually(t, func() bool { return ev.count("released") == 1 }, 30*time.Second, time.Millisecond,
+		"the lease must be released once the accepted copies are written")
 	assert.Equal(t, 1, ev.count("released"))
 	assert.Equal(t, 0, ev.count("durable"))
+	release()
 }
 
 // RB-4: a queue torn down mid-fanout (StopCh): release after the 1st enqueued
@@ -272,10 +280,12 @@ func TestRetention_StopChMidFanout(t *testing.T) {
 	_, _, perr := b.PublishMessageAsyncConfirm("fx", "", durableMsg(""), onDurable, lease)
 	require.ErrorIs(t, perr, ErrQueueClosed)
 
-	assert.Equal(t, 0, ev.count("released"), "release must wait for the enqueued q1 copy")
-	release()
-	require.Eventually(t, func() bool { return ev.count("released") == 1 }, 30*time.Second, time.Millisecond)
+	// The lease is released once the enqueued q1 copy is WRITTEN (the broker
+	// does not hold its body any more).
+	require.Eventually(t, func() bool { return ev.count("released") == 1 }, 30*time.Second, time.Millisecond,
+		"the lease must be released once the enqueued copy is written")
 	assert.Equal(t, 1, ev.count("released"))
+	release()
 }
 
 // RB-5: the shared (fused) fan-out: release after all subs complete; a
@@ -336,7 +346,7 @@ func TestRetention_WALClosed(t *testing.T) {
 	_, err := b.DeclareQueue("dq", true, false, false, nil)
 	require.NoError(t, err)
 
-	fake.storeMessageAsync = func(queueName string, message *protocol.Message, onDurable func(error)) error {
+	fake.storeMessageAsync = func(queueName string, message *protocol.Message, onWritten func(), onDurable func(error)) error {
 		onDurable(storage.ErrWALClosed) // closed WAL: synchronous completion, nil return
 		return nil
 	}
@@ -347,7 +357,8 @@ func TestRetention_WALClosed(t *testing.T) {
 	require.NoError(t, perr)
 	require.True(t, durableInflight)
 	assert.Equal(t, 1, ev.count("released"), "synchronous ErrWALClosed completion must release exactly once")
-	assert.Equal(t, []string{"durable", "released"}, ev.snapshot())
+	assert.Equal(t, []string{"released", "durable"}, ev.snapshot(),
+		"the lease settles at the write, the confirm at the completion")
 }
 
 // RB-7: a backend without async durable support: synchronous release.
@@ -398,7 +409,7 @@ func TestRetention_PerCopyExactlyOne(t *testing.T) {
 
 	var mu sync.Mutex
 	var pending []func(error) // gated completions for accepted copies
-	fake.storeMessageAsync = func(queueName string, message *protocol.Message, onDurable func(error)) error {
+	fake.storeMessageAsync = func(queueName string, message *protocol.Message, onWritten func(), onDurable func(error)) error {
 		if queueName == "q5" {
 			return errors.New("injected enqueue error") // no completion will fire
 		}
@@ -506,7 +517,7 @@ func TestRetention_AcceptedRejectEnqueueMix(t *testing.T) {
 	// reject, q3 accept, q4 enqueue error.
 	var mu sync.Mutex
 	var pending []func(error)
-	fake.storeMessageAsync = func(queueName string, message *protocol.Message, onDurable func(error)) error {
+	fake.storeMessageAsync = func(queueName string, message *protocol.Message, onWritten func(), onDurable func(error)) error {
 		if queueName == "q4" {
 			return errors.New("injected enqueue error")
 		}
@@ -562,13 +573,17 @@ func TestRetention_PerQueueMultiCopySuccess(t *testing.T) {
 	require.NoError(t, perr)
 	require.True(t, durableInflight)
 
-	assert.Equal(t, 0, ev.count("released"), "release must wait for every accepted copy")
+	// The lease is released once EVERY accepted copy is WRITTEN (the broker
+	// does not hold their bodies any more); the confirm waits for the fsync.
 	assert.Equal(t, 0, ev.count("durable"), "onDurable must not fire before the fsync")
+	require.Eventually(t, func() bool { return ev.count("released") == 1 }, 30*time.Second, time.Millisecond,
+		"the lease must be released once every accepted copy is written")
+	assert.Equal(t, []string{"released"}, ev.snapshot())
 
 	release()
-	require.Eventually(t, func() bool { return ev.count("released") == 1 }, 30*time.Second, time.Millisecond)
-	assert.Equal(t, []string{"durable", "released"}, ev.snapshot(),
-		"exactly one durable + one release, in that order, once every copy completed")
+	require.Eventually(t, func() bool { return ev.count("durable") == 1 }, 30*time.Second, time.Millisecond)
+	assert.Equal(t, []string{"released", "durable"}, ev.snapshot(),
+		"exactly one release (at the write) + one durable (at the fsync)")
 }
 
 // RB-13: the mid-fanout StopCh bail with NO copy ever accepted (the FIRST
@@ -647,7 +662,7 @@ func TestRetention_NilOnReleased(t *testing.T) {
 	require.NoError(t, err)
 
 	// Enqueue error.
-	fake.storeMessageAsync = func(queueName string, message *protocol.Message, onDurable func(error)) error {
+	fake.storeMessageAsync = func(queueName string, message *protocol.Message, onWritten func(), onDurable func(error)) error {
 		return errors.New("injected enqueue error")
 	}
 	_, _, err = b.PublishMessageAsyncConfirm("fx", "", durableMsg(""), func(error) {}, protocol.PublishLeaseToken{})

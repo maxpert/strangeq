@@ -45,8 +45,32 @@ type MessageStore interface {
 	// Does NOT write to WAL (message is already in WAL, we're loading FROM WAL)
 	LoadMessageFromRecovery(queueName string, message *protocol.Message) error
 
-	// GetMessage retrieves a specific message by delivery tag
+	// GetMessage retrieves a specific message by delivery tag.
+	//
+	// IT IS A PEEK: it does NOT admit what it read into the hot cache. The
+	// hot cache holds PUBLISHED messages, and the queue's reported message
+	// count and message list are hot-resident operations over exactly that
+	// set — a read that admitted what it read would turn a READ into a
+	// PUBLISH as far as the count is concerned (the TTL reaper probes every
+	// ready tag on every sweep, and each probe would inflate the count).
+	//
+	// A DELIVERY uses GetMessageForDelivery instead: the write-through
+	// admission is attributable to a consumer delivery, not to a probe.
 	GetMessage(queueName string, deliveryTag uint64) (*protocol.Message, error)
+
+	// GetMessageForDelivery retrieves a specific message by delivery tag for
+	// a CONSUMER DELIVERY, and admits what it read into the hot cache (the
+	// write-through admission: the message is in the consumer's working set,
+	// so it is RAM-resident again).
+	//
+	// The admission is atomic with the acknowledgement: an acknowledged tag
+	// is never admitted, never served from the hot cache and never counted
+	// by it.
+	//
+	// It is atomic with the queue's RANGE REMOVALS too (the range purge and
+	// the queue deletion): a tag settled by either is never admitted, never
+	// served from the hot cache and never counted by it.
+	GetMessageForDelivery(queueName string, deliveryTag uint64) (*protocol.Message, error)
 
 	// DeleteMessage removes a message from storage after acknowledgment
 	DeleteMessage(queueName string, deliveryTag uint64) error

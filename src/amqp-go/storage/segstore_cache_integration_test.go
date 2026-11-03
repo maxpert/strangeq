@@ -112,7 +112,7 @@ func TestSegstoreAsyncFailureNeverCaches(t *testing.T) {
 	const queue, tag = "async-failure", uint64(1)
 	msg := &protocol.Message{DeliveryTag: tag, DeliveryMode: 2, Body: []byte("not-durable")}
 	done := make(chan error, 1)
-	require.NoError(t, ds.StoreMessageAsync(queue, msg, func(err error) { done <- err }))
+	require.NoError(t, ds.StoreMessageAsync(queue, msg, nil, func(err error) { done <- err }))
 
 	select {
 	case err := <-done:

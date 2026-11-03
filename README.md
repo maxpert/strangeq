@@ -38,7 +38,7 @@ RabbitMQ is the gold standard for AMQP 0.9.1, but it runs on the Erlang VM — a
 - Queue length limits — `x-max-length` / `x-max-length-bytes` with `x-overflow` (`drop-head`, `reject-publish`)
 - Resource alarms — `connection.blocked` / `connection.unblocked` driven by memory (RSS) and free-disk watermarks
 - Exclusive and auto-delete queues with automatic cleanup (exclusive queues deleted on owning-connection close; auto-delete queues deleted when the last consumer leaves)
-- Higher durable end-to-end throughput than RabbitMQ 4.3 Classic queues on 64 KB messages with 10 producers / 10 consumers (1.58x), with lower peak memory (see [Performance](#performance))
+- Lower peak memory than RabbitMQ 4.4 Classic on every measured workload (0.23x–0.82x of stock; 0.18x–0.55x of a tuned RabbitMQ) — our strongest and most stable advantage — plus higher durable throughput on the 1 KiB workloads. We do **not** beat RabbitMQ on 64 KiB durable throughput; see [Performance](#performance)
 - Prometheus metrics and pprof profiling
 - Lock-free per-queue ring buffer with per-slot CAS
 - Batch TCP writes and ACK offloading
@@ -295,78 +295,123 @@ Key engine tuning parameters:
 
 ## Performance
 
-Throughput is measured as **end-to-end delivered messages per second (msg/s)**: every published message is delivered and acknowledged. Both brokers are tested with the same client ([`cmd/perftest`](src/amqp-go/cmd/perftest), built on [amqp091-go](https://github.com/rabbitmq/amqp091-go)) and identical settings.
+Throughput is measured as **end-to-end delivered messages per second (msg/s)**: every published message is delivered and acknowledged, and `lost=0`. Both brokers are driven by the same client ([`cmd/perftest`](src/amqp-go/cmd/perftest), built on [amqp091-go](https://github.com/rabbitmq/amqp091-go)) with identical flags.
 
-**Common settings**
-- Single Apple Silicon machine with 16 cores.
-- Durable queues, publisher confirms, fsync enabled, consumer prefetch 100, and manual acknowledgements.
-- No message loss or unconfirmed publishes.
+### How to read this
 
-### Latest benchmark (2026-10-27)
+**Contract (both brokers).** One 16-core Apple Silicon machine (M4 Max) with an APFS data volume; one broker runs at a time. Durable queue (RabbitMQ Classic; StrangeQ durable), persistent messages, publisher confirms, consumer prefetch 100, an outstanding window of 1000, manual acknowledgements. A 10 s warm-up is followed by a 30 s measured window; throughput is the median per-second receive rate over seconds 6–30.
 
-Each workload used a 10-second warmup followed by a 30-second measurement, repeated and reported as the median. Both brokers ran in the same session, on the same machine, with the same client and the same settings.
+**Validity.** Each cell is a complete run behind a gate: `lost=0`, `unconfirmed=0`, `nacked=0`, `published == confirmed`, the queue drains to empty, the queue type is verified (`classic`), the broker binary sha256 matches, and no process panicked. The pre-cell external load must clear the harness quiet gate; cells that fail any gate are retried up to three times, and cell order is rotated and interleaved across arms and repetitions.
 
-| Message size | Producers / consumers | StrangeQ | RabbitMQ 4.4 Classic | StrangeQ / RabbitMQ |
-|---|--:|--:|--:|--:|
-| 1 KB | 1 / 1 | 117,439 msg/s | 94,476 msg/s | **1.24x** |
-| 1 KB | 10 / 10 | 127,324 msg/s | 74,588 msg/s | **1.71x** |
-| 1 KB | 32 / 32 | 120,478 msg/s | 44,574 msg/s | **2.70x** |
-| 1 KB | 4 queues, 3 / 3 each | 130,537 msg/s | 119,204 msg/s | **1.10x** |
-| 64 KB | 1 / 1 | 26,228 msg/s | 34,167 msg/s | 0.77x |
-| 64 KB | 10 / 10 | 28,879 msg/s | 20,874 msg/s | **1.38x** |
+**Two RabbitMQ references.** Every comparison is made against RabbitMQ both at its **default** ("stock") configuration and at its **best-measured configuration for that workload**. The best configuration is workload-dependent — the tuned config on the 1 KiB rows, the socket-tuned config on 64 KiB 10p/10c, and on 64 KiB 1p/1c effectively the default, because every RabbitMQ tuning knob either lowers that row or lands within rep-spread noise. Both references are reported so it is always clear which one a ratio uses.
 
-Memory usage (peak RSS):
+**WAL size.** The benchmark ran StrangeQ with a **64 MiB** WAL file size (`walfilesize: 67108864`). A 1 GiB option is planned but not shipped (see [Planned, not shipped](#planned-not-shipped)).
 
-| Workload | StrangeQ | RabbitMQ 4.4 Classic | StrangeQ / RabbitMQ |
-|---|--:|--:|--:|
-| 1 KB, 1 / 1 | 94 MB | 244 MB | **0.39x** |
-| 1 KB, 10 / 10 | 352 MB | 413 MB | **0.85x** |
-| 1 KB, 32 / 32 | 469 MB | 554 MB | **0.85x** |
-| 1 KB, 4 queues, 3 / 3 each | 888 MB | 399 MB | 2.23x |
-| 64 KB, 1 / 1 | 557 MB | 1,172 MB | **0.48x** |
-| 64 KB, 10 / 10 | 1,022 MB | 1,607 MB | **0.64x** |
+**Ranges.** Where a workload shows a range, that is **session-to-session variation of the same arm** — the same configuration re-run in separate sessions — not rep-to-rep spread inside one session.
 
-On the five single-queue workloads StrangeQ used **0.39x to 0.85x** of RabbitMQ's memory, and used less on every metric (idle, steady, peak, and bytes held per in-flight message) on every one of them.
+### Throughput
 
-**The 64 KB, 1 / 1 row is the exception, and it is a durability difference, not a defect.** RabbitMQ Classic does not flush to disk before it confirms a publish; StrangeQ does an `F_FULLFSYNC` (a full drive-cache flush) before every publisher confirm, so a confirmed message is on the platter. On 64 KiB bodies with a single producer that flush dominates: the write-ahead log commits 487 messages (31 MB) per flush, the flush takes 12.7 ms, and the whole commit cycle takes 17.8 ms. This machine's durable write bandwidth puts a ceiling of roughly 31,800 messages/second on that shape — and RabbitMQ, which does not wait for the disk at all, reaches about 34,000. We report the row rather than hide it, and we do not weaken the flush to win it. The rows where the data fits the device's durable bandwidth (1 KiB) and the rows where concurrency hides the flush latency (10 / 10) are won decisively.
+`msg/s`, window median. "Best config" is RabbitMQ's best measured configuration for that row, named in the row. All figures are RabbitMQ 4.4 Classic.
 
-Median publisher-confirm latency was 7.0 ms (1 KB, 1 / 1), 79.7 ms (1 KB, 10 / 10), 31.0 ms (64 KB, 1 / 1) and 137.6 ms (64 KB, 10 / 10) for StrangeQ, against 8.3 ms, 128.4 ms, 436 ms and 32.8 ms for RabbitMQ Classic. RabbitMQ's confirm does not wait for the disk, so it is not a like-for-like comparison on the rows where a flush dominates: on 64 KB bodies a single producer RabbitMQ confirms 436 ms late, and StrangeQ confirms in 31 ms.
+| Workload | RabbitMQ stock | RabbitMQ best config | StrangeQ | vs stock | vs best | Verdict |
+|---|---:|---:|---:|---:|---:|---|
+| F1 — 1 KiB, 1p/1c | 93,783 | 97,996 (tuned) | 112,080 | 1.20x | 1.14x | **Win** |
+| F2 — 1 KiB, 10p/10c | 75,360 | 87,902 (tuned) | 135,548 | 1.80x | 1.54x | **Win** |
+| F3 — 64 KiB, 1p/1c | 34,475–35,037 | 35,322 (stats-only) | 26,142–26,306 | ~0.75x | ~0.74x | **Loss** |
+| F4 — 64 KiB, 10p/10c | 20,480–21,052 | 37,674 (socket-tuned + client pin) | 30,204–31,008 | ~1.44–1.51x | ~0.80–0.82x | Win vs stock, **loss vs best** |
+| F5 — 1 KiB, 32p/32c | 45,534 | not measured | 125,357 | 2.75x | — | Win (older session) |
 
-**Memory scaling:** StrangeQ's resident memory is driven by in-flight message data (message size x outstanding window), not by connection count. RabbitMQ's grows with connections, because each connection carries its own Erlang process heap. On the 4-queue workload RabbitMQ's node was 399 MB while StrangeQ was 888 MB — the one shape where StrangeQ uses more, because the workload is really 12 concurrent connections publishing 1 KiB messages, and StrangeQ's memory tracks the 12,000 messages in flight rather than the 12 connections.
+- **F3 is a loss, and it is a durability exception rather than merely a slow row** — the two brokers are honouring different contracts. See [Confirm latency and the durability difference](#confirm-latency-and-the-durability-difference). Every F3 tuning arm makes RabbitMQ worse or is within noise: stock 34,475–35,037; stats-only 35,322 (+0.8% = noise); TCP-buffer-only 28,670–28,818; full tuned 28,928–29,601; aggressive (queue-index embedding + busy-wait) 18,322. RabbitMQ's best F3 configuration is its default.
+- **F4 flips with the reference.** Stock RabbitMQ collapses to ~20.5k under 10p/10c contention; its socket-buffer tuning recovers that row to ~37.1k–37.7k (TCP-only 37,100–37,332; +client socket pin 37,674; full tuned 36,821–37,050; stats-only 21,868). StrangeQ's ~30.2k–31.0k beats stock by ~1.5x and **loses to the tuned reference by ~0.82x**. We report both.
+- **F5 is from an older candidate session** and was not re-measured with the current build; treat its ratio as historical.
 
-### Multi-queue scaling (durable + publisher confirms)
+**Where the wins come from.** StrangeQ's engine is co-designed with its storage and dispatch path, so CPU and queue-dispatch work parallelise across the producer/consumer fan-out where RabbitMQ Classic serialises a queue. That is where the win lives: the CPU/dispatch-bound 1 KiB rows (F2 1.54x, F5 2.75x). On the 64 KiB rows the wall is the **durable write bandwidth**, not dispatch, and parallelism buys nothing there. We do not claim a blanket parallelism win.
 
-3 producers / 3 consumers per queue, 1 KB bodies, one client process per queue. Aggregate consumed msg/s, zero loss, evenly balanced across queues.
+**Sockets are not our bottleneck.** Sweeping StrangeQ's network read/write buffers across kernel-auto, 192 KiB, 256 KiB (shipped), 512 KiB and 1 MiB moves F4 by ~1.7% and F3 by ~0.1% — it does not move. The equivalent pin on RabbitMQ moves **its** F4 by +79.5% and its F3 by −17.9%: stock RabbitMQ was sitting on unhelpful socket-buffer defaults; we were not. StrangeQ's best F4 arm is the kernel-auto setting (30,722 msg/s); the shipped 256 KiB gives 30,204, and pinning the client's sockets too gives 30,379 — all inside one ~2% band.
 
-| Queues | StrangeQ aggregate | RabbitMQ 4.4 Classic | StrangeQ / RabbitMQ |
-|---|--:|--:|--:|
-| 1 | 123,354 msg/s | — | — |
-| 2 | 133,377 msg/s | — | — |
-| 4 | 130,537 msg/s | 119,204 msg/s | **1.10x** |
+### Memory
 
-### Crash safety
+Peak resident set size is StrangeQ's strongest and most stable advantage. On **every** workload, StrangeQ's peak RSS is **0.23x–0.82x of stock RabbitMQ's**, and it is lower still against RabbitMQ's tuned configuration (**0.18x–0.55x**). Tuning *costs* RabbitMQ memory on every row.
 
-Confirmed durable messages survive `kill -9` and are recovered on restart. The invariant is **confirm ⇒ fsynced ⇒ recoverable**: a publish is confirmed only after its WAL batch is fsynced, so every confirmed message is present after a crash.
+Peak RSS, MB:
 
-This holds with `storage.fsync: true` (the default). With `fsync: false`,
-confirms are sent before data reaches stable storage and a crash or power loss
-can lose confirmed messages.
+| Workload | StrangeQ | RabbitMQ stock | vs stock | RabbitMQ tuned | vs tuned |
+|---|---:|---:|---:|---:|---:|
+| F1 — 1 KiB, 1p/1c | 89 | 262 | 0.34x | 508 | 0.18x |
+| F2 — 1 KiB, 10p/10c | 348 | 423 | 0.82x | 1,015 | 0.34x |
+| F3 — 64 KiB, 1p/1c | 256–329 | 1,125 | 0.23x–0.29x | 952–1,365 | 0.19x–0.35x |
+| F4 — 64 KiB, 10p/10c | 920–996 | 1,596 | 0.58x–0.62x | 1,815–2,079 | 0.44x–0.55x |
+| F5 — 1 KiB, 32p/32c | 425 | 555 | 0.77x | not measured | — |
+
+**Which metric separates.** The clean, stable separation is on **peak** RSS. **Idle** RSS is further apart and just as stable: StrangeQ holds ~20 MB on every row against RabbitMQ's 162–187 MB. Resident bytes per in-flight message also separate on the 64 KiB rows (F3 410 vs 859 B/msg; F4 1,021 vs 2,234 B/msg — against the tuned config those become 1,381 and 1,506 B/msg, so the gap widens). **Steady-state RSS is noisy across repetitions**, so we do **not** claim that all four metrics separate cleanly; where steady is close (1 KiB 10p/10c: StrangeQ 347 MB vs stock 398 MB) we say so rather than round it up to a clean win. Peak (and idle) are the claims worth defending.
+
+StrangeQ's resident memory is driven by in-flight message data (message size × outstanding window), not connection count — its idle RSS is ~20 MB whether there are 2 connections or 64.
+
+### Confirm latency and the durability difference
+
+Publisher-confirm latency (p50) under load, current build unless noted:
+
+| Workload | StrangeQ | RabbitMQ Classic (stock) |
+|---|---:|---:|
+| F1 — 1 KiB, 1p/1c | ~7.3 ms | ~8.4 ms |
+| F2 — 1 KiB, 10p/10c | ~69.6 ms | ~125.8 ms |
+| F3 — 64 KiB, 1p/1c | ~27.5–30.9 ms | **~432–459 µs** |
+| F4 — 64 KiB, 10p/10c | ~155 ms | ~33 ms |
+
+Confirm latency under load reflects the client window and the batch cadence as much as the disk, so on its own it is not a durability ranking. **F3 is the row that isolates the difference**, because the single producer's window is the whole story there. (On F4, stock RabbitMQ confirms in ~33 ms only because its throughput has collapsed to ~20.5k; the socket-tuned RabbitMQ that *wins* F4 confirms in ~137 ms, close to StrangeQ's ~155 ms.)
+
+On F3 the two brokers are confirming under **different durability contracts**:
+
+- **StrangeQ confirms only after `fcntl(F_FULLFSYNC)` returns** on the WAL batch — a full drive-cache flush. The measured durable write bandwidth of this machine is ~2.3 GiB/s, so a 64 KiB message costs ~28 µs of forced flush, independent of batch size. The commit cycle is ~18 ms for ~450 messages, of which the fsync alone is ~13 ms. A confirmed StrangeQ message is on stable storage.
+- **RabbitMQ Classic confirms from the page cache.** Its own documentation says classic queues are "suitable for use cases where data safety is not a priority … If data safety is a priority, the recommendation is to use quorum queues"; that "a RabbitMQ node can lose persistent messages if it fails before said messages are written to disk"; and that the message store "persists messages to disk in batches after an interval (a few hundred milliseconds)". Its measured confirm p50 of ~432–459 µs — against that documented few-hundred-millisecond flush interval — is the evidence that Classic confirms before the flush completes.
+
+The F3 row therefore compares **two different durability contracts**: StrangeQ's acknowledgements survive power loss; Classic's confirmed-but-unflushed messages do not. We report the row rather than hide it, and we do not weaken the flush to win it.
+
+**Group commit is already in place.** ~450 messages share one flush, and a single flush releases every confirm in the batch. Larger batches are not a lever: the flush is bandwidth-bound (the per-byte cost is constant), and the ingest path is already ~96% utilised refilling the client window. With `fsync: false` StrangeQ reaches **35,288 msg/s** on F3 — **parity** with stock RabbitMQ (34,475–35,037), not a win, because both are then bounded by the same device write bandwidth. That is the honest disclosure: the durable contract is what costs the ~0.75x, and removing it buys exactly parity, no more.
+
+**Compression is not a lever.** The benchmark builds every body from an all-zero buffer, which would compress about 1000:1; claiming a win from that would be benchmark gaming. On real payloads the LZ4-class CPU cost is a wash or a loss for the 64 KiB rows.
+
+### Durability modes
+
+| `storage.fsync` | Publisher-confirm semantics | F3 (64 KiB, 1p/1c) |
+|---|---|---|
+| `true` (default) | A publish is confirmed only after its WAL batch's `F_FULLFSYNC` returns. The invariant is **confirm ⇒ fsynced ⇒ recoverable**: confirmed durable messages survive `kill -9` and power loss. | 26,142–26,306 msg/s |
+| `false` | Confirms are sent before data reaches stable storage. **A crash or power loss can lose confirmed messages.** Faster, and exactly as durable as RabbitMQ Classic's page-cache confirms on this workload. | 35,288 msg/s (older 64 MiB session) |
+
+The `fsync: false` figure is a diagnostic run, not a shipped default.
+
+### What we do not claim
+
+- **We do not beat RabbitMQ on 64 KiB durable throughput.** F3 is ~0.75x and F4 is ~0.82x against RabbitMQ's best configuration. F3 is a durability exception, not a tuning problem.
+- **We do not claim F4 as a win against a socket-tuned RabbitMQ.** It is a win against stock (~1.5x) and a loss against the socket-tuned reference (~0.82x).
+- **F5 is from an older session** and was not re-measured with the current build.
+- **The 1 GiB WAL is not shipped.** The published tables use the 64 MiB benchmark setting.
+- **We do not claim steady-state RSS separates cleanly on every row** (peak and idle do).
+- **We do not claim compression**, on these all-zero bodies or as a general lever.
+- **We do not claim a blanket parallelism win** — it applies to the CPU/dispatch-bound 1 KiB rows, not the durable-write-bound 64 KiB rows.
+
+### Planned, not shipped
+
+A **1 GiB WAL file size**, measured in a controlled A/B, gives F3 **25,098 → 28,378 msg/s (+13.1%)** and drops WAL rolls from ~18.2/s to ~1.7/s. It is not in the build reported above: the shipped sample config defaults to 512 MiB, and the benchmark ran at 64 MiB. It will be exposed as a configurable option.
 
 ### Reproducing
 
 ```bash
 cd src/amqp-go
 
-# 10 producers / 10 consumers, 64 KB bodies, 30s
+# 64 KiB, 10 producers / 10 consumers, durable + confirms, 30s
 go run ./cmd/perftest -url amqp://guest:guest@localhost:5672/ \
-  -durable -confirm -producers 10 -consumers 10 -size 65536 -duration 30s
+  -durable -confirm -producers 10 -consumers 10 -size 65536 \
+  -duration 30s -outstanding 1000 -prefetch 100
 ```
 
-Point `-url` at either broker (both speak AMQP 0.9.1). To run RabbitMQ 4.3 the same way:
+Point `-url` at either broker (both speak AMQP 0.9.1). Each cell's throughput and per-second window are printed by the client; run a 10 s warm-up first, or compare only the stable portion of the window. To run RabbitMQ 4.4 the same way:
 
 ```bash
-docker run -d --name rabbitmq-bench --platform linux/arm64 -p 5672:5672 rabbitmq:4.3-management
+docker run -d --name rabbitmq-bench --platform linux/arm64 -p 5672:5672 rabbitmq:4.4-management
 ```
+
+The durability figures depend on the platform's full-flush primitive (`F_FULLFSYNC` on macOS), so run on the same kind of storage you intend to deploy against.
 
 A Go microbenchmark (`BenchmarkVersus`) also exists for allocation and latency profiling of the hot path.
 
@@ -509,7 +554,7 @@ The following RabbitMQ features are not implemented:
 4. Load persistent messages into ring buffers
 5. Restore pending acknowledgments
 
-Recovery is incremental and completes in milliseconds for typical workloads.
+Recovery is incremental (recovery time is not measured in this document).
 
 ## Production Deployment
 

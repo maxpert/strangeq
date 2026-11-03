@@ -77,8 +77,40 @@ func leaseServer(t *testing.T, budget int64, mutate func(*config.AMQPConfig), tw
 	return srv, addr, created, released, probe
 }
 
-// gateWALFsync holds every WAL group-commit fsync until release is called
+// gateWALWrite holds every WAL group-commit WRITE until release is called
 // (process-global hook: tests using it must not run parallel).
+//
+// IT GATES THE WRITE, NOT THE FSYNC: the publish lease is released at the
+// WRITE (the broker does not hold the body once the record's bytes are in
+// the file), so a test that needs a lease to stay HELD must hold the write.
+func gateWALWrite(t *testing.T) (release func()) {
+	t.Helper()
+	gate := make(chan struct{})
+	var once sync.Once
+	restore := storage.SetWALWriteVecForTest(func(f *os.File, parts [][]byte) (int, error) {
+		<-gate
+		total := 0
+		for _, p := range parts {
+			if len(p) == 0 {
+				continue
+			}
+			n, err := f.Write(p)
+			total += n
+			if err != nil {
+				return total, err
+			}
+		}
+		return total, nil
+	})
+	t.Cleanup(restore)
+	t.Cleanup(func() { once.Do(func() { close(gate) }) })
+	return func() { once.Do(func() { close(gate) }) }
+}
+
+// gateWALFsync holds every WAL group-commit fsync until release is called
+// (process-global hook: tests using it must not run parallel). It holds the
+// DURABILITY barrier only: the write has already happened, so the publish
+// lease is already released.
 func gateWALFsync(t *testing.T) (release func()) {
 	t.Helper()
 	gate := make(chan struct{})
@@ -249,7 +281,7 @@ func leaseBody(n int) []byte { return make([]byte, n) }
 // SL-1: with G fitting exactly two leases, the third header waits in Reserve
 // BEFORE its body is read and before a confirm tag is minted.
 func TestLease_ReservedAtHeaderBeforeBodyAndTag(t *testing.T) {
-	release := gateWALFsync(t)
+	release := gateWALWrite(t)
 	srv, addr, _, _, _ := leaseServer(t, 1<<20, nil, nil)
 
 	r := dialRaw(t, addr)
@@ -350,11 +382,25 @@ func TestLease_FairnessHogAndLight(t *testing.T) {
 		cfg.Engine.WALBatchSize = 1 // one fsync per publish: per-publish completion cadence
 	}, nil)
 
-	// Token-gated fsync: one token completes one publish.
+	// Token-gated WRITE: one token completes one publish. The lease is
+	// released at the write (the broker does not hold the body once the
+	// record's bytes are in the file), so the write is the point that has to
+	// be held for the lease to stay held.
 	tokens := make(chan struct{})
-	restore := storage.SetWALGroupCommitFsyncForTest(func(f *os.File) error {
+	restore := storage.SetWALWriteVecForTest(func(f *os.File, parts [][]byte) (int, error) {
 		<-tokens
-		return nil
+		total := 0
+		for _, p := range parts {
+			if len(p) == 0 {
+				continue
+			}
+			n, err := f.Write(p)
+			total += n
+			if err != nil {
+				return total, err
+			}
+		}
+		return total, nil
 	})
 	t.Cleanup(restore)
 	t.Cleanup(func() { close(tokens) })
@@ -413,7 +459,7 @@ func TestLease_FairnessHogAndLight(t *testing.T) {
 	// Complete the hog's first publish → its release grants the hog's second
 	// header (FIFO head). Then the second publish completes → the light header
 	// is granted: exactly 2 grants after the light reserve.
-	tokens <- struct{}{} // hog msg1 fsync
+	tokens <- struct{}{} // hog msg1 write
 	require.Eventually(t, func() bool {
 		mu.Lock()
 		defer mu.Unlock()
@@ -426,7 +472,7 @@ func TestLease_FairnessHogAndLight(t *testing.T) {
 		return grants >= 2
 	}, 30*time.Second, time.Millisecond, "hog msg2 must be granted next (FIFO head)")
 
-	tokens <- struct{}{} // hog msg2 fsync → light msg1 granted
+	tokens <- struct{}{} // hog msg2 write → light msg1 granted
 	leaseWaitAck(t, light, 1, 1)
 	<-lightBody
 
@@ -459,7 +505,7 @@ func TestLease_FairnessHogAndLight(t *testing.T) {
 	assert.LessOrEqual(t, grantsBetween, 2, "light header granted within <= 2 grants of its reserve")
 
 	// The hog completes.
-	tokens <- struct{}{} // light msg1 fsync → hog msg2 released earlier; hog msg2's own fsync needs a token too
+	tokens <- struct{}{} // light msg1 write → hog msg2 released earlier; hog msg2's own write needs a token too
 	leaseWaitAck(t, hog, 1, 2)
 	<-hogBody2
 	require.Eventually(t, func() bool { return leaseUsed(srv) == 0 }, 30*time.Second, time.Millisecond)
@@ -528,7 +574,7 @@ func TestLease_1000Connections(t *testing.T) {
 // at used == 0; a header over MaxMessageSize gets the existing 406 with used
 // unchanged.
 func TestLease_OversizedProgress(t *testing.T) {
-	release := gateWALFsync(t)
+	release := gateWALWrite(t)
 	srv, addr, _, _, probe := leaseServer(t, 1<<20, nil, nil)
 
 	r := dialRaw(t, addr)
@@ -583,7 +629,7 @@ func startPipeServerConnection(t *testing.T, srv *Server) (*rawAMQP, <-chan stru
 // (heartbeat write failure, hb > 0) or by limiter.Close (hb == 0).
 func TestLease_WedgedWALClientGone(t *testing.T) {
 	t.Run("hb>0 heartbeat write failure cancels the wait", func(t *testing.T) {
-		release := gateWALFsync(t)
+		release := gateWALWrite(t)
 		srv := newTransactionTestServer(t)
 		srv.Config.Network.PublishInflightBudgetBytes = 1000
 
@@ -619,7 +665,7 @@ func TestLease_WedgedWALClientGone(t *testing.T) {
 	})
 
 	t.Run("hb=0 wait ends at limiter Close", func(t *testing.T) {
-		release := gateWALFsync(t)
+		release := gateWALWrite(t)
 		srv := newTransactionTestServer(t)
 		srv.Config.Network.PublishInflightBudgetBytes = 1000
 
@@ -656,7 +702,7 @@ func TestLease_WedgedWALClientGone(t *testing.T) {
 // leases; a broker-held (transferred) lease releases on WAL completion even
 // after the connection is gone.
 func TestLease_ConnectionCloseReleasesAll(t *testing.T) {
-	release := gateWALFsync(t)
+	release := gateWALWrite(t)
 	srv, addr, created, released, _ := leaseServer(t, 0, nil, nil)
 
 	// Track WAL staging so we know msg1 reached the broker (lease transferred).
@@ -820,7 +866,7 @@ func TestLease_DiscardGatesRelease(t *testing.T) {
 // SL-11: on a mixed consumer+producer connection, acks are processed after
 // the grant and the connection stays open.
 func TestLease_MixedConnAcksAfterGrant(t *testing.T) {
-	release := gateWALFsync(t)
+	release := gateWALWrite(t)
 	srv, addr, _, _, _ := leaseServer(t, 1<<20, nil, nil)
 
 	// Producer fills the queue transiently (no leases held).
@@ -1074,7 +1120,7 @@ func TestLease_NoLeakPerLease(t *testing.T) {
 // SL-14: interleaved channels within budget: ch2's nested header TryReserve
 // succeeds; interleaved bodies both confirm.
 func TestLease_InterleavedChannelsWithinBudget(t *testing.T) {
-	release := gateWALFsync(t)
+	release := gateWALWrite(t)
 	srv, addr, _, _, _ := leaseServer(t, 1<<20, nil, nil)
 
 	r := dialRaw(t, addr)
@@ -1117,7 +1163,7 @@ func TestLease_InterleavedChannelsWithinBudget(t *testing.T) {
 // TryReserve fails → 506 close; ch2 content is never processed; teardown
 // releases everything.
 func TestLease_NestedHeaderOverBudgetCloses(t *testing.T) {
-	release := gateWALFsync(t)
+	release := gateWALWrite(t)
 	srv, addr, created, released, probe := leaseServer(t, 1<<20, nil, nil)
 
 	// X: ch1 publishes 600 KiB (lease ≈ 615272) but only sends part of the
@@ -1555,7 +1601,7 @@ func TestLease_TokenNilSafeAndPutAsserts(t *testing.T) {
 	})
 
 	t.Run("async durable releases on completion", func(t *testing.T) {
-		release := gateWALFsync(t)
+		release := gateWALWrite(t)
 		srv, conn, frameCh := newSrvConn(t)
 		declare(t, srv, conn, frameCh, "sl18-dq")
 		if v, ok := conn.Channels.Load(uint16(1)); ok {
@@ -1627,7 +1673,7 @@ func TestLease_TokenNilSafeAndPutAsserts(t *testing.T) {
 // SL-19: shutdown Close fails waiters; leases held by fsync-blocked publishes
 // release when the fsync is released; used == 0.
 func TestLease_LimiterCloseWithOutstanding(t *testing.T) {
-	release := gateWALFsync(t)
+	release := gateWALWrite(t)
 	srv, addr, created, released, _ := leaseServer(t, 1<<20, nil, nil)
 
 	// A: durable publish, lease broker-held behind the gated fsync.

@@ -105,6 +105,8 @@ func (b *StorageBroker) dropHeadEvictOne(qs *QueueState, queueName string, polic
 			return false
 		}
 		// Read the body BEFORE deleting, for dead-lettering + byte accounting.
+		// A PEEK, NOT A DELIVERY: the message is being EVICTED, so the read
+		// must not admit it into the hot cache.
 		msg, err := b.storage.GetMessage(queueName, tag)
 		if err != nil || msg == nil {
 			// Gap tag: advance the depth frontier and keep looking — it was
@@ -176,6 +178,8 @@ func (b *StorageBroker) restoreReadyBytesOnRequeue(qs *QueueState, queueName str
 	if p == nil || !p.HasMaxLengthBytes {
 		return
 	}
+	// A PEEK, NOT A DELIVERY: this is a byte-accounting read of a requeued
+	// message, not a hand-off to a consumer, so it must not admit.
 	if msg, err := b.storage.GetMessage(queueName, tag); err == nil && msg != nil {
 		qs.AddReadyBytes(int64(len(msg.Body)))
 	}

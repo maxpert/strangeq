@@ -161,15 +161,24 @@ func TestWriteAsync_BatchGrowsUnderPipelining(t *testing.T) {
 	assert.Greater(t, avgBatch, 50.0, "average group-commit batch must be >> the blocking-path ceiling (got %.1f)", avgBatch)
 }
 
-// TestStoreMessageAsync_NotRetrievableBeforeFsync (TDD test 8, INVERTED for the
-// frontier redirect — guards A3, deferred ring.Store).
+// TestStoreMessageAsync_NotRetrievableBeforeFsync (TDD test 8, guards A3).
 //
-// ring.Store is DEFERRED into the WAL success completion, so a durable message
-// is NOT retrievable until its OWN fsync completes: with the fsync gated open,
-// GetMessage misses and the ring has no entry; only after the fsync is released
-// is the message retrievable. This is the storage-level half of A3 (a persistent
-// tag is not claimable/deliverable before durable); the broker/frontier tests
-// cover the cross-connection out-of-order case.
+// A durable message is NOT RETRIEVABLE until its OWN fsync completes: with
+// the fsync gated open, the record's bytes are in the file but the covering
+// fdatasync has not returned, so the message is NOT durable, and a raw
+// GetMessage must not hand it out. Only after the fsync is released does the
+// message become retrievable. This is the storage-level half of A3 (a
+// persistent tag is not claimable/deliverable before durable); the
+// broker/frontier tests cover the cross-connection out-of-order case.
+//
+// THE HOT CACHE IS A RAM HOLDER, NOT THE VISIBILITY GATE: the body IS
+// admitted to it the moment the WAL write returns (the bytes are in the file
+// and are re-readable), so the broker does not have to hold the body until
+// the fsync. But the admission is NOT-YET-DURABLE, and a not-yet-durable
+// entry behaves exactly like a message that is not in the WAL yet: it is not
+// served, not counted and not listed. The DURABILITY POINT (the completion,
+// after the fdatasync) marks it durable, and the queue depth advances there
+// too.
 func TestStoreMessageAsync_NotRetrievableBeforeFsync(t *testing.T) {
 	release := make(chan struct{})
 	var once sync.Once
@@ -193,22 +202,39 @@ func TestStoreMessageAsync_NotRetrievableBeforeFsync(t *testing.T) {
 	}
 
 	var durableFired atomic.Bool
-	require.NoError(t, ds.StoreMessageAsync("guard-q", msg, func(error) {
+	require.NoError(t, ds.StoreMessageAsync("guard-q", msg, nil, func(error) {
 		durableFired.Store(true)
 	}))
 
-	// fsync gated: NOT durable ⇒ NOT retrievable. ring has no entry, and
-	// GetMessage misses (ring miss + WAL index not yet populated).
+	// fsync gated: NOT durable ⇒ NOT retrievable. The hot cache holds the
+	// body (it is a RAM holder: the bytes are in the file and re-readable),
+	// but the entry is NOT-YET-DURABLE, so it is not served: the hot-hit
+	// path misses, and the cold read cannot find it either (the WAL's index
+	// is published only after the fsync).
+	require.Eventually(t, func() bool {
+		_, _, ok := ds.hot.GetResident("guard-q", tag)
+		return ok
+	}, 5*time.Second, 5*time.Millisecond,
+		"the body must be admitted to the hot cache at the write (the RAM holder)")
+
 	_, _, ok := ds.hot.Get("guard-q", tag)
-	assert.False(t, ok, "durable message must NOT be ring-resident before its fsync (deferred ring.Store, A3)")
+	assert.False(t, ok,
+		"a message that is not durable must NOT be served from the hot cache (A3)")
 	_, gerr := ds.GetMessage("guard-q", tag)
 	assert.Error(t, gerr, "durable message must NOT be retrievable before its fsync (A3)")
+	hot := ds.getQueueHot("guard-q")
+	require.NotNil(t, hot)
+	assert.EqualValues(t, 0, hot.ack.Head(),
+		"a message that is not durable must NOT be visible (the queue depth must not advance, A3)")
 	assert.False(t, durableFired.Load(), "onDurable must not fire before fsync completes (A1)")
 
-	// Release: the completion fires and the message becomes retrievable.
+	// Release: the completion fires, the entry becomes durable and the
+	// message becomes retrievable.
 	once.Do(func() { close(release) })
 	require.Eventually(t, durableFired.Load, 5*time.Second, 5*time.Millisecond,
 		"onDurable must fire once the fsync completes")
+	assert.EqualValues(t, tag, hot.ack.Head(),
+		"the queue depth must advance once the record is durable")
 	got, gerr2 := ds.GetMessage("guard-q", tag)
 	require.NoError(t, gerr2, "durable message must be retrievable after its fsync")
 	assert.Equal(t, msg.Body, got.Body)
@@ -425,7 +451,7 @@ func TestStoreMessageAsync_FsyncErrorNoRingStore(t *testing.T) {
 	msg := &protocol.Message{Body: []byte("doomed"), RoutingKey: "err-q", DeliveryMode: 2, DeliveryTag: tag}
 
 	done := make(chan error, 1)
-	require.NoError(t, ds.StoreMessageAsync("err-q", msg, func(e error) { done <- e }))
+	require.NoError(t, ds.StoreMessageAsync("err-q", msg, nil, func(e error) { done <- e }))
 
 	select {
 	case e := <-done:

@@ -93,7 +93,7 @@ func TestReadAhead_DoesNotCacheBeyondDurableEnd(t *testing.T) {
 		done := make(chan error, 1)
 		storage.StoreMessageAsync("q", &protocol.Message{
 			Body: []byte("not-durable-yet"), RoutingKey: "q", DeliveryMode: 2, DeliveryTag: bad,
-		}, func(e error) { done <- e })
+		}, nil, func(e error) { done <- e })
 		select {
 		case e := <-done:
 			require.Error(t, e, "tag 10's batch must be nacked")
@@ -144,7 +144,7 @@ func TestReadAhead_DoesNotCacheBeyondDurableEnd(t *testing.T) {
 		const inflight = uint64(10)
 		storage.StoreMessageAsync("q", &protocol.Message{
 			Body: []byte("in-flight"), RoutingKey: "q", DeliveryMode: 2, DeliveryTag: inflight,
-		}, func(error) {})
+		}, nil, func(error) {})
 
 		select {
 		case <-entered:

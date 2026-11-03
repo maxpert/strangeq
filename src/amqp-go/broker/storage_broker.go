@@ -678,7 +678,13 @@ type ringDeleterDetailed interface {
 // via onDurable. DisruptorStorage implements it; PublishMessageAsyncConfirm
 // falls back to the synchronous PublishMessage for any backend that does not.
 type asyncDurableWriter interface {
-	StoreMessageAsync(queueName string, message *protocol.Message, onDurable func(error)) error
+	// StoreMessageAsync enqueues the message's durable write.
+	//
+	// onWritten fires when the record's bytes are in the WAL file (the write
+	// returned) — the broker no longer holds the body from that point, so
+	// the publish lease's bytes come back there. onDurable fires after the
+	// covering fdatasync, and is where the publisher confirm is driven from.
+	StoreMessageAsync(queueName string, message *protocol.Message, onWritten func(), onDurable func(error)) error
 }
 
 // DefaultSharedBodyThreshold is the body size (bytes) at/above which a durable
@@ -1157,7 +1163,7 @@ func (b *StorageBroker) deliver(queueState *QueueState, state *ConsumerState, ms
 func (b *StorageBroker) deliverMessage(queueState *QueueState, state *ConsumerState, msgID uint64, redelivered bool) {
 	noAck := state.consumer.NoAck
 
-	message, err := b.storage.GetMessage(state.queueName, msgID)
+	message, err := b.storage.GetMessageForDelivery(state.queueName, msgID)
 	if err != nil {
 		// Gap tag (recovered/acked message no longer in storage). deliver() —
 		// which Stores the ledger entry — has not run, so no tag exists for any
@@ -1367,6 +1373,18 @@ func (b *StorageBroker) deadLetterOnDiscard(queueState *QueueState, queueName st
 	if p == nil || !p.HasDeadLetterExchange {
 		return
 	}
+	// A DEAD-LETTER READ IS A SETTLE, NOT A CONSUMER DELIVERY, so it PEEKS.
+	//
+	// Nothing asked for this message: it is being DISCARDED (it is
+	// dead-lettered and dropped), and the source message is removed from
+	// this queue immediately afterwards by the caller. Admitting it would
+	// only churn the hot cache (the entry is created and destroyed within
+	// the same call) and would inflate the queue's reported message count
+	// with a message that is about to be gone.
+	//
+	// This is the SAME contract the BATCH path follows (discardNackedBatch
+	// peeks), and the same contract the read triage states: a delivery
+	// admits, a peek does not.
 	msg, err := b.storage.GetMessage(queueName, deliveryTag)
 	if err != nil || msg == nil {
 		return
@@ -1427,6 +1445,10 @@ func (b *StorageBroker) discardNackedBatch(queueState *QueueState, queueName, co
 		}
 		b.storage.NackFromConsumer(queueName, consumerID, tag)
 		b.storage.DeletePendingAck(queueName, tag)
+		// A PEEK, NOT A DELIVERY: the message is being DISCARDED (it is
+		// dead-lettered and dropped), so the read must not admit it into
+		// the hot cache — the admission would inflate the queue's reported
+		// message count with a message that is about to be removed.
 		if msg, err := b.storage.GetMessage(queueName, tag); err == nil && msg != nil {
 			wg.Add(1)
 			sem <- struct{}{} // bounds in-flight republish goroutines
@@ -2942,24 +2964,60 @@ func (b *StorageBroker) publishMessage(exchangeName, routingKey string, message 
 // (leaseDone.BrokerDone) once. The guard prevents a premature fire if an early
 // copy's fsync completes before later copies are enqueued.
 type publishConfirmAgg struct {
-	remaining  atomic.Int32
-	onDurable  func(error)
-	errOnce    sync.Once
-	err        error
-	leaseDone  protocol.PublishLeaseToken
-	durableOff atomic.Bool // abandoned: no onDurable may fire anymore
+	remaining atomic.Int32
+	// leaseRemaining counts the copies whose BODY the broker has released,
+	// plus the setup guard. The publish lease is released when it reaches
+	// zero: the broker no longer holds those bodies, so the lease's budget
+	// must bound the bodies actually in the write pipeline, not the
+	// outstanding publish window.
+	//
+	// The ORDINARY path reports a copy here at its WAL WRITE (the bytes are
+	// in the file and the body is released). The FUSED shared-body path
+	// reports here at its COMPLETION, because the WAL still holds that
+	// body's copy in the staging buffer until the fsync.
+	leaseRemaining atomic.Int32
+	onDurable      func(error)
+	errOnce        sync.Once
+	err            error
+	leaseDone      protocol.PublishLeaseToken
+	durableOff     atomic.Bool // abandoned: no onDurable may fire anymore
 }
 
 func newPublishConfirmAgg(onDurable func(error), leaseDone protocol.PublishLeaseToken) *publishConfirmAgg {
 	a := &publishConfirmAgg{onDurable: onDurable, leaseDone: leaseDone}
 	a.remaining.Store(1) // setup guard
+	a.leaseRemaining.Store(1)
 	return a
 }
 
 // addCopy registers one durable copy. MUST be called BEFORE that copy's WAL
 // write is enqueued, so a completion that fires immediately can never drive
 // remaining to zero before every copy has been counted.
-func (a *publishConfirmAgg) addCopy() { a.remaining.Add(1) }
+func (a *publishConfirmAgg) addCopy() {
+	a.remaining.Add(1)
+	a.leaseRemaining.Add(1)
+}
+
+// reportBodyReleased records one copy whose BODY the broker no longer holds.
+// The lease's bytes come back when the LAST copy has released its body: the
+// publish lease's budget bounds the bodies actually in the write pipeline, not
+// the outstanding publish window.
+//
+// It fires the lease exactly once (at the zero transition), exactly like the
+// durable fan-in fires the confirm.
+func (a *publishConfirmAgg) reportBodyReleased() {
+	if a.leaseRemaining.Add(-1) == 0 {
+		a.leaseDone.BrokerDone()
+	}
+}
+
+// dropLeaseGuard drops the setup guard of the lease fan-in (the copies were
+// all enqueued, so they report their own body release).
+func (a *publishConfirmAgg) dropLeaseGuard() {
+	if a.leaseRemaining.Add(-1) == 0 {
+		a.leaseDone.BrokerDone()
+	}
+}
 
 // report records one settled copy (or the setup-guard drop). The first non-nil
 // error wins. When the last outstanding count clears, onDurable fires once (if
@@ -2981,7 +3039,6 @@ func (a *publishConfirmAgg) report(err error) {
 		if !a.durableOff.Load() && a.onDurable != nil {
 			a.onDurable(a.err)
 		}
-		a.leaseDone.BrokerDone()
 	}
 }
 
@@ -2991,7 +3048,11 @@ func (a *publishConfirmAgg) report(err error) {
 // accepted copies complete (or immediately when none were ever enqueued).
 func (a *publishConfirmAgg) abandon() {
 	a.durableOff.Store(true)
-	if a.remaining.Add(-1) == 0 {
+	a.remaining.Add(-1)
+	// The lease fan-in's guard goes with it: the copies that were already
+	// enqueued still report their body release, and the lease settles when
+	// the last of them does.
+	if a.leaseRemaining.Add(-1) == 0 {
 		a.leaseDone.BrokerDone()
 	}
 }
@@ -3007,7 +3068,10 @@ func (a *publishConfirmAgg) abandon() {
 // the counted total).
 func (a *publishConfirmAgg) abandonStranded(stranded int) {
 	a.durableOff.Store(true)
-	if a.remaining.Add(int32(-1-stranded)) == 0 {
+	a.remaining.Add(int32(-1 - stranded))
+	// The stranded copies will never report (their durable writes were never
+	// handed to the backend), so their counts go with the guard.
+	if a.leaseRemaining.Add(int32(-1-stranded)) == 0 {
 		a.leaseDone.BrokerDone()
 	}
 }
@@ -3223,7 +3287,36 @@ func (b *StorageBroker) PublishMessageAsyncConfirm(exchangeName, routingKey stri
 		pol := p
 		bodyLen := len(storeMsg.Body)
 		reserved := rejectPublish
+		//
+		// THE PUBLISH LEASE IS RELEASED AT THE WRITE, NOT AT THE CONFIRM.
+		// The write returns as soon as the record's bytes are in the WAL
+		// file; from that moment the broker does not hold the body (the
+		// bytes live in the file, and in the hot cache's bounded copy), so
+		// the lease's bytes must come back there. The lease's budget then
+		// bounds the bodies actually in the WRITE PIPELINE, not the
+		// outstanding publish window.
+		//
+		// THE DURABILITY BARRIER IS UNCHANGED: the queue depth (the
+		// visibility gate) and the publisher confirm still advance in the
+		// completion, i.e. after the covering fdatasync.
+		written := false
+		onWritten := func() {
+			written = true
+			if agg != nil {
+				agg.reportBodyReleased()
+			} else {
+				// Single-copy fast path: no fan-in; the lease joins this
+				// copy's own write.
+				leaseDone.BrokerDone()
+			}
+		}
 		completion := func(cerr error) {
+			if !written {
+				// The write never completed (the WAL write failed before
+				// the bytes reached the file): the copy still has to settle
+				// the lease.
+				onWritten()
+			}
 			qs.FrontierComplete(id, cerr == nil)
 			// A RESERVED copy's bytes were transferred into readyBytes by the
 			// frontier pop; only an unreserved copy adds them here (§7).
@@ -3239,19 +3332,18 @@ func (b *StorageBroker) PublishMessageAsyncConfirm(exchangeName, routingKey stri
 			if agg != nil {
 				agg.report(cerr)
 			} else {
-				// Single-copy fast path: no fan-in; the lease joins this copy's
-				// own completion.
+				// Single-copy fast path: no fan-in; the confirm is driven
+				// directly from this copy's completion.
 				if onDurable != nil {
 					onDurable(cerr)
 				}
-				leaseDone.BrokerDone()
 			}
 		}
 
 		if agg != nil {
 			agg.addCopy() // count BEFORE enqueue so an immediate completion can't underflow
 		}
-		if serr := adw.StoreMessageAsync(queueName, storeMsg, completion); serr != nil {
+		if serr := adw.StoreMessageAsync(queueName, storeMsg, onWritten, completion); serr != nil {
 			// Enqueue failed (e.g. WAL unavailable): the completion will NOT fire,
 			// so RELEASE the frontier slot we reserved for this tag — otherwise it
 			// stays pending forever and wedges the per-queue frontier, blocking all
@@ -3290,8 +3382,12 @@ func (b *StorageBroker) PublishMessageAsyncConfirm(exchangeName, routingKey stri
 	if agg != nil {
 		// Drop the setup guard. remaining is now (#durable copies) >= 1, so onDurable
 		// fires only once the last copy's fsync completes (asynchronously). Never
-		// fires synchronously here. The lease joins the same fan-in.
+		// fires synchronously here.
 		agg.report(nil)
+		// The lease fan-in's guard goes with it: the copies report their
+		// own body release, and the lease settles when the last of them
+		// does.
+		agg.dropLeaseGuard()
 	}
 	return true, backpressure, nil
 }
@@ -3400,6 +3496,12 @@ func (b *StorageBroker) fanoutSharedAsyncConfirm(sdw sharedDurableWriter, agg *p
 				}
 			}
 			agg.report(cerr)
+			// THE SHARED-BODY PATH RELEASES THE LEASE AT THE COMPLETION:
+			// the WAL still holds this body's copy in the staging buffer
+			// until the covering fsync, so the broker does hold those bytes
+			// until then. (The ordinary path releases at the write, where
+			// the body leaves the WAL entirely.)
+			agg.reportBodyReleased()
 		}
 
 		agg.addCopy() // count BEFORE enqueue so an immediate completion can't underflow
@@ -3435,8 +3537,11 @@ func (b *StorageBroker) fanoutSharedAsyncConfirm(sdw sharedDurableWriter, agg *p
 		return false, nil, ErrMaxLengthExceeded
 	}
 
-	// Drop the setup guard: onDurable fires once the last copy's fsync completes.
+	// Drop the setup guards: onDurable fires once the last copy's fsync
+	// completes, and the lease settles once the last copy has released its
+	// body.
 	agg.report(nil)
+	agg.dropLeaseGuard()
 	return true, backpressure, nil
 }
 
@@ -4379,6 +4484,9 @@ func (b *StorageBroker) RecoverQueue(queueName string, minTag, maxTag, count uin
 	if p := queueState.Policy(); p != nil && p.HasMaxLengthBytes && count > 0 {
 		var total int64
 		for tag := minTag; tag <= maxTag; tag++ {
+			// A PEEK, NOT A DELIVERY: this is a byte-accounting
+			// reconstruction over the recovered range, not a hand-off to a
+			// consumer, so it must not admit anything into the hot cache.
 			if msg, err := b.storage.GetMessage(queueName, tag); err == nil && msg != nil {
 				total += int64(len(msg.Body))
 			}
@@ -4433,7 +4541,7 @@ func (b *StorageBroker) GetMessageForGetOwned(queueName string, noAck bool, conn
 
 	if t, r, ok := queueState.tryPopRequeue(); ok {
 		tag = t
-		message, _ = b.storage.GetMessage(queueName, tag)
+		message, _ = b.storage.GetMessageForDelivery(queueName, tag)
 		if message != nil {
 			// W4 SQ-9: drop an expired requeued message instead of returning it;
 			// fall through to the tail cursor for the next candidate.
@@ -4458,7 +4566,7 @@ func (b *StorageBroker) GetMessageForGetOwned(queueName string, noAck bool, conn
 				continue
 			}
 			tag = t
-			msg, err := b.storage.GetMessage(queueName, tag)
+			msg, err := b.storage.GetMessageForDelivery(queueName, tag)
 			if err != nil {
 				queueState.GapSkipAdvance(tag)
 				continue
@@ -4616,6 +4724,8 @@ func (b *StorageBroker) purgeIncarnation(name string, qs *QueueState) (int, erro
 func (b *StorageBroker) purgeOne(qs *QueueState, name string, tag uint64, p *QueuePolicy) bool {
 	var bodyLen int
 	if p != nil && p.HasMaxLengthBytes {
+		// A PEEK, NOT A DELIVERY: the message is being PURGED, so the read
+		// must not admit it into the hot cache.
 		m, err := b.storage.GetMessage(name, tag)
 		if err != nil || m == nil {
 			qs.GapSkipAdvance(tag)
