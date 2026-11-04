@@ -10,8 +10,9 @@ import (
 )
 
 // TestM4_FdatasyncHelper verifies that the platform-specific fdatasync helper
-// works correctly. On Linux it uses syscall.Fdatasync; on other platforms it
-// falls back to file.Sync().
+// works correctly. On Linux it uses syscall.Fdatasync; on darwin it issues
+// F_FULLFSYNC through the preemptible x/sys/unix path (fdatasyncFile); on every
+// other platform it falls back to file.Sync().
 func TestM4_FdatasyncHelper(t *testing.T) {
 	dataDir := t.TempDir()
 	wm, err := NewWALManager(dataDir)
@@ -42,9 +43,12 @@ func TestM4_FdatasyncHelper(t *testing.T) {
 	}
 
 	// Verify platform behavior
-	if runtime.GOOS == "linux" {
+	switch runtime.GOOS {
+	case "linux":
 		t.Log("Running on Linux — fdatasync syscall should be used")
-	} else {
+	case "darwin":
+		t.Log("Running on darwin — F_FULLFSYNC is issued through x/sys/unix (fdatasyncFile), not file.Sync()")
+	default:
 		t.Logf("Running on %s — fallback to file.Sync() is used", runtime.GOOS)
 	}
 }
