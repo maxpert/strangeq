@@ -605,3 +605,27 @@ func SetColdReadAdmissionForTest(fn func(queue string, tag uint64)) (restore fun
 	coldReadAdmissionHook.Store(&f)
 	return func() { coldReadAdmissionHook.Store(prev) }
 }
+
+// --- cold-read buffer pool (test hooks) -------------------------------------
+
+// ColdReadPoolStatsForTest reports the cold-read buffer pool's retained bytes
+// and free count. TEST-ONLY: it lets a test assert the pool is bounded and that
+// a released buffer re-entered the free-list.
+func ColdReadPoolStatsForTest() (retainedBytes, freeCount int) {
+	s := coldReadPoolStats()
+	return s.retainedBytes, s.freeCount
+}
+
+// ColdReadPoolLeaseCountForTest reports the live pooled checkouts. TEST-ONLY:
+// it is the local mirror of amqp_cold_read_leases_outstanding, so a test can
+// assert a release point actually released.
+func ColdReadPoolLeaseCountForTest() int64 { return coldReadPoolStats().leases }
+
+// ColdReadPoolFreeSlicesForTest returns the pool's free-list slice headers.
+// TEST-ONLY: mutating the returned slices' bytes lets a test prove an admitted
+// message's body does not alias pooled memory (the alias proof).
+func ColdReadPoolFreeSlicesForTest() [][]byte { return coldReadPoolFreeSlices() }
+
+// ResetColdReadPoolForTest empties the pool and zeroes its lease count.
+// TEST-ONLY: it isolates a pool test from any buffer a previous test retained.
+func ResetColdReadPoolForTest() { coldReadPoolReset() }
