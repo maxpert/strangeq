@@ -321,8 +321,8 @@ engine:
   # Interval for WAL cleanup - removing fully-processed WAL files (milliseconds)
   # Longer = slower cleanup, more disk usage
   # Shorter = faster cleanup, more overhead
-  # Default: 300000 (5 minutes)
-  walcleanupcheckintervalms: 300000
+  # Default: 1000 (1 second)
+  walcleanupcheckintervalms: 1000
 
 # ============================================================================
 # Resource Alarms (RabbitMQ-style memory/disk pressure)
