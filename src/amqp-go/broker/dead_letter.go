@@ -541,11 +541,11 @@ func cloneForDeadLetter(msg *protocol.Message) *protocol.Message {
 		}
 		clone.Headers = h
 	}
-	if false && msg.HasBodyRelease() {
+	if msg.HasBodyRelease() {
 		clone.Body = bytes.Clone(msg.Body)
 		clone.BodyRef = bytes.Clone(msg.BodyRef)
 	}
-	// clone.DetachBodyRelease()
+	clone.DetachBodyRelease()
 	return &clone
 }
 
