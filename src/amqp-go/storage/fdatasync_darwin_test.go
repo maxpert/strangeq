@@ -30,7 +30,9 @@ import (
 func TestFdatasyncFile_Darwin(t *testing.T) {
 	t.Run("succeeds on a real file", func(t *testing.T) {
 		path := filepath.Join(t.TempDir(), "wal-d1")
-		f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY, 0644)
+		// Match production's WAL open flags (wal_manager.go openWALFile):
+		// O_CREATE|O_WRONLY|O_APPEND, so the test exercises the same fd.
+		f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
 		require.NoError(t, err)
 		t.Cleanup(func() { _ = f.Close() })
 		_, err = f.Write([]byte("durable bytes"))
@@ -42,7 +44,8 @@ func TestFdatasyncFile_Darwin(t *testing.T) {
 
 	t.Run("closed file returns an error", func(t *testing.T) {
 		path := filepath.Join(t.TempDir(), "wal-d1-closed")
-		f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY, 0644)
+		// Match production's WAL open flags (wal_manager.go openWALFile).
+		f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
 		require.NoError(t, err)
 		require.NoError(t, f.Close())
 
