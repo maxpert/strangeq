@@ -1244,6 +1244,11 @@ func (b *StorageBroker) deliverMessage(queueState *QueueState, state *ConsumerSt
 		if _, won := b.settle(msgID); won {
 			b.finishNack(queueState, state.queueName, state.consumer.ID, msgID, true)
 		}
+		// WS-COLDREAD-PATH W5: the delivery never reached the consumer, so the
+		// cold-read lease it carries (if any) is released here. A successful
+		// send above keeps the lease: the server releases it after the socket
+		// write.
+		message.ReleaseBody()
 	}
 }
 
@@ -1280,6 +1285,9 @@ func (b *StorageBroker) dropExpiredOnDelivery(qs *QueueState, state *ConsumerSta
 	} else {
 		qs.GapSkipAdvance(tag)
 	}
+	// WS-COLDREAD-PATH W6: the message is dead-lettered/dropped, never sent, so
+	// its cold-read lease (if any) is released here.
+	msg.ReleaseBody()
 }
 
 // dropExpiredOnGet is the basic.get sibling of dropExpiredOnDelivery: it
@@ -1300,6 +1308,9 @@ func (b *StorageBroker) dropExpiredOnGet(qs *QueueState, queueName string, msg *
 	} else {
 		qs.GapSkipAdvance(tag)
 	}
+	// WS-COLDREAD-PATH W6: the message is dead-lettered/dropped, never sent, so
+	// its cold-read lease (if any) is released here.
+	msg.ReleaseBody()
 }
 
 // ackDelivered performs the storage and queue bookkeeping to acknowledge a
@@ -2575,20 +2586,7 @@ func (b *StorageBroker) UnregisterConsumer(consumerID string) error {
 	//    semantics). No semaphore permit is released: the cancelled
 	//    consumer's semaphore is dead, and the requeued message will be
 	//    claimed by another consumer which acquires its own permit.
-	for {
-		select {
-		case delivery, ok := <-state.consumer.Messages:
-			if !ok {
-				// Channel closed (defensive — Messages is never closed
-				// in current code, but guard against future changes).
-				goto drainComplete
-			}
-			b.requeueInflightDelivery(queueState, state.queueName, delivery.DeliveryTag)
-		default:
-			goto drainComplete
-		}
-	}
-drainComplete:
+	b.drainConsumerMessages(queueState, state)
 
 	// 7. Scan the deliveryIndex ledger for remaining in-flight messages owned by
 	//    this consumer. These are deliveries that already LEFT consumer.Messages
@@ -2695,6 +2693,39 @@ func (b *StorageBroker) requeueInflightDelivery(qs *QueueState, queueName string
 	b.restoreReadyBytesOnRequeue(qs, queueName, deliveryTag)
 	qs.Requeue(deliveryTag)
 	b.storage.DeletePendingAck(queueName, deliveryTag)
+}
+
+// releaseDeliveryMessage releases the cold-read lease a delivery's message
+// carries, if any. It is nil-safe and idempotent, so it is a safety net at
+// sites that discard the delivery pointer: a missed release leaks pool capacity
+// only, and a duplicate is a no-op.
+func releaseDeliveryMessage(d *protocol.Delivery) {
+	if d != nil && d.Message != nil {
+		d.Message.ReleaseBody()
+	}
+}
+
+// drainConsumerMessages requeues every delivery buffered in a cancelled
+// consumer's channel and releases its cold-read lease (WS-COLDREAD-PATH W7). It
+// is factored out of UnregisterConsumer so the release is testable without a
+// live poll loop.
+func (b *StorageBroker) drainConsumerMessages(queueState *QueueState, state *ConsumerState) {
+	for {
+		select {
+		case delivery, ok := <-state.consumer.Messages:
+			if !ok {
+				// Channel closed (defensive — Messages is never closed in
+				// current code, but guard against future changes).
+				return
+			}
+			// WS-COLDREAD-PATH W7: the delivery POINTER is discarded (only its
+			// tag is requeued), so release its cold-read lease first.
+			releaseDeliveryMessage(delivery)
+			b.requeueInflightDelivery(queueState, state.queueName, delivery.DeliveryTag)
+		default:
+			return
+		}
+	}
 }
 
 // PublishMessage publishes a message to an exchange.

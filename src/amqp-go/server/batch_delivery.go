@@ -20,6 +20,23 @@ const deliveryOverheadEstimate = 256
 // batches therefore keep the byte-identical contiguous path.
 const writevBodyThreshold = 32 * 1024
 
+// releaseDeliveryBodies releases the cold-read lease (WS-COLDREAD-PATH) each
+// delivery's message carries, if any. It is the batch-level release point: the
+// bodies are written (or the write failed) by the time the caller's deferred
+// call runs, so no reader still holds them. A non-leased message is a no-op.
+func releaseDeliveryBodies(deliveries []*protocol.Delivery) {
+	for _, d := range deliveries {
+		releaseDeliveryBody(d)
+	}
+}
+
+// releaseDeliveryBody is the single-delivery form of releaseDeliveryBodies.
+func releaseDeliveryBody(d *protocol.Delivery) {
+	if d != nil && d.Message != nil {
+		d.Message.ReleaseBody()
+	}
+}
+
 // sendBatchedDeliveries serializes all deliveries in a batch into a single
 // buffer and performs a single conn.Conn.Write under a single WriteMutex
 // acquisition. This reduces N syscalls + N mutex acquisitions to 1 of each.
@@ -27,6 +44,10 @@ func (s *Server) sendBatchedDeliveries(conn *protocol.Connection, channelID uint
 	if len(deliveries) == 0 {
 		return nil
 	}
+	// WS-COLDREAD-PATH W1: release every cold-read lease once this function
+	// returns — which is after the write completed (or failed), so no reader
+	// still holds the bodies.
+	defer releaseDeliveryBodies(deliveries)
 
 	s.Log.Debug("Sending batched deliveries",
 		zap.String("consumer_tag", consumerTag),
@@ -332,6 +353,9 @@ func (s *Server) writeVectored(conn *protocol.Connection, bufs *net.Buffers, bod
 // The per-message wire-tag stamping and the metrics/counter tail are lifted
 // verbatim from sendBatchedDeliveries.
 func (s *Server) sendBatchedDeliveriesVectored(conn *protocol.Connection, channelID uint16, consumerTag string, channel *protocol.Channel, deliveries []*protocol.Delivery) error {
+	// WS-COLDREAD-PATH W2: release every cold-read lease once this function
+	// returns — after WriteTo has consumed the body iovecs.
+	defer releaseDeliveryBodies(deliveries)
 	scratch := protocol.GetFrameSerializationBuffer()
 	defer protocol.PutFrameSerializationBuffer(scratch)
 	vec := &deliveryVec{scratch: scratch}
