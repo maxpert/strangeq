@@ -15,16 +15,24 @@ import (
 //
 // DO NOT "SIMPLIFY" THIS BACK TO f.Sync(). It looks equivalent and is not.
 // os.File.Sync on darwin reaches F_FULLFSYNC through
-// internal/poll.(*FD).Fsync -> internal/syscall/unix.Fcntl, which SINCE GO 1.21
-// is linknamed to runtime.fcntl: a bare libcCall with NO entersyscall. (Go 1.20
-// and earlier linknamed syscall.fcntl, which did enter the syscall — the
-// regression is Go 1.21's.) A goroutine inside runtime.fcntl therefore stays
-// _Grunning and KEEPS ITS P for the whole flush — 5–20 ms on an APFS SSD,
-// seconds when the device stalls — it cannot be preempted (the SIGURG lands in
-// libc, not at a Go safe point), and stopTheWorldWithSema / gcMarkDone block on
-// that P. Measured on the F3 fsync benchmark cell: 22.5 % of wall time
+// internal/poll.(*FD).Fsync -> internal/syscall/unix.Fcntl -> runtime.fcntl,
+// which is a bare libcCall with NO entersyscall. That is the observable,
+// verifiable fact on THIS Go toolchain: the built storage.test binary's
+// internal/syscall/unix.Fcntl disassembles to a CALL runtime.libcCall with no
+// entersyscall anywhere on the path (contrast x/sys/unix.FcntlInt ->
+// syscall.syscall -> runtime.entersyscall), and the stored STW trace confirms
+// the consequence. A goroutine inside runtime.fcntl therefore stays _Grunning
+// and KEEPS ITS P for the whole flush — 5–20 ms on an APFS SSD, seconds when
+// the device stalls — it cannot be preempted (the SIGURG lands in libc, not at
+// a Go safe point), and stopTheWorldWithSema / gcMarkDone block on that P.
+// Measured on the F3 fsync benchmark cell: 22.5 % of wall time
 // stopped-the-world, with 149 of 151 long STWs ending within 30 µs of the
 // committer's F_FULLFSYNC returning.
+//
+// VERSION HISTORY (context only, NOT load-bearing): this linkname has been in
+// place at least since Go 1.21. Whether Go 1.20's syscall.fcntl entered the
+// syscall cannot be verified from this checkout, and nothing below depends on
+// it — the fix rests only on the current toolchain's observed behaviour above.
 //
 // x/sys/unix.FcntlInt goes through syscall.syscall, which calls entersyscall:
 // the P is handed off, sysmon can retake it, and STW proceeds while the flush
