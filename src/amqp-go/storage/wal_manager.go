@@ -4128,10 +4128,20 @@ func (qw *QueueWAL) openWALFile(num uint64) (w, r *os.File, size int64, err erro
 		// flat. On failure the file is removed and the open fails — a file
 		// whose entry may not survive a crash must not be handed to the
 		// writer.
-		if serr := syncDir(qw.dataDir); serr != nil {
-			_ = file.Close()
-			_ = os.Remove(filename)
-			return nil, nil, 0, fmt.Errorf("WAL file directory fsync failed: %w", serr)
+		//
+		// WITH storage.fsync DISABLED NOTHING IN THIS FILE IS DURABLE, SO A
+		// DURABLE DIRECTORY ENTRY FOR IT BUYS NOTHING: skip the barrier. On
+		// APFS a directory F_FULLFSYNC flushes the volume's whole dirty set
+		// (measured 16–128 ms per 512 MiB roll with ~2 GB/s of un-fsynced WAL
+		// writes pending), so leaving it in place makes "fsync off" not
+		// actually off. The failure handling below is unchanged when the
+		// barrier does run.
+		if !qw.cfg.SyncDisabled {
+			if serr := syncDir(qw.dataDir); serr != nil {
+				_ = file.Close()
+				_ = os.Remove(filename)
+				return nil, nil, 0, fmt.Errorf("WAL file directory fsync failed: %w", serr)
+			}
 		}
 	} else {
 		if size < int64(WALHeaderSize) {
@@ -4330,7 +4340,13 @@ func (qw *QueueWAL) tryReclaimOldFiles() {
 	// Make this sweep's directory mutations durable exactly once. The reclaim
 	// is already complete in memory even if this barrier fails; only fully acked
 	// bytes could reappear after a crash, so the failure cannot invalidate it.
-	if unlinkedAny {
+	//
+	// WITH storage.fsync DISABLED THE UNLINKED FILES' CONTENTS WERE NEVER
+	// DURABLE, so making their removal durable buys nothing either — and on APFS
+	// the directory F_FULLFSYNC flushes the volume's whole dirty set. The unlink
+	// itself is unconditional: it is the barrier, not the reclamation, that is
+	// gated.
+	if unlinkedAny && !qw.cfg.SyncDisabled {
 		if err := syncDir(qw.dataDir); err != nil {
 			qw.logWarn("WAL directory fsync after reclaim failed; completed reclaim remains valid, but its directory mutations are not durable yet",
 				interfaces.LogField{Key: "dir", Value: qw.dataDir},
