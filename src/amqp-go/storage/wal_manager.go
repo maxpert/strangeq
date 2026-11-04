@@ -484,6 +484,11 @@ type QueueWAL struct {
 	// production cost is one lock per batch hand-off.
 	pipelineMu      sync.Mutex
 	pipelineBatches []*stagedBatch
+
+	// coldMetrics is the OPTIONAL cold-read observer (WS-COLDREAD-PATH),
+	// resolved once in SetMetrics. Appended after the pinned hot-path layout,
+	// like every other late field. nil = no observation.
+	coldMetrics ColdReadMetrics
 }
 
 // WALBatchSealBytesDefault is the default byte-based WAL batch seal (64 MiB):
@@ -797,6 +802,14 @@ func (wm *WALManager) SetMetrics(metrics WALMetrics) {
 	wm.metrics = metrics
 	if wm.sharedWAL != nil {
 		wm.sharedWAL.metrics = metrics
+		// WS-COLDREAD-PATH: resolve the OPTIONAL cold-read observer once, so a
+		// custom WALMetrics-only collector keeps compiling. nil = no cold-read
+		// observation.
+		if cm, ok := metrics.(ColdReadMetrics); ok {
+			wm.sharedWAL.coldMetrics = cm
+		} else {
+			wm.sharedWAL.coldMetrics = nil
+		}
 	}
 }
 
@@ -1583,6 +1596,26 @@ func (wm *WALManager) Read(queueName string, offset uint64) (*protocol.Message, 
 	}
 
 	return sw.readMessage(queueName, offset)
+}
+
+// ReadForDelivery reads a message for the CONSUMER DELIVERY path: it takes the
+// one-pread fast path AND, for records in the pool gate, reads into a pooled
+// buffer whose release token is attached to the returned message. The caller
+// owns that token and MUST release it (at most once) once the body's last read
+// completes -- after the socket write for a delivery, or before returning an
+// error.
+//
+// Read (the peek) deliberately does NOT lease: a peek has no deterministic
+// release point, so it must not alias pooled memory at all.
+func (wm *WALManager) ReadForDelivery(queueName string, offset uint64) (*protocol.Message, error) {
+	wm.mu.RLock()
+	sw := wm.sharedWAL
+	wm.mu.RUnlock()
+	if sw == nil {
+		return nil, fmt.Errorf("shared WAL not initialized")
+	}
+
+	return sw.readMessageWithLease(queueName, offset, true)
 }
 
 // Close closes the shared WAL
@@ -4412,11 +4445,19 @@ func (qw *QueueWAL) tryReclaimOldFiles() {
 	}
 }
 
-// readMessage resolves the newest physical copy. A sealed-file lookup keeps
-// its SHARD's read lock through every ReadAt so index/layout replacement
-// cannot race it; the active-file arm releases the shard before acquiring
-// fileMutex.
+// readMessage resolves the newest physical copy and reads it as a PEEK (no
+// lease). A sealed-file lookup keeps its SHARD's read lock through every ReadAt
+// so index/layout replacement cannot race it; the active-file arm releases the
+// shard before acquiring fileMutex.
 func (qw *QueueWAL) readMessage(queueName string, offset uint64) (*protocol.Message, error) {
+	return qw.readMessageWithLease(queueName, offset, false)
+}
+
+// readMessageWithLease is readMessage with the WS-COLDREAD-PATH ownership flag.
+// When lease is true the record is read into a pooled buffer (for records in
+// the pool gate) and the returned message carries a release token the caller
+// owns; when false the buffer is a plain make and no token is attached.
+func (qw *QueueWAL) readMessageWithLease(queueName string, offset uint64, lease bool) (*protocol.Message, error) {
 	if qw.isAcknowledged(queueName, offset) {
 		return nil, fmt.Errorf("message not in WAL")
 	}
@@ -4446,20 +4487,38 @@ func (qw *QueueWAL) readMessage(queueName string, offset uint64) (*protocol.Mess
 			if file == nil {
 				return nil, fmt.Errorf("WAL current read file not open for fileNum %d", location.pos.segmentID)
 			}
-			return qw.parseMessageAt(file, queueName, location.pos.position, offset)
+			msg, err := qw.parseMessageAt(file, queueName, location.pos.position, offset, location.bytes, lease)
+			if err == nil {
+				qw.noteColdReadFile(true)
+			}
+			return msg, err
 		}
 
 		var msg *protocol.Message
 		err := qw.withOldFileHandle(location.pos.segmentID, func(file *os.File) error {
 			var perr error
-			msg, perr = qw.parseMessageAt(file, queueName, location.pos.position, offset)
+			msg, perr = qw.parseMessageAt(file, queueName, location.pos.position, offset, location.bytes, lease)
 			return perr
 		})
 		sh.mu.RUnlock()
 		if err != nil {
 			return nil, err
 		}
+		qw.noteColdReadFile(false)
 		return msg, nil
+	}
+}
+
+// noteColdReadFile records whether a completed cold read came from the active
+// WAL file or a rolled one. nil observer = no cost.
+func (qw *QueueWAL) noteColdReadFile(current bool) {
+	if qw.coldMetrics == nil {
+		return
+	}
+	if current {
+		qw.coldMetrics.RecordColdReadCurrentFile()
+	} else {
+		qw.coldMetrics.RecordColdReadOldFile()
 	}
 }
 
@@ -4585,14 +4644,14 @@ func (qw *QueueWAL) readMessageAtPosition(queueName string, fileNum uint64, file
 		if file == nil {
 			return nil, fmt.Errorf("WAL current read file not open for fileNum %d", fileNum)
 		}
-		return qw.parseMessageAt(file, queueName, filePosition, expectedOffset)
+		return qw.parseMessageAt(file, queueName, filePosition, expectedOffset, 0, false)
 	}
 	qw.fileMutex.Unlock()
 
 	var msg *protocol.Message
 	err := qw.withOldFileHandle(fileNum, func(file *os.File) error {
 		var perr error
-		msg, perr = qw.parseMessageAt(file, queueName, filePosition, expectedOffset)
+		msg, perr = qw.parseMessageAt(file, queueName, filePosition, expectedOffset, 0, false)
 		return perr
 	})
 	if err != nil {
@@ -4605,35 +4664,91 @@ func (qw *QueueWAL) readMessageAtPosition(queueName string, fileNum uint64, file
 // is split out of readMessageAtPosition so both the current-file arm and the
 // retrying old-file arm decode identically — a second copy of this parse is how
 // the two arms would drift.
-func (qw *QueueWAL) parseMessageAt(file *os.File, queueName string, filePosition int64, expectedOffset uint64) (*protocol.Message, error) {
-	// Read CRC + length in a single ReadAt (8 bytes at filePosition)
-	header := make([]byte, 8)
-	_, err := walReadAt(file, header, filePosition)
-	if err != nil {
+//
+// WS-COLDREAD-PATH: it reads the WHOLE record in ONE pread of recordBytes
+// (= segmentRecord.bytes, already 8+dataLen) and verifies the CRC in one
+// contiguous sweep over buf[4:recordBytes]. When recordBytes < 8 (only the
+// test-only readMessageAtPosition wrapper, which passes 0) or the index's byte
+// count disagrees with the header's dataLen (index/format drift), it falls back
+// once to the legacy two-pread body and counts the fallback; it never
+// hard-fails the hot path on an inconsistency.
+//
+// When lease is true and recordBytes is inside the pool gate, the record buffer
+// comes from the cold-read buffer pool and the returned message carries a
+// release token the caller owns. The token is attached only when the body still
+// aliases the pooled buffer; the ITER5 shared-body arm releases immediately and
+// attaches nothing.
+func (qw *QueueWAL) parseMessageAt(file *os.File, queueName string, filePosition int64, expectedOffset uint64, recordBytes int64, lease bool) (*protocol.Message, error) {
+	if recordBytes < 8 {
+		// The two-pread legacy path: recordBytes is unknown (the test-only
+		// wrapper), so the header read is still needed to learn dataLen.
+		return qw.parseMessageAtTwoPread(file, queueName, filePosition, expectedOffset)
+	}
+
+	buf, release := qw.acquireRecordBuffer(recordBytes, lease)
+	if _, err := walReadAt(file, buf, filePosition); err != nil {
+		releaseIf(release)
 		return nil, err
 	}
 
-	crc := binary.BigEndian.Uint32(header[0:4])
-	dataLen := binary.BigEndian.Uint32(header[4:8])
+	crc := binary.BigEndian.Uint32(buf[0:4])
+	dataLen := binary.BigEndian.Uint32(buf[4:8])
 
-	// Read data portion in a single ReadAt (dataLen bytes at filePosition+8)
-	data := make([]byte, dataLen)
-	_, err = walReadAt(file, data, filePosition+8)
-	if err != nil {
-		return nil, err
+	if int64(8)+int64(dataLen) != recordBytes {
+		// The index's byte count and the record's own header disagree. This is
+		// index/format drift (a torn index), so fall back once to the legacy
+		// two-pread body rather than trusting either. The pooled buffer is
+		// returned before the fallback reads a fresh one.
+		releaseIf(release)
+		return qw.parseMessageAtTwoPread(file, queueName, filePosition, expectedOffset)
 	}
 
-	// Verify CRC (calculated over [length_bytes][data]). A zero stored CRC
-	// means CRC was disabled at write time — skip verification.
+	// One contiguous CRC sweep over [length_bytes][data], bit-identical to the
+	// legacy two-Write value. A zero stored CRC means CRC was disabled at write
+	// time — the check is skipped, exactly as before.
 	if crc != 0 {
-		h := crc32.NewIEEE()
-		h.Write(header[4:8])
-		h.Write(data)
-		if crc != h.Sum32() {
-			return nil, fmt.Errorf("CRC mismatch for offset %d (expected %d, got %d)", expectedOffset, crc, h.Sum32())
+		if sum := crc32.Checksum(buf[4:recordBytes], crc32.IEEETable); crc != sum {
+			releaseIf(release)
+			return nil, fmt.Errorf("CRC mismatch for offset %d (expected %d, got %d)", expectedOffset, crc, sum)
 		}
 	}
 
+	qw.noteOnePread()
+	return qw.finishMessageParse(file, buf[8:recordBytes], queueName, expectedOffset, release)
+}
+
+// parseMessageAtTwoPread is the legacy two-pread body reader. It is reached
+// only when the one-pread fast path cannot be trusted (a zero/unknown
+// recordBytes, or an index/header mismatch), and it counts the fallback.
+func (qw *QueueWAL) parseMessageAtTwoPread(file *os.File, queueName string, filePosition int64, expectedOffset uint64) (*protocol.Message, error) {
+	header := make([]byte, 8)
+	if _, err := walReadAt(file, header, filePosition); err != nil {
+		return nil, err
+	}
+	crc := binary.BigEndian.Uint32(header[0:4])
+	dataLen := binary.BigEndian.Uint32(header[4:8])
+
+	data := make([]byte, dataLen)
+	if _, err := walReadAt(file, data, filePosition+8); err != nil {
+		return nil, err
+	}
+
+	if crc != 0 {
+		sum := crc32.Update(crc32.Checksum(header[4:8], crc32.IEEETable), crc32.IEEETable, data)
+		if crc != sum {
+			return nil, fmt.Errorf("CRC mismatch for offset %d (expected %d, got %d)", expectedOffset, crc, sum)
+		}
+	}
+
+	qw.noteTwoPreadFallback()
+	return qw.finishMessageParse(file, data, queueName, expectedOffset, nil)
+}
+
+// finishMessageParse is the deck-agnostic tail shared by the one-pread and
+// two-pread readers: it strips the record type tag, reconstructs the message,
+// validates the queue name and offset, and applies the WS-COLDREAD-PATH
+// ownership rule to the record buffer (release).
+func (qw *QueueWAL) finishMessageParse(file *os.File, data []byte, queueName string, expectedOffset uint64, release func()) (*protocol.Message, error) {
 	// The offset index is populated only by writes made in the current process,
 	// which always use the current v4 format. Strip the per-record type tag,
 	// confirm it is a message record, and reconstruct via the shared payload
@@ -4641,19 +4756,23 @@ func (qw *QueueWAL) parseMessageAt(file *os.File, queueName string, filePosition
 	// like crash recovery does.
 	recType, payload := recordTypeAndPayload(data)
 	if recType != WALRecordTypeMessage {
+		releaseIf(release)
 		return nil, fmt.Errorf("unexpected WAL record type %d for offset %d", recType, expectedOffset)
 	}
 
 	rm, ok := deserializeMessagePayload(payload)
 	if !ok {
+		releaseIf(release)
 		return nil, fmt.Errorf("invalid WAL data: malformed message record for offset %d", expectedOffset)
 	}
 
 	// Validate queue name matches (for multi-queue isolation) and the offset.
 	if rm.QueueName != queueName {
+		releaseIf(release)
 		return nil, fmt.Errorf("queue name mismatch: expected %s, got %s", queueName, rm.QueueName)
 	}
 	if rm.Offset != expectedOffset {
+		releaseIf(release)
 		return nil, fmt.Errorf("offset mismatch: expected %d, got %d", expectedOffset, rm.Offset)
 	}
 
@@ -4668,10 +4787,12 @@ func (qw *QueueWAL) parseMessageAt(file *os.File, queueName string, filePosition
 	// propagates out of this function and is retried by withOldFileHandle
 	// against a fresh handle. The %w below is load-bearing for that: errors.Is
 	// traverses it, so wrapping keeps the diagnostic without hiding the cause.
-	if len(rm.Message.BodyRef) == 8 {
+	shared := len(rm.Message.BodyRef) == 8
+	if shared {
 		blockOffset := int64(binary.BigEndian.Uint64(rm.Message.BodyRef))
 		body, berr := readBodyBlockAt(file, blockOffset)
 		if berr != nil {
+			releaseIf(release)
 			return nil, fmt.Errorf("failed to resolve shared body for offset %d: %w", expectedOffset, berr)
 		}
 		rm.Message.Body = body
@@ -4682,7 +4803,54 @@ func (qw *QueueWAL) parseMessageAt(file *os.File, queueName string, filePosition
 	// message is not marked redelivered (deserializeMessagePayload defaults it
 	// to true for the crash-recovery path).
 	rm.Message.Redelivered = false
+
+	// THE OWNERSHIP RULE. In the shared-body arm the body no longer aliases the
+	// record buffer, so the buffer is released immediately and NO lease is
+	// attached (there is no reader of it left). Otherwise the body aliases the
+	// pooled buffer (when one was used) and the release travels with the
+	// message.
+	if shared {
+		releaseIf(release)
+		return rm.Message, nil
+	}
+	if release != nil {
+		rm.Message.AttachBodyRelease(release)
+	}
 	return rm.Message, nil
+}
+
+// acquireRecordBuffer returns a buffer of exactly recordBytes. It is a pooled,
+// release-tokened buffer when the caller asked for a lease and the size is
+// inside the pool gate; otherwise a plain make with a nil release.
+func (qw *QueueWAL) acquireRecordBuffer(recordBytes int64, lease bool) ([]byte, func()) {
+	if lease && recordBytes >= coldReadPoolMinBytes && recordBytes <= coldReadPoolMaxBufBytes {
+		buf, _ := coldReadBufferPool.acquire(int(recordBytes))
+		_, release := newColdReadLease(buf)
+		return buf, release
+	}
+	return make([]byte, int(recordBytes)), nil
+}
+
+// releaseIf invokes a release token when one is present.
+func releaseIf(fn func()) {
+	if fn != nil {
+		fn()
+	}
+}
+
+// noteOnePread records a cold WAL read taken by the single-pread fast path.
+func (qw *QueueWAL) noteOnePread() {
+	if qw.coldMetrics != nil {
+		qw.coldMetrics.RecordColdReadOnePread()
+	}
+}
+
+// noteTwoPreadFallback records a cold WAL read that fell back to the legacy
+// two-pread body. It must stay 0 on the target rows (acceptance AC1).
+func (qw *QueueWAL) noteTwoPreadFallback() {
+	if qw.coldMetrics != nil {
+		qw.coldMetrics.RecordColdReadTwoPreadFallback()
+	}
 }
 
 // readBodyBlockAt reads the ITER5 BodyBlock record at file offset `position` and
