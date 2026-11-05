@@ -1,6 +1,9 @@
 package storage
 
-import "sync"
+import (
+	"sync"
+	"sync/atomic"
+)
 
 // THE SHARDED WAL INDEX.
 //
@@ -77,6 +80,27 @@ type walIndexShard struct {
 	mu     sync.RWMutex
 	offset map[recordKey]*segmentRecord
 	copies map[recordKey][]*segmentRecord
+
+	// settledPending is the queue of records THIS shard's ack path has
+	// settled but whose per-file inventory entry has not yet been deleted.
+	//
+	// THE ACK PATH MAY NOT DELETE THE INVENTORY ENTRY ITSELF: a file's
+	// inventory is shared by every shard, so two acknowledgements of two tags
+	// in the same file would mutate the same map under two different shard
+	// locks (a data race, and a map corruption). It only QUEUES the record,
+	// under the shard lock it already holds. The committer then drains the
+	// queue under fileMutex, taking ONE shard at a time, and deletes each
+	// entry from the ACTIVE file's inventory (see drainSettledInventoryLocked).
+	//
+	// Guarded by mu.
+	settledPending []*segmentRecord
+
+	// pending is a lock-free flag: true while settledPending is non-empty.
+	// The committer reads it WITHOUT taking the shard lock (64 atomic loads
+	// per batch), so an idle shard costs no lock; the drain re-checks the
+	// queue under the lock and clears the flag only when it is empty, so a
+	// concurrent settle can never be lost.
+	pending atomic.Bool
 }
 
 // walIndexShardOf returns the shard a delivery tag belongs to.
@@ -350,24 +374,26 @@ func (s *walIndexShard) unindexSettledRecordLocked(r *segmentRecord) {
 // compare-and-swap). Only the winner removes anything, so acknowledging the
 // same copy twice is a no-op the second time.
 //
-// THE INVENTORY IS NOT TOUCHED HERE.
+// THE INVENTORY ENTRY IS QUEUED, NOT DELETED, HERE.
 //
-// The record stays in its file's inventory (inv.records) and its body block
-// stays in inv.blocks. That inventory is PER FILE and is SHARED BY EVERY
-// SHARD: a file's records carry tags of many different shards, so two
-// acknowledgements of two tags in the same file would mutate the same map
-// under two different shard locks -- a data race, and a map corruption at
-// the same time.
+// The record's per-file inventory entry (inv.records) cannot be deleted on
+// this path: a file's inventory is PER FILE and SHARED BY EVERY SHARD -- a
+// file's records carry tags of many different shards, so two acknowledgements
+// of two tags in the same file would mutate the same map under two different
+// shard locks (a data race, and a map corruption at the same time). So the
+// settled record is APPENDED to this shard's settledPending queue, under the
+// shard lock already held, and the committer drains the queue later under
+// fileMutex, ONE shard at a time (see drainSettledInventoryLocked).
 //
-// The accounting does NOT depend on the removal: inv.unacked and inv.deadBytes
-// keep the bytes, because those two are what the reclaim predicate
-// (unacked == 0) and the compaction ratio (deadBytes / durableBytes) are
-// computed from, and both are ATOMIC. The inventory is bounded by the FILE's
-// size, and the compaction -- which rewrites the file with exactly the
-// records that are not acknowledged -- drops the settled ones from it.
+// THE ACCOUNTING DOES NOT DEPEND ON THE DELETION: inv.unacked and inv.deadBytes
+// are updated by markAckDetailed above and are ATOMIC, and they are what the
+// reclaim predicate (unacked == 0) and the compaction ratio
+// (deadBytes / durableBytes) are computed from. The committer's delete is
+// gated on the record being acknowledged, so a record can never leave the
+// inventory unacked.
 //
-// The compaction already skips a record whose acked flag is set, so keeping
-// settled records in the inventory is already handled.
+// The compaction already skips a record whose acked flag is set, so a settled
+// record that has not yet been drained is still handled correctly.
 func (s *walIndexShard) settleRecordLocked(r *segmentRecord) bool {
 	if r == nil {
 		return false
@@ -377,5 +403,75 @@ func (s *walIndexShard) settleRecordLocked(r *segmentRecord) bool {
 		return false
 	}
 	s.unindexSettledRecordLocked(r)
+	// Queue the settled record for the inventory drain. The append happens
+	// under the shard lock this call already holds, so no new lock and no new
+	// atomic on the ack path; pending is a plain flag the committer polls.
+	s.settledPending = append(s.settledPending, r)
+	s.pending.Store(true)
 	return true
+}
+
+// drainSettledInventory runs the inventory drain under fileMutex. It is the
+// cleanup loop's own acquisition: fileMutex -> one shard at a time, sequential
+// and released before tryReclaimOldFiles takes its shard -> oldFilesMutex
+// order, so it can never deadlock against the reclaim or the compaction.
+func (qw *QueueWAL) drainSettledInventory() {
+	qw.fileMutex.Lock()
+	qw.drainSettledInventoryLocked()
+	qw.fileMutex.Unlock()
+}
+
+// drainSettledInventoryLocked deletes the settled records the ack path has
+// queued from the ACTIVE file's inventory. Caller holds fileMutex.
+//
+// THE LOCK ORDER IS fileMutex -> (ONE shard lock at a time). It never holds
+// two shard locks at once, so it cannot deadlock against the paths that take
+// every shard (the reclaim sweep, the compaction's install), which take them
+// in ascending order.
+//
+// ONLY THE ACTIVE FILE'S INVENTORY IS TOUCHED. A sealed file's inventory is
+// read WITHOUT a lock by the compaction (which snapshots its two maps), so
+// mutating it here would be a data race. A settled record whose file has
+// since rolled is skipped: its inventory is dropped whole by the reclaim or
+// rewritten by the compaction.
+//
+// The delete is GATED on the record being acknowledged, so a record can never
+// leave the inventory unacked even if a future caller queues it early.
+func (qw *QueueWAL) drainSettledInventoryLocked() {
+	inv := qw.currentInv
+	if inv == nil {
+		return
+	}
+	for i := range qw.indexShards {
+		sh := &qw.indexShards[i]
+		if !sh.pending.Load() {
+			continue
+		}
+		sh.mu.Lock()
+		pending := sh.settledPending
+		if len(pending) > 0 {
+			// The drain holds ONE shard lock at this instant; the hook reports
+			// it so a test can prove the "one shard at a time" rule (T2).
+			held := qw.drainHeldShards.Add(1)
+			walInventoryDrainFire(int(held))
+			for _, r := range pending {
+				if r == nil || r.inv != inv || !r.acked.Load() {
+					continue
+				}
+				if cur := inv.records[r.pos.position]; cur == r {
+					delete(inv.records, r.pos.position)
+					qw.inventoryDrains.Add(1)
+				}
+			}
+			qw.drainHeldShards.Add(-1)
+			// Drop the record pointers so the queue's backing array does not
+			// keep the drained records alive; keep the array for reuse.
+			for j := range pending {
+				pending[j] = nil
+			}
+			sh.settledPending = pending[:0]
+		}
+		sh.pending.Store(false)
+		sh.mu.Unlock()
+	}
 }

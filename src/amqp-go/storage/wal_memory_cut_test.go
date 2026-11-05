@@ -29,7 +29,10 @@ import (
 	"errors"
 	"io/fs"
 	"os"
+	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/maxpert/amqp-go/protocol"
 	"github.com/stretchr/testify/require"
@@ -207,6 +210,86 @@ func TestWALMemoryCut_ReclaimPredicateStillFires(t *testing.T) {
 	_, registered := qw.oldFiles[fileNum]
 	qw.oldFilesMutex.RUnlock()
 	require.False(t, registered, "the reclaimed file must leave the old-files registry")
+}
+
+// TestWALMemoryCut_DrainHoldsOneShardLockAtATime is T2.
+//
+// The drain must take ONE shard lock at a time, and it must not race the
+// reclaim, the ack path or the writer. The reclaim runs at a 1 ms interval and
+// the batch seal is shrunk to 4 KiB, so files roll and reclaim while the drain
+// is active. Run under -race, this is the lock-order guard; the hook records
+// the number of shard locks the drain held at each step and it must never
+// exceed 1.
+func TestWALMemoryCut_DrainHoldsOneShardLockAtATime(t *testing.T) {
+	prevSeal := walBatchSealBytes
+	walBatchSealBytes = 4 << 10
+	t.Cleanup(func() { walBatchSealBytes = prevSeal })
+
+	var maxHeld atomic.Int32
+	var bad atomic.Bool
+	restore := SetWALInventoryDrainHookForTest(func(held int) {
+		if held > 1 {
+			bad.Store(true)
+		}
+		for {
+			m := maxHeld.Load()
+			if int32(held) <= m || maxHeld.CompareAndSwap(m, int32(held)) {
+				break
+			}
+		}
+	})
+	defer restore()
+
+	cfg := DefaultWALConfig()
+	cfg.SyncDisabled = true
+	cfg.CleanupInterval = time.Millisecond
+	cfg.CompactionInterval = time.Hour
+	cfg.FileSize = 1 << 20
+	wm, err := NewWALManagerWithConfig(t.TempDir(), cfg)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = wm.Close() })
+
+	const queue = "memcut-t2-q"
+	const span = 20000
+
+	var wg sync.WaitGroup
+	stop := make(chan struct{})
+	for w := 0; w < 4; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := uint64(0); ; i++ {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				tag := 1 + i%span
+				wm.WriteAsync(queue, memoryCutMessage(queue, tag), tag, func(error) {})
+			}
+		}()
+	}
+	for a := 0; a < 4; a++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := uint64(0); ; i++ {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				wm.Acknowledge(queue, 1+i%span)
+			}
+		}()
+	}
+
+	time.Sleep(500 * time.Millisecond)
+	close(stop)
+	wg.Wait()
+
+	require.False(t, bad.Load(), "the drain held more than one shard lock at once")
+	require.Positive(t, maxHeld.Load(), "the drain must actually have run")
 }
 
 // TestWALMemoryCut_DrainDoesNotTouchSealedInventories pins the boundary the

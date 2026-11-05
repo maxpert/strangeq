@@ -494,6 +494,11 @@ type QueueWAL struct {
 	// Zero before the cut lands, which is exactly what the plan's AC4 wants
 	// to distinguish.
 	inventoryDrains atomic.Uint64
+
+	// drainHeldShards is the number of shard locks the inventory drain holds
+	// AT THIS INSTANT. The drain takes ONE shard at a time, so it is 0 or 1;
+	// the test-only hook reads it to prove the lock order (T2).
+	drainHeldShards atomic.Int32
 }
 
 // WALBatchSealBytesDefault is the default byte-based WAL batch seal (64 MiB):
@@ -2654,6 +2659,15 @@ func (qw *QueueWAL) commitBatch(sb *stagedBatch) {
 		qw.deliverCompletions(sb.reqs, nil, ErrWALClosed)
 		return
 	}
+
+	// WS-MEMORY-CUT S1a: bound the ACTIVE file's inventory by the in-flight
+	// set. The ack path queued the records it settled on their own shards; the
+	// committer deletes them here, under fileMutex, taking ONE shard at a time
+	// (the same one-shard-at-a-time rule as the index loop below). This runs
+	// BEFORE the batch is appended, so after the commit the inventory holds the
+	// in-flight records plus this batch -- not every record of the file.
+	qw.drainSettledInventoryLocked()
+
 	// C1: never write to a file whose size != fileOffset (poisoned); roll it
 	// away first or fail fast.
 	if err := qw.ensureWritableLocked(); err != nil {
@@ -4388,6 +4402,12 @@ func (qw *QueueWAL) cleanupLoop() {
 	for {
 		select {
 		case <-reclaimTicker.C:
+			// WS-MEMORY-CUT S1a: release the settled inventory entries even on
+			// an idle broker (no commits to drive the committer's drain). This
+			// runs BEFORE the reclaim, as its own sequential fileMutex -> shard
+			// acquisition; it is never nested inside the reclaim's
+			// shard -> oldFilesMutex order.
+			qw.drainSettledInventory()
 			qw.tryReclaimOldFiles()
 		case <-compactionTicker.C:
 			qw.tryCompactOldFiles()
