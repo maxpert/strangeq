@@ -292,6 +292,53 @@ func TestWALMemoryCut_DrainHoldsOneShardLockAtATime(t *testing.T) {
 	require.Positive(t, maxHeld.Load(), "the drain must actually have run")
 }
 
+// TestWALMemoryCut_IndexShardMapsShrinkWhenSettled is the S1c test.
+//
+// The shard maps are eagerly settled, yet they still measured 18.88 MB on F1
+// against a ~52k standing backlog that explains only ~3 MB. A Go map never
+// returns bucket memory on delete, so the maps keep the ramp-up peak's buckets
+// long after the unacked set has drained. The fix rebuilds a shard's maps when
+// its live count falls below a quarter of its high-water mark.
+//
+// The high-water mark is the capacity proxy (Go maps expose no capacity), so
+// the assertion is that it is RELEASED once the shards drain -- which only
+// happens if the maps were actually rebuilt.
+func TestWALMemoryCut_IndexShardMapsShrinkWhenSettled(t *testing.T) {
+	wm, err := NewWALManagerWithConfig(t.TempDir(), memoryCutConfig())
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = wm.Close() })
+
+	const queue = "memcut-s1c-q"
+	const total = 20000
+
+	var durable atomic.Int64
+	for i := uint64(1); i <= total; i++ {
+		wm.WriteAsync(queue, memoryCutMessage(queue, i), i, func(err error) {
+			if err == nil {
+				durable.Add(1)
+			}
+		})
+	}
+	require.Eventually(t, func() bool { return durable.Load() == total },
+		120*time.Second, 10*time.Millisecond, "every publish must become durable and indexed")
+
+	qw := wm.sharedWAL
+	peak := qw.indexShardHighWaterForTest()
+	require.GreaterOrEqual(t, peak, 2*total,
+		"PREMISE BROKEN: the shard maps must have grown to hold every unacknowledged key")
+
+	for i := uint64(1); i <= total; i++ {
+		wm.Acknowledge(queue, i)
+	}
+	// One more write drives the committer drain.
+	require.NoError(t, wm.Write(queue, memoryCutMessage(queue, total+1), total+1))
+
+	after := qw.indexShardHighWaterForTest()
+	require.Less(t, after, peak/2,
+		"the shard maps must be REBUILT once the unacked set drains: the retained high-water "+
+			"stayed at %d (peak %d), so the maps still hold the ramp-up's buckets", after, peak)
+}
+
 // TestWALMemoryCut_DrainDoesNotTouchSealedInventories pins the boundary the
 // compaction relies on: a SEALED file's inventory is immutable (the compaction
 // snapshots it with no lock), so the drain must delete only from the ACTIVE

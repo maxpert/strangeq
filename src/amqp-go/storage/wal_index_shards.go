@@ -101,6 +101,17 @@ type walIndexShard struct {
 	// queue under the lock and clears the flag only when it is empty, so a
 	// concurrent settle can never be lost.
 	pending atomic.Bool
+
+	// highWater is the largest len(copies)+len(offset) this shard has held
+	// since its maps were last rebuilt. A Go map never returns bucket memory
+	// on delete, so this is the proxy for the map's retained bucket capacity:
+	// after the unacked set's ramp-up peak, the maps keep the peak's buckets
+	// even though the live count is tiny. settleRecordLocked rebuilds the
+	// maps (S1c) when the live count falls below a quarter of this, and the
+	// rebuild resets it.
+	//
+	// Guarded by mu.
+	highWater int
 }
 
 // walIndexShardOf returns the shard a delivery tag belongs to.
@@ -238,6 +249,9 @@ func (s *walIndexShard) indexRecordLocked(r *segmentRecord) {
 	}
 	if current := s.offset[key]; current == nil || recordPositionNewer(r.pos, current.pos) {
 		s.offset[key] = r
+	}
+	if n := len(s.copies) + len(s.offset); n > s.highWater {
+		s.highWater = n
 	}
 }
 
@@ -409,6 +423,19 @@ func (s *walIndexShard) settleRecordLocked(r *segmentRecord) bool {
 	s.settledPending = append(s.settledPending, r)
 	s.pending.Store(true)
 	return true
+}
+
+// indexShardHighWaterForTest sums every shard's retained-capacity high-water
+// mark (see walIndexShard.highWater). TEST-ONLY: the S1c test uses it to prove
+// the shard maps are rebuilt once the unacked set has drained.
+func (qw *QueueWAL) indexShardHighWaterForTest() (total int) {
+	for i := range qw.indexShards {
+		sh := &qw.indexShards[i]
+		sh.mu.RLock()
+		total += sh.highWater
+		sh.mu.RUnlock()
+	}
+	return total
 }
 
 // drainSettledInventory runs the inventory drain under fileMutex. It is the
