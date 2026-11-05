@@ -194,10 +194,7 @@ func (s *Server) consumerDeliveryLoop(rt *connRuntime) {
 
 			info, exists := consumerInfos[delivery.ConsumerID]
 			if !exists {
-				// Consumer was removed after forwarding — drop the delivery.
-				// WS-COLDREAD-PATH W4: the delivery is never written, so release
-				// its cold-read lease.
-				releaseDeliveryBody(delivery)
+				// Consumer was removed after forwarding — drop the delivery
 				continue
 			}
 
@@ -284,9 +281,6 @@ func (s *Server) requeueSingleDelivery(d *protocol.Delivery) {
 	if d == nil {
 		return
 	}
-	// WS-COLDREAD-PATH W8: the requeue reads only DeliveryTag, so the message's
-	// cold-read lease (if any) is released here — an idempotent safety net.
-	defer releaseDeliveryBody(d)
 	consumerID, ok := s.Broker.GetConsumerForDelivery(d.DeliveryTag)
 	if !ok {
 		return

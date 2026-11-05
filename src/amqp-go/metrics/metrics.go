@@ -120,21 +120,6 @@ type Collector struct {
 	// BuildInfo is the constant-1 build identity gauge.
 	BuildInfo *prometheus.GaugeVec
 
-	// WS-COLDREAD-PATH cold-read metrics (amqp_cold_read_*, amqp_delivery_*,
-	// amqp_hot_cache_bytes). Recorded by the storage cold-read path through the
-	// optional ColdReadMetrics interface.
-	DeliveryHotHitsTotal          prometheus.Counter
-	DeliveryColdReadsTotal        prometheus.Counter
-	ColdReadOnePreadTotal         prometheus.Counter
-	ColdReadTwoPreadFallbackTotal prometheus.Counter
-	ColdReadCurrentFileTotal      prometheus.Counter
-	ColdReadOldFileTotal          prometheus.Counter
-	ColdReadBufferPoolHitsTotal   prometheus.Counter
-	ColdReadBufferPoolMissesTotal prometheus.Counter
-	ColdReadBufferPoolBytes       prometheus.Gauge
-	ColdReadLeasesOutstanding     prometheus.Gauge
-	HotCacheBytes                 prometheus.Gauge
-
 	// WS-I Phase B publish-lease metrics (amqp_publish_lease_*). The three
 	// gauges are GaugeFuncs reading the bound limiter Stats AT SCRAPE TIME
 	// (never stale); bind via BindPublishLeaseStats.
@@ -416,63 +401,6 @@ func NewCollector(namespace string) *Collector {
 			Namespace: namespace,
 			Name:      "segment_read_errors_total",
 			Help:      "Total number of segment read failures",
-		}),
-
-		// WS-COLDREAD-PATH cold-read metrics
-		DeliveryHotHitsTotal: promauto.NewCounter(prometheus.CounterOpts{
-			Namespace: namespace,
-			Name:      "delivery_hot_hits_total",
-			Help:      "Consumer deliveries served from the hot cache",
-		}),
-		DeliveryColdReadsTotal: promauto.NewCounter(prometheus.CounterOpts{
-			Namespace: namespace,
-			Name:      "delivery_cold_reads_total",
-			Help:      "Consumer deliveries that missed the hot cache and read a cold tier",
-		}),
-		ColdReadOnePreadTotal: promauto.NewCounter(prometheus.CounterOpts{
-			Namespace: namespace,
-			Name:      "cold_read_one_pread_total",
-			Help:      "WAL cold reads taken by the single-pread fast path",
-		}),
-		ColdReadTwoPreadFallbackTotal: promauto.NewCounter(prometheus.CounterOpts{
-			Namespace: namespace,
-			Name:      "cold_read_two_pread_fallback_total",
-			Help:      "WAL cold reads that fell back to the legacy two-pread body (must stay 0 on the target rows)",
-		}),
-		ColdReadCurrentFileTotal: promauto.NewCounter(prometheus.CounterOpts{
-			Namespace: namespace,
-			Name:      "cold_read_current_file_total",
-			Help:      "WAL cold reads served from the active WAL file",
-		}),
-		ColdReadOldFileTotal: promauto.NewCounter(prometheus.CounterOpts{
-			Namespace: namespace,
-			Name:      "cold_read_old_file_total",
-			Help:      "WAL cold reads served from a rolled WAL file",
-		}),
-		ColdReadBufferPoolHitsTotal: promauto.NewCounter(prometheus.CounterOpts{
-			Namespace: namespace,
-			Name:      "cold_read_buffer_pool_hits_total",
-			Help:      "Cold-read buffer pool acquisitions served from the free-list",
-		}),
-		ColdReadBufferPoolMissesTotal: promauto.NewCounter(prometheus.CounterOpts{
-			Namespace: namespace,
-			Name:      "cold_read_buffer_pool_misses_total",
-			Help:      "Cold-read buffer pool acquisitions that allocated a fresh buffer",
-		}),
-		ColdReadBufferPoolBytes: promauto.NewGauge(prometheus.GaugeOpts{
-			Namespace: namespace,
-			Name:      "cold_read_buffer_pool_bytes",
-			Help:      "Retained cold-read buffer pool bytes (budget-bounded)",
-		}),
-		ColdReadLeasesOutstanding: promauto.NewGauge(prometheus.GaugeOpts{
-			Namespace: namespace,
-			Name:      "cold_read_leases_outstanding",
-			Help:      "Live cold-read buffer leases; must return to 0 at idle",
-		}),
-		HotCacheBytes: promauto.NewGauge(prometheus.GaugeOpts{
-			Namespace: namespace,
-			Name:      "hot_cache_bytes",
-			Help:      "Resident hot-cache bytes",
 		}),
 
 		// Ring buffer metrics
@@ -916,51 +844,4 @@ func (c *Collector) RecordChannelError(errorType string) {
 func (c *Collector) RecordMessageDropped(queueName, reason string) {
 	labels := prometheus.Labels{"queue": queueName, "reason": reason}
 	c.MessagesDroppedTotal.With(labels).Inc()
-}
-
-// --- WS-COLDREAD-PATH cold-read metrics -----------------------------------
-//
-// These implement the storage.ColdReadMetrics optional interface. The
-// by-read counters are recorded at the read, independent of whether the
-// admission that follows succeeds.
-
-// RecordDeliveryHotHit records a delivery served from the hot cache.
-func (c *Collector) RecordDeliveryHotHit() { c.DeliveryHotHitsTotal.Inc() }
-
-// RecordDeliveryColdRead records a delivery that read a cold tier.
-func (c *Collector) RecordDeliveryColdRead() { c.DeliveryColdReadsTotal.Inc() }
-
-// RecordColdReadOnePread records a WAL cold read on the one-pread fast path.
-func (c *Collector) RecordColdReadOnePread() { c.ColdReadOnePreadTotal.Inc() }
-
-// RecordColdReadTwoPreadFallback records a WAL cold read that fell back to the
-// legacy two-pread body.
-func (c *Collector) RecordColdReadTwoPreadFallback() { c.ColdReadTwoPreadFallbackTotal.Inc() }
-
-// RecordColdReadCurrentFile records a cold read from the active WAL file.
-func (c *Collector) RecordColdReadCurrentFile() { c.ColdReadCurrentFileTotal.Inc() }
-
-// RecordColdReadOldFile records a cold read from a rolled WAL file.
-func (c *Collector) RecordColdReadOldFile() { c.ColdReadOldFileTotal.Inc() }
-
-// RecordColdReadBufferPoolHit records a pool acquisition served from the
-// free-list.
-func (c *Collector) RecordColdReadBufferPoolHit() { c.ColdReadBufferPoolHitsTotal.Inc() }
-
-// RecordColdReadBufferPoolMiss records a pool acquisition that allocated.
-func (c *Collector) RecordColdReadBufferPoolMiss() { c.ColdReadBufferPoolMissesTotal.Inc() }
-
-// SetColdReadBufferPoolBytes sets the retained pool bytes gauge.
-func (c *Collector) SetColdReadBufferPoolBytes(bytes int64) {
-	c.ColdReadBufferPoolBytes.Set(float64(bytes))
-}
-
-// AddColdReadLease adjusts the live-lease gauge.
-func (c *Collector) AddColdReadLease(delta int64) {
-	c.ColdReadLeasesOutstanding.Add(float64(delta))
-}
-
-// SetHotCacheBytes sets the resident hot-cache bytes gauge.
-func (c *Collector) SetHotCacheBytes(bytes int64) {
-	c.HotCacheBytes.Set(float64(bytes))
 }

@@ -87,10 +87,7 @@ type DisruptorStorage struct {
 	pendingAckShards [pendingAckShardCount]sync.Mutex
 
 	metrics StorageMetrics
-	// coldMetrics is the OPTIONAL cold-read observer (WS-COLDREAD-PATH),
-	// resolved once in SetMetrics. nil = no observation.
-	coldMetrics ColdReadMetrics
-	dataDir     string
+	dataDir string
 }
 
 type QueueHot struct {
@@ -230,16 +227,6 @@ func NewDisruptorStorageWithEngineConfig(dataDir string, engineCfg interfaces.En
 
 func (ds *DisruptorStorage) SetMetrics(metrics StorageMetrics) {
 	ds.metrics = metrics
-	// WS-COLDREAD-PATH: resolve the OPTIONAL cold-read observer once. The
-	// pool's own counters are global, so its observer is set globally too; the
-	// per-read counters reach their metrics through this handle.
-	if cm, ok := metrics.(ColdReadMetrics); ok {
-		ds.coldMetrics = cm
-		SetColdReadPoolMetrics(cm)
-	} else {
-		ds.coldMetrics = nil
-		SetColdReadPoolMetrics(nil)
-	}
 	if ds.wal != nil {
 		ds.wal.SetMetrics(metrics)
 	}
@@ -446,7 +433,7 @@ func (ds *DisruptorStorage) GetMessage(queueName string, deliveryTag uint64) (*p
 		return nil, interfaces.ErrMessageNotFound
 	}
 
-	msg, err := ds.readColdMessage(queueName, deliveryTag, false)
+	msg, err := ds.readColdMessage(queueName, deliveryTag)
 	if err != nil {
 		return nil, err
 	}
@@ -500,7 +487,6 @@ func (ds *DisruptorStorage) GetMessageForDelivery(queueName string, deliveryTag 
 		return nil, interfaces.ErrQueueNotFound
 	}
 	if msg, _, ok := ds.hot.Get(queueName, deliveryTag); ok {
-		ds.noteDeliveryHotHit()
 		return msg, nil
 	}
 	if ds.wal != nil && ds.wal.IsAcknowledged(queueName, deliveryTag) {
@@ -521,14 +507,11 @@ func (ds *DisruptorStorage) GetMessageForDelivery(queueName string, deliveryTag 
 	}
 	capturedEpoch, hotQueue := ds.hot.captureAdmission(queueName)
 
-	// THE COLD READ. No lock is held across it. It is a LEASING read: for a
-	// record in the pool gate the returned message's Body aliases a pooled
-	// buffer and carries a release token the delivery consumer owns.
-	msg, err := ds.readColdMessage(queueName, deliveryTag, true)
+	// THE COLD READ. No lock is held across it.
+	msg, err := ds.readColdMessage(queueName, deliveryTag)
 	if err != nil {
 		return nil, err
 	}
-	ds.noteDeliveryColdRead()
 
 	// THE ADMISSION. The per-tag shard lock makes the (acknowledgement
 	// re-check + admission) atomic with respect to the acknowledgement
@@ -541,9 +524,6 @@ func (ds *DisruptorStorage) GetMessageForDelivery(queueName string, deliveryTag 
 	// landed while the cold read was in flight must refuse the message, and
 	// it must NOT be admitted.
 	if ds.wal != nil && ds.wal.IsAcknowledged(queueName, deliveryTag) {
-		// O4: the error path after the read releases the pooled buffer. A read
-		// that is not delivered must not leak pool capacity.
-		msg.ReleaseBody()
 		return nil, interfaces.ErrMessageNotFound
 	}
 
@@ -571,50 +551,17 @@ func (ds *DisruptorStorage) GetMessageForDelivery(queueName string, deliveryTag 
 	// It is durable=TRUE: the WAL's index is published only after the
 	// covering fdatasync, so a WAL read can only ever find durable
 	// messages.
-	//
-	// THE COPY-ON-ADMIT HAPPENS INSIDE putBestEffortIfCurrent, UNDER THE
-	// QUEUE LOCK: the pooled body is copied exactly and released before the
-	// entry becomes visible to another reader, so no hot-cache entry ever
-	// aliases pooled memory (INV-A1).
 	if err := ds.putBestEffortIfCurrent(queueName, captured, hotQueue, capturedEpoch, msg); err != nil {
 		// AN EPOCH MISMATCH IS NOT AN ERROR THE CALLER SEES: the message was
 		// read successfully, and the purge that moved the epoch may have been
 		// aimed at a DIFFERENT band, so failing the delivery would be a
-		// spurious delivery error. The message is returned, unadmitted, and it
-		// KEEPS its lease: the delivery consumer releases it after the write.
+		// spurious delivery error. The message is returned, unadmitted.
 		if errors.Is(err, errStaleAdmissionEpoch) {
 			return msg, nil
 		}
-		// THE INCARNATION MOVED: the queue is gone, so this is a delivery
-		// error and nothing was admitted. The pooled buffer is released.
-		msg.ReleaseBody()
 		return nil, err
 	}
-	ds.noteHotCacheBytes()
 	return msg, nil
-}
-
-// noteDeliveryHotHit records a delivery served from the hot cache.
-func (ds *DisruptorStorage) noteDeliveryHotHit() {
-	if ds.coldMetrics != nil {
-		ds.coldMetrics.RecordDeliveryHotHit()
-	}
-}
-
-// noteDeliveryColdRead records a delivery that missed the hot cache and read a
-// cold tier. It is recorded at the READ, so a refused admission still counts.
-func (ds *DisruptorStorage) noteDeliveryColdRead() {
-	if ds.coldMetrics != nil {
-		ds.coldMetrics.RecordDeliveryColdRead()
-	}
-}
-
-// noteHotCacheBytes publishes the resident hot-cache bytes to the
-// amqp_hot_cache_bytes gauge.
-func (ds *DisruptorStorage) noteHotCacheBytes() {
-	if ds.coldMetrics != nil {
-		ds.coldMetrics.SetHotCacheBytes(ds.hot.globalUsedBytes())
-	}
 }
 
 // errStaleAdmissionEpoch reports that the hot cache's admission epoch for the
@@ -695,45 +642,17 @@ func (ds *DisruptorStorage) putBestEffortIfCurrent(queueName string, captured *Q
 
 	// THE ADMISSION. Nothing was reserved and nothing was mutated yet, so a
 	// refusal above needs no rollback.
-	entry := ds.hot.putBestEffortLocked(q, queueName, msg, charge, true, true)
-
-	// THE COPY-ON-ADMIT. A pooled read buffer is NEVER admitted: if the
-	// returned message carries a live lease, copy its body EXACTLY out of the
-	// pooled buffer and release the buffer immediately. The copy runs UNDER THE
-	// QUEUE LOCK, so the entry cannot be served to another reader while its
-	// message still aliases pooled memory; and because the entry's message IS
-	// msg (on a fresh admission) or an unrelated entry (on a dedup hit), the
-	// pooled bytes are never reachable after this point.
-	//
-	// A nil entry means the admission was refused (budget full): the caller
-	// keeps the message and its lease.
-	if entry != nil && msg.HasBodyRelease() {
-		copied := make([]byte, len(msg.Body))
-		copy(copied, msg.Body)
-		msg.Body = copied
-		msg.ReleaseBody()
-	}
+	ds.hot.putBestEffortLocked(q, queueName, msg, charge, true, true)
 	return nil
 }
 
 // readColdMessage reads a message from the cold tiers (the WAL, then the
 // segment tier). It NEVER admits and it NEVER acknowledges: it is the read
 // half of both the peek and the delivery path.
-//
-// lease selects the ownership mode of the WAL read: true is the delivery path
-// (pooled read buffer, release token attached), false is the peek path (a
-// plain make, never a leased body — INV-A2). The segment tier never leases.
-func (ds *DisruptorStorage) readColdMessage(queueName string, deliveryTag uint64, lease bool) (*protocol.Message, error) {
+func (ds *DisruptorStorage) readColdMessage(queueName string, deliveryTag uint64) (*protocol.Message, error) {
 	var msg *protocol.Message
 	if ds.wal != nil {
-		var m *protocol.Message
-		var err error
-		if lease {
-			m, err = ds.wal.ReadForDelivery(queueName, deliveryTag)
-		} else {
-			m, err = ds.wal.Read(queueName, deliveryTag)
-		}
-		if err == nil {
+		if m, err := ds.wal.Read(queueName, deliveryTag); err == nil {
 			msg = m
 		}
 	}

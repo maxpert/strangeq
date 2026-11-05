@@ -823,49 +823,6 @@ type Message struct {
 	// always inline, bodyKind 0x00) and leaves it nil; only ITER5 will
 	// produce/consume it. The WAL and segment layers treat its contents as opaque.
 	BodyRef []byte
-
-	// bodyRelease is the WS-COLDREAD-PATH lease token. It is set ONLY by the
-	// storage cold-read path, and ONLY when Body aliases a buffer acquired from
-	// the cold-read buffer pool: the closure returns that buffer to the pool.
-	//
-	// IT IS UNEXPORTED SO A caller cannot mint one by accident, and it is a
-	// closure so no storage type leaks into the protocol package. A message
-	// whose Body is GC-managed (a hot-cache copy, a peek, a plain make) carries
-	// a nil token and ReleaseBody is a no-op.
-	//
-	// A value-copy of the Message copies this closure; the closure itself is
-	// idempotent (an atomic CAS in the storage layer), so a duplicate release --
-	// even through a copied struct -- returns the buffer at most once. A
-	// retained copy that must NOT release the source's buffer (the DLX clone)
-	// calls DetachBodyRelease.
-	bodyRelease func()
-}
-
-// AttachBodyRelease installs fn as the message's body-release token. The
-// storage cold-read path is the only intended caller. TEST-ONLY code may also
-// use it to model a leased message.
-func (m *Message) AttachBodyRelease(fn func()) { m.bodyRelease = fn }
-
-// HasBodyRelease reports whether the message carries a live body-release
-// token, i.e. whether Body aliases a pooled cold-read buffer.
-func (m *Message) HasBodyRelease() bool { return m != nil && m.bodyRelease != nil }
-
-// DetachBodyRelease clears the release token WITHOUT invoking it. It is the
-// clone-path primitive: a retained copy must never release the source's pooled
-// buffer.
-func (m *Message) DetachBodyRelease() { m.bodyRelease = nil }
-
-// ReleaseBody invokes and clears the body-release token. It is NIL-SAFE and
-// IDEMPOTENT: a message with no token is a no-op, and a second call after the
-// token is cleared is a no-op. Correctness under value-copies comes from the
-// underlying closure's atomic once, not from the nil.
-func (m *Message) ReleaseBody() {
-	if m == nil || m.bodyRelease == nil {
-		return
-	}
-	fn := m.bodyRelease
-	m.bodyRelease = nil
-	fn()
 }
 
 // Delivery represents a message delivery to a consumer

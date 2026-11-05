@@ -1,7 +1,6 @@
 package broker
 
 import (
-	"bytes"
 	"time"
 
 	"github.com/maxpert/amqp-go/interfaces"
@@ -524,13 +523,6 @@ func (b *StorageBroker) recordDeadLetterTargetGone(srcQueueName, target string) 
 // with a deep-copied Headers map and DeliveryTag reset to 0. Annotation and any
 // Expiration strip happen on this copy so the caller's live message is never
 // mutated. Allocation here is acceptable — this is the cold dead-letter path.
-//
-// WS-COLDREAD-PATH: a leased message's Body aliases a pooled cold-read buffer.
-// The clone is a RETAINED value-copy (the DLX target admits it to its own hot
-// cache), so a shallow copy would carry the pooled alias and the release token
-// into the target. Deep-copy Body/BodyRef and DETACH the token: a clone must
-// never release its source's buffer, and the copy must outlive the source's
-// release.
 func cloneForDeadLetter(msg *protocol.Message) *protocol.Message {
 	clone := *msg
 	clone.DeliveryTag = 0
@@ -541,11 +533,6 @@ func cloneForDeadLetter(msg *protocol.Message) *protocol.Message {
 		}
 		clone.Headers = h
 	}
-	if msg.HasBodyRelease() {
-		clone.Body = bytes.Clone(msg.Body)
-		clone.BodyRef = bytes.Clone(msg.BodyRef)
-	}
-	clone.DetachBodyRelease()
 	return &clone
 }
 

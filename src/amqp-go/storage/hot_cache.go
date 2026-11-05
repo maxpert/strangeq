@@ -858,12 +858,6 @@ func (c *hotCache) globalRoom(charge int64) bool {
 	return atomic.LoadInt64(&c.globalUsed)+charge <= c.globalBytes
 }
 
-// globalUsedBytes reports the resident hot-cache bytes. It is the source of the
-// amqp_hot_cache_bytes gauge.
-func (c *hotCache) globalUsedBytes() int64 {
-	return atomic.LoadInt64(&c.globalUsed)
-}
-
 // freeGlobalSpace evicts backed entries until the global budget has room for
 // charge bytes again.
 //

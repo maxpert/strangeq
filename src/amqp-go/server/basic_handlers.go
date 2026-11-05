@@ -971,10 +971,6 @@ func (s *Server) handleBasicGet(conn *protocol.Connection, channelID uint16, pay
 			zap.Uint16("channel_id", channelID))
 		return err
 	}
-	// WS-COLDREAD-PATH W3: basic.get has its own write, so the cold-read lease
-	// is released when this handler returns — after the response write (or its
-	// failure). A nil message is a no-op.
-	defer message.ReleaseBody()
 
 	if message == nil {
 		return s.sendBasicGetEmpty(conn, channelID)
