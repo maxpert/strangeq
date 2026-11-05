@@ -87,10 +87,7 @@ type DisruptorStorage struct {
 	pendingAckShards [pendingAckShardCount]sync.Mutex
 
 	metrics StorageMetrics
-	// coldMetrics is the OPTIONAL cold-read observer (WS-COLDREAD-PATH safe
-	// core), resolved once in SetMetrics. nil = no observation.
-	coldMetrics ColdReadMetrics
-	dataDir     string
+	dataDir string
 }
 
 type QueueHot struct {
@@ -230,34 +227,11 @@ func NewDisruptorStorageWithEngineConfig(dataDir string, engineCfg interfaces.En
 
 func (ds *DisruptorStorage) SetMetrics(metrics StorageMetrics) {
 	ds.metrics = metrics
-	// WS-COLDREAD-PATH: resolve the OPTIONAL cold-read observer once, so a
-	// custom StorageMetrics-only collector keeps compiling. nil = no
-	// cold-read observation.
-	if cm, ok := metrics.(ColdReadMetrics); ok {
-		ds.coldMetrics = cm
-	} else {
-		ds.coldMetrics = nil
-	}
 	if ds.wal != nil {
 		ds.wal.SetMetrics(metrics)
 	}
 	if ds.segments != nil {
 		ds.segments.SetMetrics(metrics)
-	}
-}
-
-// noteDeliveryHotHit records a delivery served from the hot cache.
-func (ds *DisruptorStorage) noteDeliveryHotHit() {
-	if ds.coldMetrics != nil {
-		ds.coldMetrics.RecordDeliveryHotHit()
-	}
-}
-
-// noteDeliveryColdRead records a delivery that missed the hot cache and read a
-// cold tier. It is recorded at the READ, so a refused admission still counts.
-func (ds *DisruptorStorage) noteDeliveryColdRead() {
-	if ds.coldMetrics != nil {
-		ds.coldMetrics.RecordDeliveryColdRead()
 	}
 }
 
@@ -513,7 +487,6 @@ func (ds *DisruptorStorage) GetMessageForDelivery(queueName string, deliveryTag 
 		return nil, interfaces.ErrQueueNotFound
 	}
 	if msg, _, ok := ds.hot.Get(queueName, deliveryTag); ok {
-		ds.noteDeliveryHotHit()
 		return msg, nil
 	}
 	if ds.wal != nil && ds.wal.IsAcknowledged(queueName, deliveryTag) {
@@ -539,7 +512,6 @@ func (ds *DisruptorStorage) GetMessageForDelivery(queueName string, deliveryTag 
 	if err != nil {
 		return nil, err
 	}
-	ds.noteDeliveryColdRead()
 
 	// THE ADMISSION. The per-tag shard lock makes the (acknowledgement
 	// re-check + admission) atomic with respect to the acknowledgement

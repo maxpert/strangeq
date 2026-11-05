@@ -484,11 +484,6 @@ type QueueWAL struct {
 	// production cost is one lock per batch hand-off.
 	pipelineMu      sync.Mutex
 	pipelineBatches []*stagedBatch
-
-	// coldMetrics is the OPTIONAL cold-read observer (WS-COLDREAD-PATH safe
-	// core), resolved once in SetMetrics. Appended after the pinned hot-path
-	// layout, like every other late field. nil = no observation.
-	coldMetrics ColdReadMetrics
 }
 
 // WALBatchSealBytesDefault is the default byte-based WAL batch seal (64 MiB):
@@ -802,14 +797,6 @@ func (wm *WALManager) SetMetrics(metrics WALMetrics) {
 	wm.metrics = metrics
 	if wm.sharedWAL != nil {
 		wm.sharedWAL.metrics = metrics
-		// WS-COLDREAD-PATH: resolve the OPTIONAL cold-read observer once, so a
-		// custom WALMetrics-only collector keeps compiling. nil = no cold-read
-		// observation.
-		if cm, ok := metrics.(ColdReadMetrics); ok {
-			wm.sharedWAL.coldMetrics = cm
-		} else {
-			wm.sharedWAL.coldMetrics = nil
-		}
 	}
 }
 
