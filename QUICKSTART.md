@@ -4,11 +4,12 @@
 
 ### Pre-built Binary
 
-Download from the [releases page](https://github.com/maxpert/strangeq/releases):
+Download from the [releases page](https://github.com/maxpert/strangeq/releases). Each platform ships as a tarball (`amqp-server-<version>-<os>-<arch>.tar.gz`) containing the `amqp-server` binary, `config.sample.yaml`, `README.txt`, and `LICENSE`, plus a `.sha256` checksum:
 
 ```bash
-chmod +x amqp-server-*
-sudo mv amqp-server-* /usr/local/bin/amqp-server
+tar -xzf amqp-server-<version>-<os>-<arch>.tar.gz
+cd amqp-server-<version>-<os>-<arch>/
+sudo mv amqp-server /usr/local/bin/
 amqp-server --version
 ```
 

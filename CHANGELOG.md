@@ -15,6 +15,9 @@
 - The `authmechanisms` list is authoritative. A list without `PLAIN` no longer
   silently offers PLAIN; unknown names are reported at startup.
 - Telemetry defaults to loopback (`127.0.0.1`) and pprof is opt-in.
+- The shipped sample config's `engine.walcleanupcheckintervalms` is 1000 ms,
+  matching the code default. The reclaimed files' inventory is a memory bound,
+  so a slow reclaim retains more resident memory.
 
 ### Added
 - Connection access control: `allowedhosts`/`blockedhosts` (IP, CIDR, or
@@ -37,6 +40,14 @@
 - Crash/stress scripts use real flags, free ports, and readiness checks, and
   only stop the broker they started.
 - `--version` reports the stamped version instead of a hard-coded constant.
+- WAL fsync on macOS issues `F_FULLFSYNC` through a preemptible path, so the
+  committer's OS thread no longer pins a Go P for the whole drive-cache flush.
+- With `storage.fsync: false`, the WAL directory fsync is skipped: a
+  no-fsync run no longer pays a directory barrier whose contents it never
+  promised to make durable (transactions still fsync unconditionally).
+- WAL bookkeeping is bounded by the in-flight (not-yet-acknowledged) set, and
+  the WAL index shard maps shrink once the unacked set drains, cutting peak
+  RSS on the 1 KiB workloads.
 
 ## [0.1.0] - TBD
 
@@ -62,9 +73,12 @@
 - Vectored delivery for large messages (writev)
 
 ### Performance
-- 108,000 msg/s durable (1 pub / 1 con, 1 KB, publisher confirms, fsync)
-- 113,667 msg/s durable (10 pub / 10 con)
-- 1.10x to 4.48x faster than RabbitMQ 4.3 on durable workloads
+- See the [Performance section](README.md#performance) for the current measured
+  matrix against RabbitMQ 4.4 Classic, including both durability modes, the
+  validity gates, and the cross-session caveat.
+- Headline (shipped `fsync:on` mode): wins on the 1 KiB workloads and on peak
+  RSS; the 64 KiB `fsync:on` rows remain losses against RabbitMQ's
+  best-measured configuration (F3 0.81x, F4 0.87x).
 
 [Unreleased]: https://github.com/maxpert/strangeq/compare/v0.1.0...HEAD
 [0.1.0]: https://github.com/maxpert/strangeq/releases/tag/v0.1.0

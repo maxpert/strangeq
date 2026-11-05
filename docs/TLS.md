@@ -54,7 +54,7 @@ conn, err := amqp.DialTLS("amqps://localhost:5671/", &tls.Config{
 ### Security Defaults
 
 - **Minimum TLS version**: TLS 1.2 (TLS 1.0/1.1 deprecated per RFC 8996)
-- **Server cipher preference**: `PreferServerCipherSuites: true` — server selects the most secure mutually-supported cipher
+- **Cipher suites**: the server does not pin a cipher preference; Go's `crypto/tls` default suite selection applies. The `PreferServerCipherSuites` field is not set (it is legacy and has no effect on current Go).
 - **Client authentication**: 
   - Without CA file: `NoClientCert` (server-only TLS)
   - With CA file: `RequireAndVerifyClientCert` (mutual TLS)
@@ -173,7 +173,7 @@ For production, use certificates from a trusted Certificate Authority:
 ## Performance Considerations
 
 - **TLS handshake**: Adds ~1-2ms per connection. AMQP connections are long-lived, so this is amortized over the connection lifetime.
-- **No per-message overhead**: TLS session is persistent; encryption happens in the kernel/network stack.
+- **Per-record cost, no offload**: the TLS session is persistent, but every record is encrypted and authenticated by Go's `crypto/tls` in user space. There is no kernel TLS offload on this path.
 - **Certificate type**: ECDSA certificates have smaller signatures and faster verification than RSA.
 - **Session resumption**: Go's TLS stack supports session tickets (TLS 1.3) and session IDs (TLS 1.2) for faster reconnection.
 

@@ -46,9 +46,9 @@
 
 6. Verify:
    ```bash
-   wget https://github.com/maxpert/strangeq/releases/download/v0.1.0/amqp-server-linux-amd64
-   wget https://github.com/maxpert/strangeq/releases/download/v0.1.0/amqp-server-linux-amd64.sha256
-   sha256sum -c amqp-server-linux-amd64.sha256
+   wget https://github.com/maxpert/strangeq/releases/download/v0.1.0/amqp-server-0.1.0-linux-amd64.tar.gz
+   wget https://github.com/maxpert/strangeq/releases/download/v0.1.0/amqp-server-0.1.0-linux-amd64.tar.gz.sha256
+   sha256sum -c amqp-server-0.1.0-linux-amd64.tar.gz.sha256
    ```
 
 ## Post-Release
