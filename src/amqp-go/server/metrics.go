@@ -126,6 +126,14 @@ func (s *Server) leaseMetrics() LeaseMetrics {
 	return lm
 }
 
+// WALBookkeepingStatsBinder is implemented by the production collector: the
+// server binds the storage tier's bookkeeping accessor at build time so the
+// amqp_wal_bookkeeping_* gauges are read AT SCRAPE TIME (never stale).
+// DIAGNOSTIC ONLY; never gated (WS-MEMORY-CUT §8).
+type WALBookkeepingStatsBinder interface {
+	BindWALBookkeepingStats(stats func() (inventoryRecords, indexCopies int, drained uint64))
+}
+
 // NoOpMetricsCollector is a metrics collector that does nothing
 type NoOpMetricsCollector struct{}
 

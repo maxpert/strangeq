@@ -484,6 +484,16 @@ type QueueWAL struct {
 	// production cost is one lock per batch hand-off.
 	pipelineMu      sync.Mutex
 	pipelineBatches []*stagedBatch
+
+	// --- WS-MEMORY-CUT instrumentation (diagnostic only; never gated). ---
+	//
+	// inventoryDrains counts the settled records the committer (and the
+	// cleanup loop) have deleted from the CURRENT file's inventory since
+	// boot. It is the "settle-drain count" the measurement plan reads: a
+	// monotonic witness that the in-flight bound is actually being applied.
+	// Zero before the cut lands, which is exactly what the plan's AC4 wants
+	// to distinguish.
+	inventoryDrains atomic.Uint64
 }
 
 // WALBatchSealBytesDefault is the default byte-based WAL batch seal (64 MiB):
@@ -798,6 +808,19 @@ func (wm *WALManager) SetMetrics(metrics WALMetrics) {
 	if wm.sharedWAL != nil {
 		wm.sharedWAL.metrics = metrics
 	}
+}
+
+// WALBookkeepingStats exposes the shared WAL's in-memory bookkeeping for the
+// telemetry scrape (WS-MEMORY-CUT §8). It is diagnostic only and never gated.
+// Returns zeroes when the WAL is not yet built.
+func (wm *WALManager) WALBookkeepingStats() (inventoryRecords, indexCopies int, drained uint64) {
+	wm.mu.RLock()
+	sw := wm.sharedWAL
+	wm.mu.RUnlock()
+	if sw == nil {
+		return 0, 0, 0
+	}
+	return sw.bookkeepingStats()
 }
 
 // doneChannelPool pools buffered error channels (cap 1) used by Write() for
@@ -3297,6 +3320,59 @@ func (qw *QueueWAL) pipelineBufsForTest() []handoffSnapshot {
 		out[i] = sb.handoffSnapshot
 	}
 	return out
+}
+
+// bookkeepingStats reports the WAL-tier bookkeeping the memory cut targets:
+//
+//   - inventoryRecords: how many records the ACTIVE file's inventory holds.
+//     Before the cut this is bounded by the file's size (a whole 512 MiB
+//     file's records); after it, by the in-flight (unsettled) set.
+//   - indexCopies: the number of physical copies across every index shard.
+//     This is the map the ack path eagerly settles; its magnitude is the
+//     standing backlog plus the ramp-up bucket high-water.
+//   - drained: the monotonic settle-drain count (see inventoryDrains).
+//
+// DIAGNOSTIC ONLY; never gated. It takes fileMutex and each shard's read
+// lock, so it is cheap but not free: it is read by the telemetry scrape and
+// by tests, never by the write path.
+func (qw *QueueWAL) bookkeepingStats() (inventoryRecords, indexCopies int, drained uint64) {
+	qw.fileMutex.Lock()
+	if qw.currentInv != nil {
+		inventoryRecords = len(qw.currentInv.records)
+	}
+	qw.fileMutex.Unlock()
+
+	for i := range qw.indexShards {
+		sh := &qw.indexShards[i]
+		sh.mu.RLock()
+		for _, set := range sh.copies {
+			indexCopies += len(set)
+		}
+		sh.mu.RUnlock()
+	}
+	drained = qw.inventoryDrains.Load()
+	return
+}
+
+// inventorySizesForTest reports how many records the ACTIVE file's inventory
+// holds and how many every SEALED file's inventory holds in total. It exists
+// for the memory-cut tests (T1) and reads the real maps under the same locks
+// the production readers use. TEST-ONLY.
+func (qw *QueueWAL) inventorySizesForTest() (current, old int) {
+	qw.fileMutex.Lock()
+	if qw.currentInv != nil {
+		current = len(qw.currentInv.records)
+	}
+	qw.fileMutex.Unlock()
+
+	qw.oldFilesMutex.RLock()
+	for _, info := range qw.oldFiles {
+		if info.inv != nil {
+			old += len(info.inv.records)
+		}
+	}
+	qw.oldFilesMutex.RUnlock()
+	return
 }
 
 // deliverCompletions signals every request in the batch, iterating in enqueue
