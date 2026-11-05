@@ -915,3 +915,4 @@ func (c *Collector) RecordColdReadCurrentFile() { c.ColdReadCurrentFileTotal.Inc
 
 // RecordColdReadOldFile records a cold read from a rolled WAL file.
 func (c *Collector) RecordColdReadOldFile() { c.ColdReadOldFileTotal.Inc() }
+
