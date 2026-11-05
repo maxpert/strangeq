@@ -417,12 +417,57 @@ func (s *walIndexShard) settleRecordLocked(r *segmentRecord) bool {
 		return false
 	}
 	s.unindexSettledRecordLocked(r)
+	// S1c: a Go map never returns bucket memory on delete, so once the
+	// unacked set has drained the maps still hold the ramp-up's buckets.
+	// Rebuild them when the live count falls well below the peak.
+	s.shrinkMapsIfIdleLocked()
 	// Queue the settled record for the inventory drain. The append happens
 	// under the shard lock this call already holds, so no new lock and no new
 	// atomic on the ack path; pending is a plain flag the committer polls.
 	s.settledPending = append(s.settledPending, r)
 	s.pending.Store(true)
 	return true
+}
+
+// shrinkMapsIfIdleLocked rebuilds the shard's two maps when the live count has
+// fallen below a quarter of the high-water mark, dropping the bucket arrays
+// the deleted keys left behind. Caller holds the shard's write lock.
+//
+// THE REBUILD IS AMORTISED. The threshold is a quarter, so a rebuild can only
+// fire again after the maps have grown back to four times the post-rebuild
+// size; the aggregate cost is O(1) per settled record. A small floor keeps a
+// tiny shard from reallocating for no reason.
+func (s *walIndexShard) shrinkMapsIfIdleLocked() {
+	if s.highWater < 64 {
+		return
+	}
+	if len(s.copies)+len(s.offset) < s.highWater/4 {
+		s.rebuildMapsLocked()
+	}
+}
+
+// rebuildMapsLocked reallocates the shard's two maps at their CURRENT size and
+// copies the live entries across. Caller holds the shard's write lock.
+//
+// THE SWAP IS SAFE BECAUSE EVERY ACCESS IS UNDER THAT LOCK: the ack path, the
+// committer's index step, the reclaim sweep and the compaction's install all
+// take this shard's write lock (the last two take every shard), and the read
+// path takes the read lock. No caller holds a reference to the map itself
+// across the lock -- they index it by key -- so replacing it is invisible to
+// them. highWater is reset to the new live count, so the next rebuild is a
+// further four-fold drop.
+func (s *walIndexShard) rebuildMapsLocked() {
+	copies := make(map[recordKey][]*segmentRecord, len(s.copies))
+	for k, v := range s.copies {
+		copies[k] = v
+	}
+	s.copies = copies
+	offset := make(map[recordKey]*segmentRecord, len(s.offset))
+	for k, v := range s.offset {
+		offset[k] = v
+	}
+	s.offset = offset
+	s.highWater = len(s.copies) + len(s.offset)
 }
 
 // indexShardHighWaterForTest sums every shard's retained-capacity high-water
