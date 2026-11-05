@@ -120,6 +120,17 @@ type Collector struct {
 	// BuildInfo is the constant-1 build identity gauge.
 	BuildInfo *prometheus.GaugeVec
 
+	// WS-COLDREAD-PATH SAFE-CORE cold-read metrics (amqp_cold_read_*,
+	// amqp_delivery_*). Recorded by the storage cold-read path through the
+	// optional storage.ColdReadMetrics interface. The pool/lease series were
+	// removed with the rejected pooled-buffer mechanism.
+	DeliveryHotHitsTotal          prometheus.Counter
+	DeliveryColdReadsTotal        prometheus.Counter
+	ColdReadOnePreadTotal         prometheus.Counter
+	ColdReadTwoPreadFallbackTotal prometheus.Counter
+	ColdReadCurrentFileTotal      prometheus.Counter
+	ColdReadOldFileTotal          prometheus.Counter
+
 	// WS-I Phase B publish-lease metrics (amqp_publish_lease_*). The three
 	// gauges are GaugeFuncs reading the bound limiter Stats AT SCRAPE TIME
 	// (never stale); bind via BindPublishLeaseStats.
@@ -401,6 +412,38 @@ func NewCollector(namespace string) *Collector {
 			Namespace: namespace,
 			Name:      "segment_read_errors_total",
 			Help:      "Total number of segment read failures",
+		}),
+
+		// WS-COLDREAD-PATH SAFE-CORE cold-read metrics.
+		DeliveryHotHitsTotal: promauto.NewCounter(prometheus.CounterOpts{
+			Namespace: namespace,
+			Name:      "delivery_hot_hits_total",
+			Help:      "Consumer deliveries served from the hot cache",
+		}),
+		DeliveryColdReadsTotal: promauto.NewCounter(prometheus.CounterOpts{
+			Namespace: namespace,
+			Name:      "delivery_cold_reads_total",
+			Help:      "Consumer deliveries that missed the hot cache and read a cold tier",
+		}),
+		ColdReadOnePreadTotal: promauto.NewCounter(prometheus.CounterOpts{
+			Namespace: namespace,
+			Name:      "cold_read_one_pread_total",
+			Help:      "WAL cold reads taken by the single-pread fast path",
+		}),
+		ColdReadTwoPreadFallbackTotal: promauto.NewCounter(prometheus.CounterOpts{
+			Namespace: namespace,
+			Name:      "cold_read_two_pread_fallback_total",
+			Help:      "WAL cold reads that fell back to the legacy two-pread body (index byte count unavailable or inconsistent)",
+		}),
+		ColdReadCurrentFileTotal: promauto.NewCounter(prometheus.CounterOpts{
+			Namespace: namespace,
+			Name:      "cold_read_current_file_total",
+			Help:      "WAL cold reads served from the active WAL file",
+		}),
+		ColdReadOldFileTotal: promauto.NewCounter(prometheus.CounterOpts{
+			Namespace: namespace,
+			Name:      "cold_read_old_file_total",
+			Help:      "WAL cold reads served from a rolled WAL file",
 		}),
 
 		// Ring buffer metrics
@@ -845,3 +888,31 @@ func (c *Collector) RecordMessageDropped(queueName, reason string) {
 	labels := prometheus.Labels{"queue": queueName, "reason": reason}
 	c.MessagesDroppedTotal.With(labels).Inc()
 }
+
+// --- WS-COLDREAD-PATH SAFE-CORE cold-read metrics --------------------------
+//
+// These implement the storage.ColdReadMetrics optional interface. The by-read
+// counters are recorded AT THE READ, independent of whether the admission that
+// follows succeeds.
+
+// RecordDeliveryHotHit records a delivery served from the hot cache.
+func (c *Collector) RecordDeliveryHotHit() { c.DeliveryHotHitsTotal.Inc() }
+
+// RecordDeliveryColdRead records a delivery that read a cold tier.
+func (c *Collector) RecordDeliveryColdRead() { c.DeliveryColdReadsTotal.Inc() }
+
+// RecordColdReadOnePread records a WAL cold read on the one-pread fast path.
+func (c *Collector) RecordColdReadOnePread() { c.ColdReadOnePreadTotal.Inc() }
+
+// RecordColdReadTwoPreadFallback records a WAL cold read that fell back to the
+// legacy two-pread body.
+func (c *Collector) RecordColdReadTwoPreadFallback() {
+	c.ColdReadTwoPreadFallbackTotal.Inc()
+}
+
+// RecordColdReadCurrentFile records a cold read from the active WAL file.
+func (c *Collector) RecordColdReadCurrentFile() { c.ColdReadCurrentFileTotal.Inc() }
+
+// RecordColdReadOldFile records a cold read from a rolled WAL file.
+func (c *Collector) RecordColdReadOldFile() { c.ColdReadOldFileTotal.Inc() }
+
