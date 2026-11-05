@@ -151,7 +151,7 @@ func (s *Server) handleExchangeDeclarePassive(conn *protocol.Connection, channel
 	var err error
 	sb, ok := s.Broker.(*StorageBrokerAdapter)
 	if ok {
-		exchange, err = sb.broker.ExchangeDeclarePassive(declareMethod.Exchange)
+		_, err = sb.broker.ExchangeDeclarePassive(declareMethod.Exchange)
 	} else {
 		exchange = s.Broker.GetExchanges()[declareMethod.Exchange]
 		if exchange == nil {

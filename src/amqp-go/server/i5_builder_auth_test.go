@@ -2,11 +2,9 @@ package server
 
 import (
 	"encoding/json"
-	"net"
 	"os"
 	"path/filepath"
 	"testing"
-	"time"
 
 	"github.com/maxpert/amqp-go/auth"
 	"github.com/maxpert/amqp-go/config"
@@ -209,11 +207,4 @@ func TestBuilderAuth_FailClosedWhenEnabledButNoAuthenticator(t *testing.T) {
 	conn := newLoopbackPipeConn(t)
 	err = srv.handleConnectionStartOK(conn, payload)
 	assert.Error(t, err, "when auth enabled but no authenticator, must fail-closed (not fall through to guest)")
-}
-
-func dialAMQP(t *testing.T, addr string) net.Conn {
-	t.Helper()
-	conn, err := net.DialTimeout("tcp", addr, 5*time.Second)
-	require.NoError(t, err)
-	return conn
 }
