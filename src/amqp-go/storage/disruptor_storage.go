@@ -459,7 +459,7 @@ func (ds *DisruptorStorage) GetMessage(queueName string, deliveryTag uint64) (*p
 		return nil, interfaces.ErrMessageNotFound
 	}
 
-	msg, err := ds.readColdMessage(queueName, deliveryTag, false)
+	msg, err := ds.readColdMessage(queueName, deliveryTag)
 	if err != nil {
 		return nil, err
 	}
@@ -535,7 +535,7 @@ func (ds *DisruptorStorage) GetMessageForDelivery(queueName string, deliveryTag 
 	capturedEpoch, hotQueue := ds.hot.captureAdmission(queueName)
 
 	// THE COLD READ. No lock is held across it.
-	msg, err := ds.readColdMessage(queueName, deliveryTag, true)
+	msg, err := ds.readColdMessage(queueName, deliveryTag)
 	if err != nil {
 		return nil, err
 	}
@@ -677,22 +677,10 @@ func (ds *DisruptorStorage) putBestEffortIfCurrent(queueName string, captured *Q
 // readColdMessage reads a message from the cold tiers (the WAL, then the
 // segment tier). It NEVER admits and it NEVER acknowledges: it is the read
 // half of both the peek and the delivery path.
-//
-// forDelivery selects the WAL entry point: the delivery path uses
-// ReadForDelivery (the explicit delivery entry point), the peek path uses Read.
-// With no pool and no lease in the safe core both take the same one-pread read;
-// the segment tier is identical either way.
-func (ds *DisruptorStorage) readColdMessage(queueName string, deliveryTag uint64, forDelivery bool) (*protocol.Message, error) {
+func (ds *DisruptorStorage) readColdMessage(queueName string, deliveryTag uint64) (*protocol.Message, error) {
 	var msg *protocol.Message
 	if ds.wal != nil {
-		var m *protocol.Message
-		var err error
-		if forDelivery {
-			m, err = ds.wal.ReadForDelivery(queueName, deliveryTag)
-		} else {
-			m, err = ds.wal.Read(queueName, deliveryTag)
-		}
-		if err == nil {
+		if m, err := ds.wal.Read(queueName, deliveryTag); err == nil {
 			msg = m
 		}
 	}
