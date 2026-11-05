@@ -19,36 +19,33 @@ import (
 
 // ServerBuilder provides a fluent API for building AMQP servers
 type ServerBuilder struct {
-	config            *config.AMQPConfig
-	logger            interfaces.Logger
-	broker            UnifiedBroker
-	storage           interfaces.Storage
-	authenticator     interfaces.Authenticator
-	connectionHandler interfaces.ConnectionHandler
-	metrics           MetricsCollector
+	config        *config.AMQPConfig
+	logger        interfaces.Logger
+	broker        UnifiedBroker
+	storage       interfaces.Storage
+	authenticator interfaces.Authenticator
+	metrics       MetricsCollector
 }
 
 // NewServerBuilder creates a new server builder with default configuration
 func NewServerBuilder() *ServerBuilder {
 	return &ServerBuilder{
-		config:            config.DefaultConfig(),
-		logger:            nil,
-		broker:            nil,
-		storage:           nil,
-		authenticator:     nil,
-		connectionHandler: nil,
+		config:        config.DefaultConfig(),
+		logger:        nil,
+		broker:        nil,
+		storage:       nil,
+		authenticator: nil,
 	}
 }
 
 // NewServerBuilderWithConfig creates a server builder with the given configuration
 func NewServerBuilderWithConfig(cfg *config.AMQPConfig) *ServerBuilder {
 	return &ServerBuilder{
-		config:            cfg,
-		logger:            nil,
-		broker:            nil,
-		storage:           nil,
-		authenticator:     nil,
-		connectionHandler: nil,
+		config:        cfg,
+		logger:        nil,
+		broker:        nil,
+		storage:       nil,
+		authenticator: nil,
 	}
 }
 
@@ -136,9 +133,10 @@ func (b *ServerBuilder) WithFileAuthentication(userFile string) *ServerBuilder {
 	return b
 }
 
-// WithConnectionHandler sets a custom connection handler
+// WithConnectionHandler accepts a custom connection handler for API
+// compatibility. The builder has no consumer for it, so it has no effect on
+// the built server.
 func (b *ServerBuilder) WithConnectionHandler(handler interfaces.ConnectionHandler) *ServerBuilder {
-	b.connectionHandler = handler
 	return b
 }
 
@@ -317,13 +315,10 @@ func (b *ServerBuilder) Build() (*Server, error) {
 	registry := auth.RegistryForMechanisms(mechanisms)
 	mechanismRegistry = NewMechanismRegistryAdapter(registry)
 
-	// If auth is enabled, fail-closed if authenticator or registry is nil.
+	// If auth is enabled, fail-closed if the authenticator is nil.
 	if b.config.Security.AuthenticationEnabled {
 		if authenticator == nil {
 			return nil, fmt.Errorf("authentication enabled but no authenticator available (fail-closed)")
-		}
-		if mechanismRegistry == nil {
-			return nil, fmt.Errorf("authentication enabled but no mechanism registry available (fail-closed)")
 		}
 	}
 
