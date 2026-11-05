@@ -277,7 +277,7 @@ engine:
   # Segment file size - max size of each segment file (bytes)
   # Larger = fewer files, longer compaction time
   # Smaller = more files, faster compaction, more file handles
-  # Default: 268435456 (256 MB)
+  # Code default: 67108864 (64 MiB); this sample sets 268435456 (256 MB).
   segmentsize: 268435456
 
   # Segment checkpoint interval - how often to checkpoint metadata (milliseconds)

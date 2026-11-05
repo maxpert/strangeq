@@ -82,3 +82,6 @@ issues.md
 
 # Local notes, specs, and reports (never checked in)
 .notes/
+
+# Git worktrees (local only)
+.worktrees/

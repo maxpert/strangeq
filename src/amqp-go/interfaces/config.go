@@ -327,7 +327,7 @@ type EngineConfig struct {
 	// longer gates WAL batch flushing: the batch writer flushes as soon as its
 	// request channel is drained (drain-then-flush group commit), so a lone
 	// synchronous writer is never stalled waiting for a batch timer.
-	// Default: 10 (10ms)
+	// Default: 5 (5ms)
 	WALBatchTimeoutMS int64 `json:"wal_batch_timeout_ms"`
 
 	// WALFileSize is the max size of each WAL file before rotation
@@ -396,7 +396,7 @@ type EngineConfig struct {
 	// SegmentSize is the max size of each segment file before creating new one
 	// Larger = fewer files, longer compaction time
 	// Smaller = more files, faster compaction, more file handles
-	// Default: 1,073,741,824 (1 GB)
+	// Default: 67,108,864 (64 MiB)
 	SegmentSize int64 `json:"segment_size"`
 
 	// SegmentCheckpointIntervalMS is how often to checkpoint segment metadata (milliseconds)

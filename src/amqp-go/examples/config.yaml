@@ -17,7 +17,6 @@ network:
   address: :5672
   port: 5672
   maxconnections: 1000
-  connectiontimeoutms: 30000      # 30 seconds
   heartbeatintervalms: 60000      # 60 seconds
   tcpkeepalive: true
   tcpkeepaliveintervalms: 30000   # 30 seconds
@@ -59,15 +58,11 @@ server:
   maxmessagesize: 16777216         # 16MB
 
   # Timeouts and intervals
-  channeltimeoutms: 60000          # 60 seconds
-  messagetimeoutms: 30000          # 30 seconds
   cleanupintervalms: 300000        # 5 minutes
 
 # Optional: Tune engine parameters for your workload
 # See config.sample.yaml for all available options
 engine:
-  # Queue State Management
-  availablechannelbuffer: 10000000  # 10M = 80 MB per queue
 
   # Ring Buffer (Hot Path)
   ringbuffersize: 65536             # 64K messages
@@ -90,7 +85,4 @@ engine:
   consumermaxbatchsize: 100         # Max 100 messages per poll
 
   # Background Maintenance
-  expiredmessagecheckintervalms: 60000   # 60 seconds
   walcleanupcheckintervalms: 1000        # 1 second
-  offsetcleanupbatchsize: 1000           # 1,000 offsets per cycle
-  offsetcleanupintervalms: 30000         # 30 seconds
