@@ -50,7 +50,6 @@ package storage
 
 import (
 	"testing"
-	"time"
 
 	"github.com/stretchr/testify/require"
 
@@ -217,27 +216,6 @@ func TestCrossFileIndexEviction_CheckpointingOneFileEvictsAnotherFilesEntry(t *t
 	require.Equal(t, newFileNum, after,
 		"CROSS-FILE INDEX EVICTION: offsetIndex[%d] was re-attributed from the live file %d "+
 			"to %d by a checkpoint of file %d", tag, newFileNum, after, oldFileNum)
-}
-
-// waitForIndexEntryGone waits until the ack path's own cleanup goroutine has
-// removed a tag from the offset index.
-//
-// cleanupLoop adds to ackBitmap and THEN deletes the index entry, so waiting on
-// the bitmap (waitForAcksApplied) does not establish the delete. This waits on
-// the thing actually under test.
-func waitForIndexEntryGone(t *testing.T, qw *QueueWAL, tag uint64) {
-	t.Helper()
-	deadline := time.Now().Add(30 * time.Second)
-	for {
-		if _, present := indexedFileNum(qw, tag); !present {
-			return
-		}
-		if time.Now().After(deadline) {
-			t.Fatalf("PREMISE BROKEN: the ack path did not remove offsetIndex[%d] within 30s, "+
-				"so the state this test measures was never reached", tag)
-		}
-		time.Sleep(5 * time.Millisecond)
-	}
 }
 
 // TestAmbiguousTag_RealAckPathProducesTheStaleReadState is the REACHABILITY

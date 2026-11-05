@@ -732,10 +732,11 @@ type sharedUnit struct {
 	subs       []sharedSub
 }
 
-type ackRequest struct {
-	queueName string
-	offset    uint64
-}
+// ackRequest is the element type of QueueWAL.ackChan. Its two former fields
+// (queueName, offset) had no reader and no writer anywhere, so they are gone;
+// the container remains because QueueWAL.ackChan is pinned by the hot-field
+// layout test.
+type ackRequest struct{}
 
 type walFileInfo struct {
 	path      string

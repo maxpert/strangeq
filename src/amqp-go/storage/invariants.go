@@ -8,9 +8,7 @@ import (
 // WS-C invariant I3, enforced at runtime under test.
 //
 // *Whenever fileMutex is released and the WAL is not poisoned,
-// qw.fileOffset == Stat(currentFile).Size()* — and for segments, *whenever
-// qs.mutex is released and the queue is not segment-poisoned,
-// currentSegment.fileSize == Stat(currentSegment.file).Size()*.
+// qw.fileOffset == Stat(currentFile).Size()*.
 //
 // The check is OFF in production (one atomic load per flush is the entire
 // cost, but a Stat per flush is not free and the invariant is structural);
@@ -35,18 +33,5 @@ func (qw *QueueWAL) assertOffsetInvariantLocked() {
 	if err != nil || st.Size() != qw.fileOffset.Load() {
 		panic(fmt.Sprintf("WAL invariant I3 violated: fileOffset=%d stat=%d statErr=%v file=%s",
 			qw.fileOffset.Load(), st.Size(), err, qw.currentFile.Name()))
-	}
-}
-
-// assertSegmentSizeInvariantLocked verifies the segment twin of I3.
-// Precondition: caller holds qs.mutex. Skipped while segment-poisoned.
-func (qs *QueueSegments) assertSegmentSizeInvariantLocked() {
-	if !storageInvariantChecks.Load() || qs.segPoisoned != nil || qs.currentSegment == nil {
-		return
-	}
-	st, err := qs.currentSegment.file.Stat()
-	if err != nil || st.Size() != qs.currentSegment.fileSize.Load() {
-		panic(fmt.Sprintf("segment invariant I3 violated: fileSize=%d stat=%d statErr=%v file=%s",
-			qs.currentSegment.fileSize.Load(), st.Size(), err, qs.currentSegment.path))
 	}
 }

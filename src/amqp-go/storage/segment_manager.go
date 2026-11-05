@@ -175,13 +175,6 @@ type QueueSegments struct {
 	// found in the layout test's comment.
 	logger interfaces.Logger
 
-	// --- WS-C (C2): write-error repair state, appended after logger. ---
-
-	// segPoisoned is non-nil when the active segment could not be repaired
-	// after a failed write/fsync (truncate failed). While poisoned, no byte is
-	// written to the damaged segment; writeMessageBatchDurable retires it and
-	// opens a fresh one first.
-	segPoisoned error
 	// lastSegmentNum is the highest segment number loaded or created, making
 	// new numbers strictly monotone within an incarnation and across restarts
 	// even if the wall clock steps backwards. Guarded by qs.mutex.
@@ -212,13 +205,7 @@ type SegmentFile struct {
 	// once a minute forever (review-4 B-4). Declared LAST so every field the
 	// cold-read tier touches keeps its offset.
 	compactionBlocked atomic.Bool
-
-	// damagedTail (WS-C C2) is true when this segment was retired after an
-	// unrepairable failed write: bytes beyond the indexed region are a failed
-	// batch's partial bytes. Tail damage is benign at load (nothing is ever
-	// appended after it), so the segment is still sealed and read.
-	damagedTail bool
-	inv         *segmentInventory
+	inv               *segmentInventory
 }
 
 // SegmentIndex provides fast offset -> file position lookups
@@ -1516,72 +1503,6 @@ func (qs *QueueSegments) rollSegmentLocked() error {
 	qs.currentSegment = next
 	qs.currentIndex = nextIdx
 	return nil
-}
-
-// replaceActiveSegmentLocked retires the current segment WITHOUT sealing it
-// (no Sync: its earlier batches were fdatasynced by their own
-// writeMessageBatchDurable calls) and installs a fresh one. It is called with
-// the current segment damaged (segPoisoned) or missing.
-// Precondition: caller holds qs.mutex.
-func (qs *QueueSegments) replaceActiveSegmentLocked() error {
-	next, nextIdx, err := qs.createSegmentFileLocked()
-	if err != nil {
-		return err // stays poisoned; the next CheckpointBatch retries
-	}
-	if cur := qs.currentSegment; cur != nil {
-		// Retire: copy the live index into the segment's own index under its
-		// lock (as sealSegment does), try a read-only reopen (best effort, as
-		// sealSegment does), and mark the damaged tail. The failed batch was
-		// never indexed (indexing happens only after fsync), so the retired
-		// segment's index covers only its durable prefix — but the damaged
-		// tail's bytes remain in the file and are classified BENIGN at load:
-		// nothing is ever appended after them, which is what turns tail
-		// damage into interior damage.
-		cur.mutex.Lock()
-		if qs.currentIndex != nil {
-			qs.currentIndex.mutex.RLock()
-			for offset, position := range qs.currentIndex.entries {
-				cur.index[offset] = position
-			}
-			qs.currentIndex.mutex.RUnlock()
-		}
-		if readFile, rerr := os.Open(cur.path); rerr == nil {
-			old := cur.file
-			cur.file = readFile
-			_ = old.Close()
-		}
-		cur.damagedTail = qs.segPoisoned != nil
-		cur.mutex.Unlock()
-
-		qs.sealedMutex.Lock()
-		qs.sealedSegments[cur.segmentNum] = cur
-		qs.sealedMutex.Unlock()
-	}
-	qs.currentSegment = next
-	qs.currentIndex = nextIdx
-	qs.segPoisoned = nil
-	return nil
-}
-
-// repairSegmentLocked repairs the active segment after a failed batch
-// write/fsync: truncate back to the pre-batch size (fdatasync + Stat check).
-// If the truncate fails, the segment is retired (damaged tail is benign;
-// nothing confirmed is lost — everything before pre was fdatasynced by an
-// earlier successful batch) and a fresh active segment takes over.
-// Precondition: caller holds qs.mutex.
-func (qs *QueueSegments) repairSegmentLocked(seg *SegmentFile, pre int64, op string, cause error) {
-	err := segmentTruncate(seg.file, pre)
-	if err == nil {
-		seg.fileSize.Store(pre)
-		return
-	}
-	qs.segPoisoned = fmt.Errorf("segment %s diverged after failed %s: %w", seg.path, op, err)
-	qs.logError("segment write failed and could not be truncated; retiring the segment (its durable records stay readable)",
-		interfaces.LogField{Key: "queue", Value: qs.queueName},
-		interfaces.LogField{Key: "segment", Value: seg.path},
-		interfaces.LogField{Key: "op", Value: op},
-		interfaces.LogField{Key: "error", Value: err.Error()})
-	_ = qs.replaceActiveSegmentLocked()
 }
 
 // compactionLoop periodically checks if compaction is needed
