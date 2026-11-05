@@ -182,10 +182,9 @@ func publishConfirmedDurableToStaleSource(t *testing.T, uri, src, dlx, dlq strin
 }
 
 // dlqArrival is one dead-letter delivery reduced to what these tests reason
-// about: which incarnation published the original, and when it arrived.
+// about: which incarnation published the original.
 type dlqArrival struct {
 	messageID int
-	at        time.Duration
 }
 
 // observeDLQ consumes the dead-letter queue with autoAck for a FIXED WALL-CLOCK
@@ -213,7 +212,6 @@ func observeDLQ(t *testing.T, uri, dlq string, window time.Duration) []dlqArriva
 	deliveries, err := ch.Consume(dlq, "", true /*autoAck*/, false, false, false, nil)
 	require.NoError(t, err, "consuming %s", dlq)
 
-	start := time.Now()
 	deadline := time.NewTimer(window)
 	defer deadline.Stop()
 
@@ -228,7 +226,7 @@ func observeDLQ(t *testing.T, uri, dlq string, window time.Duration) []dlqArriva
 			require.NoError(t, convErr,
 				"every message this test publishes carries an integer MessageId; got %q on the "+
 					"dead-letter queue — the fixture is not observing what it published", d.MessageId)
-			out = append(out, dlqArrival{messageID: id, at: time.Since(start)})
+			out = append(out, dlqArrival{messageID: id})
 		case <-deadline.C:
 			return out
 		}

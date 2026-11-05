@@ -29,11 +29,7 @@ import (
 
 // TestConnection represents a test AMQP connection
 type TestConnection struct {
-	conn      net.Conn
-	channel   uint16
-	frameMax  uint32
-	heartbeat uint16
-	t         *testing.T
+	conn net.Conn
 }
 
 // getEnvOrDefault returns environment variable value or default
@@ -367,11 +363,7 @@ func establishConnection(t *testing.T) *TestConnection {
 	conn.SetDeadline(time.Time{})
 
 	return &TestConnection{
-		conn:      conn,
-		channel:   0,
-		frameMax:  tuneMethod.FrameMax,
-		heartbeat: tuneMethod.Heartbeat,
-		t:         t,
+		conn: conn,
 	}
 }
 

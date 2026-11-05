@@ -50,23 +50,14 @@ func versionString() string {
 	return fmt.Sprintf("amqp-server %s (commit %s, built %s, %s)", version, commit, date, runtime.Version())
 }
 
-// cliOptions holds the parsed flag values. The pointers exist so the flag
-// package owns storage; applyFlagOverrides only acts on flags the operator
-// actually set (flag.Visit), so defaults never clobber config values.
+// cliOptions holds the flags main() reads directly. Flags consumed by
+// applyFlagOverrides are registered on the FlagSet and read back by name
+// through flag.Visit, so they need no field here.
 type cliOptions struct {
-	configFile       *string
-	showVersion      *bool
-	generateConfig   *string
-	enableTelemetry  *bool
-	telemetryPort    *int
-	telemetryAddress *string
-	enablePprof      *bool
-	healthcheck      *bool
-	tlsEnable        *bool
-	tlsCert          *string
-	tlsKey           *string
-	tlsCA            *string
-	unsafeRecovery   *bool
+	configFile     *string
+	showVersion    *bool
+	generateConfig *string
+	healthcheck    *bool
 }
 
 // newFlagSet defines the final CLI surface. Flag defaults are documentation
@@ -79,18 +70,18 @@ func newFlagSet() (*flag.FlagSet, *cliOptions) {
 	o.configFile = fs.String("config", "", "Configuration file path (YAML/JSON)")
 	o.showVersion = fs.Bool("version", false, "Show version and exit")
 	o.generateConfig = fs.String("generate-config", "", "Generate default config file (mode 0600) and exit (e.g., config.yaml)")
-	o.enableTelemetry = fs.Bool("enable-telemetry", false, "Enable telemetry HTTP endpoint (/metrics, /health)")
-	o.telemetryPort = fs.Int("telemetry-port", 0, "Telemetry HTTP server port (default from config: 9419)")
-	o.telemetryAddress = fs.String("telemetry-address", "", "Telemetry bind address (default from config: 127.0.0.1)")
-	o.enablePprof = fs.Bool("enable-pprof", false, "Enable pprof profiling endpoints (off by default; loopback only)")
+	fs.Bool("enable-telemetry", false, "Enable telemetry HTTP endpoint (/metrics, /health)")
+	fs.Int("telemetry-port", 0, "Telemetry HTTP server port (default from config: 9419)")
+	fs.String("telemetry-address", "", "Telemetry bind address (default from config: 127.0.0.1)")
+	fs.Bool("enable-pprof", false, "Enable pprof profiling endpoints (off by default; loopback only)")
 	o.healthcheck = fs.Bool("healthcheck", false, "Probe the local /health endpoint and exit 0 (ready) or 1 (not ready)")
 
-	o.tlsEnable = fs.Bool("tls", false, "Enable TLS (amqps)")
-	o.tlsCert = fs.String("tls-cert", "", "Path to TLS certificate file (PEM)")
-	o.tlsKey = fs.String("tls-key", "", "Path to TLS private key file (PEM)")
-	o.tlsCA = fs.String("tls-ca", "", "Path to TLS CA file for mutual TLS client verification (PEM)")
+	fs.Bool("tls", false, "Enable TLS (amqps)")
+	fs.String("tls-cert", "", "Path to TLS certificate file (PEM)")
+	fs.String("tls-key", "", "Path to TLS private key file (PEM)")
+	fs.String("tls-ca", "", "Path to TLS CA file for mutual TLS client verification (PEM)")
 
-	o.unsafeRecovery = fs.Bool("unsafe-recovery", false,
+	fs.Bool("unsafe-recovery", false,
 		"DATA-LOSS SWITCH. Start even when recovery cannot be completed safely, DISCARDING every artifact the broker could not recover. "+
 			"Each discarded artifact is logged by path at ERROR level, the amqp_unsafe_recovery_discarded_artifacts gauge is pinned above zero "+
 			"for the lifetime of the process, and the broker re-warns every 5 minutes. Confirmed durable messages in the discarded artifacts are "+
