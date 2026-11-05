@@ -1,7 +1,6 @@
 package storage
 
 import (
-	"fmt"
 	"os"
 	"sync/atomic"
 )
@@ -268,15 +267,6 @@ type segmentWriteFn func(f *os.File, b []byte) (int, error)
 
 var segmentWriteHook atomic.Pointer[segmentWriteFn]
 
-// segmentWrite appends b to the segment file f through the hookable seam.
-// Default: f.Write(b).
-func segmentWrite(f *os.File, b []byte) (int, error) {
-	if p := segmentWriteHook.Load(); p != nil {
-		return (*p)(f, b)
-	}
-	return f.Write(b)
-}
-
 // SetSegmentWriteForTest installs fn as the write used by the segment
 // checkpoint batch path. TEST-ONLY: it lets tests inject a short write
 // (ENOSPC after N bytes) deterministically.
@@ -291,15 +281,6 @@ func SetSegmentWriteForTest(fn func(f *os.File, b []byte) (int, error)) (restore
 
 var segmentFsyncHook atomic.Pointer[walFsyncFn]
 
-// segmentFsync is the fdatasync performed after a durable segment batch
-// write. Default: fdatasyncFile.
-func segmentFsync(f *os.File) error {
-	if p := segmentFsyncHook.Load(); p != nil {
-		return (*p)(f)
-	}
-	return fdatasyncFile(f)
-}
-
 // SetSegmentFsyncForTest installs fn as the fsync used by the segment
 // checkpoint batch path. TEST-ONLY.
 func SetSegmentFsyncForTest(fn func(*os.File) error) (restore func()) {
@@ -312,37 +293,10 @@ func SetSegmentFsyncForTest(fn func(*os.File) error) (restore func()) {
 // --- segment truncate ------------------------------------------------------
 
 // segmentTruncateFn is the signature of the truncate-back-to-pre-batch-size
-// performed by repairSegmentLocked. The default (below) includes the
-// Stat==size check, so a hook that returns nil without truncating is caught
-// by the caller's invariant assertion rather than silently diverging.
+// used by the segment write-error repair.
 type segmentTruncateFn func(f *os.File, size int64) error
 
 var segmentTruncateHook atomic.Pointer[segmentTruncateFn]
-
-// segmentTruncateDefault truncates the segment file f to size and makes the
-// truncation durable, then verifies the file really is size bytes.
-func segmentTruncateDefault(f *os.File, size int64) error {
-	if err := walTruncateDefault(f, size, true); err != nil {
-		return err
-	}
-	st, err := f.Stat()
-	if err != nil {
-		return fmt.Errorf("stat after segment truncate: %w", err)
-	}
-	if st.Size() != size {
-		return fmt.Errorf("segment size %d after truncate to %d", st.Size(), size)
-	}
-	return nil
-}
-
-// segmentTruncate truncates the segment file f to size through the hookable
-// seam.
-func segmentTruncate(f *os.File, size int64) error {
-	if p := segmentTruncateHook.Load(); p != nil {
-		return (*p)(f, size)
-	}
-	return segmentTruncateDefault(f, size)
-}
 
 // SetSegmentTruncateForTest installs fn as the truncate (including its fsync
 // and Stat check) used by the segment write-error repair. TEST-ONLY:

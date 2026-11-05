@@ -1,7 +1,6 @@
 package storage
 
 import (
-	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -206,8 +205,3 @@ func TestWAL_RollFile_HeaderWriteFails_NoPoisonedStub(t *testing.T) {
 		require.True(t, found, "session 2 must recover offset %d", off)
 	}
 }
-
-// errSimulatedCrash is the error the checkpoint-unlink hook returns to
-// simulate dying between the segment fsync and the WAL unlink (used by the
-// C8 test in this suite).
-var errSimulatedCrash = errors.New("simulated crash between segment fsync and WAL unlink")

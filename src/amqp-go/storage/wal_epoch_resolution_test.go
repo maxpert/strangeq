@@ -49,10 +49,9 @@ const epochResolutionQueue = "epoch-resolution-queue"
 // substituted a default would be answering a different question (and would be
 // the very bug the gate exists to catch).
 type epochResolution struct {
-	indexed     bool   // offsetIndex held an entry for the tag
-	fileNum     uint64 // offsetLocation.fileNum, if indexed
-	fileOnDisk  bool   // the file that fileNum names still exists
-	recoverable bool   // the record is still live in SOME durable tier
+	indexed    bool   // offsetIndex held an entry for the tag
+	fileNum    uint64 // offsetLocation.fileNum, if indexed
+	fileOnDisk bool   // the file that fileNum names still exists
 }
 
 // resolveEpochLikeCandidateC runs C's tag -> file -> epoch chain for one tag.
