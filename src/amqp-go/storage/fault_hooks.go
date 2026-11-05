@@ -537,6 +537,35 @@ func SetWALReadAtForTest(fn func(f *os.File, b []byte, off int64) (int, error)) 
 	return func() { walReadAtHook.Store(prev) }
 }
 
+// --- WAL inventory drain (test observer) ------------------------------------
+
+// walInventoryDrainHookFn observes the settle-drain's per-shard step. It is
+// invoked with the number of shard locks the drain holds at that instant,
+// which must always be exactly 1: the drain takes ONE shard at a time and
+// never two.
+type walInventoryDrainHookFn func(heldShardLocks int)
+
+var walInventoryDrainHook atomic.Pointer[walInventoryDrainHookFn]
+
+// walInventoryDrainFire reports one drained shard to the installed hook. A nil
+// hook costs one atomic load, the same pattern as every seam in this file.
+func walInventoryDrainFire(heldShardLocks int) {
+	if p := walInventoryDrainHook.Load(); p != nil {
+		(*p)(heldShardLocks)
+	}
+}
+
+// SetWALInventoryDrainHookForTest installs fn as the observer of the WAL
+// inventory drain's per-shard step and returns a restore function. TEST-ONLY:
+// it lets a test prove the drain never holds two shard locks at once (T2).
+// Never called by production code; nil = default (no observation).
+func SetWALInventoryDrainHookForTest(fn func(heldShardLocks int)) (restore func()) {
+	prev := walInventoryDrainHook.Load()
+	f := walInventoryDrainHookFn(fn)
+	walInventoryDrainHook.Store(&f)
+	return func() { walInventoryDrainHook.Store(prev) }
+}
+
 // --- hot cache per-queue lock (test observer) ------------------------------
 
 // hotCacheQueueLockFn observes the PER-QUEUE lock acquisitions of the hot

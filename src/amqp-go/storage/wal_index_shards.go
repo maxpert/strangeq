@@ -1,6 +1,9 @@
 package storage
 
-import "sync"
+import (
+	"sync"
+	"sync/atomic"
+)
 
 // THE SHARDED WAL INDEX.
 //
@@ -77,6 +80,38 @@ type walIndexShard struct {
 	mu     sync.RWMutex
 	offset map[recordKey]*segmentRecord
 	copies map[recordKey][]*segmentRecord
+
+	// settledPending is the queue of records THIS shard's ack path has
+	// settled but whose per-file inventory entry has not yet been deleted.
+	//
+	// THE ACK PATH MAY NOT DELETE THE INVENTORY ENTRY ITSELF: a file's
+	// inventory is shared by every shard, so two acknowledgements of two tags
+	// in the same file would mutate the same map under two different shard
+	// locks (a data race, and a map corruption). It only QUEUES the record,
+	// under the shard lock it already holds. The committer then drains the
+	// queue under fileMutex, taking ONE shard at a time, and deletes each
+	// entry from the ACTIVE file's inventory (see drainSettledInventoryLocked).
+	//
+	// Guarded by mu.
+	settledPending []*segmentRecord
+
+	// pending is a lock-free flag: true while settledPending is non-empty.
+	// The committer reads it WITHOUT taking the shard lock (64 atomic loads
+	// per batch), so an idle shard costs no lock; the drain re-checks the
+	// queue under the lock and clears the flag only when it is empty, so a
+	// concurrent settle can never be lost.
+	pending atomic.Bool
+
+	// highWater is the largest len(copies)+len(offset) this shard has held
+	// since its maps were last rebuilt. A Go map never returns bucket memory
+	// on delete, so this is the proxy for the map's retained bucket capacity:
+	// after the unacked set's ramp-up peak, the maps keep the peak's buckets
+	// even though the live count is tiny. settleRecordLocked rebuilds the
+	// maps (S1c) when the live count falls below a quarter of this, and the
+	// rebuild resets it.
+	//
+	// Guarded by mu.
+	highWater int
 }
 
 // walIndexShardOf returns the shard a delivery tag belongs to.
@@ -215,6 +250,9 @@ func (s *walIndexShard) indexRecordLocked(r *segmentRecord) {
 	if current := s.offset[key]; current == nil || recordPositionNewer(r.pos, current.pos) {
 		s.offset[key] = r
 	}
+	if n := len(s.copies) + len(s.offset); n > s.highWater {
+		s.highWater = n
+	}
 }
 
 // removeRecordCopyLocked removes the copy at the given position from a copy
@@ -350,24 +388,26 @@ func (s *walIndexShard) unindexSettledRecordLocked(r *segmentRecord) {
 // compare-and-swap). Only the winner removes anything, so acknowledging the
 // same copy twice is a no-op the second time.
 //
-// THE INVENTORY IS NOT TOUCHED HERE.
+// THE INVENTORY ENTRY IS QUEUED, NOT DELETED, HERE.
 //
-// The record stays in its file's inventory (inv.records) and its body block
-// stays in inv.blocks. That inventory is PER FILE and is SHARED BY EVERY
-// SHARD: a file's records carry tags of many different shards, so two
-// acknowledgements of two tags in the same file would mutate the same map
-// under two different shard locks -- a data race, and a map corruption at
-// the same time.
+// The record's per-file inventory entry (inv.records) cannot be deleted on
+// this path: a file's inventory is PER FILE and SHARED BY EVERY SHARD -- a
+// file's records carry tags of many different shards, so two acknowledgements
+// of two tags in the same file would mutate the same map under two different
+// shard locks (a data race, and a map corruption at the same time). So the
+// settled record is APPENDED to this shard's settledPending queue, under the
+// shard lock already held, and the committer drains the queue later under
+// fileMutex, ONE shard at a time (see drainSettledInventoryLocked).
 //
-// The accounting does NOT depend on the removal: inv.unacked and inv.deadBytes
-// keep the bytes, because those two are what the reclaim predicate
-// (unacked == 0) and the compaction ratio (deadBytes / durableBytes) are
-// computed from, and both are ATOMIC. The inventory is bounded by the FILE's
-// size, and the compaction -- which rewrites the file with exactly the
-// records that are not acknowledged -- drops the settled ones from it.
+// THE ACCOUNTING DOES NOT DEPEND ON THE DELETION: inv.unacked and inv.deadBytes
+// are updated by markAckDetailed above and are ATOMIC, and they are what the
+// reclaim predicate (unacked == 0) and the compaction ratio
+// (deadBytes / durableBytes) are computed from. The committer's delete is
+// gated on the record being acknowledged, so a record can never leave the
+// inventory unacked.
 //
-// The compaction already skips a record whose acked flag is set, so keeping
-// settled records in the inventory is already handled.
+// The compaction already skips a record whose acked flag is set, so a settled
+// record that has not yet been drained is still handled correctly.
 func (s *walIndexShard) settleRecordLocked(r *segmentRecord) bool {
 	if r == nil {
 		return false
@@ -377,5 +417,133 @@ func (s *walIndexShard) settleRecordLocked(r *segmentRecord) bool {
 		return false
 	}
 	s.unindexSettledRecordLocked(r)
+	// S1c: a Go map never returns bucket memory on delete, so once the
+	// unacked set has drained the maps still hold the ramp-up's buckets.
+	// Rebuild them when the live count falls well below the peak.
+	s.shrinkMapsIfIdleLocked()
+	// Queue the settled record for the inventory drain. The append happens
+	// under the shard lock this call already holds, so no new lock and no new
+	// atomic on the ack path; pending is a plain flag the committer polls.
+	s.settledPending = append(s.settledPending, r)
+	s.pending.Store(true)
 	return true
+}
+
+// shrinkMapsIfIdleLocked rebuilds the shard's two maps when the live count has
+// fallen below a quarter of the high-water mark, dropping the bucket arrays
+// the deleted keys left behind. Caller holds the shard's write lock.
+//
+// THE REBUILD IS AMORTISED. The threshold is a quarter, so a rebuild can only
+// fire again after the maps have grown back to four times the post-rebuild
+// size; the aggregate cost is O(1) per settled record. A small floor keeps a
+// tiny shard from reallocating for no reason.
+func (s *walIndexShard) shrinkMapsIfIdleLocked() {
+	if s.highWater < 64 {
+		return
+	}
+	if len(s.copies)+len(s.offset) < s.highWater/4 {
+		s.rebuildMapsLocked()
+	}
+}
+
+// rebuildMapsLocked reallocates the shard's two maps at their CURRENT size and
+// copies the live entries across. Caller holds the shard's write lock.
+//
+// THE SWAP IS SAFE BECAUSE EVERY ACCESS IS UNDER THAT LOCK: the ack path, the
+// committer's index step, the reclaim sweep and the compaction's install all
+// take this shard's write lock (the last two take every shard), and the read
+// path takes the read lock. No caller holds a reference to the map itself
+// across the lock -- they index it by key -- so replacing it is invisible to
+// them. highWater is reset to the new live count, so the next rebuild is a
+// further four-fold drop.
+func (s *walIndexShard) rebuildMapsLocked() {
+	copies := make(map[recordKey][]*segmentRecord, len(s.copies))
+	for k, v := range s.copies {
+		copies[k] = v
+	}
+	s.copies = copies
+	offset := make(map[recordKey]*segmentRecord, len(s.offset))
+	for k, v := range s.offset {
+		offset[k] = v
+	}
+	s.offset = offset
+	s.highWater = len(s.copies) + len(s.offset)
+}
+
+// indexShardHighWaterForTest sums every shard's retained-capacity high-water
+// mark (see walIndexShard.highWater). TEST-ONLY: the S1c test uses it to prove
+// the shard maps are rebuilt once the unacked set has drained.
+func (qw *QueueWAL) indexShardHighWaterForTest() (total int) {
+	for i := range qw.indexShards {
+		sh := &qw.indexShards[i]
+		sh.mu.RLock()
+		total += sh.highWater
+		sh.mu.RUnlock()
+	}
+	return total
+}
+
+// drainSettledInventory runs the inventory drain under fileMutex. It is the
+// cleanup loop's own acquisition: fileMutex -> one shard at a time, sequential
+// and released before tryReclaimOldFiles takes its shard -> oldFilesMutex
+// order, so it can never deadlock against the reclaim or the compaction.
+func (qw *QueueWAL) drainSettledInventory() {
+	qw.fileMutex.Lock()
+	qw.drainSettledInventoryLocked()
+	qw.fileMutex.Unlock()
+}
+
+// drainSettledInventoryLocked deletes the settled records the ack path has
+// queued from the ACTIVE file's inventory. Caller holds fileMutex.
+//
+// THE LOCK ORDER IS fileMutex -> (ONE shard lock at a time). It never holds
+// two shard locks at once, so it cannot deadlock against the paths that take
+// every shard (the reclaim sweep, the compaction's install), which take them
+// in ascending order.
+//
+// ONLY THE ACTIVE FILE'S INVENTORY IS TOUCHED. A sealed file's inventory is
+// read WITHOUT a lock by the compaction (which snapshots its two maps), so
+// mutating it here would be a data race. A settled record whose file has
+// since rolled is skipped: its inventory is dropped whole by the reclaim or
+// rewritten by the compaction.
+//
+// The delete is GATED on the record being acknowledged, so a record can never
+// leave the inventory unacked even if a future caller queues it early.
+func (qw *QueueWAL) drainSettledInventoryLocked() {
+	inv := qw.currentInv
+	if inv == nil {
+		return
+	}
+	for i := range qw.indexShards {
+		sh := &qw.indexShards[i]
+		if !sh.pending.Load() {
+			continue
+		}
+		sh.mu.Lock()
+		pending := sh.settledPending
+		if len(pending) > 0 {
+			// The drain holds ONE shard lock at this instant; the hook reports
+			// it so a test can prove the "one shard at a time" rule (T2).
+			held := qw.drainHeldShards.Add(1)
+			walInventoryDrainFire(int(held))
+			for _, r := range pending {
+				if r == nil || r.inv != inv || !r.acked.Load() {
+					continue
+				}
+				if cur := inv.records[r.pos.position]; cur == r {
+					delete(inv.records, r.pos.position)
+					qw.inventoryDrains.Add(1)
+				}
+			}
+			qw.drainHeldShards.Add(-1)
+			// Drop the record pointers so the queue's backing array does not
+			// keep the drained records alive; keep the array for reuse.
+			for j := range pending {
+				pending[j] = nil
+			}
+			sh.settledPending = pending[:0]
+		}
+		sh.pending.Store(false)
+		sh.mu.Unlock()
+	}
 }

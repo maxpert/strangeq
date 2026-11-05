@@ -235,6 +235,16 @@ func (ds *DisruptorStorage) SetMetrics(metrics StorageMetrics) {
 	}
 }
 
+// WALBookkeepingStats exposes the WAL tier's in-memory bookkeeping for the
+// telemetry scrape (WS-MEMORY-CUT §8). Diagnostic only; never gated. Returns
+// zeroes when the WAL tier is not built.
+func (ds *DisruptorStorage) WALBookkeepingStats() (inventoryRecords, indexCopies int, drained uint64) {
+	if ds.wal == nil {
+		return 0, 0, 0
+	}
+	return ds.wal.WALBookkeepingStats()
+}
+
 func (ds *DisruptorStorage) getQueueHot(queueName string) *QueueHot {
 	if val, ok := ds.queues.Load(queueName); ok {
 		return val.(*QueueHot)

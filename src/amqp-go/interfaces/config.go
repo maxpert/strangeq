@@ -451,6 +451,6 @@ type EngineConfig struct {
 	// WALCleanupCheckIntervalMS is how often to check for old WAL files to delete (milliseconds)
 	// Longer = slower cleanup, more disk usage
 	// Shorter = faster cleanup, more overhead
-	// Default: 300000 (5 minutes)
+	// Default: 1000 (1 second)
 	WALCleanupCheckIntervalMS int64 `json:"wal_cleanup_check_interval_ms"`
 }

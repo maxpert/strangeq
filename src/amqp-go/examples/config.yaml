@@ -91,6 +91,6 @@ engine:
 
   # Background Maintenance
   expiredmessagecheckintervalms: 60000   # 60 seconds
-  walcleanupcheckintervalms: 300000      # 5 minutes
+  walcleanupcheckintervalms: 1000        # 1 second
   offsetcleanupbatchsize: 1000           # 1,000 offsets per cycle
   offsetcleanupintervalms: 30000         # 30 seconds

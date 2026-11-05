@@ -97,7 +97,7 @@ engine:
   compactionintervalms: 1800000
   consumerselecttimeoutms: 1
   consumermaxbatchsize: 100
-  walcleanupcheckintervalms: 300000
+  walcleanupcheckintervalms: 1000
 EOF
 
 ./amqp-server --config "$PROFILE_DIR/benchmark-config.yaml" --enable-telemetry --enable-pprof --telemetry-port 9419 > "$PROFILE_DIR/server.log" 2>&1 &

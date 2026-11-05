@@ -430,6 +430,18 @@ type QueueWAL struct {
 	// writeTxAtomic refuse with ErrWALClosed after it.
 	fileClosed bool
 
+	// currentFileDirEntryDurable records whether the CURRENT file's directory
+	// entry has been made durable. It exists because WriteTxAtomic is ALWAYS
+	// durable regardless of storage.fsync (interfaces/config.go), while the
+	// creation-time directory barrier in openWALFile is skipped when
+	// SyncDisabled is set (D2). A file created under SyncDisabled therefore
+	// has a non-durable entry, and the first transaction written into it must
+	// issue the barrier before it writes a single byte. Set under fileMutex by
+	// openWALFile's callers (rollFile/openNextFile) when a file is installed,
+	// and latched true by writeTxAtomic after a successful barrier; a roll
+	// installs a fresh value, so the flag never leaks across files.
+	currentFileDirEntryDurable bool
+
 	// --- WS-C: close race (C9) ---
 	// enqueueMu/closing make "Close has begun" visible to enqueuers. Every
 	// successful writeChan send happens-before closing = true (RWMutex), so
@@ -472,6 +484,21 @@ type QueueWAL struct {
 	// production cost is one lock per batch hand-off.
 	pipelineMu      sync.Mutex
 	pipelineBatches []*stagedBatch
+
+	// --- WS-MEMORY-CUT instrumentation (diagnostic only; never gated). ---
+	//
+	// inventoryDrains counts the settled records the committer (and the
+	// cleanup loop) have deleted from the CURRENT file's inventory since
+	// boot. It is the "settle-drain count" the measurement plan reads: a
+	// monotonic witness that the in-flight bound is actually being applied.
+	// Zero before the cut lands, which is exactly what the plan's AC4 wants
+	// to distinguish.
+	inventoryDrains atomic.Uint64
+
+	// drainHeldShards is the number of shard locks the inventory drain holds
+	// AT THIS INSTANT. The drain takes ONE shard at a time, so it is 0 or 1;
+	// the test-only hook reads it to prove the lock order (T2).
+	drainHeldShards atomic.Int32
 }
 
 // WALBatchSealBytesDefault is the default byte-based WAL batch seal (64 MiB):
@@ -786,6 +813,19 @@ func (wm *WALManager) SetMetrics(metrics WALMetrics) {
 	if wm.sharedWAL != nil {
 		wm.sharedWAL.metrics = metrics
 	}
+}
+
+// WALBookkeepingStats exposes the shared WAL's in-memory bookkeeping for the
+// telemetry scrape (WS-MEMORY-CUT §8). It is diagnostic only and never gated.
+// Returns zeroes when the WAL is not yet built.
+func (wm *WALManager) WALBookkeepingStats() (inventoryRecords, indexCopies int, drained uint64) {
+	wm.mu.RLock()
+	sw := wm.sharedWAL
+	wm.mu.RUnlock()
+	if sw == nil {
+		return 0, 0, 0
+	}
+	return sw.bookkeepingStats()
 }
 
 // doneChannelPool pools buffered error channels (cap 1) used by Write() for
@@ -1270,6 +1310,28 @@ func (qw *QueueWAL) writeTxAtomic(records []*RecoveryMessage) error {
 	// C1: never write to a diverged (poisoned) file; roll it away first.
 	if err := qw.ensureWritableLocked(); err != nil {
 		return err
+	}
+
+	// FINDING 1 (D2 amendment): WriteTxAtomic is documented and implemented as
+	// ALWAYS durable, independent of storage.fsync (interfaces/config.go:114,
+	// :360; walTxFsync below is unconditional). The file's DATA is made durable
+	// by that fsync, but the DIRECTORY ENTRY naming the file is a separate
+	// metadata update a file fsync does not guarantee — and openWALFile skips
+	// its creation-time barrier when SyncDisabled is set. So before the first
+	// transaction writes into a file whose entry is not yet durable, issue the
+	// directory barrier here.
+	//
+	// This runs BEFORE any byte is written: a barrier failure aborts the
+	// transaction with zero bytes on disk and zero index/offset mutation, so
+	// the client is correctly told the commit failed and no repair is needed.
+	// On success the flag latches so every later transaction (and the file's
+	// later records) share the one durable entry. A roll installs a fresh
+	// value, so a new file re-checks.
+	if !qw.currentFileDirEntryDurable {
+		if serr := syncDir(qw.dataDir); serr != nil {
+			return fmt.Errorf("WAL transaction directory fsync failed: %w", serr)
+		}
+		qw.currentFileDirEntryDurable = true
 	}
 
 	currentFileNum := qw.fileNum.Load()
@@ -2597,6 +2659,15 @@ func (qw *QueueWAL) commitBatch(sb *stagedBatch) {
 		qw.deliverCompletions(sb.reqs, nil, ErrWALClosed)
 		return
 	}
+
+	// WS-MEMORY-CUT S1a: bound the ACTIVE file's inventory by the in-flight
+	// set. The ack path queued the records it settled on their own shards; the
+	// committer deletes them here, under fileMutex, taking ONE shard at a time
+	// (the same one-shard-at-a-time rule as the index loop below). This runs
+	// BEFORE the batch is appended, so after the commit the inventory holds the
+	// in-flight records plus this batch -- not every record of the file.
+	qw.drainSettledInventoryLocked()
+
 	// C1: never write to a file whose size != fileOffset (poisoned); roll it
 	// away first or fail fast.
 	if err := qw.ensureWritableLocked(); err != nil {
@@ -3265,6 +3336,59 @@ func (qw *QueueWAL) pipelineBufsForTest() []handoffSnapshot {
 	return out
 }
 
+// bookkeepingStats reports the WAL-tier bookkeeping the memory cut targets:
+//
+//   - inventoryRecords: how many records the ACTIVE file's inventory holds.
+//     Before the cut this is bounded by the file's size (a whole 512 MiB
+//     file's records); after it, by the in-flight (unsettled) set.
+//   - indexCopies: the number of physical copies across every index shard.
+//     This is the map the ack path eagerly settles; its magnitude is the
+//     standing backlog plus the ramp-up bucket high-water.
+//   - drained: the monotonic settle-drain count (see inventoryDrains).
+//
+// DIAGNOSTIC ONLY; never gated. It takes fileMutex and each shard's read
+// lock, so it is cheap but not free: it is read by the telemetry scrape and
+// by tests, never by the write path.
+func (qw *QueueWAL) bookkeepingStats() (inventoryRecords, indexCopies int, drained uint64) {
+	qw.fileMutex.Lock()
+	if qw.currentInv != nil {
+		inventoryRecords = len(qw.currentInv.records)
+	}
+	qw.fileMutex.Unlock()
+
+	for i := range qw.indexShards {
+		sh := &qw.indexShards[i]
+		sh.mu.RLock()
+		for _, set := range sh.copies {
+			indexCopies += len(set)
+		}
+		sh.mu.RUnlock()
+	}
+	drained = qw.inventoryDrains.Load()
+	return
+}
+
+// inventorySizesForTest reports how many records the ACTIVE file's inventory
+// holds and how many every SEALED file's inventory holds in total. It exists
+// for the memory-cut tests (T1) and reads the real maps under the same locks
+// the production readers use. TEST-ONLY.
+func (qw *QueueWAL) inventorySizesForTest() (current, old int) {
+	qw.fileMutex.Lock()
+	if qw.currentInv != nil {
+		current = len(qw.currentInv.records)
+	}
+	qw.fileMutex.Unlock()
+
+	qw.oldFilesMutex.RLock()
+	for _, info := range qw.oldFiles {
+		if info.inv != nil {
+			old += len(info.inv.records)
+		}
+	}
+	qw.oldFilesMutex.RUnlock()
+	return
+}
+
 // deliverCompletions signals every request in the batch, iterating in enqueue
 // order. batchErr is the shared write/fsync outcome for the batch (nil on
 // success). serErr, when non-nil, carries a per-record serialization error
@@ -3907,7 +4031,7 @@ func (qw *QueueWAL) rollFile() error {
 	num := curNum + 1
 
 	// 1. Open the next file FIRST; the current file is untouched.
-	w, r, size, err := qw.openWALFile(num)
+	w, r, size, dirEntryDurable, err := qw.openWALFile(num)
 	if err != nil {
 		return fmt.Errorf("WAL roll: %w", err)
 	}
@@ -3972,6 +4096,10 @@ func (qw *QueueWAL) rollFile() error {
 	qw.currentReadFile = r
 	qw.fileOffset.Store(size)
 	qw.currentInv = newSegmentInventory(size)
+	// A roll installs a NEW file, so its directory-entry durability replaces
+	// the old file's. openWALFile reports whether the new file's entry is
+	// already durable; writeTxAtomic re-syncs if it is not.
+	qw.currentFileDirEntryDurable = dirEntryDurable
 	qw.poisoned = nil
 	qw.degraded = false
 	qw.rollBackoff = 0
@@ -4068,12 +4196,12 @@ func (wm *WALManager) SetLogger(l interfaces.Logger) {
 // one. On any failure AFTER the file was created, the handles are closed and
 // the file is removed, so a failed roll leaves at most nothing behind — never
 // a 1–5 byte headerless stub that every later boot refuses to append to.
-func (qw *QueueWAL) openWALFile(num uint64) (w, r *os.File, size int64, err error) {
+func (qw *QueueWAL) openWALFile(num uint64) (w, r *os.File, size int64, dirEntryDurable bool, err error) {
 	filename := filepath.Join(qw.dataDir, fmt.Sprintf("%020d%s", num, WALFileExtension))
 
 	file, err := walOpenFile(filename, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
 	if err != nil {
-		return nil, nil, 0, fmt.Errorf("failed to open WAL file: %w", err)
+		return nil, nil, 0, false, fmt.Errorf("failed to open WAL file: %w", err)
 	}
 
 	// Determine the current size so we (a) only write the file-level header on a
@@ -4084,10 +4212,20 @@ func (qw *QueueWAL) openWALFile(num uint64) (w, r *os.File, size int64, err erro
 	stat, err := file.Stat()
 	if err != nil {
 		_ = file.Close()
-		return nil, nil, 0, fmt.Errorf("failed to stat WAL file: %w", err)
+		return nil, nil, 0, false, fmt.Errorf("failed to stat WAL file: %w", err)
 	}
 	size = stat.Size()
 	created := size == 0
+
+	// dirEntryDurable reports whether the file's directory entry will be
+	// durable once this function returns. A file this process creates gets a
+	// durable entry only if the C4 creation barrier below actually runs, so
+	// the value starts false for a created file and the barrier latches it
+	// true. A file reopened from a prior run is conservatively assumed durable
+	// only when fsync is enabled: a file created by an earlier SyncDisabled
+	// run may carry a non-durable entry, and the first transaction re-syncs.
+	// (writeTxAtomic consumes this; see currentFileDirEntryDurable.)
+	dirEntryDurable = !qw.cfg.SyncDisabled
 
 	// Write the file-level header (magic + version) only on a brand-new file
 	// (SQ-4). The header is flushed to disk together with the first record
@@ -4118,7 +4256,7 @@ func (qw *QueueWAL) openWALFile(num uint64) (w, r *os.File, size int64, err erro
 			_ = file.Truncate(0)
 			_ = file.Close()
 			_ = os.Remove(filename)
-			return nil, nil, 0, fmt.Errorf("failed to write WAL file header: %w", werr)
+			return nil, nil, 0, false, fmt.Errorf("failed to write WAL file header: %w", werr)
 		}
 		size = int64(n)
 		// C4: make the file's directory entry durable NOW, at creation. The
@@ -4128,28 +4266,46 @@ func (qw *QueueWAL) openWALFile(num uint64) (w, r *os.File, size int64, err erro
 		// flat. On failure the file is removed and the open fails — a file
 		// whose entry may not survive a crash must not be handed to the
 		// writer.
-		if serr := syncDir(qw.dataDir); serr != nil {
-			_ = file.Close()
-			_ = os.Remove(filename)
-			return nil, nil, 0, fmt.Errorf("WAL file directory fsync failed: %w", serr)
+		//
+		// WITH storage.fsync DISABLED NOTHING IN THIS FILE IS DURABLE, SO A
+		// DURABLE DIRECTORY ENTRY FOR IT BUYS NOTHING FOR PUBLISHES: skip the
+		// barrier. On APFS a directory F_FULLFSYNC flushes the volume's whole
+		// dirty set (measured 16–128 ms per 512 MiB roll with ~2 GB/s of
+		// un-fsynced WAL writes pending), so leaving it in place makes "fsync
+		// off" not actually off. The failure handling below is unchanged when
+		// the barrier does run.
+		//
+		// THE ENTRY IS STILL OWED TO WriteTxAtomic, WHICH IS ALWAYS DURABLE:
+		// a transaction written into a file created here will issue the
+		// barrier itself before its first byte (finding 1). Skipping it here
+		// does not weaken the transaction contract, it defers the one barrier
+		// to the first transaction instead of paying it on every roll.
+		dirEntryDurable = false
+		if !qw.cfg.SyncDisabled {
+			if serr := syncDir(qw.dataDir); serr != nil {
+				_ = file.Close()
+				_ = os.Remove(filename)
+				return nil, nil, 0, false, fmt.Errorf("WAL file directory fsync failed: %w", serr)
+			}
+			dirEntryDurable = true
 		}
 	} else {
 		if size < int64(WALHeaderSize) {
 			_ = file.Close()
-			return nil, nil, 0, fmt.Errorf("refusing to append to WAL file %s: %w: file is %d bytes, too short to carry a %d-byte header",
+			return nil, nil, 0, false, fmt.Errorf("refusing to append to WAL file %s: %w: file is %d bytes, too short to carry a %d-byte header",
 				filename, ErrUnsupportedWALVersion, size, WALHeaderSize)
 		}
 		// currentFile is O_WRONLY and cannot ReadAt; probe with its own handle.
 		probe, perr := os.Open(filename)
 		if perr != nil {
 			_ = file.Close()
-			return nil, nil, 0, fmt.Errorf("failed to open WAL file %s for header validation: %w", filename, perr)
+			return nil, nil, 0, false, fmt.Errorf("failed to open WAL file %s for header validation: %w", filename, perr)
 		}
 		_, verr := walFileDataStart(probe)
 		_ = probe.Close()
 		if verr != nil {
 			_ = file.Close()
-			return nil, nil, 0, fmt.Errorf("refusing to append to WAL file %s: %w", filename, verr)
+			return nil, nil, 0, false, fmt.Errorf("refusing to append to WAL file %s: %w", filename, verr)
 		}
 	}
 
@@ -4161,10 +4317,10 @@ func (qw *QueueWAL) openWALFile(num uint64) (w, r *os.File, size int64, err erro
 			// The file is ours and brand new; do not leave it behind.
 			_ = os.Remove(filename)
 		}
-		return nil, nil, 0, fmt.Errorf("failed to open WAL read handle: %w", err)
+		return nil, nil, 0, false, fmt.Errorf("failed to open WAL read handle: %w", err)
 	}
 
-	return file, readFile, size, nil
+	return file, readFile, size, dirEntryDurable, nil
 }
 
 // openNextFile opens the next WAL file and installs it. BOOT ONLY: it is
@@ -4173,7 +4329,7 @@ func (qw *QueueWAL) openWALFile(num uint64) (w, r *os.File, size int64, err erro
 // rollFile, which retires the current file first.
 func (qw *QueueWAL) openNextFile() error {
 	num := qw.fileNum.Load() + 1
-	w, r, size, err := qw.openWALFile(num)
+	w, r, size, dirEntryDurable, err := qw.openWALFile(num)
 	if err != nil {
 		return err
 	}
@@ -4182,6 +4338,7 @@ func (qw *QueueWAL) openNextFile() error {
 	qw.currentReadFile = r
 	qw.fileOffset.Store(size)
 	qw.currentInv = newSegmentInventory(size)
+	qw.currentFileDirEntryDurable = dirEntryDurable
 	return nil
 }
 
@@ -4245,6 +4402,12 @@ func (qw *QueueWAL) cleanupLoop() {
 	for {
 		select {
 		case <-reclaimTicker.C:
+			// WS-MEMORY-CUT S1a: release the settled inventory entries even on
+			// an idle broker (no commits to drive the committer's drain). This
+			// runs BEFORE the reclaim, as its own sequential fileMutex -> shard
+			// acquisition; it is never nested inside the reclaim's
+			// shard -> oldFilesMutex order.
+			qw.drainSettledInventory()
 			qw.tryReclaimOldFiles()
 		case <-compactionTicker.C:
 			qw.tryCompactOldFiles()
@@ -4330,7 +4493,13 @@ func (qw *QueueWAL) tryReclaimOldFiles() {
 	// Make this sweep's directory mutations durable exactly once. The reclaim
 	// is already complete in memory even if this barrier fails; only fully acked
 	// bytes could reappear after a crash, so the failure cannot invalidate it.
-	if unlinkedAny {
+	//
+	// WITH storage.fsync DISABLED THE UNLINKED FILES' CONTENTS WERE NEVER
+	// DURABLE, so making their removal durable buys nothing either — and on APFS
+	// the directory F_FULLFSYNC flushes the volume's whole dirty set. The unlink
+	// itself is unconditional: it is the barrier, not the reclamation, that is
+	// gated.
+	if unlinkedAny && !qw.cfg.SyncDisabled {
 		if err := syncDir(qw.dataDir); err != nil {
 			qw.logWarn("WAL directory fsync after reclaim failed; completed reclaim remains valid, but its directory mutations are not durable yet",
 				interfaces.LogField{Key: "dir", Value: qw.dataDir},

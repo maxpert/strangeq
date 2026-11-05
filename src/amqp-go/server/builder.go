@@ -354,6 +354,18 @@ func (b *ServerBuilder) Build() (*Server, error) {
 		sm.SetMetrics(metricsCollector)
 	}
 
+	// WS-MEMORY-CUT §8: bind the WAL tier's in-memory bookkeeping diagnostics
+	// when both the storage tier and the collector support them. The gauges
+	// are read AT SCRAPE TIME and are DIAGNOSTIC ONLY (never gated); the bind
+	// is a no-op for any custom collector that does not implement the binder.
+	if binder, ok := metricsCollector.(WALBookkeepingStatsBinder); ok {
+		if wb, ok := storageImpl.(interface {
+			WALBookkeepingStats() (inventoryRecords, indexCopies int, drained uint64)
+		}); ok {
+			binder.BindWALBookkeepingStats(wb.WALBookkeepingStats)
+		}
+	}
+
 	// Create and attach lifecycle manager
 	server.Lifecycle = NewLifecycleManager(server, b.config)
 

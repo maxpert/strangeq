@@ -136,6 +136,17 @@ type Collector struct {
 	// publishLeaseStats points at the binding the GaugeFunc closures read
 	// (nil func → zero gauges). Set once by BindPublishLeaseStats.
 	publishLeaseStats *atomic.Value
+
+	// WS-MEMORY-CUT bookkeeping diagnostics (amqp_wal_bookkeeping_*). The three
+	// GaugeFuncs read the bound stats AT SCRAPE TIME (never stale); bind via
+	// BindWALBookkeepingStats. DIAGNOSTIC ONLY; never gated.
+	WALInventoryRecords   prometheus.GaugeFunc
+	WALIndexCopies        prometheus.GaugeFunc
+	WALSettleDrainedTotal prometheus.GaugeFunc
+
+	// walBookkeeping points at the binding the GaugeFunc closures read
+	// (nil func → zero gauges). Set once by BindWALBookkeepingStats.
+	walBookkeeping *atomic.Value
 }
 
 // NewCollector creates a new metrics collector with all Prometheus metrics
@@ -148,6 +159,11 @@ func NewCollector(namespace string) *Collector {
 	// leaseStats is the shared cell the closures and BindPublishLeaseStats
 	// both use.
 	leaseStats := &atomic.Value{}
+
+	// The WAL bookkeeping GaugeFuncs read the bound stats function at scrape
+	// time; walBookkeeping is the shared cell they and
+	// BindWALBookkeepingStats both use.
+	walBookkeeping := &atomic.Value{}
 
 	c := &Collector{
 		// Connection metrics
@@ -543,9 +559,54 @@ func NewCollector(namespace string) *Collector {
 			Help:      "Time spent blocked waiting for a publish lease (WS-I)",
 			Buckets:   prometheus.ExponentialBuckets(0.0001, 10, 7),
 		}),
+
+		// WS-MEMORY-CUT §8 diagnostics: the WAL tier's in-memory bookkeeping.
+		// Reported and NEVER gated; they exist to close the S1c magnitude
+		// question (why the index maps measure ~6× the standing backlog).
+		WALInventoryRecords: promauto.NewGaugeFunc(prometheus.GaugeOpts{
+			Namespace: namespace,
+			Name:      "wal_inventory_records",
+			Help:      "Records held in the ACTIVE WAL file's inventory (WS-MEMORY-CUT; diagnostic)",
+		}, func() float64 {
+			if fn, ok := walBookkeeping.Load().(func() (int, int, uint64)); ok && fn != nil {
+				inv, _, _ := fn()
+				return float64(inv)
+			}
+			return 0
+		}),
+		WALIndexCopies: promauto.NewGaugeFunc(prometheus.GaugeOpts{
+			Namespace: namespace,
+			Name:      "wal_index_copies",
+			Help:      "Physical copies across every WAL index shard (WS-MEMORY-CUT; diagnostic)",
+		}, func() float64 {
+			if fn, ok := walBookkeeping.Load().(func() (int, int, uint64)); ok && fn != nil {
+				_, copies, _ := fn()
+				return float64(copies)
+			}
+			return 0
+		}),
+		WALSettleDrainedTotal: promauto.NewGaugeFunc(prometheus.GaugeOpts{
+			Namespace: namespace,
+			Name:      "wal_settle_drained_total",
+			Help:      "Settled records deleted from the active WAL inventory (WS-MEMORY-CUT; diagnostic)",
+		}, func() float64 {
+			if fn, ok := walBookkeeping.Load().(func() (int, int, uint64)); ok && fn != nil {
+				_, _, drained := fn()
+				return float64(drained)
+			}
+			return 0
+		}),
 	}
 	c.publishLeaseStats = leaseStats
+	c.walBookkeeping = walBookkeeping
 	return c
+}
+
+// BindWALBookkeepingStats binds the WAL bookkeeping accessor the
+// amqp_wal_bookkeeping_* GaugeFuncs read at scrape time. Called once by the
+// server when the storage tier is created. DIAGNOSTIC ONLY; never gated.
+func (c *Collector) BindWALBookkeepingStats(stats func() (inventoryRecords, indexCopies int, drained uint64)) {
+	c.walBookkeeping.Store(stats)
 }
 
 // RecordPublishLeaseWait observes one completed blocking lease wait.
