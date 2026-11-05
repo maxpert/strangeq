@@ -133,7 +133,6 @@ func TestReadiness_Func(t *testing.T) {
 type fakeQueueLister struct {
 	queues    map[string]*protocol.Queue
 	consumers map[string]*protocol.Consumer
-	ready     map[string]uint32
 }
 
 func (f fakeQueueLister) GetQueues() map[string]*protocol.Queue       { return f.queues }

@@ -33,11 +33,10 @@ type ServerOptions struct {
 
 // Server provides an HTTP server for Prometheus metrics, health and profiling.
 type Server struct {
-	httpServer       *http.Server
-	listener         net.Listener
-	listenAddress    string
-	port             int
-	profilingEnabled bool
+	httpServer    *http.Server
+	listener      net.Listener
+	listenAddress string
+	port          int
 }
 
 // NewServerWithOptions creates a telemetry server.
@@ -163,8 +162,7 @@ go tool pprof -http=:8080 cpu.prof
 			WriteTimeout:      writeTimeout,
 			IdleTimeout:       120 * time.Second,
 		},
-		port:             o.Port,
-		profilingEnabled: o.EnablePprof,
+		port: o.Port,
 		// Remember the address for Listen (the http.Server no longer listens
 		// through Addr so bind errors can be surfaced synchronously).
 		listenAddress: address,
