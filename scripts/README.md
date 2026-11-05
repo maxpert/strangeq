@@ -13,7 +13,7 @@ Launch everything (server + monitoring + load test) with one command:
 This will:
 1. Start Prometheus and Grafana in Docker containers
 2. Start the AMQP server with telemetry enabled
-3. Run a performance test with 10 publishers and 10 consumers at 1000 msg/s
+3. Run a performance test with 10 producers and 10 consumers
 4. Display real-time progress and provide dashboard links
 
 ## Custom Configuration
@@ -35,9 +35,9 @@ PUBLISHERS=50 CONSUMERS=50 RATE=5000 DURATION=1800s ./launch-with-monitoring.sh
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `PUBLISHERS` | 10 | Number of publisher goroutines |
+| `PUBLISHERS` | 10 | Number of producer goroutines |
 | `CONSUMERS` | 10 | Number of consumer goroutines |
-| `RATE` | 1000 | Target message rate (msg/s) |
+| `RATE` | 1000 | Displayed only: `perftest` has no rate limit, so this value does not throttle the run |
 | `DURATION` | 300s | Test duration (e.g., 60s, 5m, 1h) |
 | `AMQP_PORT` | 5672 | AMQP server port |
 | `TELEMETRY_PORT` | 9419 | Prometheus metrics port |
@@ -66,9 +66,13 @@ cd ../src/amqp-go
 ### Run Performance Test Manually
 
 ```bash
-cd ../src/amqp-go/benchmark
-./perftest -publishers 10 -consumers 10 -rate 1000 -duration 300s
+cd ../src/amqp-go
+./bin/perftest -url amqp://guest:guest@localhost:5672/ \
+  -producers 10 -consumers 10 -duration 300s
 ```
+
+See [src/amqp-go/benchmark/README.md](../src/amqp-go/benchmark/README.md) for the
+full flag list (`perftest` has no rate-limit flag).
 
 ### Stop Monitoring
 

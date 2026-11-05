@@ -22,7 +22,9 @@ StrangeQ follows [Semantic Versioning](https://semver.org/).
    - macOS (arm64, amd64)
    - Linux (amd64, arm64, 386)
    
-   SHA256 checksums are generated and uploaded with the binaries.
+   Each platform is packaged as `amqp-server-<version>-<os>-<arch>.tar.gz`
+   (binary, `config.sample.yaml`, `README.txt`, `LICENSE`) and uploaded with a
+   `.sha256` checksum.
 
 4. Verify the release:
    - Check that all binaries are attached
