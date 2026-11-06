@@ -101,9 +101,7 @@ func TestWSB_AckMultipleUnknown_Gets406_SettlesNothing(t *testing.T) {
 
 	// Two manual-ack gets (wire tags 1, 2).
 	for i := 0; i < 2; i++ {
-		_, ok, err := ch1.Get("ma-q", false)
-		require.NoError(t, err)
-		require.True(t, ok)
+		_ = getVisible(t, ch1, "ma-q")
 	}
 
 	// multiple=true with a top tag that is not outstanding: error, NOTHING settled.

@@ -9,6 +9,36 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+// getVisible does a manual-ack basic.Get and waits for a delivery to appear.
+//
+// A fire-and-forget publish on ANOTHER connection is NOT ordered with this
+// connection's frames: AMQP orders only a channel's own frames (a publish is
+// enqueued before that channel's next frame), so a Get issued from a freshly
+// opened connection may legitimately race the enqueue. This waits for the
+// message the same way this suite's later assertions already do, instead of
+// hard-asserting on the first Get.
+func getVisible(t *testing.T, ch *amqp.Channel, queue string) amqp.Delivery {
+	t.Helper()
+	var (
+		got  amqp.Delivery
+		gerr error
+	)
+	require.Eventually(t, func() bool {
+		d, ok, err := ch.Get(queue, false)
+		if err != nil {
+			gerr = err
+			return false
+		}
+		if !ok {
+			return false
+		}
+		got = d
+		return true
+	}, 2*time.Second, 20*time.Millisecond, "message must become visible on %q", queue)
+	require.NoError(t, gerr)
+	return got
+}
+
 // TestWSB_GetRequeueScopedToClosingConnection: connection close must requeue
 // ONLY its own unacked basic.get deliveries — not every connection's (P1:
 // RequeueAllGetDeliveries requeued globally, so another client's later ack
@@ -30,9 +60,7 @@ func TestWSB_GetRequeueScopedToClosingConnection(t *testing.T) {
 	require.NoError(t, err)
 	c1, err := conn1.Channel()
 	require.NoError(t, err)
-	a, ok, err := c1.Get("gq", false) // manual ack
-	require.NoError(t, err)
-	require.True(t, ok)
+	a := getVisible(t, c1, "gq")
 	assert.Equal(t, "A", string(a.Body))
 
 	conn2, err := amqp.Dial("amqp://guest:guest@" + addr + "/")
@@ -40,9 +68,7 @@ func TestWSB_GetRequeueScopedToClosingConnection(t *testing.T) {
 	defer conn2.Close()
 	c2, err := conn2.Channel()
 	require.NoError(t, err)
-	b, ok, err := c2.Get("gq", false) // manual ack
-	require.NoError(t, err)
-	require.True(t, ok)
+	b := getVisible(t, c2, "gq")
 	assert.Equal(t, "B", string(b.Body))
 
 	// Close conn1: ONLY its delivery (A) is requeued.
@@ -101,9 +127,7 @@ func TestWSB_GetRequeueOwnDeliveriesOnClose(t *testing.T) {
 	require.NoError(t, err)
 	c1, err := conn1.Channel()
 	require.NoError(t, err)
-	a, ok, err := c1.Get("gq2", false)
-	require.NoError(t, err)
-	require.True(t, ok)
+	a := getVisible(t, c1, "gq2")
 	assert.Equal(t, "A", string(a.Body))
 	require.NoError(t, conn1.Close())
 

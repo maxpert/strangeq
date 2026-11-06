@@ -103,6 +103,36 @@ func wsbRoundTrip(t *testing.T, conn *amqp.Connection, queue, body string) {
 	assert.Equal(t, body, string(msg.Body))
 }
 
+// wsbGetVisible does a manual-ack basic.Get and waits for a delivery to appear.
+//
+// A fire-and-forget publish on ANOTHER connection is NOT ordered with this
+// connection's frames: AMQP orders only a channel's own frames (a publish is
+// enqueued before that channel's next frame), so a Get issued from a freshly
+// opened connection may legitimately race the enqueue. This waits for the
+// message the same way this suite's later assertions already do, instead of
+// hard-asserting on the first Get.
+func wsbGetVisible(t *testing.T, ch *amqp.Channel, queue string) amqp.Delivery {
+	t.Helper()
+	var (
+		got  amqp.Delivery
+		gerr error
+	)
+	require.Eventually(t, func() bool {
+		d, ok, err := ch.Get(queue, false)
+		if err != nil {
+			gerr = err
+			return false
+		}
+		if !ok {
+			return false
+		}
+		got = d
+		return true
+	}, 2*time.Second, 20*time.Millisecond, "message must become visible on %q", queue)
+	require.NoError(t, gerr)
+	return got
+}
+
 // TestChannelIsolationWSB: a 404 channel error closes only the channel.
 func TestChannelIsolationWSB(t *testing.T) {
 	srv, addr := wsbRootServer(t, nil)
@@ -314,9 +344,7 @@ func TestGetRequeueWSB(t *testing.T) {
 	require.NoError(t, err)
 	c1, err := conn1.Channel()
 	require.NoError(t, err)
-	a, ok, err := c1.Get("e2e-gq", false)
-	require.NoError(t, err)
-	require.True(t, ok)
+	a := wsbGetVisible(t, c1, "e2e-gq")
 	assert.Equal(t, "A", string(a.Body))
 
 	conn2, err := amqp.Dial("amqp://guest:guest@" + addr + "/")
@@ -324,9 +352,7 @@ func TestGetRequeueWSB(t *testing.T) {
 	defer conn2.Close()
 	c2, err := conn2.Channel()
 	require.NoError(t, err)
-	b, ok, err := c2.Get("e2e-gq", false)
-	require.NoError(t, err)
-	require.True(t, ok)
+	b := wsbGetVisible(t, c2, "e2e-gq")
 	assert.Equal(t, "B", string(b.Body))
 
 	require.NoError(t, conn1.Close())
@@ -344,7 +370,7 @@ func TestGetRequeueWSB(t *testing.T) {
 	assert.True(t, gotA.Redelivered)
 
 	// B belongs to conn2: not requeued, its ack still works.
-	_, ok, err = sch.Get("e2e-gq", true)
+	_, ok, err := sch.Get("e2e-gq", true)
 	require.NoError(t, err)
 	assert.False(t, ok, "B must still be owned by conn2")
 	require.NoError(t, b.Ack(false))
