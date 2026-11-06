@@ -190,6 +190,7 @@ The provided service file includes several security hardening options:
 - `ProtectSystem=strict` - Makes most of filesystem read-only
 - `ProtectHome=true` - Makes /home inaccessible
 - `ReadWritePaths=...` - Only specified paths are writable
+- `UMask=0027` - Files and directories the service creates are readable only by the service's group
 
 ### Additional Hardening (Optional)
 

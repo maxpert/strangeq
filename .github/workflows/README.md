@@ -3,7 +3,7 @@
 ## Workflows
 
 ### Release Build (`release.yml`)
-Triggers on GitHub release creation or manual dispatch. Builds binaries for macOS (arm64, amd64) and Linux (amd64, arm64, 386), generates SHA256 checksums, and uploads to the release.
+Triggers on a `v*` tag push, GitHub release creation/publishing, or manual dispatch. Builds binaries for macOS (arm64, amd64) and Linux (amd64, arm64, 386), generates SHA256 checksums, and uploads them to the release (creating it if the tag has none).
 
 ### Build and Test (`build.yml`)
 Triggers on push/PR to main and develop. Runs tests with race detection, generates coverage, runs gofmt and go vet checks, and verifies the binary builds.
@@ -11,7 +11,7 @@ Triggers on push/PR to main and develop. Runs tests with race detection, generat
 ### CodeQL Analysis (`codeql.yml`)
 Triggers on push/PR to main and weekly. Runs security and quality analysis.
 
-### Dependabot (`dependabot.yml`)
+### Dependabot (`.github/dependabot.yml`, not a workflow)
 Weekly checks for Go module and GitHub Actions updates.
 
 ## Local Testing
