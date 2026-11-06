@@ -2,7 +2,11 @@ version: '3.8'
 
 services:
   rabbitmq:
-    image: rabbitmq:3-management
+    # Must match the tag the conformance path pins (src/amqp-go/Makefile:49) and
+    # the version the locked wire values were captured against (RabbitMQ 4.3.2):
+    # the conformance suite compares against real broker behaviour, so a stale
+    # major here silently invalidates the comparison.
+    image: rabbitmq:4-management
     container_name: rabbitmq-test
     ports:
       - "5672:5672"    # AMQP port
