@@ -113,7 +113,7 @@ Closes #123
 
 When working on protocol features:
 - Reference the AMQP 0.9.1 spec in code comments where relevant
-- Test against RabbitMQ using the conformance suite (`make conformance-rabbitmq`)
+- Test against RabbitMQ using the conformance suite (`cd src/amqp-go && make conformance-rabbitmq`; it needs a RabbitMQ reachable at `AMQP_URL`, default `amqp://guest:guest@localhost:5672/`)
 - Add conformance tests for new protocol features
 
 ## License

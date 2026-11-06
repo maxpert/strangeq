@@ -29,15 +29,15 @@ Each regex pattern is matched against the resource name. Patterns are **unanchor
 | basic.publish | | exchange | |
 | basic.consume | | | queue |
 | basic.get | | | queue |
-| queue.purge | | | queue |
+| queue.purge | | queue | |
 
 ### Default Exchange
 
-The AMQP default exchange (empty name) is mapped to `amq.default` for permission checks. This matches RabbitMQ behavior.
+The AMQP default exchange (empty name) is mapped to `amq.default` for permission checks. This matches RabbitMQ behavior. Declaring or deleting the default exchange is itself refused with **403 (access-refused)** before any permission check; the `amq.default` mapping applies to the operations that *name* the default exchange (`basic.publish`, `queue.bind`, ...).
 
 ### Reserved Names
 
-Exchange and queue names starting with `amq.` are reserved for pre-declared and standardized resources. Clients may declare `amq.*` names only with the **passive** flag (checking existence) or if the resource already exists. Non-passive declaration of `amq.*` names returns **403 (access-refused)**.
+Exchange and queue names starting with `amq.` are reserved for pre-declared and standardized resources. A client may declare an `amq.*` name only with the **passive** flag (checking existence). A non-passive declaration is refused with **403 (access-refused)** whether or not the resource already exists — the reserved-name check runs before the broker looks the resource up. Deleting the default exchange or an `amq.*` exchange is likewise refused with 403.
 
 Server-generated queue names use the `amq.gen.` prefix and are exempt from this restriction.
 
@@ -113,7 +113,7 @@ Authorization is configured via the auth file (JSON). Each user has `vhost_permi
 
 ### Loopback Restriction
 
-Users with `"loopback_only": true` can only connect from localhost (loopback interface). This is enabled by default for the `guest` user, matching RabbitMQ behavior. Remote connections from loopback-restricted users are refused with **403 (access-refused)**.
+Users with `"loopback_only": true` can only connect from the loopback interface; remote connections from such users are refused with **403 (access-refused)**. The file backend applies this only when the auth file sets the field (the `guest` entry in the example above does). The ANONYMOUS mechanism always creates its `guest` identity with this restriction, matching RabbitMQ's default loopback-only guest.
 
 ### Backward Compatibility
 

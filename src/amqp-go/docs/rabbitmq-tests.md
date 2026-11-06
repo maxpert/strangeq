@@ -26,20 +26,22 @@ To run these tests, you need:
 
 ## Quick Start with Docker
 
-The easiest way to run these tests is using Docker:
+The easiest way to run these tests is using Docker. Run the `go test`
+commands from the Go module root (`src/amqp-go`); the interop tests live in the
+`protocol` package:
 
 ```bash
 # Start RabbitMQ with management interface
 docker run -d --name rabbitmq-test \
   -p 5672:5672 \
   -p 15672:15672 \
-  rabbitmq:3-management
+  rabbitmq:4-management
 
 # Wait for RabbitMQ to be ready (about 10 seconds)
 sleep 10
 
 # Run the tests
-go test -v -run TestRabbitMQ
+go test -v -run TestRabbitMQ ./protocol/
 
 # Stop and remove the container when done
 docker stop rabbitmq-test
@@ -67,7 +69,7 @@ RABBITMQ_HOST=rabbitmq.example.com \
 RABBITMQ_PORT=5672 \
 RABBITMQ_USER=testuser \
 RABBITMQ_PASS=testpass \
-go test -v -run TestRabbitMQ
+go test -v -run TestRabbitMQ ./protocol/
 ```
 
 ### Skipping Tests
@@ -76,7 +78,7 @@ If you don't have RabbitMQ available or want to skip these tests:
 
 ```bash
 # Skip RabbitMQ interop tests
-SKIP_RABBITMQ_TESTS=1 go test -v
+SKIP_RABBITMQ_TESTS=1 go test -v ./protocol/
 ```
 
 The tests will also automatically skip if they cannot connect to RabbitMQ.
@@ -140,10 +142,10 @@ You can run individual tests using the `-run` flag:
 
 ```bash
 # Run only the connection handshake test
-go test -v -run TestRabbitMQ_ConnectionHandshake
+go test -v -run TestRabbitMQ_ConnectionHandshake ./protocol/
 
 # Run only publishing and consumption tests
-go test -v -run "TestRabbitMQ_(BasicPublish|BasicGet)"
+go test -v -run "TestRabbitMQ_(BasicPublish|BasicGet)" ./protocol/
 ```
 
 ## Debugging
@@ -152,7 +154,7 @@ go test -v -run "TestRabbitMQ_(BasicPublish|BasicGet)"
 
 ```bash
 # Run tests with verbose output
-go test -v -run TestRabbitMQ
+go test -v -run TestRabbitMQ ./protocol/
 ```
 
 ### Check RabbitMQ Logs
@@ -189,7 +191,7 @@ For automated testing in CI/CD pipelines:
 # Example GitHub Actions workflow
 - name: Start RabbitMQ
   run: |
-    docker run -d --name rabbitmq-test -p 5672:5672 rabbitmq:3
+    docker run -d --name rabbitmq-test -p 5672:5672 rabbitmq:4-management
     sleep 10
 
 - name: Run RabbitMQ interop tests
@@ -219,7 +221,7 @@ If you see authentication errors:
 ### Timeout Errors
 
 If tests timeout:
-1. Increase the test timeout: `go test -timeout 30s -run TestRabbitMQ`
+1. Increase the test timeout: `go test -timeout 30s -run TestRabbitMQ ./protocol/`
 2. Check if RabbitMQ is overloaded or slow to respond
 3. Verify network latency is acceptable
 

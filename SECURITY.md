@@ -27,7 +27,7 @@ We aim to acknowledge within 48 hours. Fixes are released as patch versions and 
 - Use PLAIN mechanism with TLS to protect credentials
 - Never use ANONYMOUS mechanism in production
 - Rotate passwords regularly
-- Use strong passwords (bcrypt hashed with high cost)
+- Use strong passwords; the broker verifies them with bcrypt (`bcrypt.CompareHashAndPassword`). The cost factor comes from the stored hash — the shipped systemd example generates cost-10 hashes.
 
 ### Network Security
 - Enable TLS for all production deployments
