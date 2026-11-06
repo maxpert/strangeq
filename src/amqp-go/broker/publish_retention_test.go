@@ -95,6 +95,45 @@ func gateWALFsync(t *testing.T) (release func()) {
 	return func() { once.Do(func() { close(gate) }) }
 }
 
+// clampStagerUntilReleased holds the WAL STAGER on its first staged record
+// until the returned release is called. Used to force a multi-copy publish's
+// durable copies into ONE staged batch (see publishCoalescedAsyncConfirm).
+func clampStagerUntilReleased(t *testing.T) (release func()) {
+	t.Helper()
+	gate := make(chan struct{})
+	var once sync.Once
+	restore := storage.SetWALStageHookForTest(func(int) { <-gate })
+	release = func() { once.Do(func() { close(gate) }) }
+	t.Cleanup(func() { release(); restore() })
+	return release
+}
+
+// publishCoalescedAsyncConfirm publishes ONE durable message through
+// PublishMessageAsyncConfirm with all of its per-queue copies forced into a
+// single WAL batch.
+//
+// WHY: gateWALFsync parks the group-commit fsync. The WAL committer is
+// strictly serial — "write(i+1) is never issued before fsync(i) returns" (D3)
+// — so a multi-copy publish whose copies split across two batches has its
+// SECOND batch's write blocked forever behind the FIRST batch's parked fsync;
+// the lease fan-in never reaches zero and the test times out. The copies split
+// whenever the stager drains writeChan between the broker's two enqueues (it
+// hands a partial batch off as soon as writeChan is momentarily empty), which
+// is schedule-dependent and therefore passes on an idle machine and loses on a
+// loaded one.
+//
+// The fix holds the stager until every copy is enqueued (PublishMessageAsyncConfirm
+// returns only after its last StoreMessageAsync), so the copies coalesce. The
+// release runs as soon as the publish returns; on any earlier exit the
+// t.Cleanup in clampStagerUntilReleased opens it so a failing test cannot wedge
+// the stager.
+func publishCoalescedAsyncConfirm(t *testing.T, b *StorageBroker, exchangeName, routingKey string, message *protocol.Message, onDurable func(error), lease protocol.PublishLeaseToken) (bool, protocol.DepthGate, error) {
+	t.Helper()
+	release := clampStagerUntilReleased(t)
+	defer release()
+	return b.PublishMessageAsyncConfirm(exchangeName, routingKey, message, onDurable, lease)
+}
+
 // retentionStorage wraps a real backend and intercepts the async durable
 // write seams, so the tests can gate, error, or synchronously fire
 // completions deterministically.
@@ -167,7 +206,7 @@ func TestRetention_SingleDurableCopy(t *testing.T) {
 
 	ev := &retentionEvents{}
 	onDurable, lease := ev.callbacks()
-	durableInflight, _, perr := b.PublishMessageAsyncConfirm("", "dq", durableMsg("dq"), onDurable, lease)
+	durableInflight, _, perr := publishCoalescedAsyncConfirm(t, b, "", "dq", durableMsg("dq"), onDurable, lease)
 	require.NoError(t, perr)
 	require.True(t, durableInflight)
 
@@ -259,7 +298,7 @@ func TestRetention_PartialFanoutReject(t *testing.T) {
 	ev := &retentionEvents{}
 	onDurable, lease := ev.callbacks()
 	// Small body: per-queue path (below the shared-body threshold).
-	_, _, perr := b.PublishMessageAsyncConfirm("fx", "", durableMsg(""), onDurable, lease)
+	_, _, perr := publishCoalescedAsyncConfirm(t, b, "fx", "", durableMsg(""), onDurable, lease)
 	require.ErrorIs(t, perr, ErrMaxLengthExceeded)
 
 	assert.Equal(t, 0, ev.count("durable"), "a rejected publish never fires onDurable")
@@ -296,7 +335,7 @@ func TestRetention_StopChMidFanout(t *testing.T) {
 
 	ev := &retentionEvents{}
 	onDurable, lease := ev.callbacks()
-	_, _, perr := b.PublishMessageAsyncConfirm("fx", "", durableMsg(""), onDurable, lease)
+	_, _, perr := publishCoalescedAsyncConfirm(t, b, "fx", "", durableMsg(""), onDurable, lease)
 	require.ErrorIs(t, perr, ErrQueueClosed)
 
 	// The lease is released once the enqueued q1 copy is WRITTEN (the broker
@@ -327,7 +366,7 @@ func TestRetention_SharedFanoutSuccessAndEnqueueError(t *testing.T) {
 	bigBody := make([]byte, DefaultSharedBodyThreshold+1)
 	ev := &retentionEvents{}
 	onDurable, lease := ev.callbacks()
-	durableInflight, _, perr := b.PublishMessageAsyncConfirm("fx", "",
+	durableInflight, _, perr := publishCoalescedAsyncConfirm(t, b, "fx", "",
 		&protocol.Message{Body: bigBody, DeliveryMode: 2}, onDurable, lease)
 	require.NoError(t, perr)
 	require.True(t, durableInflight)
@@ -594,7 +633,7 @@ func TestRetention_PerQueueMultiCopySuccess(t *testing.T) {
 	ev := &retentionEvents{}
 	onDurable, lease := ev.callbacks()
 	// Small body: the per-queue path (below the shared-body threshold).
-	durableInflight, _, perr := b.PublishMessageAsyncConfirm("fx", "", durableMsg(""), onDurable, lease)
+	durableInflight, _, perr := publishCoalescedAsyncConfirm(t, b, "fx", "", durableMsg(""), onDurable, lease)
 	require.NoError(t, perr)
 	require.True(t, durableInflight)
 
