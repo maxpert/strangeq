@@ -22,6 +22,7 @@ jobs:
         uses: actions/setup-go@v5
         with:
           go-version: ${{ matrix.go-version }}
+          cache-dependency-path: src/amqp-go/go.sum
 
       - name: Cache Go modules
         uses: actions/cache@v4
@@ -63,6 +64,10 @@ jobs:
         uses: actions/setup-go@v5
         with:
           go-version: '1.25.1'
+          # The module lives in src/amqp-go; without this setup-go looks for a
+          # go.sum at the repo root, finds none, and silently disables its Go
+          # build/module cache ("Dependencies file is not found ... go.sum").
+          cache-dependency-path: src/amqp-go/go.sum
 
       - name: Run go fmt
         run: |
@@ -93,6 +98,10 @@ jobs:
         uses: actions/setup-go@v5
         with:
           go-version: '1.25.1'
+          # The module lives in src/amqp-go; without this setup-go looks for a
+          # go.sum at the repo root, finds none, and silently disables its Go
+          # build/module cache ("Dependencies file is not found ... go.sum").
+          cache-dependency-path: src/amqp-go/go.sum
 
       - name: Build binary
         run: |

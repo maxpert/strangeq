@@ -60,6 +60,8 @@ jobs:
         uses: actions/setup-go@v5
         with:
           go-version: '1.25.1'
+          # Module root is src/amqp-go (see the matching note in build.yml).
+          cache-dependency-path: src/amqp-go/go.sum
 
       - name: Get version
         id: version
