@@ -72,6 +72,16 @@ func newLeaseSinkToken(e *retentionEvents) protocol.PublishLeaseToken {
 
 // gateWALFsync holds every WAL group-commit fsync on a token channel so no
 // durable completion fires until the test releases it.
+//
+// The gate MUST be released BEFORE any teardown that closes the
+// broker/storage: Close joins the WAL commit loop, which is parked here while
+// the gate is closed. A test that fails before calling release() runs its
+// DEFERRED cleanup first (Goexit), and only THEN t.Cleanup — so registering
+// the release solely under t.Cleanup is not enough: closing the broker while
+// the commit loop is parked wedges Close() and turns a test failure into a
+// package-wide timeout. Callers must therefore release the gate *inside* the
+// same defer, before cleanup() (see gateWALFsync's callers); the t.Cleanup
+// below is a last-resort backstop for callers with no store to close.
 func gateWALFsync(t *testing.T) (release func()) {
 	t.Helper()
 	gate := make(chan struct{})
@@ -147,7 +157,10 @@ func durableMsg(routingKey string) *protocol.Message {
 func TestRetention_SingleDurableCopy(t *testing.T) {
 	release := gateWALFsync(t)
 	b, _, cleanup := newRetentionBroker(t, nil)
-	defer cleanup()
+	// Release the gated WAL fsync BEFORE cleanup() joins the WAL commit loop:
+	// a failure before release() must not wedge store.Close() and take the
+	// whole package down with it.
+	defer func() { release(); cleanup() }()
 
 	_, err := b.DeclareQueue("dq", true, false, false, nil)
 	require.NoError(t, err)
@@ -229,7 +242,10 @@ func declareRejectQueue(t *testing.T, b *StorageBroker, name string) {
 func TestRetention_PartialFanoutReject(t *testing.T) {
 	release := gateWALFsync(t)
 	b, _, cleanup := newRetentionBroker(t, nil)
-	defer cleanup()
+	// Release the gated WAL fsync BEFORE cleanup() joins the WAL commit loop:
+	// a failure before release() must not wedge store.Close() and take the
+	// whole package down with it.
+	defer func() { release(); cleanup() }()
 
 	require.NoError(t, b.DeclareExchange("fx", "fanout", true, false, false, nil))
 	for _, q := range []string{"q1", "q3"} {
@@ -261,7 +277,10 @@ func TestRetention_PartialFanoutReject(t *testing.T) {
 func TestRetention_StopChMidFanout(t *testing.T) {
 	release := gateWALFsync(t)
 	b, _, cleanup := newRetentionBroker(t, nil)
-	defer cleanup()
+	// Release the gated WAL fsync BEFORE cleanup() joins the WAL commit loop:
+	// a failure before release() must not wedge store.Close() and take the
+	// whole package down with it.
+	defer func() { release(); cleanup() }()
 
 	require.NoError(t, b.DeclareExchange("fx", "fanout", true, false, false, nil))
 	_, err := b.DeclareQueue("q1", true, false, false, nil)
@@ -293,7 +312,10 @@ func TestRetention_StopChMidFanout(t *testing.T) {
 func TestRetention_SharedFanoutSuccessAndEnqueueError(t *testing.T) {
 	release := gateWALFsync(t)
 	b, _, cleanup := newRetentionBroker(t, nil)
-	defer cleanup()
+	// Release the gated WAL fsync BEFORE cleanup() joins the WAL commit loop:
+	// a failure before release() must not wedge store.Close() and take the
+	// whole package down with it.
+	defer func() { release(); cleanup() }()
 
 	require.NoError(t, b.DeclareExchange("fx", "fanout", true, false, false, nil))
 	for _, q := range []string{"q1", "q2"} {
@@ -557,7 +579,10 @@ func TestRetention_AcceptedRejectEnqueueMix(t *testing.T) {
 func TestRetention_PerQueueMultiCopySuccess(t *testing.T) {
 	release := gateWALFsync(t)
 	b, _, cleanup := newRetentionBroker(t, nil)
-	defer cleanup()
+	// Release the gated WAL fsync BEFORE cleanup() joins the WAL commit loop:
+	// a failure before release() must not wedge store.Close() and take the
+	// whole package down with it.
+	defer func() { release(); cleanup() }()
 
 	require.NoError(t, b.DeclareExchange("fx", "fanout", true, false, false, nil))
 	for _, q := range []string{"q1", "q2"} {
