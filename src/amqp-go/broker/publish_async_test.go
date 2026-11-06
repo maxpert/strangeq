@@ -30,10 +30,14 @@ func TestAsyncConfirm_NotVisibleBeforeDurable(t *testing.T) {
 		return nil
 	})
 	defer restore()
-	defer once.Do(func() { close(release) })
 
 	b, cleanup := createTestBroker(t)
-	defer cleanup()
+	// Release the gated WAL fsync BEFORE cleanup() joins the WAL commit loop:
+	// a failure before release must not wedge store.Close().
+	defer func() {
+		once.Do(func() { close(release) })
+		cleanup()
+	}()
 
 	_, err := b.DeclareQueue("dq", true, false, false, nil)
 	require.NoError(t, err)
@@ -178,10 +182,14 @@ func TestAsyncConfirm_FanoutFiresOnceAfterAllCopies(t *testing.T) {
 		return nil
 	})
 	defer restore()
-	defer once.Do(func() { close(release) })
 
 	b, cleanup := createTestBroker(t)
-	defer cleanup()
+	// Release the gated WAL fsync BEFORE cleanup() joins the WAL commit loop:
+	// a failure before release must not wedge store.Close().
+	defer func() {
+		once.Do(func() { close(release) })
+		cleanup()
+	}()
 
 	require.NoError(t, b.DeclareExchange("fx", "fanout", true, false, false, nil))
 	for _, q := range []string{"fq1", "fq2"} {
@@ -298,10 +306,14 @@ func TestAsyncConfirm_MultiPublisherNotVisibleBeforeDurable(t *testing.T) {
 		return nil
 	})
 	defer restore()
-	defer once.Do(func() { close(release) })
 
 	b, cleanup := createTestBroker(t)
-	defer cleanup()
+	// Release the gated WAL fsync BEFORE cleanup() joins the WAL commit loop:
+	// a failure before release must not wedge store.Close().
+	defer func() {
+		once.Do(func() { close(release) })
+		cleanup()
+	}()
 	_, err := b.DeclareQueue("mq", true, false, false, nil)
 	require.NoError(t, err)
 	qs := b.getOrCreateQueueState("mq")
