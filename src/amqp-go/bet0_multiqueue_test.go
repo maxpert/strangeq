@@ -630,11 +630,16 @@ func bet0RunConcurrentMultiQueue(t *testing.T, shape string, durable []bool) {
 	// running, so the ratio is consumption-under-load over the same interval.
 	// The few thousand messages in flight at that instant (prefetch x consumers
 	// plus socket buffers) are noise against the hundreds of thousands published.
+	//
+	// E11: the deficit sampler is a no-op unless STRANGEQ_F2_DIAG is set; it is
+	// a wall-clock diagnostic and must never run in CI or the determinism soak.
+	stopF2Sampler := bet0F2StartSampler(results)
 	time.Sleep(bet0PublishWindow)
 	for _, res := range results {
 		res.publishedAtWindow = res.published.Load()
 		res.consumedAtWindow = res.consumed.Load()
 	}
+	stopF2Sampler()
 
 	stopPubOnce.Do(func() { close(stopPub) })
 
@@ -708,6 +713,11 @@ func bet0RunConcurrentMultiQueue(t *testing.T, shape string, durable []bool) {
 		}
 	})
 	require.NoErrorf(t, livenessErr, "shape=%s window=%s%s", shape, bet0PublishWindow, hint)
+	// E11/R4: conjunctive and strictly-stronger only — consulted ONLY when the
+	// liveness verdict passed, and off entirely unless STRANGEQ_F2_DIAG is set.
+	if series := bet0F2SeriesIfDiagnosticEnabled(); len(series) > 0 {
+		require.NoError(t, bet0DeficitVerdict(series, bet0Queues))
+	}
 	targets := bet0FreezePublisherTargets(func() { <-publishersDone }, bet0Queues,
 		bet0ProducersPerQueue, func(queue, producer int) uint64 {
 			return successCounts[queue][producer].Load()
