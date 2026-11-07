@@ -3,6 +3,7 @@ package auth
 import (
 	"fmt"
 	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/maxpert/amqp-go/interfaces"
@@ -169,8 +170,7 @@ func TestDefaultRegistry(t *testing.T) {
 }
 
 func TestFileAuthenticator(t *testing.T) {
-	authFile := "/tmp/test_auth.json"
-	defer os.Remove(authFile)
+	authFile := filepath.Join(t.TempDir(), "test_auth.json")
 
 	hash, err := bcrypt.GenerateFromPassword([]byte("guest"), bcrypt.DefaultCost)
 	if err != nil {
