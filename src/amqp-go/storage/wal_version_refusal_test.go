@@ -211,7 +211,16 @@ func walkWALRecords(t *testing.T, path string) []walRecordSpan {
 		if _, err := io.ReadFull(f, hdr); err != nil {
 			break
 		}
+		crc := binary.BigEndian.Uint32(hdr[0:4])
 		dataLen := int(binary.BigEndian.Uint32(hdr[4:8]))
+		// A BLANK HEADER IS THE END OF THE DATA, not a run of zero-length
+		// records. A sparse zero tail (a preallocated file, or a barrier tail
+		// the drive has not materialised) would otherwise be read as millions
+		// of zero-length records. This mirrors walBlankRecordHeader, the
+		// production rule (canon rule 12).
+		if crc == 0 && dataLen == 0 {
+			break
+		}
 		if _, err := f.Seek(int64(dataLen), io.SeekCurrent); err != nil {
 			break
 		}
@@ -219,6 +228,20 @@ func walkWALRecords(t *testing.T, path string) []walRecordSpan {
 		pos += 8 + int64(dataLen)
 	}
 	return spans
+}
+
+// setWALTailBoundForTest shrinks the R-TAIL-HOLE unconfirmed bound for a test
+// and returns a restore function. It exists so the FATAL rule ("real interior
+// corruption with an out-of-bound suffix") can be pinned deterministically
+// without writing 256 MiB of suffix. TEST-ONLY: the bound vars are
+// package-global, so a test using this must not be parallel; restore via
+// t.Cleanup.
+func setWALTailBoundForTest(unconfirmed, frame int64) func() {
+	prevU, prevF := walMaxUnconfirmedBytes, walMaxFrameBytes
+	walMaxUnconfirmedBytes, walMaxFrameBytes = unconfirmed, frame
+	return func() {
+		walMaxUnconfirmedBytes, walMaxFrameBytes = prevU, prevF
+	}
 }
 
 // seedWAL writes n durable records through the real write path and returns the
@@ -332,6 +355,15 @@ func TestWALCRC_CleanFileIsBenignControl(t *testing.T) {
 }
 
 func TestWALCRC_InteriorFailureIsFatal(t *testing.T) {
+	// R-TAIL-HOLE SUPERSEDES the unconditional form of this assertion: on one
+	// of the two newest WAL files a bounded non-zero suffix after a CRC failure
+	// is a benign unconfirmed tail (replay stops at the defect). seedWAL
+	// produces a single file, which IS the newest, so the bound is shrunk to
+	// zero here to keep pinning the FATAL rule for a suffix that is out of
+	// bound. The benign arm for a newest file is pinned by
+	// TestWALTail_ZeroFilledTailBoundaryShapes and TestWALTail_BoundedHole*.
+	t.Cleanup(setWALTailBoundForTest(0, 0))
+
 	dataDir := t.TempDir()
 	path := seedWAL(t, dataDir, 5)
 	spans := walkWALRecords(t, path)

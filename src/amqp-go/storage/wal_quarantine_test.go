@@ -456,6 +456,14 @@ func TestWALTail_ZeroFilledTailBoundaryShapes(t *testing.T) {
 	})
 
 	t.Run("real_data_after_a_bad_crc_record_stays_fatal", func(t *testing.T) {
+		// R-TAIL-HOLE SUPERSEDES the historical rule that real data after a
+		// bad CRC record is ALWAYS fatal. Under the new rule it is fatal only
+		// when the non-zero suffix is OUT OF BOUND, or the file is not one of
+		// the two newest. seedWAL produces a single file (which IS the newest),
+		// so the unconfirmed bound is shrunk to zero here to keep asserting the
+		// FATAL arm deterministically.
+		t.Cleanup(setWALTailBoundForTest(0, 0))
+
 		dataDir := t.TempDir()
 		path := seedWAL(t, dataDir, 12)
 		spans := walkWALRecords(t, path)

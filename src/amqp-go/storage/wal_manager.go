@@ -528,6 +528,25 @@ var (
 	// Initialised from the exported WALBatchSealBytesDefault (WS-I Phase B:
 	// the default publish-inflight lease budget is 4× that constant).
 	walBatchSealBytes = WALBatchSealBytesDefault
+
+	// walMaxUnconfirmedBytes bounds the WAL's WRITTEN-BUT-UNCONFIRMED suffix:
+	// the bytes above the durable end that a crash can leave on disk. It is
+	// the recovery bound R-TAIL-HOLE uses to tell "a bounded unconfirmed tail"
+	// (benign, replay stops at the first defect) apart from "real interior
+	// corruption" (fatal). It matches the S-B committer backpressure cap
+	// (4 × walBatchSealBytes = 256 MiB).
+	//
+	// Test-shrinkable like the other tunables: a test that needs to prove
+	// "non-zero data past the bound stays fatal" shrinks it (and restores it
+	// with t.Cleanup) instead of writing 256 MiB.
+	walMaxUnconfirmedBytes = 4 * int64(WALBatchSealBytesDefault)
+
+	// walMaxFrameBytes is the allowance for ONE overshooting WAL record
+	// frame in the R-TAIL-HOLE bound: a batch is sealed at walBatchSealBytes,
+	// but a single record larger than the seal forms its own batch, so the
+	// last frame before the durable end can exceed the seal. The bound is
+	// `z - defectAt <= walMaxUnconfirmedBytes + walMaxFrameBytes`.
+	walMaxFrameBytes = int64(WALBatchSealBytesDefault)
 )
 
 // walPipelineBatchCount is the exact number of stagedBatch objects per
@@ -1092,7 +1111,7 @@ func scanWALFileRecordCounts(filePath string) (WALRecordCounts, error) {
 	}
 	defer f.Close()
 
-	dataStart, err := walFileDataStart(f)
+	dataStart, err := walRecoveryDataStart(f)
 	if err != nil {
 		return c, err
 	}
@@ -1118,7 +1137,11 @@ func scanWALFileRecordCounts(filePath string) (WALRecordCounts, error) {
 			h.Write(hdr[4:8])
 			h.Write(data)
 			if storedCRC != h.Sum32() {
-				continue
+				// R-TAIL-HOLE / stop-replay: the first defect ends the
+				// intelligible prefix. This walk must agree with
+				// scanWALFileDetailed and indexWALFile about where the data
+				// ends (canon rule 12), so it STOPS rather than skipping.
+				break
 			}
 		}
 		recType, payload := recordTypeAndPayload(data)
@@ -1687,6 +1710,29 @@ func (wm *WALManager) RecoverFromWAL() ([]*RecoveryMessage, error) {
 			"every durable message in the WAL directory is abandoned", err)
 	}
 
+	// The two newest file numbers, for the R-TAIL-HOLE bound. A trailing roll
+	// can leave unconfirmed bytes on both N and N+1.
+	var firstNewest, secondNewest uint64
+	for _, file := range files {
+		if !isWALFileName(file) {
+			continue
+		}
+		num, ok := parseWALFileNum(file.Name())
+		if !ok {
+			continue
+		}
+		switch {
+		case num > firstNewest:
+			secondNewest = firstNewest
+			firstNewest = num
+		case num > secondNewest:
+			secondNewest = num
+		}
+	}
+	isTwoNewest := func(n uint64) bool {
+		return n == firstNewest || (secondNewest != 0 && n == secondNewest)
+	}
+
 	// Scan each WAL file. isWALFileName is the SINGLE enumeration predicate for
 	// this directory (canon rule 12) — rebuildBootState used to accept only
 	// <digits>.wal while this loop accepted any *.wal, and the looser one was
@@ -1698,7 +1744,11 @@ func (wm *WALManager) RecoverFromWAL() ([]*RecoveryMessage, error) {
 		}
 
 		filePath := filepath.Join(sharedDir, file.Name())
-		res, serr := wm.sharedWAL.scanWALFileDetailed(filePath, -1)
+		fileNewest := false
+		if num, ok := parseWALFileNum(file.Name()); ok {
+			fileNewest = isTwoNewest(num)
+		}
+		res, serr := wm.sharedWAL.scanWALFileDetailed(filePath, -1, fileNewest)
 		if serr != nil {
 			fault := classifyWALScanError(filePath, serr)
 			faults = append(faults, fault)
@@ -1723,6 +1773,13 @@ func (wm *WALManager) RecoverFromWAL() ([]*RecoveryMessage, error) {
 		for key := range res.unloadable {
 			identified[key] = true
 		}
+
+		// R-TAIL-HOLE: the durable truncation of a newest file at its first
+		// defect is performed ONCE, at boot, by rebuildBootState (which runs
+		// before openNextFile and before any writer exists). RecoverFromWAL is
+		// a SCAN and never mutates a file: the boot-state rebuild already
+		// truncated, and a concurrent RecoverFromWAL (the shard-race test) must
+		// not truncate the live active file out from under the committer.
 
 		// Select the newest physical copy before considering acknowledgement.
 		// Filtering each copy independently could revive an older duplicate after
@@ -1996,36 +2053,22 @@ func walBlankRecordHeader(crc, dataLen uint32) bool { return crc == 0 && dataLen
 // treats bytes beyond the limit as ignorable, because it already knows they
 // are a nacked partial batch that will go away with the unlink.
 func walNothingIntelligibleFollows(f *os.File, from, limit int64) bool {
-	buf := make([]byte, 64*1024)
-	pos := from
-	for {
-		n := int64(len(buf))
-		if limit >= 0 {
-			remaining := limit - pos
-			if remaining <= 0 {
-				return true
-			}
-			if remaining < n {
-				n = remaining
-			}
-		}
-		nr, err := f.ReadAt(buf[:n], pos)
-		for i := 0; i < nr; i++ {
-			if buf[i] != 0 {
-				return false
-			}
-		}
-		if err == io.EOF {
-			return true
-		}
+	end := limit
+	if end < 0 {
+		st, err := f.Stat()
 		if err != nil {
 			return false
 		}
-		if nr == 0 {
-			return true
-		}
-		pos += int64(nr)
+		end = st.Size()
 	}
+	// SEEK_DATA/SEEK_HOLE when available (see wal_tail_scan.go): a sparse
+	// preallocated tail is answered from metadata rather than read as 600 MiB
+	// of zeros.
+	z, ok := walLastNonZeroOffset(f, from, end)
+	if !ok {
+		return false
+	}
+	return z < 0
 }
 
 // walScanResult is what ONE WAL file's scan produced.
@@ -2106,7 +2149,10 @@ func (qw *QueueWAL) scanWALFile(filePath string) ([]*RecoveryMessage, error) {
 // (benign), and walNothingIntelligibleFollows treats bytes beyond it as
 // ignorable.
 func (qw *QueueWAL) scanWALFileUpTo(filePath string, limit int64) ([]*RecoveryMessage, error) {
-	res, err := qw.scanWALFileDetailed(filePath, limit)
+	// Standalone scans (tests, and the package's own scanWALFile) treat the
+	// file as one of the two newest: the caller that knows the directory
+	// layout is RecoverFromWAL, which passes the real answer.
+	res, err := qw.scanWALFileDetailed(filePath, limit, true)
 	if err != nil {
 		return nil, err
 	}
@@ -2131,7 +2177,11 @@ func joinScanFaults(faults []error) error {
 // A non-nil error means the file could not be interpreted at all (FATAL —
 // the file is quarantined and nothing is taken from it). Every other fault
 // is returned inside the result, ALONGSIDE the records the scan did read.
-func (qw *QueueWAL) scanWALFileDetailed(filePath string, limit int64) (*walScanResult, error) {
+//
+// `newest` selects the R-TAIL-HOLE bound: a bounded non-zero suffix after the
+// first defect is a benign unconfirmed tail only on one of the two newest
+// files; elsewhere it is fatal.
+func (qw *QueueWAL) scanWALFileDetailed(filePath string, limit int64, newest bool) (*walScanResult, error) {
 	res := &walScanResult{unloadable: map[recordKey]string{}}
 
 	file, err := os.Open(filePath)
@@ -2156,7 +2206,9 @@ func (qw *QueueWAL) scanWALFileDetailed(filePath string, limit int64) (*walScanR
 	// Detect the file-level header and start parsing records after it. ITER4 is a
 	// clean break: only v4 files are accepted; a non-v4 or headerless (pre-v4)
 	// file returns ErrUnsupportedWALVersion rather than being silently mis-parsed.
-	dataStart, err := walFileDataStart(file)
+	// walRecoveryDataStart additionally accepts an all-zero header block as an
+	// empty file (R-TAIL-HOLE).
+	dataStart, err := walRecoveryDataStart(file)
 	if err != nil {
 		return nil, err
 	}
@@ -2215,15 +2267,22 @@ func (qw *QueueWAL) scanWALFileDetailed(filePath string, limit int64) (*walScanR
 		if walBlankRecordHeader(crc, dataLen) {
 			// A zero region starting exactly on a record boundary. See
 			// walBlankRecordHeader: the write path cannot produce this.
-			if walNothingIntelligibleFollows(file, recStart, fileSize) {
+			//
+			// R-TAIL-HOLE: classify the region after the defect.
+			switch class, _ := classifyWALDefect(file, recStart, fileSize, newest); class {
+			case walDefectTornTail:
 				res.faults = append(res.faults, interfaces.BenignFault("wal-scan", filePath,
 					fmt.Sprintf("zero-filled tail from byte offset %d to end of file (%d bytes); those blocks never reached the platter, so nothing in them was ever fsynced or confirmed", recStart, fileSize-recStart)))
-				break
+			case walDefectUnconfirmedTail:
+				res.faults = append(res.faults, interfaces.BenignFault("wal-scan", filePath,
+					fmt.Sprintf("a zero-filled region begins at byte offset %d and is followed by data WITHIN the bounded unconfirmed window on one of the two newest WAL files (%d bytes to end of file); everything from the defect on is above the durable end, so no barrier ever covered it — replay stops at the defect and the file is truncated there", recStart, fileSize-recStart)))
+			default:
+				return nil, interfaces.FatalFault("wal-scan", filePath,
+					fmt.Sprintf("a zero-filled region begins at byte offset %d and is FOLLOWED BY DATA past the bounded unconfirmed window before end of file (%d bytes); this file cannot be interpreted", recStart, fileSize),
+					"every durable message in this WAL file is abandoned, including any that follow the zero-filled region and are themselves intact; every OTHER WAL file in the directory is still recovered",
+					nil)
 			}
-			return nil, interfaces.FatalFault("wal-scan", filePath,
-				fmt.Sprintf("a zero-filled region begins at byte offset %d and is FOLLOWED BY MORE DATA before end of file (%d bytes); this file cannot be interpreted", recStart, fileSize),
-				"every durable message in this WAL file is abandoned, including any that follow the zero-filled region and are themselves intact; every OTHER WAL file in the directory is still recovered",
-				nil)
+			break
 		}
 
 		data := make([]byte, dataLen)
@@ -2245,21 +2304,26 @@ func (qw *QueueWAL) scanWALFileDetailed(filePath string, limit int64) (*walScanR
 			h.Write(hdr[4:8])
 			h.Write(data)
 			if crc != h.Sum32() {
-				if !walNothingIntelligibleFollows(file, recStart, fileSize) {
+				// R-TAIL-HOLE: classify the region from the defect.
+				switch class, _ := classifyWALDefect(file, curRecStart, fileSize, newest); class {
+				case walDefectTornTail:
+					// TAIL. Drop this record only and stop; nothing
+					// intelligible follows it (Ra's is_last_record/3).
+					res.faults = append(res.faults, interfaces.BenignFault("wal-scan", filePath,
+						fmt.Sprintf("the last intelligible record in this file (byte offset %d) failed its CRC32 check and nothing but zeros follows it — a torn write; it was never fsynced, so no publisher was confirmed for it", curRecStart)))
+				case walDefectUnconfirmedTail:
+					res.faults = append(res.faults, interfaces.BenignFault("wal-scan", filePath,
+						fmt.Sprintf("the record at byte offset %d failed its CRC32 check on one of the two newest WAL files and real data within the bounded unconfirmed window follows it (%d bytes to end of file); everything from the defect on is above the durable end, so no barrier ever covered it — replay stops at the defect and the file is truncated there", curRecStart, fileSize-curRecStart)))
+				default:
 					// INTERIOR. Silently skipping it (what this line used to do,
 					// with no count and no log) drops a confirmed durable
 					// message and reports the boot successful.
 					return nil, interfaces.FatalFault("wal-scan", filePath,
 						fmt.Sprintf("the record at byte offset %d failed its CRC32 check and is NOT the last record in the file — real data follows it (%d of %d bytes); this file cannot be interpreted",
-							curRecStart, fileSize-recStart, fileSize),
+							curRecStart, fileSize-curRecStart, fileSize),
 						"every durable message in this WAL file is abandoned, including any that follow the damaged record and are themselves intact; every OTHER WAL file in the directory is still recovered",
 						nil)
-					// unreachable
 				}
-				// TAIL. Drop this record only and stop; nothing intelligible
-				// follows it (Ra's is_last_record/3).
-				res.faults = append(res.faults, interfaces.BenignFault("wal-scan", filePath,
-					fmt.Sprintf("the last intelligible record in this file (byte offset %d) failed its CRC32 check and nothing but zeros follows it — a torn write; it was never fsynced, so no publisher was confirmed for it", curRecStart)))
 				break
 			}
 		}
@@ -4373,6 +4437,43 @@ func walFileDataStart(f *os.File) (dataStart int64, err error) {
 		return 0, fmt.Errorf("%w: got %d, want %d", ErrUnsupportedWALVersion, v, WALFormatVersion)
 	}
 	return int64(WALHeaderSize), nil
+}
+
+// walRecoveryDataStart is walFileDataStart for the RECOVERY walks
+// (scanWALFileDetailed, indexWALFile). It differs in exactly one case: an
+// ALL-ZERO header block is accepted as an empty file (data start 0) instead of
+// ErrUnsupportedWALVersion.
+//
+// WHY (R-TAIL-HOLE): a crash can persist the preallocated i_size WITHOUT the
+// file header (the header is made durable by the first batch's fdatasync, which
+// may never have run). Such a file is all zeros; the record loop then reads a
+// blank header at offset 0 and classifies the (empty) tail as benign — the same
+// rule that already handles a zero-filled file. A FOREIGN header (non-zero
+// bytes) is still ErrUnsupportedWALVersion, exactly as walFileDataStart returns
+// it.
+func walRecoveryDataStart(f *os.File) (dataStart int64, err error) {
+	hdr := make([]byte, WALHeaderSize)
+	n, rerr := f.ReadAt(hdr, 0)
+	if n < WALHeaderSize {
+		if rerr != nil && rerr != io.EOF {
+			return 0, rerr
+		}
+		return 0, nil
+	}
+	if string(hdr[:len(WALMagic)]) == WALMagic {
+		if v := hdr[len(WALMagic)]; v != WALVersion4 {
+			return 0, fmt.Errorf("%w: got %d, want %d", ErrUnsupportedWALVersion, v, WALFormatVersion)
+		}
+		return int64(WALHeaderSize), nil
+	}
+	for _, b := range hdr {
+		if b != 0 {
+			return 0, fmt.Errorf("%w: missing SQWAL magic (pre-v4 headerless file)", ErrUnsupportedWALVersion)
+		}
+	}
+	// All-zero header block: treat the file as starting at 0 and let the
+	// record walk classify the (empty or bounded) region.
+	return 0, nil
 }
 
 // cleanupLoop runs the two maintenance passes on their own cadences.

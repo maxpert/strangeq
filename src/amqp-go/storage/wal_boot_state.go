@@ -107,7 +107,8 @@ func parseWALFileNum(name string) (uint64, bool) {
 // shares scanWALFile's transaction rule: message records become live only when
 // a matching Commit is present. Discarded uncommitted records and a torn tail
 // are dead bytes, never live records.
-func indexWALFile(fileNum uint64, path string) (inv *segmentInventory, hasSharedBody bool, err error) {
+func indexWALFile(fileNum uint64, path string, newest bool) (inv *segmentInventory, hasSharedBody bool, durableEnd int64, truncateAt int64, err error) {
+	truncateAt = -1
 	inv = newSegmentInventory(0)
 	defer func() {
 		if err != nil {
@@ -116,26 +117,29 @@ func indexWALFile(fileNum uint64, path string) (inv *segmentInventory, hasShared
 	}()
 	file, err := os.Open(path)
 	if err != nil {
-		return inv, false, err
+		return inv, false, 0, -1, err
 	}
 	defer file.Close()
 	stat, err := file.Stat()
 	if err != nil {
-		return inv, false, err
+		return inv, false, 0, -1, err
 	}
 	fileSize := stat.Size()
 
-	dataStart, err := walFileDataStart(file)
+	dataStart, err := walRecoveryDataStart(file)
 	if err != nil {
-		return inv, false, err
+		return inv, false, 0, -1, err
 	}
-	inv.durableBytes.Store(fileSize)
+	// durableBytes is the file's DURABLE size: the end of the last valid
+	// record, not i_size (a crash can leave i_size above the last record).
+	// It is finalised at the end of the walk.
+	inv.durableBytes.Store(dataStart)
 	if _, err := file.Seek(dataStart, io.SeekStart); err != nil {
-		return inv, false, err
+		return inv, false, 0, -1, err
 	}
 
 	recStart := dataStart
-	durableEnd := dataStart
+	durableEnd = dataStart
 	hdr := make([]byte, 8)
 	inTx := false
 	var txEpoch uint64
@@ -182,13 +186,24 @@ func indexWALFile(fileNum uint64, path string) (inv *segmentInventory, hasShared
 		recordBytes := int64(8) + int64(dataLen)
 
 		if walBlankRecordHeader(crc, dataLen) {
-			if walNothingIntelligibleFollows(file, recStart, -1) {
-				break
+			// R-TAIL-HOLE: benign only when the region is all zero, or bounded
+			// and on one of the two newest files.
+			switch class, _ := classifyWALDefect(file, recStart, fileSize, newest); class {
+			case walDefectTornTail:
+				// durableEnd already points at the defect (the end of the last
+				// valid record); break so the tail is left as dead bytes. A
+				// pure zero tail is NOT truncated (the existing benign shape).
+			case walDefectUnconfirmedTail:
+				// A bounded non-zero suffix on a newest file: benign, and boot
+				// durably truncates the file at the defect (R-TAIL-HOLE).
+				truncateAt = recStart
+			default:
+				return inv, false, 0, -1, interfaces.FatalFault("wal-open", path,
+					fmt.Sprintf("a zero-filled region begins at byte offset %d and is FOLLOWED BY DATA past the bounded unconfirmed window before end of file; this file cannot be interpreted", recStart),
+					"every durable message in this WAL file is abandoned, including any that follow the zero-filled region and are themselves intact; the file is left on disk untouched, and every OTHER WAL file in the directory is still recovered",
+					nil)
 			}
-			return inv, false, interfaces.FatalFault("wal-open", path,
-				fmt.Sprintf("a zero-filled region begins at byte offset %d and is FOLLOWED BY MORE DATA before end of file; this file cannot be interpreted", recStart),
-				"every durable message in this WAL file is abandoned; the file is left on disk untouched, and every OTHER WAL file in the directory is still recovered",
-				nil)
+			break
 		}
 
 		data := make([]byte, dataLen)
@@ -204,14 +219,21 @@ func indexWALFile(fileNum uint64, path string) (inv *segmentInventory, hasShared
 			h.Write(hdr[4:8])
 			h.Write(data)
 			if crc != h.Sum32() {
-				if walNothingIntelligibleFollows(file, recStart, -1) {
+				// R-TAIL-HOLE: the bad record is dead either way; only its
+				// classification differs.
+				switch class, _ := classifyWALDefect(file, curRecStart, fileSize, newest); class {
+				case walDefectTornTail:
 					recStart = curRecStart // the whole bad tail record is dead
-					break
+				case walDefectUnconfirmedTail:
+					recStart = curRecStart
+					truncateAt = curRecStart
+				default:
+					return inv, false, 0, -1, interfaces.FatalFault("wal-open", path,
+						fmt.Sprintf("the record at byte offset %d failed its CRC32 check and is NOT the last record in the file — real data follows it past the bounded unconfirmed window; this file cannot be interpreted", curRecStart),
+						"every durable message in this WAL file is abandoned, including any that follow the damaged record and are themselves intact; every OTHER WAL file in the directory is still recovered",
+						nil)
 				}
-				return inv, false, interfaces.FatalFault("wal-open", path,
-					fmt.Sprintf("the record at byte offset %d failed its CRC32 check and is NOT the last record in the file — real data follows it; this file cannot be interpreted", curRecStart),
-					"every durable message in this WAL file is abandoned, including any that follow the damaged record and are themselves intact; every OTHER WAL file in the directory is still recovered",
-					nil)
+				break
 			}
 		}
 
@@ -334,7 +356,11 @@ func indexWALFile(fileNum uint64, path string) (inv *segmentInventory, hasShared
 		}
 	}
 	inv.deadBytes.Add(fileSize - durableEnd)
-	return inv, hasSharedBody, nil
+	// I3-consistent durability: the DURABLE size is the end of the last valid
+	// record (never the preallocated i_size), and deadBytes above already
+	// accounts for the zero/unconfirmed tail.
+	inv.durableBytes.Store(durableEnd)
+	return inv, hasSharedBody, durableEnd, truncateAt, nil
 }
 
 // walPayloadLayout describes the structural prefix of a v4 message payload
@@ -557,6 +583,32 @@ func (qw *QueueWAL) rebuildBootState() error {
 		qw.fileNum.Store(maxNum)
 	}
 
+	// The two newest file numbers. R-TAIL-HOLE treats a bounded non-zero
+	// suffix after the first defect as a benign unconfirmed tail only on
+	// these files: a trailing roll can leave unconfirmed bytes on both N and
+	// N+1, while a defect on an older file is real interior corruption.
+	var firstNewest, secondNewest uint64
+	for _, f := range files {
+		switch {
+		case f.num > firstNewest:
+			secondNewest = firstNewest
+			firstNewest = f.num
+		case f.num > secondNewest:
+			secondNewest = f.num
+		}
+	}
+	isTwoNewest := func(n uint64) bool {
+		return n == firstNewest || (secondNewest != 0 && n == secondNewest)
+	}
+
+	// Deferred R-TAIL-HOLE truncations (path, offset), applied only once the
+	// boot is known to proceed — see the append site.
+	type pendingTruncation struct {
+		path string
+		at   int64
+	}
+	var truncations []pendingTruncation
+
 	var faults []*interfaces.RecoveryFault
 	for _, f := range files {
 		// durableSize -1 marks an inherited file: its whole content is
@@ -568,7 +620,7 @@ func (qw *QueueWAL) rebuildBootState() error {
 			info.createdAt = st.ModTime()
 		}
 
-		inv, hasSharedBody, ierr := indexWALFile(f.num, f.path)
+		inv, hasSharedBody, _, truncateAt, ierr := indexWALFile(f.num, f.path, isTwoNewest(f.num))
 		info.inv = inv
 		if ierr != nil {
 			// Unreadable/foreign/unsupported-version file: keep it, but with no
@@ -578,6 +630,18 @@ func (qw *QueueWAL) rebuildBootState() error {
 			continue
 		}
 		info.hasSharedBody = hasSharedBody
+
+		// R-TAIL-HOLE: a newest file whose first defect is a BOUNDED
+		// UNCONFIRMED TAIL is durably truncated at that defect so a later boot
+		// never sees the shape again. A pure zero tail (walDefectTornTail) is
+		// left as-is — the pre-existing benign shape, not a truncation target.
+		// The truncation is DEFERRED until after the boot-gating check below:
+		// a refused boot must not mutate the data directory (the operator is
+		// about to inspect it). Only durable mode truncates: SyncDisabled keeps
+		// the byte-identical nofsync lifecycle.
+		if truncateAt >= 0 && !qw.cfg.SyncDisabled {
+			truncations = append(truncations, pendingTruncation{path: f.path, at: truncateAt})
+		}
 
 		offsets := roaring64.New()
 		for _, rec := range inv.records {
@@ -596,6 +660,20 @@ func (qw *QueueWAL) rebuildBootState() error {
 	}
 	if len(gating) > 0 && !qw.cfg.UnsafeRecovery {
 		return errors.New(interfaces.RecoveryRefusalMessage("WAL recovery", gating))
+	}
+
+	// R-TAIL-HOLE: now that the boot is known to proceed, durably truncate
+	// each newest file at its first bounded unconfirmed-tail defect — BEFORE
+	// openNextFile (called by createSharedWAL after this returns), so a later
+	// boot never sees the shape again. Best-effort: a failure is logged, not
+	// fatal — the file is left intact and the next boot reclassifies it.
+	for _, tr := range truncations {
+		if terr := walTruncateTailDurable(tr.path, tr.at); terr != nil {
+			qw.logWarn("could not durably truncate a WAL file at its first defect; the file is left intact and the next boot reclassifies it",
+				interfaces.LogField{Key: "path", Value: tr.path},
+				interfaces.LogField{Key: "truncateAt", Value: tr.at},
+				interfaces.LogField{Key: "error", Value: terr.Error()})
+		}
 	}
 	return nil
 }

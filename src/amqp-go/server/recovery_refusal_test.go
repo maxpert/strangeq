@@ -3,6 +3,7 @@ package server
 import (
 	"encoding/binary"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sort"
@@ -398,24 +399,47 @@ func TestRecovery_LegacyOrdinalZeroRecordStillRefuses(t *testing.T) {
 // It is a third, deliberately independent implementation of the walk (the
 // storage package has its own test walker): a test that asked the code under
 // test how much its own quarantine cost could not detect that code being wrong.
+//
+// A BLANK RECORD HEADER (CRC == 0 AND length == 0) ENDS THE DATA, it is not a
+// run of zero-length records. This is the production rule
+// (storage.walBlankRecordHeader, canon rule 12) and it is load-bearing here: a
+// still-open WAL file can carry a sparse zero tail, so a whole-file read walks
+// the entire zero tail counting it as millions of records. Before this stop the
+// seeding loop below read a live file's zero tail, concluded the just-created
+// last file already held enough records, and broke BEFORE writing any record
+// into it — leaving an empty file that the post-Close premise rejected.
 func walRecordCount(t *testing.T, path string) int {
 	t.Helper()
-	raw, err := os.ReadFile(path)
+	f, err := os.Open(path)
 	if err != nil {
-		t.Fatalf("read %s: %v", path, err)
+		t.Fatalf("open %s: %v", path, err)
 	}
+	defer f.Close()
+
 	hdrLen := len(storage.WALMagic) + 1
-	if len(raw) < hdrLen || string(raw[:len(storage.WALMagic)]) != storage.WALMagic {
+	hdr := make([]byte, hdrLen)
+	if _, err := io.ReadFull(f, hdr); err != nil {
 		return 0
 	}
+	if string(hdr[:len(storage.WALMagic)]) != storage.WALMagic {
+		return 0
+	}
+
 	n := 0
-	for pos := hdrLen; pos+8 <= len(raw); {
-		dataLen := int(binary.BigEndian.Uint32(raw[pos+4 : pos+8]))
-		if pos+8+dataLen > len(raw) {
+	rec := make([]byte, 8)
+	for {
+		if _, err := io.ReadFull(f, rec); err != nil {
+			break
+		}
+		crc := binary.BigEndian.Uint32(rec[0:4])
+		dataLen := int(binary.BigEndian.Uint32(rec[4:8]))
+		if crc == 0 && dataLen == 0 {
+			break // blank header: end of data (sparse zero tail)
+		}
+		if _, err := f.Seek(int64(dataLen), io.SeekCurrent); err != nil {
 			break
 		}
 		n++
-		pos += 8 + dataLen
 	}
 	return n
 }

@@ -120,7 +120,9 @@ func (s *Server) calculateDataDirSize(dataDir string) int64 {
 			return nil // Skip files with errors
 		}
 		if !info.IsDir() {
-			totalSize += info.Size()
+			// ALLOCATED bytes, not apparent: the WAL is sparse, so info.Size()
+			// over-reports it (see allocatedFileSize).
+			totalSize += allocatedFileSize(info)
 		}
 		return nil
 	})
@@ -155,7 +157,10 @@ func (s *Server) updateWALMetrics() {
 		if filepath.Ext(entry.Name()) == ".wal" {
 			info, err := entry.Info()
 			if err == nil {
-				totalSize += info.Size()
+				// ALLOCATED bytes: a sparse WAL file's apparent size is larger
+				// than what it stores, so info.Size() would over-report wal_size
+				// (see allocatedFileSize).
+				totalSize += allocatedFileSize(info)
 			}
 		}
 	}
