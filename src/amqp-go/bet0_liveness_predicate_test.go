@@ -67,7 +67,7 @@ import (
 //
 //	metric            worst healthy   starved   margin at the 0.50 floor
 //	ratio-balance          0.5152      0.0000       1.03x  — a coin flip
-//	consumed-balance       0.8577      0.0000       1.72x
+//	consumed-balance       0.746       0.0000       1.49x
 //
 // Consumed counts measure the invariant the test actually states: a queue's
 // delivery liveness must not depend on whether OTHER, unrelated queues are
@@ -196,11 +196,11 @@ const (
 	// GOMAXPROCS=4 under -race), against the case gate §11 requires us to
 	// catch:
 	//
-	//	worst healthy observation (consumed-balance) .. 0.8577
+	//	worst healthy observation (consumed-balance) .. 0.746
 	//	partial starvation, 0.35 beside 0.90 .......... 0.389
 	//	broken tree (8a65f98), durable and mixed ...... 0.0000
 	//
-	// 0.50 sits 1.29x above the regression it must catch and 1.72x below the
+	// 0.50 sits 1.29x above the regression it must catch and 1.49x below the
 	// worst healthy sample. On the ratio metric the healthy side would be
 	// 1.03x — see the header for why the metric, not the constant, is what
 	// bought that margin.
@@ -208,6 +208,21 @@ const (
 	// ⛔ If this flakes, DO NOT LOWER IT. Lowering B below ~0.39 retires the
 	// partial-starvation catch, which is the entire purpose of this term.
 	// Investigate why balance degraded instead.
+	//
+	// The `0.746` is the worst **recorded** healthy row, `CI 116/transient`
+	// `{q1 60310/8675, q2 41183/6469}` at :569 (`6469/8675 = 0.7457`); the older
+	// `0.8577 / 1.72×` was inconsistent with this file's own table. The observed
+	// `0.4895` sits 34 % below the worst recorded healthy balance, not 43 %.
+	//
+	// Regime note (lead, 2026-11-06): 30/30 fast-box `-race` runs of
+	// `…/durable` passed with balance `0.9683–0.9998` and consumed/published ratio
+	// `≈0.72`, versus `0.08` in the one recorded CI failure. On a fast box the
+	// consumers keep up and the test does not reach the deep-backlog,
+	// consumer-bottlenecked state it was written to measure. This is a **power**
+	// limitation, not a flakiness source: the assertion is unchanged and the
+	// runtime premise check (`bet0PremiseNotice`, `:357-375`) still fires at the
+	// `0.80` ceiling if that changes. See the spec §6 for why the plan does not
+	// force the regime.
 	bet0MinQueueBalance = 0.50
 
 	// bet0MinPublishedForHealth is the PUBLISH-HEALTH floor, and it is a hard
