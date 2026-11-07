@@ -1,6 +1,11 @@
 package server
 
 import (
+	"errors"
+	"fmt"
+	"runtime"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -9,7 +14,22 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// getVisible does a manual-ack basic.Get and waits for a delivery to appear.
+// wsbGetFunc is the basic.Get call shape the visibility poll needs.
+type wsbGetFunc func(queue string, autoAck bool) (amqp.Delivery, bool, error)
+
+// wsbGetT is the minimal *testing.T surface the getter seam needs. It exists so
+// the persistent-error control can drive the failure path with a recorder
+// instead of failing the real test: a fake *testing.T cannot be constructed
+// (it has unexported methods), so the seam cannot take *testing.T literally and
+// still be exercised on both outcomes. *testing.T satisfies this interface, so
+// every production caller is unchanged.
+type wsbGetT interface {
+	Helper()
+	Errorf(format string, args ...interface{})
+	FailNow()
+}
+
+// getVisibleWith polls get until a delivery appears.
 //
 // A fire-and-forget publish on ANOTHER connection is NOT ordered with this
 // connection's frames: AMQP orders only a channel's own frames (a publish is
@@ -17,14 +37,19 @@ import (
 // opened connection may legitimately race the enqueue. This waits for the
 // message the same way this suite's later assertions already do, instead of
 // hard-asserting on the first Get.
-func getVisible(t *testing.T, ch *amqp.Channel, queue string) amqp.Delivery {
+//
+// R2: a successful poll clears any earlier transient Get error. Without this,
+// one blip leaves gerr set and require.NoError fails on a poll that DID see the
+// message — the error is stale state, not a signal. A persistent error never
+// satisfies the condition, so it still times out and still fails.
+func getVisibleWith(t wsbGetT, get wsbGetFunc, queue string) amqp.Delivery {
 	t.Helper()
 	var (
 		got  amqp.Delivery
 		gerr error
 	)
 	require.Eventually(t, func() bool {
-		d, ok, err := ch.Get(queue, false)
+		d, ok, err := get(queue, false)
 		if err != nil {
 			gerr = err
 			return false
@@ -32,11 +57,77 @@ func getVisible(t *testing.T, ch *amqp.Channel, queue string) amqp.Delivery {
 		if !ok {
 			return false
 		}
-		got = d
+		got, gerr = d, nil // a later success clears an earlier transient error
 		return true
 	}, 2*time.Second, 20*time.Millisecond, "message must become visible on %q", queue)
 	require.NoError(t, gerr)
 	return got
+}
+
+// getVisible is getVisibleWith bound to a real channel.
+func getVisible(t *testing.T, ch *amqp.Channel, queue string) amqp.Delivery {
+	t.Helper()
+	return getVisibleWith(t, ch.Get, queue)
+}
+
+// wsbFailRecorder implements wsbGetT without touching a real *testing.T, so a
+// test can assert that the seam FAILS on a persistent error. FailNow mirrors
+// the real method by exiting the calling goroutine; the control runs the seam
+// on its own goroutine so that Goexit cannot abort the test itself.
+type wsbFailRecorder struct {
+	failed atomic.Bool
+	mu     sync.Mutex
+	msgs   []string
+}
+
+func (r *wsbFailRecorder) Helper() {}
+
+func (r *wsbFailRecorder) Errorf(format string, args ...interface{}) {
+	r.mu.Lock()
+	r.msgs = append(r.msgs, fmt.Sprintf(format, args...))
+	r.mu.Unlock()
+}
+
+func (r *wsbFailRecorder) FailNow() {
+	r.failed.Store(true)
+	runtime.Goexit()
+}
+
+// TestWsbGetVisibleClearsTransientError: one transient Get error followed by a
+// success must not leave gerr set. Red before the `gerr = nil` fix (the
+// successful poll still reported the stale error); green after.
+func TestWsbGetVisibleClearsTransientError(t *testing.T) {
+	var calls atomic.Int64
+	delivery := getVisibleWith(t, func(queue string, autoAck bool) (amqp.Delivery, bool, error) {
+		if calls.Add(1) == 1 {
+			return amqp.Delivery{}, false, errors.New("transient get failure")
+		}
+		return amqp.Delivery{Body: []byte("ok")}, true, nil
+	}, "transient-q")
+	require.Equal(t, "ok", string(delivery.Body), "the successful poll's delivery must be returned")
+	require.GreaterOrEqual(t, calls.Load(), int64(2), "the poll must have retried after the transient error")
+}
+
+// TestWsbGetVisibleStillFailsOnPersistentError is the counterexample control:
+// when Get never succeeds, the poll times out and the seam fails. It runs on
+// its own goroutine because the recorder's FailNow exits the caller, exactly as
+// a real *testing.T.FailNow would.
+func TestWsbGetVisibleStillFailsOnPersistentError(t *testing.T) {
+	rec := &wsbFailRecorder{}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_ = getVisibleWith(rec, func(queue string, autoAck bool) (amqp.Delivery, bool, error) {
+			return amqp.Delivery{}, false, errors.New("persistent get failure")
+		}, "never")
+	}()
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("seam did not return after its poll timed out")
+	}
+	require.True(t, rec.failed.Load(),
+		"a persistent Get error must still fail the poll, got messages %v", rec.msgs)
 }
 
 // TestWSB_GetRequeueScopedToClosingConnection: connection close must requeue

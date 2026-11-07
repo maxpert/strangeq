@@ -103,7 +103,10 @@ func wsbRoundTrip(t *testing.T, conn *amqp.Connection, queue, body string) {
 	assert.Equal(t, body, string(msg.Body))
 }
 
-// wsbGetVisible does a manual-ack basic.Get and waits for a delivery to appear.
+// wsbGetVisibleFunc is the basic.Get call shape the visibility poll needs.
+type wsbGetVisibleFunc func(queue string, autoAck bool) (amqp.Delivery, bool, error)
+
+// wsbGetVisibleWith polls get until a delivery appears.
 //
 // A fire-and-forget publish on ANOTHER connection is NOT ordered with this
 // connection's frames: AMQP orders only a channel's own frames (a publish is
@@ -111,14 +114,18 @@ func wsbRoundTrip(t *testing.T, conn *amqp.Connection, queue, body string) {
 // opened connection may legitimately race the enqueue. This waits for the
 // message the same way this suite's later assertions already do, instead of
 // hard-asserting on the first Get.
-func wsbGetVisible(t *testing.T, ch *amqp.Channel, queue string) amqp.Delivery {
+//
+// R2: a successful poll clears any earlier transient Get error, so one blip
+// cannot fail require.NoError on a poll that did see the message. A persistent
+// error never satisfies the condition and still times out.
+func wsbGetVisibleWith(t *testing.T, get wsbGetVisibleFunc, queue string) amqp.Delivery {
 	t.Helper()
 	var (
 		got  amqp.Delivery
 		gerr error
 	)
 	require.Eventually(t, func() bool {
-		d, ok, err := ch.Get(queue, false)
+		d, ok, err := get(queue, false)
 		if err != nil {
 			gerr = err
 			return false
@@ -126,11 +133,17 @@ func wsbGetVisible(t *testing.T, ch *amqp.Channel, queue string) amqp.Delivery {
 		if !ok {
 			return false
 		}
-		got = d
+		got, gerr = d, nil // a later success clears an earlier transient error
 		return true
 	}, 2*time.Second, 20*time.Millisecond, "message must become visible on %q", queue)
 	require.NoError(t, gerr)
 	return got
+}
+
+// wsbGetVisible is wsbGetVisibleWith bound to a real channel.
+func wsbGetVisible(t *testing.T, ch *amqp.Channel, queue string) amqp.Delivery {
+	t.Helper()
+	return wsbGetVisibleWith(t, ch.Get, queue)
 }
 
 // TestChannelIsolationWSB: a 404 channel error closes only the channel.
