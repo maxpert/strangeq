@@ -127,7 +127,7 @@ func startTLSTestServer(t *testing.T, port string, certFile, keyFile, caFile str
 	waitForListening(t, srv)
 
 	t.Cleanup(func() {
-		srv.Stop()
+		testShutdownServer(t, srv)
 	})
 
 	return srv

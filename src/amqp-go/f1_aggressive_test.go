@@ -44,7 +44,7 @@ func f1AggServer(t *testing.T, fsync bool, ringSize int, walChanBuf int) (string
 		t.Fatalf("Build failed: %v", err)
 	}
 	waitForListening(t, srv)
-	return fmt.Sprintf("amqp://guest:guest@%s/", addr), func() { _ = srv.Stop() }
+	return fmt.Sprintf("amqp://guest:guest@%s/", addr), func() { testShutdownServer(t, srv) }
 }
 
 func f1AggDump(t *testing.T, label string) {

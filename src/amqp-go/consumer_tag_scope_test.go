@@ -61,7 +61,7 @@ func ctagServer(t *testing.T) (string, func()) {
 		t.Fatalf("Build failed: %v", err)
 	}
 	waitForListening(t, srv)
-	return fmt.Sprintf("amqp://guest:guest@%s/", addr), func() { _ = srv.Stop() }
+	return fmt.Sprintf("amqp://guest:guest@%s/", addr), func() { testShutdownServer(t, srv) }
 }
 
 // TestConsumerTagScope_DuplicateOnSameChannelIsConnectionException530 pins the

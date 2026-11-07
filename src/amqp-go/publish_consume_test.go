@@ -429,6 +429,7 @@ func stageBServer(t *testing.T, dir string) (*server.Server, string) {
 	srv, err := server.NewServerBuilder().WithConfig(cfg).Build()
 	require.NoError(t, err, "server build")
 	waitForListening(t, srv)
+	t.Cleanup(func() { testShutdownServer(t, srv) })
 	return srv, fmt.Sprintf("amqp://guest:guest@%s/", addr)
 }
 
@@ -572,7 +573,7 @@ func TestStageB_DurableRecoveryBitIdentity(t *testing.T) {
 	}()
 
 	// Restart onto the same dir: recovery must reload the durable messages.
-	require.NoError(t, srv1.Stop())
+	testShutdownServer(t, srv1)
 	_, uri2 := stageBServer(t, dir)
 
 	conn2, err := amqp.Dial(uri2)

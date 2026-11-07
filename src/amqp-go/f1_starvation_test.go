@@ -50,7 +50,7 @@ func f1Server(t *testing.T, fsync bool) (string, func()) {
 		t.Fatalf("Build failed: %v", err)
 	}
 	waitForListening(t, srv)
-	cleanup := func() { _ = srv.Stop() }
+	cleanup := func() { testShutdownServer(t, srv) }
 	return fmt.Sprintf("amqp://guest:guest@%s/", addr), cleanup
 }
 

@@ -115,14 +115,6 @@ func TestAuthenticationPLAIN(t *testing.T) {
 		}
 		t.Logf("Authentication correctly failed for unknown user: %v", err)
 	})
-
-	// Stop server
-	srv.Mutex.Lock()
-	srv.ShuttingDown = true
-	srv.Mutex.Unlock()
-	if srv.Listener != nil {
-		srv.Listener.Close()
-	}
 }
 
 // TestAuthenticationANONYMOUS tests ANONYMOUS mechanism authentication
@@ -179,14 +171,6 @@ func TestAuthenticationANONYMOUS(t *testing.T) {
 
 		t.Log("Successfully connected with anonymous authentication")
 	})
-
-	// Stop server
-	srv.Mutex.Lock()
-	srv.ShuttingDown = true
-	srv.Mutex.Unlock()
-	if srv.Listener != nil {
-		srv.Listener.Close()
-	}
 }
 
 // TestAuthenticationDisabled tests that auth can be disabled
@@ -220,14 +204,6 @@ func TestAuthenticationDisabled(t *testing.T) {
 
 		t.Log("Successfully connected with authentication disabled")
 	})
-
-	// Stop server
-	srv.Mutex.Lock()
-	srv.ShuttingDown = true
-	srv.Mutex.Unlock()
-	if srv.Listener != nil {
-		srv.Listener.Close()
-	}
 }
 
 // TestAuthenticationWithMessaging tests that authenticated connections can publish/consume

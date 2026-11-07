@@ -16,7 +16,7 @@ import (
 //     PRECONDITION_FAILED while the connection stays usable.
 func TestQueuePolicyIntegration(t *testing.T) {
 	srv := newIsolatedTestServer(t, isolatedTestConfig(t, ":5696"))
-	defer srv.Stop()
+	defer testShutdownServer(t, srv)
 	waitForListening(t, srv)
 
 	conn, err := amqp.Dial("amqp://guest:guest@localhost:5696//")

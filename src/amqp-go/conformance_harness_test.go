@@ -181,7 +181,7 @@ func (b *confBroker) restart() {
 	if b.target == "rabbitmq" {
 		return
 	}
-	require.NoError(b.t, b.srv.Stop(), "stop embedded server")
+	testShutdownServer(b.t, b.srv)
 	if c, ok := b.st.(interface{ Close() error }); ok {
 		require.NoError(b.t, c.Close(), "close storage before reopen")
 	}
@@ -195,7 +195,7 @@ func (b *confBroker) cleanup() {
 		return
 	}
 	if b.srv != nil {
-		_ = b.srv.Stop()
+		testShutdownServer(b.t, b.srv)
 	}
 	if c, ok := b.st.(interface{ Close() error }); ok {
 		_ = c.Close()

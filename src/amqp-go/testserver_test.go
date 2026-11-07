@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -12,6 +13,20 @@ import (
 	"github.com/maxpert/amqp-go/config"
 	"github.com/maxpert/amqp-go/server"
 )
+
+// testShutdownServer is the single bounded-teardown seam for root-package
+// embedded brokers. Shutdown is idempotent and safe to call after Stop().
+// On a forced join it legitimately returns context.DeadlineExceeded or
+// ErrShutdownIncomplete (server/shutdown.go:105-117,138-142); a teardown must
+// never turn that into a machine-speed test failure, so this LOGS, never fails.
+func testShutdownServer(t *testing.T, srv *server.Server) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := srv.Shutdown(ctx); err != nil {
+		t.Logf("teardown: Shutdown returned %v (listener closed; storage may remain open)", err)
+	}
+}
 
 // isolatedTestConfig returns a default config bound to addr whose storage
 // points at a per-test temporary directory.
@@ -44,6 +59,7 @@ func newIsolatedTestServer(t *testing.T, cfg *config.AMQPConfig) *server.Server 
 	if err != nil {
 		t.Fatalf("building test server at %s: %v", cfg.Network.Address, err)
 	}
+	t.Cleanup(func() { testShutdownServer(t, srv) })
 	return srv
 }
 

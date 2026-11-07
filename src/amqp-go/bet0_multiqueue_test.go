@@ -156,9 +156,10 @@ func bet0Server(t *testing.T, dir string) (*server.Server, string) {
 	waitForListening(t, srv)
 	// These tests drive hundreds of thousands of messages through an embedded
 	// broker. Leaving one running would let a finished (or failed) test's load
-	// bleed into the next one and distort it, so every server is stopped here.
-	// Stop is safe to call twice — the restart test stops srv itself first.
-	t.Cleanup(func() { _ = srv.Stop() })
+	// bleed into the next one and distort it, so every server is torn down here
+	// with a bounded Shutdown. Shutdown is idempotent and safe after a mid-test
+	// Shutdown — the restart tests close srv themselves first.
+	t.Cleanup(func() { testShutdownServer(t, srv) })
 	return srv, fmt.Sprintf("amqp://guest:guest@%s/", addr)
 }
 
@@ -911,7 +912,7 @@ func TestBet0_MultiQueueConfirmImpliesRecoverable(t *testing.T) {
 		}
 	}()
 
-	require.NoError(t, srv.Stop())
+	testShutdownServer(t, srv)
 	_, uri2 := bet0Server(t, dir)
 
 	conn2, err := amqp.Dial(uri2)
@@ -1164,7 +1165,7 @@ func TestBet0_SparseMultiQueueRecovery(t *testing.T) {
 		time.Sleep(1 * time.Second)
 	}()
 
-	require.NoError(t, srv.Stop())
+	testShutdownServer(t, srv)
 	_, uri2 := bet0Server(t, dir)
 
 	conn2, err := amqp.Dial(uri2)
@@ -1235,7 +1236,7 @@ func bet0ServerWithConfig(t *testing.T, dir string, tweak func(*config.AMQPConfi
 	srv, err := server.NewServerBuilder().WithConfig(cfg).Build()
 	require.NoError(t, err, "server build")
 	waitForListening(t, srv)
-	t.Cleanup(func() { _ = srv.Stop() })
+	t.Cleanup(func() { testShutdownServer(t, srv) })
 	return srv, fmt.Sprintf("amqp://guest:guest@%s/", addr)
 }
 
@@ -1404,7 +1405,7 @@ func TestBet0_CrossQueueAckIsolationAcrossCheckpoint(t *testing.T) {
 		time.Sleep(3 * time.Second)
 	}()
 
-	require.NoError(t, srv.Stop())
+	testShutdownServer(t, srv)
 	_, uri2 := bet0ServerWithConfig(t, dir, fastCheckpoint)
 
 	conn2, err := amqp.Dial(uri2)
@@ -1553,7 +1554,7 @@ func TestBet0_PublishAfterRestartDoesNotReuseSequences(t *testing.T) {
 		time.Sleep(1 * time.Second) // let the acks settle
 	}()
 
-	require.NoError(t, srv.Stop())
+	testShutdownServer(t, srv)
 	_, uri2 := bet0Server(t, dir)
 
 	// Phase 2: publish a fresh batch to each queue and require all of it back.
@@ -1750,7 +1751,7 @@ func TestBet0_ConcurrentDeclareSurvivesRestart(t *testing.T) {
 		time.Sleep(500 * time.Millisecond)
 	}()
 
-	require.NoError(t, srv.Stop())
+	testShutdownServer(t, srv)
 	_, uri2 := bet0ServerWithConfig(t, dir, nil)
 
 	// Phase 2: every queue must still work — recovered messages AND a new one.
@@ -1859,7 +1860,7 @@ func TestBet0_RestartWithBacklogThenPublish(t *testing.T) {
 		time.Sleep(500 * time.Millisecond)
 	}()
 
-	require.NoError(t, srv.Stop())
+	testShutdownServer(t, srv)
 	_, uri2 := bet0Server(t, dir)
 
 	// Phase 2: publish MORE to the same queue, on top of the recovered backlog.
@@ -2056,7 +2057,7 @@ func TestBet0_DeleteRedeclareDoesNotReuseIdentity(t *testing.T) {
 			}
 		}
 	}()
-	require.NoError(t, srv.Stop())
+	testShutdownServer(t, srv)
 	_, uri2 := bet0Server(t, dir)
 
 	conn2, err := amqp.Dial(uri2)
@@ -2204,12 +2205,12 @@ func TestBet0_OrdinalAllocatorHighWaterSurvivesRestart(t *testing.T) {
 		_, err = ch.QueueDelete(qA, false, false, false)
 		require.NoError(t, err, "delete %s", qA)
 	}()
-	require.NoError(t, srv1.Stop())
+	testShutdownServer(t, srv1)
 
 	// The allocator must come back knowing qA's retired ordinal is spent.
 	srv2, uri2 := bet0Server(t, dir)
 	publishConfirmed(t, uri2, qA, eraSecond, secondBatch)
-	require.NoError(t, srv2.Stop())
+	testShutdownServer(t, srv2)
 
 	srv3, uri3 := bet0Server(t, dir)
 	consumeExactly(t, uri3, qA, eraSecond, secondBatch)
@@ -2224,11 +2225,11 @@ func TestBet0_OrdinalAllocatorHighWaterSurvivesRestart(t *testing.T) {
 		_, err = ch.QueueDelete(qA, false, false, false)
 		require.NoError(t, err, "second delete of %s", qA)
 	}()
-	require.NoError(t, srv3.Stop())
+	testShutdownServer(t, srv3)
 
 	srv4, uri4 := bet0Server(t, dir)
 	publishConfirmed(t, uri4, qB, eraFresh, firstBatch)
-	require.NoError(t, srv4.Stop())
+	testShutdownServer(t, srv4)
 
 	_, uri5 := bet0Server(t, dir)
 	consumeExactly(t, uri5, qB, eraFresh, firstBatch)
@@ -2287,7 +2288,7 @@ func TestBet0_LegacyDirMessageOnlyForUnversionedRecords(t *testing.T) {
 			_, err = ch.QueueDelete(qName, false, false, false)
 			require.NoError(t, err)
 		}()
-		require.NoError(t, srv.Stop())
+		testShutdownServer(t, srv)
 
 		// Must start. A deleted queue's leftover records are not a legacy dir.
 		_, uri2, err := bet0TryServer(t, dir)
@@ -2331,7 +2332,7 @@ func TestBet0_LegacyDirMessageOnlyForUnversionedRecords(t *testing.T) {
 				}
 			}
 		}()
-		require.NoError(t, srv.Stop())
+		testShutdownServer(t, srv)
 
 		// Forge the pre-packing state: the queue's metadata record survives but
 		// carries no ordinal, while its durable records remain in the WAL. This
@@ -2385,7 +2386,7 @@ func bet0TryServer(t *testing.T, dir string) (*server.Server, string, error) {
 	go func() { startErrCh <- srv.Start() }()
 	for i := 0; i < brokerStartupPolls; i++ {
 		if srv.IsListening() {
-			t.Cleanup(func() { _ = srv.Stop() })
+			t.Cleanup(func() { testShutdownServer(t, srv) })
 			return srv, fmt.Sprintf("amqp://guest:guest@%s/", addr), nil
 		}
 		select {
@@ -2836,7 +2837,14 @@ func bet0PinnedServer(t *testing.T, dir string) (*server.Server, string, *c1Pinn
 	srv, err := server.NewServerBuilder().WithConfig(cfg).WithStorage(pinned).Build()
 	require.NoError(t, err, "server build")
 	waitForListening(t, srv)
-	t.Cleanup(func() { _ = srv.Stop() })
+	// WithStorage ⇒ ownsStorage=false, so Shutdown will NOT close raw; the test
+	// owns it and closes it after the broker has stopped its reapers.
+	t.Cleanup(func() {
+		testShutdownServer(t, srv)
+		if err := raw.Close(); err != nil {
+			t.Logf("injected storage close: %v", err)
+		}
+	})
 	return srv, fmt.Sprintf("amqp://guest:guest@%s/", addr), pinned
 }
 
@@ -2965,7 +2973,7 @@ func TestBet0_DeleteRacingDeclareCannotOrphanConfirmedMessages(t *testing.T) {
 	require.NoError(t, declConn.Close())
 
 	// Restart on the same data directory, with plain storage (no pin).
-	require.NoError(t, srv.Stop())
+	testShutdownServer(t, srv)
 	_, uri2 := bet0Server(t, dir)
 
 	if len(promised) == 0 {
@@ -3104,7 +3112,7 @@ func TestBet0_DeleteRacingPublishCannotOrphanConfirmedMessages(t *testing.T) {
 		acked, wasReturned, promised)
 
 	require.NoError(t, pubConn.Close())
-	require.NoError(t, srv.Stop())
+	testShutdownServer(t, srv)
 	_, uri2 := bet0Server(t, dir)
 
 	if !promised {
@@ -3244,7 +3252,7 @@ func TestBet0_DeleteRacingTxCommitCannotOrphanCommittedMessages(t *testing.T) {
 	t.Logf("after the racing delete: tx.commit err=%v — broker promised to store it=%v",
 		commitErr, promised)
 
-	require.NoError(t, srv.Stop())
+	testShutdownServer(t, srv)
 	_, uri2 := bet0Server(t, dir)
 
 	if !promised {
@@ -3318,7 +3326,7 @@ func bet0LogCapturingServer(t *testing.T, dir, logFile string) (*server.Server, 
 	go func() { startErrCh <- srv.Start() }()
 	for i := 0; i < brokerStartupPolls; i++ {
 		if srv.IsListening() {
-			t.Cleanup(func() { _ = srv.Stop() })
+			t.Cleanup(func() { testShutdownServer(t, srv) })
 			return srv, fmt.Sprintf("amqp://guest:guest@%s/", addr), nil
 		}
 		select {
@@ -3520,7 +3528,7 @@ func TestBet0_OrdinalAwareRecoveryCaseBAndMismatch(t *testing.T) {
 			require.NoError(t, err)
 			publish(t, ch2, liveEra, liveBatch)
 		}()
-		require.NoError(t, srv.Stop())
+		testShutdownServer(t, srv)
 
 		// Precondition: this really is a LATER incarnation. Ordinals are handed
 		// out monotonically and never reused, so an ordinal of at least 2 is
@@ -3665,7 +3673,7 @@ func TestBet0_OrdinalAwareRecoveryCaseBAndMismatch(t *testing.T) {
 				}
 			}
 		}()
-		require.NoError(t, srv.Stop())
+		testShutdownServer(t, srv)
 
 		// Forge the regression: the records on disk were minted under ordinal
 		// N, but the metadata record now claims N-1. Nothing legitimate can
@@ -3735,7 +3743,14 @@ func bet0PinnedLoggingServer(t *testing.T, dir, logFile string) (*server.Server,
 	srv, err := server.NewServerBuilder().WithConfig(cfg).WithStorage(pinned).Build()
 	require.NoError(t, err, "server build")
 	waitForListening(t, srv)
-	t.Cleanup(func() { _ = srv.Stop() })
+	// WithStorage ⇒ ownsStorage=false, so Shutdown will NOT close raw; the test
+	// owns it and closes it after the broker has stopped its reapers.
+	t.Cleanup(func() {
+		testShutdownServer(t, srv)
+		if err := raw.Close(); err != nil {
+			t.Logf("injected storage close: %v", err)
+		}
+	})
 	return srv, fmt.Sprintf("amqp://guest:guest@%s/", addr), pinned
 }
 
@@ -3930,7 +3945,7 @@ func TestBet0_DeleteRacingDeadLetterCannotOrphanTargetQueue(t *testing.T) {
 			"declare cannot recover from", acked, returned)
 
 	require.NoError(t, conn.Close())
-	require.NoError(t, srv.Stop())
+	testShutdownServer(t, srv)
 	_, uri2 := bet0Server(t, dir)
 
 	conn2, err := amqp.Dial(uri2)
@@ -4157,7 +4172,7 @@ func TestBet0_DeclareQueueTransientReadFailureDoesNotRebandLiveQueue(t *testing.
 	// precisely so they would not tear the connection down. This path is
 	// pre-existing and untouched by the Bet 0 diff.)
 	_ = conn.Close()
-	require.NoError(t, srv.Stop())
+	testShutdownServer(t, srv)
 	_, uri2 := bet0Server(t, dir)
 
 	conn2, err := amqp.Dial(uri2)

@@ -64,7 +64,7 @@ func sq18Server(t *testing.T) (string, func()) {
 		t.Fatalf("Build failed: %v", err)
 	}
 	waitForListening(t, srv)
-	return fmt.Sprintf("amqp://guest:guest@%s/", addr), func() { _ = srv.Stop() }
+	return fmt.Sprintf("amqp://guest:guest@%s/", addr), func() { testShutdownServer(t, srv) }
 }
 
 // sq18Collect pulls exactly want deliveries out of the two consumer channels.

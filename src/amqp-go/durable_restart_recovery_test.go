@@ -172,7 +172,7 @@ func (b *restartableBroker) stop() {
 	if b.srv == nil {
 		return
 	}
-	_ = b.srv.Stop()
+	testShutdownServer(b.t, b.srv)
 	b.srv = nil
 }
 

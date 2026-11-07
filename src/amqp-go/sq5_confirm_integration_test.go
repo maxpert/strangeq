@@ -41,7 +41,7 @@ func sq5Server(t *testing.T) string {
 		t.Fatalf("Build failed: %v", err)
 	}
 	waitForListening(t, srv)
-	t.Cleanup(func() { _ = srv.Stop() })
+	t.Cleanup(func() { testShutdownServer(t, srv) })
 	return fmt.Sprintf("amqp://guest:guest@%s/", addr)
 }
 

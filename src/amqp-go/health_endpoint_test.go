@@ -60,7 +60,7 @@ func TestHealth_503UntilReady(t *testing.T) {
 	assert.Contains(t, rec.Body.String(), "NOT READY:")
 
 	waitForListening(t, srv)
-	t.Cleanup(func() { _ = srv.Stop() })
+	t.Cleanup(func() { testShutdownServer(t, srv) })
 
 	rec = getHealth(t, h)
 	assert.Equal(t, http.StatusOK, rec.Code)
@@ -71,7 +71,7 @@ func TestHealth_503DuringShutdown(t *testing.T) {
 	cfg := isolatedTestConfig(t, "127.0.0.1:0")
 	srv := newIsolatedTestServer(t, cfg)
 	waitForListening(t, srv)
-	t.Cleanup(func() { _ = srv.Stop() })
+	t.Cleanup(func() { testShutdownServer(t, srv) })
 
 	h, shutting := healthHandler(srv)
 
@@ -86,7 +86,7 @@ func TestHealth_503DuringShutdown(t *testing.T) {
 
 	// Even with the flag cleared, a stopped listener must not report ready.
 	shutting.Store(false)
-	require.NoError(t, srv.Stop())
+	testShutdownServer(t, srv)
 	rec = getHealth(t, h)
 	assert.Equal(t, http.StatusServiceUnavailable, rec.Code)
 	assert.Contains(t, rec.Body.String(), "not bound")
