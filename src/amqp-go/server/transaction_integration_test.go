@@ -36,6 +36,15 @@ func newTransactionTestServer(t *testing.T) *Server {
 	executor := transaction.NewUnifiedBrokerExecutor(unifiedBroker)
 	tm.SetExecutor(executor)
 
+	// E8/C4: bare &Server{} ⇒ Shutdown closes neither broker nor storage. Close
+	// explicitly, broker FIRST then storage.
+	t.Cleanup(func() {
+		storageBroker.Close() // does NOT close storage
+		if err := storageImpl.Close(); err != nil {
+			t.Logf("test storage close: %v", err)
+		}
+	})
+
 	return &Server{
 		Addr:               ":0",
 		Connections:        make(map[string]*protocol.Connection),

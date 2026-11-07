@@ -108,6 +108,15 @@ func newAuthzTestServer(t *testing.T, authEnabled bool, authenticator interfaces
 		registry.Register(&auth.PlainMechanism{})
 		srv.MechanismRegistry = NewMechanismRegistryAdapter(registry)
 	}
+	// E8/C4: a bare &Server{} has ownsBroker=false, ownsStorage=false and
+	// storage==nil, so Shutdown closes neither. Close explicitly, broker FIRST
+	// (it stops the per-queue reapers), storage second.
+	t.Cleanup(func() {
+		storageBroker.Close() // does NOT close storage
+		if err := storageImpl.Close(); err != nil {
+			t.Logf("test storage close: %v", err)
+		}
+	})
 	return srv
 }
 
