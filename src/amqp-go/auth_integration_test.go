@@ -300,12 +300,4 @@ func TestAuthenticationWithMessaging(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("Timeout waiting for message")
 	}
-
-	// Stop server
-	srv.Mutex.Lock()
-	srv.ShuttingDown = true
-	srv.Mutex.Unlock()
-	if srv.Listener != nil {
-		srv.Listener.Close()
-	}
 }
