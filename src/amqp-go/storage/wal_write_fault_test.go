@@ -305,7 +305,9 @@ func TestWAL_TruncateFails_PoisonsAndRolls(t *testing.T) {
 			}
 			return walTruncateDefault(f, size, true)
 		})
+		t.Cleanup(truncRestore) // E6: restore the global hook even on an early return
 		writeRestore := installOneShotWriteHook(t, dir, 100)
+		t.Cleanup(writeRestore) // E6: restore the global hook even on an early return
 
 		err = wm.Write("q", walFaultMessage(2, walFaultBody), 2)
 		writeRestore()
@@ -361,7 +363,9 @@ func TestWAL_TruncateFails_PoisonsAndRolls(t *testing.T) {
 			}
 			return walTruncateDefault(f, size, true)
 		})
+		t.Cleanup(truncRestore) // E6: restore the global hook even on an early return
 		writeRestore := installOneShotWriteHook(t, dir, 100)
+		t.Cleanup(writeRestore) // E6: restore the global hook even on an early return
 
 		err = wm.Write("q", walFaultMessage(2, walFaultBody), 2)
 		writeRestore()
@@ -613,5 +617,21 @@ func TestWAL_OffsetInvariantHoldsUnderFaultMix(t *testing.T) {
 			}
 		}
 		t.Fatalf("seeded mix (source 42) diverged: missing=%v unexpected=%v", wantOnly, gotOnly)
+	}
+}
+
+// TestWAL_HookRestoredWhenTestReturnsEarly is the E6 proof: a require failure
+// (Goexit) between installing a process-global fault hook and restoring it must
+// not leak the hook into the rest of the package. t.Cleanup runs on the Goexit
+// path, so the parent sees the default hook again.
+func TestWAL_HookRestoredWhenTestReturnsEarly(t *testing.T) {
+	before := walTruncateHook.Load()
+	t.Run("installs and returns without restoring", func(t *testing.T) {
+		restore := SetWALTruncateForTest(func(f *os.File, size int64) error { return syscall.EIO })
+		t.Cleanup(restore)
+		// No inline restore: the registered cleanup must do it.
+	})
+	if got := walTruncateHook.Load(); got != before {
+		t.Fatalf("the WAL truncate hook leaked past an early-returning subtest: got %p, want %p", got, before)
 	}
 }

@@ -242,6 +242,7 @@ func TestWAL_Tx_DirSyncFailureAbortsTx(t *testing.T) {
 	beforeOffset := sw.fileOffset.Load()
 
 	restore := SetSyncDirForTest(func(string) error { return syscall.EIO })
+	t.Cleanup(restore) // E6: restore the global hook even on an early return
 	terr := wm.WriteTxAtomic([]*RecoveryMessage{txDirSyncRecord("fail-q", 1)})
 	restore()
 
