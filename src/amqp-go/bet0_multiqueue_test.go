@@ -2789,6 +2789,21 @@ func TestBet0_MultiQueueWithConfirmsDelivers(t *testing.T) {
 			"changed, both queues run healthily — so a failure here is specific to the "+
 			"confirm path, and it is the exact workload (durable + confirms + multiple "+
 			"queues) that multi-queue scaling exists to serve.%s", window, hint)
+
+	// E10 (R2): the balance verdict has been evaluated and reported first. Now
+	// surface any Ack error / consumer death the old ordering hid — and fail the
+	// run when balance passed, so a death cannot hide behind an imbalance.
+	if earlyAckErr != nil {
+		t.Fatal(earlyAckErr)
+	}
+	if n := bet0TotalClosed(closed); n > 0 {
+		t.Fatalf("consumer death during the measured window: %d delivery channel(s) closed;%s", n, hint)
+	}
+	select {
+	case err := <-ackErrors:
+		t.Fatal(err)
+	default:
+	}
 }
 
 // ----------------------------------------------------------------------------
