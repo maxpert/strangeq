@@ -507,8 +507,18 @@ func TestWALPipeline_ConfirmWithheldUntilCoveringFsync(t *testing.T) {
 // flight (stagedDuringFsync > 0) — the part that fails on the pre-pipeline
 // writer, where nothing is staged during an fsync.
 //
-// BatchSize is 64 (not 8): this test does not gate specific calls, it needs
-// many batch/fsync windows for the overlap assertion to be robust.
+// BatchSize is 64 (not 8): this test does not gate specific calls, and the
+// overlap the assertion needs must not be left to luck across the ~31
+// batch/fsync windows (under -race contention the stager can be scheduled
+// such that it never lands inside a window). Instead the two hooks
+// rendezvous: the stage hook PARKS the stager at the first record of its
+// second batch (a batch is always handed off by then, so the committer is
+// already committing the first one) until an fsync window opens, and the
+// fsync hook HOLDS the window open after a successful f.Sync() until that
+// stage lands. The overlap is therefore established by the SETUP. Both waits
+// are bounded by this file's 10s liveness pattern: with no staging pipeline
+// the stage hook never fires, the hold expires, and the assertion fails
+// exactly as before — it remains falsifiable.
 func TestWALPipeline_CompletionsStrictlyOrderedAndCovered(t *testing.T) {
 	run := func(t *testing.T, producers int) {
 		dir := t.TempDir()
@@ -519,11 +529,44 @@ func TestWALPipeline_CompletionsStrictlyOrderedAndCovered(t *testing.T) {
 		var durableEnd atomic.Int64
 		var stagedTotal atomic.Int64
 		var stagedDuringFsync atomic.Int64
+		// overlapSeen is closed the first time a record is staged while an
+		// fsync is in flight; the fsync hook holds its window open until it
+		// fires, so the overlap is guaranteed by the setup.
+		overlapSeen := make(chan struct{})
+		var overlapOnce sync.Once
+		// fsyncWindow is closed when an fsync enters; the stage hook parks
+		// the stager at the first record of its second batch until then.
+		// Whichever hook arrives first wins: the close is idempotent and a
+		// closed channel never blocks, so neither side has a deadline race.
+		fsyncWindow := make(chan struct{})
+		var windowOnce sync.Once
+		openWindow := func() { windowOnce.Do(func() { close(fsyncWindow) }) }
+		var holdSettled atomic.Bool
 		fsyncRestore := SetWALGroupCommitFsyncForTest(func(f *os.File) error {
 			inFsync.Store(true)
+			openWindow()
 			err := f.Sync()
 			if st, serr := f.Stat(); serr == nil {
 				durableEnd.Store(st.Size())
+			}
+			// Hold the window open until the stager has landed at least one
+			// record inside it, so the stager/committer overlap asserted
+			// below comes from this setup rather than from luck across the
+			// ~31 batch/fsync windows (under -race contention the stager can
+			// be scheduled out of every window). The wait is bounded by this
+			// file's 10s liveness pattern: with no staging pipeline (nothing
+			// fires the stage hook) it expires, inFsync drops, and
+			// require.Positive(stagedDuringFsync) fails exactly as before, so
+			// the assertion stays falsifiable. Only the first window attempts
+			// the hold: the stager is parked waiting for it, so the
+			// rendezvous completes in microseconds, and holdSettled stops a
+			// no-pipeline writer paying the bound once per batch.
+			if err == nil && !holdSettled.Load() {
+				select {
+				case <-overlapSeen:
+				case <-time.After(10 * time.Second):
+				}
+				holdSettled.Store(true)
 			}
 			inFsync.Store(false)
 			return err
@@ -536,6 +579,21 @@ func TestWALPipeline_CompletionsStrictlyOrderedAndCovered(t *testing.T) {
 			stagedTotal.Store(int64(stagedRecords))
 			if inFsync.Load() {
 				stagedDuringFsync.Add(1)
+				overlapOnce.Do(func() { close(overlapSeen) })
+				return
+			}
+			// First record of the SECOND batch: the first batch has already
+			// been handed off (the stager can only reach the second batch
+			// after that send completed), so the committer is busy committing
+			// it. Park until an fsync window opens, then let the stager add
+			// its next record inside that held-open window. Bounded the same
+			// 10s way; on a writer with no staging pipeline this hook never
+			// runs at all.
+			if stagedRecords == cfg.BatchSize+1 {
+				select {
+				case <-fsyncWindow:
+				case <-time.After(10 * time.Second):
+				}
 			}
 		})
 		defer stageRestore()
