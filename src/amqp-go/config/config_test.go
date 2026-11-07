@@ -583,3 +583,90 @@ func TestValidateHotCacheEffectiveBudgets(t *testing.T) {
 			"a global budget below the explicit per-queue budget must be rejected")
 	})
 }
+
+// TestCrashModel_DefaultsAndOverlay pins the durable-confirm crash model
+// plumbing end-to-end at the config layer: omitted and "barrier" both mean the
+// ordered barrier, "force_flush" is the only value that selects the full
+// drive-cache flush, and every zero-value path stays on the safe barrier.
+func TestCrashModel_DefaultsAndOverlay(t *testing.T) {
+	// Zero-value paths normalize to the barrier default.
+	assert.Equal(t, interfaces.CrashModelBarrier, DefaultConfig().CrashModel())
+	assert.Equal(t, interfaces.CrashModelBarrier, (&AMQPConfig{}).CrashModel())
+	assert.False(t, DefaultConfig().CrashModelForceFlush())
+	assert.False(t, (&AMQPConfig{}).CrashModelForceFlush())
+
+	// The engine transport carries the normalized effective value, so a
+	// zero-value EngineConfig keeps the safe barrier default.
+	assert.Equal(t, interfaces.CrashModelBarrier, DefaultConfig().GetEngine().CrashModel)
+	assert.Equal(t, interfaces.CrashModelBarrier, (&AMQPConfig{}).GetEngine().CrashModel)
+	// A raw zero-value EngineConfig{} carries "" — the storage layer maps
+	// anything other than the explicit "force_flush" to the barrier (pinned in
+	// storage by TestWALConfigFromEngine_CrashModelMapping).
+	assert.Equal(t, "", interfaces.EngineConfig{}.CrashModel)
+
+	// Explicit force_flush threads through CrashModel()/CrashModelForceFlush()
+	// and the engine overlay.
+	c := DefaultConfig()
+	c.Storage.CrashModel = interfaces.CrashModelForceFlush
+	assert.Equal(t, interfaces.CrashModelForceFlush, c.CrashModel())
+	assert.True(t, c.CrashModelForceFlush())
+	assert.Equal(t, interfaces.CrashModelForceFlush, c.GetEngine().CrashModel)
+}
+
+// TestCrashModel_LoadPaths pins the file-load path: an omitted crash_model key
+// stays "" on a zero-value load but resolves to the barrier, and each explicit
+// value round-trips to the engine overlay.
+func TestCrashModel_LoadPaths(t *testing.T) {
+	cOmit := loadYAML(t, validYAMLWithFsync(""))
+	assert.Equal(t, "", cOmit.Storage.CrashModel, "omitted crash_model stays empty on a zero-value load")
+	assert.Equal(t, interfaces.CrashModelBarrier, cOmit.CrashModel(), "omitted crash_model defaults to the barrier")
+
+	cBarrier := loadYAML(t, validYAMLWithFsync("  crash_model: barrier\n"))
+	assert.Equal(t, interfaces.CrashModelBarrier, cBarrier.CrashModel())
+	assert.False(t, cBarrier.CrashModelForceFlush())
+
+	cForce := loadYAML(t, validYAMLWithFsync("  crash_model: force_flush\n"))
+	assert.Equal(t, interfaces.CrashModelForceFlush, cForce.CrashModel())
+	assert.True(t, cForce.CrashModelForceFlush())
+	assert.Equal(t, interfaces.CrashModelForceFlush, cForce.GetEngine().CrashModel)
+
+	// fsync:false + force_flush is a coherent combination: the group-commit
+	// barrier is skipped entirely, and the always-on transaction path uses the
+	// full flush.
+	cMixed := loadYAML(t, validYAMLWithFsync("  fsync: false\n  crash_model: force_flush\n"))
+	assert.False(t, cMixed.FsyncEnabled())
+	assert.True(t, cMixed.CrashModelForceFlush())
+	assert.True(t, cMixed.GetEngine().WALSyncDisabled)
+	assert.Equal(t, interfaces.CrashModelForceFlush, cMixed.GetEngine().CrashModel)
+}
+
+// TestCrashModel_InvalidRejectedAtBoot pins that an unknown crash_model FAILS at
+// boot through both entry points: the file-load path (Load) and Validate
+// directly (which cmd/amqp-server and server.Builder both call).
+func TestCrashModel_InvalidRejectedAtBoot(t *testing.T) {
+	dir := t.TempDir()
+	f := filepath.Join(dir, "cfg.yaml")
+	require.NoError(t, os.WriteFile(f, []byte(validYAMLWithFsync("  crash_model: bogus\n")), 0644))
+
+	c := &AMQPConfig{}
+	err := c.Load(f)
+	require.Error(t, err, "an unknown crash_model must fail at boot")
+	assert.Contains(t, err.Error(), "crash_model")
+	assert.Contains(t, err.Error(), interfaces.CrashModelBarrier)
+	assert.Contains(t, err.Error(), interfaces.CrashModelForceFlush)
+
+	// Validate directly, the entry point main and server.Builder use.
+	v := DefaultConfig()
+	v.Storage.CrashModel = "bogus"
+	require.Error(t, v.Validate(), "Validate must reject an unknown crash_model")
+}
+
+// TestCrashModel_BuilderWiring pins the fluent builder setter.
+func TestCrashModel_BuilderWiring(t *testing.T) {
+	cfg, err := NewConfigBuilder().WithCrashModel(interfaces.CrashModelForceFlush).Build()
+	require.NoError(t, err)
+	assert.True(t, cfg.CrashModelForceFlush())
+
+	_, err = NewConfigBuilder().WithCrashModel("bogus").Build()
+	require.Error(t, err, "Build must reject an unknown crash_model")
+}
