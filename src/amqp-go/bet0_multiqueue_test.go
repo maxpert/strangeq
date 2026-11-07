@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -352,6 +353,99 @@ func TestBet0_StartBarrierCleanupReleases(t *testing.T) {
 	}
 }
 
+// bet0ConsumerDeathHint renders consumer-death evidence for a FAILURE MESSAGE.
+// It is never an input to bet0CheckLiveness and never chooses the verdict; it
+// only makes a cause that the old ordering (balance require before the ack-error
+// drain) hid visible, so the next F2 recurrence is self-explaining.
+func bet0ConsumerDeathHint(ackErr error, closed []int64, names []string) string {
+	var b strings.Builder
+	if ackErr != nil {
+		fmt.Fprintf(&b, " ADDITIONALLY: a consumer aborted with an Ack error: %v;", ackErr)
+	}
+	for i, n := range closed {
+		if n > 0 {
+			fmt.Fprintf(&b, " consumer(s) on %s had their delivery channel closed %d time(s) during the window;",
+				names[i], n)
+		}
+	}
+	return b.String()
+}
+
+// bet0ClosedCounts snapshots the per-queue closed-delivery counts.
+func bet0ClosedCounts(closed []*atomic.Int64) []int64 {
+	out := make([]int64, len(closed))
+	for i, c := range closed {
+		out[i] = c.Load()
+	}
+	return out
+}
+
+// bet0TotalClosed sums the per-queue closed-delivery counts.
+func bet0TotalClosed(closed []*atomic.Int64) int64 {
+	var n int64
+	for _, c := range closed {
+		n += c.Load()
+	}
+	return n
+}
+
+// TestBet0_ConsumerDeathHintSurfacesAckError is the deterministic proof that a
+// hidden Ack error / consumer death is named in the failure message.
+func TestBet0_ConsumerDeathHintSurfacesAckError(t *testing.T) {
+	boom := errors.New("ack boom")
+	cases := []struct {
+		name   string
+		ackErr error
+		closed []int64
+		want   []string
+		absent []string
+	}{
+		{name: "clean", ackErr: nil, closed: []int64{0, 0}, absent: []string{"Ack error", "delivery channel closed"}},
+		{name: "ack only", ackErr: boom, closed: []int64{0, 0}, want: []string{"Ack error", "ack boom"}},
+		{name: "death only", ackErr: nil, closed: []int64{0, 1}, want: []string{"q2", "delivery channel closed"}},
+		{name: "both", ackErr: boom, closed: []int64{1, 1}, want: []string{"Ack error", "ack boom", "q1", "q2", "delivery channel closed"}},
+	}
+	names := []string{"q1", "q2"}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := bet0ConsumerDeathHint(tc.ackErr, tc.closed, names)
+			if tc.ackErr == nil && len(tc.want) == 0 {
+				require.Empty(t, got, "no ack error and no deaths must render nothing")
+			}
+			for _, w := range tc.want {
+				require.Contains(t, got, w)
+			}
+			for _, a := range tc.absent {
+				require.NotContains(t, got, a)
+			}
+		})
+	}
+}
+
+// TestBet0_DeathHintIsAppendedNotSubstituted: the balance verdict still comes
+// first and is never replaced by the death evidence.
+func TestBet0_DeathHintIsAppendedNotSubstituted(t *testing.T) {
+	samples := []bet0Sample{
+		{name: "q1", published: 100000, consumed: 90000},
+		{name: "q2", published: 100000, consumed: 35000},
+	}
+	livenessErr := bet0CheckLiveness(samples, bet0Policy())
+	require.Error(t, livenessErr)
+	require.Contains(t, livenessErr.Error(), "IMBALANCE",
+		"the partial-starvation verdict class must be unchanged")
+
+	hint := bet0ConsumerDeathHint(errors.New("ack boom"), []int64{1, 1}, []string{"q1", "q2"})
+	require.NotEmpty(t, hint)
+
+	// Exactly the composition the harness performs: the liveness verdict is
+	// reported first, the death evidence is appended.
+	reported := livenessErr.Error() + hint
+	require.True(t, strings.HasPrefix(reported, livenessErr.Error()),
+		"the reported failure must start with the unchanged liveness verdict")
+	require.Contains(t, reported, hint)
+	require.Contains(t, reported, "IMBALANCE")
+}
+
 // bet0RunConcurrentMultiQueue drives the multi-queue load shape used by the P0
 // repro and the durable/transient variants.
 func bet0RunConcurrentMultiQueue(t *testing.T, shape string, durable []bool) {
@@ -361,9 +455,13 @@ func bet0RunConcurrentMultiQueue(t *testing.T, shape string, durable []bool) {
 	drainChanged := make(chan struct{}, 1)
 	results := make([]*bet0LoadResult, bet0Queues)
 	queueNames := make([]string, bet0Queues)
+	// E10: one closed-delivery counter per queue, so a delivery channel that
+	// closes during the run is no longer invisible.
+	closed := make([]*atomic.Int64, bet0Queues)
 	for i := range results {
 		results[i] = &bet0LoadResult{observed: newBet0ObservedIdentities(drainChanged)}
 		queueNames[i] = fmt.Sprintf("bet0-load-%s-q%d", shape, i+1)
+		closed[i] = &atomic.Int64{}
 	}
 	ackErrors := make(chan error, 1)
 
@@ -437,6 +535,7 @@ func bet0RunConcurrentMultiQueue(t *testing.T, shape string, durable []bool) {
 
 			res := results[qi]
 			queueIndex := uint16(qi)
+			closedCount := closed[qi]
 			conWG.Add(1)
 			go func() {
 				defer conWG.Done()
@@ -446,6 +545,7 @@ func bet0RunConcurrentMultiQueue(t *testing.T, shape string, durable []bool) {
 						return
 					case d, ok := <-deliveries:
 						if !ok {
+							closedCount.Add(1)
 							return
 						}
 						if err := bet0AckAndObserve(func() error { return d.Ack(false) }, res.observed,
@@ -541,9 +641,14 @@ func bet0RunConcurrentMultiQueue(t *testing.T, shape string, durable []bool) {
 	// --- LIVENESS assertion (this is the one that fails on broken main) ---
 	// Evaluate the already-frozen under-window samples before publisher join. On
 	// the broken tree a producer may be stuck inside PublishWithContext, so a join
-	// guard must not mask this P0 assertion. For the same attribution reason,
-	// queued Ack errors are reported only after this predicate: an Ack-induced
-	// sample failure cannot blunt the starvation regression detector.
+	// guard must not mask this P0 assertion.
+	//
+	// The balance verdict is still evaluated and reported FIRST. Any Ack error or
+	// closed delivery channel is APPENDED to that verdict and, when balance
+	// passed, additionally fails the run — so a consumer death can no longer hide
+	// behind an imbalance verdict. (The old ordering drained ackErrors only after
+	// the balance require, which is exactly how the one recorded F2 recurrence
+	// lost its cause.)
 	//
 	// The predicate itself, and the measurements behind every threshold it
 	// applies, are in bet0_liveness_predicate_test.go. Read that file before
@@ -566,6 +671,18 @@ func bet0RunConcurrentMultiQueue(t *testing.T, shape string, durable []bool) {
 	if notice := bet0SignalNotice(samples); notice != "" {
 		t.Log(notice)
 	}
+
+	// E10 (R2): snapshot what the old code only read after the balance require.
+	// A consumer killed by an Ack error, or a delivery channel closed during the
+	// window, is rendered into the failure message below instead of being hidden
+	// behind it. This does not affect the verdict.
+	var earlyAckErr error
+	select {
+	case earlyAckErr = <-ackErrors:
+	default:
+	}
+	hint := bet0ConsumerDeathHint(earlyAckErr, bet0ClosedCounts(closed), queueNames)
+
 	var publishersDone chan struct{}
 	livenessErr := bet0CheckBeforePublisherJoin(func() error {
 		return bet0CheckLiveness(samples, bet0Policy())
@@ -590,7 +707,7 @@ func bet0RunConcurrentMultiQueue(t *testing.T, shape string, durable []bool) {
 				bet0PublisherStopGuard)
 		}
 	})
-	require.NoErrorf(t, livenessErr, "shape=%s window=%s", shape, bet0PublishWindow)
+	require.NoErrorf(t, livenessErr, "shape=%s window=%s%s", shape, bet0PublishWindow, hint)
 	targets := bet0FreezePublisherTargets(func() { <-publishersDone }, bet0Queues,
 		bet0ProducersPerQueue, func(queue, producer int) uint64 {
 			return successCounts[queue][producer].Load()
@@ -602,6 +719,15 @@ func bet0RunConcurrentMultiQueue(t *testing.T, shape string, durable []bool) {
 	require.NoError(t, bet0ValidatePublisherTargets(targets, publishedTotals, bet0ProducersPerQueue),
 		"publisher target wiring premise failed after publisher join")
 
+	// E10 (R2): the balance verdict has been evaluated and reported first. Now
+	// surface any Ack error / consumer death the old ordering hid — and fail the
+	// run when balance passed, so a death cannot hide behind an imbalance.
+	if earlyAckErr != nil {
+		t.Fatal(earlyAckErr)
+	}
+	if n := bet0TotalClosed(closed); n > 0 {
+		t.Fatalf("consumer death during the measured window: %d delivery channel(s) closed;%s", n, hint)
+	}
 	select {
 	case err := <-ackErrors:
 		t.Fatal(err)
@@ -2472,11 +2598,16 @@ func TestBet0_MultiQueueWithConfirmsDelivers(t *testing.T) {
 	names := make([]string, queues)
 	published := make([]*atomic.Int64, queues)
 	consumed := make([]*atomic.Int64, queues)
+	// E10: one closed-delivery counter per queue plus an Ack-error channel, so a
+	// consumer death is surfaced rather than silent.
+	closed := make([]*atomic.Int64, queues)
 	for i := range names {
 		names[i] = fmt.Sprintf("bet0-cfm-q%d", i+1)
 		published[i] = &atomic.Int64{}
 		consumed[i] = &atomic.Int64{}
+		closed[i] = &atomic.Int64{}
 	}
+	ackErrors := make(chan error, 1)
 
 	var connMu sync.Mutex
 	var conns []*amqp.Connection
@@ -2526,6 +2657,8 @@ func TestBet0_MultiQueueWithConfirmsDelivers(t *testing.T) {
 			deliveries, err := ch.Consume(names[qi], "", false, false, false, false, nil)
 			require.NoError(t, err)
 			cnt := consumed[qi]
+			qName := names[qi]
+			closedCount := closed[qi]
 			go func() {
 				for {
 					select {
@@ -2533,9 +2666,16 @@ func TestBet0_MultiQueueWithConfirmsDelivers(t *testing.T) {
 						return
 					case d, ok := <-deliveries:
 						if !ok {
+							closedCount.Add(1)
 							return
 						}
-						_ = d.Ack(false)
+						if err := d.Ack(false); err != nil {
+							select {
+							case ackErrors <- fmt.Errorf("queue %s: delivery Ack failed: %w", qName, err):
+							default:
+							}
+							return
+						}
 						cnt.Add(1)
 					}
 				}
@@ -2621,11 +2761,19 @@ func TestBet0_MultiQueueWithConfirmsDelivers(t *testing.T) {
 	if notice := bet0SignalNotice(samples); notice != "" {
 		t.Log(notice)
 	}
+	// E10 (R2): surface any Ack error / consumer death in the failure message.
+	// The verdict itself is unchanged.
+	var earlyAckErr error
+	select {
+	case earlyAckErr = <-ackErrors:
+	default:
+	}
+	hint := bet0ConsumerDeathHint(earlyAckErr, bet0ClosedCounts(closed), names)
 	require.NoErrorf(t, bet0CheckLiveness(samples, policy),
 		"UNDER PUBLISHER CONFIRMS, window=%s. With confirms disabled and nothing else "+
 			"changed, both queues run healthily — so a failure here is specific to the "+
 			"confirm path, and it is the exact workload (durable + confirms + multiple "+
-			"queues) that multi-queue scaling exists to serve.", window)
+			"queues) that multi-queue scaling exists to serve.%s", window, hint)
 }
 
 // ----------------------------------------------------------------------------
