@@ -63,6 +63,10 @@ func newTestServer(t *testing.T) *Server {
 func newPipeConn(t *testing.T) *protocol.Connection {
 	t.Helper()
 	clientConn, serverConn := net.Pipe()
+	// E9: close BOTH ends. The client end is otherwise never closed, so the
+	// io.Copy drain goroutine below blocks forever and leaks 1 goroutine + 2 fds
+	// per call.
+	t.Cleanup(func() { clientConn.Close(); serverConn.Close() })
 	go io.Copy(io.Discard, clientConn) // drain response frames
 	return protocol.NewConnection(serverConn)
 }
