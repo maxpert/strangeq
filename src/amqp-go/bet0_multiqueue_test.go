@@ -267,6 +267,92 @@ const (
 	bet0Prefetch              = 100
 )
 
+// bet0StartBarrier releases producer goroutines together and ALWAYS releases:
+// t.Cleanup (which runs on runtime.Goexit/FailNow) plus a sync.Once make both
+// the normal path and the require-Goexit path in a launch loop safe (RH-2).
+// Without it, q0's producers are dialled and launched before q1's, so both
+// queues are measured over different intervals and the bias is systematically
+// against the later queue (C9).
+type bet0StartBarrier struct {
+	ch   chan struct{}
+	once sync.Once
+}
+
+func bet0NewStartBarrier(t *testing.T) *bet0StartBarrier {
+	b := &bet0StartBarrier{ch: make(chan struct{})}
+	t.Cleanup(b.Release) // registered before any require in the launch loop
+	return b
+}
+
+// Wait blocks until Release, or returns false if stop is closed first.
+func (b *bet0StartBarrier) Wait(stop <-chan struct{}) bool {
+	select {
+	case <-b.ch:
+		return true
+	case <-stop:
+		return false
+	}
+}
+
+// Release closes the gate exactly once, so the second and later calls are safe.
+func (b *bet0StartBarrier) Release() { b.once.Do(func() { close(b.ch) }) }
+
+// TestBet0_StartBarrierReleasesIdempotently: Release twice must not panic and
+// the gate must be closed.
+func TestBet0_StartBarrierReleasesIdempotently(t *testing.T) {
+	b := bet0NewStartBarrier(t)
+	b.Release()
+	b.Release() // must not panic
+
+	select {
+	case <-b.ch:
+	default:
+		t.Fatal("Release must close the gate")
+	}
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		if !b.Wait(make(chan struct{})) {
+			t.Error("Wait returned false after Release")
+		}
+	}()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Wait did not unblock after Release")
+	}
+}
+
+// TestBet0_StartBarrierWaitHonoursStop: Wait must return false when stop is
+// already closed, so a producer cannot block forever on an unreleased barrier.
+func TestBet0_StartBarrierWaitHonoursStop(t *testing.T) {
+	b := bet0NewStartBarrier(t)
+	stop := make(chan struct{})
+	close(stop)
+	if b.Wait(stop) {
+		t.Fatal("Wait must return false when stop is closed first")
+	}
+}
+
+// TestBet0_StartBarrierCleanupReleases: a producer blocked on Wait must be
+// released by cleanup even when the test/subtest returns (Goexit) without an
+// explicit Release.
+func TestBet0_StartBarrierCleanupReleases(t *testing.T) {
+	var b *bet0StartBarrier
+	t.Run("returns without releasing", func(t *testing.T) {
+		b = bet0NewStartBarrier(t)
+		// No Release: the registered cleanup must do it.
+	})
+	select {
+	case <-b.ch:
+	case <-time.After(2 * time.Second):
+		t.Fatal("cleanup did not release the barrier")
+	}
+}
+
+// bet0RunConcurrentMultiQueue drives the multi-queue load shape used by the P0
+// repro and the durable/transient variants.
 func bet0RunConcurrentMultiQueue(t *testing.T, shape string, durable []bool) {
 	require.Len(t, durable, bet0Queues)
 	_, uri := bet0Server(t, t.TempDir())
@@ -327,6 +413,12 @@ func bet0RunConcurrentMultiQueue(t *testing.T, shape string, durable []bool) {
 		stopConOnce.Do(func() { close(stopCon) })
 	})
 
+	// E2: producers must all start publishing at the same instant, so the two
+	// queues are measured over the same interval (C9). The gate is registered
+	// here, before any require in the launch loops, so a launch-loop failure
+	// still releases it via t.Cleanup.
+	barrier := bet0NewStartBarrier(t)
+
 	// --- consumers first, so they are registered before any publish ---
 	var conWG sync.WaitGroup
 	for qi := 0; qi < bet0Queues; qi++ {
@@ -369,9 +461,11 @@ func bet0RunConcurrentMultiQueue(t *testing.T, shape string, durable []bool) {
 			}()
 		}
 	}
-	time.Sleep(250 * time.Millisecond) // let consumer registration land
 
 	// --- producers ---
+	// All consumers above are registered before any producer starts: ch.Consume
+	// returns only after the server has RegisterConsumer'd, so the old fixed
+	// "let consumer registration land" sleep is not needed (E2).
 	successCounts := make([][]*atomic.Uint64, bet0Queues)
 	var pubWG sync.WaitGroup
 	for qi := 0; qi < bet0Queues; qi++ {
@@ -395,6 +489,9 @@ func bet0RunConcurrentMultiQueue(t *testing.T, shape string, durable []bool) {
 			pubWG.Add(1)
 			go func() {
 				defer pubWG.Done()
+				if !barrier.Wait(stopPub) {
+					return
+				}
 				pub := amqp.Publishing{DeliveryMode: mode, Body: make([]byte, bet0BodySize)}
 				var seq uint64
 				for {
@@ -416,6 +513,16 @@ func bet0RunConcurrentMultiQueue(t *testing.T, shape string, durable []bool) {
 			}()
 		}
 	}
+
+	// E2 (PC-3): nothing may have published before the gate opens. If this fires,
+	// a producer was launched outside the barrier — the systematic interval skew
+	// C9 is back.
+	var preRelease int64
+	for _, res := range results {
+		preRelease += res.published.Load()
+	}
+	require.Zero(t, preRelease, "a producer published before the start barrier was released")
+	barrier.Release()
 
 	// --- publish window ---
 	// Both counters are sampled at the same instant with publishers still
@@ -2400,6 +2507,10 @@ func TestBet0_MultiQueueWithConfirmsDelivers(t *testing.T) {
 	var stopOnce sync.Once
 	t.Cleanup(func() { stopOnce.Do(func() { close(stop) }) })
 
+	// E2: same symmetric start gate as the P0 repro, so both queues' producers
+	// begin publishing at one instant.
+	start := bet0NewStartBarrier(t)
+
 	// Consumers first so they are registered before any publish.
 	for qi := 0; qi < queues; qi++ {
 		for c := 0; c < consumers; c++ {
@@ -2430,7 +2541,6 @@ func TestBet0_MultiQueueWithConfirmsDelivers(t *testing.T) {
 			}()
 		}
 	}
-	time.Sleep(300 * time.Millisecond)
 
 	// Producers with publisher confirms and a bounded outstanding window.
 	body := make([]byte, bodySize)
@@ -2446,6 +2556,9 @@ func TestBet0_MultiQueueWithConfirmsDelivers(t *testing.T) {
 			qName := names[qi]
 			cnt := published[qi]
 			go func() {
+				if !start.Wait(stop) {
+					return
+				}
 				pub := amqp.Publishing{DeliveryMode: amqp.Persistent, Body: body}
 				inFlight := 0
 				for {
@@ -2475,6 +2588,14 @@ func TestBet0_MultiQueueWithConfirmsDelivers(t *testing.T) {
 			}()
 		}
 	}
+
+	// E2 (PC-3): no producer may have published before the gate opens.
+	var preRelease int64
+	for _, p := range published {
+		preRelease += p.Load()
+	}
+	require.Zero(t, preRelease, "a producer published before the start barrier was released")
+	start.Release()
 
 	time.Sleep(window)
 	pubAt := make([]int64, queues)
