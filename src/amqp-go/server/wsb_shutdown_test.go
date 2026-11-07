@@ -182,6 +182,12 @@ func TestWSB_Shutdown_ForceClosesNonCooperativeClient(t *testing.T) {
 
 	r := dialRaw(t, addr)
 	r.handshake("guest", "guest", 0, 0)
+	// E1: wait on the server-side handshake completion. channel.open-ok is
+	// written by the processor goroutine started at server.go:706, which is
+	// program-ordered AFTER rt.handshakeDone.Store(true) at :691. Receiving it
+	// is a happens-before edge, so Shutdown can no longer observe a half-open
+	// connection and take the "still handshaking" path that returned nil here.
+	r.openChannel(1)
 	// Never read or reply again.
 
 	ctx, cancel := wsbCtx(200 * time.Millisecond)
