@@ -43,6 +43,13 @@ type queueReadyCounter interface {
 	QueueReadyCount(name string) uint32
 }
 
+// queueHighWaterCounter is the optional seam exposing a queue's maximum depth
+// observed since creation (Task 2; diagnostic). When absent the series is
+// omitted.
+type queueHighWaterCounter interface {
+	QueueDepthHighWater(name string) uint64
+}
+
 // brokerQueueStats adapts the live broker to metrics.QueueStatsProvider.
 type brokerQueueStats struct {
 	b queueLister
@@ -66,6 +73,7 @@ func queueStatsFrom(l queueLister) []metrics.QueueStat {
 	}
 
 	readyCounter, hasReady := l.(queueReadyCounter)
+	hwCounter, hasHW := l.(queueHighWaterCounter)
 	stats := make([]metrics.QueueStat, 0, len(l.GetQueues()))
 	for name := range l.GetQueues() {
 		stat := metrics.QueueStat{
@@ -76,6 +84,10 @@ func queueStatsFrom(l queueLister) []metrics.QueueStat {
 		if hasReady {
 			stat.Ready = int(readyCounter.QueueReadyCount(name))
 			stat.ReadyKnown = true
+		}
+		if hasHW {
+			stat.HighWater = int(hwCounter.QueueDepthHighWater(name))
+			stat.HighWaterSet = true
 		}
 		stats = append(stats, stat)
 	}

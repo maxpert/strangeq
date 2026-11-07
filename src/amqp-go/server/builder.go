@@ -361,6 +361,14 @@ func (b *ServerBuilder) Build() (*Server, error) {
 		}
 	}
 
+	// Task 2: bind the publisher-park diagnostics when the collector supports
+	// them. The gauges are read AT SCRAPE TIME and are DIAGNOSTIC ONLY; the
+	// bind is a no-op for any custom collector that does not implement the
+	// binder.
+	if binder, ok := metricsCollector.(PublisherParkStatsBinder); ok {
+		binder.BindPublisherParkStats(server.PublisherParkStats)
+	}
+
 	// Create and attach lifecycle manager
 	server.Lifecycle = NewLifecycleManager(server, b.config)
 

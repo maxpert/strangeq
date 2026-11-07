@@ -173,6 +173,16 @@ type StorageBroker struct {
 	getDeliveryOwners sync.Map // uint64 → string
 	metricsCollector  MetricsCollector
 
+	// hotPacer is the RESOLVED hot-cache publisher pacer, or nil when pacing is
+	// INERT. It is resolved ONCE at construction and is non-nil ONLY in
+	// non-durable mode (the WAL fsync barrier disabled) — see NewStorageBroker.
+	//
+	// WHY WIRING-LEVEL, not a per-call early return: in durable mode the
+	// publisher path must be wired exactly as it is on main, paying NO
+	// per-publish park decision. A nil field means publishBackpressure skips
+	// the storage capability assertion and the HotCachePaceGate call entirely.
+	hotPacer hotCachePacer
+
 	// queueCreateMuByName holds one *sync.Mutex per queue name (LoadOrStore,
 	// same pattern as queueConsumersMu / getQueueConsumersMutex). It backs
 	// FIVE distinct per-name critical sections. The mutex is NOT reentrant and
@@ -317,6 +327,23 @@ func NewStorageBroker(storage interfaces.Storage, engineConfig interfaces.Engine
 		storage:      storage,
 		engineConfig: engineConfig,
 		ttlNow:       func() int64 { return time.Now().UnixMilli() },
+	}
+
+	// HOT-CACHE PUBLISHER PACING IS WIRED ONLY IN NON-DURABLE MODE. The pace
+	// gate keeps the delivered head hot by parking the publisher's connection
+	// reader at the hot cache's byte budget. In DURABLE mode that backfires:
+	// the WAL group-commit batch size is the throughput limiter (the ~16 ms
+	// F_FULLFSYNC per batch is the critical path, so msgs/fsync IS throughput),
+	// and parking the reader creates arrival gaps that halve the batch. Measured
+	// (campaign ab-runC, F3 64 KiB 1p/1c durable+confirm): 499 -> 221 msgs/fsync
+	// with the gate active, costing ~33% throughput. fsync's own confirm latency
+	// already paces the publisher in durable mode, so the cold-read problem the
+	// gate targets barely arises. Resolving NO pacer here leaves the publisher
+	// path wired exactly as on main and the hot path pays nothing.
+	if engineConfig.WALSyncDisabled {
+		if pacer, ok := storage.(hotCachePacer); ok {
+			broker.hotPacer = pacer
+		}
 	}
 
 	broker.initErr = broker.initOrdinalAllocator()
@@ -1084,6 +1111,69 @@ func (b *StorageBroker) computeDepthHighWM() uint64 {
 		spillPct = 80
 	}
 	return uint64(ringSize) * uint64(spillPct) / 100
+}
+
+// hotCachePacer is the optional storage capability that paces a publisher to a
+// queue's hot-cache BYTE budget (Task 2, design D-B). The storage layer owns
+// the byte budget and the resident accounting, so it is the layer that answers
+// "would the cache refuse one more message this size"; the broker only turns
+// that answer into reader backpressure.
+type hotCachePacer interface {
+	// HotCachePaceGate returns a non-nil gate while the queue's hot cache
+	// cannot admit one more message the size of m, or nil when it has room
+	// (or the message is larger than the whole budget and can never be hot).
+	HotCachePaceGate(queue string, m *protocol.Message) protocol.DepthGate
+}
+
+// publisherGate is the per-queue publisher backpressure gate: the queue's
+// message-count depth high-water mark OR the hot-cache byte capacity, whichever
+// binds first.
+//
+// THE DEPTH HWM ALONE IS THE BUG. On F3 the shipped depth HWM is 52,428
+// messages while the hot cache holds ~1,015 64 KiB bodies, so the producer is
+// allowed to run ~51,000 messages ahead of the consumer: the delivered head is
+// evicted from RAM long before the consumer reads it and ~96% of deliveries
+// take a cold WAL read. The byte gate caps the in-flight window at what the
+// cache can actually hold, so the head is served from memory.
+type publisherGate struct {
+	depth protocol.DepthGate
+	hot   protocol.DepthGate
+}
+
+func (g *publisherGate) AtHighWaterMark() bool {
+	if g.hot != nil && g.hot.AtHighWaterMark() {
+		return true
+	}
+	return g.depth != nil && g.depth.AtHighWaterMark()
+}
+
+// publishBackpressure returns the backpressure gate for one routed target, or
+// nil when the target has room for the message under both the depth HWM and the
+// hot-cache byte budget.
+//
+// The hot-cache check runs FIRST and is allocation-free on the common path (the
+// storage returns nil while the queue has room), so a healthy queue pays only a
+// mirror read; the gate object is built only when the publisher must be paced.
+//
+// b.hotPacer is nil in durable mode, so this whole hot-cache arm is skipped
+// there and the publisher path is wired exactly as on main (see NewStorageBroker
+// for the measured reason).
+func (b *StorageBroker) publishBackpressure(queueState *QueueState, queueName string, m *protocol.Message) protocol.DepthGate {
+	var hot protocol.DepthGate
+	if b.hotPacer != nil {
+		hot = b.hotPacer.HotCachePaceGate(queueName, m)
+	}
+	depthHigh := queueState.AtHighWaterMark()
+	switch {
+	case hot == nil && !depthHigh:
+		return nil
+	case hot == nil:
+		return queueState
+	case !depthHigh:
+		return hot
+	default:
+		return &publisherGate{depth: queueState, hot: hot}
+	}
 }
 
 // consumerPollLoop implements three-stage pipeline with semaphore-based flow control
@@ -2764,8 +2854,10 @@ func (b *StorageBroker) PublishMessageAdmitted(exchangeName, routingKey string, 
 			return nil, fmt.Errorf("queue '%s': %w", queueName, ErrQueueClosed)
 		default:
 		}
-		if gate == nil && queueState.AtHighWaterMark() {
-			gate = queueState // report the first at-HWM target
+		if gate == nil {
+			// The hot-cache byte budget binds before the message-count depth
+			// HWM (Task 2); report the first target that binds.
+			gate = b.publishBackpressure(queueState, queueName, message)
 		}
 	}
 	// Store synchronously (never parks: the per-queue capacity check below is
@@ -3220,8 +3312,13 @@ func (b *StorageBroker) PublishMessageAsyncConfirm(exchangeName, routingKey stri
 			return false, nil, fmt.Errorf("queue '%s': %w", queueName, ErrQueueClosed)
 		default:
 		}
-		if queueState.AtHighWaterMark() {
-			backpressure = queueState
+		// The hot-cache byte budget binds before the message-count depth HWM on
+		// any queue whose in-flight window can outgrow the cache (Task 2): a
+		// publisher paced by the depth HWM alone runs thousands of messages
+		// ahead of the consumer, evicting the head from RAM and forcing a cold
+		// WAL read per delivery. First target to bind wins.
+		if backpressure == nil {
+			backpressure = b.publishBackpressure(queueState, queueName, message)
 		}
 
 		// SQ-11 reject-publish admission (synchronous), identical to PublishMessage:
@@ -3431,8 +3528,13 @@ func (b *StorageBroker) fanoutSharedAsyncConfirm(sdw sharedDurableWriter, agg *p
 			return false, nil, fmt.Errorf("queue '%s': %w", queueName, ErrQueueClosed)
 		default:
 		}
-		if queueState.AtHighWaterMark() {
-			backpressure = queueState
+		// The hot-cache byte budget binds before the message-count depth HWM on
+		// any queue whose in-flight window can outgrow the cache (Task 2): a
+		// publisher paced by the depth HWM alone runs thousands of messages
+		// ahead of the consumer, evicting the head from RAM and forcing a cold
+		// WAL read per delivery. First target to bind wins.
+		if backpressure == nil {
+			backpressure = b.publishBackpressure(queueState, queueName, message)
 		}
 
 		p := queueState.Policy()
@@ -4238,6 +4340,18 @@ func (b *StorageBroker) GetQueueReadyCount(queueName string) uint32 {
 		return 0
 	}
 	return uint32(ready)
+}
+
+// GetQueueDepthHighWater returns the maximum Depth() (waiting+inflight)
+// observed on the queue since it was created. Diagnostic only; it lets the
+// benchmark harness read a measured window's backlog high-water directly. Zero
+// for an unknown queue.
+func (b *StorageBroker) GetQueueDepthHighWater(queueName string) uint64 {
+	val, ok := b.queueStates.Load(queueName)
+	if !ok {
+		return 0
+	}
+	return val.(*QueueState).DepthHighWaterSeen()
 }
 
 // GetQueueConsumerIDs returns the broker-internal identities (Consumer.ID) of

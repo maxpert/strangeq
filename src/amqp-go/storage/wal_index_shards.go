@@ -112,7 +112,42 @@ type walIndexShard struct {
 	//
 	// Guarded by mu.
 	highWater int
+
+	// insertsSinceRebuild counts the NEW keys indexed since the maps were
+	// last (re)built, and churnRebuilds how many times the churn rule below
+	// has rebuilt them (observability for the tests). See
+	// walIndexChurnRebuildFactor.
+	//
+	// Guarded by mu.
+	insertsSinceRebuild int
+	churnRebuilds       int
 }
+
+// walIndexChurnRebuildFactor bounds the bucket memory a shard's maps retain
+// under STEADY-STATE CHURN.
+//
+// The S1c rule (shrinkMapsIfIdleLocked) rebuilds the maps when the live count
+// falls below a quarter of its high-water mark, i.e. when the backlog DRAINS.
+// It never fires at a constant backlog -- and a constant backlog is exactly
+// the F1-F5 fsync:off shape: the depth gate pins the queue at ~52k
+// unacknowledged messages while ~100k+ keys per second enter the index
+// (commit) and leave it (ack). A Go map under insert/delete churn at a
+// constant live count keeps growing: a delete leaves a tombstone, an insert
+// that finds no free slot grows the table, and the table is never returned.
+// Measured in isolation (64 shards, 53,000 live keys, FIFO churn): the two
+// maps grow from 6.8 MB after the fill to 25.7 MB after ~1.4 M inserts.
+//
+// So a shard also rebuilds its maps once it has indexed this many times its
+// live count (plus walIndexChurnRebuildFloor) of new keys since the last
+// rebuild. The rebuild is the S1c one -- same lock, same copy -- and its cost
+// is amortised: copying L live keys once per factor*L inserts is O(1/factor)
+// map writes per insert. With the rule the same churn settles at ~13 MB
+// (~2x the compact size: one doubling to make room for tombstones).
+const walIndexChurnRebuildFactor = 4
+
+// walIndexChurnRebuildFloor keeps a nearly empty shard from rebuilding every
+// few inserts: the trigger is factor * (live + floor) inserts.
+const walIndexChurnRebuildFloor = 64
 
 // walIndexShardOf returns the shard a delivery tag belongs to.
 //
@@ -240,6 +275,7 @@ func (s *walIndexShard) indexRecordLocked(r *segmentRecord) {
 			break
 		}
 	}
+	newKey := len(copies) == 0
 	if !replaced {
 		copies = append(copies, r)
 	}
@@ -252,6 +288,30 @@ func (s *walIndexShard) indexRecordLocked(r *segmentRecord) {
 	}
 	if n := len(s.copies) + len(s.offset); n > s.highWater {
 		s.highWater = n
+	}
+	if newKey {
+		s.noteInsertLocked()
+	}
+}
+
+// noteInsertLocked counts one new key and rebuilds the maps once the shard has
+// absorbed walIndexChurnRebuildFactor times its live count of new keys since
+// the last rebuild (see walIndexChurnRebuildFactor). Caller holds the shard's
+// write lock.
+//
+// A pure fill never triggers it: while the shard is growing toward its live
+// set, the live count grows with the inserts, so inserts can only exceed
+// factor*(live+floor) once keys have also LEFT the maps -- i.e. under churn,
+// which is the only case in which the maps hold tombstones worth dropping.
+//
+// It is called only from the insert path (indexRecordLocked), never from a
+// loop that ranges over this shard's maps, so swapping the maps here cannot
+// change a map under an iterator.
+func (s *walIndexShard) noteInsertLocked() {
+	s.insertsSinceRebuild++
+	if s.insertsSinceRebuild > walIndexChurnRebuildFactor*(len(s.offset)+walIndexChurnRebuildFloor) {
+		s.rebuildMapsLocked()
+		s.churnRebuilds++
 	}
 }
 
@@ -468,6 +528,7 @@ func (s *walIndexShard) rebuildMapsLocked() {
 	}
 	s.offset = offset
 	s.highWater = len(s.copies) + len(s.offset)
+	s.insertsSinceRebuild = 0
 }
 
 // indexShardHighWaterForTest sums every shard's retained-capacity high-water

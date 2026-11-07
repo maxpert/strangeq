@@ -70,6 +70,10 @@ func (s *spyMetricsCollector) RecordSegmentReadError()               {}
 func (s *spyMetricsCollector) UpdateRingBufferUtilization(queueName string, utilization float64) {
 }
 func (s *spyMetricsCollector) DeleteRingBufferUtilization(queueName string)     {}
+func (s *spyMetricsCollector) RecordHotCacheDeliveryHit(queue string)           {}
+func (s *spyMetricsCollector) RecordHotCacheDeliveryColdRead(queue string)      {}
+func (s *spyMetricsCollector) RecordHotCacheDeliveryPread(queue string, n int)  {}
+func (s *spyMetricsCollector) RecordPublisherPark(seconds float64)              {}
 func (s *spyMetricsCollector) UpdateMemoryMetrics(usedBytes, heapBytes float64) {}
 func (s *spyMetricsCollector) RecordGCPause(duration float64)                   {}
 func (s *spyMetricsCollector) UpdateGoroutines(count float64)                   {}

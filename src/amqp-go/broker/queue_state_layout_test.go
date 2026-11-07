@@ -46,10 +46,16 @@ func TestQueueStateLayoutUnchanged(t *testing.T) {
 	// WS-D §7 appended the reject-publish reservation fields (pendingCount,
 	// pendingBytes, frontierResv) AFTER frontierMax, so every hot-field offset
 	// above is unchanged and only the struct size grew (264 → measured).
-	const wantSize = 288
+	//
+	// Task 2 appended the diagnostic depthHighWaterSeen atomic AFTER
+	// frontierResv for the same reason: a pure end-of-struct append keeps every
+	// pinned hot-field offset above unchanged and only grows the size again
+	// (288 → 296). Neither append reordered a hot field; the offset pins above
+	// are therefore still the load-bearing assertion, and only the size moved.
+	const wantSize = 296
 	if got := unsafe.Sizeof(qs); got != wantSize {
-		t.Errorf("unsafe.Sizeof(QueueState) = %d, want %d — the WS-D §7 reject-publish "+
-			"reservation fields were appended after frontierMax; hot-field offsets are "+
-			"unchanged, so re-derive this pin only if you changed the struct", got, wantSize)
+		t.Errorf("unsafe.Sizeof(QueueState) = %d, want %d — the Task 2 depthHighWaterSeen "+
+			"field is appended at the END of the struct; hot-field offsets are unchanged, "+
+			"so re-derive this pin only if you changed the struct", got, wantSize)
 	}
 }

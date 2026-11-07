@@ -73,6 +73,19 @@ type MetricsCollector interface {
 	UpdateRingBufferUtilization(queueName string, utilization float64)
 	DeleteRingBufferUtilization(queueName string)
 
+	// Hot-cache delivery-path metrics (Task 2). These mirror
+	// storage.StorageMetrics so the collector stays assignable to it, and they
+	// are what make the cold-read fix provable: the delivery hot-hit ratio is
+	// hits / (hits + cold_reads), and preads per delivered message is
+	// preads / deliveries.
+	RecordHotCacheDeliveryHit(queue string)
+	RecordHotCacheDeliveryColdRead(queue string)
+	RecordHotCacheDeliveryPread(queue string, n int)
+
+	// Publisher-park metrics (Task 2): one call per completed queue-depth
+	// reader park, so the pacing is visible rather than inferred.
+	RecordPublisherPark(seconds float64)
+
 	// Memory metrics
 	UpdateMemoryMetrics(usedBytes, heapBytes float64)
 	RecordGCPause(duration float64)
@@ -134,6 +147,14 @@ type WALBookkeepingStatsBinder interface {
 	BindWALBookkeepingStats(stats func() (inventoryRecords, indexCopies int, drained uint64))
 }
 
+// PublisherParkStatsBinder is implemented by the production collector: the
+// server binds its publisher-park accessor at build time so the
+// amqp_publisher_parked_* gauges are read AT SCRAPE TIME (never stale).
+// DIAGNOSTIC ONLY; never gated (Task 2).
+type PublisherParkStatsBinder interface {
+	BindPublisherParkStats(stats func() (count uint64, seconds float64, current int64))
+}
+
 // NoOpMetricsCollector is a metrics collector that does nothing
 type NoOpMetricsCollector struct{}
 
@@ -186,6 +207,15 @@ func (n *NoOpMetricsCollector) RecordSegmentReadError()                         
 // Ring buffer metrics
 func (n *NoOpMetricsCollector) UpdateRingBufferUtilization(queueName string, utilization float64) {}
 func (n *NoOpMetricsCollector) DeleteRingBufferUtilization(queueName string)                      {}
+
+// Hot-cache delivery-path metrics (Task 2)
+func (n *NoOpMetricsCollector) RecordHotCacheDeliveryHit(queue string)      {}
+func (n *NoOpMetricsCollector) RecordHotCacheDeliveryColdRead(queue string) {}
+func (n *NoOpMetricsCollector) RecordHotCacheDeliveryPread(queue string, count int) {
+}
+
+// Publisher-park metrics (Task 2)
+func (n *NoOpMetricsCollector) RecordPublisherPark(seconds float64) {}
 
 // Memory metrics
 func (n *NoOpMetricsCollector) UpdateMemoryMetrics(usedBytes, heapBytes float64) {}

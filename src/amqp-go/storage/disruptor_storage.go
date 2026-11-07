@@ -25,8 +25,55 @@ const (
 type StorageMetrics interface {
 	UpdateDiskMetrics(freeBytes, usedBytes float64)
 	UpdateRingBufferUtilization(queueName string, utilization float64)
+	// RecordHotCacheDeliveryHit counts ONE GetMessageForDelivery served from
+	// the hot cache (no cold-tier read).
+	RecordHotCacheDeliveryHit(queue string)
+	// RecordHotCacheDeliveryColdRead counts ONE GetMessageForDelivery that
+	// missed the hot cache and took a cold-tier read (WAL or segment).
+	RecordHotCacheDeliveryColdRead(queue string)
+	// RecordHotCacheDeliveryPread counts positional reads issued by the
+	// delivery cold path (the WAL parse uses one header read plus one payload
+	// read per record, plus optionally one shared-body-block read). The
+	// per-delivered-message ratio is RecordHotCacheDeliveryPread / deliveries.
+	RecordHotCacheDeliveryPread(queue string, n int)
 	WALMetrics
 	SegmentMetrics
+}
+
+// recordHotCacheDeliveryHit / ...ColdRead / ...Pread update the in-process
+// counters (readable by tests and by DeliveryCacheStats) and, when a collector
+// is bound, the exported Prometheus series. The in-process atomics are always
+// maintained so the classification is observable without a metrics collector.
+func (ds *DisruptorStorage) recordHotCacheDeliveryHit(queue string) {
+	ds.deliveryHits.Add(1)
+	if ds.metrics != nil {
+		ds.metrics.RecordHotCacheDeliveryHit(queue)
+	}
+}
+
+func (ds *DisruptorStorage) recordHotCacheDeliveryColdRead(queue string) {
+	ds.deliveryColdReads.Add(1)
+	if ds.metrics != nil {
+		ds.metrics.RecordHotCacheDeliveryColdRead(queue)
+	}
+}
+
+func (ds *DisruptorStorage) recordHotCacheDeliveryPread(queue string, n int) {
+	if n <= 0 {
+		return
+	}
+	ds.deliveryPreads.Add(uint64(n))
+	if ds.metrics != nil {
+		ds.metrics.RecordHotCacheDeliveryPread(queue, n)
+	}
+}
+
+// DeliveryCacheStats returns the delivery-path classification counters since
+// process start: (hot-cache hits, cold reads, cold-path positional reads).
+// DIAGNOSTIC ONLY (Task 2): the hot-hit ratio is hits/(hits+coldReads) and
+// preads per delivered message is preads/deliveries.
+func (ds *DisruptorStorage) DeliveryCacheStats() (hits, coldReads, preads uint64) {
+	return ds.deliveryHits.Load(), ds.deliveryColdReads.Load(), ds.deliveryPreads.Load()
 }
 
 type DisruptorStorage struct {
@@ -88,6 +135,12 @@ type DisruptorStorage struct {
 
 	metrics StorageMetrics
 	dataDir string
+
+	// Delivery-path classification counters (Task 2; diagnostic). Always
+	// maintained so the cold-read fix is observable without a collector bound.
+	deliveryHits      atomic.Uint64
+	deliveryColdReads atomic.Uint64
+	deliveryPreads    atomic.Uint64
 }
 
 type QueueHot struct {
@@ -233,6 +286,53 @@ func (ds *DisruptorStorage) SetMetrics(metrics StorageMetrics) {
 	if ds.segments != nil {
 		ds.segments.SetMetrics(metrics)
 	}
+}
+
+// HotCachePaceGate returns the publisher backpressure gate the broker arms to
+// pace a producer to this queue's hot-cache BYTE budget, or nil when the queue
+// has room for one more message the size of m.
+//
+// IT IS THE D-B CREDIT SIGNAL (Task 2). The returned gate reports
+// AtHighWaterMark while the queue's resident bytes plus this message's charge
+// exceed the per-queue budget; the broker's reader then stops pulling the
+// producer's publishes off the socket (TCP backpressure) until an
+// acknowledgement frees the room, keeping the backlog inside the hot cache so
+// the delivered head is served from memory rather than by a cold WAL pread.
+//
+// A message that is LARGER than the whole per-queue budget can never be
+// admitted (the documented "oversized durable publish succeeds disk-only"
+// path); such a message must NOT arm a gate, because that gate would never
+// clear and the producer would park forever.
+func (ds *DisruptorStorage) HotCachePaceGate(queue string, m *protocol.Message) protocol.DepthGate {
+	if ds.hot == nil || m == nil {
+		return nil
+	}
+	charge := cacheCharge(queue, m)
+	if charge <= 0 || charge > ds.hot.queueBytes {
+		return nil
+	}
+	if ds.hot.residentBytes(queue)+charge <= ds.hot.queueBytes {
+		return nil // room: no gate, and no allocation on the common fast path
+	}
+	return &hotCacheByteGate{c: ds.hot, queue: queue, charge: charge}
+}
+
+// HotCacheResidentBytes reports the queue's resident hot-cache bytes (the
+// observable projection of the queue's own accounting). Diagnostic only.
+func (ds *DisruptorStorage) HotCacheResidentBytes(queue string) int64 {
+	if ds.hot == nil {
+		return 0
+	}
+	return ds.hot.residentBytes(queue)
+}
+
+// HotCacheQueueByteBudget reports the effective per-queue hot-cache byte budget.
+// Diagnostic only.
+func (ds *DisruptorStorage) HotCacheQueueByteBudget() int64 {
+	if ds.hot == nil {
+		return 0
+	}
+	return ds.hot.queueBytes
 }
 
 // WALBookkeepingStats exposes the WAL tier's in-memory bookkeeping for the
@@ -443,7 +543,7 @@ func (ds *DisruptorStorage) GetMessage(queueName string, deliveryTag uint64) (*p
 		return nil, interfaces.ErrMessageNotFound
 	}
 
-	msg, err := ds.readColdMessage(queueName, deliveryTag)
+	msg, err := ds.readColdMessageCounted(queueName, deliveryTag, false)
 	if err != nil {
 		return nil, err
 	}
@@ -497,6 +597,7 @@ func (ds *DisruptorStorage) GetMessageForDelivery(queueName string, deliveryTag 
 		return nil, interfaces.ErrQueueNotFound
 	}
 	if msg, _, ok := ds.hot.Get(queueName, deliveryTag); ok {
+		ds.recordHotCacheDeliveryHit(queueName)
 		return msg, nil
 	}
 	if ds.wal != nil && ds.wal.IsAcknowledged(queueName, deliveryTag) {
@@ -517,8 +618,10 @@ func (ds *DisruptorStorage) GetMessageForDelivery(queueName string, deliveryTag 
 	}
 	capturedEpoch, hotQueue := ds.hot.captureAdmission(queueName)
 
-	// THE COLD READ. No lock is held across it.
-	msg, err := ds.readColdMessage(queueName, deliveryTag)
+	// THE COLD READ. No lock is held across it. This is a DELIVERY, so the
+	// positional reads it issues are attributed to the delivery metric.
+	ds.recordHotCacheDeliveryColdRead(queueName)
+	msg, err := ds.readColdMessageCounted(queueName, deliveryTag, true)
 	if err != nil {
 		return nil, err
 	}
@@ -656,14 +759,28 @@ func (ds *DisruptorStorage) putBestEffortIfCurrent(queueName string, captured *Q
 	return nil
 }
 
-// readColdMessage reads a message from the cold tiers (the WAL, then the
-// segment tier). It NEVER admits and it NEVER acknowledges: it is the read
-// half of both the peek and the delivery path.
-func (ds *DisruptorStorage) readColdMessage(queueName string, deliveryTag uint64) (*protocol.Message, error) {
+// readColdMessageCounted reads a message from the cold tiers (the WAL, then the
+// segment tier). It NEVER admits and it NEVER acknowledges: it is the read half
+// of both the peek and the delivery path.
+//
+// countPreads attributes the WAL's positional reads to the DELIVERY metric. It
+// is true only on the delivery path: the peek (GetMessage) is used by the TTL
+// reaper's per-tag probes, and counting those would inflate preads per
+// delivered message with reads no consumer asked for.
+func (ds *DisruptorStorage) readColdMessageCounted(queueName string, deliveryTag uint64, countPreads bool) (*protocol.Message, error) {
 	var msg *protocol.Message
 	if ds.wal != nil {
 		if m, err := ds.wal.Read(queueName, deliveryTag); err == nil {
 			msg = m
+			if countPreads {
+				// The WAL delivery parse issues one positional read for the
+				// record header and one for its payload (parseMessageAt); a
+				// shared-body record adds one more for the co-located body
+				// block. They are counted here, at the boundary, so the metric
+				// attributes them to the queue without threading a counter
+				// through the WAL.
+				ds.recordHotCacheDeliveryPread(queueName, 2)
+			}
 		}
 	}
 	if msg == nil && ds.segments != nil {

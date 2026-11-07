@@ -296,6 +296,46 @@ func (c *hotCache) queueStateIfPresent(queue string) *hotCacheQueue {
 	return nil
 }
 
+// residentBytes returns the queue's resident byte count from the mirror map
+// (the observable projection of hotCacheQueue.used; see noteQueueUsed). A queue
+// that has never been admitted into reports 0.
+func (c *hotCache) residentBytes(queue string) int64 {
+	c.queueUsedMu.Lock()
+	used := c.queueUsed[queue]
+	c.queueUsedMu.Unlock()
+	return used
+}
+
+// hotCacheByteGate reports whether a queue's hot cache would REFUSE to admit a
+// message of a fixed byte charge — i.e. the queue's resident bytes plus the
+// charge exceed the per-queue budget.
+//
+// IT IS THE PUBLISHER'S CREDIT SIGNAL (Task 2, design D-B). The hot cache is
+// the in-flight store the delivered head is served from; a publisher that runs
+// further ahead than the budget evicts (or fails to admit) the message the FIFO
+// consumer is about to read, so nearly every delivery becomes a cold WAL read.
+// Rather than let the queue reach a message-count high-water mark (52,428) that
+// dwarfs the byte budget, the broker arms THIS gate: the reader parks the
+// producer connection while the cache cannot hold one more message of the size
+// being published, and resumes the instant an acknowledgement frees the room.
+//
+// It holds no reference to the message: only the queue name and the charge, so
+// the gate can outlive the publish call that armed it. AtHighWaterMark is a
+// cheap read of the queue's accounting mirror.
+type hotCacheByteGate struct {
+	c      *hotCache
+	queue  string
+	charge int64
+}
+
+// AtHighWaterMark implements protocol.DepthGate.
+func (g *hotCacheByteGate) AtHighWaterMark() bool {
+	if g == nil {
+		return false
+	}
+	return g.c.residentBytes(g.queue)+g.charge > g.c.queueBytes
+}
+
 // captureAdmission captures the queue's ADMISSION EPOCH and its state.
 //
 // IT IS TAKEN IMMEDIATELY BEFORE A COLD READ, by the delivery reader, so the

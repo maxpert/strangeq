@@ -149,6 +149,26 @@ type Server struct {
 	shutdownErr    error
 	storageClosed  atomic.Bool           // set after storage.Close returns (tests/health)
 	onConnTornDown func(rt *connRuntime) // tests only; nil in production (cold path, §13)
+
+	// --- Task 2: publisher-park instrumentation (append-only) ---
+	//
+	// One queue-depth reader park is one episode of the publisher being paced:
+	// the reader stops pulling publishes off the socket until the queue drains
+	// below the gate. Counting them and summing their duration makes the
+	// pacing VISIBLE (the producer is expected to park continuously once the
+	// queue sits at the gate, rather than sawtoothing between empty and the
+	// depth HWM). Diagnostic only; never gated.
+	publisherParkCount atomic.Uint64
+	publisherParkNanos atomic.Int64
+	publisherParkedNow atomic.Int64
+}
+
+// PublisherParkStats returns (number of completed reader parks, total parked
+// seconds, number of parks currently in progress). Diagnostic only (Task 2).
+func (s *Server) PublisherParkStats() (count uint64, seconds float64, current int64) {
+	return s.publisherParkCount.Load(),
+		float64(s.publisherParkNanos.Load()) / float64(time.Second),
+		s.publisherParkedNow.Load()
 }
 
 // markUnsafeRecovery records that this process booted with --unsafe-recovery
@@ -868,6 +888,20 @@ func (s *Server) parkReaderWhileDepthBackpressured(conn *protocol.Connection) (p
 		conn.SetDepthGate(nil)
 		return false
 	}
+	// One park episode begins here and ends when the gate clears, the
+	// connection tears down, or the liveness timer breaks out. Recording its
+	// duration makes the pacing behaviour measurable rather than inferred.
+	s.publisherParkedNow.Add(1)
+	parkStart := time.Now()
+	defer func() {
+		s.publisherParkedNow.Add(-1)
+		s.publisherParkCount.Add(1)
+		parked := time.Since(parkStart)
+		s.publisherParkNanos.Add(int64(parked))
+		if s.MetricsCollector != nil {
+			s.MetricsCollector.RecordPublisherPark(parked.Seconds())
+		}
+	}()
 	recheck := time.NewTimer(s.readerBackpressureProbeInterval())
 	defer recheck.Stop()
 	liveness := time.NewTimer(s.depthLivenessInterval())

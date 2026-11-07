@@ -62,6 +62,38 @@ func TestDepthPark_ParksAtHWMResumesAndClearsOnDrain(t *testing.T) {
 	require.False(t, conn.DepthBackpressure.Load(), "the gate must be cleared once the queue drains")
 }
 
+// TestPublisherParkStats_CountDurationAndCurrent pins the Task 2 pacing
+// instrumentation: a reader park is counted once when it ends, its duration is
+// accumulated, and the in-progress gauge is 1 while the park is live and 0 once
+// it clears. It makes the pacing visible rather than inferred.
+func TestPublisherParkStats_CountDurationAndCurrent(t *testing.T) {
+	s := newDepthParkServer()
+	conn := protocol.NewConnection(nil)
+	g := &fakeDepthGate{}
+	g.hwm.Store(true)
+	conn.SetDepthGate(g)
+
+	done := make(chan bool, 1)
+	go func() { done <- s.parkReaderWhileDepthBackpressured(conn) }()
+
+	require.Eventually(t, func() bool {
+		_, _, current := s.PublisherParkStats()
+		return current >= 1
+	}, 2*time.Second, time.Millisecond, "a live park must be visible in the current gauge")
+
+	g.hwm.Store(false)
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("park did not resume after the gate cleared")
+	}
+
+	count, seconds, current := s.PublisherParkStats()
+	require.GreaterOrEqual(t, count, uint64(1), "a completed park must be counted")
+	require.Greater(t, seconds, 0.0, "a completed park must accumulate its duration")
+	require.Equal(t, int64(0), current, "no park is in progress after it clears")
+}
+
 // TestDepthPark_SkipsConnectionWithConsumer: depth backpressure must never pause
 // a connection that has an active consumer — it must keep reading to deliver its
 // own basic.ack frames (which drain the very queue), so pausing could deadlock.

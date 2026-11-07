@@ -791,11 +791,8 @@ type Message struct {
 	Exchange        string
 	RoutingKey      string
 	DeliveryTag     uint64
-	Redelivered     bool
 	ContentType     string
 	ContentEncoding string
-	DeliveryMode    uint8 // 1 = non-persistent, 2 = persistent
-	Priority        uint8
 	CorrelationID   string
 	ReplyTo         string
 	Expiration      string
@@ -805,7 +802,6 @@ type Message struct {
 	UserID          string
 	AppID           string
 	ClusterID       string
-	Mandatory       bool
 	// EnqueueUnixMilli is the absolute publish/enqueue instant in Unix
 	// milliseconds, used by SQ-9 (W4) as the anchor for per-message and
 	// per-queue TTL deadline evaluation across a restart. W2 only makes this
@@ -823,6 +819,15 @@ type Message struct {
 	// always inline, bodyKind 0x00) and leaves it nil; only ITER5 will
 	// produce/consume it. The WAL and segment layers treat its contents as opaque.
 	BodyRef []byte
+	// THE ONE-BYTE FIELDS ARE PACKED TOGETHER, LAST. Interleaved with the
+	// pointer-aligned fields above, each of them padded out to a full word
+	// and the struct fell into Go's 320 B size class; packed they share one
+	// word and the struct fits the 288 B class -- paid once per message
+	// resident in the hot cache (see message_layout_test.go).
+	Redelivered  bool
+	Mandatory    bool
+	DeliveryMode uint8 // 1 = non-persistent, 2 = persistent
+	Priority     uint8
 }
 
 // Delivery represents a message delivery to a consumer

@@ -34,6 +34,10 @@ type Collector struct {
 	QueueMessagesUnacked *prometheus.GaugeVec
 	QueueMessagesTotal   *prometheus.GaugeVec
 	QueueConsumers       *prometheus.GaugeVec
+	// QueueDepthHighWater is the per-queue maximum depth (waiting + inflight)
+	// since queue creation (Task 2; diagnostic). Monotonic, so a window's
+	// high-water is at least the value read at the window's end.
+	QueueDepthHighWater *prometheus.GaugeVec
 
 	// Exchange metrics
 	ExchangesTotal    prometheus.Gauge
@@ -147,6 +151,27 @@ type Collector struct {
 	// walBookkeeping points at the binding the GaugeFunc closures read
 	// (nil func → zero gauges). Set once by BindWALBookkeepingStats.
 	walBookkeeping *atomic.Value
+
+	// --- Task 2: cold-read / publisher-park instrumentation ---
+	//
+	// HotCacheDeliveryHits / ColdReads / Preads classify every
+	// GetMessageForDelivery call. The hot-hit ratio is
+	// hits / (hits + cold_reads); preads per delivered message is
+	// preads / deliveries. All three carry a queue label.
+	HotCacheDeliveryHits      *prometheus.CounterVec
+	HotCacheDeliveryColdReads *prometheus.CounterVec
+	HotCacheDeliveryPreads    *prometheus.CounterVec
+
+	// Pacing metrics: PublisherParksTotal counts completed reader parks,
+	// PublisherParkSecondsTotal sums their duration, PublisherParkDuration is
+	// their histogram, and PublisherParkedCurrent is the number in progress
+	// (read at scrape time via BindPublisherParkStats).
+	PublisherParksTotal       prometheus.Counter
+	PublisherParkSecondsTotal prometheus.Counter
+	PublisherParkDuration     prometheus.Histogram
+	PublisherParkedCurrent    prometheus.GaugeFunc
+
+	publisherParkStats *atomic.Value
 }
 
 // NewCollector creates a new metrics collector with all Prometheus metrics
@@ -164,6 +189,11 @@ func NewCollector(namespace string) *Collector {
 	// time; walBookkeeping is the shared cell they and
 	// BindWALBookkeepingStats both use.
 	walBookkeeping := &atomic.Value{}
+
+	// Task 2: the publisher-park gauges read the server's accessor at scrape
+	// time; publisherParkStats is the shared cell the closures and
+	// BindPublisherParkStats both use.
+	publisherParkStats := &atomic.Value{}
 
 	c := &Collector{
 		// Connection metrics
@@ -235,6 +265,11 @@ func NewCollector(namespace string) *Collector {
 			Namespace: namespace,
 			Name:      "queue_consumers",
 			Help:      "Number of consumers on queue",
+		}, []string{"queue", "vhost"}),
+		QueueDepthHighWater: promauto.NewGaugeVec(prometheus.GaugeOpts{
+			Namespace: namespace,
+			Name:      "queue_depth_high_water",
+			Help:      "Maximum queue depth (waiting + inflight) observed since queue creation (Task 2; diagnostic)",
 		}, []string{"queue", "vhost"}),
 
 		// Exchange metrics
@@ -596,10 +631,92 @@ func NewCollector(namespace string) *Collector {
 			}
 			return 0
 		}),
+
+		// Task 2: delivery-path cold-read instrumentation. Every
+		// GetMessageForDelivery is exactly one of a hit or a cold read, so the
+		// hot-hit ratio is hits/(hits+cold_reads) and preads per delivered
+		// message is preads/deliveries.
+		HotCacheDeliveryHits: promauto.NewCounterVec(prometheus.CounterOpts{
+			Namespace: namespace,
+			Name:      "hot_cache_delivery_hits_total",
+			Help:      "Deliveries served from the hot cache (no cold-tier read)",
+		}, []string{"queue"}),
+		HotCacheDeliveryColdReads: promauto.NewCounterVec(prometheus.CounterOpts{
+			Namespace: namespace,
+			Name:      "hot_cache_delivery_cold_reads_total",
+			Help:      "Deliveries that missed the hot cache and read a cold tier",
+		}, []string{"queue"}),
+		HotCacheDeliveryPreads: promauto.NewCounterVec(prometheus.CounterOpts{
+			Namespace: namespace,
+			Name:      "hot_cache_delivery_preads_total",
+			Help:      "Positional reads the delivery WAL parse issues (one header + one payload per record; the optional shared-body-block read is not counted)",
+		}, []string{"queue"}),
+
+		// Task 2: publisher pacing.
+		PublisherParksTotal: promauto.NewCounter(prometheus.CounterOpts{
+			Namespace: namespace,
+			Name:      "publisher_parked_total",
+			Help:      "Completed queue-depth reader parks (one = one pacing episode)",
+		}),
+		PublisherParkSecondsTotal: promauto.NewCounter(prometheus.CounterOpts{
+			Namespace: namespace,
+			Name:      "publisher_park_seconds_total",
+			Help:      "Total seconds the publisher reader spent parked on queue-depth backpressure",
+		}),
+		PublisherParkDuration: promauto.NewHistogram(prometheus.HistogramOpts{
+			Namespace: namespace,
+			Name:      "publisher_park_duration_seconds",
+			Help:      "Duration of one queue-depth reader park",
+			Buckets:   prometheus.ExponentialBuckets(0.0001, 4, 10),
+		}),
+		PublisherParkedCurrent: promauto.NewGaugeFunc(prometheus.GaugeOpts{
+			Namespace: namespace,
+			Name:      "publisher_parked_current",
+			Help:      "Queue-depth reader parks currently in progress",
+		}, func() float64 {
+			if fn, ok := publisherParkStats.Load().(func() (uint64, float64, int64)); ok && fn != nil {
+				_, _, current := fn()
+				return float64(current)
+			}
+			return 0
+		}),
 	}
 	c.publishLeaseStats = leaseStats
 	c.walBookkeeping = walBookkeeping
+	c.publisherParkStats = publisherParkStats
 	return c
+}
+
+// RecordHotCacheDeliveryHit counts one delivery served from the hot cache.
+func (c *Collector) RecordHotCacheDeliveryHit(queue string) {
+	c.HotCacheDeliveryHits.WithLabelValues(queue).Inc()
+}
+
+// RecordHotCacheDeliveryColdRead counts one delivery that read a cold tier.
+func (c *Collector) RecordHotCacheDeliveryColdRead(queue string) {
+	c.HotCacheDeliveryColdReads.WithLabelValues(queue).Inc()
+}
+
+// RecordHotCacheDeliveryPread counts n positional reads on the delivery cold
+// path.
+func (c *Collector) RecordHotCacheDeliveryPread(queue string, n int) {
+	if n <= 0 {
+		return
+	}
+	c.HotCacheDeliveryPreads.WithLabelValues(queue).Add(float64(n))
+}
+
+// RecordPublisherPark observes one completed queue-depth reader park.
+func (c *Collector) RecordPublisherPark(seconds float64) {
+	c.PublisherParksTotal.Inc()
+	c.PublisherParkSecondsTotal.Add(seconds)
+	c.PublisherParkDuration.Observe(seconds)
+}
+
+// BindPublisherParkStats binds the server's publisher-park accessor the
+// amqp_publisher_parked_* gauge reads at scrape time. DIAGNOSTIC ONLY.
+func (c *Collector) BindPublisherParkStats(stats func() (count uint64, seconds float64, current int64)) {
+	c.publisherParkStats.Store(stats)
 }
 
 // BindWALBookkeepingStats binds the WAL bookkeeping accessor the
@@ -751,6 +868,7 @@ func (c *Collector) DeleteQueueMetrics(queueName, vhost string) {
 	c.QueueMessagesUnacked.Delete(labels)
 	c.QueueMessagesTotal.Delete(labels)
 	c.QueueConsumers.Delete(labels)
+	c.QueueDepthHighWater.Delete(labels)
 }
 
 // SetConsumersTotal sets the total number of consumers

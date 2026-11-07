@@ -14,3 +14,14 @@ func (a *StorageBrokerAdapter) QueueReadyCount(name string) uint32 {
 	}
 	return a.broker.GetQueueReadyCount(name)
 }
+
+// QueueDepthHighWater reports a queue's maximum observed depth (waiting +
+// inflight) since it was created. Diagnostic only (Task 2); unknown queues
+// report 0. It backs the telemetry poller's per-queue high-water gauge through
+// the same optional-seam pattern as QueueReadyCount.
+func (a *StorageBrokerAdapter) QueueDepthHighWater(name string) uint64 {
+	if a == nil || a.broker == nil {
+		return 0
+	}
+	return a.broker.GetQueueDepthHighWater(name)
+}

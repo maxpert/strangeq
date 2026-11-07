@@ -110,6 +110,18 @@ func TestWSB_FrameBudget_ReleaseWakesReader(t *testing.T) {
 		return stalled
 	}, 2*time.Second, 100*time.Millisecond)
 
+	// Snapshot the writer's progress BEFORE the release that can wake the
+	// reader. Order matters: on a busy runner this goroutine can be preempted
+	// between the drain below and a baseline captured after it, so the
+	// baseline would record the post-cascade plateau (admitted + 1 pending)
+	// and sent > before becomes unsatisfiable by design. The baseline must
+	// precede the action it measures.
+	// Falsifiability: the budget is exhausted at snapshot time and the ONLY
+	// thing that frees budget is the release below, so a lost wake still
+	// leaves sent pinned at before and Eventually fails — the assertion keeps
+	// its teeth.
+	before := sent.Load()
+
 	// Drain one frame from the FrameQueue and release its budget.
 	select {
 	case f := <-conn.FrameQueue:
@@ -119,7 +131,6 @@ func TestWSB_FrameBudget_ReleaseWakesReader(t *testing.T) {
 		t.Fatal("no frame queued")
 	}
 
-	before := sent.Load()
 	require.Eventually(t, func() bool {
 		return sent.Load() > before
 	}, 2*time.Second, 20*time.Millisecond, "releasing budget must wake the reader")

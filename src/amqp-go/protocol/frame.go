@@ -96,15 +96,22 @@ func ReadFrameWithLimit(reader io.Reader, maxSize uint32) (*Frame, error) {
 		return nil, err
 	}
 
-	// Read the payload + end-byte
-	payload := make([]byte, size+1) // +1 for end-byte
-	_, err = io.ReadFull(reader, payload)
+	// Read the payload at exactly its size, then the end-byte on its own (see
+	// ReadFrameOptimizedWithLimit: size+1 spills a size-class-aligned body
+	// into the next class).
+	payload := make([]byte, size)
+	if size > 0 {
+		if _, err = io.ReadFull(reader, payload); err != nil {
+			return nil, err
+		}
+	}
+	end, err := readFrameEnd(reader, header[:1], size)
 	if err != nil {
 		return nil, err
 	}
 
 	// Verify end-byte
-	if payload[size] != 0xCE {
+	if end != 0xCE {
 		return nil, fmt.Errorf("invalid frame end-byte")
 	}
 
@@ -112,7 +119,7 @@ func ReadFrameWithLimit(reader io.Reader, maxSize uint32) (*Frame, error) {
 		Type:    frameType,
 		Channel: channel,
 		Size:    size,
-		Payload: payload[:size],
+		Payload: payload,
 	}, nil
 }
 

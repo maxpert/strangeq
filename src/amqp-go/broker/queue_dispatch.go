@@ -122,6 +122,16 @@ type QueueState struct {
 	pendingCount atomic.Int64
 	pendingBytes atomic.Int64
 	frontierResv map[uint64]int64
+
+	// depthHighWaterSeen is the MAXIMUM Depth() (waiting+inflight) observed on
+	// this queue since it was created. Diagnostic only (Task 2): it lets the
+	// benchmark harness read a measured window's backlog high-water directly
+	// instead of inferring it from per-second ready samples. It is APPENDED at
+	// the end of the struct so every dispatch-plane hot-field offset above is
+	// unchanged (broker/queue_state_layout_test.go), and it is updated only
+	// when a publish exposes real messages (FrontierComplete), so it costs
+	// nothing on the delivery hot path.
+	depthHighWaterSeen atomic.Uint64
 }
 
 // Policy returns the queue's resolved policy, or nil if the queue has no
@@ -407,9 +417,29 @@ func (qs *QueueState) FrontierComplete(tag uint64, real bool) {
 	}
 	qs.frontierMu.Unlock()
 
+	if newlyReal > 0 {
+		qs.noteDepthHighWater()
+	}
 	qs.casMaxHead(newHead)
 	qs.NotifyNewMessage()
 }
+
+// noteDepthHighWater records the queue's current depth if it exceeds the
+// maximum recorded so far. Diagnostic only; a couple of atomic loads and a
+// CAS-max, and it is called only when a publish exposes real messages.
+func (qs *QueueState) noteDepthHighWater() {
+	d := qs.Depth()
+	for {
+		cur := qs.depthHighWaterSeen.Load()
+		if d <= cur || qs.depthHighWaterSeen.CompareAndSwap(cur, d) {
+			return
+		}
+	}
+}
+
+// DepthHighWaterSeen returns the maximum Depth() (waiting+inflight) observed on
+// this queue since it was created. Diagnostic only (Task 2).
+func (qs *QueueState) DepthHighWaterSeen() uint64 { return qs.depthHighWaterSeen.Load() }
 
 // frontierAdvanceLocked pops the contiguous done-prefix off the pending ring and
 // returns the new head target (lowest still-pending tag, or frontierMax+1 when

@@ -27,6 +27,11 @@ type QueueStat struct {
 	Ready      int
 	ReadyKnown bool
 	Consumers  int
+	// HighWater is the maximum queue depth (waiting + inflight) observed since
+	// the queue was created, when the provider exposes it (Task 2). Diagnostic
+	// only.
+	HighWater    int
+	HighWaterSet bool
 }
 
 // QueueStatsProvider supplies a point-in-time queue snapshot. Implementations
@@ -120,6 +125,9 @@ func (p *queuePoller) pollOnce(q QueueStatsProvider, alarms AlarmStateProvider) 
 		key := queueKey{name: stat.Name, vhost: vhost}
 		current[key] = struct{}{}
 		p.collector.UpdateQueueReadyAndConsumers(stat.Name, vhost, stat.Ready, stat.ReadyKnown, stat.Consumers)
+		if stat.HighWaterSet {
+			p.collector.QueueDepthHighWater.WithLabelValues(stat.Name, vhost).Set(float64(stat.HighWater))
+		}
 	}
 
 	for key := range p.last {

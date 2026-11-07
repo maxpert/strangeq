@@ -61,22 +61,72 @@ func ReadFrameOptimizedWithLimit(reader io.Reader, maxSize uint32) (*Frame, erro
 		return nil, err
 	}
 
-	payload := make([]byte, size+1)
-	_, err = io.ReadFull(reader, payload)
+	// THE PAYLOAD IS ALLOCATED AT EXACTLY ITS SIZE, AND THE FRAME-END OCTET IS
+	// READ SEPARATELY. A single-frame body is DONATED to the stored message
+	// (processBodyFrame), so this backing array is what the hot cache, the WAL
+	// hand-off and the publish lease keep alive for the life of the message.
+	// Reading the end octet into the same allocation (size+1) pushes a body
+	// whose size sits on a Go size-class or page boundary into the next class:
+	// a 1 KiB body costs 1,152 B and a 64 KiB body 73,728 B (one extra 8 KiB
+	// page) -- +12.5 % of every in-flight body. See
+	// frame_payload_sizeclass_test.go.
+	//
+	// The end octet is read through readFrameEnd, which uses the reader's
+	// io.ByteReader fast path. The production connection reader is a
+	// *bufio.Reader (protocol/structures.go:189, 64 KiB by default), and at
+	// the moment the end octet is read the buffer is non-empty because the
+	// preceding 7-byte header read always fills it, so ReadByte is served from
+	// the buffer and does NOT issue a read syscall. That is asserted by
+	// TestReadFrameOptimized_EndOctetIsBufferServed, and was confirmed for the
+	// F3 64 KiB shape: 64 frames cost 65 underlying reads either way (1
+	// fill/frame -- the frame is larger than the 64 KiB buffer, so a refill is
+	// owed regardless).
+	payload := make([]byte, size)
+	if size > 0 {
+		if _, err = io.ReadFull(reader, payload); err != nil {
+			return nil, err
+		}
+	}
+	end, err := readFrameEnd(reader, header[:1], size)
 	if err != nil {
 		return nil, err
 	}
-
-	if payload[size] != FrameEnd {
-		return nil, fmt.Errorf("invalid frame end-byte: expected 0x%02X, got 0x%02X", FrameEnd, payload[size])
+	if end != FrameEnd {
+		return nil, fmt.Errorf("invalid frame end-byte: expected 0x%02X, got 0x%02X", FrameEnd, end)
 	}
 
 	frame := GetFrame()
 	frame.Type = frameType
 	frame.Channel = channel
 	frame.Size = size
-	frame.Payload = payload[:size]
+	frame.Payload = payload
 	return frame, nil
+}
+
+// readFrameEnd reads the one-octet frame-end marker that follows a payload of
+// payloadSize bytes. scratch is a one-byte buffer the caller owns (the pooled
+// frame header, already parsed), so the read allocates nothing; a buffered
+// reader (the production connection's *bufio.Reader) serves it from its buffer
+// via the io.ByteReader fast path, without a read syscall.
+//
+// An EOF here means the payload arrived but its frame-end octet did not: for
+// a non-empty payload that is a truncated frame, and it is reported as
+// io.ErrUnexpectedEOF exactly as the former single size+1 read reported it.
+func readFrameEnd(reader io.Reader, scratch []byte, payloadSize uint32) (byte, error) {
+	if br, ok := reader.(io.ByteReader); ok {
+		b, err := br.ReadByte()
+		if err == io.EOF && payloadSize > 0 {
+			err = io.ErrUnexpectedEOF
+		}
+		return b, err
+	}
+	if _, err := io.ReadFull(reader, scratch[:1]); err != nil {
+		if err == io.EOF && payloadSize > 0 {
+			err = io.ErrUnexpectedEOF
+		}
+		return 0, err
+	}
+	return scratch[0], nil
 }
 
 func ReadFrameOptimized(reader io.Reader) (*Frame, error) {
