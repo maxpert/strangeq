@@ -56,7 +56,7 @@ SECURITY.md            Security policy
 ## Troubleshooting
 
 ### Build failing
-- Verify Go version: `go version` (needs 1.25.1+)
+- Verify Go version: `go version` (needs 1.27.3+)
 - Run locally: `go build ./cmd/amqp-server`
 - Check logs in the Actions tab
 

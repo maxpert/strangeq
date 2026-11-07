@@ -2,7 +2,11 @@
 
 ## [Unreleased]
 
+## [0.12.0] - 2026-11-07
+
 ### Changed
+- Build and release toolchain is Go 1.27.3: `go.mod` (both modules), all four
+  CI `setup-go` steps, the Dockerfile and the docs moved together.
 - The default listener now binds `127.0.0.1:5672` instead of all interfaces. Use
   `network.address` (or `AMQP_NETWORK_ADDRESS`) to expose the broker, and read
   the startup security warnings before doing so.
@@ -34,6 +38,12 @@
   and `.dockerignore`.
 
 ### Fixed
+- CI is green again: four `basic.get` tests asserted cross-connection visibility
+  of a fire-and-forget publish, which AMQP does not guarantee, and a gated WAL
+  fsync parked the commit loop while broker teardown joined it, turning a 30 s
+  assertion failure into a 10-minute package timeout. The test step now carries
+  an explicit 25-minute timeout and `setup-go` is given the module path so its
+  Go cache key resolves.
 - `--telemetry-port` and `--tls-*` flags no longer override config with their
   defaults when the operator did not pass them.
 - Unknown usernames no longer return measurably faster than wrong passwords.
@@ -55,7 +65,7 @@
 - Full AMQP 0.9.1 protocol implementation
 - Exchange types: direct, fanout, topic, headers
 - Exchange-to-exchange bindings with cycle detection
-- Three-tier storage architecture (ring buffer, WAL, segments)
+- Three-tier storage architecture (in-memory hot cache, WAL, segments)
 - Persistent and non-persistent messages with crash recovery
 - TLS/SSL encryption with mutual TLS support
 - SASL authentication (PLAIN, ANONYMOUS)

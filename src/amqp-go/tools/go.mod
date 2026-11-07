@@ -1,6 +1,6 @@
 module github.com/maxpert/amqp-go/tools
 
-go 1.25.1
+go 1.27.3
 
 tool golang.org/x/perf/cmd/benchstat
 

@@ -22,7 +22,7 @@ A clear and concise description of what you expected to happen.
 **Environment:**
  - OS: [e.g. Ubuntu 22.04, macOS 14, Windows 11]
  - AMQP-Go Version: [e.g. v0.1.0]
- - Go Version: [e.g. 1.25.1]
+ - Go Version: [e.g. 1.27.3]
   - Storage: [e.g. persistent (default), in-memory]
 
 **Configuration:**

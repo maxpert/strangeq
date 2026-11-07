@@ -26,14 +26,14 @@
 2. Commit final changes:
    ```bash
    git add CHANGELOG.md
-   git commit -m "chore: prepare for v0.1.0 release"
+   git commit -m "chore: prepare for v0.12.0 release"
    git push origin main
    ```
 
 3. Create and push tag:
    ```bash
-   git tag -a v0.1.0 -m "Release v0.1.0"
-   git push origin v0.1.0
+   git tag -a v0.12.0 -m "Release v0.12.0"
+   git push origin v0.12.0
    ```
 
 4. Create GitHub release:
@@ -46,8 +46,8 @@
 
 6. Verify:
    ```bash
-   wget https://github.com/maxpert/strangeq/releases/download/v0.1.0/amqp-server-0.1.0-linux-amd64.tar.gz
-   wget https://github.com/maxpert/strangeq/releases/download/v0.1.0/amqp-server-0.1.0-linux-amd64.tar.gz.sha256
+   wget https://github.com/maxpert/strangeq/releases/download/v0.12.0/amqp-server-0.1.0-linux-amd64.tar.gz
+   wget https://github.com/maxpert/strangeq/releases/download/v0.12.0/amqp-server-0.1.0-linux-amd64.tar.gz.sha256
    sha256sum -c amqp-server-0.1.0-linux-amd64.tar.gz.sha256
    ```
 
@@ -59,13 +59,13 @@
 ## Hotfix
 
 ```bash
-git checkout -b hotfix/0.1.1 v0.1.0
+git checkout -b hotfix/0.12.1 v0.12.0
 # make fix
 git commit -m "fix: critical bug description"
-git tag -a v0.1.1 -m "Hotfix v0.1.1"
-git push origin v0.1.1
+git tag -a v0.12.1 -m "Hotfix v0.12.1"
+git push origin v0.12.1
 # create GitHub release, then merge back to main
 git checkout main
-git merge hotfix/0.1.1
+git merge hotfix/0.12.1
 git push origin main
 ```

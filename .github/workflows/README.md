@@ -30,5 +30,5 @@ go build ./cmd/amqp-server
 3. Check Actions tab for errors
 
 ### Build failures
-1. Check Go version (requires 1.25.1+)
+1. Check Go version (requires 1.27.3+)
 2. Run locally: `go test ./... && go build ./cmd/amqp-server`

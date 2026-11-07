@@ -1,6 +1,6 @@
 module github.com/maxpert/amqp-go
 
-go 1.25.1
+go 1.27.3
 
 require (
 	github.com/HdrHistogram/hdrhistogram-go v1.2.0

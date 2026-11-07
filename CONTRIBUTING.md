@@ -16,7 +16,7 @@
 ## Development Setup
 
 ### Prerequisites
-- Go 1.25.1 or later
+- Go 1.27.3 or later
 - Git
 
 ### Build
