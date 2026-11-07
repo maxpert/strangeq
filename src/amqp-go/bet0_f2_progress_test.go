@@ -233,7 +233,13 @@ func TestBet0_DeficitVerdictDiscriminates(t *testing.T) {
 // predicate ONLY after liveness passed, so liveness's IMBALANCE is always the
 // returned verdict — even when a deficit series would also fire.
 func TestBet0_DeficitVerdictCannotSuppressBalance(t *testing.T) {
+	// The balance term is what must not be suppressed, so use an explicitly
+	// balance-enabled policy. bet0Policy() only enables minBalance under -race
+	// (the instrumented path); pinning it here makes the test deterministic on
+	// both builds instead of passing only under the race detector.
 	policy := bet0Policy()
+	policy.minBalance = bet0MinQueueBalance
+	policy.minRateRatio = 0
 	rows := []struct {
 		name    string
 		samples []bet0Sample
@@ -289,9 +295,6 @@ func TestBet0_DeficitVerdictOffByDefault(t *testing.T) {
 		t.Skip("STRANGEQ_F2_DIAG is set; this control only applies with it unset")
 	}
 	results := []*bet0LoadResult{{}, {}}
-	for i := range results {
-		results[i] = &bet0LoadResult{}
-	}
 	stop := bet0F2StartSampler(results)
 	stop()
 	if got := bet0F2SeriesIfDiagnosticEnabled(); got != nil {

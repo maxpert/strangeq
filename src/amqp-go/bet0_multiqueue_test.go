@@ -425,11 +425,16 @@ func TestBet0_ConsumerDeathHintSurfacesAckError(t *testing.T) {
 // TestBet0_DeathHintIsAppendedNotSubstituted: the balance verdict still comes
 // first and is never replaced by the death evidence.
 func TestBet0_DeathHintIsAppendedNotSubstituted(t *testing.T) {
+	// Pin the balance-enabled policy: bet0Policy() only turns the balance term
+	// on under -race, and this test is about the balance verdict class.
+	policy := bet0Policy()
+	policy.minBalance = bet0MinQueueBalance
+	policy.minRateRatio = 0
 	samples := []bet0Sample{
 		{name: "q1", published: 100000, consumed: 90000},
 		{name: "q2", published: 100000, consumed: 35000},
 	}
-	livenessErr := bet0CheckLiveness(samples, bet0Policy())
+	livenessErr := bet0CheckLiveness(samples, policy)
 	require.Error(t, livenessErr)
 	require.Contains(t, livenessErr.Error(), "IMBALANCE",
 		"the partial-starvation verdict class must be unchanged")
