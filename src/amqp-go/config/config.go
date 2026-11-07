@@ -45,8 +45,12 @@ func DefaultConfig() *AMQPConfig {
 			// Durable by default: an explicit non-nil true so --generate-config
 			// emits `fsync: true` (not `fsync: null`) and the no-config path is
 			// unambiguously durable. Set fsync:false to opt out of the barrier.
-			Fsync:       boolPtr(true),
-			CRCCheck:    boolPtr(true),
+			Fsync:    boolPtr(true),
+			CRCCheck: boolPtr(true),
+			// Durable-confirm crash model: F_BARRIERFSYNC on macOS (the
+			// default). Set force_flush to restore the full F_FULLFSYNC
+			// drive-cache flush. No effect off darwin.
+			CrashModel:  interfaces.CrashModelBarrier,
 			CacheMB:     64,       // 64 MB metadata cache
 			MaxFiles:    100,      // Max open file handles
 			RetentionMS: 86400000, // 24 hours
@@ -221,17 +225,36 @@ func (c *AMQPConfig) CRCEnabled() bool {
 	return c.Storage.CRCCheck == nil || *c.Storage.CRCCheck
 }
 
+// CrashModel returns the effective durable-confirm crash model. An omitted key
+// ("" on a zero-value Load caller) normalizes to CrashModelBarrier, the safe
+// shipped default, so every zero-value path stays on the ordered barrier.
+func (c *AMQPConfig) CrashModel() string {
+	if c.Storage.CrashModel == "" {
+		return interfaces.CrashModelBarrier
+	}
+	return c.Storage.CrashModel
+}
+
+// CrashModelForceFlush reports whether the full drive-cache flush
+// (crash_model: force_flush, F_FULLFSYNC on darwin) is selected. "" and
+// "barrier" both map to false; only an explicit "force_flush" is true.
+func (c *AMQPConfig) CrashModelForceFlush() bool {
+	return c.CrashModel() == interfaces.CrashModelForceFlush
+}
+
 // GetEngine returns engine tuning configuration. It overlays the single user
 // fsync knob onto the internal (inverted) WALSyncDisabled transport and the
 // CRC knob onto WALCRCDisabled so the storage layer honors both while every
-// zero-value path stays durable and integrity-checked. Storage.UnsafeRecovery
-// rides the same overlay (same sense, not inverted: false = refuse to start on
-// an unrecoverable directory) because storage CONSTRUCTION is where an
+// zero-value path stays durable and integrity-checked. The crash-model knob
+// rides the same overlay (same sense: the zero value = the safe barrier
+// default), and Storage.UnsafeRecovery too (false = refuse to start on an
+// unrecoverable directory) because storage CONSTRUCTION is where an
 // unparseable WAL framing version is first detected.
 func (c *AMQPConfig) GetEngine() interfaces.EngineConfig {
 	e := c.Engine
 	e.WALSyncDisabled = !c.FsyncEnabled()
 	e.WALCRCDisabled = !c.CRCEnabled()
+	e.CrashModel = c.CrashModel()
 	e.UnsafeRecovery = c.Storage.UnsafeRecovery
 	return e
 }
@@ -265,6 +288,17 @@ func (c *AMQPConfig) Validate() error {
 	// Validate storage configuration
 	if c.Storage.Path == "" {
 		return fmt.Errorf("storage path cannot be empty")
+	}
+
+	// The durable-confirm crash model. "" is accepted for zero-value Load
+	// callers and normalizes to the barrier default; anything else outside the
+	// two documented values FAILS at boot rather than silently selecting a
+	// primitive nobody asked for.
+	switch c.Storage.CrashModel {
+	case "", interfaces.CrashModelBarrier, interfaces.CrashModelForceFlush:
+	default:
+		return fmt.Errorf("invalid storage.crash_model %q: allowed values are %q and %q (omit for the default %q)",
+			c.Storage.CrashModel, interfaces.CrashModelBarrier, interfaces.CrashModelForceFlush, interfaces.CrashModelBarrier)
 	}
 
 	// Validate security configuration

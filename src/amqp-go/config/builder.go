@@ -88,6 +88,14 @@ func (b *ConfigBuilder) WithCRCCheck(enabled bool) *ConfigBuilder {
 	return b
 }
 
+// WithCrashModel sets the durable-confirm crash model: interfaces.CrashModelBarrier
+// (F_BARRIERFSYNC, the default) or interfaces.CrashModelForceFlush
+// (F_FULLFSYNC). Any other value is rejected by Validate/Build.
+func (b *ConfigBuilder) WithCrashModel(model string) *ConfigBuilder {
+	b.config.Storage.CrashModel = model
+	return b
+}
+
 // WithCacheSize sets the storage cache size in megabytes
 func (b *ConfigBuilder) WithCacheSize(sizeMB int64) *ConfigBuilder {
 	b.config.Storage.CacheMB = sizeMB

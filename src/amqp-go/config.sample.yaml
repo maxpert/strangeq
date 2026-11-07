@@ -92,6 +92,17 @@ storage:
   # Omitting this key defaults to CRC ON (safe). Record format is unchanged.
   crccheck: true
 
+  # Crash model for the durable confirm barrier (macOS only; no effect on Linux,
+  # where both values use fdatasync).
+  # barrier (default) = fcntl(F_BARRIERFSYNC): the batch is handed to the drive
+  #   under an ordering barrier. Confirmed messages survive kill -9 and an OS
+  #   crash; a sudden power loss can lose the most recent confirmed messages
+  #   still in the drive's volatile cache (survivors are a prefix in WAL order).
+  # force_flush = fcntl(F_FULLFSYNC): the full drive-cache flush, so confirmed
+  #   messages also survive power loss. Restores the pre-barrier behaviour.
+  # Anything else fails at boot.
+  crash_model: barrier
+
   # Message TTL in seconds (0 = no expiration)
   messagettl: 0
 

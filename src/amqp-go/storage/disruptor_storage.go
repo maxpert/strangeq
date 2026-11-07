@@ -164,6 +164,13 @@ func WALConfigFromEngine(ec interfaces.EngineConfig) WALConfig {
 	cfg.SyncDisabled = ec.WALSyncDisabled
 	cfg.CRCDisabled = ec.WALCRCDisabled
 	cfg.UnsafeRecovery = ec.UnsafeRecovery
+	// ConfirmSync: the zero value (walConfirmBarrier) is the default, so any
+	// value other than the explicit "force_flush" — including the empty string
+	// of a zero-value EngineConfig{} — keeps the barrier. This mirrors the
+	// zero-value-means-safe contract of the fields above.
+	if ec.CrashModel == interfaces.CrashModelForceFlush {
+		cfg.ConfirmSync = walConfirmForceFlush
+	}
 	if ec.WALBatchSize > 0 {
 		cfg.BatchSize = ec.WALBatchSize
 	}

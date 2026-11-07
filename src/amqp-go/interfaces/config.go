@@ -97,6 +97,21 @@ type NetworkConfig struct {
 	PublishInflightBudgetBytes int64
 }
 
+// Accepted values of StorageConfig.CrashModel. The empty string is also
+// accepted and means CrashModelBarrier (the shipped default).
+const (
+	// CrashModelBarrier is the default confirm primitive: fcntl(F_BARRIERFSYNC)
+	// on macOS. A confirmed message survives a process kill and an OS crash; a
+	// sudden power loss can still lose the most recent confirmed messages that
+	// the drive had accepted but not yet written from its volatile cache.
+	CrashModelBarrier = "barrier"
+
+	// CrashModelForceFlush is the opt-in full drive-cache flush:
+	// fcntl(F_FULLFSYNC) on macOS. Confirmed messages then also survive power
+	// loss, restoring the pre-barrier behaviour exactly.
+	CrashModelForceFlush = "force_flush"
+)
+
 // StorageConfig holds storage-related configuration
 type StorageConfig struct {
 	// Path is the directory where all persistent data is stored
@@ -124,6 +139,31 @@ type StorageConfig struct {
 	// when disabled. The read path skips verification when the stored CRC is
 	// zero, so mixed files (some with CRC, some without) are handled gracefully.
 	CRCCheck *bool
+
+	// CrashModel selects the primitive the TWO WAL confirm barriers — the
+	// group-commit batch fsync and the transaction slow-path fsync — issue on
+	// macOS. It is the crash-consistency contract a publisher confirm implies:
+	//
+	//   "" or "barrier" (default)
+	//        fcntl(F_BARRIERFSYNC): fsync the batch's bytes to the drive, then
+	//        issue an ORDERING BARRIER instead of flushing the drive's volatile
+	//        write cache. A confirmed message survives a process kill (kill -9)
+	//        and an operating-system crash, because the bytes were handed to
+	//        the drive. On a SUDDEN POWER LOSS the most recently confirmed
+	//        messages that the drive accepted but had not yet written from its
+	//        volatile cache can be lost; on drives that honour barriers what
+	//        survives is a prefix of the log in write order.
+	//
+	//   "force_flush"
+	//        fcntl(F_FULLFSYNC): the full drive-cache flush. Confirmed messages
+	//        also survive power loss. This restores the pre-barrier behaviour
+	//        byte-for-byte and is the opt-in for drives that do not order
+	//        across barrier epochs.
+	//
+	// On Linux and every non-darwin platform both values use fdatasync, which
+	// already flushes the drive cache, so this setting has NO effect there.
+	// Any value other than the two above is rejected by Validate.
+	CrashModel string
 
 	// Message settings
 	MessageTTL int64 // Message TTL in seconds (0 = no TTL)
@@ -359,6 +399,17 @@ type EngineConfig struct {
 	// fdatasync is skipped (Storage.Fsync=false). It never disables the
 	// transaction fsync (WriteTxAtomic is always durable).
 	WALSyncDisabled bool `json:"wal_sync_disabled"`
+
+	// CrashModel is the internal transport for the user Storage.CrashModel
+	// flag. Zero value ("") and "barrier" both request the group-commit and
+	// transaction confirm barriers issue fcntl(F_BARRIERFSYNC) on darwin;
+	// "force_flush" requests fcntl(F_FULLFSYNC), the pre-barrier full
+	// drive-cache flush. On Linux and every non-darwin platform both behave
+	// identically (fdatasync), so the value is inert there. Only the config
+	// layer sets it, from GetEngine(); storage maps anything other than
+	// "force_flush" to the barrier default, so a zero-value EngineConfig{}
+	// stays on the safe-by-default barrier.
+	CrashModel string `json:"wal_crash_model"`
 
 	// UnsafeRecovery is the internal transport for the user-facing
 	// StorageConfig.UnsafeRecovery flag (--unsafe-recovery). Zero value

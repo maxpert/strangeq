@@ -157,22 +157,56 @@ func SetWALStageHookForTest(fn func(stagedRecords int)) (restore func()) {
 	return func() { walStageHook.Store(prev) }
 }
 
+// --- raw ordered-sync command (crash_model observability) ------------------
+
+// walSyncCmdFn is the signature of the raw ordered-sync fcntl a confirm barrier
+// issues: fcntl(fd, cmd), where cmd is F_BARRIERFSYNC (85) for the
+// crash_model: barrier fence and F_FULLFSYNC (51) for the full drive-cache
+// flush, on darwin. It is consulted by BOTH fullFsyncFD and barrierFsyncFD
+// (fdatasync_darwin.go), so a test can observe — and fault — exactly which
+// command each durability site issues, and can make either command report
+// EINVAL/ENOTSUP to drive the barrier -> full-flush fallback.
+//
+// It is inert on Linux and every other platform: those have no fcntl sync
+// command, barrierSyncFile is fdatasyncFile, and crash_model has no effect.
+type walSyncCmdFn func(fd uintptr, cmd int) error
+
+var walSyncCmdHook atomic.Pointer[walSyncCmdFn]
+
+// SetWALSyncCmdForTest installs fn as the raw fcntl issued by the darwin
+// confirm fence and full flush, and returns a restore function. TEST-ONLY: the
+// site-pin tests use it to record the command each durability site issues (51
+// at the FULL sites, 85 at the two confirm sites under the default), so a
+// later change that quietly routes a FULL site through the barrier fails the
+// pin. Never called by production code; nil = the real x/sys/unix call.
+func SetWALSyncCmdForTest(fn func(fd uintptr, cmd int) error) (restore func()) {
+	prev := walSyncCmdHook.Load()
+	f := walSyncCmdFn(fn)
+	walSyncCmdHook.Store(&f)
+	return func() { walSyncCmdHook.Store(prev) }
+}
+
 // --- WAL transaction fsync ------------------------------------------------
 
 // walTxFsyncHook installs over the walFsyncFn type declared alongside the
 // group-commit fsync hook (wal_manager.go).
 var walTxFsyncHook atomic.Pointer[walFsyncFn]
 
-// walTxFsync is the fdatasync performed by writeTxAtomic. Default:
-// fdatasyncFile — identical to the pre-hook behaviour, which called
-// fdatasyncFile directly. It is deliberately NOT routed through
-// walGroupCommitFsync: tests that fault the group-commit barrier must not
-// break transaction commits (and vice versa).
-func walTxFsync(f *os.File) error {
+// walTxFsync is the confirm barrier performed by writeTxAtomic. The hook, when
+// installed, wins and REPLACES the primitive entirely. Otherwise force selects
+// the full drive-cache flush (fdatasyncFile) — the crash_model: force_flush
+// path — and the default issues barrierSyncFile, the crash_model: barrier
+// fence. It is deliberately NOT routed through walGroupCommitFsync: tests that
+// fault the group-commit barrier must not break transaction commits (and vice
+// versa).
+func walTxFsync(f *os.File, force bool) error {
 	if p := walTxFsyncHook.Load(); p != nil {
 		return (*p)(f)
 	}
-	return fdatasyncFile(f)
+	if force {
+		return fdatasyncFile(f)
+	}
+	return barrierSyncFile(f)
 }
 
 // SetWALTxFsyncForTest installs fn as the fsync used by the transaction slow

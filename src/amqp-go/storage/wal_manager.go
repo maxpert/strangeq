@@ -157,6 +157,32 @@ const (
 	bodyKindReference = uint8(0x01)
 )
 
+// walConfirmSync selects the primitive the TWO confirm barriers — the
+// group-commit batch fsync (commitBatch) and the transaction slow-path fsync
+// (writeTxAtomic) — issue.
+//
+//   - walConfirmBarrier (0) is the shipped default (crash_model: barrier):
+//     fcntl(F_BARRIERFSYNC) on darwin, i.e. fsync plus an ordering barrier
+//     WITHOUT the drive-cache flush. A confirmed message survives a process
+//     kill and an OS crash; a sudden power loss can still lose the most recent
+//     confirmed messages still in the drive's volatile cache.
+//   - walConfirmForceFlush selects fcntl(F_FULLFSYNC) on darwin, the full
+//     drive-cache flush, restoring the pre-barrier behaviour byte-for-byte.
+//
+// It is uint8-backed ON PURPOSE: it is declared beside the three bools above
+// CompactionThreshold and occupies one of their padding bytes, so WALConfig's
+// size (and therefore the QueueWAL hot-field layout pinned by
+// storage/wal_layout_test.go) does not change. Do not widen it.
+//
+// On Linux and non-darwin platforms both values are fdatasync, so the setting
+// has no effect there.
+type walConfirmSync uint8
+
+const (
+	walConfirmBarrier    walConfirmSync = iota // 0 = crash_model: barrier (default)
+	walConfirmForceFlush                       // 1 = crash_model: force_flush
+)
+
 // WALConfig holds configurable parameters for the WAL manager
 type WALConfig struct {
 	BatchSize int
@@ -228,6 +254,12 @@ type WALConfig struct {
 	// = refuse, which is the safe default for DefaultWALConfig() and every
 	// zero-value WALConfig{}. Set only via WALConfigFromEngine.
 	UnsafeRecovery bool
+
+	// ConfirmSync selects the fence the TWO confirm barriers use. The zero
+	// value (walConfirmBarrier) is the shipped default, so a zero-value
+	// WALConfig{}/DefaultWALConfig() stays on the barrier. Set only via
+	// WALConfigFromEngine from EngineConfig.CrashModel. See walConfirmSync.
+	ConfirmSync walConfirmSync
 
 	// CompactionThreshold is the fraction of a sealed WAL file's durable bytes
 	// that must be ACKNOWLEDGED before the file is compacted (WI7). The
@@ -1032,21 +1064,25 @@ func (wm *WALManager) WriteSharedAsync(subs []sharedSub, body []byte, fanoutHint
 	})
 }
 
-// walGroupCommitFsync is the fsync applied by the group-commit committer
-// (commitBatch). It is swappable via an atomic pointer so tests can gate the
-// durability barrier or inject a write/fsync error deterministically; the
-// production path always uses fdatasyncFile. Only the group-commit path is
-// affected — WriteTxAtomic keeps calling fdatasyncFile directly, so the
-// transaction slow path is byte-for-byte unchanged.
+// walGroupCommitFsync is the confirm barrier applied by the group-commit
+// committer (commitBatch). The hook, when installed, wins and REPLACES the
+// primitive entirely (tests gate the barrier or inject an error there).
+// Otherwise force selects the full drive-cache flush (fdatasyncFile) — the
+// crash_model: force_flush path — and the default issues barrierSyncFile, the
+// crash_model: barrier fence. Only the group-commit path is affected;
+// writeTxAtomic has its own parallel switch in walTxFsync.
 type walFsyncFn func(*os.File) error
 
 var walGroupCommitFsyncHook atomic.Pointer[walFsyncFn]
 
-func walGroupCommitFsync(f *os.File) error {
+func walGroupCommitFsync(f *os.File, force bool) error {
 	if p := walGroupCommitFsyncHook.Load(); p != nil {
 		return (*p)(f)
 	}
-	return fdatasyncFile(f)
+	if force {
+		return fdatasyncFile(f)
+	}
+	return barrierSyncFile(f)
 }
 
 // SetWALGroupCommitFsyncForTest installs fn as the fsync used by the shared-WAL
@@ -1404,14 +1440,17 @@ func (qw *QueueWAL) writeTxAtomic(records []*RecoveryMessage) error {
 	// Single fsync makes the whole bracketed unit durable. The Commit marker is
 	// the last thing written, so if this fsync does not complete the tail
 	// (Commit) is lost and recovery discards the transaction. walTxFsync is a
-	// hook seam whose default is exactly the previous direct fdatasyncFile.
+	// hook seam whose default is the crash_model fence (F_BARRIERFSYNC) or, under
+	// crash_model: force_flush, the F_FULLFSYNC full drive-cache flush. Both
+	// are ordered durability barriers; neither drops the ordering guarantee. The
+	// transaction path stays always-durable regardless of storage.fsync.
 	//
 	// C1: a FAILED fsync no longer leaves the unit on disk. The client was
 	// told the commit failed; keeping the bytes would resurrect a nacked
 	// commit after restart and seed interior corruption once more data
 	// follows possibly-lost pages (fsyncgate). Truncate to startPos instead.
 	fsyncStart := time.Now()
-	fsyncErr := walTxFsync(qw.currentFile)
+	fsyncErr := walTxFsync(qw.currentFile, qw.cfg.ConfirmSync == walConfirmForceFlush)
 	if qw.metrics != nil {
 		qw.metrics.RecordWALFsync(time.Since(fsyncStart).Seconds())
 		if fsyncErr != nil {
@@ -2841,17 +2880,21 @@ func (qw *QueueWAL) commitBatch(sb *stagedBatch) {
 	// Uses fdatasync on Linux (skips metadata sync for ~2-5x speedup vs fsync).
 	// This is the critical durability guarantee - messages are only durable after this completes.
 	//
+	// The primitive is the crash_model fence (F_BARRIERFSYNC, the default) or,
+	// under crash_model: force_flush, the F_FULLFSYNC full drive-cache flush:
+	// see walGroupCommitFsync. Both are ordered durability barriers.
+	//
 	// When fsync is explicitly disabled (Storage.Fsync=false =>
 	// WALConfig.SyncDisabled), the barrier is skipped: the write(2) above is
 	// still page-cache-visible for same-process reads, so the index update and
 	// completions below proceed exactly as on the durable path, but the batch is
 	// not crash-durable. The fsync is NOT recorded when skipped, so
 	// wal_fsync_total stays a truthful count of real syncs. WriteTxAtomic is
-	// unaffected — it always fdatasyncs directly.
+	// unaffected by SyncDisabled — it always issues its own confirm barrier.
 	var fsyncErr error
 	if !qw.cfg.SyncDisabled {
 		fsyncStart := time.Now()
-		fsyncErr = walGroupCommitFsync(qw.currentFile)
+		fsyncErr = walGroupCommitFsync(qw.currentFile, qw.cfg.ConfirmSync == walConfirmForceFlush)
 		fsyncDuration := time.Since(fsyncStart).Seconds()
 
 		// Record fsync metrics

@@ -11,3 +11,10 @@ import "os"
 func fdatasyncFile(f *os.File) error {
 	return f.Sync()
 }
+
+// barrierSyncFile mirrors fdatasyncFile on the platforms that are neither Linux
+// nor macOS: os.File.Sync. There is no cheaper ordered primitive here, so
+// crash_model has no effect on these platforms.
+func barrierSyncFile(f *os.File) error {
+	return f.Sync()
+}
