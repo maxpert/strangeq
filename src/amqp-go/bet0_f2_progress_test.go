@@ -288,16 +288,29 @@ func TestBet0_DeficitVerdictCannotSuppressBalance(t *testing.T) {
 	}
 }
 
-// TestBet0_DeficitVerdictOffByDefault proves the sampler is not enabled without
-// the env var, so CI and the determinism soak never pay for it.
-func TestBet0_DeficitVerdictOffByDefault(t *testing.T) {
-	if _, set := os.LookupEnv("STRANGEQ_F2_DIAG"); set {
-		t.Skip("STRANGEQ_F2_DIAG is set; this control only applies with it unset")
-	}
+// TestBet0_DeficitVerdictSamplerGate proves the sampler is inert without the
+// env var, so CI and the determinism soak never pay for it.
+func TestBet0_DeficitVerdictSamplerGate(t *testing.T) {
 	results := []*bet0LoadResult{{}, {}}
+	results[0].published.Store(1000)
+	results[0].consumed.Store(500)
+
 	stop := bet0F2StartSampler(results)
+	if os.Getenv("STRANGEQ_F2_DIAG") == "" {
+		stop()
+		if got := bet0F2SeriesIfDiagnosticEnabled(); got != nil {
+			t.Fatalf("diagnostic must be off by default, got %d intervals", len(got))
+		}
+		return
+	}
+	// Enabled: the sampler must actually record intervals.
+	time.Sleep(3 * bet0DeficitInterval)
 	stop()
-	if got := bet0F2SeriesIfDiagnosticEnabled(); got != nil {
-		t.Fatalf("diagnostic must be off by default, got %d intervals", len(got))
+	series := bet0F2SeriesIfDiagnosticEnabled()
+	if len(series) == 0 {
+		t.Fatal("diagnostic must record intervals when STRANGEQ_F2_DIAG is set")
+	}
+	if series[len(series)-1].published[0] != 1000 {
+		t.Fatalf("sampled published=%d, want 1000", series[len(series)-1].published[0])
 	}
 }
