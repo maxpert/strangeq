@@ -46,7 +46,7 @@ jobs:
           go test -v -race -count=1 -coverprofile=coverage.out -covermode=atomic -timeout 25m ./...
 
       - name: Upload coverage to Codecov
-        uses: codecov/codecov-action@v4
+        uses: codecov/codecov-action@v7
         with:
           files: ./src/amqp-go/coverage.out
           flags: unittests
