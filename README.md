@@ -21,7 +21,7 @@ RabbitMQ is the gold standard for AMQP 0.9.1, but it runs on the Erlang VM — a
 - AMQP 0.9.1 protocol compatible with RabbitMQ clients (Go, Python, Node.js, Java, Ruby, C#)
 - Exchange types: direct, fanout, topic (with `*` and `#` wildcards), headers (with `x-match: all`, `any`, `all-with-x`, `any-with-x`)
 - Exchange-to-exchange bindings with cycle detection
-- Three-tier storage architecture (ring buffer → WAL → segments)
+- Three-tier storage architecture (in-memory hot cache → WAL (durable) → segments (cold fallback))
 - Persistent and non-persistent messages with crash recovery
 - TLS/SSL encryption with mutual TLS support
 - SASL authentication (PLAIN, ANONYMOUS)
@@ -38,9 +38,9 @@ RabbitMQ is the gold standard for AMQP 0.9.1, but it runs on the Erlang VM — a
 - Queue length limits — `x-max-length` / `x-max-length-bytes` with `x-overflow` (`drop-head`, `reject-publish`)
 - Resource alarms — `connection.blocked` / `connection.unblocked` driven by memory (RSS) and free-disk watermarks
 - Exclusive and auto-delete queues with automatic cleanup (exclusive queues deleted on owning-connection close; auto-delete queues deleted when the last consumer leaves)
-- Memory-efficient by design: ~20 MB idle RSS on every workload against RabbitMQ 4.4 Classic's 164–175 MB. Peak RSS is lower than RabbitMQ's best-measured configuration on 9 of 10 cells across both durability modes; the exception is 1 KiB, 1p/1c at `fsync:false` (265 MB vs 259 MB, +2.3%). Throughput beats RabbitMQ's best-measured configuration on all five workloads at `fsync:false` (+1.5% to +220%); at `fsync:true` two 64 KiB rows are losses (F3 0.81x, F4 0.88x against best; F4 still wins against stock at 1.57x). See [Performance](#performance)
+- Peak RSS is lower than RabbitMQ's best-measured configuration on 9 of 10 cells across both durability modes; the exception is 1 KiB, 1p/1c at `fsync:false` (265 MB vs 259 MB, +2.3%). Throughput beats RabbitMQ's best-measured configuration on all five workloads at `fsync:false` (+1.5% to +220%); at `fsync:true` two 64 KiB rows are losses (F3 0.81x, F4 0.88x against best; F4 still wins against stock at 1.57x). See [Performance](#performance)
 - Prometheus metrics and pprof profiling
-- Lock-free per-queue ring buffer with per-slot CAS
+- Byte-bounded per-queue hot cache with its own eviction budget
 - Batch TCP writes and ACK offloading
 
 ## Installation
@@ -286,8 +286,8 @@ Run it under systemd (see `deployment/systemd/`) rather than `daemonize: true`
 and a PID file; the unit handles restart, environment, and logging.
 
 Key engine tuning parameters:
-- `ringbuffersize` — In-memory ring buffer per queue (must be power of 2, default 64K)
-- `spillthresholdpercent` — Ring fill % before spilling to WAL (default 80)
+- `ringbuffersize` — Depth high-water-mark input retained from the pre-segstore ring buffer (`RingBufferSize × SpillThresholdPercent`); default 64K, any positive integer
+- `spillthresholdpercent` — Spill percentage used with `ringbuffersize` to compute the depth high-water mark (default 80)
 - `walbatchsize` — Messages per WAL batch (default 1000)
 - `walbatchtimeoutms` — Retained for compatibility; WAL flushing is drain-then-flush, not timer-gated
 - `walfilesize` — Size of each WAL file (default 512 MB)
@@ -317,7 +317,7 @@ Throughput is measured as **end-to-end delivered messages per second (msg/s)**: 
 
 **Storage ceiling.** Measured with no broker running, this machine's bare `write` + `F_FULLFSYNC` ceiling is **~2.23 GB/s** into media; the 64 KiB 10p/10c reference of 36,864 msg/s is 2.42 GB/s of body bytes.
 
-**Two supporting experiments** are labelled where they appear: the socket-buffer sweep and the WAL-size A/B. Both are same-binary, same-session A/Bs from the 2026-11-03 reference session.
+**Supporting experiment.** The WAL-size A/B is labelled where it appears and is a same-binary, same-session A/B from the 2026-11-03 reference session.
 
 ### Throughput
 
@@ -339,21 +339,7 @@ Throughput is measured as **end-to-end delivered messages per second (msg/s)**: 
 
 **Workload shape.** The 1 KiB rows are CPU- and dispatch-bound: StrangeQ's engine parallelises queue dispatch across the producer/consumer fan-out where RabbitMQ Classic serialises a single queue, so added connections raise throughput. The 64 KiB rows are limited by durable write bandwidth, which added connections do not raise. That is the shape of the two modes' divergence: small on the 1 KiB rows, large on the 64 KiB rows.
 
-**Socket buffers.** A controlled sweep of StrangeQ's accepted-socket read/write buffers (kernel-auto, 192 KiB, 256 KiB shipped, 512 KiB, 1 MiB; separate 64 MiB-WAL session, 28 cells) moves F4 by ~1.7% and F3 by ~0.1%. The equivalent pin on RabbitMQ moves its F4 by +79.5% and its F3 by −17.9%: stock RabbitMQ was sitting on unhelpful socket-buffer defaults, while StrangeQ already pins 256 KiB, larger than the 192 KiB RabbitMQ needs. No client-side socket pinning is used anywhere in the table above. This sweep is a 2026-11-03 reference-session A/B.
-
 ### Memory
-
-Idle RSS is measured with no load. Idle RSS, MB (median of reps, 2026-11-03 reference session):
-
-| Workload | StrangeQ | RabbitMQ stock | RabbitMQ best config |
-|---|---:|---:|---:|
-| F1 — 1 KiB, 1p/1c | 19.8 | 167 | 173 |
-| F2 — 1 KiB, 10p/10c | 19.8 | 170 | 171 |
-| F3 — 64 KiB, 1p/1c | 19.8 | 168 | 164 |
-| F4 — 64 KiB, 10p/10c | 19.8 | 169 | 168 |
-| F5 — 1 KiB, 32p/32c | 19.9 | 172 | 164 |
-
-Idle RSS holds at ~20 MB for StrangeQ on every workload (2 to 64 connections), against 164–175 MB for RabbitMQ, and does not depend on the fsync mode.
 
 Peak RSS, MB (StrangeQ medians from the 2026-11-06 session, against the 2026-11-03 RabbitMQ reference):
 
@@ -383,7 +369,7 @@ In earlier 64 MiB sessions the F1 peak was ~90 MB (0.35x of stock); at the shipp
 - The shipped **1-second WAL reclaim interval** (`walcleanupcheckintervalms: 1000`, matching the code default) costs **−0.7% to −1.9% throughput** versus the previous 5-minute interval, in exchange for **−22% to −78% peak RSS**. The reclaim latency is itself a memory bound, because an unreclaimed file keeps its per-file inventory alive.
 - The **S1 WAL-bookkeeping cut** (the WAL index is bounded by the in-flight set, and the per-shard index maps shrink once the unacked set drains) costs **≈ −0.8% (F1) to −3.9% (F5) confirmed/s on the `fsync:true` rows**, while cutting **120–158 MB of peak RSS on the 1 KiB rows**.
 
-**Steady-state RSS is noisy across repetitions**, so **idle RSS** and (on the 64 KiB rows) **peak RSS** are the memory measures worth treating as separated; this document does not claim that every metric separates cleanly. StrangeQ's resident set is driven by in-flight message data and the WAL, not connection count.
+**RSS is noisy across repetitions.** The memory claim this document makes is the peak-RSS comparison in the table above, not a claim that every memory metric separates cleanly. StrangeQ's resident set is driven by in-flight message data and the WAL, not connection count.
 
 ### Confirm latency and the durability difference
 
@@ -419,7 +405,7 @@ Both modes are measured on the same build and the same WAL size. The F3/F4 throu
 - **We do not beat RabbitMQ on 64 KiB throughput in `fsync:true` mode.** F3 is 0.81x and F4 is 0.88x against RabbitMQ's best configuration for those rows. With `fsync:false`, F3 is +1.5% and F4 is +16.2%.
 - **We do not claim F4 as a win against a configuration-tuned RabbitMQ in `fsync:true` mode.** It is a win against stock (1.57x) and a loss against the tuned reference (0.88x).
 - **We do not claim a peak-RSS win on every cell.** With `fsync:false`, F1 — 1 KiB, 1p/1c peaks above both references (265 MB; 1.03x stock, 1.02x best). With `fsync:true`, peak RSS is lower than both references on every row (0.15x–0.78x on the 1 KiB rows, 0.28x–0.49x on the 64 KiB rows).
-- **We do not claim steady-state RSS separates cleanly** (idle RSS and the 64 KiB peaks do).
+- **We do not claim steady-state RSS separates cleanly** — this document reports peak RSS, not steady-state RSS.
 - **We do not claim compression**, on these all-zero bodies or as a general lever.
 - **We do not claim a blanket parallelism win** — it applies to the CPU/dispatch-bound 1 KiB rows, not the durable-write-bound 64 KiB rows.
 
@@ -570,10 +556,10 @@ The following RabbitMQ features are not implemented:
 
 ### Storage Engine
 
-- **Ring Buffer**: Per-queue lock-free ring with per-slot CAS — zero allocations on the hot path
-- **WAL Spill**: When the ring buffer fills, messages spill to a write-ahead log with batched fsync
-- **Segment Storage**: Cold message storage in segment files
-- **Per-Queue Isolation**: Each queue has its own ring buffer, WAL cursor, and consumer dispatch — no cross-queue contention
+- **Hot Cache**: Byte-bounded per-queue in-memory cache with its own eviction budget
+- **WAL Spill**: Durable messages are written to the write-ahead log with batched group-commit fsync; a transient message the hot cache cannot admit spills to the WAL too.
+- **Segment Storage**: Cold message storage in segment files, read after the WAL on the cold path
+- **Per-Queue Isolation**: Each queue has its own hot cache, WAL cursor, and consumer dispatch — no cross-queue contention
 
 ### Connection Handling
 
@@ -590,7 +576,7 @@ The following RabbitMQ features are not implemented:
 1. Validate storage integrity
 2. Recover durable exchanges and queues
 3. Rebuild bindings
-4. Load persistent messages into ring buffers
+4. Load persistent messages into the hot cache
 5. Restore pending acknowledgments
 
 Recovery is incremental (recovery time is not measured in this document).
@@ -725,7 +711,7 @@ src/amqp-go/
 ├── config/              # Configuration management
 ├── protocol/            # AMQP protocol implementation
 ├── server/              # Server and connection handling
-├── storage/             # Storage engine (ring buffer, WAL, segments)
+├── storage/             # Storage engine (hot cache, WAL, segments)
 ├── interfaces/          # Interface definitions
 ├── broker/              # Message routing and delivery
 ├── auth/                # Authentication & authorization
