@@ -1374,11 +1374,10 @@ func (s *Server) readFrames(rt *connRuntime, done chan struct{}) {
 			// A server-initiated close (failConnection: shutdown / connection
 			// error, and the reader-overflow/oversized-ack sites) already
 			// counted its own cause, so the reader's error is NOT a second
-			// cause for the same close.
-			if s.MetricsCollector != nil && !rt.connClosing.Load() && !conn.Closed.Load() {
-				s.MetricsCollector.RecordConnectionClosedByCause(closeCause)
-			}
-			conn.Closed.Store(true)
+			// cause for the same close. recordReaderClose shares the per-runtime
+			// once-guard with every other close site, so a concurrent write-error
+			// close cannot double-count either.
+			s.recordReaderClose(rt, conn, closeCause)
 			return
 		}
 

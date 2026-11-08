@@ -244,24 +244,8 @@ func (s *Server) consumerDeliveryLoop(rt *connRuntime) {
 			}
 
 			// Process any extras from other consumers
-			for i, extra := range extras {
-				extraInfo, exists := consumerInfos[extra.ConsumerID]
-				if !exists {
-					continue
-				}
-				err := s.sendBatchedDeliveries(conn, extraInfo.channel.ID, extraInfo.tag, []*protocol.Delivery{extra})
-				if err != nil {
-					if s.MetricsCollector != nil {
-						s.MetricsCollector.RecordDeliverySendError()
-					}
-					s.Log.Error("Failed to send batched deliveries",
-						zap.Error(err),
-						zap.String("consumer_tag", extraInfo.tag),
-						zap.Int("remaining_extras", len(extras)-i))
-					conn.Closed.Store(true)
-					s.requeueFailedDeliveries(nil, extras[i:])
-					return
-				}
+			if !s.sendExtraDeliveries(conn, consumerInfos, extras) {
+				return
 			}
 
 			// Clear references to avoid retaining Delivery pointers
@@ -273,6 +257,44 @@ func (s *Server) consumerDeliveryLoop(rt *connRuntime) {
 			}
 		}
 	}
+}
+
+// sendExtraDeliveries forwards fan-in deliveries that were drained alongside a
+// batch but belong to OTHER consumers, one send per delivery. It reports false
+// when a TCP write error closed the connection (the caller must return).
+//
+// The per-consumer send and the error cleanup deliberately mirror the main
+// batch path above so the two cannot drift.
+func (s *Server) sendExtraDeliveries(conn *protocol.Connection, consumerInfos map[string]*consumerInfo, extras []*protocol.Delivery) bool {
+	for i := 0; i < len(extras); i++ {
+		extra := extras[i]
+		extraInfo, exists := consumerInfos[extra.ConsumerID]
+		if !exists {
+			// The consumer was removed after its delivery was forwarded. The
+			// delivery is dropped without requeue; for a NoAck consumer the
+			// broker already settled and deleted it on enqueue, so this fan-in
+			// copy is the ONLY copy. Counted explicitly so the loss is never
+			// invisible (spec 06 §3.4), exactly as the main dispatch path does.
+			if s.MetricsCollector != nil {
+				s.MetricsCollector.RecordDeliveriesDropped(DeliveryDropConsumerRemoved, 1)
+			}
+			continue
+		}
+		err := s.sendBatchedDeliveries(conn, extraInfo.channel.ID, extraInfo.tag, []*protocol.Delivery{extra})
+		if err != nil {
+			if s.MetricsCollector != nil {
+				s.MetricsCollector.RecordDeliverySendError()
+			}
+			s.Log.Error("Failed to send batched deliveries",
+				zap.Error(err),
+				zap.String("consumer_tag", extraInfo.tag),
+				zap.Int("remaining_extras", len(extras)-i))
+			conn.Closed.Store(true)
+			s.requeueFailedDeliveries(nil, extras[i:])
+			return false
+		}
+	}
+	return true
 }
 
 // requeueFailedDeliveries requeues batch and extra deliveries after a TCP
@@ -310,12 +332,23 @@ func (s *Server) requeueFailedDeliveries(batch []*protocol.Delivery, extras []*p
 // RejectMessage returned nil. A vanished consumer (no delivery-index entry) or
 // a failed RejectMessage returns false, so the caller counts it as a drop
 // rather than silently stranding it.
+//
+// A false return is counted as a consumer_removed drop, but it is NOT by itself
+// proof the message was lost: UnregisterConsumer (connection teardown, step 7)
+// may already have requeued this delivery tag and cleared the delivery index
+// with the same LoadAndDelete guard, in which case the tag is simply no longer
+// resolvable here. The counter is an upper bound on stranded deliveries, which
+// is the safe direction for an operator — it never understates loss.
 func (s *Server) requeueSingleDelivery(d *protocol.Delivery) bool {
 	if d == nil {
 		return false
 	}
 	consumerID, ok := s.Broker.GetConsumerForDelivery(d.DeliveryTag)
 	if !ok {
+		// No live consumer resolves the tag: either the consumer vanished (the
+		// delivery is stranded) or teardown's UnregisterConsumer already
+		// requeued it. Either way this path cannot requeue; the caller counts
+		// it and the counter is an upper bound, not certain data loss.
 		return false
 	}
 	if err := s.Broker.RejectMessage(consumerID, d.DeliveryTag, true); err != nil {

@@ -11,7 +11,7 @@ import (
 // Collector holds all Prometheus metrics for the AMQP server.
 //
 // Cardinality: per-queue series = 4 gauges (ready, unacknowledged, total,
-// consumers) plus message_age when wired, times the number of queues. The
+// consumers) times the number of queues. The
 // queue poller caps per-queue series at maxQueueSeries (2000) and keeps
 // publishing only the authoritative queues_total above that; segment, ring
 // and dropped series carry no vhost label because the broker is not

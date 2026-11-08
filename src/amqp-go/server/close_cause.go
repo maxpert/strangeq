@@ -38,6 +38,19 @@ func (s *Server) recordConnectionClose(conn *protocol.Connection, cause string) 
 	s.recordCloseCause(nil, cause)
 }
 
+// recordReaderClose records the close cause the READER goroutine discovered
+// (client EOF, heartbeat miss, protocol error, …) and marks the connection
+// closed. It shares the per-runtime close-cause entry with every other close
+// site so a concurrent hard-close (e.g. a write error) of the same connection
+// cannot record a second cause for one close — otherwise
+// amqp_connections_closed_by_cause_total would count one close twice.
+func (s *Server) recordReaderClose(rt *connRuntime, conn *protocol.Connection, cause string) {
+	if !rt.connClosing.Load() && !conn.Closed.Load() {
+		s.recordCloseCause(rt, cause)
+	}
+	conn.Closed.Store(true)
+}
+
 // connectionCloseCauseForCode maps an AMQP close code to the bounded cause
 // enum. Only CONNECTION_FORCED is a policy close; every other code is a
 // protocol-level peer violation, reported as protocol_error.
