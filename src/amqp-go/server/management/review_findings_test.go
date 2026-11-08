@@ -3,9 +3,11 @@ package management
 import (
 	"bytes"
 	"mime/multipart"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -66,6 +68,19 @@ func TestClose_NoneModeGuestOwnerNotBypass(t *testing.T) {
 	}
 	if rec := e2.do(http.MethodDelete, "/api/connections/username/guest", nil, nil); rec.Code != http.StatusForbidden {
 		t.Fatalf("close-by-user with allow_unauthenticated_mutations=false = %d, want 403 (%s)", rec.Code, rec.Body.String())
+	}
+
+	// Neither opt-in: refused (the mutation gate fires first).
+	e4 := setup(func(cfg *config.AMQPConfig) {
+		cfg.Management.AllowConnectionClose = false
+		cfg.Management.AllowUnauthenticatedMutations = false
+	})
+	e4.injectConnection(t, "guest-conn", "guest")
+	if rec := e4.do(http.MethodDelete, "/api/connections/guest-conn", nil, nil); rec.Code != http.StatusForbidden {
+		t.Fatalf("close with neither opt-in = %d, want 403 (%s)", rec.Code, rec.Body.String())
+	}
+	if rec := e4.do(http.MethodDelete, "/api/connections/username/guest", nil, nil); rec.Code != http.StatusForbidden {
+		t.Fatalf("close-by-user with neither opt-in = %d, want 403 (%s)", rec.Code, rec.Body.String())
 	}
 
 	// Both opt-ins: the close proceeds for both endpoints.
@@ -414,7 +429,9 @@ func TestCORS_AllowedOriginAndPreflight(t *testing.T) {
 // --- F15: constant-time CSRF compare ---
 
 // TestCSRF_WrongToken403 pins that a wrong (same-length, one-character-off)
-// CSRF token is refused.
+// CSRF token is refused. NOTE: the CONSTANT-TIME property of the comparison is
+// established by inspection (`subtle.ConstantTimeCompare` in csrfGate) and is
+// deliberately NOT timing-tested — a timing assertion here would be flaky.
 func TestCSRF_WrongToken403(t *testing.T) {
 	e := basicEnv(t, true, nil)
 	sess, csrf := sessionLogin(t, e)
@@ -508,5 +525,215 @@ func TestPublish_DepthGate503RetryAfterNoPark(t *testing.T) {
 		}
 	case <-time.After(1 * time.Second):
 		t.Fatalf("a non-parking depth-gate publish did not return within 1s")
+	}
+}
+
+// --- Round 2 ---
+
+// TestClose_GuestCookieCannotCloseWithoutOptIns pins the round-2 F1: the cookie
+// path must not turn the guest identity into an owner. With broker auth ENABLED
+// (security.authentication_enabled=true) and neither opt-in set, a guest session
+// cookie close is refused on both endpoints.
+func TestClose_GuestCookieCannotCloseWithoutOptIns(t *testing.T) {
+	authPath := writeAuthFile(t, `{"users":[]}`)
+	e := newEnv(t, true, func(cfg *config.AMQPConfig) {
+		cfg.Management.Authentication = config.ManagementAuthenticationNone
+		cfg.Management.AllowUnauthenticated = true
+		cfg.Management.AllowConnectionClose = false
+		cfg.Management.AllowUnauthenticatedMutations = false
+		cfg.Security.AuthenticationEnabled = true
+		cfg.Security.AuthenticationBackend = "file"
+		cfg.Security.AuthenticationFilePath = authPath
+	})
+	e.injectConnection(t, "guest-conn", "guest")
+
+	login := e.do(http.MethodPost, "/api/strangeq/session", nil, nil)
+	wantStatus(t, login, http.StatusOK)
+	var cookie *http.Cookie
+	for _, c := range login.Result().Cookies() {
+		if c.Name == sessionCookieName {
+			cookie = c
+		}
+	}
+	if cookie == nil {
+		t.Fatalf("the guest session endpoint must set %s", sessionCookieName)
+	}
+	csrf := decode[sessionResponse](t, login).CSRFToken
+	if csrf == "" {
+		t.Fatalf("the guest session must return a csrf_token")
+	}
+	hdr := map[string]string{
+		"Cookie":       cookie.Name + "=" + cookie.Value,
+		"X-CSRF-Token": csrf,
+	}
+
+	if rec := e.do(http.MethodDelete, "/api/connections/guest-conn", nil, hdr); rec.Code != http.StatusForbidden {
+		t.Fatalf("guest cookie close = %d, want 403 (%s)", rec.Code, rec.Body.String())
+	}
+	if rec := e.do(http.MethodDelete, "/api/connections/username/guest", nil, hdr); rec.Code != http.StatusForbidden {
+		t.Fatalf("guest cookie close-by-user = %d, want 403 (%s)", rec.Code, rec.Body.String())
+	}
+}
+
+// TestLoopback_GuestCookieReplayFromNonLoopback403 pins round-2 F4: the guest
+// identity is loopback-only, and checkPrincipalClient enforces that on the
+// cookie path too.
+func TestLoopback_GuestCookieReplayFromNonLoopback403(t *testing.T) {
+	e := newEnv(t, true, func(cfg *config.AMQPConfig) {
+		cfg.Management.Authentication = config.ManagementAuthenticationNone
+		cfg.Management.AllowUnauthenticated = true
+		cfg.Security.AuthorizationEnabled = true
+	})
+
+	login := e.do(http.MethodPost, "/api/strangeq/session", nil, nil)
+	wantStatus(t, login, http.StatusOK)
+	var cookie *http.Cookie
+	for _, c := range login.Result().Cookies() {
+		if c.Name == sessionCookieName {
+			cookie = c
+		}
+	}
+	if cookie == nil {
+		t.Fatalf("the guest session endpoint must set %s", sessionCookieName)
+	}
+	hdr := map[string]string{"Cookie": cookie.Name + "=" + cookie.Value}
+
+	replay := e.doFrom("198.51.100.7:5555", http.MethodGet, "/api/overview", nil, hdr)
+	if replay.Code != http.StatusForbidden {
+		t.Fatalf("guest cookie replayed off-loopback = %d, want 403 (%s)", replay.Code, replay.Body.String())
+	}
+	if ok := e.do(http.MethodGet, "/api/overview", nil, hdr); ok.Code != http.StatusOK {
+		t.Fatalf("the same guest cookie from loopback must be 200, got %d (%s)", ok.Code, ok.Body.String())
+	}
+}
+
+// TestDefinitionsImport_MultipartChunkedOverCap413 pins round-2 F6: a chunked
+// multipart body (Content-Length absent, so the pre-routing cap does not apply)
+// must still be bounded in the handler, with the generic cap reason, and must
+// not apply anything.
+func TestDefinitionsImport_MultipartChunkedOverCap413(t *testing.T) {
+	e := basicEnv(t, true, func(cfg *config.AMQPConfig) {
+		cfg.Management.Limits.MaxBodyBytes = 1024
+		cfg.Management.Limits.MaxImportBodyBytes = 1024
+	})
+
+	defs := definitionsImportRequest{Exchanges: []map[string]any{{"name": "huge-ex", "type": "direct"}}}
+	var buf bytes.Buffer
+	mw := multipart.NewWriter(&buf)
+	fw, err := mw.CreateFormFile("file", "definitions.json")
+	if err != nil {
+		t.Fatalf("create form file: %v", err)
+	}
+	payload := append(e.jsonBody(t, defs), bytes.Repeat([]byte(" "), 4096)...)
+	if _, err := fw.Write(payload); err != nil {
+		t.Fatalf("write part: %v", err)
+	}
+	if err := mw.Close(); err != nil {
+		t.Fatalf("close multipart writer: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/definitions", bytes.NewReader(buf.Bytes()))
+	req.RemoteAddr = "127.0.0.1:43210"
+	req.Header.Set("Content-Type", mw.FormDataContentType())
+	req.Header.Set("Authorization", basicAuthHeader()["Authorization"])
+	req.ContentLength = -1 // chunked: the pre-routing Content-Length cap is skipped
+	rec := httptest.NewRecorder()
+	e.mgmt.Handler().ServeHTTP(rec, req)
+
+	wantStatus(t, rec, http.StatusRequestEntityTooLarge)
+	if env := decode[errorEnvelope](t, rec); env.Reason != "request body exceeds 1024 bytes" {
+		t.Fatalf("reason = %q, want the generic request-body cap text", env.Reason)
+	}
+	list := e.do(http.MethodGet, "/api/exchanges", nil, basicAuthHeader())
+	if strings.Contains(list.Body.String(), "huge-ex") {
+		t.Fatalf("an over-cap import must not declare anything: %s", truncate(list.Body.String()))
+	}
+}
+
+// TestIfMatch_StrongComparison pins round-2 #4: If-Match uses a STRONG
+// comparator, so a weak validator (W/"…") never matches the current tag.
+func TestIfMatch_StrongComparison(t *testing.T) {
+	e := basicEnv(t, true, nil)
+	wantStatus(t, e.do(http.MethodPut, "/api/queues/%2F/strong-q", e.jsonBody(t, queueDeclareRequest{Durable: true}), basicAuthHeader()), http.StatusCreated)
+	get := e.do(http.MethodGet, "/api/queues/%2F/strong-q", nil, basicAuthHeader())
+	tag := get.Header().Get("ETag")
+	if tag == "" {
+		t.Fatalf("the GET must carry an ETag")
+	}
+
+	weak := e.do(http.MethodDelete, "/api/queues/%2F/strong-q", nil, withReqHeader(basicAuthHeader(), "If-Match", "W/"+tag))
+	wantStatus(t, weak, http.StatusPreconditionFailed)
+	if got := e.do(http.MethodGet, "/api/queues/%2F/strong-q", nil, basicAuthHeader()); got.Code != http.StatusOK {
+		t.Fatalf("a weak If-Match must not delete the resource (%d)", got.Code)
+	}
+	okDel := e.do(http.MethodDelete, "/api/queues/%2F/strong-q", nil, withReqHeader(basicAuthHeader(), "If-Match", tag))
+	wantStatus(t, okDel, http.StatusNoContent)
+}
+
+// TestAuth_ResourceReadGate_EntityRoutesOnly pins round-2 #7: the read resource
+// gate applies to entity routes only; health/whoami/overview stay reachable
+// with the capability they were granted.
+func TestAuth_ResourceReadGate_EntityRoutesOnly(t *testing.T) {
+	hdr := map[string]string{"Authorization": "Basic " + basicToken("mon", "secret")}
+	noPerms := inheritEnv(t, `{"users":[{"username":"mon","password_hash":"`+secretHash(t)+`",
+		"tags":["monitoring"]}]}`, nil)
+
+	// /api/health reports not_ready unless the broker is listening; stub the
+	// listener so the route reaches its own 200 rather than the readiness 503.
+	ln := &stubListener{addr: &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 5672}, closed: make(chan struct{})}
+	noPerms.srv.Listener = ln
+	t.Cleanup(func() { _ = ln.Close() })
+
+	if rec := noPerms.do(http.MethodGet, "/api/queues", nil, hdr); rec.Code != http.StatusForbidden {
+		t.Fatalf("entity read without a vhost permission = %d, want 403 (%s)", rec.Code, rec.Body.String())
+	}
+	for _, p := range []string{"/api/health", "/api/whoami", "/api/overview"} {
+		if rec := noPerms.do(http.MethodGet, p, nil, hdr); rec.Code != http.StatusOK {
+			t.Fatalf("non-entity read %s = %d, want 200 (%s)", p, rec.Code, rec.Body.String())
+		}
+	}
+
+	withPerms := inheritEnv(t, `{"users":[{"username":"mon","password_hash":"`+secretHash(t)+`",
+		"tags":["monitoring"],"vhost_permissions":[{"vhost":"/","permission":{"configure":".*","write":".*","read":".*"}}]}]}`, nil)
+	if got := withPerms.do(http.MethodGet, "/api/queues", nil, hdr); got.Code != http.StatusOK {
+		t.Fatalf("entity read with a / permission = %d, want 200 (%s)", got.Code, got.Body.String())
+	}
+}
+
+// TestSession_ConcurrentCookieRequestsNoRace pins round-2 #8: principalFromCookie
+// must return a copy, so concurrent requests on one session do not race on the
+// shared session principal (run under -race).
+func TestSession_ConcurrentCookieRequestsNoRace(t *testing.T) {
+	e := basicEnv(t, true, nil)
+	sess, _ := sessionLogin(t, e)
+	hdr := map[string]string{"Cookie": sess.Name + "=" + sess.Value}
+
+	const n = 8
+	start := make(chan struct{})
+	failed := make(chan string, n)
+	var wg sync.WaitGroup
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			rec := e.do(http.MethodGet, "/api/overview", nil, hdr)
+			if rec.Code != http.StatusOK {
+				failed <- rec.Body.String()
+			}
+		}()
+	}
+	close(start)
+
+	done := make(chan struct{})
+	go func() { wg.Wait(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatalf("concurrent cookie requests did not finish within 5s")
+	}
+	close(failed)
+	for msg := range failed {
+		t.Fatalf("a concurrent cookie request failed: %s", msg)
 	}
 }
