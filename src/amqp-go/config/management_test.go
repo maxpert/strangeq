@@ -34,6 +34,18 @@ func TestConfig_ManagementDefaults(t *testing.T) {
 	if m.Limits.MaxPageSize != 500 || m.Limits.MaxInFlight != 64 || m.Limits.MaxResponseBytes != 4<<20 {
 		t.Fatalf("limits defaults wrong: %+v", m.Limits)
 	}
+	// Import body cap is 20 MiB (SEC-065 / FR-API-124 spec default), distinct
+	// from the ordinary 2 MiB endpoint cap.
+	if m.Limits.MaxBodyBytes != 2<<20 {
+		t.Fatalf("limits.max_body_bytes default = %d, want %d", m.Limits.MaxBodyBytes, 2<<20)
+	}
+	if m.Limits.MaxImportBodyBytes != 20<<20 {
+		t.Fatalf("limits.max_import_body_bytes default = %d, want %d", m.Limits.MaxImportBodyBytes, 20<<20)
+	}
+	// SEC-067: definitions import is rate-limited out of the box (10 s window).
+	if m.RateLimits.DefinitionsImportSeconds != 10 {
+		t.Fatalf("rate_limits.definitions_import_seconds default = %d, want 10", m.RateLimits.DefinitionsImportSeconds)
+	}
 	if m.Async.MessageThreshold != 10000 || m.Async.EntityThreshold != 1000 || m.Async.MaxJobs != 128 {
 		t.Fatalf("async defaults wrong: %+v", m.Async)
 	}

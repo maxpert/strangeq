@@ -309,10 +309,17 @@ func defsNote(kind defsActionKind, name, vhost, result, reason string) defsActio
 // no broker mutation; the Apply closures it returns are invoked only by the
 // apply phase, never by dry-run.
 //
-// The cap for each kind bounds how many entities THIS import creates (0 =
-// unlimited). A payload entity that already exists is an "updated" apply, not a
-// create, so it never counts against the cap and a re-import of an unchanged
-// topology can never trip it.
+// Caps (COMPAT-027) are a per-vhost ceiling on the TOTAL entity count, not a
+// per-request create budget: a NEW entity is refused when
+// existing+planned >= cap, so a broker already at/over the cap cannot accept an
+// unbounded stream of imports. A payload entity that already exists is an
+// "updated" apply (no new entity), so it never counts against the cap and a
+// re-import of an unchanged topology can never trip it.
+//
+// CAP-maxExchanges counts NON-SYSTEM exchanges only: the broker's own exchange
+// cap excludes the default exchange ("") and every amq.* built-in, so a finite
+// definitions cap that counted them could never be reached. See
+// countUserExchanges.
 func (s *Server) planDefinitions(p *definitionsPayload, cur defsTopology, caps defsCaps) []defsAction {
 	var actions []defsAction
 
@@ -340,7 +347,9 @@ func (s *Server) planDefinitions(p *definitionsPayload, cur defsTopology, caps d
 		}
 		_, existed := cur.exchanges[name]
 		if !existed {
-			if caps.MaxExchanges > 0 && createdExchanges >= caps.MaxExchanges {
+			// CAP-maxExchanges counts non-system exchanges because the broker's
+			// own cap excludes ""/amq.* (see countUserExchanges).
+			if caps.MaxExchanges > 0 && countUserExchanges(cur.exchanges)+createdExchanges >= caps.MaxExchanges {
 				actions = append(actions, defsNote(defExchange, name, "/", "failed", "exchange cap exceeded (COMPAT-027)"))
 				continue
 			}
@@ -379,12 +388,17 @@ func (s *Server) planDefinitions(p *definitionsPayload, cur defsTopology, caps d
 		}
 		_, existed := cur.queues[name]
 		if !existed {
-			if caps.MaxQueues > 0 && createdQueues >= caps.MaxQueues {
+			if caps.MaxQueues > 0 && len(cur.queues)+createdQueues >= caps.MaxQueues {
 				actions = append(actions, defsNote(defQueue, name, "/", "failed", "queue cap exceeded (COMPAT-027)"))
 				continue
 			}
 			createdQueues++
 		}
+		// AMQP redeclare-equivalence contract: an existing queue whose durable/
+		// auto_delete/exclusive/arguments differ is REFUSED by the broker (it is
+		// never overwritten) and is reported here as `failed` with the broker's
+		// equivalence reason. A "mutable conflict overwrite" primitive is out of
+		// scope for mgmt-05 (§7.2 test 8 pins this behaviour).
 		result := "created"
 		if existed {
 			result = "updated"
@@ -414,29 +428,30 @@ func (s *Server) planDefinitions(p *definitionsPayload, cur defsTopology, caps d
 	createdBindings := 0
 	for i := range p.Bindings {
 		bn := p.Bindings[i]
+		// A binding whose identity cannot even be computed still carries the
+		// source/destination/properties_key it was given, so its failure item is
+		// as identifying as its skip item (§2.4 MUST).
+		view := &defsBindingView{Source: bn.Source, Destination: bn.Destination, DestinationType: bn.DestinationType, RoutingKey: bn.RoutingKey, Arguments: bn.Arguments}
+		synth := propertiesKey(bn.RoutingKey, bn.Arguments)
 		if bn.DestinationType != "queue" && bn.DestinationType != "exchange" {
-			actions = append(actions, defsNote(defBinding, "", "/", "failed", "destination_type must be queue or exchange"))
+			actions = append(actions, defsAction{Kind: defBinding, Name: bn.Destination, Vhost: "/", Result: "failed", Reason: "destination_type must be queue or exchange", Binding: view, Key: synth, rtype: interfaces.ResourceQueue})
 			continue
 		}
-		synth := propertiesKey(bn.RoutingKey, bn.Arguments)
 		rtype := interfaces.ResourceQueue
 		if bn.DestinationType == "exchange" {
 			rtype = interfaces.ResourceExchange
 		}
 		key := bindingIdentity(bn.Source, bn.Destination, bn.DestinationType, synth)
 		if _, dup := existing[key]; dup {
-			view := &defsBindingView{Source: bn.Source, Destination: bn.Destination, DestinationType: bn.DestinationType, RoutingKey: bn.RoutingKey, Arguments: bn.Arguments}
 			actions = append(actions, defsAction{Kind: defBinding, Name: bn.Destination, Vhost: "/", Result: "skipped", Reason: "equivalent", Binding: view, Key: synth, rtype: rtype})
 			continue
 		}
-		if caps.MaxBindings > 0 && createdBindings >= caps.MaxBindings {
-			view := &defsBindingView{Source: bn.Source, Destination: bn.Destination, DestinationType: bn.DestinationType, RoutingKey: bn.RoutingKey, Arguments: bn.Arguments}
+		if caps.MaxBindings > 0 && len(cur.bindings)+createdBindings >= caps.MaxBindings {
 			actions = append(actions, defsAction{Kind: defBinding, Name: bn.Destination, Vhost: "/", Result: "failed", Reason: "binding cap exceeded (COMPAT-027)", Binding: view, Key: synth, rtype: rtype})
 			continue
 		}
 		createdBindings++
 		existing[key] = struct{}{}
-		view := &defsBindingView{Source: bn.Source, Destination: bn.Destination, DestinationType: bn.DestinationType, RoutingKey: bn.RoutingKey, Arguments: bn.Arguments}
 		b := bn
 		action := defsAction{Kind: defBinding, Name: bn.Destination, Vhost: "/", Result: "created", Binding: view, Key: synth, rtype: rtype}
 		if bn.DestinationType == "queue" {
@@ -460,6 +475,20 @@ func (s *Server) planDefinitions(p *definitionsPayload, cur defsTopology, caps d
 }
 
 const defsUsersSkippedReason = "user/permission management is not implemented (BOB-6)"
+
+// countUserExchanges counts the NON-SYSTEM exchanges of a topology: the default
+// exchange ("") and every amq.* built-in are excluded, exactly as the broker's
+// own MaxExchanges backstop excludes them (COMPAT-027/CAP-maxExchanges).
+func countUserExchanges(m map[string]defsExchange) int {
+	n := 0
+	for name := range m {
+		if name == "" || strings.HasPrefix(name, "amq.") {
+			continue
+		}
+		n++
+	}
+	return n
+}
 
 // --- executor ---------------------------------------------------------------
 
@@ -510,11 +539,10 @@ func (s *Server) runDefinitions(actions []defsAction, p *Principal, dryRun bool)
 	failed = []defsResult{}
 	for _, a := range actions {
 		if a.Apply == nil {
-			item := noteResult(a)
 			if a.Result == "failed" {
-				failed = append(failed, item)
+				failed = append(failed, failedResult(a, a.Reason))
 			} else {
-				skipped = append(skipped, item)
+				skipped = append(skipped, noteResult(a))
 			}
 			continue
 		}
@@ -522,7 +550,7 @@ func (s *Server) runDefinitions(actions []defsAction, p *Principal, dryRun bool)
 		// target is reported failed with a non-disclosing reason and never
 		// declared. The rest of the import still applies.
 		if !s.definitionsConfigureAllowed(p, a.rtype, a.Name) {
-			failed = append(failed, defsResult{Type: string(a.Kind), Name: a.Name, Vhost: a.Vhost, Reason: "access refused"})
+			failed = append(failed, failedResult(a, "access refused"))
 			continue
 		}
 		if dryRun {
@@ -530,12 +558,31 @@ func (s *Server) runDefinitions(actions []defsAction, p *Principal, dryRun bool)
 			continue
 		}
 		if err := a.Apply(); err != nil {
-			failed = append(failed, defsResult{Type: string(a.Kind), Name: a.Name, Vhost: a.Vhost, Reason: sanitizedReason(err.Error())})
+			failed = append(failed, failedResult(a, err.Error()))
 			continue
 		}
 		applied = append(applied, applyResult(a))
 	}
 	return applied, skipped, failed
+}
+
+// failedResult renders one failed item. A binding failure carries its full
+// identity — source, destination, destination_type and the synthesised
+// properties_key — exactly like a skipped binding (§2.4 MUST); every other
+// kind carries {type,name,vhost,reason}.
+func failedResult(a defsAction, reason string) defsResult {
+	if a.Kind == defBinding && a.Binding != nil {
+		return defsResult{
+			Type:            string(a.Kind),
+			Source:          a.Binding.Source,
+			Destination:     a.Binding.Destination,
+			DestinationType: a.Binding.DestinationType,
+			Vhost:           a.Vhost,
+			PropertiesKey:   a.Key,
+			Reason:          sanitizedReason(reason),
+		}
+	}
+	return defsResult{Type: string(a.Kind), Name: a.Name, Vhost: a.Vhost, Reason: sanitizedReason(reason)}
 }
 
 func applyResult(a defsAction) defsResult {

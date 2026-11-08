@@ -106,16 +106,18 @@ func DefaultConfig() *AMQPConfig {
 				RequestTimeoutSeconds: 30,
 				MaxInFlight:           64,
 				MaxBodyBytes:          2 << 20,  // 2 MiB (SEC-065)
-				MaxImportBodyBytes:    32 << 20, // 32 MiB (FR-API-125)
+				MaxImportBodyBytes:    20 << 20, // 20 MiB (SEC-065/FR-API-124, spec default)
 				MaxResponseBytes:      4 << 20,  // 4 MiB (FR-CONV-083)
 				MaxNameBytes:          256,      // SEC-085
 			},
 			RateLimits: interfaces.ManagementRateLimitsConfig{
-				Publish:                  0,
-				Get:                      0,
-				Purge:                    0,
-				Declare:                  0,
-				DefinitionsImportSeconds: 0,
+				Publish: 0,
+				Get:     0,
+				Purge:   0,
+				Declare: 0,
+				// SEC-067: one definitions import per principal per 10 s by
+				// default. 0 disables the limit.
+				DefinitionsImportSeconds: 10,
 			},
 			Definitions: interfaces.ManagementDefinitionsConfig{
 				MaxQueues:    0,

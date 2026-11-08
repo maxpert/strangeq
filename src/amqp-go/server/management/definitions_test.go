@@ -316,6 +316,64 @@ func TestDefinitionsImport_NonAtomicContinues(t *testing.T) {
 	}
 }
 
+// TestDefinitionsImport_FailedBindingCarriesIdentity pins §2.4: a FAILED
+// binding carries source/destination/destination_type/properties_key, exactly
+// like a skipped one — for the apply-error path AND the destination_type
+// validation path.
+func TestDefinitionsImport_FailedBindingCarriesIdentity(t *testing.T) {
+	e := basicEnv(t, true, nil)
+	doc := definitionsImportRequest{
+		Exchanges: []map[string]any{{"name": "na-ex", "type": "direct"}},
+		Bindings: []map[string]any{
+			{"source": "na-ex", "destination": "missing-q", "destination_type": "queue", "routing_key": "k"},
+			{"source": "na-ex", "destination": "q2", "destination_type": "topic", "routing_key": "k2"},
+		},
+	}
+	res := decode[defsImportResponse](t, importDefs(t, e, "", e.jsonBody(t, doc), nil))
+	if len(res.Failed) != 2 {
+		t.Fatalf("both bindings must fail, got %+v", res.Failed)
+	}
+	applyErr := res.Failed[0]
+	if applyErr.Type != "binding" || applyErr.Source != "na-ex" || applyErr.Destination != "missing-q" ||
+		applyErr.DestinationType != "queue" || applyErr.PropertiesKey != "k" || applyErr.Reason == "" {
+		t.Fatalf("apply-error binding lost identity: %+v", applyErr)
+	}
+	badType := res.Failed[1]
+	if badType.Type != "binding" || badType.Source != "na-ex" || badType.Destination != "q2" ||
+		badType.DestinationType != "topic" || badType.PropertiesKey != "k2" || badType.Reason == "" {
+		t.Fatalf("destination_type-failure binding lost identity: %+v", badType)
+	}
+}
+
+// TestDefinitionsImport_MutableConflictFails pins §7.2 test 8 / COMPAT-022: a
+// conflicting mutable property (durable) is REFUSED, never overwritten, and is
+// reported failed with the broker's equivalence reason while the original
+// queue is unchanged.
+func TestDefinitionsImport_MutableConflictFails(t *testing.T) {
+	e := basicEnv(t, true, nil)
+	e.declareQueue(t, "mut-q", queueDeclareRequest{Durable: true})
+
+	doc := definitionsImportRequest{Queues: []map[string]any{{"name": "mut-q", "durable": false}}}
+	res := decode[defsImportResponse](t, importDefs(t, e, "", e.jsonBody(t, doc), nil))
+	if len(res.Failed) != 1 || res.Failed[0].Type != "queue" || res.Failed[0].Name != "mut-q" {
+		t.Fatalf("a mutable conflict must be failed: %+v", res.Failed)
+	}
+	if !strings.Contains(res.Failed[0].Reason, "durable") {
+		t.Fatalf("the failure must name the conflicting property: %+v", res.Failed[0])
+	}
+	var q struct {
+		Durable bool `json:"durable"`
+	}
+	got := e.do(http.MethodGet, "/api/queues/%2F/mut-q", nil, basicAuthHeader())
+	wantStatus(t, got, http.StatusOK)
+	if err := json.Unmarshal(got.Body.Bytes(), &q); err != nil {
+		t.Fatalf("decode queue: %v", err)
+	}
+	if !q.Durable {
+		t.Fatalf("the original queue must be unchanged (durable:true)")
+	}
+}
+
 func TestDefinitionsImport_OverCapFailsEntity(t *testing.T) {
 	e := basicEnv(t, true, func(cfg *config.AMQPConfig) {
 		cfg.Management.Definitions.MaxQueues = 1
@@ -340,11 +398,11 @@ func TestDefinitionsImport_OverCapFailsEntity(t *testing.T) {
 		t.Fatalf("over-cap entities must be failed: %+v", res.Failed)
 	}
 
-	// max_bindings likewise: seed one binding, import two more.
+	// max_bindings is a TOTAL ceiling: seed one binding with max=1 and BOTH
+	// payload bindings must fail (existing + planned already at the cap).
 	e2 := basicEnv(t, true, func(cfg *config.AMQPConfig) {
 		cfg.Management.Definitions.MaxBindings = 1
 	})
-	e2.declareQueue(t, "capb-q1", queueDeclareRequest{})
 	e2.declareQueue(t, "capb-q2", queueDeclareRequest{})
 	e2.declareQueue(t, "capb-q3", queueDeclareRequest{})
 	fake := installFakeBindings(t, e2)
@@ -354,11 +412,141 @@ func TestDefinitionsImport_OverCapFailsEntity(t *testing.T) {
 		{"source": "amq.topic", "destination": "capb-q3", "destination_type": "queue", "routing_key": "c"},
 	}}
 	bres := decode[defsImportResponse](t, importDefs(t, e2, "", e2.jsonBody(t, bdoc), nil))
-	if !containsName(bres, bres.Applied, "binding", "capb-q2") {
-		t.Fatalf("the first binding under the cap must be applied: %+v", bres.Applied)
+	if len(bres.Applied) != 0 {
+		t.Fatalf("a broker at the binding cap must accept no new binding: %+v", bres.Applied)
 	}
-	if !containsName(bres, bres.Failed, "binding", "capb-q3") {
-		t.Fatalf("the over-cap binding must be failed: %+v", bres.Failed)
+	for _, name := range []string{"capb-q2", "capb-q3"} {
+		if !containsName(bres, bres.Failed, "binding", name) {
+			t.Fatalf("binding %s must be failed at the cap: %+v", name, bres.Failed)
+		}
+	}
+}
+
+// TestDefinitionsImport_CapCountsExistingQueue pins CAP-maxQueues as a TOTAL
+// ceiling: a broker already holding one queue at max_queues=1 refuses a new one.
+func TestDefinitionsImport_CapCountsExistingQueue(t *testing.T) {
+	e := basicEnv(t, true, func(cfg *config.AMQPConfig) {
+		cfg.Management.Definitions.MaxQueues = 1
+		cfg.Management.Definitions.MaxExchanges = 1
+	})
+	e.declareQueue(t, "existing-q", queueDeclareRequest{})
+	wantStatus(t, e.do(http.MethodPut, "/api/exchanges/%2F/existing-ex", e.jsonBody(t, exchangeDeclareRequest{Type: "direct"}), basicAuthHeader()), http.StatusCreated)
+
+	doc := definitionsImportRequest{
+		Exchanges: []map[string]any{{"name": "new-ex", "type": "direct"}},
+		Queues:    []map[string]any{{"name": "new-q"}},
+	}
+	res := decode[defsImportResponse](t, importDefs(t, e, "", e.jsonBody(t, doc), nil))
+	if len(res.Applied) != 0 {
+		t.Fatalf("a broker at the cap must accept no new entity: %+v", res.Applied)
+	}
+	if !containsName(res, res.Failed, "queue", "new-q") || !containsName(res, res.Failed, "exchange", "new-ex") {
+		t.Fatalf("over-cap entities must be failed: %+v", res.Failed)
+	}
+}
+
+// TestDefinitionsImport_BindingSeamAbsentOnRealBroker PINS the current gap:
+// against the real UnifiedBroker (no aggregate ListBindings seam yet), the
+// planner's `cur.bindings` is empty, so re-importing the SAME binding reports
+// `created` both times rather than skipping the second as equivalent.
+//
+// REQUIRED INTEGRATION CHANGE: when mgmt-04 lands broker.BindingView and its
+// ListBindings seam, swap the local defsBindingView/defsBindingLister below for
+// that seam (definitions.go currentTopology); the dedup logic then uses the real
+// topology and the second import becomes `equivalent`. This test documents the
+// limitation explicitly rather than letting it surprise a reviewer.
+func TestDefinitionsImport_BindingSeamAbsentOnRealBroker(t *testing.T) {
+	e := basicEnv(t, true, func(cfg *config.AMQPConfig) {
+		cfg.Management.RateLimits.DefinitionsImportSeconds = 0
+	})
+	e.declareQueue(t, "seam-q", queueDeclareRequest{})
+	doc := definitionsImportRequest{Bindings: []map[string]any{
+		{"source": "amq.topic", "destination": "seam-q", "destination_type": "queue", "routing_key": "k"},
+	}}
+	body := e.jsonBody(t, doc)
+
+	first := decode[defsImportResponse](t, importDefs(t, e, "", body, nil))
+	if !containsName(first, first.Applied, "binding", "seam-q") {
+		t.Fatalf("first import must report the binding created: %+v", first.Applied)
+	}
+	second := decode[defsImportResponse](t, importDefs(t, e, "", body, nil))
+	if !containsName(second, second.Applied, "binding", "seam-q") {
+		t.Fatalf("with no seam the second import re-creates rather than skips: %+v", second)
+	}
+	if len(second.Skipped) != 0 {
+		t.Fatalf("the absent seam means no equivalent skip yet: %+v", second.Skipped)
+	}
+}
+
+// TestDefinitionsImport_PerTargetConfigureDenied pins AUTH-016/AUTH-012: the
+// import applies the same per-target configure gate a direct PUT does, for both
+// queues and exchanges, and declares neither.
+func TestDefinitionsImport_PerTargetConfigureDenied(t *testing.T) {
+	e := inheritEnv(t, `{"users":[{"username":"adm","password_hash":"`+secretHash(t)+`",
+		"tags":["administrator"],"vhost_permissions":[{"vhost":"/","permission":{"configure":"^$","write":".*","read":".*"}}]}]}`, nil)
+	hdr := map[string]string{"Authorization": "Basic " + basicToken("adm", "secret")}
+
+	doc := definitionsImportRequest{
+		Exchanges: []map[string]any{{"name": "denied-ex", "type": "direct"}},
+		Queues:    []map[string]any{{"name": "denied-q"}},
+	}
+	res := decode[defsImportResponse](t, importDefs(t, e, "", e.jsonBody(t, doc), hdr))
+	if len(res.Applied) != 0 {
+		t.Fatalf("a denied target must never be applied: %+v", res.Applied)
+	}
+	if !containsName(res, res.Failed, "exchange", "denied-ex") || !containsName(res, res.Failed, "queue", "denied-q") {
+		t.Fatalf("denied targets must be failed: %+v", res.Failed)
+	}
+	list := e.do(http.MethodGet, "/api/exchanges", nil, hdr)
+	wantStatus(t, list, http.StatusOK)
+	if strings.Contains(list.Body.String(), "denied-ex") {
+		t.Fatalf("a denied exchange must not be declared")
+	}
+	queues := e.do(http.MethodGet, "/api/queues", nil, hdr)
+	if strings.Contains(queues.Body.String(), "denied-q") {
+		t.Fatalf("a denied queue must not be declared")
+	}
+}
+
+// TestDefinitionsImport_MultipartChunkedOverCap413 pins the chunked-multipart
+// hardening: Content-Length is absent (-1) so the pre-routing cap is skipped,
+// yet the handler still bounds the stream at max_import_body_bytes ⇒ 413 with
+// the generic cap reason, and nothing is applied.
+func TestDefinitionsImport_MultipartChunkedOverCap413(t *testing.T) {
+	e := basicEnv(t, true, func(cfg *config.AMQPConfig) {
+		cfg.Management.Limits.MaxBodyBytes = 1024
+		cfg.Management.Limits.MaxImportBodyBytes = 1024
+	})
+	defs := definitionsImportRequest{Exchanges: []map[string]any{{"name": "huge-ex", "type": "direct"}}}
+	var buf bytes.Buffer
+	mw := multipart.NewWriter(&buf)
+	fw, err := mw.CreateFormFile("file", "definitions.json")
+	if err != nil {
+		t.Fatalf("create form file: %v", err)
+	}
+	payload := append(e.jsonBody(t, defs), bytes.Repeat([]byte(" "), 4096)...)
+	if _, err := fw.Write(payload); err != nil {
+		t.Fatalf("write part: %v", err)
+	}
+	if err := mw.Close(); err != nil {
+		t.Fatalf("close multipart writer: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/definitions", bytes.NewReader(buf.Bytes()))
+	req.RemoteAddr = "127.0.0.1:43210"
+	req.Header.Set("Content-Type", mw.FormDataContentType())
+	req.Header.Set("Authorization", basicAuthHeader()["Authorization"])
+	req.ContentLength = -1 // chunked: the pre-routing Content-Length cap is skipped
+	rec := httptest.NewRecorder()
+	e.mgmt.Handler().ServeHTTP(rec, req)
+
+	wantStatus(t, rec, http.StatusRequestEntityTooLarge)
+	if env := decode[errorEnvelope](t, rec); env.Reason != "request body exceeds 1024 bytes" {
+		t.Fatalf("reason = %q, want the generic request-body cap text", env.Reason)
+	}
+	list := e.do(http.MethodGet, "/api/exchanges", nil, basicAuthHeader())
+	if strings.Contains(list.Body.String(), "huge-ex") {
+		t.Fatalf("an over-cap import must not declare anything: %s", truncate(list.Body.String()))
 	}
 }
 
@@ -382,7 +570,9 @@ func TestDefinitionsImport_BindingDedupByPropertiesKey(t *testing.T) {
 }
 
 func TestDefinitionsImport_MultipartFile(t *testing.T) {
-	e := basicEnv(t, true, nil)
+	e := basicEnv(t, true, func(cfg *config.AMQPConfig) {
+		cfg.Management.RateLimits.DefinitionsImportSeconds = 0 // multipart + JSON in this test
+	})
 	doc := definitionsImportRequest{Exchanges: []map[string]any{{"name": "mp-ex", "type": "direct"}}}
 
 	var buf bytes.Buffer
@@ -494,7 +684,9 @@ func TestDefinitionsDryRun_NoMutation(t *testing.T) {
 }
 
 func TestDefinitionsDryRun_MatchesApply(t *testing.T) {
-	e := basicEnv(t, true, nil)
+	e := basicEnv(t, true, func(cfg *config.AMQPConfig) {
+		cfg.Management.RateLimits.DefinitionsImportSeconds = 0 // dry-run + apply
+	})
 	doc := definitionsImportRequest{
 		VHosts:    []map[string]any{{"name": "/"}},
 		Exchanges: []map[string]any{{"name": "m-ex", "type": "direct"}},
@@ -515,6 +707,19 @@ func TestDefinitionsDryRun_MatchesApply(t *testing.T) {
 	if string(dj) != string(aj) {
 		t.Fatalf("dry-run plan diverged from apply:\ndry=%s\napply=%s", dj, aj)
 	}
+	// applied and failed are disjoint (D-6), and the apply actually MUTATED the
+	// topology: a no-op apply that reported success would be caught here.
+	seen := map[string]bool{}
+	for _, it := range apply.Applied {
+		seen[it.Type+":"+it.Name+":"+it.Destination] = true
+	}
+	for _, it := range apply.Failed {
+		if seen[it.Type+":"+it.Name+":"+it.Destination] {
+			t.Fatalf("an entity appears in both applied and failed: %+v", it)
+		}
+	}
+	wantStatus(t, e.do(http.MethodGet, "/api/exchanges/%2F/m-ex", nil, basicAuthHeader()), http.StatusOK)
+	wantStatus(t, e.do(http.MethodGet, "/api/queues/%2F/m-q", nil, basicAuthHeader()), http.StatusOK)
 }
 
 func TestDefinitionsDryRun_InvalidPayload400(t *testing.T) {
@@ -531,11 +736,24 @@ func TestDefinitionsImport_RateLimited429(t *testing.T) {
 	wantStatus(t, importDefs(t, e, "", body, nil), http.StatusOK)
 	second := importDefs(t, e, "", body, nil)
 	wantStatus(t, second, http.StatusTooManyRequests)
-	if second.Header().Get("Retry-After") == "" {
-		t.Fatalf("a 429 must carry Retry-After")
+	if got := second.Header().Get("Retry-After"); got != "300" {
+		t.Fatalf("Retry-After = %q, want the rate-limit window (300)", got)
 	}
 	// The dry-run counts against the same budget.
 	wantStatus(t, importDefs(t, e, "?dry_run=true", body, nil), http.StatusTooManyRequests)
+}
+
+// TestDefinitionsImport_DefaultRateLimited429 pins the SEC-067 default: with no
+// explicit configuration, the second import by one principal is 429.
+func TestDefinitionsImport_DefaultRateLimited429(t *testing.T) {
+	e := basicEnv(t, true, nil) // DefaultConfig: definitions_import_seconds = 10
+	body := e.jsonBody(t, definitionsImportRequest{Queues: []map[string]any{{"name": "dflt-q"}}})
+	wantStatus(t, importDefs(t, e, "", body, nil), http.StatusOK)
+	second := importDefs(t, e, "", body, nil)
+	wantStatus(t, second, http.StatusTooManyRequests)
+	if got := second.Header().Get("Retry-After"); got != "10" {
+		t.Fatalf("default Retry-After = %q, want 10", got)
+	}
 }
 
 func TestDefinitionsImport_AuditDurableBeforeApply(t *testing.T) {
@@ -561,7 +779,13 @@ func TestDefinitionsImport_DryRunNotAudited(t *testing.T) {
 }
 
 func TestDefinitions_NoForbiddenLock(t *testing.T) {
-	e := basicEnv(t, true, nil)
+	// EntityThreshold=1 lets the 2-queue call below take the async/202 path with
+	// the forbidden locks held; DefinitionsImportSeconds=0 keeps four import
+	// requests within budget.
+	e := basicEnv(t, true, func(cfg *config.AMQPConfig) {
+		cfg.Management.RateLimits.DefinitionsImportSeconds = 0
+		cfg.Management.Async.EntityThreshold = 1
+	})
 	e.declareQueue(t, "lock-q", queueDeclareRequest{})
 
 	peer := e.injectConnection(t, "defs-locked-conn", "u")
@@ -581,6 +805,7 @@ func TestDefinitions_NoForbiddenLock(t *testing.T) {
 	defer conn.WriteMutex.Unlock()
 
 	body := e.jsonBody(t, definitionsImportRequest{Queues: []map[string]any{{"name": "lock-import-q"}}})
+	asyncLoc := ""
 	calls := []struct {
 		name   string
 		do     func() *httptest.ResponseRecorder
@@ -595,6 +820,15 @@ func TestDefinitions_NoForbiddenLock(t *testing.T) {
 		{"apply", func() *httptest.ResponseRecorder {
 			return importDefs(t, e, "", body, nil)
 		}, http.StatusOK},
+		{"async-apply", func() *httptest.ResponseRecorder {
+			// Two applies exceed EntityThreshold=1 ⇒ 202; the job's apply also
+			// runs off the management goroutine but must not take a forbidden
+			// lock on this request's accessor graph.
+			asyncBody := e.jsonBody(t, definitionsImportRequest{Queues: []map[string]any{{"name": "lock-async-q1"}, {"name": "lock-async-q2"}}})
+			rec := importDefs(t, e, "", asyncBody, nil)
+			asyncLoc = rec.Header().Get("Location")
+			return rec
+		}, http.StatusAccepted},
 	}
 	for _, c := range calls {
 		done := make(chan *httptest.ResponseRecorder, 1)
@@ -608,9 +842,30 @@ func TestDefinitions_NoForbiddenLock(t *testing.T) {
 			t.Fatalf("%s did not return within 1s while a forbidden lock is held", c.name)
 		}
 	}
-	if n := e.mgmt.forbiddenLockHits.Load(); n != 0 {
-		t.Fatalf("amqp_management_forbidden_lock_acquired_total = %d, want 0", n)
+	// Drain the async apply so its job does not race the temp-dir teardown.
+	if asyncLoc != "" {
+		deadline := time.Now().Add(3 * time.Second)
+		for {
+			got := e.do(http.MethodGet, asyncLoc, nil, basicAuthHeader())
+			if got.Code == http.StatusOK {
+				var view struct {
+					State string `json:"state"`
+				}
+				if json.Unmarshal(got.Body.Bytes(), &view) == nil && (view.State == jobDone || view.State == jobFailed) {
+					break
+				}
+			}
+			if time.Now().After(deadline) {
+				t.Fatalf("async apply job did not finish")
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
 	}
+	// NOT load-bearing: forbiddenLockHits is never incremented anywhere (the
+	// counter is a placeholder). The 1s deadline above and the AST scan
+	// (TestForbiddenLockGate_ASTScan, which now also covers definitions.go) are
+	// the real proof that no forbidden accessor is on the path.
+	_ = e.mgmt.forbiddenLockHits.Load()
 }
 
 func TestDefinitions_AsyncOverThreshold202(t *testing.T) {
@@ -663,6 +918,12 @@ func TestDefinitionsImport_BindingAuthz(t *testing.T) {
 	if !containsName(res, res.Failed, "binding", "bad-q") {
 		t.Fatalf("a binding to an unconfigurable target must be failed: %+v", res.Failed)
 	}
+	// The authz-denied failure must still carry the binding identity (§2.4).
+	denied := res.Failed[0]
+	if denied.Type != "binding" || denied.Source != "ok-ex" || denied.Destination != "bad-q" ||
+		denied.DestinationType != "queue" || denied.PropertiesKey != "k" {
+		t.Fatalf("authz-denied binding lost its identity: %+v", denied)
+	}
 	if !containsName(res, res.Applied, "exchange", "ok-ex") || !containsName(res, res.Applied, "queue", "ok-q") {
 		t.Fatalf("permitted entities must still apply: %+v", res.Applied)
 	}
@@ -674,7 +935,9 @@ func TestDefinitionsExportImport_RoundTrip(t *testing.T) {
 	src.declareQueue(t, "rt-q", queueDeclareRequest{Durable: true})
 	body := src.do(http.MethodGet, "/api/definitions", nil, basicAuthHeader()).Body.Bytes()
 
-	dst := basicEnv(t, true, nil)
+	dst := basicEnv(t, true, func(cfg *config.AMQPConfig) {
+		cfg.Management.RateLimits.DefinitionsImportSeconds = 0 // two imports in this test
+	})
 	res := decode[defsImportResponse](t, importDefs(t, dst, "", body, nil))
 	if !containsName(res, res.Applied, "exchange", "rt-ex") || !containsName(res, res.Applied, "queue", "rt-q") {
 		t.Fatalf("round-trip did not apply the user entities: applied=%v failed=%v", appliedNames(res), failedNames(res))

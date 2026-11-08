@@ -1002,8 +1002,14 @@ func (s *Server) hDefinitionsImport(w http.ResponseWriter, r *http.Request) {
 	// window, per principal; the dry-run counts against the same budget.
 	if !s.importLimit.allow(p.Name) {
 		setRateLimitHeaders(w, s.importLimit, p.Name)
+		// Retry-After is the rate-limit WINDOW (definitions_import_seconds),
+		// the shortest a client must wait for its next import to be admitted.
+		retryAfter := s.mcfg.RateLimits.DefinitionsImportSeconds
+		if retryAfter < 1 {
+			retryAfter = 1
+		}
 		s.writeAPIError(w, r, apiErr(http.StatusTooManyRequests, errRateLimited,
-			"definitions import rate limit exceeded", withHeader("Retry-After", "1")))
+			"definitions import rate limit exceeded", withHeader("Retry-After", strconv.Itoa(retryAfter))))
 		return
 	}
 	setRateLimitHeaders(w, s.importLimit, p.Name)
