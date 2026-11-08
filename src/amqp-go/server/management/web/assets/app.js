@@ -214,8 +214,10 @@
     var hasBody = hasRaw || (opts.body !== undefined && opts.body !== null);
     if (hasBody) headers["Content-Type"] = "application/json";
     /* Caller-supplied headers (for example the X-Reason on a graceful
-     * connection.close). Applied before the CSRF token so a caller can never
-     * override it. */
+     * connection.close). Applied first, then any case-insensitive
+     * x-csrf-token is dropped before the canonical token is set, so a
+     * caller-supplied value can never displace or fake it — even when there
+     * is no session token yet. */
     if (opts.headers && typeof opts.headers === "object") {
       Object.keys(opts.headers).forEach(function (hk) {
         var hv = opts.headers[hk];
@@ -223,6 +225,9 @@
         headers[hk] = String(hv);
       });
     }
+    Object.keys(headers).forEach(function (hk) {
+      if (hk.toLowerCase() === "x-csrf-token") delete headers[hk];
+    });
     if (method !== "GET" && method !== "HEAD" && state.csrf) headers["X-CSRF-Token"] = state.csrf;
     if (opts.ifNoneMatch) headers["If-None-Match"] = opts.ifNoneMatch;
     var init = { method: method, headers: headers, credentials: "same-origin", cache: "no-store" };
@@ -1398,7 +1403,7 @@
       h("dt", { text: "prefetch_count" }), h("dd", null, [num(c.prefetch_count)]),
       h("dt", { text: "confirm" }), h("dd", null, [boolCell(c.confirm)]),
       h("dt", { text: "transactional" }), h("dd", null, [boolCell(c.transactional)]),
-      h("dt", { text: "stats" }), h("dd", null, [c.stats_partial ? h("span", { class: "stat-partial", text: "partial" }) : h("span", { text: "complete" })])
+      h("dt", { text: "stats" }), h("dd", null, [isNull(c.stats_partial) ? dash("stats_partial not reported") : (c.stats_partial ? h("span", { class: "stat-partial", text: "partial" }) : h("span", { text: "complete" }))])
     ]);
     return h("div", { class: "screen screen-channel-detail" }, [
       h("nav", { class: "breadcrumb" }, [link("Channels", "/channels"), h("span", { text: " / " }), h("span", { text: val(c.number) })]),
@@ -2071,13 +2076,14 @@
     });
   }
 
-  /* openCreateBinding declares a new binding. dtype is "q" (queue destination)
-   * or "e" (exchange destination); the body carries the routing key and the
-   * x-* arguments (FR-API-091/092). */
+  /* openCreateBinding declares a new binding. The destination type is the
+   * API's destination_type ("queue"/"exchange"); the path letter ("q"/"e") is
+   * derived through bindingDtype so create and delete share one mapping. The
+   * body carries the routing key and the x-* arguments (FR-API-091/092). */
   function openCreateBinding(route, vhost, prefill) {
     prefill = prefill || {};
     var sourceInput = h("input", { type: "text", id: "binding-source", value: prefill.source || "", "aria-label": "Source exchange" });
-    var dtypeSel = h("select", { id: "binding-dest-type", "aria-label": "Destination type" }, [option("q", "queue"), option("e", "exchange")]);
+    var dtypeSel = h("select", { id: "binding-dest-type", "aria-label": "Destination type" }, [option("queue", "queue"), option("exchange", "exchange")]);
     if (prefill.destinationType) dtypeSel.value = prefill.destinationType;
     var destInput = h("input", { type: "text", id: "binding-destination", value: prefill.destination || "", "aria-label": "Destination" });
     var rkInput = h("input", { type: "text", id: "binding-routing-key", value: prefill.routingKey || "", "aria-label": "Routing key" });
@@ -2105,7 +2111,7 @@
         err.textContent = "";
         var parsed = parseArguments(argsInput.value);
         if (parsed.error) { err.textContent = parsed.error; return Promise.resolve(true); }
-        return api(bindingsPath(vhost, sourceInput.value.trim(), dtypeSel.value, destInput.value.trim()), {
+        return api(bindingsPath(vhost, sourceInput.value.trim(), bindingDtype(dtypeSel.value), destInput.value.trim()), {
           method: "POST",
           body: { routing_key: rkInput.value, arguments: parsed.arguments }
         }).then(function (r) {
