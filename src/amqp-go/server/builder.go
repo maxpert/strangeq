@@ -289,7 +289,7 @@ func (b *ServerBuilder) Build() (*Server, error) {
 		// benign faults out — an unwritten load-bearing premise in a different
 		// package — so it is checked here rather than inherited.
 		if ierr := storageBroker.InitError(); ierr != nil {
-			ordinalFaults := interfaces.ExplainedFaults("ordinal-allocator", ierr)
+			ordinalFaults := interfaces.ExplainedFaults(RecoveryStageOrdinalAllocator, ierr)
 			ordinalGating = gatingFaultList(ordinalFaults)
 			// The ordinal-allocator faults are created HERE, never by the
 			// RecoveryManager, so counting them here cannot double-count with
@@ -304,7 +304,7 @@ func (b *ServerBuilder) Build() (*Server, error) {
 					return nil, errors.New(interfaces.RecoveryRefusalMessage(
 						"delivery-tag ordinal recovery", ordinalGating))
 				}
-				logUnsafeRecovery(logger, "ordinal-allocator", ordinalGating)
+				logUnsafeRecovery(logger, RecoveryStageOrdinalAllocator, ordinalGating)
 			}
 		}
 		unifiedBroker = NewStorageBrokerAdapter(storageBroker)
@@ -487,7 +487,12 @@ func (b *ServerBuilder) Build() (*Server, error) {
 	// Now the severity comes from the site that produced the error
 	// (interfaces.RecoveryOutcome), an unclassified error is FATAL by the
 	// type's zero value, and only --unsafe-recovery proceeds.
-	faults := interfaces.ExplainedFaults(RecoveryStageRecovery, err)
+	// This classifier context is NOT a metric label: every fault reaching here
+	// was already counted by the RecoveryManager at the site that created it
+	// (addFault/absorb), so re-recording it would double-count. The former
+	// "recovery" stage const was dropped from the metric enum because no
+	// classified fault ever carried it — a permanently-zero series.
+	faults := interfaces.ExplainedFaults("recovery", err)
 	gating := gatingFaultList(faults)
 	if len(gating) > 0 && !b.config.Storage.UnsafeRecovery {
 		return nil, errors.New(interfaces.RecoveryRefusalMessage("recovery", gating))

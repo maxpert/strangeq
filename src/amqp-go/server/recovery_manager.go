@@ -154,7 +154,7 @@ func (r *RecoveryManager) PerformRecovery() (*protocol.RecoveryStats, error) {
 	// Step 1: Validate storage integrity and repair if needed
 	stats, err := r.validateAndRepairStorage()
 	if err != nil {
-		r.absorb("storage-validation", err)
+		r.absorb(RecoveryStageStorageValidation, err)
 		return stats, r.result()
 	}
 
@@ -165,7 +165,7 @@ func (r *RecoveryManager) PerformRecovery() (*protocol.RecoveryStats, error) {
 	// classification, and two fewer full metadata directory walks per boot.
 	metadata, merr := r.storage.GetDurableEntityMetadata()
 	if merr != nil {
-		r.absorb("metadata", merr)
+		r.absorb(RecoveryStageMetadata, merr)
 		return stats, r.result()
 	}
 
@@ -180,7 +180,7 @@ func (r *RecoveryManager) PerformRecovery() (*protocol.RecoveryStats, error) {
 
 	// Step 6: Recover pending acknowledgments
 	if err := r.recoverPendingAcknowledgments(stats); err != nil {
-		if r.absorb("pending-acks", err) == interfaces.RecoveryFatal {
+		if r.absorb(RecoveryStagePendingAcks, err) == interfaces.RecoveryFatal {
 			return stats, r.result()
 		}
 	}
@@ -274,7 +274,7 @@ func (r *RecoveryManager) recoverDurableExchanges(stats *protocol.RecoveryStats,
 					zap.Error(err))
 				stats.ValidationErrors = append(stats.ValidationErrors,
 					fmt.Sprintf("Failed to recover exchange %s: %v", exchange.Name, err))
-				r.addFault(interfaces.DegradedFault("exchange-recovery", "exchange "+exchange.Name,
+				r.addFault(interfaces.DegradedFault(RecoveryStageExchange, "exchange "+exchange.Name,
 					"a durable exchange that exists on disk could not be redeclared into the running broker",
 					"this exchange is absent from the running broker; publishes to it are unroutable and every queue bound through it receives nothing",
 					err))
@@ -316,7 +316,7 @@ func (r *RecoveryManager) recoverDurableQueues(stats *protocol.RecoveryStats, me
 					zap.Error(err))
 				stats.ValidationErrors = append(stats.ValidationErrors,
 					fmt.Sprintf("Failed to recover queue %s: %v", queue.Name, err))
-				r.addFault(interfaces.DegradedFault("queue-recovery", "queue "+queue.Name,
+				r.addFault(interfaces.DegradedFault(RecoveryStageQueue, "queue "+queue.Name,
 					"a durable queue that exists on disk could not be redeclared into the running broker",
 					"this queue is absent from the running broker; its confirmed durable records stay on disk with nothing to load them into, and a client redeclaring the name may be handed a different incarnation",
 					err))
@@ -357,13 +357,13 @@ func (r *RecoveryManager) recoverPersistentMessages(stats *protocol.RecoveryStat
 	// file must not cost us the records we DID read, whatever its class.
 	recoverableMessages, err := r.storage.GetRecoverableMessages()
 	if err != nil {
-		r.absorb("wal-scan", err)
+		r.absorb(RecoveryStageWALScan, err)
 	}
 
 	for queueName, messages := range recoverableMessages {
 		queueOrdinal, hasRecord, durable, oerr := r.resolveRecoveredQueueOrdinal(queueName)
 		if oerr != nil {
-			r.addFault(interfaces.FatalFault("queue-recovery", "queue "+queueName,
+			r.addFault(interfaces.FatalFault(RecoveryStageQueue, "queue "+queueName,
 				"the metadata record for a queue that has recoverable records could not be read, so its delivery-tag ordinal is unknown and its records cannot be attributed to an incarnation",
 				"every confirmed durable record for this queue is abandoned, and a later declare of the same name may be handed a colliding ordinal; every OTHER queue in this data directory is recovered normally",
 				oerr))
@@ -414,7 +414,7 @@ func (r *RecoveryManager) recoverPersistentMessages(stats *protocol.RecoveryStat
 				durableCount++
 			}
 			if durableCount == 0 {
-				r.addFault(interfaces.BenignFault("queue-recovery", "queue "+queueName,
+				r.addFault(interfaces.BenignFault(RecoveryStageQueue, "queue "+queueName,
 					fmt.Sprintf("discarded %d non-durable record(s) for a queue with no metadata record", len(messages))))
 				r.recordDiscarded(RecoveryStageQueue, len(messages))
 				continue
@@ -424,7 +424,7 @@ func (r *RecoveryManager) recoverPersistentMessages(stats *protocol.RecoveryStat
 				zap.Int("durable_records", durableCount),
 				zap.Uint64("ordinal_span_min", broker.TagOrdinal(lo)),
 				zap.Uint64("ordinal_span_max", broker.TagOrdinal(hi)))
-			r.addFault(interfaces.BenignFault("queue-recovery", "queue "+queueName,
+			r.addFault(interfaces.BenignFault(RecoveryStageQueue, "queue "+queueName,
 				fmt.Sprintf("discarded %d durable record(s) (tags %d..%d) for a queue whose metadata record is ABSENT (AMQP 0-9-1 §1.7.2.10, queue.delete removes the queue and its messages)",
 					durableCount, lo, hi)))
 			r.recordDiscarded(RecoveryStageQueue, durableCount)
@@ -444,7 +444,7 @@ func (r *RecoveryManager) recoverPersistentMessages(stats *protocol.RecoveryStat
 			// deliberately NOT gated instead: createQueueStateLocked guards on
 			// record existence, so refusing to persist transient queues would
 			// break them outright.
-			r.addFault(interfaces.BenignFault("queue-recovery", "queue "+queueName,
+			r.addFault(interfaces.BenignFault(RecoveryStageQueue, "queue "+queueName,
 				fmt.Sprintf("reaped %d record(s) belonging to a NON-DURABLE queue; AMQP 0-9-1 §1.7.2.1 forbids it surviving a restart", len(messages))))
 			r.recordDiscarded(RecoveryStageQueue, len(messages))
 			r.logger.Warn("reaping recovered records for a non-durable queue",
@@ -474,7 +474,7 @@ func (r *RecoveryManager) recoverPersistentMessages(stats *protocol.RecoveryStat
 				count++
 			}
 			if has {
-				r.addFault(interfaces.FatalFault("queue-recovery", "queue "+queueName,
+				r.addFault(interfaces.FatalFault(RecoveryStageQueue, "queue "+queueName,
 					fmt.Sprintf("%s: %d recovered durable message(s) (tags %d..%d) but no delivery-tag ordinal was ever persisted for this queue",
 						ErrLegacyDataDirectory.Error(), count, minTag, maxTag),
 					"the recovered delivery tags are raw legacy values whose high bits are not a valid queue ordinal; starting anyway abandons every one of these confirmed durable messages, and the tags they carry may collide with another queue's tag space; every OTHER queue in this data directory is recovered normally",
@@ -511,7 +511,7 @@ func (r *RecoveryManager) recoverPersistentMessages(stats *protocol.RecoveryStat
 				continue
 			}
 			if tagOrdinal := broker.TagOrdinal(message.DeliveryTag); tagOrdinal > queueOrdinal {
-				r.addFault(interfaces.FatalFault("queue-recovery", "queue "+queueName,
+				r.addFault(interfaces.FatalFault(RecoveryStageQueue, "queue "+queueName,
 					fmt.Sprintf("%s: queue is assigned ordinal %d, but a recovered tag carries ordinal %d (tag=%d)",
 						ErrOrdinalMismatch.Error(), queueOrdinal, tagOrdinal, message.DeliveryTag),
 					"recovery is about to hand this queue's consumers delivery tags that collide with another queue's tag space in a WAL keyed by a bare uint64; starting anyway risks cross-queue message corruption, not just loss. Every record of this queue is quarantined and none is loaded; every OTHER queue in this data directory is recovered normally",
@@ -583,7 +583,7 @@ func (r *RecoveryManager) recoverPersistentMessages(stats *protocol.RecoveryStat
 					zap.Error(err))
 				stats.ValidationErrors = append(stats.ValidationErrors,
 					fmt.Sprintf("Failed to load message in queue %s: %v", queueName, err))
-				r.addFault(interfaces.DegradedFault("message-recovery", "queue "+queueName,
+				r.addFault(interfaces.DegradedFault(RecoveryStageMessage, "queue "+queueName,
 					fmt.Sprintf("a confirmed durable record (delivery tag %d) could not be loaded back into the queue", message.DeliveryTag),
 					"this confirmed durable message is not delivered after the restart; its delivery tag stays inside the recovered span, so it is skipped as a gap",
 					err))
@@ -609,7 +609,7 @@ func (r *RecoveryManager) recoverPersistentMessages(stats *protocol.RecoveryStat
 			// write-once per incarnation and never reclaimed, so the record
 			// provably belongs to an incarnation that was deleted. AMQP
 			// §1.7.2.10 says its messages went with it.
-			r.addFault(interfaces.BenignFault("queue-recovery", "queue "+queueName,
+			r.addFault(interfaces.BenignFault(RecoveryStageQueue, "queue "+queueName,
 				fmt.Sprintf("discarded %d record(s) from a dead incarnation (tag ordinals %d..%d, current ordinal %d)",
 					discardedCount, broker.TagOrdinal(discardedLo), broker.TagOrdinal(discardedHi), queueOrdinal)))
 			r.recordDiscarded(RecoveryStageQueue, discardedCount)

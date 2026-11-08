@@ -8,7 +8,15 @@ package server
 // exchange name.
 
 // Recovery stages (spec 06 §3.2). These mirror the stage strings recovery
-// already uses in its faults.
+// uses in its faults and are the CLOSED metric label domain for
+// amqp_recovery_faults_total{stage} / amqp_recovery_discarded_records_total{stage}.
+// Every recording site passes one of these consts — a string literal here would
+// silently widen the domain past the guard.
+//
+// The former `recovery` arm is deliberately absent: PerformRecovery classified
+// and recorded every fault at the site that created it, so the builder's
+// aggregate classifier could never mint a fault of that stage. It was a
+// permanently-zero series (see builder.go's classifier).
 const (
 	RecoveryStageStorageValidation = "storage-validation"
 	RecoveryStageMetadata          = "metadata"
@@ -18,7 +26,6 @@ const (
 	RecoveryStageWALScan           = "wal-scan"
 	RecoveryStagePendingAcks       = "pending-acks"
 	RecoveryStageOrdinalAllocator  = "ordinal-allocator"
-	RecoveryStageRecovery          = "recovery"
 )
 
 // Recovery outcomes (spec 06 §3.2), matching interfaces.RecoveryOutcome.String().
