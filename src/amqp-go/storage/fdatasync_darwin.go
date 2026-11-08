@@ -155,3 +155,14 @@ func barrierFsyncFD(fd uintptr) error {
 
 // barrierFallbackWarned guards the one-time WARN above.
 var barrierFallbackWarned atomic.Bool
+
+// ConfirmFenceOrdersOnly reports whether the crash_model: barrier confirm
+// primitive is a genuine ORDERING-ONLY fence — an fsync to the drive plus an
+// ordering barrier, WITHOUT a drive write-cache flush. On darwin it is
+// fcntl(F_BARRIERFSYNC), so it is true: the fence does NOT pay the ~16 ms
+// full-flush cost that made the hot-cache publisher pace gate a loss (see
+// broker.NewStorageBroker). On Linux and every other platform the barrier IS
+// fdatasync/os.File.Sync — a full flush — so the value is false there and the
+// original rationale still holds. Build-tagged so exactly one definition
+// exists per platform.
+const ConfirmFenceOrdersOnly = true

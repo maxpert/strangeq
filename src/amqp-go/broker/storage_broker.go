@@ -11,6 +11,7 @@ import (
 
 	"github.com/maxpert/amqp-go/interfaces"
 	"github.com/maxpert/amqp-go/protocol"
+	"github.com/maxpert/amqp-go/storage"
 )
 
 // ErrConsumerChannelFull is returned when a consumer channel is full and cannot accept more messages
@@ -329,18 +330,35 @@ func NewStorageBroker(storage interfaces.Storage, engineConfig interfaces.Engine
 		ttlNow:       func() int64 { return time.Now().UnixMilli() },
 	}
 
-	// HOT-CACHE PUBLISHER PACING IS WIRED ONLY IN NON-DURABLE MODE. The pace
-	// gate keeps the delivered head hot by parking the publisher's connection
-	// reader at the hot cache's byte budget. In DURABLE mode that backfires:
-	// the WAL group-commit batch size is the throughput limiter (the ~16 ms
-	// F_FULLFSYNC per batch is the critical path, so msgs/fsync IS throughput),
-	// and parking the reader creates arrival gaps that halve the batch. Measured
-	// (campaign ab-runC, F3 64 KiB 1p/1c durable+confirm): 499 -> 221 msgs/fsync
-	// with the gate active, costing ~33% throughput. fsync's own confirm latency
-	// already paces the publisher in durable mode, so the cold-read problem the
-	// gate targets barely arises. Resolving NO pacer here leaves the publisher
-	// path wired exactly as on main and the hot path pays nothing.
-	if engineConfig.WALSyncDisabled {
+	// HOT-CACHE PUBLISHER PACING IS WIRED WHEN THE CONFIRM FENCE IS CHEAP.
+	//
+	// The pace gate keeps the delivered head hot by parking the publisher's
+	// connection reader at the hot cache's byte budget. It was originally wired
+	// only for fsync:false, because in the F_FULLFSYNC durable mode the WAL
+	// group-commit BATCH SIZE is the throughput limiter — the ~16 ms full flush
+	// per batch is the critical path, so msgs/fsync IS throughput, and parking
+	// the reader creates arrival gaps that halve the batch (measured campaign
+	// ab-runC, F3 64 KiB 1p/1c durable+confirm: 499 -> 221 msgs/fsync, ~33%
+	// throughput lost).
+	//
+	// THAT RATIONALE NO LONGER HOLDS under crash_model: barrier, where the
+	// confirm fence is fcntl(F_BARRIERFSYNC) — an fsync to the drive plus an
+	// ordering barrier, with NO drive-cache flush. Its cost is ~71 µs of fence
+	// plus ~25 µs/msg, not 16 ms/batch, so the cycle is ~1.3 ms and the stager
+	// self-sizes batches to ~25-30 records; batch size is NOT the limiter any
+	// more. With the roll's directory flush also moved off the commit path (W8),
+	// COLD WAL READS become the F3 limiter (84-88% of deliveries are cold reads
+	// in the durable arms, vs 1.5-2.5% with fsync off), and pacing the publisher
+	// to the hot budget is exactly what removes them. So the gate is wired
+	// whenever the fence is ordering-only (crash_model: barrier AND the platform
+	// has a cheaper primitive than a full flush — darwin only; on Linux the
+	// barrier IS fdatasync, a full flush, so the original rationale still
+	// applies). force_flush keeps the original wiring exactly: pacing OFF.
+	//
+	// The guard for the ~16 ms burn does NOT come back: the seal policy is
+	// unchanged, and under the fence a park adds at most one barrier
+	// (~0.35 ms) per park, on a resource with ~40% duty.
+	if engineConfig.WALSyncDisabled || confirmFenceIsOrderingOnly(engineConfig) {
 		if pacer, ok := storage.(hotCachePacer); ok {
 			broker.hotPacer = pacer
 		}
@@ -351,6 +369,19 @@ func NewStorageBroker(storage interfaces.Storage, engineConfig interfaces.Engine
 	broker.seedTopologyCounts()
 
 	return broker
+}
+
+// confirmFenceIsOrderingOnly reports whether the configured confirm fence is
+// the cheap ORDERING primitive rather than a full drive-cache flush. It is true
+// only for crash_model: barrier on a platform whose barrier really is cheaper
+// than a full flush (storage.ConfirmFenceOrdersOnly, true on darwin); it is
+// false for force_flush and on Linux/most platforms, where the barrier IS
+// fdatasync — a full flush — and the original batch-size rationale holds.
+func confirmFenceIsOrderingOnly(ec interfaces.EngineConfig) bool {
+	if ec.CrashModel == interfaces.CrashModelForceFlush {
+		return false
+	}
+	return storage.ConfirmFenceOrdersOnly
 }
 
 // SetTopologyLimits configures the MaxQueues/MaxExchanges caps (§15; 0 =

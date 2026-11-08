@@ -32,15 +32,55 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// TestDurableModeHotCachePaceGateInert is the durable-mode counterpart of
+// TestBarrierModeHotCachePaceGateActive is the behavioural twin of
+// TestForceFlushModeHotCachePaceGateInert: under crash_model: barrier (the
+// shipped durable default) the SAME byte-budget-exceeded condition DOES arm the
+// gate, because the ~71 µs ordering fence is not the throughput limiter and cold
+// WAL reads are. Guarded on darwin: on Linux and other platforms the barrier IS
+// a full drive-cache flush, so pacing stays off exactly as under force_flush.
+func TestBarrierModeHotCachePaceGateActive(t *testing.T) {
+	if !storage.ConfirmFenceOrdersOnly {
+		t.Skip("crash_model: barrier is a full flush on this platform; pacing stays off")
+	}
+	const queue = "barrier-pace-q"
+	body := bytes.Repeat([]byte("b"), 256)
+	ec := interfaces.EngineConfig{
+		HotCacheQueueBytes:    3200,
+		DepthHighWMOverride:   1_000_000,
+		RingBufferSize:        65536,
+		SpillThresholdPercent: 80,
+		WALSyncDisabled:       false,
+		CrashModel:            interfaces.CrashModelBarrier,
+	}
+	store, err := storage.NewDisruptorStorageWithEngineConfig(t.TempDir(), ec)
+	require.NoError(t, err)
+	b := NewStorageBroker(store, ec)
+	t.Cleanup(func() { b.Close(); _ = store.Close() })
+	_, err = b.DeclareQueue(queue, true, false, false, nil)
+	require.NoError(t, err)
+
+	armed := 0
+	for i := 0; i < 16; i++ {
+		gate, _ := publishDurableAwait(t, b, queue, body)
+		if gate != nil {
+			armed++
+		}
+	}
+	require.Greater(t, armed, 0,
+		"durable + crash_model barrier must arm the hot-cache pace gate once the byte budget is "+
+			"full: the ordering fence is not the throughput limiter")
+}
+
+// TestForceFlushModeHotCachePaceGateInert is the durable-mode counterpart of
 // TestPublisherPacedToHotCacheCapacity: the SAME byte-budget-exceeded condition
 // that arms the gate and parks the publisher in fsync:false mode must leave the
-// publisher UNPACED when the WAL fsync barrier is enabled.
+// publisher UNPACED under crash_model: force_flush, where the confirm fence is
+// the ~16 ms full drive-cache flush and batch size IS throughput.
 //
 // RED BEFORE THE FIX: NewStorageBroker resolved the storage's pace capability
 // unconditionally, so exceeding the byte budget armed the gate and this test
 // failed on the require.Nil(gate) assertion below.
-func TestDurableModeHotCachePaceGateInert(t *testing.T) {
+func TestForceFlushModeHotCachePaceGateInert(t *testing.T) {
 	const queue = "durable-inert-q"
 	body := bytes.Repeat([]byte("d"), 256)
 	ec := interfaces.EngineConfig{
@@ -50,9 +90,10 @@ func TestDurableModeHotCachePaceGateInert(t *testing.T) {
 		DepthHighWMOverride:   1_000_000,
 		RingBufferSize:        65536,
 		SpillThresholdPercent: 80,
-		// DURABLE MODE: fsync enabled. WALSyncDisabled=false is fsync ON (the
-		// shipped default); named explicitly so the mode under test is obvious.
+		// DURABLE MODE with the full drive-cache flush, where pacing stays off
+		// (the 52e0a47 wiring).
 		WALSyncDisabled: false,
+		CrashModel:      interfaces.CrashModelForceFlush,
 	}
 	store, err := storage.NewDisruptorStorageWithEngineConfig(t.TempDir(), ec)
 	require.NoError(t, err)
@@ -89,19 +130,24 @@ func TestDurableModeHotCachePaceGateInert(t *testing.T) {
 		"fixture premise: the cache must be within one message of full — the condition that arms the pacing gate in fsync:false mode")
 }
 
-// TestHotCachePaceGateWiringIsDurableModeGated is the byte-level guard for the
-// wiring itself: the resolved pacer is PRESENT when the WAL fsync barrier is
-// disabled (pacing retained) and ABSENT when it is enabled (pacing inert). It
+// TestHotCachePaceGateWiringByCrashModel is the byte-level guard for the wiring
+// itself: the resolved pacer is PRESENT when the WAL fsync barrier is disabled,
+// PRESENT in durable mode when the confirm fence is an ordering-only barrier
+// (crash_model: barrier on darwin — the fence stops being the throughput
+// limiter, so the gate's cold-read win dominates), and ABSENT under
+// crash_model: force_flush (and under barrier on a platform where the barrier
+// IS a full flush) — where the ~16 ms flush makes batch size throughput. It
 // asserts the structural property directly, independent of whether any gate
 // happens to arm.
-func TestHotCachePaceGateWiringIsDurableModeGated(t *testing.T) {
-	newBroker := func(t *testing.T, syncDisabled bool) *StorageBroker {
+func TestHotCachePaceGateWiringByCrashModel(t *testing.T) {
+	newBroker := func(t *testing.T, syncDisabled bool, crashModel string) *StorageBroker {
 		t.Helper()
 		ec := interfaces.EngineConfig{
 			HotCacheQueueBytes: 3200,
 			// fsync ON (durable) is the zero value; syncDisabled=true is
-			// fsync:false, the only mode in which pacing is wired.
+			// fsync:false, which always wires pacing.
 			WALSyncDisabled: syncDisabled,
+			CrashModel:      crashModel,
 		}
 		store, err := storage.NewDisruptorStorageWithEngineConfig(t.TempDir(), ec)
 		require.NoError(t, err)
@@ -110,8 +156,23 @@ func TestHotCachePaceGateWiringIsDurableModeGated(t *testing.T) {
 		return b
 	}
 
-	require.NotNil(t, newBroker(t, true).hotPacer,
+	require.NotNil(t, newBroker(t, true, interfaces.CrashModelBarrier).hotPacer,
 		"fsync:false mode must wire the hot-cache pacer")
-	require.Nil(t, newBroker(t, false).hotPacer,
-		"durable (fsync:true) mode must leave the publisher path unpaced")
+
+	require.Nil(t, newBroker(t, false, interfaces.CrashModelForceFlush).hotPacer,
+		"durable + crash_model force_flush must leave the publisher path unpaced: the full flush "+
+			"makes the group-commit batch size the throughput limiter")
+
+	if storage.ConfirmFenceOrdersOnly {
+		// darwin: crash_model barrier is the cheap ordering fence.
+		require.NotNil(t, newBroker(t, false, interfaces.CrashModelBarrier).hotPacer,
+			"durable + crash_model barrier on a platform with an ordering-only fence must wire "+
+				"the pacer: cold WAL reads, not batch size, are the limiter")
+	} else {
+		// Linux and every other platform: the barrier IS fdatasync (a full
+		// flush), so the 52e0a47 rationale still holds and pacing stays off.
+		require.Nil(t, newBroker(t, false, interfaces.CrashModelBarrier).hotPacer,
+			"durable + crash_model barrier on a platform whose barrier is a full flush must "+
+				"leave the publisher path unpaced")
+	}
 }

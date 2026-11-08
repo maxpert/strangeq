@@ -1,19 +1,26 @@
 package server
 
-// DURABLE-MODE INERTNESS, end to end through the real publish path.
+// DURABLE-MODE PACING, end to end through the real publish path.
 //
-// The broker-level test (broker/hot_cache_pacing_durable_test.go) proves the
-// broker never RETURNS a hot-cache pace gate in durable mode. This test proves
-// the consequence at the server: even when the queue's hot-cache byte budget is
-// exceeded, the producer-only connection's depth-backpressure flag is never
-// armed and no publisher reader park is ever counted — the reader path is wired
-// exactly as on main.
+// The broker-level tests (broker/hot_cache_pacing_durable_test.go) prove WHICH
+// durable crash models return a hot-cache pace gate. These tests prove the
+// consequence at the server:
 //
-// WHY (campaign ab-runC, F3 64 KiB 1p/1c durable+confirm): in durable mode the
-// WAL group-commit batch size is the throughput limiter; parking the publisher
-// reader creates arrival gaps that halve the batch, 499 -> 221 msgs/fsync,
-// costing ~33% throughput. fsync's own confirm latency already paces the
-// publisher, so the gate is not wired in durable mode.
+//   - crash_model: force_flush (the full flush) — even when the queue's
+//     hot-cache byte budget is exceeded, the producer-only connection's
+//     depth-backpressure flag is never armed and no publisher reader park is
+//     counted: the batch size is the throughput limiter there.
+//   - crash_model: barrier (the shipped durable default, darwin) — the SAME
+//     condition DOES arm the connection and count a park, because the ordering
+//     fence is cheap and cold WAL reads are the limiter.
+//
+// WHY THE SPLIT: the original inertness (campaign ab-runC, F3 64 KiB 1p/1c
+// durable+confirm) held because the ~16 ms F_FULLFSYNC per batch made
+// msgs/fsync the throughput, and parking the reader halved the batch
+// (499 -> 221 msgs/fsync, ~33% throughput). Under the ~71 µs
+// F_BARRIERFSYNC fence the cycle is ~1.3 ms and the stager self-sizes batches
+// to ~25-30, so parking no longer starves the batch — while it removes the
+// 84-88% cold WAL reads that now dominate.
 
 import (
 	"testing"
@@ -21,6 +28,7 @@ import (
 
 	"github.com/maxpert/amqp-go/broker"
 	"github.com/maxpert/amqp-go/config"
+	"github.com/maxpert/amqp-go/interfaces"
 	"github.com/maxpert/amqp-go/protocol"
 	"github.com/maxpert/amqp-go/storage"
 	"github.com/maxpert/amqp-go/transaction"
@@ -31,14 +39,19 @@ import (
 // newHotBudgetServer builds a server whose hot-cache byte budget is tiny and
 // whose message-count depth HWM is huge, so the ONLY thing that could arm
 // reader backpressure is the hot-cache pace gate. syncDisabled selects
-// fsync:false (true) vs durable (false, the shipped default). Returns the
-// server and its storage so the test can read the resident-byte mirror.
-func newHotBudgetServer(t *testing.T, syncDisabled bool) (*Server, *storage.DisruptorStorage) {
+// fsync:false (true) vs durable (false, the shipped default); crashModel
+// selects the durable confirm fence (interfaces.CrashModelBarrier /
+// CrashModelForceFlush), or "" to leave the config default. Returns the server
+// and its storage so the test can read the resident-byte mirror.
+func newHotBudgetServer(t *testing.T, syncDisabled bool, crashModel string) (*Server, *storage.DisruptorStorage) {
 	t.Helper()
 	cfg := config.DefaultConfig()
 	cfg.Storage.Path = t.TempDir()
 	fsyncOn := !syncDisabled
 	cfg.Storage.Fsync = &fsyncOn // tri-state: explicit fsync for this mode
+	if crashModel != "" {
+		cfg.Storage.CrashModel = crashModel
+	}
 
 	eng := cfg.GetEngine()
 	eng.HotCacheQueueBytes = 2048 // tiny: binds after a dozen small bodies
@@ -66,16 +79,19 @@ func newHotBudgetServer(t *testing.T, syncDisabled bool) (*Server, *storage.Disr
 	}, storageImpl
 }
 
-// TestDurableModePublishNeverParksReaderAtHotBudget drives the real durable
-// publish path past the hot-cache byte budget and asserts the producer-only
-// connection is NEVER armed for reader backpressure and NO park is counted.
-func TestDurableModePublishNeverParksReaderAtHotBudget(t *testing.T) {
+// TestForceFlushModePublishNeverParksReaderAtHotBudget drives the real durable
+// publish path past the hot-cache byte budget under crash_model: force_flush
+// and asserts the producer-only connection is NEVER armed for reader
+// backpressure and NO park is counted. There the confirm fence is the ~16 ms
+// full drive-cache flush, so the group-commit batch size IS the throughput
+// limiter and pacing the publisher would starve it.
+func TestForceFlushModePublishNeverParksReaderAtHotBudget(t *testing.T) {
 	const queue = "durable-nopace-q"
 	// ~64-byte bodies so the 2048-byte budget is spent within a handful of
 	// publishes; the loop publishes far past that.
 	body := "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
 
-	srv, store := newHotBudgetServer(t, false) // DURABLE: fsync enabled
+	srv, store := newHotBudgetServer(t, false, interfaces.CrashModelForceFlush) // DURABLE, full flush
 	conn, frameCh := newPipeConnWithFrames(t)
 	sq5Setup(t, srv, conn, frameCh, queue)
 
@@ -123,7 +139,7 @@ func TestNonDurableModePublishParksReaderAtHotBudget(t *testing.T) {
 	const queue = "nondur-pace-q"
 	body := "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
 
-	srv, _ := newHotBudgetServer(t, true) // fsync:false: pacing wired
+	srv, _ := newHotBudgetServer(t, true, "") // fsync:false: pacing wired
 	conn, frameCh := newPipeConnWithFrames(t)
 	sq5Setup(t, srv, conn, frameCh, queue)
 
@@ -147,4 +163,45 @@ func TestNonDurableModePublishParksReaderAtHotBudget(t *testing.T) {
 	}
 	require.True(t, conn.DepthBackpressure.Load(),
 		"fsync:false mode must pace the publisher at the hot-cache byte budget")
+}
+
+// TestBarrierModePublishParksReaderAtHotBudget is the durable counterpart: under
+// crash_model: barrier (the shipped default) with fsync ON, the SAME
+// byte-budget-exceeded condition DOES arm the producer-only connection and
+// count a park, because the ~71 µs ordering fence is not the throughput
+// limiter and cold WAL reads are. Guarded on darwin: on Linux and other
+// platforms the barrier IS a full drive-cache flush, so pacing stays off
+// (TestForceFlushModePublishNeverParksReaderAtHotBudget covers that wiring via
+// force_flush).
+func TestBarrierModePublishParksReaderAtHotBudget(t *testing.T) {
+	if !storage.ConfirmFenceOrdersOnly {
+		t.Skip("crash_model: barrier is a full flush on this platform; pacing stays off")
+	}
+	const queue = "barrier-pace-q"
+	body := "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+
+	srv, _ := newHotBudgetServer(t, false, interfaces.CrashModelBarrier) // DURABLE, ordering fence
+	conn, frameCh := newPipeConnWithFrames(t)
+	sq5Setup(t, srv, conn, frameCh, queue)
+
+	done := make(chan struct{})
+	go srv.confirmFlusher(conn, done)
+	defer func() { <-done }()
+	defer close(conn.Done)
+
+	conn.HeartbeatSec.Store(0)
+	conn.HasPublished.Store(true) // producer-only
+
+	deadline := time.After(5 * time.Second)
+	for i := 0; i < 200 && !conn.DepthBackpressure.Load(); i++ {
+		select {
+		case <-deadline:
+			t.Fatalf("hot-cache pacing never armed after %d publishes under crash_model: barrier", i)
+		default:
+		}
+		require.NoError(t, srv.processCompleteMessage(conn, 1, makeDurablePendingMessage("", queue, body)))
+		time.Sleep(time.Millisecond)
+	}
+	require.True(t, conn.DepthBackpressure.Load(),
+		"durable + crash_model barrier must pace the publisher at the hot-cache byte budget")
 }

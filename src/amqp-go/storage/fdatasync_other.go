@@ -18,3 +18,10 @@ func fdatasyncFile(f *os.File) error {
 func barrierSyncFile(f *os.File) error {
 	return f.Sync()
 }
+
+// ConfirmFenceOrdersOnly reports whether the crash_model: barrier confirm
+// primitive is a genuine ORDERING-ONLY fence (an fsync plus an ordering
+// barrier, WITHOUT a drive write-cache flush). This platform has no cheaper
+// ordered primitive than os.File.Sync — a full flush — so the barrier is a
+// full flush and this is false.
+const ConfirmFenceOrdersOnly = false
