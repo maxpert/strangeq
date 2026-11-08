@@ -362,6 +362,60 @@ func TestAccessors_RaceWithLiveTraffic(t *testing.T) {
 	}
 }
 
+// TestAccessors_RaceWithChannelChurn exercises §10.4's "clean -race with a
+// concurrently-closing channel": one bounded goroutine repeatedly creates and
+// tears down a fresh channel through the same path a client channel.close takes
+// (conn.Channels.Delete + ChannelCount.Add(-1) + entity delta) while readers
+// enumerate ChannelViews and SnapshotEntityTotals. All goroutines join through
+// a WaitGroup with a fail-fast deadline; run under
+// `go test -race ./server -run TestAccessors_RaceWithChannelChurn`.
+func TestAccessors_RaceWithChannelChurn(t *testing.T) {
+	srv, sb := newEntityTestServer(t)
+	_, err := sb.DeclareQueue("q", false, false, false, nil)
+	require.NoError(t, err)
+
+	conn := protocol.NewConnection(nil)
+	conn.ID = "churn-conn"
+	attachConnection(srv, "churn-conn", "u", "/")
+	srv.InitEntityCounters()
+
+	const readers = 4
+	const iterations = 300
+	const churn = 80
+
+	var wg sync.WaitGroup
+	for r := 0; r < readers; r++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := 0; i < iterations; i++ {
+				srv.ChannelViews()
+				srv.SnapshotEntityTotals()
+			}
+		}()
+	}
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < churn; i++ {
+			id := uint16(i + 1)
+			conn.Channels.Store(id, protocol.NewChannel(id, conn))
+			conn.ChannelCount.Add(1)
+			srv.withEntityDelta("channels", 1)
+			srv.teardownChannel(conn, id)
+		}
+	}()
+
+	done := make(chan struct{})
+	go func() { wg.Wait(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(20 * time.Second):
+		t.Fatal("channel churn + accessors did not complete within the 20s deadline")
+	}
+}
+
 // lockUnexported locks an unexported sync.Mutex field of target (by name) and
 // returns its unlock. It uses the reflected field offset so a struct-layout
 // change cannot silently point at the wrong field. Test-only.
