@@ -923,15 +923,16 @@ func (s *Server) hCloseConnectionsByUser(w http.ResponseWriter, r *http.Request)
 
 // canClose enforces AUTH-015. With broker authentication disabled there is no
 // per-connection owner to compare against, so BOTH explicit opt-ins are
-// required and they are checked BEFORE any name comparison: the
-// unauthenticated principal is itself named "guest", so comparing p.Name with
-// an owner would otherwise authorise a close whenever the connection's
-// Username happened to be "guest" (SEC-066).
+// required. The guest identity is NAMED "guest" but is never an owner — and
+// the cookie path sets Authenticated=true on it — so the auth-disabled branch
+// is keyed on p.Unauthenticated, never on the name. A principal that is
+// neither authenticated nor the known guest identity fails closed.
 func (s *Server) canClose(p *Principal, ownerUser string) *apiError {
 	if p == nil {
 		return errUnauth("authentication required")
 	}
-	if !s.brokerAuthEnabled() {
+	switch {
+	case p.Unauthenticated, !s.brokerAuthEnabled():
 		if p.Unauthenticated && !s.mcfg.AllowUnauthenticatedMutations {
 			return errRefused("unauthenticated management mutations are disabled")
 		}
@@ -939,14 +940,18 @@ func (s *Server) canClose(p *Principal, ownerUser string) *apiError {
 			return errRefused("closing connections is disabled (management.allow_connection_close)")
 		}
 		return nil
+	case p.Authenticated:
+		if p.Name == ownerUser {
+			return nil
+		}
+		if p.Has(capCloseOthers) {
+			return nil
+		}
+		return errRefused("not permitted to close another user's connection")
+	default:
+		// Neither authenticated nor the known guest identity: never an owner.
+		return errRefused("not permitted to close another user's connection")
 	}
-	if p.Authenticated && p.Name == ownerUser {
-		return nil
-	}
-	if p.Has(capCloseOthers) {
-		return nil
-	}
-	return errRefused("not permitted to close another user's connection")
 }
 
 // --- definitions ---
@@ -1049,9 +1054,19 @@ func (s *Server) hDefinitionsImport(w http.ResponseWriter, r *http.Request) {
 	var body []byte
 	if isMultipart(r) {
 		// multipart/form-data import (RabbitMQ-compatible): the definitions
-		// document is the "file" part. The pre-routing body cap has already
-		// bounded the request; the part itself is bounded here too.
+		// document is the "file" part. The pre-routing cap uses Content-Length
+		// and is bypassed by a chunked body (ContentLength == -1), so bound the
+		// reader here too: ParseMultipartForm(maxMemory) treats its argument as
+		// an in-memory threshold, NOT a hard cap, and would otherwise consume an
+		// unbounded stream.
+		r.Body = http.MaxBytesReader(w, r.Body, int64(limit))
 		if err := r.ParseMultipartForm(int64(limit)); err != nil {
+			var mbe *http.MaxBytesError
+			if errors.As(err, &mbe) {
+				s.writeAPIError(w, r, apiErr(http.StatusRequestEntityTooLarge, errPayloadTooLarge,
+					"request body exceeds "+strconv.Itoa(limit)+" bytes"))
+				return
+			}
 			s.writeAPIError(w, r, errBad("invalid multipart form: "+err.Error()))
 			return
 		}
@@ -1063,6 +1078,12 @@ func (s *Server) hDefinitionsImport(w http.ResponseWriter, r *http.Request) {
 		defer func() { _ = part.Close() }()
 		data, rerr := io.ReadAll(io.LimitReader(part, int64(limit)+1))
 		if rerr != nil {
+			var mbe *http.MaxBytesError
+			if errors.As(rerr, &mbe) {
+				s.writeAPIError(w, r, apiErr(http.StatusRequestEntityTooLarge, errPayloadTooLarge,
+					"request body exceeds "+strconv.Itoa(limit)+" bytes"))
+				return
+			}
 			s.writeAPIError(w, r, errBad("could not read the multipart file part: "+rerr.Error()))
 			return
 		}
@@ -1219,7 +1240,7 @@ func (s *Server) ifMatchGate(r *http.Request, ok bool, current any) *apiError {
 	if err != nil {
 		return newAPIError(http.StatusInternalServerError, errInternal, "internal error")
 	}
-	if !etagMatches(raw, etagFor(body)) {
+	if !etagStrongMatches(raw, etagFor(body)) {
 		return newAPIError(http.StatusPreconditionFailed, errPrecondition,
 			"the resource has changed since it was read")
 	}

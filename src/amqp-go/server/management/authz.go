@@ -125,7 +125,12 @@ func (s *Server) authenticate(r *http.Request) (*Principal, clientInfo, *apiErro
 	return nil, ci, errUnauth("authentication required")
 }
 
-// principalFromCookie resolves the SQ_SESSION cookie to a Principal.
+// principalFromCookie resolves the SQ_SESSION cookie to a Principal. It returns
+// a COPY of the session's principal: the session object is shared by every
+// request on that session, so mutating it in place (ViaCookie/SessionID/
+// Authenticated) would race concurrent cookie requests. Authenticated mirrors
+// !Unauthenticated — the guest identity is NOT authenticated, even when it
+// arrives via a cookie.
 func (s *Server) principalFromCookie(r *http.Request, ci clientInfo) (*Principal, bool) {
 	c, err := r.Cookie(sessionCookieName)
 	if err != nil || c.Value == "" {
@@ -135,11 +140,11 @@ func (s *Server) principalFromCookie(r *http.Request, ci clientInfo) (*Principal
 	if !ok {
 		return nil, false
 	}
-	p := sess.principal
-	p.ViaCookie = true
-	p.SessionID = sess.id
-	p.Authenticated = true
-	return p, true
+	cp := *sess.principal
+	cp.ViaCookie = true
+	cp.SessionID = sess.id
+	cp.Authenticated = !cp.Unauthenticated
+	return &cp, true
 }
 
 // unauthenticatedPrincipal returns the loopback-only guest identity when the
@@ -236,14 +241,19 @@ func (s *Server) loginInherit(username, password string, ci clientInfo) (*Princi
 }
 
 // checkPrincipalClient applies the client restrictions attached to a
-// principal's broker user: loopback_only (AUTH-013) and the security.allowedhosts
-// / blockedhosts ACL (AUTH-009). It is shared by every authentication path —
-// Basic, the session cookie (SEC-112/T-06), and the session-create endpoint —
-// so a cookie minted on loopback cannot be replayed from a non-loopback client.
-// A built-in principal (p.User == nil) only enforces the host ACL.
+// principal: the guest identity is loopback-only (AUTH-041), a broker user may
+// carry loopback_only (AUTH-013), and every principal is subject to the
+// security.allowedhosts / blockedhosts ACL (AUTH-009). It is shared by every
+// authentication path — Basic, the session cookie (SEC-112/T-06), and the
+// session-create endpoint — so a cookie minted on loopback cannot be replayed
+// from a non-loopback client. A built-in principal (p.User == nil) still
+// enforces the guest loopback rule and the host ACL.
 func (s *Server) checkPrincipalClient(p *Principal, ci clientInfo) *apiError {
 	if p == nil {
 		return nil
+	}
+	if p.Unauthenticated && !ci.Loopback {
+		return errRefused("user is restricted to loopback connections")
 	}
 	if p.User != nil {
 		p.User.RLock()
@@ -311,9 +321,14 @@ func (s *Server) authzEnabled() bool {
 	return s.opts.Config != nil && s.opts.Config.Security.AuthorizationEnabled
 }
 
-// resourceReadGate enforces AUTH-011: a read needs at least one
-// VHostPermissions entry for the requested vhost. Built-in principals
-// (basic/none) carry a synthesized full permission for "/".
+// resourceReadGate enforces AUTH-011 ("the read/list of an entity in `/` needs
+// at least one entry for `/`", 07-auth-and-permissions.md:32): a principal must
+// hold a VHostPermissions entry for the requested vhost. Per AUTH-011 this is a
+// vhost-EXISTENCE check, deliberately NOT a match against the read regex — that
+// regex governs AMQP reads, not the management read gate. Built-in principals
+// (basic/none) carry a synthesized full permission for "/". This gate applies
+// only to ENTITY routes (see isEntityReadRoute); health/whoami/overview and
+// other non-entity endpoints are covered by the capability gate alone.
 func (s *Server) resourceReadGate(p *Principal, vhost string) *apiError {
 	if p.User == nil {
 		return nil
@@ -326,6 +341,21 @@ func (s *Server) resourceReadGate(p *Principal, vhost string) *apiError {
 		}
 	}
 	return errRefused("access to vhost " + vhost + " refused for user " + p.Name)
+}
+
+// isEntityReadRoute reports whether the matched route addresses a broker ENTITY
+// under a vhost, and therefore must pass resourceReadGate (AUTH-011). The
+// non-entity surface — health, whoami, overview, nodes, jobs, session, version,
+// static UI — is governed by the capability gate alone.
+func isEntityReadRoute(m *route) bool {
+	if m == nil || len(m.segs) < 2 || m.segs[0] != "api" {
+		return false
+	}
+	switch m.segs[1] {
+	case "queues", "exchanges", "bindings", "consumers", "channels", "connections", "vhosts", "definitions":
+		return true
+	}
+	return false
 }
 
 // requestVhost resolves the vhost a request targets: the decoded {vhost} path

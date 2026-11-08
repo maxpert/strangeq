@@ -179,12 +179,15 @@ func (s *Server) serveHTTP(w http.ResponseWriter, r *http.Request) {
 			s.writeAPIError(rw, r, ae)
 			return
 		}
-		// AUTH-011: the principal must hold at least one vhost permission for
-		// the vhost the request targets. Built-in principals (p.User == nil)
-		// hold a synthesized full permission and pass automatically.
-		if ae := s.resourceReadGate(p, requestVhost(r)); ae != nil {
-			s.writeAPIError(rw, r, ae)
-			return
+		// AUTH-011: an ENTITY read requires at least one vhost permission for
+		// the vhost the request targets. Non-entity endpoints (health, whoami,
+		// overview, …) are governed by the capability gate alone. Built-in
+		// principals (p.User == nil) hold a synthesized full permission.
+		if isEntityReadRoute(m) {
+			if ae := s.resourceReadGate(p, requestVhost(r)); ae != nil {
+				s.writeAPIError(rw, r, ae)
+				return
+			}
 		}
 		if ae := s.csrfGate(r, p); ae != nil {
 			s.writeAPIError(rw, r, ae)
@@ -392,6 +395,20 @@ func etagMatches(ifNoneMatch, tag string) bool {
 	for _, part := range strings.Split(ifNoneMatch, ",") {
 		p := strings.TrimSpace(part)
 		if p == "*" || p == tag || strings.TrimPrefix(p, "W/") == tag {
+			return true
+		}
+	}
+	return false
+}
+
+// etagStrongMatches implements the STRONG comparison required by If-Match
+// (RFC 9110 §13.1.1): "*" matches any current representation, otherwise the
+// validator must be the exact opaque tag. A weak validator (W/"…") NEVER
+// matches, unlike the weak comparison If-None-Match uses.
+func etagStrongMatches(ifMatch, tag string) bool {
+	for _, part := range strings.Split(ifMatch, ",") {
+		p := strings.TrimSpace(part)
+		if p == "*" || p == tag {
 			return true
 		}
 	}
