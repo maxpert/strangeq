@@ -35,12 +35,15 @@ var (
 	vitalHeadRe = regexp.MustCompile(`^([a-zA-Z_:][a-zA-Z0-9_:]*)(?:\{(.*)\})?$`)
 	// vitalLabelRe matches the single label matcher app.js supports.
 	vitalLabelRe = regexp.MustCompile(`^([a-zA-Z_][a-zA-Z0-9_]*)\s*(!=|=)\s*"((?:[^"\\]|\\.)*)"$`)
-	// inventoryNameRe pulls the amqp_* family names out of the golden list.
+	// inventoryNameRe pulls the amqp_* family names out of a golden list.
 	inventoryNameRe = regexp.MustCompile(`"(amqp_[a-zA-Z0-9_]+)"`)
-	// inventoryWantRe bounds that list to the test's `want := []string{...}`
-	// literal, so a family merely mentioned in a comment is not treated as part
-	// of the pinned set.
-	inventoryWantRe = regexp.MustCompile(`(?s)want\s*:=\s*\[\]string\{(.*?)\n\s*\}`)
+	// inventoryListRe bounds each `[]string{ ... }` block in the inventory
+	// golden. loadInventoryGolden scans every such block and keeps the one
+	// carrying the most amqp_* names, so the pinned set is found regardless of
+	// the variable name it is bound to (want := ..., amqpFamilyGolden = ...).
+	// Only names INSIDE a block count, so a family merely mentioned in a
+	// comment is not treated as part of the pinned set.
+	inventoryListRe = regexp.MustCompile(`(?s)\[\]string\{(.*?)\n\s*\}`)
 )
 
 // labelDomains is the enumerable label-literal domain for every family the
@@ -132,9 +135,15 @@ func loadInventoryGolden(t *testing.T) map[string]bool {
 	path := filepath.Join("..", "..", "..", "metrics", "inventory_test.go")
 	data, err := os.ReadFile(path)
 	require.NoErrorf(t, err, "reading the metric inventory golden %s", path)
-	block := inventoryWantRe.FindSubmatch(data)
-	require.NotNilf(t, block, "the inventory golden %s no longer has a `want := []string{...}` list", path)
-	names := inventoryNameRe.FindAllStringSubmatch(string(block[1]), -1)
+	blocks := inventoryListRe.FindAllSubmatch(data, -1)
+	require.NotEmptyf(t, blocks, "the inventory golden %s no longer has a `[]string{...}` list", path)
+	var names [][]string
+	for _, block := range blocks {
+		found := inventoryNameRe.FindAllStringSubmatch(string(block[1]), -1)
+		if len(found) > len(names) {
+			names = found
+		}
+	}
 	require.Greaterf(t, len(names), 100, "the inventory golden %s yielded only %d names", path, len(names))
 	golden := make(map[string]bool, len(names))
 	for _, n := range names {
