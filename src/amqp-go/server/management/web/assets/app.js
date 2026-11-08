@@ -1124,8 +1124,12 @@
     var q = route.query;
     var params = { page: q.get("page") || 1, page_size: q.get("page_size") || 50, name: q.get("name"), user: q.get("user") };
     var path = API + "/connections" + qs(params);
-    return loadList(container, "connections:" + path, path, {
-      render: function (r) { return buildConnections(r.data, route); }
+    /* The per-row Close column is capability-gated, so ensure the capability
+     * map is present before the first paint. */
+    return ensureCapabilities().then(function () {
+      return loadList(container, "connections:" + path, path, {
+        render: function (r) { return buildConnections(r.data, route); }
+      });
     });
   }
 
