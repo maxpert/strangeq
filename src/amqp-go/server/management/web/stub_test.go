@@ -76,14 +76,20 @@ type stubAPI struct {
 	queuePageCount int
 	queuePages     []int
 
-	// definitions-import controls: a forced status (413/429) and custom outcome
-	// tables, plus the last raw body for byte-fidelity assertions.
-	defsImportStatus int
-	defsApplied      []map[string]any
-	defsSkipped      []map[string]any
-	defsFailed       []map[string]any
-	lastDefsBody     string
-	defsBodies       []string
+	// definitions-import controls: a forced status (413/429/202) and custom
+	// outcome tables, plus the last raw body for byte-fidelity assertions.
+	defsImportStatus  int
+	defsApplyLocation string
+	defsApplied       []map[string]any
+	defsSkipped       []map[string]any
+	defsFailed        []map[string]any
+	lastDefsBody      string
+	defsBodies        []string
+
+	// purgeStatus/purgeLocation drive DELETE /api/queues/{vhost}/{name}/contents
+	// so a test can exercise the 202-async outcome.
+	purgeStatus   int
+	purgeLocation string
 
 	declared         []string
 	lastQueueDeclare map[string]any
@@ -482,6 +488,7 @@ func (s *stubAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			dry := r.URL.Query().Get("dry_run") == "true"
 			s.mu.Lock()
 			status := s.defsImportStatus
+			applyLoc := s.defsApplyLocation
 			applied, skipped, failed := s.defsApplied, s.defsSkipped, s.defsFailed
 			s.lastDefsBody = string(body)
 			s.defsBodies = append(s.defsBodies, string(body))
@@ -494,6 +501,17 @@ func (s *stubAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				w.Header().Set("Retry-After", "1")
 				writeJSON(w, status, map[string]any{"error": "rate_limited", "reason": "definitions import rate limited"})
 				return
+			case http.StatusAccepted:
+				// Only the APPLY is accepted asynchronously; the dry-run preview
+				// is synchronous, so it falls through to the normal preview body.
+				if !dry {
+					if applyLoc == "" {
+						applyLoc = "/api/strangeq/jobs/definitions-1"
+					}
+					w.Header().Set("Location", applyLoc)
+					writeJSON(w, status, map[string]any{"job_id": "definitions-1", "status": "accepted"})
+					return
+				}
 			}
 			if applied == nil {
 				applied = []map[string]any{{"type": "exchange", "name": "events", "vhost": "/", "result": "created"}}
@@ -779,6 +797,18 @@ func (s *stubAPI) handleQueues(w http.ResponseWriter, r *http.Request, segs []st
 		}
 		if len(segs) == 5 && segs[4] == "contents" && r.Method == http.MethodDelete {
 			if !s.guardCSRF(w, r) {
+				return
+			}
+			s.mu.Lock()
+			status := s.purgeStatus
+			loc := s.purgeLocation
+			s.mu.Unlock()
+			if status == http.StatusAccepted {
+				if loc == "" {
+					loc = "/api/strangeq/jobs/purge-1"
+				}
+				w.Header().Set("Location", loc)
+				writeJSON(w, http.StatusAccepted, map[string]any{"job_id": "purge-1", "status": "accepted"})
 				return
 			}
 			w.Header().Set("X-Sq-Messages-Purged", "1234")

@@ -91,8 +91,10 @@ func (s *Server) connectionsSnapshot() []connectionInfo {
 		return nil
 	}
 	alarm := srv.AlarmState() != 0
-	out := make([]connectionInfo, 0, len(srv.Connections))
+	lockStart := time.Now()
 	srv.Mutex.RLock()
+	s.sink.ManagementSnapshotLockWait(time.Since(lockStart).Seconds())
+	out := make([]connectionInfo, 0, len(srv.Connections))
 	for id, conn := range srv.Connections {
 		info := connectionInfo{
 			Name:     id,
@@ -262,7 +264,9 @@ func (s *Server) channelsSnapshot() []channelInfo {
 	// Fallback: enumerate channels from the connection registry, reading only
 	// lock-free atomics (BOB-3 promoted PrefetchCount/Transactional to atomics).
 	var out []channelInfo
+	lockStart := time.Now()
 	srv.Mutex.RLock()
+	s.sink.ManagementSnapshotLockWait(time.Since(lockStart).Seconds())
 	for id, conn := range srv.Connections {
 		conn.Channels.Range(func(_, value any) bool {
 			ch, ok := value.(*protocol.Channel)

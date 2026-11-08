@@ -257,6 +257,10 @@ table.data-table { border-collapse: collapse; width: 100%; background: var(--pan
 .toast.error { background: var(--danger); }
 .toast.ok { background: var(--ok); }
 
+/* A 202 "accepted as a background job" notice is shown in the toast root but
+ * carries a link to the job endpoint, so it is not a transient .toast. */
+.toast-root .notice.job-accepted { max-width: 360px; box-shadow: 0 2px 8px rgba(0, 0, 0, 0.25); }
+
 dl.props { display: grid; grid-template-columns: max-content 1fr; gap: 3px 14px; margin: 8px 0; }
 dl.props dt { color: var(--muted); }
 dl.props dd { margin: 0; }

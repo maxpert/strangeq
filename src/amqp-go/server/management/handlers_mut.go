@@ -854,13 +854,17 @@ func (s *Server) hCloseConnection(w http.ResponseWriter, r *http.Request) {
 	}
 	srv.Mutex.RLock()
 	conn := srv.Connections[name]
+	var username string
+	if conn != nil {
+		username = conn.Username
+	}
 	srv.Mutex.RUnlock()
 	if conn == nil {
 		s.writeAPIError(w, r, errNotFoundMsg("unknown connection"))
 		return
 	}
 	p := principalFrom(r)
-	if aerr := s.canClose(p, conn.Username); aerr != nil {
+	if aerr := s.canClose(p, username); aerr != nil {
 		s.auditMutation(r, "connection", name, "close", aerr.status)
 		s.writeAPIError(w, r, aerr)
 		return
@@ -912,7 +916,7 @@ func (s *Server) hCloseConnectionsByUser(w http.ResponseWriter, r *http.Request)
 		CloseConnection(id, reason string) error
 	})
 	for i, conn := range targets {
-		if aerr := s.canClose(p, conn.Username); aerr != nil {
+		if aerr := s.canClose(p, user); aerr != nil {
 			s.writeAPIError(w, r, aerr)
 			return
 		}

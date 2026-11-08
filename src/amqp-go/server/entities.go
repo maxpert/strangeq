@@ -240,14 +240,10 @@ func (s *Server) ChannelViews() []ChannelView {
 	for _, conn := range s.Connections {
 		connID := conn.ID
 		rt, hasRT := s.runtimes.Load(conn)
-		// PRE-EXISTING FOLLOW-UP (reviewer F6): Username and Vhost are written
-		// by the handshake goroutine (handleConnectionStartOK / handleConnectionOpen
-		// in connection_handlers.go) AFTER this connection was already published
-		// into s.Connections (server.go), and that write is NOT held under
-		// Server.Mutex. Reading them here under Mutex.RLock is therefore an
-		// unsynchronised read. A correct fix publishes the connection only after
-		// connection.open (or guards the two fields), which is a handshake change
-		// deliberately left out of this work stream rather than risked here.
+		// Username and Vhost are written by the handshake goroutine
+		// (handleConnectionStartOK / handleConnectionOpen in
+		// connection_handlers.go) under Server.Mutex, so reading them here
+		// under Mutex.RLock is synchronised (F2 fixed).
 		user := conn.Username
 		vhost := conn.Vhost
 		conn.Channels.Range(func(_, value interface{}) bool {

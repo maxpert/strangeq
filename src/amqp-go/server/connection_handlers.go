@@ -216,8 +216,14 @@ func (s *Server) processConnectionOpen(conn *protocol.Connection, payload []byte
 		}
 	}
 
-	// Set the connection's vhost
+	// Set the connection's vhost. The connection is already published into
+	// Server.Connections, so the write is taken under Server.Mutex: the
+	// management read path (connectionsSnapshot, ChannelViews) reads Vhost
+	// under Mutex.RLock. The AMQP-side readers run on this same goroutine and
+	// observe the value before sendConnectionOpenOK, so they stay lock-free.
+	s.Mutex.Lock()
 	conn.Vhost = vhost
+	s.Mutex.Unlock()
 
 	s.Log.Info("Connection opened",
 		zap.String("connection_id", conn.ID),
@@ -275,8 +281,12 @@ func (s *Server) handleConnectionStartOK(conn *protocol.Connection, payload []by
 
 	// Check if authentication is enabled
 	if s.Config != nil && !s.Config.Security.AuthenticationEnabled {
-		// Authentication disabled, allow connection as guest
+		// Authentication disabled, allow connection as guest. The connection is
+		// already published into Server.Connections, so the write is guarded by
+		// Server.Mutex for the management read path (F2).
+		s.Mutex.Lock()
 		conn.Username = "guest"
+		s.Mutex.Unlock()
 		s.Log.Info("Authentication disabled, allowing connection as guest",
 			zap.String("connection_id", conn.ID))
 		return nil
@@ -329,14 +339,19 @@ func (s *Server) handleConnectionStartOK(conn *protocol.Connection, payload []by
 		if err := s.checkUserAccess(conn, user.Username); err != nil {
 			return err
 		}
+		// Published under Server.Mutex for the management read path (F2).
+		s.Mutex.Lock()
 		conn.Username = user.Username
 		conn.User = user
+		s.Mutex.Unlock()
 		s.Log.Info("User authenticated successfully",
 			zap.String("connection_id", conn.ID),
 			zap.String("username", user.Username),
 			zap.String("mechanism", startOK.Mechanism))
 	} else {
+		s.Mutex.Lock()
 		conn.Username = "authenticated"
+		s.Mutex.Unlock()
 		s.Log.Info("Authentication successful",
 			zap.String("connection_id", conn.ID),
 			zap.String("mechanism", startOK.Mechanism))

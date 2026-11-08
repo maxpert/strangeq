@@ -172,6 +172,10 @@ func New(o Options) (*Server, error) {
 	}
 	s.jobs = newJobPool(mcfg.Async.MaxJobs,
 		time.Duration(mcfg.Async.JobRetentionSeconds)*time.Second, workers)
+	// Feed amqp_management_jobs{state} from the pool's lifecycle transitions
+	// (MEDIUM-2). The sink is the management surface's sink (noop when
+	// telemetry is disabled).
+	s.jobs.setSink(s.sink)
 
 	const window = time.Minute
 	s.authFailLimit = newCounterWindow(window, authFailureLimit(cfg), nil)
@@ -293,8 +297,12 @@ func (s *Server) Start() error {
 		Handler:           http.HandlerFunc(s.serveHTTP),
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       10 * time.Second,
-		WriteTimeout:      10 * time.Second,
-		IdleTimeout:       120 * time.Second,
+		// The write deadline must outlive the per-request deadline
+		// (management.limits.request_timeout_seconds), or a request allowed to
+		// run for N seconds is cut off by the listener at 10s. See
+		// managementWriteTimeout.
+		WriteTimeout: managementWriteTimeout(s.mcfg),
+		IdleTimeout:  120 * time.Second,
 	}
 	s.httpSrv = httpSrv
 	s.mu.Unlock()
@@ -318,6 +326,26 @@ func (s *Server) Addr() net.Addr {
 		return nil
 	}
 	return s.ln.Addr()
+}
+
+// managementWriteTimeout is the listener WriteTimeout (LOW-5). A request may
+// run for management.limits.request_timeout_seconds, so the listener write
+// deadline must be at least that plus a small slack; it is never SMALLER than
+// the 10s default. A request with a deadline longer than the listener timeout
+// would be truncated by net/http with a partial response, not the handler's
+// own status.
+func managementWriteTimeout(mcfg interfaces.ManagementConfig) time.Duration {
+	const (
+		defaultWriteTimeout = 10 * time.Second
+		writeSlack          = 5 * time.Second
+	)
+	wt := defaultWriteTimeout
+	if secs := mcfg.Limits.RequestTimeoutSeconds; secs > 0 {
+		if want := time.Duration(secs)*time.Second + writeSlack; want > wt {
+			wt = want
+		}
+	}
+	return wt
 }
 
 // Shutdown stops the surface gracefully. It is idempotent, safe to call before

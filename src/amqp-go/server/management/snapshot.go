@@ -6,6 +6,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/maxpert/amqp-go/broker"
 	"github.com/maxpert/amqp-go/server"
@@ -73,9 +74,13 @@ func (s *Server) entityTotals() (server.EntityTotals, bool) {
 	}
 	// Fallback: independent reads. Server.Mutex.RLock and the metadata-store
 	// read lock inside GetQueues/GetExchanges are permitted; Lifecycle.GetStats
-	// (which takes the forbidden Channel.Mutex) is never called.
+	// (which takes the forbidden Channel.Mutex) is never called. The wait for
+	// the permitted Server.Mutex read lock is observed (OPS-003/NFR-011); the
+	// seam path above is lock-free and takes no such lock.
 	if srv := s.opts.Server; srv != nil {
+		lockStart := time.Now()
 		srv.Mutex.RLock()
+		s.sink.ManagementSnapshotLockWait(time.Since(lockStart).Seconds())
 		t.Connections = int64(len(srv.Connections))
 		for _, c := range srv.Connections {
 			c.Channels.Range(func(_, _ any) bool {
@@ -200,11 +205,15 @@ type overviewResponse struct {
 }
 
 func (s *Server) hOverview(w http.ResponseWriter, r *http.Request) {
+	// Time the snapshot (the coherent entity read plus the queue aggregate
+	// pass) and publish it on the bounded route template (OPS-003).
+	snapshotStart := time.Now()
 	totals, coherent := s.entityTotals()
 	if !coherent {
 		s.sink.ManagementSnapshotPartial("/api/overview")
 	}
 	qt, _ := s.queueTotals()
+	s.sink.ManagementSnapshotDuration("/api/overview", time.Since(snapshotStart).Seconds())
 
 	alarmState := uint32(0)
 	degraded := 0

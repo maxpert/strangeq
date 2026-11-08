@@ -56,9 +56,10 @@ func TestForbiddenLock_OverviewDoesNotBlock(t *testing.T) {
 			t.Fatalf("GET %s did not return within 1s while a forbidden lock is held", target)
 		}
 	}
-	if n := e.mgmt.forbiddenLockHits.Load(); n != 0 {
-		t.Fatalf("amqp_management_forbidden_lock_acquired_total = %d, want 0", n)
-	}
+	// The deadline checks above are the real content. The
+	// forbiddenLockHits counter is NOT asserted here: it is never incremented
+	// (the runtime cannot detect a lock acquisition), so an assertion on it
+	// would be vacuous. TestForbiddenLockGate_ASTScan is the mechanical barrier.
 }
 
 // TestForbiddenLockGate_ASTScan is the mechanical gate behind
@@ -138,6 +139,51 @@ func TestForbiddenLockGate_ASTScan(t *testing.T) {
 				t.Errorf("%s:%d: management request path reads channel-guarded %s.%s",
 					path, line, id.Name, sel.Sel.Name)
 			}
+			return true
+		})
+	}
+	if checked == 0 {
+		t.Fatalf("AST scan found no source files")
+	}
+}
+
+// TestForbiddenLockMetric_NotRuntimeReachable pins the honesty of
+// amqp_management_forbidden_lock_acquired_total: no management request path
+// calls ManagementForbiddenLock, so the counter cannot fire. The real barrier
+// is the AST gate above plus the hold-the-lock deadline test; this test exists
+// so the metric is not read as evidence of a runtime check that does not exist
+// (NFR-011).
+func TestForbiddenLockMetric_NotRuntimeReachable(t *testing.T) {
+	files, err := filepath.Glob("*.go")
+	if err != nil {
+		t.Fatalf("glob: %v", err)
+	}
+	fset := token.NewFileSet()
+	checked := 0
+	for _, path := range files {
+		if strings.HasSuffix(path, "_test.go") {
+			continue
+		}
+		src, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatalf("read %s: %v", path, err)
+		}
+		checked++
+		f, err := parser.ParseFile(fset, path, src, 0)
+		if err != nil {
+			t.Fatalf("parse %s: %v", path, err)
+		}
+		ast.Inspect(f, func(n ast.Node) bool {
+			call, ok := n.(*ast.CallExpr)
+			if !ok {
+				return true
+			}
+			sel, ok := call.Fun.(*ast.SelectorExpr)
+			if !ok || sel.Sel.Name != "ManagementForbiddenLock" {
+				return true
+			}
+			t.Errorf("%s:%d: management request path calls ManagementForbiddenLock; the counter must not be runtime-reachable",
+				path, fset.Position(call.Pos()).Line)
 			return true
 		})
 	}

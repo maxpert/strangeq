@@ -47,6 +47,11 @@ var (
 	date    = "unknown"
 )
 
+// Compile-time contract: the telemetry collector is the management surface's
+// metrics sink (mgmt-01 §9). If this stops compiling, the amqp_management_*
+// families silently disappear from /metrics (OPS-001).
+var _ management.ManagementMetricsSink = (*metrics.Collector)(nil)
+
 // versionString is the one-line --version output.
 func versionString() string {
 	return fmt.Sprintf("amqp-server %s (commit %s, built %s, %s)", version, commit, date, runtime.Version())
@@ -328,14 +333,14 @@ func main() {
 				}
 			}
 		}
-		// The metrics sink is OPTIONAL: *metrics.Collector implements it only
-		// once the amqp_management_* families land. Until then the surface
-		// records into a no-op sink (SEC-001 zero-cost).
+		// Register the amqp_management_* families ONLY when the surface is
+		// enabled (OPS-002): with management disabled RegisterManagement is
+		// never called and no family is registered. The compile-time assertion
+		// above guarantees *metrics.Collector is the sink.
 		var mgmtSink management.ManagementMetricsSink
 		if collector != nil {
-			if s, ok := any(collector).(management.ManagementMetricsSink); ok {
-				mgmtSink = s
-			}
+			collector.RegisterManagement()
+			mgmtSink = collector
 		}
 		// The SPA renders its /metrics link from a CSP-safe <meta> the shell
 		// carries, so the management surface must know the telemetry URL.

@@ -50,6 +50,11 @@ type jobPool struct {
 	running int
 	done    int
 	failed  int
+
+	// sink, when non-nil, receives the per-state job counts on every lifecycle
+	// transition (submit/start/complete/expire) so amqp_management_jobs{state}
+	// tracks the pool. It is read under mu; set once by setSink.
+	sink ManagementMetricsSink
 }
 
 func newJobPool(max int, retention time.Duration, workers int) *jobPool {
@@ -88,6 +93,7 @@ func (p *jobPool) worker() {
 		j.startedAt = p.now()
 		p.running++
 		p.mu.Unlock()
+		p.publishStats()
 
 		res, err := j.fn()
 
@@ -104,6 +110,34 @@ func (p *jobPool) worker() {
 		}
 		p.running--
 		p.mu.Unlock()
+		p.publishStats()
+	}
+}
+
+// setSink installs the metrics sink that receives per-state job counts. It is
+// called once by Server.New after the pool is created.
+func (p *jobPool) setSink(s ManagementMetricsSink) {
+	p.mu.Lock()
+	p.sink = s
+	p.mu.Unlock()
+}
+
+// publishStats pushes the current per-state job counts to the sink (if any).
+// The counts are computed under the pool lock and the sink is called AFTER it
+// is released, so a sink that blocks can never hold the pool lock.
+func (p *jobPool) publishStats() {
+	if p == nil {
+		return
+	}
+	p.mu.Lock()
+	sink := p.sink
+	out := p.statsLocked()
+	p.mu.Unlock()
+	if sink == nil {
+		return
+	}
+	for state, n := range out {
+		sink.ManagementJobs(state, n)
 	}
 }
 
@@ -115,9 +149,9 @@ func (p *jobPool) submit(kind, owner string, target any, fn func() (any, error))
 		return nil, err
 	}
 	p.mu.Lock()
-	defer p.mu.Unlock()
 	p.reapLocked(p.now())
 	if len(p.jobs) >= p.max {
+		p.mu.Unlock()
 		return nil, ErrJobPoolFull
 	}
 	j := &job{
@@ -137,6 +171,7 @@ func (p *jobPool) submit(kind, owner string, target any, fn func() (any, error))
 			j.startedAt = p.now()
 			p.running++
 			p.mu.Unlock()
+			p.publishStats()
 			res, err := j.fn()
 			p.mu.Lock()
 			j.finishedAt = p.now()
@@ -151,8 +186,11 @@ func (p *jobPool) submit(kind, owner string, target any, fn func() (any, error))
 			}
 			p.running--
 			p.mu.Unlock()
+			p.publishStats()
 		}()
 	}
+	p.mu.Unlock()
+	p.publishStats()
 	return j, nil
 }
 
@@ -160,11 +198,18 @@ func (p *jobPool) submit(kind, owner string, target any, fn func() (any, error))
 // sees 404, FR-API-142).
 func (p *jobPool) get(id, owner string) (*job, bool) {
 	p.mu.Lock()
-	defer p.mu.Unlock()
-	p.reapLocked(p.now())
+	removed := p.reapLocked(p.now())
 	j, ok := p.jobs[id]
 	if !ok || j.owner != owner {
+		p.mu.Unlock()
+		if removed > 0 {
+			p.publishStats()
+		}
 		return nil, false
+	}
+	p.mu.Unlock()
+	if removed > 0 {
+		p.publishStats()
 	}
 	return j, true
 }
@@ -174,13 +219,21 @@ func (p *jobPool) get(id, owner string) (*job, bool) {
 // so reading the fields outside it is a data race.
 func (p *jobPool) viewOf(id, owner string) (JobView, bool) {
 	p.mu.Lock()
-	defer p.mu.Unlock()
-	p.reapLocked(p.now())
+	removed := p.reapLocked(p.now())
 	j, ok := p.jobs[id]
 	if !ok || j.owner != owner {
+		p.mu.Unlock()
+		if removed > 0 {
+			p.publishStats()
+		}
 		return JobView{}, false
 	}
-	return j.view(), true
+	v := j.view()
+	p.mu.Unlock()
+	if removed > 0 {
+		p.publishStats()
+	}
+	return v, true
 }
 
 // stateOf reports a job's state under the pool lock. It exists so tests (and
@@ -195,10 +248,11 @@ func (p *jobPool) stateOf(id, owner string) (string, bool) {
 	return j.state, true
 }
 
-func (p *jobPool) reapLocked(now time.Time) {
+func (p *jobPool) reapLocked(now time.Time) int {
 	if p.retention <= 0 {
-		return
+		return 0
 	}
+	removed := 0
 	keep := p.order[:0]
 	for _, id := range p.order {
 		j := p.jobs[id]
@@ -208,26 +262,36 @@ func (p *jobPool) reapLocked(now time.Time) {
 		terminal := j.state == jobDone || j.state == jobFailed
 		if terminal && now.Sub(j.finishedAt) > p.retention {
 			delete(p.jobs, id)
+			removed++
 			continue
 		}
 		keep = append(keep, id)
 	}
 	p.order = keep
+	return removed
 }
 
-// stats reports the number of jobs in each state (label for the
-// amqp_management_jobs{state} gauge).
-func (p *jobPool) stats() map[string]int {
-	p.mu.Lock()
-	defer p.mu.Unlock()
+// statsLocked reports the number of jobs CURRENTLY in each state (the label for
+// the amqp_management_jobs{state} gauge). The caller must hold p.mu. A reaped
+// terminal job stops being counted, so expiry lowers `done`/`failed`.
+func (p *jobPool) statsLocked() map[string]int {
 	p.reapLocked(p.now())
-	out := map[string]int{jobQueued: 0, jobRunning: p.running, jobDone: p.done, jobFailed: p.failed}
+	out := map[string]int{jobQueued: 0, jobRunning: 0, jobDone: 0, jobFailed: 0}
 	for _, j := range p.jobs {
-		if j.state == jobQueued {
-			out[jobQueued]++
+		switch j.state {
+		case jobQueued, jobRunning, jobDone, jobFailed:
+			out[j.state]++
 		}
 	}
 	return out
+}
+
+// stats reports the number of jobs in each state. It takes the pool lock and
+// exists for tests and any caller that does not already hold it.
+func (p *jobPool) stats() map[string]int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.statsLocked()
 }
 
 // close stops the worker pool.
