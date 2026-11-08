@@ -993,7 +993,11 @@ func (s *Server) hDefinitionsExport(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	p := principalFrom(r)
-	cur := s.currentTopology()
+	cur, terr := s.currentTopology()
+	if terr != nil {
+		s.writeAPIError(w, r, errUnavailableMsg(terr.Error()))
+		return
+	}
 	doc := s.buildDefinitionsExport(cur, p != nil && p.Has(capManageUsers))
 	s.writeJSON(w, r, http.StatusOK, doc)
 }
@@ -1053,7 +1057,13 @@ func (s *Server) hDefinitionsImport(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	cur := s.currentTopology()
+	cur, terr := s.currentTopology()
+	if terr != nil {
+		// Read-only at this point: nothing was declared or audited, so a
+		// dry-run and an apply refuse identically (review finding 1).
+		s.writeAPIError(w, r, errUnavailableMsg(terr.Error()))
+		return
+	}
 	caps := defsCaps{
 		MaxQueues:    s.mcfg.Definitions.MaxQueues,
 		MaxExchanges: s.mcfg.Definitions.MaxExchanges,

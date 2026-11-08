@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net/http"
 	"net/url"
+	"sort"
 
 	"github.com/maxpert/amqp-go/broker"
 	"github.com/maxpert/amqp-go/interfaces"
@@ -229,6 +230,29 @@ func filterBindingsExact(items []bindingItem, vals url.Values) []bindingItem {
 }
 
 func (s *Server) writeBindingList(w http.ResponseWriter, r *http.Request, items []bindingItem, q *listQuery) {
+	// WS4 finding 6: ListBindings returns sync.Map Range order, so with no
+	// explicit `sort` the default order must be a stable, total order or paging
+	// is nondeterministic. The full identity tuple (routing_key, source,
+	// destination, destination_type, properties_key) is a total order over
+	// distinct bindings.
+	if q.sortField == "" {
+		sort.SliceStable(items, func(i, j int) bool {
+			a, b := items[i], items[j]
+			if a.RoutingKey != b.RoutingKey {
+				return a.RoutingKey < b.RoutingKey
+			}
+			if a.Source != b.Source {
+				return a.Source < b.Source
+			}
+			if a.Destination != b.Destination {
+				return a.Destination < b.Destination
+			}
+			if a.DestinationType != b.DestinationType {
+				return a.DestinationType < b.DestinationType
+			}
+			return a.PropertiesKey < b.PropertiesKey
+		})
+	}
 	anyItems := make([]any, 0, len(items))
 	for _, it := range items {
 		anyItems = append(anyItems, it)
@@ -477,6 +501,3 @@ func (s *Server) hBindingDelete(w http.ResponseWriter, r *http.Request) {
 		s.writeAPIError(w, r, errBad("destination type must be 'q' or 'e'"))
 	}
 }
-
-// matchArguments extracts the raw (pre-JSON) field table from a matched item so
-// the argument-qualified unbind compares like-for-like.

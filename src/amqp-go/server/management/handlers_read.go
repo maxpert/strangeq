@@ -310,34 +310,54 @@ func (s *Server) hChannels(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) hChannel(w http.ResponseWriter, r *http.Request) {
 	raw := pathValue(endpointLabel(r), r.URL.EscapedPath(), "id")
-	for _, c := range s.channelsSnapshot() {
-		if channelIDMatches(raw, c) {
-			s.writeJSON(w, r, http.StatusOK, c)
-			return
-		}
+	if c, ok := resolveChannelID(raw, s.channelsSnapshot()); ok {
+		s.writeJSON(w, r, http.StatusOK, c)
+		return
 	}
 	s.writeAPIError(w, r, errNotFoundMsg("unknown channel"))
 }
 
-// channelIDMatches resolves the `{id}` path key. The canonical key is the
-// percent-encoded "{connection}:{number}" composite (connection ids are
-// colon-free hex, so the split is unambiguous; spec mgmt-04 §3.6). A bare
-// integer is also accepted and matched against the channel number, which keeps
-// a single-connection lookup working and matches the pre-BOB-3 behaviour.
-func channelIDMatches(raw string, c channelInfo) bool {
+// resolveChannelID resolves the `{id}` path key deterministically (WS4 finding
+// 5). The canonical key is the percent-decoded "{connection}:{number}"
+// composite (connection ids are colon-free, so the split is unambiguous; spec
+// mgmt-04 §3.6) and always resolves to exactly one channel.
+//
+// A bare integer is ALSO accepted, but only when it is UNAMBIGUOUS: it must
+// match exactly one channel across every connection. When two connections both
+// own a channel with that number the request 404s on every call instead of
+// returning whichever connection Go's map order happened to yield.
+func resolveChannelID(raw string, channels []channelInfo) (channelInfo, bool) {
 	if i := strings.IndexByte(raw, ':'); i >= 0 {
 		connID, numStr := raw[:i], raw[i+1:]
 		n, err := strconv.Atoi(numStr)
 		if err != nil {
-			return false
+			return channelInfo{}, false
 		}
-		return c.Connection == connID && int(c.Number) == n
+		for _, c := range channels {
+			if c.Connection == connID && int(c.Number) == n {
+				return c, true
+			}
+		}
+		return channelInfo{}, false
 	}
+
 	n, err := strconv.Atoi(raw)
 	if err != nil {
-		return false
+		return channelInfo{}, false
 	}
-	return int(c.Number) == n
+	var match channelInfo
+	found := false
+	for _, c := range channels {
+		if int(c.Number) != n {
+			continue
+		}
+		if found {
+			// A second match makes the bare number ambiguous: refuse it.
+			return channelInfo{}, false
+		}
+		match, found = c, true
+	}
+	return match, found
 }
 
 // hConnectionChannels serves GET /api/connections/{name}/channels (FR-API-024):

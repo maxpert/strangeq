@@ -5,6 +5,7 @@ import (
 
 	amqperrors "github.com/maxpert/amqp-go/errors"
 	"github.com/maxpert/amqp-go/protocol"
+	"github.com/maxpert/amqp-go/transaction"
 	"github.com/stretchr/testify/require"
 )
 
@@ -86,6 +87,18 @@ func TestChannelView_TransactionalMatchesManager(t *testing.T) {
 
 	require.NoError(t, srv.handleTxRollback(conn, 1, nil))
 	assertMirror("after rollback")
+
+	// Failed-commit transition (WS4 review, tx_handlers.go:146-148): with a
+	// buffered publish and no executor, the commit fails, the manager drops the
+	// channel out of tx mode, and the handler must clear the atomic mirror on
+	// the same path it closes the channel.
+	require.NoError(t, srv.txm(conn).AddOperation(1, transaction.NewPublishOperation("", "", &protocol.Message{})))
+	srv.TransactionManager.SetExecutor(nil)
+	err := srv.handleTxCommit(conn, 1, nil)
+	require.Error(t, err, "a commit with no executor must fail")
+	require.False(t, ch.Transactional.Load(), "the failed commit must clear the channel mirror")
+	require.False(t, srv.txm(conn).IsTransactional(1), "the failed commit must drop the manager's tx state")
+	assertMirror("after failed commit")
 
 	srv.teardownChannel(conn, 1)
 	require.False(t, srv.txm(conn).IsTransactional(1))

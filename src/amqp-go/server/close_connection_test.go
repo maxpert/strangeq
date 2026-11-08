@@ -63,6 +63,20 @@ func TestCloseConnection_ReasonSanitised(t *testing.T) {
 	require.True(t, strings.HasPrefix(m.ReplyText, "badreason"), "reason=%q", m.ReplyText)
 }
 
+// TestCloseConnection_ReasonRuneBoundary pins the rune-boundary truncation
+// (WS4 review finding 7): 254 ASCII bytes plus a 2-byte rune is 256 bytes, and
+// the 255-byte cap must drop the rune WHOLE rather than split it into invalid
+// UTF-8.
+func TestCloseConnection_ReasonRuneBoundary(t *testing.T) {
+	reason := strings.Repeat("a", 254) + "é" // 254 + 2 = 256 bytes
+	require.Len(t, []byte(reason), 256, "fixture premise: 256 bytes")
+
+	got := sanitizeCloseReason(reason)
+	require.LessOrEqual(t, len(got), 255, "the reason must be capped at 255 bytes")
+	require.True(t, utf8.ValidString(got), "the sanitised reason must not split a rune: %q", got)
+	require.Equal(t, strings.Repeat("a", 254), got, "the straddling rune is dropped whole")
+}
+
 // TestCloseConnection_StuckForcesBounded proves a peer that never replies
 // close-ok is force-closed within closeOKTimeout (spec §5.4 test 36).
 func TestCloseConnection_StuckForcesBounded(t *testing.T) {

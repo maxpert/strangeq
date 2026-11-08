@@ -1820,6 +1820,7 @@
         ["DIV-bindings", "bindings list source/destination/destination_type/routing_key/properties_key; create/delete use /api/bindings/{vhost}/e/... with properties_key as the canonical delete key"],
         ["DIV-close", "close connection sends connection.close 320 with the operator reason; the peer is force-closed only if it does not reply close-ok within 3 s"],
         ["DIV-channel", "channel prefetch_count/transactional are real lock-free atomics; state=closing is observable only while the channel is still registered"],
+        ["DIV-channel-id", "GET /api/channels/{id} takes the canonical {connection}:{number} composite; a bare channel number is accepted only when it is unambiguous and is otherwise a deterministic 404 (tooling should use the composite form)"],
         ["DIV-15", "unanswerable health checks return 501, not a fake 200"]
       ];
       container.replaceChildren(h("div", { class: "screen screen-about" }, [
