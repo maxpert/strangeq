@@ -79,6 +79,20 @@ func (s *Server) serveHTTP(w http.ResponseWriter, r *http.Request) {
 	rw := &responseRecorder{ResponseWriter: w}
 	path := r.URL.EscapedPath()
 
+	// OPS-062: record EVERY request, including every early return below —
+	// shutdown 503, body-cap 413, in-flight shed 503, negotiation/404/405/401/
+	// 429/403. The route is not known yet, so the bounded endpoint label starts
+	// at the sentinel "pre_route" (OPS-004) and is replaced with the matched
+	// route TEMPLATE as soon as routing succeeds; a request that never matches a
+	// route keeps "pre_route". Recording in a defer means no early return can be
+	// uncounted, and it is the single recorder for both the count and the
+	// duration.
+	endpoint := "pre_route"
+	defer func() {
+		s.sink.ManagementRequests(endpoint, r.Method, statusClass(rw.statusCode()))
+		s.sink.ManagementDuration(endpoint, time.Since(start).Seconds())
+	}()
+
 	if path != "/api" && !strings.HasPrefix(path, "/api/") {
 		s.serveUI(rw, r, reqID)
 		return
@@ -152,6 +166,7 @@ func (s *Server) serveHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	r = r.WithContext(withEndpoint(r.Context(), m.pattern))
+	endpoint = m.pattern
 
 	// The session-login endpoint authenticates itself and must be reachable
 	// without a prior credential (AUTH-031).
@@ -217,9 +232,6 @@ func (s *Server) serveHTTP(w http.ResponseWriter, r *http.Request) {
 
 	// Dispatch with panic isolation (NFR-020).
 	s.dispatch(rw, r, m)
-
-	s.sink.ManagementRequests(m.pattern, r.Method, statusClass(rw.statusCode()))
-	s.sink.ManagementDuration(m.pattern, time.Since(start).Seconds())
 }
 
 func (s *Server) dispatch(rw *responseRecorder, r *http.Request, m *route) {
