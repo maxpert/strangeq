@@ -609,6 +609,8 @@ func use() {
 	_ = ch.Consumers
 	var conn any
 	_ = conn.WriteMutex
+	var srv any
+	_ = srv.TransactionManager
 }
 `)
 
@@ -617,6 +619,23 @@ func use() {
 	joined := strings.Join(findings, "\n")
 	require.Contains(t, joined, "Consumers", "a channel-guarded field must be caught: %v", findings)
 	require.Contains(t, joined, "WriteMutex", "an always-forbidden field must be caught: %v", findings)
+	require.Contains(t, joined, "TransactionManager", "the tx-manager must be caught: %v", findings)
+}
+
+// TestForbiddenLockGate_ASTScan_CatchesChannelMutex pins the BOB-3 extension:
+// Channel.Mutex is forbidden to a management request (the receiver is
+// channel-typed), while an untyped/Server receiver named `s` is not flagged.
+func TestForbiddenLockGate_ASTScan_CatchesChannelMutex(t *testing.T) {
+	chanMutex := writeScanFixture(t, "chan_mutex.go", "package fixture\n\nfunc use(ch *protocol.Channel) {\n\tch.Mutex.Lock()\n}\n")
+	f, err := scanForbidden([]string{chanMutex})
+	require.NoError(t, err)
+	require.Len(t, f, 1, "Channel.Mutex must be flagged: %v", f)
+	require.Contains(t, f[0], "Mutex")
+
+	serverMutex := writeScanFixture(t, "server_mutex.go", "package fixture\n\nfunc use(s *Server) {\n\ts.Mutex.RLock()\n}\n")
+	f, err = scanForbidden([]string{serverMutex})
+	require.NoError(t, err)
+	require.Empty(t, f, "a Server.Mutex (permitted) must not be flagged: %v", f)
 }
 
 // TestForbiddenLockGate_ASTScan_ChannelVsConnection pins the Channel-vs-
