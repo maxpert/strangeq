@@ -452,6 +452,11 @@ func walRecordCount(t *testing.T, path string) int {
 func seedSixFileWAL(t *testing.T, dataDir string, wantFiles int) []string {
 	t.Helper()
 
+	// W8 pre-creates the next WAL file off the commit path; this fixture counts
+	// the .wal files on disk EXACTLY, so pin the inline-roll path (no
+	// background pre-open) for determinism.
+	t.Cleanup(storage.SetWALPreopenEnabledForTest(false))
+
 	pm, err := storage.NewPersistentMetadataStore(dataDir)
 	if err != nil {
 		t.Fatalf("metadata store: %v", err)
