@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/maxpert/amqp-go/config"
+	"github.com/maxpert/amqp-go/server"
 )
 
 // --- lifecycle / zero cost ---
@@ -304,6 +305,25 @@ func TestSecurityHeaders_OnAPIAndUI(t *testing.T) {
 	}
 }
 
+// TestBareAPIPath_JSONEnvelope pins that "/api" (no trailing slash) is an API
+// path: it must reach the router and return the JSON 404 envelope, not fall
+// through to the UI handler and serve the SPA shell.
+func TestBareAPIPath_JSONEnvelope(t *testing.T) {
+	e := newEnv(t, false, nil)
+	rec := e.get("/api")
+	wantStatus(t, rec, http.StatusNotFound)
+	if got := rec.Header().Get("Content-Type"); !strings.HasPrefix(got, "application/json") {
+		t.Fatalf("GET /api Content-Type = %q, want application/json", got)
+	}
+	if strings.Contains(rec.Body.String(), "<html") {
+		t.Fatalf("GET /api leaked an HTML body: %s", rec.Body.String())
+	}
+	env := decode[errorEnvelope](t, rec)
+	if env.Error != "not_found" {
+		t.Fatalf("GET /api error = %q, want not_found", env.Error)
+	}
+}
+
 // TestETag_DeterministicAnd304 (FR-CONV-064, spec §11 test 34).
 func TestETag_DeterministicAnd304(t *testing.T) {
 	e := basicEnv(t, true, nil)
@@ -338,16 +358,37 @@ func TestETag_ListChangesWithPageContent(t *testing.T) {
 	}
 }
 
+// noTotalsBroker embeds a UnifiedBroker so it satisfies the interface but
+// deliberately does NOT promote the optional BOB-1/BOB-8 accessor seams
+// (QueueMessageCounts / ConsumerViews / QueueReadyCount), none of which are part
+// of UnifiedBroker. It models a custom broker on which message totals are
+// genuinely unknowable, so the management layer must render null (never 0) with
+// stats_partial:true.
+type noTotalsBroker struct {
+	server.UnifiedBroker
+}
+
 // TestNullDiscipline_NeverZero (FR-CONV-041, spec §11 test 37).
 func TestNullDiscipline_NeverZero(t *testing.T) {
 	e := basicEnv(t, true, nil)
 	rec := e.do(http.MethodPut, "/api/queues/%2F/null-q", e.jsonBody(t, queueDeclareRequest{Exclusive: true, AutoDelete: true}), basicAuthHeader())
 	wantStatus(t, rec, http.StatusCreated)
 
+	// Known path: BOB-1 is built, so a queue with a live QueueState reports a
+	// real 0 (Known=true) with stats_partial:false — null would be a lie here.
+	known := e.do(http.MethodGet, "/api/queues?page=1", nil, basicAuthHeader()).Body.String()
+	if !strings.Contains(known, `"messages_unacknowledged":0`) || !strings.Contains(known, `"stats_partial":false`) {
+		t.Fatalf("a live queue's known totals must be 0/false, got %s", truncate(known))
+	}
+
+	// Unknown path: strip the optional BOB-1/BOB-8 accessor seams so the totals
+	// are genuinely unknowable. The null discipline must hold — an unknown stat
+	// is null, never 0 — and stats_partial must be true.
+	e.srv.Broker = noTotalsBroker{UnifiedBroker: e.srv.Broker}
+
 	body := e.do(http.MethodGet, "/api/queues?page=1", nil, basicAuthHeader()).Body.String()
-	// BOB-1 is unbuilt in this tree, so unacked/total must be null — never 0.
 	if !strings.Contains(body, `"messages_unacknowledged":null`) {
-		t.Fatalf("messages_unacknowledged must be null, got %s", truncate(body))
+		t.Fatalf("messages_unacknowledged must be null when unknown, got %s", truncate(body))
 	}
 	if !strings.Contains(body, `"stats_partial":true`) {
 		t.Fatalf("stats_partial must be true when a stat is unknown, got %s", truncate(body))

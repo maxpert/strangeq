@@ -184,3 +184,28 @@ func healthcheckURL(address string, port int) string {
 	}
 	return "http://" + net.JoinHostPort(host, strconv.Itoa(port)) + "/health"
 }
+
+// metricsURLFor builds the /metrics URL advertised to the management SPA from
+// the bound telemetry listener. A nil or unparseable address, or a wildcard
+// bind (0.0.0.0/::), yields "" — a wildcard host is not connectable by a
+// browser, so the SPA omits the link rather than advertise a dead address.
+// There is no telemetry TLS setting, so the scheme tracks the deployment's
+// control-plane TLS posture (management.tls.enabled).
+func metricsURLFor(addr net.Addr, tlsEnabled bool) string {
+	if addr == nil {
+		return ""
+	}
+	host, port, err := net.SplitHostPort(addr.String())
+	if err != nil {
+		return ""
+	}
+	switch host {
+	case "", "0.0.0.0", "::":
+		return ""
+	}
+	scheme := "http"
+	if tlsEnabled {
+		scheme = "https"
+	}
+	return scheme + "://" + net.JoinHostPort(host, port) + "/metrics"
+}

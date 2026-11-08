@@ -308,13 +308,13 @@ type ManagementSessionConfig struct {
 
 // ManagementLimitsConfig is management.limits.*.
 type ManagementLimitsConfig struct {
-	MaxPageSize          int `json:"max_page_size"` // default 500
+	MaxPageSize           int `json:"max_page_size"` // default 500
 	RequestTimeoutSeconds int `json:"request_timeout_seconds"`
-	MaxInFlight          int `json:"max_in_flight"` // default 64 (SEC-061)
-	MaxBodyBytes         int `json:"max_body_bytes"`
-	MaxImportBodyBytes   int `json:"max_import_body_bytes"`
-	MaxResponseBytes     int `json:"max_response_bytes"` // default 4 MiB
-	MaxNameBytes         int `json:"max_name_bytes"`     // default 256 (SEC-085)
+	MaxInFlight           int `json:"max_in_flight"` // default 64 (SEC-061)
+	MaxBodyBytes          int `json:"max_body_bytes"`
+	MaxImportBodyBytes    int `json:"max_import_body_bytes"`
+	MaxResponseBytes      int `json:"max_response_bytes"` // default 4 MiB
+	MaxNameBytes          int `json:"max_name_bytes"`     // default 256 (SEC-085)
 }
 
 // ManagementRateLimitsConfig is management.rate_limits.* (SEC-067/068/069).

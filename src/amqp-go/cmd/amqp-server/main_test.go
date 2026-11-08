@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"net"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -236,4 +237,21 @@ func TestHealthcheckAddress(t *testing.T) {
 	assert.Equal(t, "http://127.0.0.1:9419/health", healthcheckURL("", 9419))
 	assert.Equal(t, "http://127.0.0.1:9419/health", healthcheckURL("::", 9419))
 	assert.Equal(t, "http://[::1]:9419/health", healthcheckURL("::1", 9419))
+}
+
+// TestMetricsURLFor pins the SPA /metrics link glue: an absolute loopback URL,
+// https when the control plane is TLS, and NO link for a wildcard bind or a
+// missing listener (a non-connectable host must not be advertised).
+func TestMetricsURLFor(t *testing.T) {
+	tcp := func(s string) net.Addr {
+		a, err := net.ResolveTCPAddr("tcp", s)
+		require.NoError(t, err)
+		return a
+	}
+	assert.Equal(t, "http://127.0.0.1:9419/metrics", metricsURLFor(tcp("127.0.0.1:9419"), false))
+	assert.Equal(t, "https://127.0.0.1:9419/metrics", metricsURLFor(tcp("127.0.0.1:9419"), true))
+	assert.Equal(t, "http://[::1]:9419/metrics", metricsURLFor(tcp("[::1]:9419"), false))
+	assert.Equal(t, "", metricsURLFor(tcp("0.0.0.0:9419"), false), "wildcard IPv4 bind must not be advertised")
+	assert.Equal(t, "", metricsURLFor(tcp("[::]:9419"), true), "wildcard IPv6 bind must not be advertised")
+	assert.Equal(t, "", metricsURLFor(nil, false), "no listener means no link")
 }

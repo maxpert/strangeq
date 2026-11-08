@@ -1051,6 +1051,11 @@ func (s *Server) hDefinitionsImport(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	limit := s.mcfg.Limits.MaxImportBodyBytes
+	if limit <= 0 {
+		// A directly constructed Options may leave the import limit unset;
+		// mirror readBodyLimited's default rather than 413 every import.
+		limit = 2 << 20
+	}
 	var body []byte
 	if isMultipart(r) {
 		// multipart/form-data import (RabbitMQ-compatible): the definitions

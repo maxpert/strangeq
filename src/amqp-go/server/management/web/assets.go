@@ -18,9 +18,12 @@
 package web
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"embed"
 	"encoding/hex"
+	"encoding/json"
+	"html"
 	"io/fs"
 	"net/http"
 	"path"
@@ -82,14 +85,61 @@ func loadBundle() *bundle {
 	return b
 }
 
+// Options carries the runtime configuration injected into the SPA shell. The
+// zero value serves the shell byte-for-byte as embedded.
+type Options struct {
+	// MetricsURL, when non-empty, is injected into <head> as a
+	// <meta name="sq-config"> element so the SPA can render the /metrics link
+	// without an inline <script> (the CSP is script-src 'self').
+	MetricsURL string
+}
+
 // Handler returns the http.Handler that serves the embedded SPA.
-func Handler() http.Handler { return http.HandlerFunc(handle) }
+func Handler() http.Handler { return HandlerWithOptions(Options{}) }
+
+// HandlerWithOptions returns the SPA handler with opts applied. The only
+// option today injects the metrics URL as a CSP-safe <meta> element; an empty
+// option set returns a handler that serves the embedded bytes unchanged.
+func HandlerWithOptions(opts Options) http.Handler {
+	return &spaHandler{shell: shellForOptions(opts)}
+}
+
+// spaHandler serves the (optionally rewritten) shell plus the immutable assets.
+type spaHandler struct {
+	shell []byte
+}
+
+func (h *spaHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	handle(h.shell, w, r)
+}
+
+// shellForOptions renders index.html with the injected config, or the embedded
+// bytes verbatim when nothing is configured.
+func shellForOptions(opts Options) []byte {
+	if opts.MetricsURL == "" {
+		return embedded.index.body
+	}
+	cfg, err := json.Marshal(map[string]string{"metricsUrl": opts.MetricsURL})
+	if err != nil {
+		return embedded.index.body
+	}
+	// The attribute value is HTML-escaped so a URL (or a future option) cannot
+	// break out of the double-quoted attribute; the browser decodes the
+	// entities before app.js reads the attribute, so JSON.parse sees the JSON.
+	meta := `<meta name="sq-config" content="` + html.EscapeString(string(cfg)) + `">` + "\n"
+	// index.html embeds exactly one </head>; the SPA shell is the only thing
+	// this rewrites, so a missing marker degrades to the embedded bytes.
+	if !bytes.Contains(embedded.index.body, []byte("</head>")) {
+		return embedded.index.body
+	}
+	return bytes.Replace(embedded.index.body, []byte("</head>"), []byte(meta+"</head>"), 1)
+}
 
 // AssetHandler is an alias of Handler retained for the frozen interface named
 // in spec 02 §1.2/§9.
 func AssetHandler() http.Handler { return Handler() }
 
-func handle(w http.ResponseWriter, r *http.Request) {
+func handle(shell []byte, w http.ResponseWriter, r *http.Request) {
 	setSecurityHeaders(w)
 
 	if r.Method != http.MethodGet && r.Method != http.MethodHead {
@@ -120,7 +170,7 @@ func handle(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 	default:
 		// SPA fallback: any other path renders the shell so deep links reload.
-		serveShell(w, head)
+		serveShell(w, head, shell)
 	}
 }
 
@@ -149,14 +199,14 @@ func serveAsset(w http.ResponseWriter, r *http.Request, head bool, name string) 
 	}
 }
 
-func serveShell(w http.ResponseWriter, head bool) {
+func serveShell(w http.ResponseWriter, head bool, shell []byte) {
 	h := w.Header()
 	h.Set("Content-Type", "text/html; charset=utf-8")
 	h.Set("Cache-Control", "no-store")
-	h.Set("Content-Length", strconv.Itoa(len(embedded.index.body)))
+	h.Set("Content-Length", strconv.Itoa(len(shell)))
 	w.WriteHeader(http.StatusOK)
 	if !head {
-		_, _ = w.Write(embedded.index.body)
+		_, _ = w.Write(shell)
 	}
 }
 

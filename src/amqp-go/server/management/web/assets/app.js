@@ -8,11 +8,33 @@
  * textContent; the innerHTML setter is never used with non-literal data.
  */
 (function () {
-  var CONFIG = window.__SQ_CONFIG__ || {};
+  /* Runtime configuration. The server injects a CSP-safe
+   * <meta name="sq-config" content="{...}"> into the shell (an inline
+   * <script> is forbidden by script-src 'self'); it takes precedence over the
+   * window.__SQ_CONFIG__ seam the headless-browser tests use. */
+  var CONFIG = {};
+  var winCfg = window.__SQ_CONFIG__;
+  if (winCfg && typeof winCfg === 'object') {
+    for (var wk in winCfg) {
+      if (Object.prototype.hasOwnProperty.call(winCfg, wk)) { CONFIG[wk] = winCfg[wk]; }
+    }
+  }
+  var meta = document.querySelector('meta[name="sq-config"]');
+  if (meta) {
+    try {
+      var injected = JSON.parse(meta.getAttribute('content') || '{}');
+      if (injected && typeof injected === 'object') {
+        for (var mk in injected) {
+          if (Object.prototype.hasOwnProperty.call(injected, mk)) { CONFIG[mk] = injected[mk]; }
+        }
+      }
+    } catch (e) { /* a malformed meta must never break the SPA */ }
+  }
   var API = CONFIG.apiBase || '/api';
-  /* metricsUrl may point at a different listener than the SPA origin, so it is
-   * emitted only when configured (round-2 #9). */
-  var METRICS_URL = CONFIG.metricsUrl || '';
+  /* Only an absolute http(s) URL may become an href. A hostile or malformed
+   * config value (javascript:, data:, vbscript:, an off-origin
+   * scheme-relative URL) is rejected so it can never be promoted into a link. */
+  var METRICS_URL = /^https?:[/][/]/i.test(CONFIG.metricsUrl || '') ? CONFIG.metricsUrl : '';
   var DEFAULT_REFRESH_MS = CONFIG.refreshInterval || 5000;
   var S1_REFRESH_MS = CONFIG.s1RefreshInterval || 2000;
   var MAX_BACKOFF_MS = 30000;

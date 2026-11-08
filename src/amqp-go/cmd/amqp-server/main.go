@@ -20,6 +20,7 @@ import (
 	"github.com/maxpert/amqp-go/metrics"
 	"github.com/maxpert/amqp-go/server"
 	"github.com/maxpert/amqp-go/server/management"
+	"github.com/maxpert/amqp-go/server/management/web"
 	"go.uber.org/zap"
 )
 
@@ -336,6 +337,14 @@ func main() {
 				mgmtSink = s
 			}
 		}
+		// The SPA renders its /metrics link from a CSP-safe <meta> the shell
+		// carries, so the management surface must know the telemetry URL.
+		// metricsURLFor omits the link for a wildcard bind and picks the
+		// scheme from the control-plane TLS posture; see its doc comment.
+		var metricsURL string
+		if telemetryServer != nil {
+			metricsURL = metricsURLFor(telemetryServer.Addr(), cfg.Management.TLS.Enabled)
+		}
 		mgmtServer, err = management.New(management.Options{
 			Server:        amqpServer,
 			Config:        cfg,
@@ -347,6 +356,7 @@ func main() {
 			Commit:        commit,
 			BuildDate:     date,
 			GoVersion:     runtime.Version(),
+			UIHandler:     web.HandlerWithOptions(web.Options{MetricsURL: metricsURL}),
 		})
 		if err != nil {
 			log.Fatalf("management: %v", err)

@@ -43,6 +43,10 @@ func (s *Server) hSessionCreate(w http.ResponseWriter, r *http.Request) {
 	var p *Principal
 	if req.Username == "" && req.Password == "" {
 		if gp := s.unauthenticatedPrincipal(r, ci); gp != nil {
+			if ae := s.checkPrincipalClient(gp, ci); ae != nil {
+				s.writeAPIError(w, r, ae)
+				return
+			}
 			p = gp
 		} else {
 			s.writeAPIError(w, r, errUnauth("credentials required"))
@@ -59,6 +63,10 @@ func (s *Server) hSessionCreate(w http.ResponseWriter, r *http.Request) {
 			}
 			w.Header().Set("WWW-Authenticate", `Basic realm="StrangeQ Management"`)
 			s.writeAPIError(w, r, err)
+			return
+		}
+		if ae := s.checkPrincipalClient(p, ci); ae != nil {
+			s.writeAPIError(w, r, ae)
 			return
 		}
 	}
