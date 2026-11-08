@@ -11,8 +11,21 @@ import (
 	"time"
 
 	"github.com/maxpert/amqp-go/config"
+	"github.com/maxpert/amqp-go/metrics"
 	"github.com/maxpert/amqp-go/protocol"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 )
+
+// newPanicTestCollector returns a management-enabled collector on its own
+// PRIVATE registry. A fresh registry per call means the counter starts at 0
+// (the `== 1` assertion is exact, not a delta) and `-count=N` cannot accumulate
+// or hit the process-global duplicate-registration panic.
+func newPanicTestCollector() *metrics.Collector {
+	c := metrics.NewCollectorWithRegistry(prometheus.NewRegistry(), "amqp")
+	c.RegisterManagement()
+	return c
+}
 
 // declareQueue is a small helper for the mutation tests.
 func (e *env) declareQueue(t *testing.T, name string, body queueDeclareRequest) {
@@ -481,6 +494,10 @@ func TestJobs_BoundedOwnedExpired404(t *testing.T) {
 // TestPanicRecovered500WithRequestID (NFR-020, spec §11 test 80).
 func TestPanicRecovered500WithRequestID(t *testing.T) {
 	e := basicEnv(t, true, nil)
+	// A fresh collector on its own namespace, so the amqp_management_panics_total
+	// assertion below is exact (OPS-060).
+	c := newPanicTestCollector()
+	e.mgmt.sink = c
 	for _, rt := range e.mgmt.router.routes {
 		if rt.pattern == "/api/overview" {
 			rt.handler = func(http.ResponseWriter, *http.Request) { panic("boom") }
@@ -500,6 +517,10 @@ func TestPanicRecovered500WithRequestID(t *testing.T) {
 	}
 	if !strings.Contains(rec.Body.String(), env.RequestID) {
 		t.Fatalf("the correlation id must be in the body")
+	}
+	// OPS-060: the recovered panic is counted by the bounded route TEMPLATE.
+	if got := testutil.ToFloat64(c.ManagementPanics.WithLabelValues("/api/overview")); got != 1 {
+		t.Fatalf("amqp_management_panics_total{endpoint=/api/overview} = %v, want 1", got)
 	}
 }
 

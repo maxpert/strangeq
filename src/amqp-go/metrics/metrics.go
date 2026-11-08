@@ -74,7 +74,6 @@ type Collector struct {
 	// Latency metrics
 	MessagePublishDuration  prometheus.Histogram
 	MessageDeliveryDuration prometheus.Histogram
-	MessageAge              *prometheus.GaugeVec
 
 	// Disk metrics
 	DiskFreeBytes  prometheus.Gauge
@@ -162,6 +161,13 @@ type Collector struct {
 	// to a private registry.
 	mgmtRegistry prometheus.Registerer
 
+	// ManagementPanics aliases the lazily-registered
+	// amqp_management_panics_total{endpoint} family (OPS-060) so tests and
+	// diagnostics can read it directly. It is nil until RegisterManagement
+	// runs, matching the disabled-surface contract (OPS-002). Production reads
+	// the family through the ManagementPanic sink method, not this field.
+	ManagementPanics *prometheus.CounterVec
+
 	// WS-MEMORY-CUT bookkeeping diagnostics (amqp_wal_bookkeeping_*). The three
 	// GaugeFuncs read the bound stats AT SCRAPE TIME (never stale); bind via
 	// BindWALBookkeepingStats. DIAGNOSTIC ONLY; never gated.
@@ -193,13 +199,91 @@ type Collector struct {
 	PublisherParkedCurrent    prometheus.GaugeFunc
 
 	publisherParkStats *atomic.Value
+
+	// --- Spec 06: broker outage telemetry (the 29 broker families) ---
+
+	// Recovery (spec 06 §3.2). RecoveryFaultsTotal counts every classified
+	// recovery fault by stage and outcome; an unclassified error is FATAL by
+	// construction (interfaces.RecoveryOutcome zero value). The three others
+	// quantify a degraded boot: discarded record counts by stage, the boot
+	// recovery duration, and the messages actually recovered.
+	RecoveryFaultsTotal           *prometheus.CounterVec
+	RecoveryDiscardedRecordsTotal *prometheus.CounterVec
+	RecoveryDurationSeconds       prometheus.Histogram
+	RecoveryMessagesRecovered     prometheus.Gauge
+
+	// WAL durability failures (spec 06 §3.3). WALFsyncErrorsTotal is kept
+	// SEPARATE from WALWriteErrorsTotal: a failed durability barrier and a
+	// failed page-cache write are different outages.
+	WALFsyncErrorsTotal        prometheus.Counter
+	WALRollErrorsTotal         prometheus.Counter
+	WALCompactionErrorsTotal   prometheus.Counter
+	WALReclaimFsyncErrorsTotal prometheus.Counter
+	WALFiles                   prometheus.Gauge
+	SegmentRollErrorsTotal     prometheus.Counter
+	SegmentFsyncErrorsTotal    prometheus.Counter
+
+	// Publish refusal / consumer registration (spec 06 §3.4).
+	PublishRefusedTotal         *prometheus.CounterVec
+	ConsumerRegisterErrorsTotal prometheus.Counter
+	DepthGateArmedTotal         prometheus.Counter
+	DeliverySendErrorsTotal     prometheus.Counter
+	DeliveriesRequeuedTotal     *prometheus.CounterVec
+	DeliveriesDroppedTotal      *prometheus.CounterVec
+
+	// Live gauges read AT SCRAPE TIME (spec 06 §3.4/§3.5). Zero hot-path cost.
+	DepthGatedCurrent   prometheus.GaugeFunc
+	ReaderPausedCurrent prometheus.GaugeFunc
+	MessagesInflight    prometheus.GaugeFunc
+
+	// Reader-pause counter (SQ-13 frame-budget park).
+	ReaderPausedTotal prometheus.Counter
+
+	depthGateStats    *atomic.Value
+	readerPausedStats *atomic.Value
+	inflightStats     *atomic.Value
+
+	// Connections, shutdown, alarms, panics (spec 06 §3.5).
+	ConnectionsClosedByCauseTotal  *prometheus.CounterVec
+	ShutdownTotal                  *prometheus.CounterVec
+	ShutdownDurationSeconds        prometheus.Histogram
+	ShutdownConnectionsForcedTotal prometheus.Counter
+	StorageCloseErrorsTotal        prometheus.Counter
+	ResourceAlarmTripsTotal        *prometheus.CounterVec
+	PanicsTotal                    *prometheus.CounterVec
 }
 
-// NewCollector creates a new metrics collector with all Prometheus metrics
+// NewCollector creates a new metrics collector with all Prometheus metrics,
+// registered on the default (global) registerer. It is the production
+// constructor.
 func NewCollector(namespace string) *Collector {
+	return newCollector(prometheus.DefaultRegisterer, namespace)
+}
+
+// NewCollectorWithRegistry is the registry-injectable constructor: every family
+// is registered on reg instead of the process-global default. Tests use a
+// private registry so a collector can be built without the duplicate-
+// registration panic and without contaminating the default gatherer. A nil reg
+// falls back to prometheus.DefaultRegisterer.
+func NewCollectorWithRegistry(reg prometheus.Registerer, namespace string) *Collector {
+	return newCollector(reg, namespace)
+}
+
+// newCollector is the registry-injectable constructor. Production always uses
+// NewCollector (the default registerer promhttp.Handler() scrapes); tests use a
+// private registry so a collector can be built without the process-global
+// duplicate-registration panic and without contaminating the default gatherer
+// (spec 06 §5 test-infrastructure prerequisite, test #24).
+//
+// registerer must be non-nil; prometheus.DefaultRegisterer is used otherwise.
+func newCollector(registerer prometheus.Registerer, namespace string) *Collector {
 	if namespace == "" {
 		namespace = "amqp"
 	}
+	if registerer == nil {
+		registerer = prometheus.DefaultRegisterer
+	}
+	factory := promauto.With(registerer)
 
 	// The lease GaugeFuncs read the bound limiter Stats at scrape time;
 	// leaseStats is the shared cell the closures and BindPublishLeaseStats
@@ -216,284 +300,285 @@ func NewCollector(namespace string) *Collector {
 	// BindPublisherParkStats both use.
 	publisherParkStats := &atomic.Value{}
 
+	// Spec 06 §3.4/§3.5: the live gauges read their bound accessor at scrape
+	// time, so the hot path pays nothing.
+	depthGateStats := &atomic.Value{}
+	readerPausedStats := &atomic.Value{}
+	inflightStats := &atomic.Value{}
+
 	c := &Collector{
 		namespace:    namespace,
-		mgmtRegistry: prometheus.DefaultRegisterer,
+		mgmtRegistry: registerer,
 		// Connection metrics
-		ConnectionsTotal: promauto.NewGauge(prometheus.GaugeOpts{
+		ConnectionsTotal: factory.NewGauge(prometheus.GaugeOpts{
 			Namespace: namespace,
 			Name:      "connections_total",
 			Help:      "Current number of active connections",
 		}),
-		ConnectionsCreated: promauto.NewCounter(prometheus.CounterOpts{
+		ConnectionsCreated: factory.NewCounter(prometheus.CounterOpts{
 			Namespace: namespace,
 			Name:      "connections_created_total",
 			Help:      "Total number of connections created since server start",
 		}),
-		ConnectionsClosed: promauto.NewCounter(prometheus.CounterOpts{
+		ConnectionsClosed: factory.NewCounter(prometheus.CounterOpts{
 			Namespace: namespace,
 			Name:      "connections_closed_total",
 			Help:      "Total number of connections closed since server start",
 		}),
 
 		// Channel metrics
-		ChannelsTotal: promauto.NewGauge(prometheus.GaugeOpts{
+		ChannelsTotal: factory.NewGauge(prometheus.GaugeOpts{
 			Namespace: namespace,
 			Name:      "channels_total",
 			Help:      "Current number of active channels",
 		}),
-		ChannelsCreated: promauto.NewCounter(prometheus.CounterOpts{
+		ChannelsCreated: factory.NewCounter(prometheus.CounterOpts{
 			Namespace: namespace,
 			Name:      "channels_created_total",
 			Help:      "Total number of channels created since server start",
 		}),
-		ChannelsClosed: promauto.NewCounter(prometheus.CounterOpts{
+		ChannelsClosed: factory.NewCounter(prometheus.CounterOpts{
 			Namespace: namespace,
 			Name:      "channels_closed_total",
 			Help:      "Total number of channels closed since server start",
 		}),
 
 		// Queue metrics
-		QueuesTotal: promauto.NewGauge(prometheus.GaugeOpts{
+		QueuesTotal: factory.NewGauge(prometheus.GaugeOpts{
 			Namespace: namespace,
 			Name:      "queues_total",
 			Help:      "Current number of queues",
 		}),
-		QueuesDeclared: promauto.NewCounter(prometheus.CounterOpts{
+		QueuesDeclared: factory.NewCounter(prometheus.CounterOpts{
 			Namespace: namespace,
 			Name:      "queues_declared_total",
 			Help:      "Total number of queues declared since server start",
 		}),
-		QueuesDeleted: promauto.NewCounter(prometheus.CounterOpts{
+		QueuesDeleted: factory.NewCounter(prometheus.CounterOpts{
 			Namespace: namespace,
 			Name:      "queues_deleted_total",
 			Help:      "Total number of queues deleted since server start",
 		}),
-		QueueMessagesReady: promauto.NewGaugeVec(prometheus.GaugeOpts{
+		QueueMessagesReady: factory.NewGaugeVec(prometheus.GaugeOpts{
 			Namespace: namespace,
 			Name:      "queue_messages_ready",
 			Help:      "Number of messages ready to be delivered in queue",
 		}, []string{"queue", "vhost"}),
-		QueueMessagesUnacked: promauto.NewGaugeVec(prometheus.GaugeOpts{
+		QueueMessagesUnacked: factory.NewGaugeVec(prometheus.GaugeOpts{
 			Namespace: namespace,
 			Name:      "queue_messages_unacknowledged",
 			Help:      "Number of messages delivered but not yet acknowledged in queue",
 		}, []string{"queue", "vhost"}),
-		QueueMessagesTotal: promauto.NewGaugeVec(prometheus.GaugeOpts{
+		QueueMessagesTotal: factory.NewGaugeVec(prometheus.GaugeOpts{
 			Namespace: namespace,
 			Name:      "queue_messages_total",
 			Help:      "Total number of messages in queue (ready + unacknowledged)",
 		}, []string{"queue", "vhost"}),
-		QueueConsumers: promauto.NewGaugeVec(prometheus.GaugeOpts{
+		QueueConsumers: factory.NewGaugeVec(prometheus.GaugeOpts{
 			Namespace: namespace,
 			Name:      "queue_consumers",
 			Help:      "Number of consumers on queue",
 		}, []string{"queue", "vhost"}),
-		QueueDepthHighWater: promauto.NewGaugeVec(prometheus.GaugeOpts{
+		QueueDepthHighWater: factory.NewGaugeVec(prometheus.GaugeOpts{
 			Namespace: namespace,
 			Name:      "queue_depth_high_water",
 			Help:      "Maximum queue depth (waiting + inflight) observed since queue creation (Task 2; diagnostic)",
 		}, []string{"queue", "vhost"}),
 
 		// Exchange metrics
-		ExchangesTotal: promauto.NewGauge(prometheus.GaugeOpts{
+		ExchangesTotal: factory.NewGauge(prometheus.GaugeOpts{
 			Namespace: namespace,
 			Name:      "exchanges_total",
 			Help:      "Current number of exchanges",
 		}),
-		ExchangesDeclared: promauto.NewCounter(prometheus.CounterOpts{
+		ExchangesDeclared: factory.NewCounter(prometheus.CounterOpts{
 			Namespace: namespace,
 			Name:      "exchanges_declared_total",
 			Help:      "Total number of exchanges declared since server start",
 		}),
-		ExchangesDeleted: promauto.NewCounter(prometheus.CounterOpts{
+		ExchangesDeleted: factory.NewCounter(prometheus.CounterOpts{
 			Namespace: namespace,
 			Name:      "exchanges_deleted_total",
 			Help:      "Total number of exchanges deleted since server start",
 		}),
 
 		// Message metrics
-		MessagesPublished: promauto.NewCounter(prometheus.CounterOpts{
+		MessagesPublished: factory.NewCounter(prometheus.CounterOpts{
 			Namespace: namespace,
 			Name:      "messages_published_total",
 			Help:      "Total number of messages published since server start",
 		}),
-		MessagesPublishedBytes: promauto.NewCounter(prometheus.CounterOpts{
+		MessagesPublishedBytes: factory.NewCounter(prometheus.CounterOpts{
 			Namespace: namespace,
 			Name:      "messages_published_bytes_total",
 			Help:      "Total bytes of messages published since server start",
 		}),
-		MessagesDelivered: promauto.NewCounter(prometheus.CounterOpts{
+		MessagesDelivered: factory.NewCounter(prometheus.CounterOpts{
 			Namespace: namespace,
 			Name:      "messages_delivered_total",
 			Help:      "Total number of messages delivered to consumers since server start",
 		}),
-		MessagesDeliveredBytes: promauto.NewCounter(prometheus.CounterOpts{
+		MessagesDeliveredBytes: factory.NewCounter(prometheus.CounterOpts{
 			Namespace: namespace,
 			Name:      "messages_delivered_bytes_total",
 			Help:      "Total bytes of messages delivered to consumers since server start",
 		}),
-		MessagesAcknowledged: promauto.NewCounter(prometheus.CounterOpts{
+		MessagesAcknowledged: factory.NewCounter(prometheus.CounterOpts{
 			Namespace: namespace,
 			Name:      "messages_acknowledged_total",
 			Help:      "Total number of messages acknowledged since server start",
 		}),
-		MessagesRedelivered: promauto.NewCounter(prometheus.CounterOpts{
+		MessagesRedelivered: factory.NewCounter(prometheus.CounterOpts{
 			Namespace: namespace,
 			Name:      "messages_redelivered_total",
 			Help:      "Total number of messages redelivered since server start",
 		}),
-		MessagesRejected: promauto.NewCounter(prometheus.CounterOpts{
+		MessagesRejected: factory.NewCounter(prometheus.CounterOpts{
 			Namespace: namespace,
 			Name:      "messages_rejected_total",
 			Help:      "Total number of messages rejected since server start",
 		}),
-		MessagesUnroutable: promauto.NewCounter(prometheus.CounterOpts{
+		MessagesUnroutable: factory.NewCounter(prometheus.CounterOpts{
 			Namespace: namespace,
 			Name:      "messages_unroutable_total",
 			Help:      "Total number of unroutable messages since server start",
 		}),
 
 		// Consumer metrics
-		ConsumersTotal: promauto.NewGauge(prometheus.GaugeOpts{
+		ConsumersTotal: factory.NewGauge(prometheus.GaugeOpts{
 			Namespace: namespace,
 			Name:      "consumers_total",
 			Help:      "Current number of active consumers",
 		}),
 
 		// Transaction metrics
-		TransactionsStarted: promauto.NewCounter(prometheus.CounterOpts{
+		TransactionsStarted: factory.NewCounter(prometheus.CounterOpts{
 			Namespace: namespace,
 			Name:      "transactions_started_total",
 			Help:      "Total number of transactions started since server start",
 		}),
-		TransactionsCommitted: promauto.NewCounter(prometheus.CounterOpts{
+		TransactionsCommitted: factory.NewCounter(prometheus.CounterOpts{
 			Namespace: namespace,
 			Name:      "transactions_committed_total",
 			Help:      "Total number of transactions committed since server start",
 		}),
-		TransactionsRolledback: promauto.NewCounter(prometheus.CounterOpts{
+		TransactionsRolledback: factory.NewCounter(prometheus.CounterOpts{
 			Namespace: namespace,
 			Name:      "transactions_rolledback_total",
 			Help:      "Total number of transactions rolled back since server start",
 		}),
 
 		// Server metrics
-		ServerUptime: promauto.NewGauge(prometheus.GaugeOpts{
+		ServerUptime: factory.NewGauge(prometheus.GaugeOpts{
 			Namespace: namespace,
 			Name:      "server_uptime_seconds",
 			Help:      "Server uptime in seconds",
 		}),
 
-		UnsafeRecoveryArtifacts: promauto.NewGauge(prometheus.GaugeOpts{
+		UnsafeRecoveryArtifacts: factory.NewGauge(prometheus.GaugeOpts{
 			Namespace: namespace,
 			Name:      "unsafe_recovery_discarded_artifacts",
 			Help:      "Number of data artifacts discarded at boot because --unsafe-recovery was set; 0 on a clean boot. Non-zero means this broker is serving from data it could not fully recover.",
 		}),
 
 		// Latency metrics
-		MessagePublishDuration: promauto.NewHistogram(prometheus.HistogramOpts{
+		MessagePublishDuration: factory.NewHistogram(prometheus.HistogramOpts{
 			Namespace: namespace,
 			Name:      "message_publish_duration_seconds",
 			Help:      "Time taken to publish a message",
 			Buckets:   prometheus.ExponentialBuckets(0.0001, 2, 15), // 0.1ms to ~3s
 		}),
-		MessageDeliveryDuration: promauto.NewHistogram(prometheus.HistogramOpts{
+		MessageDeliveryDuration: factory.NewHistogram(prometheus.HistogramOpts{
 			Namespace: namespace,
 			Name:      "message_delivery_duration_seconds",
 			Help:      "Time taken to deliver a message to consumer",
 			Buckets:   prometheus.ExponentialBuckets(0.0001, 2, 15), // 0.1ms to ~3s
 		}),
-		MessageAge: promauto.NewGaugeVec(prometheus.GaugeOpts{
-			Namespace: namespace,
-			Name:      "message_age_seconds",
-			Help:      "Age of oldest message in queue",
-		}, []string{"queue", "vhost"}),
 
 		// Disk metrics
-		DiskFreeBytes: promauto.NewGauge(prometheus.GaugeOpts{
+		DiskFreeBytes: factory.NewGauge(prometheus.GaugeOpts{
 			Namespace: namespace,
 			Name:      "disk_free_bytes",
 			Help:      "Free disk space in data directory",
 		}),
-		DiskUsageBytes: promauto.NewGauge(prometheus.GaugeOpts{
+		DiskUsageBytes: factory.NewGauge(prometheus.GaugeOpts{
 			Namespace: namespace,
 			Name:      "disk_usage_bytes",
 			Help:      "Total disk used by server data",
 		}),
 
 		// WAL metrics
-		WALSizeBytes: promauto.NewGauge(prometheus.GaugeOpts{
+		WALSizeBytes: factory.NewGauge(prometheus.GaugeOpts{
 			Namespace: namespace,
 			Name:      "wal_size_bytes",
 			Help:      "Total size of WAL files",
 		}),
-		WALWriteTotal: promauto.NewCounter(prometheus.CounterOpts{
+		WALWriteTotal: factory.NewCounter(prometheus.CounterOpts{
 			Namespace: namespace,
 			Name:      "wal_write_total",
 			Help:      "Total number of messages written to WAL",
 		}),
-		WALFsyncTotal: promauto.NewCounter(prometheus.CounterOpts{
+		WALFsyncTotal: factory.NewCounter(prometheus.CounterOpts{
 			Namespace: namespace,
 			Name:      "wal_fsync_total",
 			Help:      "Total number of fsync operations on WAL",
 		}),
-		WALFsyncDuration: promauto.NewHistogram(prometheus.HistogramOpts{
+		WALFsyncDuration: factory.NewHistogram(prometheus.HistogramOpts{
 			Namespace: namespace,
 			Name:      "wal_fsync_duration_seconds",
 			Help:      "Time taken for WAL fsync operations",
 			Buckets:   prometheus.ExponentialBuckets(0.0001, 2, 15), // 0.1ms to ~3s
 		}),
-		WALWriteErrorsTotal: promauto.NewCounter(prometheus.CounterOpts{
+		WALWriteErrorsTotal: factory.NewCounter(prometheus.CounterOpts{
 			Namespace: namespace,
 			Name:      "wal_write_errors_total",
 			Help:      "Total number of WAL write failures",
 		}),
-		WALFullFlushTotal: promauto.NewCounterVec(prometheus.CounterOpts{
+		WALFullFlushTotal: factory.NewCounterVec(prometheus.CounterOpts{
 			Namespace: namespace,
 			Name:      "wal_full_flush_total",
 			Help:      "fcntl(F_FULLFSYNC) drive-cache flushes issued, by durability site. Barrier-mode gate: must stay 0 across the measured window.",
 		}, []string{"site"}),
 
 		// Segment metrics
-		SegmentCount: promauto.NewGaugeVec(prometheus.GaugeOpts{
+		SegmentCount: factory.NewGaugeVec(prometheus.GaugeOpts{
 			Namespace: namespace,
 			Name:      "segment_count",
 			Help:      "Number of segment files per queue",
 		}, []string{"queue"}),
-		SegmentSizeBytes: promauto.NewGaugeVec(prometheus.GaugeOpts{
+		SegmentSizeBytes: factory.NewGaugeVec(prometheus.GaugeOpts{
 			Namespace: namespace,
 			Name:      "segment_size_bytes",
 			Help:      "Total size of segment files per queue",
 		}, []string{"queue"}),
-		SegmentCompactionTotal: promauto.NewCounter(prometheus.CounterOpts{
+		SegmentCompactionTotal: factory.NewCounter(prometheus.CounterOpts{
 			Namespace: namespace,
 			Name:      "segment_compaction_total",
 			Help:      "Total number of segment compactions performed",
 		}),
-		SegmentCompactionFailuresTotal: promauto.NewCounter(prometheus.CounterOpts{
+		SegmentCompactionFailuresTotal: factory.NewCounter(prometheus.CounterOpts{
 			Namespace: namespace,
 			Name:      "segment_compaction_failures_total",
 			Help:      "Segments withdrawn from compaction because they cannot be rewritten (no data is lost; acked records are not reclaimed)",
 		}),
-		SegmentReadErrorsTotal: promauto.NewCounter(prometheus.CounterOpts{
+		SegmentReadErrorsTotal: factory.NewCounter(prometheus.CounterOpts{
 			Namespace: namespace,
 			Name:      "segment_read_errors_total",
 			Help:      "Total number of segment read failures",
 		}),
 
 		// Memory metrics
-		MemoryUsedBytes: promauto.NewGauge(prometheus.GaugeOpts{
+		MemoryUsedBytes: factory.NewGauge(prometheus.GaugeOpts{
 			Namespace: namespace,
 			Name:      "memory_used_bytes",
 			Help:      "Total memory used by Go runtime",
 		}),
-		MemoryHeapBytes: promauto.NewGauge(prometheus.GaugeOpts{
+		MemoryHeapBytes: factory.NewGauge(prometheus.GaugeOpts{
 			Namespace: namespace,
 			Name:      "memory_heap_bytes",
 			Help:      "Heap memory in use",
 		}),
-		MemoryGCPause: promauto.NewSummary(prometheus.SummaryOpts{
+		MemoryGCPause: factory.NewSummary(prometheus.SummaryOpts{
 			Namespace: namespace,
 			Name:      "memory_gc_pause_seconds",
 			Help:      "GC pause duration",
@@ -505,53 +590,59 @@ func NewCollector(namespace string) *Collector {
 		}),
 
 		// System resource metrics
-		GoroutinesTotal: promauto.NewGauge(prometheus.GaugeOpts{
+		GoroutinesTotal: factory.NewGauge(prometheus.GaugeOpts{
 			Namespace: namespace,
 			Name:      "goroutines_total",
 			Help:      "Number of active goroutines",
 		}),
-		FileDescriptorsOpen: promauto.NewGauge(prometheus.GaugeOpts{
+		FileDescriptorsOpen: factory.NewGauge(prometheus.GaugeOpts{
 			Namespace: namespace,
 			Name:      "file_descriptors_open",
 			Help:      "Number of open file descriptors",
 		}),
 
 		// Error metrics
-		ConnectionErrorsTotal: promauto.NewCounterVec(prometheus.CounterOpts{
+		ConnectionErrorsTotal: factory.NewCounterVec(prometheus.CounterOpts{
 			Namespace: namespace,
 			Name:      "connection_errors_total",
 			Help:      "Total number of connection errors by type",
 		}, []string{"error_type"}),
-		ChannelErrorsTotal: promauto.NewCounterVec(prometheus.CounterOpts{
+		ChannelErrorsTotal: factory.NewCounterVec(prometheus.CounterOpts{
 			Namespace: namespace,
 			Name:      "channel_errors_total",
 			Help:      "Total number of channel errors by type",
 		}, []string{"error_type"}),
-		MessagesDroppedTotal: promauto.NewCounterVec(prometheus.CounterOpts{
+		// MessagesDroppedTotal is DEPRECATED IN PLACE (spec 06 §3.6). It carries
+		// an UNBOUNDED queue label and has no production caller; it stays
+		// registered only so removing a registered name is not a breaking change
+		// for an existing dashboard. The two bounded successors carry the real
+		// signal: amqp_publish_refused_total{reason} and
+		// amqp_deliveries_dropped_total{reason}. Do not write it.
+		MessagesDroppedTotal: factory.NewCounterVec(prometheus.CounterOpts{
 			Namespace: namespace,
 			Name:      "messages_dropped_total",
-			Help:      "Total number of messages dropped by reason",
+			Help:      "DEPRECATED IN PLACE: unbounded queue label, no writer. Use publish_refused_total / deliveries_dropped_total.",
 		}, []string{"queue", "reason"}),
 
-		AuthFailuresTotal: promauto.NewCounterVec(prometheus.CounterOpts{
+		AuthFailuresTotal: factory.NewCounterVec(prometheus.CounterOpts{
 			Namespace: namespace,
 			Name:      "auth_failures_total",
 			Help:      "Total number of refused authentication attempts by reason",
 		}, []string{"reason"}),
 
-		ResourceAlarmActive: promauto.NewGaugeVec(prometheus.GaugeOpts{
+		ResourceAlarmActive: factory.NewGaugeVec(prometheus.GaugeOpts{
 			Namespace: namespace,
 			Name:      "resource_alarm_active",
 			Help:      "1 while the named resource alarm (memory|disk) is tripped",
 		}, []string{"resource"}),
 
-		BuildInfo: promauto.NewGaugeVec(prometheus.GaugeOpts{
+		BuildInfo: factory.NewGaugeVec(prometheus.GaugeOpts{
 			Namespace: namespace,
 			Name:      "build_info",
 			Help:      "Build identity; the value is always 1",
 		}, []string{"version", "commit", "go_version"}),
 
-		PublishLeaseUsedBytes: promauto.NewGaugeFunc(prometheus.GaugeOpts{
+		PublishLeaseUsedBytes: factory.NewGaugeFunc(prometheus.GaugeOpts{
 			Namespace: namespace,
 			Name:      "publish_lease_used_bytes",
 			Help:      "Declared publish body bytes (+framing) currently leased (WS-I)",
@@ -562,7 +653,7 @@ func NewCollector(namespace string) *Collector {
 			}
 			return 0
 		}),
-		PublishLeaseBudgetBytes: promauto.NewGaugeFunc(prometheus.GaugeOpts{
+		PublishLeaseBudgetBytes: factory.NewGaugeFunc(prometheus.GaugeOpts{
 			Namespace: namespace,
 			Name:      "publish_lease_budget_bytes",
 			Help:      "Publish-inflight lease budget G (WS-I)",
@@ -573,7 +664,7 @@ func NewCollector(namespace string) *Collector {
 			}
 			return 0
 		}),
-		PublishLeaseWaiters: promauto.NewGaugeFunc(prometheus.GaugeOpts{
+		PublishLeaseWaiters: factory.NewGaugeFunc(prometheus.GaugeOpts{
 			Namespace: namespace,
 			Name:      "publish_lease_waiters",
 			Help:      "Connections currently queued for a publish lease (WS-I)",
@@ -584,32 +675,32 @@ func NewCollector(namespace string) *Collector {
 			}
 			return 0
 		}),
-		PublishLeaseWaitsTotal: promauto.NewCounter(prometheus.CounterOpts{
+		PublishLeaseWaitsTotal: factory.NewCounter(prometheus.CounterOpts{
 			Namespace: namespace,
 			Name:      "publish_lease_waits_total",
 			Help:      "Blocking publish-lease waits (WS-I; diagnostic, never gated)",
 		}),
-		PublishLeaseOversizedTotal: promauto.NewCounter(prometheus.CounterOpts{
+		PublishLeaseOversizedTotal: factory.NewCounter(prometheus.CounterOpts{
 			Namespace: namespace,
 			Name:      "publish_lease_oversized_total",
 			Help:      "Oversized (>G) publish leases granted at used==0 (WS-I)",
 		}),
-		PublishLeaseOverbudgetClosesTotal: promauto.NewCounter(prometheus.CounterOpts{
+		PublishLeaseOverbudgetClosesTotal: factory.NewCounter(prometheus.CounterOpts{
 			Namespace: namespace,
 			Name:      "publish_lease_overbudget_closes_total",
 			Help:      "Connections closed with 506 because a nested header could not be leased (WS-I)",
 		}),
-		PublishLeaseBodyStallClosesTotal: promauto.NewCounter(prometheus.CounterOpts{
+		PublishLeaseBodyStallClosesTotal: factory.NewCounter(prometheus.CounterOpts{
 			Namespace: namespace,
 			Name:      "publish_lease_body_stall_closes_total",
 			Help:      "Connections closed for no leased-body progress within writeTimeout (WS-I)",
 		}),
-		PublishLeaseLeakedTotal: promauto.NewCounter(prometheus.CounterOpts{
+		PublishLeaseLeakedTotal: factory.NewCounter(prometheus.CounterOpts{
 			Namespace: namespace,
 			Name:      "publish_lease_leaked_total",
 			Help:      "Publish leases recovered by PutPendingMessage instead of a proper release (WS-I; must stay 0)",
 		}),
-		PublishLeaseWaitSeconds: promauto.NewHistogram(prometheus.HistogramOpts{
+		PublishLeaseWaitSeconds: factory.NewHistogram(prometheus.HistogramOpts{
 			Namespace: namespace,
 			Name:      "publish_lease_wait_seconds",
 			Help:      "Time spent blocked waiting for a publish lease (WS-I)",
@@ -619,7 +710,7 @@ func NewCollector(namespace string) *Collector {
 		// WS-MEMORY-CUT §8 diagnostics: the WAL tier's in-memory bookkeeping.
 		// Reported and NEVER gated; they exist to close the S1c magnitude
 		// question (why the index maps measure ~6× the standing backlog).
-		WALInventoryRecords: promauto.NewGaugeFunc(prometheus.GaugeOpts{
+		WALInventoryRecords: factory.NewGaugeFunc(prometheus.GaugeOpts{
 			Namespace: namespace,
 			Name:      "wal_inventory_records",
 			Help:      "Records held in the ACTIVE WAL file's inventory (WS-MEMORY-CUT; diagnostic)",
@@ -630,7 +721,7 @@ func NewCollector(namespace string) *Collector {
 			}
 			return 0
 		}),
-		WALIndexCopies: promauto.NewGaugeFunc(prometheus.GaugeOpts{
+		WALIndexCopies: factory.NewGaugeFunc(prometheus.GaugeOpts{
 			Namespace: namespace,
 			Name:      "wal_index_copies",
 			Help:      "Physical copies across every WAL index shard (WS-MEMORY-CUT; diagnostic)",
@@ -641,7 +732,7 @@ func NewCollector(namespace string) *Collector {
 			}
 			return 0
 		}),
-		WALSettleDrainedTotal: promauto.NewGaugeFunc(prometheus.GaugeOpts{
+		WALSettleDrainedTotal: factory.NewGaugeFunc(prometheus.GaugeOpts{
 			Namespace: namespace,
 			Name:      "wal_settle_drained_total",
 			Help:      "Settled records deleted from the active WAL inventory (WS-MEMORY-CUT; diagnostic)",
@@ -657,40 +748,40 @@ func NewCollector(namespace string) *Collector {
 		// GetMessageForDelivery is exactly one of a hit or a cold read, so the
 		// hot-hit ratio is hits/(hits+cold_reads) and preads per delivered
 		// message is preads/deliveries.
-		HotCacheDeliveryHits: promauto.NewCounterVec(prometheus.CounterOpts{
+		HotCacheDeliveryHits: factory.NewCounterVec(prometheus.CounterOpts{
 			Namespace: namespace,
 			Name:      "hot_cache_delivery_hits_total",
 			Help:      "Deliveries served from the hot cache (no cold-tier read)",
 		}, []string{"queue"}),
-		HotCacheDeliveryColdReads: promauto.NewCounterVec(prometheus.CounterOpts{
+		HotCacheDeliveryColdReads: factory.NewCounterVec(prometheus.CounterOpts{
 			Namespace: namespace,
 			Name:      "hot_cache_delivery_cold_reads_total",
 			Help:      "Deliveries that missed the hot cache and read a cold tier",
 		}, []string{"queue"}),
-		HotCacheDeliveryPreads: promauto.NewCounterVec(prometheus.CounterOpts{
+		HotCacheDeliveryPreads: factory.NewCounterVec(prometheus.CounterOpts{
 			Namespace: namespace,
 			Name:      "hot_cache_delivery_preads_total",
 			Help:      "Positional reads the delivery WAL parse issues (one header + one payload per record; the optional shared-body-block read is not counted)",
 		}, []string{"queue"}),
 
 		// Task 2: publisher pacing.
-		PublisherParksTotal: promauto.NewCounter(prometheus.CounterOpts{
+		PublisherParksTotal: factory.NewCounter(prometheus.CounterOpts{
 			Namespace: namespace,
 			Name:      "publisher_parked_total",
 			Help:      "Completed queue-depth reader parks (one = one pacing episode)",
 		}),
-		PublisherParkSecondsTotal: promauto.NewCounter(prometheus.CounterOpts{
+		PublisherParkSecondsTotal: factory.NewCounter(prometheus.CounterOpts{
 			Namespace: namespace,
 			Name:      "publisher_park_seconds_total",
 			Help:      "Total seconds the publisher reader spent parked on queue-depth backpressure",
 		}),
-		PublisherParkDuration: promauto.NewHistogram(prometheus.HistogramOpts{
+		PublisherParkDuration: factory.NewHistogram(prometheus.HistogramOpts{
 			Namespace: namespace,
 			Name:      "publisher_park_duration_seconds",
 			Help:      "Duration of one queue-depth reader park",
 			Buckets:   prometheus.ExponentialBuckets(0.0001, 4, 10),
 		}),
-		PublisherParkedCurrent: promauto.NewGaugeFunc(prometheus.GaugeOpts{
+		PublisherParkedCurrent: factory.NewGaugeFunc(prometheus.GaugeOpts{
 			Namespace: namespace,
 			Name:      "publisher_parked_current",
 			Help:      "Queue-depth reader parks currently in progress",
@@ -701,10 +792,177 @@ func NewCollector(namespace string) *Collector {
 			}
 			return 0
 		}),
+		// --- Spec 06 §3.2: recovery outage telemetry ---
+		RecoveryFaultsTotal: factory.NewCounterVec(prometheus.CounterOpts{
+			Namespace: namespace,
+			Name:      "recovery_faults_total",
+			Help:      "Classified recovery faults by stage and outcome; a non-zero outcome=degraded|fatal means the broker booted on data it could not fully recover",
+		}, []string{"stage", "outcome"}),
+		RecoveryDiscardedRecordsTotal: factory.NewCounterVec(prometheus.CounterOpts{
+			Namespace: namespace,
+			Name:      "recovery_discarded_records_total",
+			Help:      "Recovered records deliberately discarded or quarantined at boot, by recovery stage",
+		}, []string{"stage"}),
+		RecoveryDurationSeconds: factory.NewHistogram(prometheus.HistogramOpts{
+			Namespace: namespace,
+			Name:      "recovery_duration_seconds",
+			Help:      "Wall-clock duration of the boot recovery pass",
+			Buckets:   prometheus.ExponentialBuckets(0.001, 2, 16),
+		}),
+		RecoveryMessagesRecovered: factory.NewGauge(prometheus.GaugeOpts{
+			Namespace: namespace,
+			Name:      "recovery_messages_recovered",
+			Help:      "Persistent messages recovered into the running broker at boot",
+		}),
+
+		// --- Spec 06 §3.3: WAL / segment durability failures ---
+		WALFsyncErrorsTotal: factory.NewCounter(prometheus.CounterOpts{
+			Namespace: namespace,
+			Name:      "wal_fsync_errors_total",
+			Help:      "Failed WAL durability barriers (fdatasync/F_BARRIERFSYNC/F_FULLFSYNC); distinct from a failed write",
+		}),
+		WALRollErrorsTotal: factory.NewCounter(prometheus.CounterOpts{
+			Namespace: namespace,
+			Name:      "wal_roll_errors_total",
+			Help:      "Failed WAL roll (open the next file); the current file stays active and writes continue past the size limit",
+		}),
+		WALCompactionErrorsTotal: factory.NewCounter(prometheus.CounterOpts{
+			Namespace: namespace,
+			Name:      "wal_compaction_errors_total",
+			Help:      "Failed WAL compactions; the file keeps its bytes and its index unchanged",
+		}),
+		WALReclaimFsyncErrorsTotal: factory.NewCounter(prometheus.CounterOpts{
+			Namespace: namespace,
+			Name:      "wal_reclaim_fsync_errors_total",
+			Help:      "Failed directory fsync after WAL reclamation; the completed reclaim remains valid but is not yet durable",
+		}),
+		WALFiles: factory.NewGauge(prometheus.GaugeOpts{
+			Namespace: namespace,
+			Name:      "wal_files",
+			Help:      "Number of .wal files in the shared WAL directory (unreclaimed-file leak signal)",
+		}),
+		SegmentRollErrorsTotal: factory.NewCounter(prometheus.CounterOpts{
+			Namespace: namespace,
+			Name:      "segment_roll_errors_total",
+			Help:      "Failed segment file create/open (roll)",
+		}),
+		SegmentFsyncErrorsTotal: factory.NewCounter(prometheus.CounterOpts{
+			Namespace: namespace,
+			Name:      "segment_fsync_errors_total",
+			Help:      "Failed segment fsync barriers (seal/temp-file) during a segment rewrite",
+		}),
+
+		// --- Spec 06 §3.4: publish refusal / backpressure / delivery ---
+		PublishRefusedTotal: factory.NewCounterVec(prometheus.CounterOpts{
+			Namespace: namespace,
+			Name:      "publish_refused_total",
+			Help:      "Publishes refused by the broker after routing, by bounded reason (x_max_length|queue_closed)",
+		}, []string{"reason"}),
+		ConsumerRegisterErrorsTotal: factory.NewCounter(prometheus.CounterOpts{
+			Namespace: namespace,
+			Name:      "consumer_register_errors_total",
+			Help:      "basic.consume registrations refused by the broker",
+		}),
+		DepthGateArmedTotal: factory.NewCounter(prometheus.CounterOpts{
+			Namespace: namespace,
+			Name:      "depth_gate_armed_total",
+			Help:      "Queue-depth reader gates armed on a producer-only connection (one per gate episode)",
+		}),
+		DeliverySendErrorsTotal: factory.NewCounter(prometheus.CounterOpts{
+			Namespace: namespace,
+			Name:      "delivery_send_errors_total",
+			Help:      "basic.deliver batch write failures to a consumer",
+		}),
+		DeliveriesRequeuedTotal: factory.NewCounterVec(prometheus.CounterOpts{
+			Namespace: namespace,
+			Name:      "deliveries_requeued_total",
+			Help:      "Deliveries requeued after a delivery-path failure, by bounded reason (write_error)",
+		}, []string{"reason"}),
+		DeliveriesDroppedTotal: factory.NewCounterVec(prometheus.CounterOpts{
+			Namespace: namespace,
+			Name:      "deliveries_dropped_total",
+			Help:      "Deliveries dropped without requeue, by bounded reason (consumer_removed); a message-loss signal",
+		}, []string{"reason"}),
+		ReaderPausedTotal: factory.NewCounter(prometheus.CounterOpts{
+			Namespace: namespace,
+			Name:      "reader_paused_total",
+			Help:      "Times a reader parked on the frame-budget hand-off (SQ-13 backpressure)",
+		}),
+		DepthGatedCurrent: factory.NewGaugeFunc(prometheus.GaugeOpts{
+			Namespace: namespace,
+			Name:      "depth_gated_current",
+			Help:      "Connections currently gated by queue-depth reader backpressure",
+		}, func() float64 {
+			if fn, ok := depthGateStats.Load().(func() int64); ok && fn != nil {
+				return float64(fn())
+			}
+			return 0
+		}),
+		ReaderPausedCurrent: factory.NewGaugeFunc(prometheus.GaugeOpts{
+			Namespace: namespace,
+			Name:      "reader_paused_current",
+			Help:      "Readers currently parked on the frame-budget hand-off",
+		}, func() float64 {
+			if fn, ok := readerPausedStats.Load().(func() int64); ok && fn != nil {
+				return float64(fn())
+			}
+			return 0
+		}),
+		MessagesInflight: factory.NewGaugeFunc(prometheus.GaugeOpts{
+			Namespace: namespace,
+			Name:      "messages_inflight",
+			Help:      "Messages delivered but not yet settled across every queue",
+		}, func() float64 {
+			if fn, ok := inflightStats.Load().(func() int64); ok && fn != nil {
+				return float64(fn())
+			}
+			return 0
+		}),
+
+		// --- Spec 06 §3.5: connections, shutdown, alarms, panics ---
+		ConnectionsClosedByCauseTotal: factory.NewCounterVec(prometheus.CounterOpts{
+			Namespace: namespace,
+			Name:      "connections_closed_by_cause_total",
+			Help:      "Connections closed by bounded cause",
+		}, []string{"cause"}),
+		ShutdownTotal: factory.NewCounterVec(prometheus.CounterOpts{
+			Namespace: namespace,
+			Name:      "shutdown_total",
+			Help:      "Broker shutdowns by bounded result (clean|forced|incomplete)",
+		}, []string{"result"}),
+		ShutdownDurationSeconds: factory.NewHistogram(prometheus.HistogramOpts{
+			Namespace: namespace,
+			Name:      "shutdown_duration_seconds",
+			Help:      "Wall-clock duration of Server.Shutdown",
+			Buckets:   prometheus.ExponentialBuckets(0.001, 2, 16),
+		}),
+		ShutdownConnectionsForcedTotal: factory.NewCounter(prometheus.CounterOpts{
+			Namespace: namespace,
+			Name:      "shutdown_connections_forced_total",
+			Help:      "Connections told to close by broker shutdown",
+		}),
+		StorageCloseErrorsTotal: factory.NewCounter(prometheus.CounterOpts{
+			Namespace: namespace,
+			Name:      "storage_close_errors_total",
+			Help:      "Failures closing the storage tier during shutdown",
+		}),
+		ResourceAlarmTripsTotal: factory.NewCounterVec(prometheus.CounterOpts{
+			Namespace: namespace,
+			Name:      "resource_alarm_trips_total",
+			Help:      "Resource alarms raised, by resource, on the clear->tripped edge",
+		}, []string{"resource"}),
+		PanicsTotal: factory.NewCounterVec(prometheus.CounterOpts{
+			Namespace: namespace,
+			Name:      "panics_total",
+			Help:      "Recovered panics by bounded component",
+		}, []string{"component"}),
 	}
 	c.publishLeaseStats = leaseStats
 	c.walBookkeeping = walBookkeeping
 	c.publisherParkStats = publisherParkStats
+	c.depthGateStats = depthGateStats
+	c.readerPausedStats = readerPausedStats
+	c.inflightStats = inflightStats
 	return c
 }
 
@@ -782,13 +1040,21 @@ func (c *Collector) SetBuildInfo(version, commit, goVersion string) {
 	c.BuildInfo.WithLabelValues(version, commit, goVersion).Set(1)
 }
 
-// UpdateQueueReadyAndConsumers sets the ready depth (only when known) and the
-// consumer count for one queue. Unacked/total are deliberately not written:
-// no cheap unacked accessor exists, and total = ready + 0 would mislead.
-func (c *Collector) UpdateQueueReadyAndConsumers(queue, vhost string, ready int, readyKnown bool, consumers int) {
+// UpdateQueueReadyAndConsumers sets the ready and unacknowledged depths (each
+// only when known) and the consumer count for one queue, plus the total when
+// both depths are known. The unacked/total series are wired from the broker's
+// QueueMessageCounts at poll time (spec 06 §3.5); a queue whose unacked depth
+// is unknown emits no unacked or total series rather than a fabricated 0.
+func (c *Collector) UpdateQueueReadyAndConsumers(queue, vhost string, ready int, readyKnown bool, unacked int, unackedKnown bool, consumers int) {
 	labels := prometheus.Labels{"queue": queue, "vhost": vhost}
 	if readyKnown {
 		c.QueueMessagesReady.With(labels).Set(float64(ready))
+	}
+	if unackedKnown {
+		c.QueueMessagesUnacked.With(labels).Set(float64(unacked))
+	}
+	if readyKnown && unackedKnown {
+		c.QueueMessagesTotal.With(labels).Set(float64(ready + unacked))
 	}
 	c.QueueConsumers.With(labels).Set(float64(consumers))
 }
@@ -931,18 +1197,6 @@ func (c *Collector) RecordPublishLatency(duration float64) {
 // RecordDeliveryLatency records the time taken to deliver a message
 func (c *Collector) RecordDeliveryLatency(duration float64) {
 	c.MessageDeliveryDuration.Observe(duration)
-}
-
-// UpdateMessageAge updates the age of the oldest message in a queue
-func (c *Collector) UpdateMessageAge(queueName, vhost string, ageSeconds float64) {
-	labels := prometheus.Labels{"queue": queueName, "vhost": vhost}
-	c.MessageAge.With(labels).Set(ageSeconds)
-}
-
-// DeleteMessageAge removes message age metric for a deleted queue
-func (c *Collector) DeleteMessageAge(queueName, vhost string) {
-	labels := prometheus.Labels{"queue": queueName, "vhost": vhost}
-	c.MessageAge.Delete(labels)
 }
 
 // UpdateDiskMetrics updates disk usage metrics

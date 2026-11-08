@@ -72,7 +72,7 @@ func (s *Server) admitOversizedAckFrame(conn *protocol.Connection, frame *protoc
 		if s.MetricsCollector != nil {
 			s.MetricsCollector.RecordConnectionError("oversized_ack")
 		}
-		conn.Closed.Store(true)
+		s.recordConnectionClose(conn, ConnectionCloseOversizedAck)
 		_ = conn.Conn.Close()
 		return false
 	}

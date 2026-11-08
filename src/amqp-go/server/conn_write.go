@@ -36,7 +36,8 @@ func (s *Server) writeLocked(conn *protocol.Connection, fn func(w net.Conn) erro
 	err := fn(conn.Conn)
 	_ = conn.Conn.SetWriteDeadline(time.Time{})
 	if err != nil {
-		conn.Closed.Store(true)
+		// A failed write is a hard close: record the bounded cause once.
+		s.recordConnectionClose(conn, ConnectionCloseWriteError)
 		_ = conn.Conn.Close()
 		// WS-I: unblock a reader parked in a publish-lease Reserve — the
 		// connection is dead, so its wait must not linger until WAL progress

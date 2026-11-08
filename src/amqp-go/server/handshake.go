@@ -185,6 +185,9 @@ func (s *Server) dispatchAccepted(nc net.Conn) {
 		_ = nc.Close()
 		if s.MetricsCollector != nil {
 			s.MetricsCollector.RecordConnectionError("handshake_backlog")
+			// The socket never became a Connection; the refusal is its own
+			// bounded close cause (spec 06 §3.5).
+			s.MetricsCollector.RecordConnectionClosedByCause(ConnectionCloseHandshakeBacklog)
 		}
 		s.Log.Debug("pending-handshake limit reached; refusing socket",
 			zap.String("remote", nc.RemoteAddr().String()))

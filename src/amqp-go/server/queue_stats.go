@@ -38,6 +38,16 @@ func (a *StorageBrokerAdapter) QueueMessageCounts(name string) broker.QueueMessa
 	return a.broker.QueueMessageCounts(name)
 }
 
+// InflightCount reports the broker-wide total of delivered-but-unsettled
+// messages. It is the optional seam the builder discovers on the injected
+// UnifiedBroker to bind amqp_messages_inflight (spec 06 §3.5); nil-safe.
+func (a *StorageBrokerAdapter) InflightCount() int64 {
+	if a == nil || a.broker == nil {
+		return 0
+	}
+	return a.broker.InflightCount()
+}
+
 // ConsumerViews returns one management view per live consumer (BOB-8), the
 // optional-interface seam (consumerViews) the management layer discovers on the
 // injected UnifiedBroker.

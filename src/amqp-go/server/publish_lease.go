@@ -359,7 +359,7 @@ func (s *Server) bodyStallClose(conn *protocol.Connection, rs *readerState) {
 	s.Log.Warn("leased publish body stalled; closing connection",
 		zap.String("connection_id", conn.ID),
 		zap.Int("owed_channels", rs.owedLen()))
-	conn.Closed.Store(true)
+	s.recordConnectionClose(conn, ConnectionCloseBodyStall)
 }
 
 // leaseClose506 makes a best-effort connection.close 506 under writeTimeout,
@@ -374,6 +374,10 @@ func (s *Server) leaseClose506(rt *connRuntime, channel uint16, wireReason, logR
 		zap.Uint16("channel", channel),
 		zap.Int("owed_channels", owedChannels))
 	s.goConn(rt, "lease-close", func() {
+		// Record lease_close BEFORE connectionError: that call runs
+		// failConnection, whose code-derived cause would otherwise win the
+		// once-guard with protocol_error. The runtime guard keeps it to one.
+		s.recordCloseCause(rt, ConnectionCloseLeaseClose)
 		_ = s.connectionError(conn, amqperrors.ResourceError, wireReason, 60, 40)
 		conn.Closed.Store(true)
 		_ = conn.Conn.Close()

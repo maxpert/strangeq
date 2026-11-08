@@ -226,6 +226,10 @@ func (s *Server) dispatch(rw *responseRecorder, r *http.Request, m *route) {
 	defer func() {
 		if rec := recover(); rec != nil {
 			s.panicCount.Add(1)
+			// OPS-060: the recovered panic is counted by bounded route
+			// TEMPLATE, never the raw path. The label domain is the router's
+			// pattern set. A no-op when management metrics are disabled.
+			s.sink.ManagementPanic(m.pattern)
 			s.log.Error("management handler panicked",
 				zap.Any("panic", rec), zap.String("endpoint", m.pattern),
 				zap.String("request_id", requestID(r)))

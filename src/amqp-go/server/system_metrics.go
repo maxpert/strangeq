@@ -150,11 +150,16 @@ func (s *Server) updateWALMetrics() {
 	}
 
 	var totalSize int64
+	fileCount := 0
 	for _, entry := range entries {
 		if entry.IsDir() {
 			continue
 		}
 		if filepath.Ext(entry.Name()) == ".wal" {
+			// Counted in the same walk that sums bytes (spec 06 §3.3): an
+			// unreclaimed-file leak shows up as amqp_wal_files climbing. Zero
+			// new locking.
+			fileCount++
 			info, err := entry.Info()
 			if err == nil {
 				// ALLOCATED bytes: a sparse WAL file's apparent size is larger
@@ -166,6 +171,7 @@ func (s *Server) updateWALMetrics() {
 	}
 
 	s.MetricsCollector.UpdateWALSize(float64(totalSize))
+	s.MetricsCollector.UpdateWALFileCount(fileCount)
 }
 
 // updateSegmentMetrics collects metrics about segment files per queue

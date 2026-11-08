@@ -53,7 +53,17 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	return s.shutdownErr
 }
 
-func (s *Server) shutdown(ctx context.Context) error {
+func (s *Server) shutdown(ctx context.Context) (err error) {
+	// Shutdown telemetry (spec 06 §3.5): one result counter and the wall-clock
+	// duration, recorded on every exit path.
+	shutdownStart := time.Now()
+	shutdownResult := ShutdownResultClean
+	defer func() {
+		if s.MetricsCollector != nil {
+			s.MetricsCollector.RecordShutdown(shutdownResult, time.Since(shutdownStart).Seconds())
+		}
+	}()
+
 	if s.Lifecycle != nil {
 		s.Lifecycle.setState(StateStopping)
 		defer func() {
@@ -99,11 +109,18 @@ func (s *Server) shutdown(ctx context.Context) error {
 	}
 	s.Mutex.RUnlock()
 	for _, c := range conns {
+		if s.MetricsCollector != nil {
+			s.MetricsCollector.RecordShutdownConnectionForced()
+		}
 		if rt, ok := s.runtimes.Load(c); ok && rt.(*connRuntime).handshakeDone.Load() {
+			// failConnection records the forced_shutdown cause once (the code
+			// is CONNECTION_FORCED), so this branch must NOT record it again.
 			go s.failConnection(rt.(*connRuntime), amqperrors.ConnectionForced,
 				"CONNECTION_FORCED - broker shutdown", 0, 0)
 		} else {
-			// Still handshaking (or no runtime): just close the socket.
+			// Still handshaking (or no runtime): just close the socket. There
+			// is no failConnection to record the cause, so record it here.
+			s.recordConnectionClose(c, ConnectionCloseForcedShutdown)
 			_ = c.Conn.Close()
 		}
 	}
@@ -116,6 +133,7 @@ func (s *Server) shutdown(ctx context.Context) error {
 	case <-joined:
 	case <-ctx.Done():
 		forced = true
+		shutdownResult = ShutdownResultForced
 	}
 
 	// 4. Forced: close every remaining socket, then wait up to
@@ -129,6 +147,7 @@ func (s *Server) shutdown(ctx context.Context) error {
 		select {
 		case <-joined:
 		case <-time.After(shutdownForceJoinTimeout):
+			shutdownResult = ShutdownResultIncomplete
 			s.Log.Error("shutdown: connections did not terminate; storage left open")
 			return fmt.Errorf("%w: %w", ErrShutdownIncomplete, ctx.Err())
 		}
@@ -146,6 +165,9 @@ func (s *Server) shutdown(ctx context.Context) error {
 		// interfaces.Storage has no Close method; the concrete stores do.
 		if closer, ok := s.storage.(interface{ Close() error }); ok {
 			if err := closer.Close(); err != nil {
+				if s.MetricsCollector != nil {
+					s.MetricsCollector.RecordStorageCloseError()
+				}
 				s.Log.Error("shutdown: storage close failed", zap.Error(err))
 			} else {
 				s.storageClosed.Store(true)

@@ -194,7 +194,13 @@ func (s *Server) consumerDeliveryLoop(rt *connRuntime) {
 
 			info, exists := consumerInfos[delivery.ConsumerID]
 			if !exists {
-				// Consumer was removed after forwarding — drop the delivery
+				// Consumer was removed after forwarding — the delivery is
+				// dropped without requeue. This is a SILENT message-loss path:
+				// it is counted explicitly so the loss is never invisible
+				// (spec 06 §3.4).
+				if s.MetricsCollector != nil {
+					s.MetricsCollector.RecordDeliveriesDropped(DeliveryDropConsumerRemoved, 1)
+				}
 				continue
 			}
 
@@ -224,6 +230,9 @@ func (s *Server) consumerDeliveryLoop(rt *connRuntime) {
 			// from the delivery: the delivery carries the internal identity.
 			err := s.sendBatchedDeliveries(conn, info.channel.ID, info.tag, batch)
 			if err != nil {
+				if s.MetricsCollector != nil {
+					s.MetricsCollector.RecordDeliverySendError()
+				}
 				s.Log.Error("Failed to send batched deliveries",
 					zap.Error(err),
 					zap.String("consumer_tag", info.tag),
@@ -242,6 +251,9 @@ func (s *Server) consumerDeliveryLoop(rt *connRuntime) {
 				}
 				err := s.sendBatchedDeliveries(conn, extraInfo.channel.ID, extraInfo.tag, []*protocol.Delivery{extra})
 				if err != nil {
+					if s.MetricsCollector != nil {
+						s.MetricsCollector.RecordDeliverySendError()
+					}
 					s.Log.Error("Failed to send batched deliveries",
 						zap.Error(err),
 						zap.String("consumer_tag", extraInfo.tag),
@@ -269,26 +281,49 @@ func (s *Server) consumerDeliveryLoop(rt *connRuntime) {
 // ensures no double-requeue with the connection teardown's UnregisterConsumer
 // cleanup (step 7), which also uses LoadAndDelete on the same index.
 func (s *Server) requeueFailedDeliveries(batch []*protocol.Delivery, extras []*protocol.Delivery) {
+	var requeued, dropped int
+	count := func(d *protocol.Delivery) {
+		if s.requeueSingleDelivery(d) {
+			requeued++
+		} else {
+			dropped++
+		}
+	}
 	for _, d := range batch {
-		s.requeueSingleDelivery(d)
+		count(d)
 	}
 	for _, d := range extras {
-		s.requeueSingleDelivery(d)
+		count(d)
+	}
+	if s.MetricsCollector != nil {
+		// Count what was ACTUALLY requeued, not what was handed to the path:
+		// a delivery whose consumer vanished is stranded otherwise (neither
+		// requeued nor counted anywhere). The remainder is a bounded
+		// consumer_removed delivery loss (spec 06 §3.4).
+		s.MetricsCollector.RecordDeliveriesRequeued(DeliveryRequeueWriteError, requeued)
+		s.MetricsCollector.RecordDeliveriesDropped(DeliveryDropConsumerRemoved, dropped)
 	}
 }
 
-func (s *Server) requeueSingleDelivery(d *protocol.Delivery) {
+// requeueSingleDelivery requeues one failed delivery and reports whether the
+// requeue actually landed: true only when a live consumer was found AND
+// RejectMessage returned nil. A vanished consumer (no delivery-index entry) or
+// a failed RejectMessage returns false, so the caller counts it as a drop
+// rather than silently stranding it.
+func (s *Server) requeueSingleDelivery(d *protocol.Delivery) bool {
 	if d == nil {
-		return
+		return false
 	}
 	consumerID, ok := s.Broker.GetConsumerForDelivery(d.DeliveryTag)
 	if !ok {
-		return
+		return false
 	}
 	if err := s.Broker.RejectMessage(consumerID, d.DeliveryTag, true); err != nil {
 		s.Log.Warn("Failed to requeue delivery on write error",
 			zap.Uint64("delivery_tag", d.DeliveryTag),
 			zap.String("consumer_id", consumerID),
 			zap.Error(err))
+		return false
 	}
+	return true
 }

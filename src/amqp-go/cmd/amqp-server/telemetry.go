@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"sync/atomic"
 
+	"github.com/maxpert/amqp-go/broker"
 	"github.com/maxpert/amqp-go/interfaces"
 	"github.com/maxpert/amqp-go/metrics"
 	"github.com/maxpert/amqp-go/protocol"
@@ -50,6 +51,14 @@ type queueHighWaterCounter interface {
 	QueueDepthHighWater(name string) uint64
 }
 
+// queueMessageCounter is the optional seam exposing a queue's ready/unacked/
+// total depth (BOB-1). It is what wires amqp_queue_messages_unacknowledged and
+// amqp_queue_messages_total from the broker at poll time (spec 06 §3.5); when
+// absent those series are omitted rather than fabricated.
+type queueMessageCounter interface {
+	QueueMessageCounts(name string) broker.QueueMessageCounts
+}
+
 // brokerQueueStats adapts the live broker to metrics.QueueStatsProvider.
 type brokerQueueStats struct {
 	b queueLister
@@ -74,6 +83,7 @@ func queueStatsFrom(l queueLister) []metrics.QueueStat {
 
 	readyCounter, hasReady := l.(queueReadyCounter)
 	hwCounter, hasHW := l.(queueHighWaterCounter)
+	msgCounter, hasMsg := l.(queueMessageCounter)
 	stats := make([]metrics.QueueStat, 0, len(l.GetQueues()))
 	for name := range l.GetQueues() {
 		stat := metrics.QueueStat{
@@ -88,6 +98,19 @@ func queueStatsFrom(l queueLister) []metrics.QueueStat {
 		if hasHW {
 			stat.HighWater = int(hwCounter.QueueDepthHighWater(name))
 			stat.HighWaterSet = true
+		}
+		if hasMsg {
+			// The unacked/total families are written ONLY when the broker
+			// reports a live QueueState (Known), so an unknown queue emits no
+			// series rather than a fabricated 0.
+			if mc := msgCounter.QueueMessageCounts(name); mc.Known {
+				stat.Unacked = int(mc.Unacked)
+				stat.UnackedKnown = true
+				if !stat.ReadyKnown {
+					stat.Ready = int(mc.Ready)
+					stat.ReadyKnown = true
+				}
+			}
 		}
 		stats = append(stats, stat)
 	}

@@ -110,6 +110,11 @@ func (s *Server) failConnection(rt *connRuntime, code uint16, text string, class
 		return
 	}
 	rt.closeHandshakeStarted.Store(true)
+	// Record the bounded close cause (spec 06 §3.5) BEFORE closing. The
+	// runtime once-guard means a hard-close site that already recorded its own
+	// cause (e.g. write_error, lease_close) keeps it; this is the code-derived
+	// fallback for every other server-initiated close.
+	s.recordCloseCause(rt, connectionCloseCauseForCode(code))
 	// WS-I: unblock a reader parked in a lease wait — the connection is
 	// closing; the reader pairs nil leases from here and keeps reading so the
 	// client's close-ok is seen (covers BOTH branches below: the close frame
