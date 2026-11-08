@@ -289,7 +289,16 @@ func (b *ServerBuilder) Build() (*Server, error) {
 		// benign faults out — an unwritten load-bearing premise in a different
 		// package — so it is checked here rather than inherited.
 		if ierr := storageBroker.InitError(); ierr != nil {
-			ordinalGating = gatingFaultList(interfaces.ExplainedFaults("ordinal-allocator", ierr))
+			ordinalFaults := interfaces.ExplainedFaults("ordinal-allocator", ierr)
+			ordinalGating = gatingFaultList(ordinalFaults)
+			// The ordinal-allocator faults are created HERE, never by the
+			// RecoveryManager, so counting them here cannot double-count with
+			// the manager's own reporting (spec 06 §3.2).
+			if sink, ok := b.metrics.(RecoveryFaultSink); ok && sink != nil {
+				for _, f := range ordinalFaults {
+					sink.RecordRecoveryFault(f.Stage, f.Outcome.String())
+				}
+			}
 			if len(ordinalGating) > 0 {
 				if !b.config.Storage.UnsafeRecovery {
 					return nil, errors.New(interfaces.RecoveryRefusalMessage(
@@ -414,6 +423,21 @@ func (b *ServerBuilder) Build() (*Server, error) {
 		storage.SetWALFullFlushSink(binder.RecordWALFullFlush)
 	}
 
+	// Spec 06 §3.4/§3.5: bind the live gauges the collector reads AT SCRAPE
+	// TIME. Each is a no-op for a collector that does not implement the
+	// binder, and costs the hot path nothing (the counter is a plain atomic).
+	if binder, ok := metricsCollector.(DepthGateStatsBinder); ok {
+		binder.BindDepthGateStats(server.DepthGatedCurrent)
+	}
+	if binder, ok := metricsCollector.(ReaderPausedStatsBinder); ok {
+		binder.BindReaderPausedStats(server.ReaderPausedCurrent)
+	}
+	if binder, ok := metricsCollector.(MessagesInflightStatsBinder); ok {
+		if ic, ok := unifiedBroker.(interface{ InflightCount() int64 }); ok {
+			binder.BindMessagesInflightStats(ic.InflightCount)
+		}
+	}
+
 	// Create and attach lifecycle manager
 	server.Lifecycle = NewLifecycleManager(server, b.config)
 
@@ -435,8 +459,21 @@ func (b *ServerBuilder) Build() (*Server, error) {
 
 	// Always perform recovery (storage is always persistent)
 	recoveryManager := NewRecoveryManager(storageImpl, unifiedBroker, logger.(*ZapLoggerAdapter).logger)
+	// Spec 06 §3.2: every classified recovery fault and discarded-record count
+	// is reported to the collector as the boot runs, so an outage is COUNTED
+	// rather than only logged.
+	if sink, ok := metricsCollector.(RecoveryFaultSink); ok && sink != nil {
+		recoveryManager.SetRecoveryFaultSink(sink)
+	}
 
 	recoveryStats, err := recoveryManager.PerformRecovery()
+
+	// Recovery duration + messages recovered (spec 06 §3.2). Recorded where
+	// the stats are produced so a degraded boot is visible without log parsing.
+	if recoveryStats != nil {
+		metricsCollector.RecordRecoveryDuration(recoveryStats.RecoveryDuration.Seconds())
+		metricsCollector.SetRecoveryMessagesRecovered(recoveryStats.PersistentMessagesRecovered)
+	}
 
 	// THE INVERSION. This used to be an ALLOW-LIST of two fatal sentinels:
 	// anything else logged "Recovery failed" and fell through to

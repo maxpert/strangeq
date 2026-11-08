@@ -59,11 +59,40 @@ type RecoveryManager struct {
 	// than returned one at a time so a degraded boot can NAME EVERY discarded
 	// artifact instead of the first one.
 	faults []*interfaces.RecoveryFault
+
+	// faultSink is the optional metrics surface every classified fault and
+	// discarded-record count is reported to (spec 06 §3.2). nil means "no
+	// metrics collector"; every report is then a no-op. It is set once by
+	// server/builder.go before PerformRecovery.
+	faultSink RecoveryFaultSink
+}
+
+// SetRecoveryFaultSink installs the optional metrics surface recovery reports
+// faults and discarded-record counts through. It MUST be called before
+// PerformRecovery so a boot outage is counted, not merely logged.
+func (r *RecoveryManager) SetRecoveryFaultSink(s RecoveryFaultSink) { r.faultSink = s }
+
+// recordFault counts one classified fault. Reported at the site that creates
+// the fault so the metric and the log cannot drift.
+func (r *RecoveryManager) recordFault(f *interfaces.RecoveryFault) {
+	if r.faultSink == nil {
+		return
+	}
+	r.faultSink.RecordRecoveryFault(f.Stage, f.Outcome.String())
+}
+
+// recordDiscarded counts n records discarded or quarantined at a stage.
+func (r *RecoveryManager) recordDiscarded(stage string, n int) {
+	if r.faultSink == nil {
+		return
+	}
+	r.faultSink.RecordRecoveryDiscardedRecords(stage, n)
 }
 
 // addFault records a classified fault.
 func (r *RecoveryManager) addFault(f *interfaces.RecoveryFault) {
 	r.faults = append(r.faults, f)
+	r.recordFault(f)
 }
 
 // absorb records whatever classification an error carries and reports the
@@ -79,7 +108,11 @@ func (r *RecoveryManager) absorb(stage string, err error) interfaces.RecoveryOut
 	if err == nil {
 		return interfaces.RecoveryBenign
 	}
-	r.faults = append(r.faults, interfaces.ExplainedFaults(stage, err)...)
+	explained := interfaces.ExplainedFaults(stage, err)
+	r.faults = append(r.faults, explained...)
+	for _, f := range explained {
+		r.recordFault(f)
+	}
 	return interfaces.OutcomeOf(err)
 }
 
@@ -383,6 +416,7 @@ func (r *RecoveryManager) recoverPersistentMessages(stats *protocol.RecoveryStat
 			if durableCount == 0 {
 				r.addFault(interfaces.BenignFault("queue-recovery", "queue "+queueName,
 					fmt.Sprintf("discarded %d non-durable record(s) for a queue with no metadata record", len(messages))))
+				r.recordDiscarded(RecoveryStageQueue, len(messages))
 				continue
 			}
 			r.logger.Warn("discarding recovered records for a queue with no metadata record",
@@ -393,6 +427,7 @@ func (r *RecoveryManager) recoverPersistentMessages(stats *protocol.RecoveryStat
 			r.addFault(interfaces.BenignFault("queue-recovery", "queue "+queueName,
 				fmt.Sprintf("discarded %d durable record(s) (tags %d..%d) for a queue whose metadata record is ABSENT (AMQP 0-9-1 §1.7.2.10, queue.delete removes the queue and its messages)",
 					durableCount, lo, hi)))
+			r.recordDiscarded(RecoveryStageQueue, durableCount)
 			continue
 		}
 
@@ -411,6 +446,7 @@ func (r *RecoveryManager) recoverPersistentMessages(stats *protocol.RecoveryStat
 			// break them outright.
 			r.addFault(interfaces.BenignFault("queue-recovery", "queue "+queueName,
 				fmt.Sprintf("reaped %d record(s) belonging to a NON-DURABLE queue; AMQP 0-9-1 §1.7.2.1 forbids it surviving a restart", len(messages))))
+			r.recordDiscarded(RecoveryStageQueue, len(messages))
 			r.logger.Warn("reaping recovered records for a non-durable queue",
 				zap.String("queue", queueName),
 				zap.Int("reaped", len(messages)))
@@ -443,6 +479,7 @@ func (r *RecoveryManager) recoverPersistentMessages(stats *protocol.RecoveryStat
 						ErrLegacyDataDirectory.Error(), count, minTag, maxTag),
 					"the recovered delivery tags are raw legacy values whose high bits are not a valid queue ordinal; starting anyway abandons every one of these confirmed durable messages, and the tags they carry may collide with another queue's tag space; every OTHER queue in this data directory is recovered normally",
 					ErrLegacyDataDirectory))
+				r.recordDiscarded(RecoveryStageQueue, int(count))
 				continue
 			}
 			// No DeliveryMode==2 records at all — nothing to recover, nothing
@@ -460,6 +497,14 @@ func (r *RecoveryManager) recoverPersistentMessages(stats *protocol.RecoveryStat
 		// (RecoverQueue is not reached), so "abandoned" was not what actually
 		// happened. Pre-passing makes the quarantine total and the cost
 		// statement true.
+		// Count the queue's durable records once, so a quarantine fault can
+		// report the exact number of records it abandons (spec 06 §3.2).
+		durableInQueue := 0
+		for _, message := range messages {
+			if message.DeliveryMode == 2 {
+				durableInQueue++
+			}
+		}
 		mismatched := false
 		for _, message := range messages {
 			if message.DeliveryMode != 2 {
@@ -476,6 +521,7 @@ func (r *RecoveryManager) recoverPersistentMessages(stats *protocol.RecoveryStat
 			}
 		}
 		if mismatched {
+			r.recordDiscarded(RecoveryStageQueue, durableInQueue)
 			continue
 		}
 
@@ -541,6 +587,7 @@ func (r *RecoveryManager) recoverPersistentMessages(stats *protocol.RecoveryStat
 					fmt.Sprintf("a confirmed durable record (delivery tag %d) could not be loaded back into the queue", message.DeliveryTag),
 					"this confirmed durable message is not delivered after the restart; its delivery tag stays inside the recovered span, so it is skipped as a gap",
 					err))
+				r.recordDiscarded(RecoveryStageMessage, 1)
 				continue
 			}
 			stats.PersistentMessagesRecovered++
@@ -565,6 +612,7 @@ func (r *RecoveryManager) recoverPersistentMessages(stats *protocol.RecoveryStat
 			r.addFault(interfaces.BenignFault("queue-recovery", "queue "+queueName,
 				fmt.Sprintf("discarded %d record(s) from a dead incarnation (tag ordinals %d..%d, current ordinal %d)",
 					discardedCount, broker.TagOrdinal(discardedLo), broker.TagOrdinal(discardedHi), queueOrdinal)))
+			r.recordDiscarded(RecoveryStageQueue, discardedCount)
 		}
 
 		if hasRecovered {

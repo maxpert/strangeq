@@ -194,7 +194,13 @@ func (s *Server) consumerDeliveryLoop(rt *connRuntime) {
 
 			info, exists := consumerInfos[delivery.ConsumerID]
 			if !exists {
-				// Consumer was removed after forwarding — drop the delivery
+				// Consumer was removed after forwarding — the delivery is
+				// dropped without requeue. This is a SILENT message-loss path:
+				// it is counted explicitly so the loss is never invisible
+				// (spec 06 §3.4).
+				if s.MetricsCollector != nil {
+					s.MetricsCollector.RecordDeliveriesDropped(DeliveryDropConsumerRemoved, 1)
+				}
 				continue
 			}
 
@@ -224,6 +230,9 @@ func (s *Server) consumerDeliveryLoop(rt *connRuntime) {
 			// from the delivery: the delivery carries the internal identity.
 			err := s.sendBatchedDeliveries(conn, info.channel.ID, info.tag, batch)
 			if err != nil {
+				if s.MetricsCollector != nil {
+					s.MetricsCollector.RecordDeliverySendError()
+				}
 				s.Log.Error("Failed to send batched deliveries",
 					zap.Error(err),
 					zap.String("consumer_tag", info.tag),
@@ -242,6 +251,9 @@ func (s *Server) consumerDeliveryLoop(rt *connRuntime) {
 				}
 				err := s.sendBatchedDeliveries(conn, extraInfo.channel.ID, extraInfo.tag, []*protocol.Delivery{extra})
 				if err != nil {
+					if s.MetricsCollector != nil {
+						s.MetricsCollector.RecordDeliverySendError()
+					}
 					s.Log.Error("Failed to send batched deliveries",
 						zap.Error(err),
 						zap.String("consumer_tag", extraInfo.tag),
@@ -269,6 +281,13 @@ func (s *Server) consumerDeliveryLoop(rt *connRuntime) {
 // ensures no double-requeue with the connection teardown's UnregisterConsumer
 // cleanup (step 7), which also uses LoadAndDelete on the same index.
 func (s *Server) requeueFailedDeliveries(batch []*protocol.Delivery, extras []*protocol.Delivery) {
+	if s.MetricsCollector != nil {
+		// Every delivery handed to the requeue path after a write error is
+		// counted (spec 06 §3.4); the index LoadAndDelete guard in RejectMessage
+		// makes a double-requeue impossible, so the count matches what was
+		// actually requeued or dropped by a missing consumer.
+		s.MetricsCollector.RecordDeliveriesRequeued(DeliveryRequeueWriteError, len(batch)+len(extras))
+	}
 	for _, d := range batch {
 		s.requeueSingleDelivery(d)
 	}

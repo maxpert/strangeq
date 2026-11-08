@@ -162,6 +162,16 @@ type Server struct {
 	publisherParkNanos atomic.Int64
 	publisherParkedNow atomic.Int64
 
+	// --- Spec 06 §3.4: live backpressure gauges (append-only) ---
+	//
+	// depthGatedNow is the number of connections currently gated by the
+	// queue-depth reader backpressure; readerPausedNow is the number of readers
+	// currently parked on the frame-budget hand-off. Both are read at SCRAPE
+	// TIME through the collector's GaugeFuncs, so the publish/read hot path
+	// pays only one atomic add.
+	depthGatedNow   atomic.Int64
+	readerPausedNow atomic.Int64
+
 	// --- BOB-11: coherent entity counters (append-only) ---
 	//
 	// entityGate serialises every update to the five entity counters plus the
@@ -209,6 +219,14 @@ func (s *Server) PublisherParkStats() (count uint64, seconds float64, current in
 		float64(s.publisherParkNanos.Load()) / float64(time.Second),
 		s.publisherParkedNow.Load()
 }
+
+// DepthGatedCurrent is the number of connections currently gated by the
+// queue-depth reader backpressure (spec 06 §3.4). Read at scrape time.
+func (s *Server) DepthGatedCurrent() int64 { return s.depthGatedNow.Load() }
+
+// ReaderPausedCurrent is the number of readers currently parked on the
+// frame-budget hand-off (spec 06 §3.4). Read at scrape time.
+func (s *Server) ReaderPausedCurrent() int64 { return s.readerPausedNow.Load() }
 
 // markUnsafeRecovery records that this process booted with --unsafe-recovery
 // after discarding artifacts it could not recover. Called once from Build.
@@ -600,6 +618,13 @@ func (s *Server) cleanupConnection(connection *protocol.Connection) {
 	s.withEntityDelta("connections", -1)
 	s.Mutex.Unlock()
 
+	// A connection torn down while still depth-gated must release its gauge
+	// slot, or amqp_depth_gated_current would leak upward for the process
+	// lifetime (spec 06 §3.4).
+	if connection.DepthBackpressure.Load() {
+		s.depthGatedNow.Add(-1)
+	}
+
 	if s.MetricsCollector != nil {
 		s.MetricsCollector.RecordConnectionClosed()
 	}
@@ -929,6 +954,7 @@ func (s *Server) parkReaderWhileDepthBackpressured(conn *protocol.Connection) (p
 	gate := conn.DepthGateValue()
 	if gate == nil || conn.HasActiveConsumer() {
 		conn.SetDepthGate(nil)
+		s.depthGatedNow.Add(-1)
 		return false
 	}
 	// One park episode begins here and ends when the gate clears, the
@@ -951,7 +977,8 @@ func (s *Server) parkReaderWhileDepthBackpressured(conn *protocol.Connection) (p
 	defer liveness.Stop()
 	for {
 		if !gate.AtHighWaterMark() {
-			conn.SetDepthGate(nil) // drained — resume full-speed reads
+			conn.SetDepthGate(nil)
+			s.depthGatedNow.Add(-1) // drained — resume full-speed reads
 			return false
 		}
 		select {
@@ -1145,13 +1172,29 @@ func (s *Server) readFrames(rt *connRuntime, done chan struct{}) {
 			// (nil chan), so the reader parks on FrameBudgetWake exactly as it
 			// would park on a full FrameQueue (TCP backpressure).
 			q := conn.FrameQueue
+			paused := false
 			if !s.frameBudgetAllows(conn, headCost) {
 				q = nil
+				// The reader is about to park on the frame-budget hand-off
+				// (SQ-13). Count the park and expose the live gauge (spec 06
+				// §3.4).
+				paused = true
+				s.readerPausedNow.Add(1)
+				if s.MetricsCollector != nil {
+					s.MetricsCollector.RecordReaderPaused()
+				}
+			}
+			unpause := func() {
+				if paused {
+					paused = false
+					s.readerPausedNow.Add(-1)
+				}
 			}
 			backpressureProbe.Reset(s.readerBackpressureProbeInterval())
 			select {
 			case q <- head:
 				backpressureProbe.Stop()
+				unpause()
 				// Add after the send: a transient negative is harmless
 				// (frameBudgetAllows always admits q <= 0).
 				conn.FrameQueueBytes.Add(headCost)
@@ -1161,11 +1204,14 @@ func (s *Server) readFrames(rt *connRuntime, done chan struct{}) {
 				continue
 			case <-conn.FrameBudgetWake:
 				backpressureProbe.Stop()
+				unpause()
 				continue // re-evaluate budget
 			case <-conn.Done:
 				backpressureProbe.Stop()
+				unpause()
 				return
 			case <-backpressureProbe.C:
+				unpause()
 				// Probe fired: fall through to read EXACTLY ONE frame (bounded by
 				// the read deadline armed below), then loop back and re-park. This
 				// keeps acks + control frames flowing while backlogged.
@@ -1273,6 +1319,10 @@ func (s *Server) readFrames(rt *connRuntime, done chan struct{}) {
 		}
 		frame, err := protocol.ReadFrameOptimizedWithLimit(conn.Reader, maxSize)
 		if err != nil {
+			// The cause of this close (spec 06 §3.5), overwritten by the
+			// specific branches below; the default covers an unclassified
+			// socket read error.
+			closeCause := ConnectionCloseProtocolError
 			if ne, ok := err.(net.Error); ok && ne.Timeout() {
 				if depthDraining {
 					// Option A burst-drain: the short-deadline read found RX empty —
@@ -1291,6 +1341,7 @@ func (s *Server) readFrames(rt *connRuntime, done chan struct{}) {
 					return
 				}
 				if hb > 0 {
+					closeCause = ConnectionCloseHeartbeatTimeout
 					s.Log.Info("heartbeat missed, closing dead connection",
 						zap.String("connection_id", conn.ID))
 				} else if probing && s.alarmState.Load() != 0 {
@@ -1307,6 +1358,7 @@ func (s *Server) readFrames(rt *connRuntime, done chan struct{}) {
 					continue
 				}
 			} else if err.Error() == "EOF" {
+				closeCause = ConnectionCloseClientEOF
 				s.Log.Info("Connection closed by client", zap.String("connection_id", conn.ID))
 			} else {
 				s.Log.Error("Error reading frame from connection",
@@ -1317,6 +1369,15 @@ func (s *Server) readFrames(rt *connRuntime, done chan struct{}) {
 				}
 			}
 
+			// Every connection close increments exactly one bounded cause
+			// (spec 06 §3.5); the reader_overflow branch has its own site.
+			// A server-initiated close (failConnection: shutdown / connection
+			// error, and the reader-overflow/oversized-ack sites) already
+			// counted its own cause, so the reader's error is NOT a second
+			// cause for the same close.
+			if s.MetricsCollector != nil && !rt.connClosing.Load() && !conn.Closed.Load() {
+				s.MetricsCollector.RecordConnectionClosedByCause(closeCause)
+			}
 			conn.Closed.Store(true)
 			return
 		}
@@ -1410,6 +1471,7 @@ func (s *Server) readFrames(rt *connRuntime, done chan struct{}) {
 				zap.Int64("hard_cap_bytes", hardCap))
 			if s.MetricsCollector != nil {
 				s.MetricsCollector.RecordConnectionError("reader_overflow")
+				s.MetricsCollector.RecordConnectionClosedByCause(ConnectionCloseReaderOverflow)
 			}
 			conn.Closed.Store(true)
 			conn.Conn.Close()

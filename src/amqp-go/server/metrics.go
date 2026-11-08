@@ -94,6 +94,56 @@ type MetricsCollector interface {
 	RecordConnectionError(errorType string)
 	RecordChannelError(errorType string)
 	RecordMessageDropped(queueName, reason string)
+
+	// --- Spec 06 broker outage telemetry (bounded-label families) ---
+
+	// Recovery (spec 06 §3.2). outcome is one of the closed
+	// recoveryOutcome* values; stage one of the bounded recoveryStage* values.
+	RecordRecoveryFault(stage, outcome string)
+	RecordRecoveryDiscardedRecords(stage string, n int)
+	RecordRecoveryDuration(seconds float64)
+	SetRecoveryMessagesRecovered(n int)
+
+	// WAL file-count gauge (spec 06 §3.3).
+	UpdateWALFileCount(n int)
+
+	// Publish / back-pressure / delivery (spec 06 §3.4). Reasons/causes are
+	// closed enums (publishRefused*, deliveryRequeue*, deliveryDrop*,
+	// connectionCloseCause*).
+	RecordPublishRefused(reason string)
+	RecordConsumerRegisterError()
+	RecordDepthGateArmed()
+	RecordDeliverySendError()
+	RecordDeliveriesRequeued(reason string, n int)
+	RecordDeliveriesDropped(reason string, n int)
+	RecordReaderPaused()
+
+	// Connections / shutdown / alarms / panics (spec 06 §3.5).
+	RecordConnectionClosedByCause(cause string)
+	RecordShutdown(result string, seconds float64)
+	RecordShutdownConnectionForced()
+	RecordStorageCloseError()
+	RecordResourceAlarmTrip(resource string)
+	RecordPanic(component string)
+}
+
+// DepthGateStatsBinder is an OPTIONAL extension implemented by the production
+// collector: the server binds the live gated-connection counter so
+// amqp_depth_gated_current is read AT SCRAPE TIME (spec 06 §3.4).
+type DepthGateStatsBinder interface {
+	BindDepthGateStats(stats func() int64)
+}
+
+// ReaderPausedStatsBinder is an OPTIONAL extension implemented by the
+// production collector for amqp_reader_paused_current (spec 06 §3.4).
+type ReaderPausedStatsBinder interface {
+	BindReaderPausedStats(stats func() int64)
+}
+
+// MessagesInflightStatsBinder is an OPTIONAL extension implemented by the
+// production collector for amqp_messages_inflight (spec 06 §3.5).
+type MessagesInflightStatsBinder interface {
+	BindMessagesInflightStats(stats func() int64)
 }
 
 // LeaseMetrics is an OPTIONAL extension of MetricsCollector (WS-I Phase B):
@@ -230,3 +280,23 @@ func (n *NoOpMetricsCollector) UpdateFileDescriptors(count float64) {}
 func (n *NoOpMetricsCollector) RecordConnectionError(errorType string)        {}
 func (n *NoOpMetricsCollector) RecordChannelError(errorType string)           {}
 func (n *NoOpMetricsCollector) RecordMessageDropped(queueName, reason string) {}
+
+// Spec 06 broker outage telemetry
+func (n *NoOpMetricsCollector) RecordRecoveryFault(stage, outcome string)            {}
+func (n *NoOpMetricsCollector) RecordRecoveryDiscardedRecords(stage string, cnt int) {}
+func (n *NoOpMetricsCollector) RecordRecoveryDuration(seconds float64)               {}
+func (n *NoOpMetricsCollector) SetRecoveryMessagesRecovered(count int)               {}
+func (n *NoOpMetricsCollector) UpdateWALFileCount(count int)                         {}
+func (n *NoOpMetricsCollector) RecordPublishRefused(reason string)                   {}
+func (n *NoOpMetricsCollector) RecordConsumerRegisterError()                         {}
+func (n *NoOpMetricsCollector) RecordDepthGateArmed()                                {}
+func (n *NoOpMetricsCollector) RecordDeliverySendError()                             {}
+func (n *NoOpMetricsCollector) RecordDeliveriesRequeued(reason string, cnt int)      {}
+func (n *NoOpMetricsCollector) RecordDeliveriesDropped(reason string, cnt int)       {}
+func (n *NoOpMetricsCollector) RecordReaderPaused()                                  {}
+func (n *NoOpMetricsCollector) RecordConnectionClosedByCause(cause string)           {}
+func (n *NoOpMetricsCollector) RecordShutdown(result string, seconds float64)        {}
+func (n *NoOpMetricsCollector) RecordShutdownConnectionForced()                      {}
+func (n *NoOpMetricsCollector) RecordStorageCloseError()                             {}
+func (n *NoOpMetricsCollector) RecordResourceAlarmTrip(resource string)              {}
+func (n *NoOpMetricsCollector) RecordPanic(component string)                         {}

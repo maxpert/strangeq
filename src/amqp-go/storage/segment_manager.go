@@ -1380,7 +1380,10 @@ func (qs *QueueSegments) sealSegment() error {
 	// Sync to durability before sealing. Under barrier mode this is the fence
 	// (an ordering barrier, no whole-drive flush); under force_flush the full
 	// drive-cache flush. Must succeed for durability before sealing.
-	if err := qs.pol.withSite(siteSegmentSeal).file(qs.currentSegment.file); err != nil {
+	if err := segmentFsync(qs.currentSegment.file, qs.pol.withSite(siteSegmentSeal)); err != nil {
+		// A failed segment fsync barrier is counted on its own series
+		// (spec 06 §3.3).
+		recordSegmentFsyncError(qs.metrics)
 		return fmt.Errorf("failed to sync segment before sealing: %w", err)
 	}
 
@@ -1491,6 +1494,9 @@ func (qs *QueueSegments) createSegmentFileLocked() (*SegmentFile, *SegmentIndex,
 				num++ // never reopen an existing file with fileSize=0
 				continue
 			}
+			// A failed segment create/open is a roll error (spec 06 §3.3),
+			// counted rather than only returned.
+			recordSegmentRollError(qs.metrics)
 			return nil, nil, fmt.Errorf("failed to open segment file: %w", err)
 		}
 		if serr := qs.pol.withSite(siteSegmentDir).dir(qs.dataDir); serr != nil {
@@ -1781,7 +1787,11 @@ func (qs *QueueSegments) compactSegment(segment *SegmentFile) error {
 	// Sync the new file BEFORE it can become the segment. A discarded Sync
 	// error means the rename can publish a file whose contents are not on the
 	// platter.
-	if serr := qs.pol.withSite(siteSegmentTemp).file(tempFile); serr != nil {
+	if serr := segmentFsync(tempFile, qs.pol.withSite(siteSegmentTemp)); serr != nil {
+		// A failed segment fsync barrier is counted on its own series
+		// (spec 06 §3.3), distinct from the generic compaction-withdrawal
+		// signal tryCompaction records for the enclosing error.
+		recordSegmentFsyncError(qs.metrics)
 		_ = tempFile.Close()
 		_ = os.Remove(tempPath)
 		return fmt.Errorf("segment compaction aborted: cannot fsync %s: %w", tempPath, serr)

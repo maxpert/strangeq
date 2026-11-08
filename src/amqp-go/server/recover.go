@@ -13,6 +13,9 @@ func (s *Server) PanicCount() int64 { return s.panics.Load() }
 
 func (s *Server) notePanic(where, connID string, r any) {
 	s.panics.Add(1)
+	if s.MetricsCollector != nil {
+		s.MetricsCollector.RecordPanic(panicComponent(where))
+	}
 	s.Log.Error("recovered panic in connection goroutine",
 		zap.String("goroutine", where), zap.String("connection_id", connID),
 		zap.Any("panic", r), zap.ByteString("stack", debug.Stack()))

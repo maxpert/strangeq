@@ -362,12 +362,28 @@ func SetSegmentWriteForTest(fn func(f *os.File, b []byte) (int, error)) (restore
 var segmentFsyncHook atomic.Pointer[walFsyncFn]
 
 // SetSegmentFsyncForTest installs fn as the fsync used by the segment
-// checkpoint batch path. TEST-ONLY.
+// rewrite (compaction temp-file) path. TEST-ONLY.
 func SetSegmentFsyncForTest(fn func(*os.File) error) (restore func()) {
 	prev := segmentFsyncHook.Load()
 	f := walFsyncFn(fn)
 	segmentFsyncHook.Store(&f)
 	return func() { segmentFsyncHook.Store(prev) }
+}
+
+// segmentFsync is the fsync applied to a segment file's rewrite barrier. The
+// hook, when installed, wins and REPLACES the primitive entirely; otherwise
+// the crash-model policy selects it (fence in barrier mode, full flush in
+// force_flush), exactly like every other durability site.
+//
+// The segstore-v1 rework removed the WAL->segment checkpoint COPY (the old
+// CheckpointBatch) that this seam originally faulted; the surviving segment
+// file fsync site is the compaction rewrite's temp-file barrier, so the seam
+// is wired there. This is the spec 06 §3.3 "segment fsync error" site.
+func segmentFsync(f *os.File, p syncPolicy) error {
+	if h := segmentFsyncHook.Load(); h != nil {
+		return (*h)(f)
+	}
+	return p.file(f)
 }
 
 // --- segment truncate ------------------------------------------------------

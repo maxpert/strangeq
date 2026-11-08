@@ -200,6 +200,16 @@ func (s *Server) applyAlarmBits(next uint32) {
 	switch {
 	case old == 0 && next != 0:
 		// 0 -> nonzero: emit connection.blocked(reason) to opted-in clients.
+		// Count the trip per resource on this edge (spec 06 §3.5), so the
+		// transition is visible without polling the current-state gauge.
+		if s.MetricsCollector != nil {
+			if next&AlarmMemory != 0 {
+				s.MetricsCollector.RecordResourceAlarmTrip(AlarmResourceMemory)
+			}
+			if next&AlarmDisk != 0 {
+				s.MetricsCollector.RecordResourceAlarmTrip(AlarmResourceDisk)
+			}
+		}
 		s.Log.Warn("resource alarm raised; blocking publishers",
 			zap.String("reason", alarmReason(next)), zap.Uint32("alarm_bits", next))
 		s.broadcastConnectionBlocked(alarmReason(next))

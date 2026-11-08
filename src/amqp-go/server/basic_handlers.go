@@ -511,6 +511,10 @@ func (s *Server) processCompleteMessage(conn *protocol.Connection, channelID uin
 			token.BrokerDone()
 			if err == nil && gate != nil && !conn.DepthBackpressure.Load() && !conn.HasActiveConsumer() {
 				conn.SetDepthGate(gate)
+				s.depthGatedNow.Add(1)
+				if s.MetricsCollector != nil {
+					s.MetricsCollector.RecordDepthGateArmed()
+				}
 			}
 		} else {
 			// A custom broker without non-blocking admission (only reachable
@@ -556,6 +560,10 @@ func (s *Server) processCompleteMessage(conn *protocol.Connection, channelID uin
 	// drains below HWM.
 	if backpressure != nil && !conn.DepthBackpressure.Load() && !conn.HasActiveConsumer() {
 		conn.SetDepthGate(backpressure)
+		s.depthGatedNow.Add(1)
+		if s.MetricsCollector != nil {
+			s.MetricsCollector.RecordDepthGateArmed()
+		}
 	}
 
 	if s.MetricsCollector != nil {
@@ -579,6 +587,11 @@ func (s *Server) processCompleteMessage(conn *protocol.Connection, channelID uin
 			return nil
 		}
 		if errors.Is(err, broker.ErrMaxLengthExceeded) {
+			// Counted, not silent (spec 06 §3.4): the publish was refused
+			// after routing. One increment per terminal branch below.
+			if s.MetricsCollector != nil {
+				s.MetricsCollector.RecordPublishRefused(PublishRefusedMaxLength)
+			}
 			// SQ-11 x-overflow=reject-publish: a target queue refused the
 			// message because it is at/over its x-max-length / x-max-length-bytes
 			// limit. The broker neither stored nor dead-lettered it. Signal the
@@ -599,6 +612,10 @@ func (s *Server) processCompleteMessage(conn *protocol.Connection, channelID uin
 			return nil
 		}
 		if errors.Is(err, broker.ErrQueueClosed) {
+			// Counted, not silent (spec 06 §3.4).
+			if s.MetricsCollector != nil {
+				s.MetricsCollector.RecordPublishRefused(PublishRefusedQueueClosed)
+			}
 			// A concurrent queue.delete tore the target queue down after routing
 			// resolved its binding. The broker neither stored nor dead-lettered
 			// the message, so it must never be confirmed — but the connection is
@@ -826,6 +843,9 @@ func (s *Server) handleBasicConsume(conn *protocol.Connection, channelID uint16,
 		}
 		channel.Mutex.Unlock()
 		conn.ConsumersDirty.Store(true)
+		if s.MetricsCollector != nil {
+			s.MetricsCollector.RecordConsumerRegisterError()
+		}
 		s.Log.Error("Failed to register consumer with broker",
 			zap.Error(err),
 			zap.String("consumer_tag", consumer.Tag),

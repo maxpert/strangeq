@@ -1526,7 +1526,10 @@ func (qw *QueueWAL) writeTxAtomic(records []*RecoveryMessage) error {
 	if qw.metrics != nil {
 		qw.metrics.RecordWALFsync(time.Since(fsyncStart).Seconds())
 		if fsyncErr != nil {
-			qw.metrics.RecordWALWriteError()
+			// A failed durability BARRIER, not a failed write: counted on the
+			// dedicated fsync-error series (spec 06 §3.3) so the two outages
+			// stay distinguishable.
+			recordWALFsyncError(qw.metrics)
 		}
 	}
 	if fsyncErr != nil {
@@ -2971,7 +2974,8 @@ func (qw *QueueWAL) commitBatch(sb *stagedBatch) {
 		if qw.metrics != nil {
 			qw.metrics.RecordWALFsync(fsyncDuration)
 			if fsyncErr != nil {
-				qw.metrics.RecordWALWriteError()
+				// A failed durability BARRIER, not a failed write (spec 06 §3.3).
+				recordWALFsyncError(qw.metrics)
 			}
 		}
 	}
@@ -4494,6 +4498,10 @@ func (qw *QueueWAL) tryRollLocked(ignoreBackoff bool) error {
 	if err == nil {
 		return nil
 	}
+	// Every failed roll attempt is counted (spec 06 §3.3): the current file
+	// stays active and writes continue past FileSize, so the alert is on the
+	// counter moving at all.
+	recordWALRollError(qw.metrics)
 	qw.rollBackoff = clampDuration(2*qw.rollBackoff, walRollBackoffMin, walRollBackoffMax)
 	qw.nextRollAttempt = now.Add(qw.rollBackoff)
 	qw.rollFailures++
@@ -4961,6 +4969,7 @@ func (qw *QueueWAL) reclaimUnlinkPass(newPaths []string) {
 	// gated.
 	if unlinkedAny && !qw.cfg.SyncDisabled {
 		if err := qw.policy(siteReclaimDir).dir(qw.dataDir); err != nil {
+			recordWALReclaimFsyncError(qw.metrics)
 			qw.logWarn("WAL directory fsync after reclaim failed; completed reclaim remains valid, but its directory mutations are not durable yet",
 				interfaces.LogField{Key: "dir", Value: qw.dataDir},
 				interfaces.LogField{Key: "error", Value: err.Error()})

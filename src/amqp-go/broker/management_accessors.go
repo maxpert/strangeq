@@ -45,6 +45,19 @@ func (b *StorageBroker) QueueMessageCounts(name string) QueueMessageCounts {
 // not yet settled). Lock-free; it takes no lock the gate itself uses.
 func (g *prefetchGate) InflightCount() int64 { return g.inflight.Load() }
 
+// InflightCount returns the total number of messages delivered but not yet
+// settled (ack/nack/reject) across every live queue. It is the broker-wide
+// aggregate behind amqp_messages_inflight (spec 06 §3.5). Lock-free: one atomic
+// load per QueueState, no broker lock, so a scrape never stalls a publisher.
+func (b *StorageBroker) InflightCount() int64 {
+	var total int64
+	b.queueStates.Range(func(_, value interface{}) bool {
+		total += value.(*QueueState).InflightCount()
+		return true
+	})
+	return total
+}
+
 // ConsumerView is the management view of one live consumer. ID is the
 // broker-internal identity (the activeConsumers key); it MUST NOT be
 // serialised. ChannelID/ConnectionID are the linkage values that were null

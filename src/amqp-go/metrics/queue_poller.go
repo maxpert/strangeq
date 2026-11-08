@@ -26,7 +26,12 @@ type QueueStat struct {
 	VHost      string
 	Ready      int
 	ReadyKnown bool
-	Consumers  int
+	// Unacked is the inflight (delivered, unsettled) depth and UnackedKnown its
+	// availability. Wired from the broker's QueueMessageCounts (spec 06 §3.5);
+	// when unknown, no unacked/total series is emitted.
+	Unacked      int
+	UnackedKnown bool
+	Consumers    int
 	// HighWater is the maximum queue depth (waiting + inflight) observed since
 	// the queue was created, when the provider exposes it (Task 2). Diagnostic
 	// only.
@@ -124,7 +129,7 @@ func (p *queuePoller) pollOnce(q QueueStatsProvider, alarms AlarmStateProvider) 
 		}
 		key := queueKey{name: stat.Name, vhost: vhost}
 		current[key] = struct{}{}
-		p.collector.UpdateQueueReadyAndConsumers(stat.Name, vhost, stat.Ready, stat.ReadyKnown, stat.Consumers)
+		p.collector.UpdateQueueReadyAndConsumers(stat.Name, vhost, stat.Ready, stat.ReadyKnown, stat.Unacked, stat.UnackedKnown, stat.Consumers)
 		if stat.HighWaterSet {
 			p.collector.QueueDepthHighWater.WithLabelValues(stat.Name, vhost).Set(float64(stat.HighWater))
 		}

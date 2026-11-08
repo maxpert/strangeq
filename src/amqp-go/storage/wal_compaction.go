@@ -88,6 +88,10 @@ func (qw *QueueWAL) tryCompactOldFiles() {
 
 	for _, num := range nums {
 		if err := qw.compactOldFile(num); err != nil {
+			// Counted, not just logged (spec 06 §3.3): a compaction failure
+			// leaves the file's bytes and index unchanged, but it is a
+			// durability-maintenance outage an operator must see.
+			recordWALCompactionError(qw.metrics)
 			qw.logError("WAL file compaction failed; the file keeps its bytes and its index unchanged",
 				interfaces.LogField{Key: "fileNum", Value: num},
 				interfaces.LogField{Key: "error", Value: err.Error()})
