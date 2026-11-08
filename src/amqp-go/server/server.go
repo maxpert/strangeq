@@ -181,7 +181,20 @@ type Server struct {
 	entityExchanges     int64
 	entityGeneration    uint64
 	entityObserverWired bool
+
+	// --- Management control plane (append-only; spec mgmt-01 §4) ---
+	//
+	// management is the optional control-plane HTTP surface. The builder stores
+	// it; the CALLER starts it after Build (exactly as telemetry does). Shutdown
+	// stops it before storage closes. nil when management is disabled, which is
+	// the default — no field is read on any AMQP path, so the disabled surface
+	// is zero-cost (SEC-001).
+	management ManagementSurface
 }
+
+// Management returns the attached control-plane surface, or nil when none was
+// configured. Read-only accessor for wiring and tests.
+func (s *Server) Management() ManagementSurface { return s.management }
 
 // PublisherParkStats returns (number of completed reader parks, total parked
 // seconds, number of parks currently in progress). Diagnostic only (Task 2).

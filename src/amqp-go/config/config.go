@@ -88,6 +88,48 @@ func DefaultConfig() *AMQPConfig {
 			Port:         9419,
 			PprofEnabled: false,
 		},
+		// Management (control plane) is OFF and loopback-only by default
+		// (SEC-001/002). Every value here is the documented default of
+		// spec mgmt-01 §2; the surface refuses to start on an unsafe
+		// combination rather than degrading silently (AUTH-040/041/SEC-111).
+		Management: interfaces.ManagementConfig{
+			Enabled:        false,
+			Address:        "127.0.0.1",
+			Port:           15672,
+			Authentication: ManagementAuthenticationInherit,
+			Session: interfaces.ManagementSessionConfig{
+				IdleTimeoutSeconds: 28800,
+				MaxSessions:        1024,
+			},
+			Limits: interfaces.ManagementLimitsConfig{
+				MaxPageSize:           500,
+				RequestTimeoutSeconds: 30,
+				MaxInFlight:           64,
+				MaxBodyBytes:          2 << 20,  // 2 MiB (SEC-065)
+				MaxImportBodyBytes:    32 << 20, // 32 MiB (FR-API-125)
+				MaxResponseBytes:      4 << 20,  // 4 MiB (FR-CONV-083)
+				MaxNameBytes:          256,      // SEC-085
+			},
+			RateLimits: interfaces.ManagementRateLimitsConfig{
+				Publish:                  0,
+				Get:                      0,
+				Purge:                    0,
+				Declare:                  0,
+				DefinitionsImportSeconds: 0,
+			},
+			Definitions: interfaces.ManagementDefinitionsConfig{
+				MaxQueues:    0,
+				MaxExchanges: 0,
+				MaxBindings:  0,
+			},
+			Async: interfaces.ManagementAsyncConfig{
+				MessageThreshold:    10000,
+				EntityThreshold:     1000,
+				MaxJobs:             128,
+				JobRetentionSeconds: 3600,
+			},
+			Get: interfaces.ManagementGetConfig{MaxCount: 100},
+		},
 		Server: interfaces.ServerConfig{
 			Name:                     "amqp-go-server",
 			Version:                  "0.1.0-dev",
@@ -186,6 +228,19 @@ type AMQPConfig struct {
 	Engine         interfaces.EngineConfig        `json:"engine"`
 	ResourceAlarms interfaces.ResourceAlarmConfig `json:"resource_alarms"`
 	Telemetry      interfaces.TelemetryConfig     `json:"telemetry"`
+	Management     interfaces.ManagementConfig    `json:"management"`
+}
+
+// Management authentication modes (spec mgmt-01 §5.1).
+const (
+	ManagementAuthenticationInherit = "inherit"
+	ManagementAuthenticationBasic   = "basic"
+	ManagementAuthenticationNone    = "none"
+)
+
+// GetManagement returns the management (control-plane) configuration.
+func (c *AMQPConfig) GetManagement() interfaces.ManagementConfig {
+	return c.Management
 }
 
 // GetNetwork returns network configuration
@@ -442,6 +497,13 @@ func (c *AMQPConfig) Validate() error {
 		}
 	}
 
+	// Management (control plane). Only validated when enabled: an explicitly
+	// disabled surface ignores bad management.* values rather than refusing to
+	// boot the broker (spec mgmt-01 §2 fail-closed note).
+	if err := c.validateManagement(); err != nil {
+		return err
+	}
+
 	// Log level. "" is accepted for zero-value Load callers (mapped to info);
 	// "silent" is accepted because benchmarks use it.
 	switch c.Server.LogLevel {
@@ -528,6 +590,41 @@ func (c *AMQPConfig) Load(source string) error {
 	}
 	if c.Engine.HotCacheGlobalBytes == 0 && !k.Exists("engine.hot_cache_global_bytes") {
 		c.Engine.HotCacheGlobalBytes = DefaultConfig().Engine.HotCacheGlobalBytes
+	}
+	// Management (control plane): a zero-value Load caller omits the whole
+	// section. Seed the documented defaults per sub-section so an operator who
+	// enables the surface with `management.enabled: true` alone still gets the
+	// safe limits rather than a validation failure on 0. An explicit
+	// management.port: 0 (or any sub-key) is left as given.
+	{
+		def := DefaultConfig().Management
+		if !k.Exists("management.session") {
+			c.Management.Session = def.Session
+		}
+		if !k.Exists("management.limits") {
+			c.Management.Limits = def.Limits
+		}
+		if !k.Exists("management.rate_limits") {
+			c.Management.RateLimits = def.RateLimits
+		}
+		if !k.Exists("management.definitions") {
+			c.Management.Definitions = def.Definitions
+		}
+		if !k.Exists("management.async") {
+			c.Management.Async = def.Async
+		}
+		if !k.Exists("management.get") {
+			c.Management.Get = def.Get
+		}
+		if c.Management.Port == 0 && !k.Exists("management.port") {
+			c.Management.Port = def.Port
+		}
+		if c.Management.Address == "" && !k.Exists("management.address") {
+			c.Management.Address = def.Address
+		}
+		if c.Management.Authentication == "" && !k.Exists("management.authentication") {
+			c.Management.Authentication = def.Authentication
+		}
 	}
 	return c.Validate()
 }
