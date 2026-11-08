@@ -50,7 +50,7 @@ func (g *prefetchGate) InflightCount() int64 { return g.inflight.Load() }
 // serialised. ChannelID/ConnectionID are the linkage values that were null
 // until BOB-8.
 type ConsumerView struct {
-	ID            string
+	ID            string `json:"-"` // broker-internal activeConsumers key (DATA-030: never serialised)
 	Tag           string // client-visible; NOT unique broker-wide
 	Queue         string
 	NoAck         bool

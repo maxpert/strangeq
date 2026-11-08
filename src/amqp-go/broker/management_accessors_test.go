@@ -1,6 +1,8 @@
 package broker
 
 import (
+	"encoding/json"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -262,8 +264,22 @@ func TestConsumerViews_IDNeverEqualsTagByAccident(t *testing.T) {
 	require.Equal(t, 2, byTag["shared"], "tag-keying would have collapsed them to one")
 }
 
-// --- BOB-11: broker-side EntityObserver -------------------------------------
+// TestConsumerView_IDNotSerialised pins DATA-030: the broker-internal consumer
+// identity is read by the management layer (to key same-tag consumers) but MUST
+// never reach the wire. A JSON marshal of the view omits ID entirely.
+func TestConsumerView_IDNotSerialised(t *testing.T) {
+	v := ConsumerView{ID: "internal-consumer-id", Tag: "client-tag", Queue: "q"}
+	data, err := json.Marshal(v)
+	require.NoError(t, err)
 
+	require.False(t, strings.Contains(string(data), "internal-consumer-id"),
+		"ConsumerView.ID must never be serialised (DATA-030)")
+	require.False(t, strings.Contains(string(data), `"ID"`),
+		"ConsumerView.ID must carry json:\"-\"")
+	require.Contains(t, string(data), `"Tag"`, "the client-visible tag must still serialise")
+}
+
+// --- BOB-11: broker-side EntityObserver -------------------------------------
 type entityEvent struct {
 	kind  string
 	delta int64
