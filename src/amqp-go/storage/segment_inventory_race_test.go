@@ -1,6 +1,7 @@
 package storage
 
 import (
+	"errors"
 	"math"
 	"os"
 	"runtime"
@@ -120,14 +121,22 @@ func TestSegmentInventory_BlocksRace(t *testing.T) {
 		// the flag is raised just before PurgeQueue takes the read lock, so
 		// the flag alone is not enough - it must still be raised one settle
 		// interval later, which proves the read lock was taken and is still
-		// held.
+		// held. Bounded: a purger that never reaches the lock must fail the
+		// commit (and therefore the test) instead of spinning forever.
+		settleDeadline := time.Now().Add(30 * time.Second)
 		for {
 			for !purgeInside.Load() {
+				if time.Now().After(settleDeadline) {
+					return errors.New("purger never entered its read-locked section")
+				}
 				runtime.Gosched()
 			}
 			time.Sleep(50 * time.Microsecond)
 			if purgeInside.Load() {
 				break
+			}
+			if time.Now().After(settleDeadline) {
+				return errors.New("purger never held its read-locked section for a settle interval")
 			}
 		}
 		return nil

@@ -171,8 +171,10 @@ func TestDeadPeerReaped(t *testing.T) {
 
 func TestConnectionTouchActivity(t *testing.T) {
 	conn, _ := newPipeConnWithFrames(t)
+	// Pin a known, ancient timestamp so TouchActivity's update is observable
+	// without a sleep: after must be strictly later than this baseline.
+	conn.LastActivity.Store(1)
 	before := conn.GetLastActivity()
-	time.Sleep(10 * time.Millisecond)
 	conn.TouchActivity()
 	after := conn.GetLastActivity()
 	assert.True(t, after.After(before), "TouchActivity should update LastActivity")

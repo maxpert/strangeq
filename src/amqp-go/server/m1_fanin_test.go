@@ -2,14 +2,30 @@ package server
 
 import (
 	"net"
-	"runtime"
 	"testing"
 	"time"
 
 	"github.com/maxpert/amqp-go/config"
 	"github.com/maxpert/amqp-go/protocol"
+	"github.com/stretchr/testify/require"
 	"go.uber.org/zap"
 )
+
+// delivery builds a minimal delivery for a consumer's message channel.
+func fanInDelivery(consumerID, body string, tag uint64) *protocol.Delivery {
+	return &protocol.Delivery{
+		Message: &protocol.Message{
+			DeliveryTag: tag,
+			Body:        []byte(body),
+			Exchange:    "",
+			RoutingKey:  "queue-" + consumerID,
+		},
+		DeliveryTag: tag,
+		ConsumerID:  consumerID,
+		Exchange:    "",
+		RoutingKey:  "queue-" + consumerID,
+	}
+}
 
 // TestM1_FanInMultipleConsumers verifies that the fan-in channel correctly
 // forwards messages from multiple consumers to the delivery loop, which then
@@ -50,57 +66,21 @@ func TestM1_FanInMultipleConsumers(t *testing.T) {
 	ch.Mutex.Unlock()
 	conn.Channels.Store(uint16(1), ch)
 
-	// Start a background reader to drain the pipe and count frames
-	frameCount := 0
-	readerDone := make(chan struct{})
-	go func() {
-		defer close(readerDone)
-		buf := make([]byte, 4096)
-		for {
-			if _, err := clientConn.Read(buf); err != nil {
-				return
-			}
-			frameCount++
-		}
-	}()
+	// Record every byte the client receives so delivery is observed by EVENT,
+	// not by sleeping a fixed window that races the loop under load.
+	rr, readerDone := newRecordingReader(clientConn)
 
 	// Start the delivery loop
 	done := make(chan struct{})
 	conn.ConsumersDirty.Store(true)
 	go func() { srv.consumerDeliveryLoop(srv.runtimeFor(conn)); close(done) }()
 
-	// Give the loop time to discover consumers
-	time.Sleep(100 * time.Millisecond)
-
-	// Send a message to each consumer
-	ch.Consumers["consumer-a"].Messages <- &protocol.Delivery{
-		Message: &protocol.Message{
-			DeliveryTag: 1,
-			Body:        []byte("msg-a"),
-			Exchange:    "",
-			RoutingKey:  "queue-a",
-		},
-		DeliveryTag: 1,
-		ConsumerID:  "consumer-a",
-		Exchange:    "",
-		RoutingKey:  "queue-a",
-	}
-
-	ch.Consumers["consumer-b"].Messages <- &protocol.Delivery{
-		Message: &protocol.Message{
-			DeliveryTag: 2,
-			Body:        []byte("msg-b"),
-			Exchange:    "",
-			RoutingKey:  "queue-b",
-		},
-		DeliveryTag: 2,
-		ConsumerID:  "consumer-b",
-		Exchange:    "",
-		RoutingKey:  "queue-b",
-	}
-
-	// Wait for frames to be sent
-	time.Sleep(200 * time.Millisecond)
+	// Send a message to each consumer. The loop discovers consumers and starts
+	// forwarders on its own; wait for both bodies on the wire.
+	ch.Consumers["consumer-a"].Messages <- fanInDelivery("consumer-a", "msg-a", 1)
+	ch.Consumers["consumer-b"].Messages <- fanInDelivery("consumer-b", "msg-b", 2)
+	require.Eventually(t, func() bool { return rr.received("msg-a") && rr.received("msg-b") },
+		5*time.Second, time.Millisecond, "both consumers' messages must reach the wire")
 
 	// Close the connection to stop the loop
 	conn.Closed.Store(true)
@@ -115,11 +95,6 @@ func TestM1_FanInMultipleConsumers(t *testing.T) {
 	// Stop the reader
 	serverConn.Close()
 	<-readerDone
-
-	// Verify that frames were sent (at least 2 deliveries worth of frames)
-	if frameCount < 2 {
-		t.Errorf("expected at least 2 frame reads, got %d", frameCount)
-	}
 }
 
 // TestM1_FanInNoGoroutineLeak verifies that forwarding goroutines are cleaned
@@ -154,18 +129,21 @@ func TestM1_FanInNoGoroutineLeak(t *testing.T) {
 	ch.Mutex.Unlock()
 	conn.Channels.Store(uint16(1), ch)
 
-	// Record goroutine count before starting the loop
-	beforeGoroutines := runtime.NumGoroutine()
+	// rt tracks every per-connection goroutine (forwarders included) on
+	// liveGoroutines, so the leak check can wait for an exact count instead of a
+	// noisy runtime.NumGoroutine() delta after a sleep.
+	rt := srv.runtimeFor(conn)
 
 	// Start the delivery loop
 	done := make(chan struct{})
 	conn.ConsumersDirty.Store(true)
-	go func() { srv.consumerDeliveryLoop(srv.runtimeFor(conn)); close(done) }()
+	go func() { srv.consumerDeliveryLoop(rt); close(done) }()
 
-	// Give the loop time to discover consumers and start forwarders
-	time.Sleep(100 * time.Millisecond)
+	// The loop must start exactly one forwarder goroutine per consumer.
+	require.Eventually(t, func() bool { return rt.liveGoroutines.Load() == 3 },
+		5*time.Second, time.Millisecond, "the loop must start one forwarder per consumer")
 
-	// Close the connection to stop the loop
+	// Close the connection to stop the loop and its forwarders.
 	conn.Closed.Store(true)
 
 	select {
@@ -175,17 +153,9 @@ func TestM1_FanInNoGoroutineLeak(t *testing.T) {
 		t.Fatal("consumerDeliveryLoop did not exit within 2s")
 	}
 
-	// Give forwarding goroutines time to fully exit
-	time.Sleep(100 * time.Millisecond)
-
-	// Check goroutine count — should return to approximately the same as before
-	// (allow some slack for runtime/goroutine scheduling variance)
-	afterGoroutines := runtime.NumGoroutine()
-	leaked := afterGoroutines - beforeGoroutines
-	if leaked > 1 {
-		t.Errorf("goroutine leak: before=%d, after=%d, leaked=%d (expected ≤1)",
-			beforeGoroutines, afterGoroutines, leaked)
-	}
+	// Every forwarding goroutine must have exited.
+	require.Eventually(t, func() bool { return rt.liveGoroutines.Load() == 0 },
+		2*time.Second, time.Millisecond, "forwarding goroutines leaked after the loop exited")
 }
 
 // TestM1_FanInConsumerRemoval verifies that when a consumer is removed
@@ -205,17 +175,7 @@ func TestM1_FanInConsumerRemoval(t *testing.T) {
 		MetricsCollector: &NoOpMetricsCollector{},
 	}
 
-	// Background reader to drain the pipe (net.Pipe is synchronous)
-	readerDone := make(chan struct{})
-	go func() {
-		defer close(readerDone)
-		buf := make([]byte, 4096)
-		for {
-			if _, err := clientConn.Read(buf); err != nil {
-				return
-			}
-		}
-	}()
+	rr, readerDone := newRecordingReader(clientConn)
 
 	// Create a channel with one consumer
 	ch := protocol.NewChannel(1, conn)
@@ -231,25 +191,29 @@ func TestM1_FanInConsumerRemoval(t *testing.T) {
 	ch.Mutex.Unlock()
 	conn.Channels.Store(uint16(1), ch)
 
-	beforeGoroutines := runtime.NumGoroutine()
-
+	rt := srv.runtimeFor(conn)
 	done := make(chan struct{})
 	conn.ConsumersDirty.Store(true)
-	go func() { srv.consumerDeliveryLoop(srv.runtimeFor(conn)); close(done) }()
+	go func() { srv.consumerDeliveryLoop(rt); close(done) }()
 
-	// Give the loop time to discover the consumer and start a forwarder
-	time.Sleep(100 * time.Millisecond)
+	// Discover and route the first consumer.
+	ch.Consumers["consumer-x"].Messages <- fanInDelivery("consumer-x", "x-before", 1)
+	require.Eventually(t, func() bool { return rr.received("x-before") },
+		5*time.Second, time.Millisecond, "the initial consumer's delivery must reach the wire")
+	require.Eventually(t, func() bool { return rt.liveGoroutines.Load() == 1 },
+		5*time.Second, time.Millisecond, "exactly one forwarder must be running")
 
-	// Remove the consumer (simulates basic.cancel)
+	// Remove the consumer (simulates basic.cancel) and set the dirty flag.
 	ch.Mutex.Lock()
 	delete(ch.Consumers, "consumer-x")
 	ch.Mutex.Unlock()
 	conn.ConsumersDirty.Store(true)
 
-	// Give the loop time to detect removal and stop the forwarder
-	time.Sleep(100 * time.Millisecond)
+	// The loop must stop the now-stale forwarder.
+	require.Eventually(t, func() bool { return rt.liveGoroutines.Load() == 0 },
+		5*time.Second, time.Millisecond, "the removed consumer's forwarder must stop")
 
-	// Re-add a consumer with the same tag (simulates new basic.consume)
+	// Re-add a consumer with the same tag (simulates new basic.consume).
 	ch.Mutex.Lock()
 	ch.Consumers["consumer-x"] = &protocol.Consumer{
 		ID:       "consumer-x",
@@ -261,29 +225,15 @@ func TestM1_FanInConsumerRemoval(t *testing.T) {
 	ch.Mutex.Unlock()
 	conn.ConsumersDirty.Store(true)
 
-	// Give the loop time to discover the new consumer
-	time.Sleep(100 * time.Millisecond)
+	// The reused tag must route through the NEW forwarder: a message to the new
+	// consumer is delivered (a stale forwarder would have dropped it).
+	ch.Consumers["consumer-x"].Messages <- fanInDelivery("consumer-x", "x-after", 2)
+	require.Eventually(t, func() bool { return rr.received("x-after") },
+		5*time.Second, time.Millisecond, "the re-added consumer's delivery must reach the wire")
 
-	// Send a message to the new consumer — should be delivered
-	ch.Consumers["consumer-x"].Messages <- &protocol.Delivery{
-		Message: &protocol.Message{
-			DeliveryTag: 1,
-			Body:        []byte("reused-tag"),
-			Exchange:    "",
-			RoutingKey:  "queue-x",
-		},
-		DeliveryTag: 1,
-		ConsumerID:  "consumer-x",
-		Exchange:    "",
-		RoutingKey:  "queue-x",
-	}
-
-	// Give time for delivery
-	time.Sleep(200 * time.Millisecond)
-
-	// Close connection
+	// Close connection and stop the loop.
 	conn.Closed.Store(true)
-	clientConn.Close() // unblock the reader so pipe writes fail
+	clientConn.Close()
 
 	select {
 	case <-done:
@@ -291,14 +241,9 @@ func TestM1_FanInConsumerRemoval(t *testing.T) {
 		t.Fatal("consumerDeliveryLoop did not exit within 2s")
 	}
 
+	require.Eventually(t, func() bool { return rt.liveGoroutines.Load() == 0 },
+		2*time.Second, time.Millisecond, "forwarding goroutine leaked after removal + reuse")
 	<-readerDone
-	time.Sleep(100 * time.Millisecond)
-	afterGoroutines := runtime.NumGoroutine()
-	leaked := afterGoroutines - beforeGoroutines
-	if leaked > 1 {
-		t.Errorf("goroutine leak after consumer removal + reuse: before=%d, after=%d, leaked=%d",
-			beforeGoroutines, afterGoroutines, leaked)
-	}
 }
 
 // TestM1_FanInNoReflectImport verifies that the consumer_delivery.go file

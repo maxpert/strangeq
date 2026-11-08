@@ -1,15 +1,52 @@
 package server
 
 import (
+	"bytes"
 	"net"
-	"sync/atomic"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/maxpert/amqp-go/config"
 	"github.com/maxpert/amqp-go/protocol"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	"go.uber.org/zap"
 )
+
+// recordingReader drains a client connection and records every byte received,
+// so a test can WAIT for a specific message body to reach the wire instead of
+// sleeping a fixed window (which races the delivery loop under load).
+type recordingReader struct {
+	mu  sync.Mutex
+	buf []byte
+}
+
+func newRecordingReader(clientConn net.Conn) (*recordingReader, <-chan struct{}) {
+	rr := &recordingReader{}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		b := make([]byte, 4096)
+		for {
+			n, err := clientConn.Read(b)
+			if err != nil {
+				return
+			}
+			rr.mu.Lock()
+			rr.buf = append(rr.buf, b[:n]...)
+			rr.mu.Unlock()
+		}
+	}()
+	return rr, done
+}
+
+// received reports whether the given literal has appeared on the wire so far.
+func (rr *recordingReader) received(sub string) bool {
+	rr.mu.Lock()
+	defer rr.mu.Unlock()
+	return bytes.Contains(rr.buf, []byte(sub))
+}
 
 // TestA7_DirtyFlagGatesRediscovery verifies that the delivery loop skips
 // consumer discovery when ConsumersDirty is false, and re-scans when true.
@@ -28,19 +65,7 @@ func TestA7_DirtyFlagGatesRediscovery(t *testing.T) {
 		MetricsCollector: &NoOpMetricsCollector{},
 	}
 
-	var readBytes int64
-	readerDone := make(chan struct{})
-	go func() {
-		defer close(readerDone)
-		buf := make([]byte, 4096)
-		for {
-			n, err := clientConn.Read(buf)
-			if err != nil {
-				return
-			}
-			atomic.AddInt64(&readBytes, int64(n))
-		}
-	}()
+	rr, readerDone := newRecordingReader(clientConn)
 
 	ch := protocol.NewChannel(1, conn)
 	ch.Mutex.Lock()
@@ -60,13 +85,49 @@ func TestA7_DirtyFlagGatesRediscovery(t *testing.T) {
 	go func() { srv.consumerDeliveryLoop(srv.runtimeFor(conn)); close(done) }()
 	defer func() {
 		conn.Closed.Store(true)
-		<-done
+		// The loop's blocking select watches fan-in, not conn.Closed, so poke it
+		// with a c1 delivery to make the next iteration observe the close and
+		// exit — avoids waiting out the 10s select timeout at teardown.
+		wake := &protocol.Delivery{
+			Message:    &protocol.Message{DeliveryTag: 9, Body: []byte("teardown-wake"), RoutingKey: "q1"},
+			ConsumerID: "c1",
+			Exchange:   "",
+			RoutingKey: "q1",
+		}
+		select {
+		case ch.Consumers["c1"].Messages <- wake:
+		case <-time.After(time.Second):
+		}
+		select {
+		case <-done:
+		case <-time.After(3 * time.Second):
+			t.Error("delivery loop did not exit on teardown")
+		}
 		clientConn.Close()
 		<-readerDone
 	}()
 
-	time.Sleep(100 * time.Millisecond)
+	// Deterministic synchronization point: the loop clears ConsumersDirty when
+	// it scans, and the 10s select timeout means the flag is not self-set again
+	// within this test. Waiting on the cleared flag — not a 100ms sleep — is what
+	// guarantees c1 was discovered BEFORE c2 is registered. If c2 were added
+	// before the first scan it would be discovered too (the CI flake).
+	require.Eventually(t, func() bool { return !conn.ConsumersDirty.Load() },
+		5*time.Second, time.Millisecond, "delivery loop must complete its initial discovery")
 
+	// Prove the loop is live and routing: a c1 body reaches the wire.
+	ch.Consumers["c1"].Messages <- &protocol.Delivery{
+		Message:     &protocol.Message{DeliveryTag: 1, Body: []byte("c1-warm"), Exchange: "", RoutingKey: "q1"},
+		DeliveryTag: 1,
+		ConsumerID:  "c1",
+		Exchange:    "",
+		RoutingKey:  "q1",
+	}
+	require.Eventually(t, func() bool { return rr.received("c1-warm") },
+		5*time.Second, time.Millisecond, "the discovered consumer's delivery must reach the wire")
+
+	// c2 is registered while the dirty flag is CLEAR: the gated loop must not
+	// rediscover it, so its message can never be forwarded.
 	ch.Mutex.Lock()
 	ch.Consumers["c2"] = &protocol.Consumer{
 		ID:       "c2",
@@ -78,33 +139,32 @@ func TestA7_DirtyFlagGatesRediscovery(t *testing.T) {
 	ch.Mutex.Unlock()
 
 	ch.Consumers["c2"].Messages <- &protocol.Delivery{
-		Message:     &protocol.Message{DeliveryTag: 1, Body: []byte("c2-msg"), Exchange: "", RoutingKey: "q2"},
-		DeliveryTag: 1,
+		Message:     &protocol.Message{DeliveryTag: 2, Body: []byte("c2-must-not-flow"), Exchange: "", RoutingKey: "q2"},
+		DeliveryTag: 2,
 		ConsumerID:  "c2",
 		Exchange:    "",
 		RoutingKey:  "q2",
 	}
 
-	time.Sleep(200 * time.Millisecond)
-	phase1 := atomic.LoadInt64(&readBytes)
-	if phase1 > 0 {
-		t.Errorf("expected no delivery when dirty=false, got %d bytes", phase1)
-	}
+	// No forwarder exists for c2, so this is a deterministic check (not a window):
+	// had the loop rediscovered, c2's body would already be on the wire.
+	assert.False(t, rr.received("c2-must-not-flow"),
+		"a consumer registered while the dirty flag is clear must not be discovered")
 
+	// Setting the flag makes the loop rescan and route c2. The loop only checks
+	// the flag after its blocking select returns, so a c1 delivery (already
+	// discovered) wakes it: the next iteration re-scans, discovers c2, and its
+	// stranded message is delivered.
 	conn.ConsumersDirty.Store(true)
 	ch.Consumers["c1"].Messages <- &protocol.Delivery{
-		Message:     &protocol.Message{DeliveryTag: 2, Body: []byte("c1-trigger"), Exchange: "", RoutingKey: "q1"},
-		DeliveryTag: 2,
+		Message:     &protocol.Message{DeliveryTag: 3, Body: []byte("c1-wake"), Exchange: "", RoutingKey: "q1"},
+		DeliveryTag: 3,
 		ConsumerID:  "c1",
 		Exchange:    "",
 		RoutingKey:  "q1",
 	}
-
-	time.Sleep(300 * time.Millisecond)
-	phase2 := atomic.LoadInt64(&readBytes)
-	if phase2 <= 0 {
-		t.Errorf("expected delivery when dirty=true, got 0 bytes")
-	}
+	require.Eventually(t, func() bool { return rr.received("c2-must-not-flow") },
+		5*time.Second, time.Millisecond, "setting the dirty flag must rediscover c2 and deliver its message")
 }
 
 // TestA7_RegisterConsumerSetsDirtyFlag verifies that handleBasicConsume sets
@@ -174,19 +234,7 @@ func TestA7_TimeoutFallbackSelfHeals(t *testing.T) {
 		MetricsCollector: &NoOpMetricsCollector{},
 	}
 
-	var readBytes int64
-	readerDone := make(chan struct{})
-	go func() {
-		defer close(readerDone)
-		buf := make([]byte, 4096)
-		for {
-			n, err := clientConn.Read(buf)
-			if err != nil {
-				return
-			}
-			atomic.AddInt64(&readBytes, int64(n))
-		}
-	}()
+	rr, readerDone := newRecordingReader(clientConn)
 
 	ch := protocol.NewChannel(1, conn)
 	ch.Mutex.Lock()
@@ -206,13 +254,31 @@ func TestA7_TimeoutFallbackSelfHeals(t *testing.T) {
 	go func() { srv.consumerDeliveryLoop(srv.runtimeFor(conn)); close(done) }()
 	defer func() {
 		conn.Closed.Store(true)
-		<-done
+		select {
+		case <-done:
+		case <-time.After(3 * time.Second):
+			t.Error("delivery loop did not exit on teardown")
+		}
 		clientConn.Close()
 		<-readerDone
 	}()
 
-	time.Sleep(100 * time.Millisecond)
+	// Wait for the loop to be live and routing c1 (its initial scan). With the
+	// select timeout at 5ms, waiting on the dirty flag would race the self-set;
+	// waiting on an actual c1 delivery is a real synchronization point.
+	ch.Consumers["c1"].Messages <- &protocol.Delivery{
+		Message:     &protocol.Message{DeliveryTag: 1, Body: []byte("c1-warm"), Exchange: "", RoutingKey: "q1"},
+		DeliveryTag: 1,
+		ConsumerID:  "c1",
+		Exchange:    "",
+		RoutingKey:  "q1",
+	}
+	require.Eventually(t, func() bool { return rr.received("c1-warm") },
+		5*time.Second, time.Millisecond, "the delivery loop must be live and routing c1")
 
+	// c2 is registered with the dirty flag NOT set by the test: only the
+	// periodic select-timeout fallback can rediscover it. Wait for the actual
+	// delivery instead of a fixed 300ms window.
 	ch.Mutex.Lock()
 	ch.Consumers["c2"] = &protocol.Consumer{
 		ID:       "c2",
@@ -224,18 +290,15 @@ func TestA7_TimeoutFallbackSelfHeals(t *testing.T) {
 	ch.Mutex.Unlock()
 
 	ch.Consumers["c2"].Messages <- &protocol.Delivery{
-		Message:     &protocol.Message{DeliveryTag: 1, Body: []byte("c2-msg"), Exchange: "", RoutingKey: "q2"},
-		DeliveryTag: 1,
+		Message:     &protocol.Message{DeliveryTag: 2, Body: []byte("c2-timeout-fallback"), Exchange: "", RoutingKey: "q2"},
+		DeliveryTag: 2,
 		ConsumerID:  "c2",
 		Exchange:    "",
 		RoutingKey:  "q2",
 	}
 
-	time.Sleep(300 * time.Millisecond)
-	phase := atomic.LoadInt64(&readBytes)
-	if phase <= 0 {
-		t.Errorf("expected delivery via timeout fallback, got 0 bytes")
-	}
+	require.Eventually(t, func() bool { return rr.received("c2-timeout-fallback") },
+		5*time.Second, time.Millisecond, "the timeout fallback must rediscover c2 and deliver its message")
 }
 
 // TestA7_NoAllocationsInSteadyState verifies that discoverConsumers does not

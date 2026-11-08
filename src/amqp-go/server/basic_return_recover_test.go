@@ -3,6 +3,7 @@ package server
 import (
 	"bytes"
 	"encoding/binary"
+	"io"
 	"net"
 	"testing"
 	"time"
@@ -706,6 +707,11 @@ func TestHandleBasicRecoverNoChannel(t *testing.T) {
 	defer serverConn.Close()
 
 	conn := protocol.NewConnection(serverConn)
+
+	// Drain the connection-error write: the handler writes connection.close to
+	// the synchronous pipe, and with no reader it blocks until the 30s write
+	// deadline (the test would otherwise always take 30s).
+	go func() { _, _ = io.Copy(io.Discard, clientConn) }()
 
 	recoverMethod := &protocol.BasicRecoverMethod{Requeue: false}
 	payload, err := recoverMethod.Serialize()
