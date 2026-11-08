@@ -98,6 +98,13 @@ func TestManagementJobsGauge_TracksQueueLifecycle(t *testing.T) {
 
 	started := make(chan struct{})
 	release := make(chan struct{})
+	var releaseOnce sync.Once
+	unblock := func() { releaseOnce.Do(func() { close(release) }) }
+	// A failing assertion must not leave the single worker blocked in j1.fn:
+	// pool.close (registered first) waits for the workers, so this cleanup
+	// (registered last, runs first) must release them.
+	t.Cleanup(unblock)
+
 	if _, err := pool.submit("purge", "alice", nil, func() (any, error) {
 		close(started)
 		<-release
@@ -123,7 +130,7 @@ func TestManagementJobsGauge_TracksQueueLifecycle(t *testing.T) {
 		t.Fatalf("amqp_management_jobs{state=running} = %v, want 1", got)
 	}
 
-	close(release)
+	unblock()
 	deadline := time.Now().Add(3 * time.Second)
 	for {
 		if st, _ := pool.stateOf(j2.id, "alice"); st == jobDone || st == jobFailed {
