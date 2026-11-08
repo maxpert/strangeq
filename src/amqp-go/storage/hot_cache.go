@@ -86,6 +86,16 @@ type hotCache struct {
 	queueBytes  int64
 	globalBytes int64
 
+	// exemptPendingDurable enables the BARRIER-MODE PACING EXEMPTION: while it
+	// is set, the per-queue budget does not charge the bytes of entries that
+	// were admitted NOT-YET-DURABLE (their covering fence has not returned), up
+	// to a per-queue cap of queueBytes/8. It is set at construction from the
+	// WAL config: true iff the WAL barrier is ON and crash_model is NOT
+	// force_flush. With storage.fsync disabled there is no barrier at all and
+	// with force_flush the pace gate is not wired, so in both the exemption is
+	// OFF and the charging is byte-identical to before.
+	exemptPendingDurable bool
+
 	// seq hands out the recency stamps that order the queues against EACH
 	// OTHER. Every access to an entry stamps it with the next value, so the
 	// stamps are totally ordered and comparable across queues. The
@@ -158,6 +168,15 @@ type hotCacheQueue struct {
 	// per-queue accounting and it is guarded by mu.
 	used int64
 
+	// pendingDurable is the sum of the charges of this queue's entries that
+	// were admitted NOT-YET-DURABLE (see hotCacheEntry.pendingDurable) and have
+	// not yet been marked durable. It is an atomic because MarkDurableEntry --
+	// which runs on the WAL committer goroutine -- decrements it WITHOUT taking
+	// this queue's lock, and the pace gate reads it without taking the lock
+	// either. It is only ever incremented when the cache has
+	// exemptPendingDurable set.
+	pendingDurable atomic.Int64
+
 	// admissionEpoch is this queue's ADMISSION EPOCH: the counter that says
 	// "the set of messages this queue's hot cache may admit has not changed
 	// since the reader captured it".
@@ -202,6 +221,11 @@ type hotCacheQueue struct {
 // hotCacheEntry is one admitted message.
 type hotCacheEntry struct {
 	queue string
+	// q is the queue this entry was admitted into. It is what lets the
+	// lock-free durability point (MarkDurableEntry, on the WAL committer
+	// goroutine) decrement the queue's pendingDurable counter without taking the
+	// queue's lock. It is set once, at admission, and never changes.
+	q *hotCacheQueue
 	// tag is the entry's OWNED identity: the delivery tag the entry was
 	// admitted under. The cache hands out the live message pointer, so a
 	// caller can mutate message.DeliveryTag after admission; every identity
@@ -247,6 +271,16 @@ type hotCacheEntry struct {
 	// lastUsed is the recency stamp of the entry's last access. It orders
 	// the queues against each other for the cross-queue eviction.
 	lastUsed uint64
+
+	// pendingDurable is true while this entry is counted in its queue's
+	// pendingDurable byte total (i.e. it was admitted NOT-YET-DURABLE and has
+	// not yet been marked durable or removed). It is an atomic because the
+	// clearance happens both under the queue's lock (an upgrade, a removal) and
+	// WITHOUT it (MarkDurableEntry), and it is the CAS guard that makes the
+	// subtraction happen EXACTLY ONCE per admitted-and-counted entry: an
+	// eviction and a late durability mark can race, and only the winner clears
+	// the flag and subtracts.
+	pendingDurable atomic.Bool
 }
 
 // hotCacheRangeEntry pairs a message with the tag it was admitted under so
@@ -256,11 +290,21 @@ type hotCacheRangeEntry struct {
 	message *protocol.Message
 }
 
+// newHotCache builds a hot cache with the pacing exemption OFF. It is the
+// constructor the unit tests use; the engine path uses
+// newHotCacheWithExemption, which selects the exemption from the WAL config.
 func newHotCache(queueBytes, globalBytes int64) *hotCache {
+	return newHotCacheWithExemption(queueBytes, globalBytes, false)
+}
+
+// newHotCacheWithExemption builds a hot cache and selects whether the pace
+// budget exempts NOT-YET-DURABLE bodies (see hotCache.exemptPendingDurable).
+func newHotCacheWithExemption(queueBytes, globalBytes int64, exemptPendingDurable bool) *hotCache {
 	return &hotCache{
-		queueBytes:  queueBytes,
-		globalBytes: globalBytes,
-		queueUsed:   make(map[string]int64),
+		queueBytes:           queueBytes,
+		globalBytes:          globalBytes,
+		exemptPendingDurable: exemptPendingDurable,
+		queueUsed:            make(map[string]int64),
 	}
 }
 
@@ -306,6 +350,72 @@ func (c *hotCache) residentBytes(queue string) int64 {
 	return used
 }
 
+// pendingDurableExemptLocked is the number of bytes the pacing/admission budget
+// exempts for this queue: min(pendingDurable, queueBytes/8), or 0 when the
+// exemption is disabled. The CAP is what bounds the extra resident memory the
+// exemption can create (at most queueBytes/8 over the budget) and what bounds
+// the hot cache's exposure to bytes whose barrier has not returned.
+//
+// Caller holds the queue's lock (it reads only atomics, but the callers that
+// use it for the admission decision already hold it).
+func (c *hotCache) pendingDurableExemptLocked(q *hotCacheQueue) int64 {
+	if !c.exemptPendingDurable {
+		return 0
+	}
+	p := q.pendingDurable.Load()
+	if p <= 0 {
+		return 0
+	}
+	if capBytes := c.queueBytes / 8; p > capBytes {
+		p = capBytes
+	}
+	return p
+}
+
+// paceEffectiveResident is the resident byte count the PACE GATE (not the
+// accounting) sees for a queue: the raw resident bytes minus the exempt
+// not-yet-durable bytes, capped at queueBytes/8. With the exemption disabled it
+// is exactly residentBytes.
+//
+// It reads the mirror and the atomic pendingDurable WITHOUT taking the queue's
+// lock, because the gate runs on the publisher's reader path; a momentarily
+// stale pair can only move the gate by one admission, which the gate re-reads
+// on the next call.
+func (c *hotCache) paceEffectiveResident(queue string) int64 {
+	used := c.residentBytes(queue)
+	if !c.exemptPendingDurable {
+		return used
+	}
+	q := c.queueStateIfPresent(queue)
+	if q == nil {
+		return used
+	}
+	p := q.pendingDurable.Load()
+	if p <= 0 {
+		return used
+	}
+	if capBytes := c.queueBytes / 8; p > capBytes {
+		p = capBytes
+	}
+	if used -= p; used < 0 {
+		used = 0
+	}
+	return used
+}
+
+// entryBecameDurableLocked clears an entry's pending-durable accounting when it
+// is upgraded under the queue's lock. Caller holds the queue's lock.
+func (c *hotCache) entryBecameDurableLocked(entry *hotCacheEntry) {
+	if !c.exemptPendingDurable {
+		return
+	}
+	if entry.pendingDurable.CompareAndSwap(true, false) {
+		if q := entry.q; q != nil {
+			q.pendingDurable.Add(-entry.charge)
+		}
+	}
+}
+
 // hotCacheByteGate reports whether a queue's hot cache would REFUSE to admit a
 // message of a fixed byte charge — i.e. the queue's resident bytes plus the
 // charge exceed the per-queue budget.
@@ -333,7 +443,7 @@ func (g *hotCacheByteGate) AtHighWaterMark() bool {
 	if g == nil {
 		return false
 	}
-	return g.c.residentBytes(g.queue)+g.charge > g.c.queueBytes
+	return g.c.paceEffectiveResident(g.queue)+g.charge > g.c.queueBytes
 }
 
 // captureAdmission captures the queue's ADMISSION EPOCH and its state.
@@ -418,6 +528,7 @@ func (c *hotCache) Put(queue string, m *protocol.Message, backed bool) bool {
 			// already fsynced in the WAL or a transient message that lives
 			// only in RAM. Either way it may be served.
 			entry.durable.Store(true)
+			c.entryBecameDurableLocked(entry)
 			c.touchLocked(q, entry)
 			q.mu.Unlock()
 			return true
@@ -425,6 +536,7 @@ func (c *hotCache) Put(queue string, m *protocol.Message, backed bool) bool {
 		if entry, ok := q.entries[m.DeliveryTag]; ok {
 			entry.backed = entry.backed || backed
 			entry.durable.Store(true)
+			c.entryBecameDurableLocked(entry)
 			c.touchLocked(q, entry)
 			q.mu.Unlock()
 			return true
@@ -447,7 +559,14 @@ func (c *hotCache) Put(queue string, m *protocol.Message, backed bool) bool {
 		// room for this queue's admission is a cross-queue starvation bug
 		// (the evicted queue's FIFO consumer then has to take a cold read
 		// for its next target).
-		for q.used+charge > c.queueBytes {
+		//
+		// THE BARRIER-MODE EXEMPTION applies here too, on the same terms as
+		// the non-evicting admission: the deliverable set is what owns the
+		// budget, so a queue that is over budget only because of its
+		// not-yet-durable bytes does not evict DELIVERABLE entries to make
+		// room. With the exemption off the condition is q.used+charge, exactly
+		// as before.
+		for q.used-c.pendingDurableExemptLocked(q)+charge > c.queueBytes {
 			if !q.evictOldestBackedLocked() {
 				c.noteQueueUsed(queue, q.used)
 				q.mu.Unlock()
@@ -477,6 +596,7 @@ func (c *hotCache) Put(queue string, m *protocol.Message, backed bool) bool {
 
 		entry := &hotCacheEntry{
 			queue:   queue,
+			q:       q,
 			tag:     m.DeliveryTag,
 			message: m,
 			charge:  charge,
@@ -585,6 +705,7 @@ func (c *hotCache) putBestEffortLocked(q *hotCacheQueue, queue string, m *protoc
 		entry.backed = entry.backed || backed
 		if durable {
 			entry.durable.Store(true)
+			c.entryBecameDurableLocked(entry)
 		}
 		c.touchLocked(q, entry)
 		return entry
@@ -593,6 +714,7 @@ func (c *hotCache) putBestEffortLocked(q *hotCacheQueue, queue string, m *protoc
 		entry.backed = entry.backed || backed
 		if durable {
 			entry.durable.Store(true)
+			c.entryBecameDurableLocked(entry)
 		}
 		c.touchLocked(q, entry)
 		return entry
@@ -603,7 +725,13 @@ func (c *hotCache) putBestEffortLocked(q *hotCacheQueue, queue string, m *protoc
 	}
 	// NO ROOM, NO ADMISSION: the queue's budget is full and this admission
 	// does not evict.
-	if q.used+charge > c.queueBytes {
+	//
+	// THE BARRIER-MODE EXEMPTION: with the exemption enabled the budget exempts
+	// up to queueBytes/8 of the queue's NOT-YET-DURABLE bytes, so a body whose
+	// covering fence has not returned does not consume the room the deliverable
+	// backlog needs -- and the total resident bytes may therefore rise to
+	// queueBytes + queueBytes/8 before an admission is refused.
+	if q.used-c.pendingDurableExemptLocked(q)+charge > c.queueBytes {
 		return nil
 	}
 	// The global budget is claimed with the same atomic compare-and-swap the
@@ -614,6 +742,7 @@ func (c *hotCache) putBestEffortLocked(q *hotCacheQueue, queue string, m *protoc
 
 	entry := &hotCacheEntry{
 		queue:   queue,
+		q:       q,
 		tag:     m.DeliveryTag,
 		message: m,
 		charge:  charge,
@@ -621,6 +750,13 @@ func (c *hotCache) putBestEffortLocked(q *hotCacheQueue, queue string, m *protoc
 	}
 	if durable {
 		entry.durable.Store(true)
+	} else if c.exemptPendingDurable {
+		// THE WRITE-SIDE ADMISSION (the async durable path): the body is in
+		// the file but its covering fence has NOT returned, so it is not yet
+		// durable and its charge is exempt from the pace budget -- capped,
+		// through pendingDurableExemptLocked, at queueBytes/8.
+		entry.pendingDurable.Store(true)
+		q.pendingDurable.Add(charge)
 	}
 	entry.lastUsed = c.seq.Add(1)
 	entry.lru = q.lru.PushFront(entry)
@@ -651,6 +787,14 @@ func (c *hotCache) MarkDurableEntry(entry *hotCacheEntry) bool {
 		return false
 	}
 	entry.durable.Store(true)
+	// Clear the pending-durable accounting EXACTLY ONCE: if the entry was
+	// evicted (or otherwise removed) first, removeLocked already cleared the
+	// flag and this CAS fails, so the byte is never double-subtracted.
+	if entry.pendingDurable.CompareAndSwap(true, false) {
+		if q := entry.q; q != nil {
+			q.pendingDurable.Add(-entry.charge)
+		}
+	}
 	return true
 }
 
@@ -1008,6 +1152,12 @@ func (c *hotCache) removeLocked(q *hotCacheQueue, entry *hotCacheEntry) {
 	// later re-Put of the removed message upgrade an entry that is no longer
 	// in the queue map.
 	delete(q.byMessage, entry.message)
+	// A removed entry that was still counted as not-yet-durable leaves the
+	// pending-durable total with it (the CAS makes a later MarkDurableEntry on
+	// the same entry a no-op).
+	if c.exemptPendingDurable && entry.pendingDurable.CompareAndSwap(true, false) {
+		q.pendingDurable.Add(-entry.charge)
+	}
 	q.used -= entry.charge
 	atomic.AddInt64(&c.globalUsed, -entry.charge)
 	q.lru.Remove(entry.lru)

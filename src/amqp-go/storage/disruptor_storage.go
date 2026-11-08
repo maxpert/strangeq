@@ -280,13 +280,27 @@ func NewDisruptorStorageWithEngineConfig(dataDir string, engineCfg interfaces.En
 	}
 
 	return &DisruptorStorage{
-		hot:           newHotCache(hotCacheQueueBytes, hotCacheGlobalBytes),
+		hot:           newHotCacheWithExemption(hotCacheQueueBytes, hotCacheGlobalBytes, hotCachePaceExemptsPendingDurable(walCfg, engineCfg)),
 		metadataStore: metadataStore,
 		wal:           walManager,
 		segments:      segmentManager,
 		transactions:  make(map[string]*interfaces.Transaction),
 		dataDir:       dataDir,
 	}, nil
+}
+
+// hotCachePaceExemptsPendingDurable reports whether the hot cache exempts
+// NOT-YET-DURABLE bodies (up to queueBytes/8) from the pace budget.
+//
+// IT IS TRUE ONLY IN THE BARRIER CONFIGURATION: the exemption exists because in
+// that mode a body whose covering fence has not returned occupies budget that
+// the deliverable backlog needs. With storage.fsync DISABLED there is no
+// barrier and every admitted body is durable at once, so the exemption is OFF
+// and the charging is byte-identical to before. Under crash_model: force_flush
+// it is OFF too -- the pace gate is not wired there at all (the full-flush
+// makes batch size the limiter), and the charging must stay unchanged.
+func hotCachePaceExemptsPendingDurable(walCfg WALConfig, ec interfaces.EngineConfig) bool {
+	return !walCfg.SyncDisabled && ec.CrashModel != interfaces.CrashModelForceFlush
 }
 
 func (ds *DisruptorStorage) SetMetrics(metrics StorageMetrics) {
@@ -322,7 +336,7 @@ func (ds *DisruptorStorage) HotCachePaceGate(queue string, m *protocol.Message) 
 	if charge <= 0 || charge > ds.hot.queueBytes {
 		return nil
 	}
-	if ds.hot.residentBytes(queue)+charge <= ds.hot.queueBytes {
+	if ds.hot.paceEffectiveResident(queue)+charge <= ds.hot.queueBytes {
 		return nil // room: no gate, and no allocation on the common fast path
 	}
 	return &hotCacheByteGate{c: ds.hot, queue: queue, charge: charge}
