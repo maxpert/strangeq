@@ -658,6 +658,52 @@ func TestConsumers_DuplicateTagBothReturned(t *testing.T) {
 	}
 }
 
+// TestRequestBodyRejectedBeforeRouting (SEC-065, spec §11 test 84): an
+// oversized body is refused 413 without a route match, an authenticator, or a
+// handler running — the request never reaches routing.
+func TestRequestBodyRejectedBeforeRouting(t *testing.T) {
+	e := basicEnv(t, true, func(cfg *config.AMQPConfig) {
+		cfg.Management.Limits.MaxBodyBytes = 1024
+		cfg.Management.Limits.MaxImportBodyBytes = 4096
+	})
+	// A path that has NO route at all: without the pre-routing cap this would
+	// be 404. It must be 413 instead.
+	big := strings.Repeat("x", 8192)
+	rec := e.do(http.MethodPost, "/api/does-not-exist", []byte(`{"a":"`+big+`"}`), basicAuthHeader())
+	wantStatus(t, rec, http.StatusRequestEntityTooLarge)
+	if env := decode[errorEnvelope](t, rec); env.Error != errPayloadTooLarge {
+		t.Fatalf("token = %q, want payload_too_large", env.Error)
+	}
+}
+
+// TestDefinitionsImport_OverCapFailsEntity (MIL-043, spec §11 test 77).
+func TestDefinitionsImport_OverCapFailsEntity(t *testing.T) {
+	e := basicEnv(t, true, func(cfg *config.AMQPConfig) {
+		cfg.Management.Definitions.MaxQueues = 1
+		cfg.Management.Definitions.MaxExchanges = 1
+	})
+	defs := definitionsImportRequest{
+		Exchanges: []map[string]any{
+			{"name": "cap-ex-1", "type": "direct"},
+			{"name": "cap-ex-2", "type": "direct"},
+		},
+		Queues: []map[string]any{
+			{"name": "cap-q-1"},
+			{"name": "cap-q-2"},
+		},
+	}
+	rec := e.do(http.MethodPost, "/api/definitions", e.jsonBody(t, defs), basicAuthHeader())
+	wantStatus(t, rec, http.StatusOK)
+	res := decode[definitionsImportResult](t, rec)
+	if len(res.Applied) != 2 {
+		t.Fatalf("only one exchange and one queue may be applied, got %v", res.Applied)
+	}
+	failed := strings.Join(res.Failed, ",")
+	if !strings.Contains(failed, "cap-ex-2") || !strings.Contains(failed, "cap-q-2") {
+		t.Fatalf("over-cap entities must be reported as failed, got %v", res.Failed)
+	}
+}
+
 // --- sinks used by the audit tests ---
 
 type captureSink struct {

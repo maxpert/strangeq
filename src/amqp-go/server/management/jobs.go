@@ -181,7 +181,8 @@ func (p *jobPool) stateOf(id, owner string) (string, bool) {
 	return j.state, true
 }
 
-func (p *jobPool) reapLocked(now time.Time) {	if p.retention <= 0 {
+func (p *jobPool) reapLocked(now time.Time) {
+	if p.retention <= 0 {
 		return
 	}
 	keep := p.order[:0]

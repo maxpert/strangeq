@@ -85,6 +85,16 @@ func (s *Server) serveHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Body cap BEFORE routing (SEC-065/MIL-046): a declared body larger than
+	// any endpoint can accept is refused 413 without touching a route, an
+	// authenticator, or a handler. The bound is the LARGEST per-endpoint limit
+	// (definitions import); each endpoint then enforces its own tighter one.
+	if limit := s.preRoutingBodyLimit(); limit > 0 && r.ContentLength > int64(limit) {
+		s.writeAPIError(rw, r, apiErr(http.StatusRequestEntityTooLarge, errPayloadTooLarge,
+			"request body exceeds "+strconv.Itoa(limit)+" bytes"))
+		return
+	}
+
 	// In-flight cap (SEC-061).
 	if n := s.inflight.Add(1); int(n) > s.mcfg.Limits.MaxInFlight {
 		s.inflight.Add(-1)
@@ -361,6 +371,15 @@ func (s *Server) readBodyLimited(r *http.Request, limit int) ([]byte, *apiError)
 			"request body exceeds "+strconv.Itoa(limit)+" bytes")
 	}
 	return buf.Bytes(), nil
+}
+
+// preRoutingBodyLimit is the largest body any management endpoint may accept.
+func (s *Server) preRoutingBodyLimit() int {
+	limit := s.mcfg.Limits.MaxBodyBytes
+	if v := s.mcfg.Limits.MaxImportBodyBytes; v > limit {
+		limit = v
+	}
+	return limit
 }
 
 // counterWindow is a fixed-window per-key counter (SEC-067/068/069).
