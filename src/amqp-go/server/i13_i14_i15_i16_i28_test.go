@@ -14,6 +14,10 @@ import (
 )
 
 type spyMetricsCollector struct {
+	// NoOpMetricsCollector supplies the methods this spy does not override
+	// (notably the spec 06 outage families), so adding a collector method does
+	// not break this double.
+	NoOpMetricsCollector
 	acks           atomic.Int64
 	rejects        atomic.Int64
 	redeliver      atomic.Int64
