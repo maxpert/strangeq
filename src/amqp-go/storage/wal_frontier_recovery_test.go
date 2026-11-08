@@ -1,3 +1,5 @@
+//go:build darwin
+
 package storage
 
 // FRONTIER recovery rule (crash_model: barrier, darwin).
