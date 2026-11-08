@@ -382,9 +382,11 @@ func TestUI_S10_ExchangeBindingsSection(t *testing.T) {
 }
 
 // TestUI_S10_BindingsCapabilityOff proves capability gating: with
-// capabilities.bindings false the screen renders a notice carrying the NEW
-// reason (not the stale BOB-4 text) and never an enabled create control or a
-// data table.
+// capabilities.bindings false the client-side gate renders a notice carrying
+// the NEW reason (not the stale BOB-4 text), never an enabled create control or
+// a data table, and it short-circuits without calling the aggregate endpoint.
+// The capability is awaited from /api/strangeq/version so the CLIENT gate — not
+// the 501 fallback — is what renders.
 func TestUI_S10_BindingsCapabilityOff(t *testing.T) {
 	stub := newStub()
 	stub.set(func(s *stubAPI) { s.caps["bindings"] = false })
@@ -392,7 +394,15 @@ func TestUI_S10_BindingsCapabilityOff(t *testing.T) {
 	ctx, cancel := newTab(t)
 	defer cancel()
 
-	mustDo(t, ctx, chromedp.Navigate(srv.URL+"/bindings"), chromedp.WaitVisible(chromedp.CSS("#content .notice")))
+	mustDo(t, ctx, chromedp.Navigate(srv.URL+"/"), chromedp.WaitVisible(chromedp.CSS("#top-queues")))
+	if !waitFor(t, 3*time.Second, func() bool {
+		v, err := evalStrOK(ctx, `String(!!(window.SQ && window.SQ.state && window.SQ.state.capabilities && window.SQ.state.capabilities.bindings === false))`)
+		return err == nil && v == "true"
+	}) {
+		t.Fatal("the SPA never learned capabilities.bindings === false")
+	}
+	evalStr(t, ctx, `(function(){ window.SQ.navigate('/bindings'); return 'ok'; })()`)
+	mustDo(t, ctx, chromedp.WaitVisible(chromedp.CSS("#content .notice")))
 	txt := evalStr(t, ctx, `document.getElementById('content').textContent`)
 	if !strings.Contains(txt, "binding management is not available in this deployment") {
 		t.Fatalf("bindings notice = %q, want the current capability reason", txt)
@@ -405,6 +415,9 @@ func TestUI_S10_BindingsCapabilityOff(t *testing.T) {
 	}
 	if n := evalInt(t, ctx, `document.querySelectorAll('#content .data-table').length`); n != 0 {
 		t.Fatalf("unsupported bindings rendered a data table (%d)", n)
+	}
+	if paths := stub.pathsFor("bindings"); len(paths) != 0 {
+		t.Fatalf("the capability-off gate still called the API: %v", paths)
 	}
 }
 
