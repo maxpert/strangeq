@@ -91,10 +91,11 @@ type stubAPI struct {
 }
 
 // recordedReq is one observed request: the endpoint kind (the segment after
-// /api/), its raw query string, and the HTTP method.
+// /api/), its raw query string, its escaped path, and the HTTP method.
 type recordedReq struct {
 	kind   string
 	raw    string
+	path   string
 	method string
 }
 
@@ -111,6 +112,30 @@ func (s *stubAPI) queriesFor(kind string) []string {
 		}
 	}
 	return out
+}
+
+// pathsFor returns the escaped request path of every request whose endpoint
+// kind matches, so a test can pin which endpoint a screen actually called.
+func (s *stubAPI) pathsFor(kind string) []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]string, 0, len(s.reqLog))
+	for _, e := range s.reqLog {
+		if e.kind == kind {
+			out = append(out, e.path)
+		}
+	}
+	return out
+}
+
+// pathSeen reports whether any request for the endpoint had exactly the path.
+func (s *stubAPI) pathSeen(kind, path string) bool {
+	for _, p := range s.pathsFor(kind) {
+		if p == path {
+			return true
+		}
+	}
+	return false
 }
 
 // postQueriesFor returns the raw query strings of every POST for an endpoint,
@@ -312,7 +337,7 @@ func (s *stubAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	kind := segs[1]
 	s.mu.Lock()
-	s.reqLog = append(s.reqLog, recordedReq{kind: kind, raw: r.URL.RawQuery, method: r.Method})
+	s.reqLog = append(s.reqLog, recordedReq{kind: kind, raw: r.URL.RawQuery, path: r.URL.EscapedPath(), method: r.Method})
 	s.mu.Unlock()
 
 	switch kind {
