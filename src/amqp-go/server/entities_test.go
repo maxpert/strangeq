@@ -477,12 +477,13 @@ func TestForbiddenLockGate_HoldEveryForbiddenLock(t *testing.T) {
 // must never reference a forbidden lock/field/method.
 //
 // The scan is syntactic (the repo's established source-guard style): the
-// unambiguous lock/field names are forbidden on ANY receiver, while the three
-// names that also exist on the immutable protocol.Consumer
-// (Consumers/Closed/PrefetchCount) are flagged only when the receiver is
-// provably a channel/connection — an explicitly annotated parameter/var, a
-// type-assertion target, a channel/connection-returning selector, or a
-// conventional channel/connection identifier.
+// unambiguous lock/field names are forbidden on ANY receiver, while the
+// Channel-only mutex-guarded names (Consumers/Closed/PrefetchCount) are flagged
+// only when the receiver is provably a *protocol.Channel — an explicitly
+// annotated parameter/var, a type-assertion target, a channel-returning
+// selector, or a conventional channel identifier. A *protocol.Connection
+// receiver is tracked separately: Connection.Closed is an atomic and is
+// therefore allowed.
 func TestForbiddenLockGate_ASTScan(t *testing.T) {
 	paths := []string{"entities.go", "queue_stats.go", "../broker/management_accessors.go"}
 
@@ -552,6 +553,45 @@ func use() {
 	require.Contains(t, joined, "WriteMutex", "an always-forbidden field must be caught: %v", findings)
 }
 
+// TestForbiddenLockGate_ASTScan_ChannelVsConnection pins the Channel-vs-
+// Connection refinement of the gate. protocol.Connection.Closed is an
+// atomic.Bool (a safe lock-free read) and must NOT be flagged, while
+// protocol.Channel.Closed is a plain bool guarded by Channel.Mutex and MUST be
+// flagged; the unconditional mutex field is flagged on either receiver.
+func TestForbiddenLockGate_ASTScan_ChannelVsConnection(t *testing.T) {
+	atomicConn := writeScanFixture(t, "conn_atomic.go", `package fixture
+
+func use(conn *protocol.Connection) {
+	_ = conn.Closed.Load()
+}
+`)
+	findings, err := scanForbidden([]string{atomicConn})
+	require.NoError(t, err)
+	require.Empty(t, findings, "Connection.Closed is an atomic and must not be flagged: %v", findings)
+
+	chanClosed := writeScanFixture(t, "chan_closed.go", `package fixture
+
+func use(ch *protocol.Channel) {
+	_ = ch.Closed
+}
+`)
+	findings, err = scanForbidden([]string{chanClosed})
+	require.NoError(t, err)
+	require.Len(t, findings, 1, "Channel.Closed must be flagged: %v", findings)
+	require.Contains(t, findings[0], "Closed")
+
+	connMutex := writeScanFixture(t, "conn_mutex.go", `package fixture
+
+func use(conn *protocol.Connection) {
+	_ = conn.WriteMutex
+}
+`)
+	findings, err = scanForbidden([]string{connMutex})
+	require.NoError(t, err)
+	require.Len(t, findings, 1, "Connection.WriteMutex is unconditionally forbidden: %v", findings)
+	require.Contains(t, findings[0], "WriteMutex")
+}
+
 // writeScanFixture writes a throwaway Go source file for the AST gate's
 // negative self-tests and returns its path.
 func writeScanFixture(t *testing.T, name, src string) string {
@@ -562,10 +602,13 @@ func writeScanFixture(t *testing.T, name, src string) string {
 }
 
 // scanForbidden parses each path and returns one human-readable finding per
-// reference to a forbidden lock, field, or method. alwaysForbidden names are
-// flagged on any receiver; the names that also exist on the immutable
-// protocol.Consumer (Consumers/Closed/PrefetchCount) are flagged only when the
-// receiver is provably channel/connection-typed.
+// reference to a forbidden lock, field, or method. The mutex names
+// (WriteMutex/wireTagMu/confirmOrderMu/confirmFlushMu) and GetStats are flagged
+// on any receiver. The three names shared with the immutable protocol.Consumer
+// (Consumers/Closed/PrefetchCount) are Channel-only, mutex-guarded fields and
+// are flagged only on a receiver proven to be a *protocol.Channel. In
+// particular protocol.Connection.Closed is an atomic.Bool — a safe lock-free
+// read — and is deliberately NOT forbidden.
 func scanForbidden(paths []string) ([]string, error) {
 	alwaysForbidden := map[string]bool{
 		"GetStats":       true,
@@ -574,13 +617,16 @@ func scanForbidden(paths []string) ([]string, error) {
 		"confirmOrderMu": true,
 		"confirmFlushMu": true,
 	}
-	guardedOnChan := map[string]bool{
+	// Channel-only, mutex-guarded fields.
+	chanOnlyFields := map[string]bool{
 		"Consumers":     true,
 		"Closed":        true,
 		"PrefetchCount": true,
 	}
-	chanLikeNames := map[string]bool{
-		"ch": true, "channel": true, "conn": true, "connection": true,
+	// Conventional receiver identifiers mapped to the type they name.
+	chanLikeNames := map[string]recvKind{
+		"ch": recvChannel, "channel": recvChannel,
+		"conn": recvConnection, "connection": recvConnection,
 	}
 
 	var findings []string
@@ -591,22 +637,13 @@ func scanForbidden(paths []string) ([]string, error) {
 			return findings, fmt.Errorf("parse %s: %w", path, err)
 		}
 
-		// Identifiers known to hold a channel/connection in this file.
-		chanTyped := map[string]bool{}
-		markTyped := func(id *ast.Ident, chanConn bool) {
-			if id != nil && chanConn {
-				chanTyped[id.Name] = true
+		// Identifiers known to hold a channel/connection in this file, and the
+		// kind (Channel vs Connection) each holds.
+		typed := map[string]recvKind{}
+		markTyped := func(id *ast.Ident, kind recvKind) {
+			if id != nil && kind != recvUnknown {
+				typed[id.Name] = kind
 			}
-		}
-		// A value read through a Channel/Connection field selector is itself a
-		// channel/connection (e.g. f().Channel), regardless of what it is
-		// assigned to.
-		isChanConnSelectorName := func(e ast.Expr) bool {
-			sel, ok := e.(*ast.SelectorExpr)
-			if !ok {
-				return false
-			}
-			return sel.Sel.Name == "Channel" || sel.Sel.Name == "Connection"
 		}
 		ast.Inspect(f, func(n ast.Node) bool {
 			switch d := n.(type) {
@@ -623,9 +660,10 @@ func scanForbidden(paths []string) ([]string, error) {
 					case *ast.TypeAssertExpr:
 						markTyped(asIdent(d.Lhs[i]), isChanConnType(r.Type))
 					default:
-						if lhs := asIdent(d.Lhs[i]); lhs != nil && isChanConnSelectorName(rhs) {
-							markTyped(lhs, true)
-						}
+						// A value read through a Channel/Connection field
+						// selector is itself that type (e.g. f().Channel),
+						// regardless of what it is assigned to.
+						markTyped(asIdent(d.Lhs[i]), isChanConnSelector(rhs))
 					}
 				}
 			case *ast.ValueSpec:
@@ -637,13 +675,25 @@ func scanForbidden(paths []string) ([]string, error) {
 						markTyped(nm, isChanConnType(ta.Type))
 						continue
 					}
-					if isChanConnSelectorName(d.Values[i]) {
-						markTyped(nm, true)
-					}
+					markTyped(nm, isChanConnSelector(d.Values[i]))
 				}
 			}
 			return true
 		})
+
+		// receiverKind resolves the Channel/Connection kind of a selector's
+		// base: a Channel/Connection field selector, a typed identifier, or a
+		// conventional name (ch/conn/...).
+		receiverKind := func(e ast.Expr) recvKind {
+			if kind := isChanConnSelector(e); kind != recvUnknown {
+				return kind
+			}
+			base := rootIdent(e)
+			if kind, ok := typed[base]; ok {
+				return kind
+			}
+			return chanLikeNames[base]
+		}
 
 		ast.Inspect(f, func(n ast.Node) bool {
 			sel, ok := n.(*ast.SelectorExpr)
@@ -656,11 +706,10 @@ func scanForbidden(paths []string) ([]string, error) {
 					path, fset.Position(sel.Pos()).Line, name))
 				return true
 			}
-			if guardedOnChan[name] {
-				base := rootIdent(sel.X)
-				if chanLikeNames[base] || chanTyped[base] || isChanConnSelector(sel.X) {
-					findings = append(findings, fmt.Sprintf("%s:%d: forbidden channel/connection field %q on receiver %q",
-						path, fset.Position(sel.Pos()).Line, name, base))
+			if chanOnlyFields[name] {
+				if receiverKind(sel.X) == recvChannel {
+					findings = append(findings, fmt.Sprintf("%s:%d: forbidden channel field %q on receiver %q",
+						path, fset.Position(sel.Pos()).Line, name, rootIdent(sel.X)))
 				}
 			}
 			return true
@@ -692,27 +741,56 @@ func rootIdent(e ast.Expr) string {
 	return ""
 }
 
-func isChanConnSelector(e ast.Expr) bool {
+// recvKind classifies a scan receiver as a *protocol.Channel, a
+// *protocol.Connection, or unknown. Channel and Connection differ in which
+// fields are lock-guarded: Channel.Closed is a bool under Channel.Mutex, while
+// Connection.Closed is an atomic.Bool.
+type recvKind int
+
+const (
+	recvUnknown recvKind = iota
+	recvChannel
+	recvConnection
+)
+
+// isChanConnSelector returns the kind of the value read through a
+// Channel/Connection field selector (e.g. f().Channel is a channel), or
+// recvUnknown for any other expression.
+func isChanConnSelector(e ast.Expr) recvKind {
 	sel, ok := e.(*ast.SelectorExpr)
 	if !ok {
-		return false
+		return recvUnknown
 	}
-	return sel.Sel.Name == "Channel" || sel.Sel.Name == "Connection"
+	switch sel.Sel.Name {
+	case "Channel":
+		return recvChannel
+	case "Connection":
+		return recvConnection
+	}
+	return recvUnknown
 }
 
-func isChanConnType(e ast.Expr) bool {
+// isChanConnType returns the kind of a type expression that is
+// *protocol.Channel or *protocol.Connection, or recvUnknown otherwise.
+func isChanConnType(e ast.Expr) recvKind {
 	if star, ok := e.(*ast.StarExpr); ok {
 		e = star.X
 	}
 	sel, ok := e.(*ast.SelectorExpr)
 	if !ok {
-		return false
+		return recvUnknown
 	}
 	pkg, ok := sel.X.(*ast.Ident)
 	if !ok || pkg.Name != "protocol" {
-		return false
+		return recvUnknown
 	}
-	return sel.Sel.Name == "Channel" || sel.Sel.Name == "Connection"
+	switch sel.Sel.Name {
+	case "Channel":
+		return recvChannel
+	case "Connection":
+		return recvConnection
+	}
+	return recvUnknown
 }
 
 // BenchmarkSnapshotEntityTotals measures the O(1) coherent snapshot with 10 000
