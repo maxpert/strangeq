@@ -362,6 +362,9 @@ func main() {
 			BuildDate:     date,
 			GoVersion:     runtime.Version(),
 			UIHandler:     web.HandlerWithOptions(web.Options{MetricsURL: metricsURL}),
+			// Same-origin source for the SPA's Metrics screen (spec mgmt-07):
+			// nil when telemetry is disabled, so GET /api/metrics answers 501.
+			MetricsScrape: metricsScrapeFunc(telemetryServer),
 		})
 		if err != nil {
 			log.Fatalf("management: %v", err)
