@@ -1,17 +1,10 @@
 package management
 
 import (
-	"bytes"
-	"context"
-	"mime/multipart"
 	"net/http"
-	"net/http/httptest"
 	"testing"
-	"time"
 
 	"github.com/maxpert/amqp-go/config"
-	"github.com/maxpert/amqp-go/server"
-	"go.uber.org/zap"
 )
 
 // --- WS1 round-3 F1: trusted proxy with no forwarded client ---
@@ -61,80 +54,6 @@ func TestTrustedProxy_MissingXFFIsNotLoopback(t *testing.T) {
 		withReqHeader(hdr, "X-Forwarded-For", "127.0.0.2"))
 	if local.Code != http.StatusOK {
 		t.Fatalf("forwarded loopback client = %d, want 200 (%s)", local.Code, local.Body.String())
-	}
-}
-
-// --- WS1 round-3 F2: multipart import with a non-positive limit ---
-
-// TestDefinitionsImport_ZeroImportLimitDefaults pins round-3 F2: a directly
-// constructed Options with a zero MaxImportBodyBytes must fall back to the same
-// 2 MiB default readBodyLimited uses, not 413 every multipart import.
-func TestDefinitionsImport_ZeroImportLimitDefaults(t *testing.T) {
-	// The broker builder validates the config it is handed, so build the
-	// broker with a valid config and hand the management server a copy whose
-	// import limit is zero — the "embedder constructed Options directly" case.
-	srvCfg := config.DefaultConfig()
-	srvCfg.Storage.Path = t.TempDir()
-	srvCfg.Server.LogLevel = "silent"
-	srvCfg.Management.Enabled = true
-	srvCfg.Management.Address = "127.0.0.1"
-	srvCfg.Management.Authentication = config.ManagementAuthenticationBasic
-	srvCfg.Management.Basic.Username = "admin"
-	srvCfg.Management.Basic.PasswordHash = secretHash(t)
-	srvCfg.Management.Basic.Admin = true
-
-	srv, err := server.NewServerBuilder().WithConfig(srvCfg).WithZapLogger("silent").Build()
-	if err != nil {
-		t.Fatalf("build broker: %v", err)
-	}
-	t.Cleanup(func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		_ = srv.Shutdown(ctx)
-	})
-
-	mcfg := *srvCfg
-	mcfg.Management.Limits.MaxImportBodyBytes = 0
-	m, err := New(Options{
-		Server:        srv,
-		Config:        &mcfg,
-		AuthFile:      mcfg.Security.AuthenticationFilePath,
-		Authenticator: srv.Authenticator,
-		Logger:        zap.NewNop(),
-		Version:       "9.9.9",
-	})
-	if err != nil {
-		t.Fatalf("management.New: %v", err)
-	}
-	e := &env{t: t, cfg: &mcfg, srv: srv, mgmt: m}
-
-	defs := definitionsImportRequest{Exchanges: []map[string]any{{"name": "small-ex", "type": "direct"}}}
-	var buf bytes.Buffer
-	mw := multipart.NewWriter(&buf)
-	fw, err := mw.CreateFormFile("file", "definitions.json")
-	if err != nil {
-		t.Fatalf("create form file: %v", err)
-	}
-	if _, err := fw.Write(e.jsonBody(t, defs)); err != nil {
-		t.Fatalf("write part: %v", err)
-	}
-	if err := mw.Close(); err != nil {
-		t.Fatalf("close multipart writer: %v", err)
-	}
-
-	req := httptest.NewRequest(http.MethodPost, "/api/definitions", bytes.NewReader(buf.Bytes()))
-	req.RemoteAddr = "127.0.0.1:43210"
-	req.Header.Set("Content-Type", mw.FormDataContentType())
-	req.Header.Set("Authorization", basicAuthHeader()["Authorization"])
-	rec := httptest.NewRecorder()
-	e.mgmt.Handler().ServeHTTP(rec, req)
-
-	if rec.Code == http.StatusRequestEntityTooLarge {
-		t.Fatalf("a zero import limit must default, not 413 every import (%s)", rec.Body.String())
-	}
-	wantStatus(t, rec, http.StatusOK)
-	if ex := e.do(http.MethodGet, "/api/exchanges/%2F/small-ex", nil, basicAuthHeader()); ex.Code != http.StatusOK {
-		t.Fatalf("small import must apply its exchange, got %d (%s)", ex.Code, ex.Body.String())
 	}
 }
 

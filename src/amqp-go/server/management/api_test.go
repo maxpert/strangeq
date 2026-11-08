@@ -647,11 +647,14 @@ func TestDefinitionsExport_NoHashesAndSubset(t *testing.T) {
 	adm := e.do(http.MethodGet, "/api/definitions", nil, map[string]string{"Authorization": "Basic " + basicToken("adm", "secret")})
 	wantStatus(t, adm, http.StatusOK)
 	body := adm.Body.String()
-	if strings.Contains(body, "password_hash") || strings.Contains(body, "$2") {
+	// The excludes list names "user_password_hashes" (the fact that hashes are
+	// omitted), so the check must be for the credential KEY, never the bare
+	// substring.
+	if strings.Contains(body, `"password_hash":`) || strings.Contains(body, "$2") {
 		t.Fatalf("definitions export must never carry a hash: %s", truncate(body))
 	}
-	if !strings.Contains(body, `"subset":true`) {
-		t.Fatalf("export must declare subset:true: %s", truncate(body))
+	if !strings.Contains(body, `"subset":true`) || !strings.Contains(body, `"atomic":false`) {
+		t.Fatalf("export must declare subset:true and atomic:false: %s", truncate(body))
 	}
 	var admDoc map[string]json.RawMessage
 	if err := jsonUnmarshalStrict(adm.Body.Bytes(), &admDoc); err != nil {
@@ -670,8 +673,30 @@ func TestDefinitionsExport_NoHashesAndSubset(t *testing.T) {
 	if _, ok := monDoc["users"]; ok {
 		t.Fatalf("a principal without manage_users must not receive the user section: %s", truncate(mon.Body.String()))
 	}
+	if _, ok := monDoc["permissions"]; ok {
+		t.Fatalf("a principal without manage_users must not receive the permission section: %s", truncate(mon.Body.String()))
+	}
 	if string(monDoc["bindings"]) != "[]" {
 		t.Fatalf("export must include an empty bindings list, got %s", string(monDoc["bindings"]))
+	}
+	// The omission must be STATED so a client can see exactly which sections are
+	// absent (D-1/AUTH-024).
+	var monStrangeq struct {
+		ExcludedSections []string `json:"excluded_sections"`
+	}
+	if err := jsonUnmarshalStrict(monDoc["strangeq"], &monStrangeq); err != nil {
+		t.Fatalf("decode strangeq marker: %v", err)
+	}
+	for _, want := range []string{"users", "permissions", "bindings"} {
+		found := false
+		for _, got := range monStrangeq.ExcludedSections {
+			if got == want {
+				found = true
+			}
+		}
+		if !found {
+			t.Fatalf("excluded_sections must name %q, got %v", want, monStrangeq.ExcludedSections)
+		}
 	}
 }
 
