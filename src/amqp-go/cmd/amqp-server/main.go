@@ -19,6 +19,7 @@ import (
 	"github.com/maxpert/amqp-go/config"
 	"github.com/maxpert/amqp-go/metrics"
 	"github.com/maxpert/amqp-go/server"
+	"github.com/maxpert/amqp-go/server/management"
 	"go.uber.org/zap"
 )
 
@@ -74,6 +75,10 @@ func newFlagSet() (*flag.FlagSet, *cliOptions) {
 	fs.Int("telemetry-port", 0, "Telemetry HTTP server port (default from config: 9419)")
 	fs.String("telemetry-address", "", "Telemetry bind address (default from config: 127.0.0.1)")
 	fs.Bool("enable-pprof", false, "Enable pprof profiling endpoints (off by default; loopback only)")
+
+	fs.Bool("management", false, "Enable the management (control-plane) HTTP API (default from config: management.enabled)")
+	fs.String("management-address", "", "Management API bind address (default from config: 127.0.0.1)")
+	fs.Int("management-port", 0, "Management API port (default from config: 15672)")
 	o.healthcheck = fs.Bool("healthcheck", false, "Probe the local /health endpoint and exit 0 (ready) or 1 (not ready)")
 
 	fs.Bool("tls", false, "Enable TLS (amqps)")
@@ -121,6 +126,19 @@ func applyFlagOverrides(cfg *config.AMQPConfig, fs *flag.FlagSet) error {
 			cfg.Telemetry.Address = value
 		case "enable-pprof":
 			cfg.Telemetry.PprofEnabled = value == "true"
+		case "management":
+			cfg.Management.Enabled = value == "true"
+		case "management-address":
+			cfg.Management.Address = value
+		case "management-port":
+			port, err := strconv.Atoi(value)
+			if err != nil {
+				if firstErr == nil {
+					firstErr = fmt.Errorf("invalid --management-port %q: %w", value, err)
+				}
+				return
+			}
+			cfg.Management.Port = port
 		}
 	})
 	return firstErr
@@ -257,6 +275,7 @@ func main() {
 	var shuttingDown atomic.Bool
 	var telemetryServer *metrics.Server
 	var stopPoller context.CancelFunc
+	var mgmtServer *management.Server
 	if cfg.Telemetry.Enabled {
 		telemetryServer = metrics.NewServerWithOptions(metrics.ServerOptions{
 			Address:     cfg.Telemetry.Address,
@@ -293,6 +312,57 @@ func main() {
 		}
 	}
 
+	// Management (control-plane) HTTP surface: a SEPARATE listener from
+	// telemetry (SEC-004). It is off by default, loopback by default, and
+	// strictly optional; a bind failure is fatal before the broker serves
+	// (the surface is off-box-reachable, so silently skipping it would hide a
+	// misconfiguration).
+	if cfg.Management.Enabled {
+		var authFile string
+		if cfg.Security.AuthenticationEnabled {
+			authFile = cfg.Security.AuthenticationFilePath
+			if authFile == "" {
+				if uf, ok := cfg.Security.AuthenticationConfig["user_file"].(string); ok {
+					authFile = uf
+				}
+			}
+		}
+		// The metrics sink is OPTIONAL: *metrics.Collector implements it only
+		// once the amqp_management_* families land. Until then the surface
+		// records into a no-op sink (SEC-001 zero-cost).
+		var mgmtSink management.ManagementMetricsSink
+		if collector != nil {
+			if s, ok := any(collector).(management.ManagementMetricsSink); ok {
+				mgmtSink = s
+			}
+		}
+		mgmtServer, err = management.New(management.Options{
+			Server:        amqpServer,
+			Config:        cfg,
+			Authenticator: amqpServer.Authenticator,
+			AuthFile:      authFile,
+			Logger:        amqpServer.Log,
+			Metrics:       mgmtSink,
+			Version:       version,
+			Commit:        commit,
+			BuildDate:     date,
+			GoVersion:     runtime.Version(),
+		})
+		if err != nil {
+			log.Fatalf("management: %v", err)
+		}
+		if err := mgmtServer.Start(); err != nil {
+			log.Fatalf("management: %v", err)
+		}
+		// Attach it so Server.Shutdown stops the control plane before storage
+		// closes (spec mgmt-01 §4).
+		amqpServer.SetManagement(mgmtServer)
+		base := "http://" + mgmtServer.Addr().String()
+		fmt.Printf("Management API listening on %s\n", base)
+		fmt.Printf("  Version:  %s/api/strangeq/version\n", base)
+		fmt.Printf("  Overview: %s/api/overview\n", base)
+	}
+
 	// Signal handling must be installed before Start: SIGHUP's default action
 	// terminates the process.
 	sigCh := make(chan os.Signal, 2)
@@ -302,6 +372,11 @@ func main() {
 	go func() {
 		for range hupCh {
 			reloadAuth(amqpServer)
+			if mgmtServer != nil {
+				if n := mgmtServer.ReloadUsers(); n > 0 {
+					fmt.Printf("Management: invalidated %d session(s) for changed/removed users\n", n)
+				}
+			}
 		}
 	}()
 

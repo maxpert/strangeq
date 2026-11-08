@@ -53,6 +53,13 @@ func (b *ServerBuilder) WithManagement(m ManagementSurface) *ServerBuilder {
 	return b
 }
 
+// SetManagement attaches (or replaces) the control-plane surface on an already
+// built Server. cmd/amqp-server uses it because the management surface needs
+// the built Server (it reads the broker for its entity snapshot); embedders
+// that construct the surface before Build use WithManagement instead. Either
+// way Server.Shutdown stops the surface first (spec mgmt-01 §4).
+func (s *Server) SetManagement(m ManagementSurface) { s.management = m }
+
 // NewServerBuilder creates a new server builder with default configuration
 func NewServerBuilder() *ServerBuilder {
 	return &ServerBuilder{
