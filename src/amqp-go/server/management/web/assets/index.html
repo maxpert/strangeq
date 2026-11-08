@@ -2,11 +2,59 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
 <title>StrangeQ Management</title>
 <link rel="stylesheet" href="/assets/styles.css">
 </head>
 <body>
-<main id="content"></main>
+<a class="skip-link" href="#content">Skip to content</a>
+<header class="topbar">
+  <div class="brand">
+    <span class="brand-name">StrangeQ</span>
+    <span class="brand-version" id="app-version">&mdash;</span>
+  </div>
+  <div class="health" id="health" data-state="unknown" role="status" aria-live="polite">
+    <span class="health-dot" aria-hidden="true"></span>
+    <span class="health-text" id="health-text">checking&hellip;</span>
+  </div>
+  <form class="global-search" id="global-search" role="search">
+    <label class="visually-hidden" for="search-input">Global search</label>
+    <input id="search-input" name="q" type="search" autocomplete="off" placeholder="Search queues, exchanges, connections">
+    <button type="submit">Search</button>
+  </form>
+  <div class="principal" id="principal" aria-live="polite"></div>
+  <div class="refresh-control" id="refresh-status" data-delay-ms="0" data-stale="false">
+    <span class="refresh-label" id="refresh-label">live</span>
+    <button type="button" id="refresh-toggle" aria-pressed="false">Pause</button>
+    <button type="button" id="refresh-now">Refresh</button>
+  </div>
+</header>
+<button type="button" class="alarm-trigger" id="alarm-trigger" aria-expanded="false" hidden>Alarms</button>
+<div class="banner" id="alarm-banner" role="alert" hidden></div>
+<div class="capability-notice" id="capability-notice" role="note" hidden>
+  <span class="capability-notice-text">Some RabbitMQ concepts are not implemented by StrangeQ: policies, federation, shovels, plugins, parameters, clustering and multi-vhost. <a href="/about">See About / Capabilities</a>.</span>
+  <button type="button" id="capability-dismiss" aria-label="Dismiss notice">Dismiss</button>
+</div>
+<div class="layout">
+  <nav class="rail" id="nav" aria-label="Primary">
+    <a href="/" data-nav="overview">Overview</a>
+    <a href="/connections" data-nav="connections">Connections</a>
+    <a href="/channels" data-nav="channels">Channels</a>
+    <a href="/consumers" data-nav="consumers">Consumers</a>
+    <a href="/exchanges" data-nav="exchanges">Exchanges</a>
+    <a href="/queues" data-nav="queues">Queues</a>
+    <a href="/bindings" data-nav="bindings">Bindings</a>
+    <a href="/nodes" data-nav="nodes">Nodes</a>
+    <a href="/users" data-nav="users">Users</a>
+    <a href="/permissions" data-nav="permissions">Permissions</a>
+    <a href="/definitions" data-nav="definitions">Definitions</a>
+    <a href="/about" data-nav="about">About</a>
+  </nav>
+  <main id="content" class="content" tabindex="-1"></main>
+</div>
+<div id="modal-root"></div>
+<div id="toast-root" class="toast-root" role="status" aria-live="polite"></div>
 <script src="/assets/app.js" defer></script>
 </body>
 </html>

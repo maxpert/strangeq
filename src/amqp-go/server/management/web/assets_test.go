@@ -56,10 +56,11 @@ func TestAssets_EmbeddedAndOffline(t *testing.T) {
 		t.Errorf("bundle size %d bytes exceeds budget %d bytes", total, maxBytes)
 	}
 
-	// index.html may only reference same-origin (root-relative) URLs.
+	// index.html may only reference same-origin (root-relative) URLs or
+	// same-page fragments.
 	attrRe := regexp.MustCompile(`(?i)(?:src|href)\s*=\s*"([^"]*)"`)
 	for _, m := range attrRe.FindAllStringSubmatch(string(readAsset(t, "index.html")), -1) {
-		if !strings.HasPrefix(m[1], "/") {
+		if !strings.HasPrefix(m[1], "/") && !strings.HasPrefix(m[1], "#") {
 			t.Errorf("index.html references non-same-origin URL %q", m[1])
 		}
 	}
