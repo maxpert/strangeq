@@ -136,6 +136,14 @@ func TestUI_MetricsMissingFamilyRendersDash(t *testing.T) {
 	if got := tileSeverity(t, ctx, "wal_fsync_errors"); got != "unknown" {
 		t.Fatalf("missing-family severity = %q, want unknown", got)
 	}
+	// Spec D3/R3: an unknown tile carries title="not emitted by this broker".
+	if got := evalStr(t, ctx, `document.getElementById('metrics-tile-wal_fsync_errors').title`); got != "not emitted by this broker" {
+		t.Fatalf("unknown tile title = %q, want %q", got, "not emitted by this broker")
+	}
+	// A present tile must NOT carry that title (it was emitted).
+	if got := evalStr(t, ctx, `document.getElementById('metrics-tile-wal_write_errors').title`); got != "" {
+		t.Fatalf("present tile title = %q, want empty", got)
+	}
 }
 
 // TestUI_MetricsPresentZeroRendersZero (spec test 22): a family present with
@@ -300,30 +308,73 @@ func TestUI_MetricsNonFiniteValue(t *testing.T) {
 
 /* ------------------------------------------------------------ caps --------- */
 
-// TestUI_MetricsTruncationNotice (spec test 28): over the family cap the render
-// is capped at 400 with a truthful notice.
-func TestUI_MetricsTruncationNotice(t *testing.T) {
+// manySeriesFixture builds a labelled gauge family with n series, each in its
+// own table row, so the total-series cap can be exercised.
+func manySeriesFixture(prefix string, n int) string {
 	var b strings.Builder
-	for i := 0; i < 450; i++ {
-		fmt.Fprintf(&b, "# HELP amqp_fam_%03d family %d\n# TYPE amqp_fam_%03d counter\namqp_fam_%03d %d\n", i, i, i, i, i)
+	fmt.Fprintf(&b, "# HELP %s_metric many series\n# TYPE %s_metric gauge\n", prefix, prefix)
+	for i := 0; i < n; i++ {
+		fmt.Fprintf(&b, "%s_metric{queue=\"q%04d\"} %d\n", prefix, i, i)
 	}
-	stub := newStub()
-	stub.set(func(s *stubAPI) { s.metricsText = b.String() })
-	srv := appServer(t, stub)
-	ctx, cancel := newTab(t)
-	defer cancel()
+	return b.String()
+}
 
-	openMetrics(t, ctx, srv.URL, true, "")
+// TestUI_MetricsTruncationNotice (spec test 28 + B3 LOW #4): over the family
+// cap the render is capped at 400; and the series cap raises the notice whenever
+// it actually bit, including an overshoot on the final family.
+func TestUI_MetricsTruncationNotice(t *testing.T) {
+	t.Run("family cap", func(t *testing.T) {
+		var b strings.Builder
+		for i := 0; i < 450; i++ {
+			fmt.Fprintf(&b, "# HELP amqp_fam_%03d family %d\n# TYPE amqp_fam_%03d counter\namqp_fam_%03d %d\n", i, i, i, i, i)
+		}
+		stub := newStub()
+		stub.set(func(s *stubAPI) { s.metricsText = b.String() })
+		srv := appServer(t, stub)
+		ctx, cancel := newTab(t)
+		defer cancel()
 
-	if n := evalInt(t, ctx, `document.querySelectorAll('.metric-family').length`); n != 400 {
-		t.Fatalf("rendered families = %d, want 400", n)
-	}
-	if hidden := evalBool(t, ctx, `document.getElementById('metrics-truncation').hidden`); hidden {
-		t.Fatal("truncation notice is present but hidden")
-	}
-	if txt := evalStr(t, ctx, `document.getElementById('metrics-truncation').textContent`); !strings.Contains(txt, "400") {
-		t.Fatalf("truncation notice does not name the cap: %q", txt)
-	}
+		openMetrics(t, ctx, srv.URL, true, "")
+
+		if n := evalInt(t, ctx, `document.querySelectorAll('.metric-family').length`); n != 400 {
+			t.Fatalf("rendered families = %d, want 400", n)
+		}
+		if hidden := evalBool(t, ctx, `document.getElementById('metrics-truncation').hidden`); hidden {
+			t.Fatal("truncation notice is present but hidden")
+		}
+		if txt := evalStr(t, ctx, `document.getElementById('metrics-truncation').textContent`); !strings.Contains(txt, "400") {
+			t.Fatalf("truncation notice does not name the cap: %q", txt)
+		}
+	})
+
+	// 9x200 + 50 + 200 = 2050 series over 11 families. The final family pushes
+	// the running total from 1850 past 2000, so the old family-boundary check
+	// alone would miss it; the notice must still appear.
+	t.Run("series overshoot", func(t *testing.T) {
+		var b strings.Builder
+		for i := 0; i < 9; i++ {
+			b.WriteString(manySeriesFixture(fmt.Sprintf("amqp_a%02d", i), 200))
+		}
+		b.WriteString(manySeriesFixture("amqp_b00", 50))
+		b.WriteString(manySeriesFixture("amqp_c00", 200))
+		stub := newStub()
+		stub.set(func(s *stubAPI) { s.metricsText = b.String() })
+		srv := appServer(t, stub)
+		ctx, cancel := newTab(t)
+		defer cancel()
+
+		openMetrics(t, ctx, srv.URL, true, "")
+
+		if n := evalInt(t, ctx, `document.querySelectorAll('.metric-family').length`); n != 11 {
+			t.Fatalf("rendered families = %d, want 11", n)
+		}
+		if hidden := evalBool(t, ctx, `document.getElementById('metrics-truncation').hidden`); hidden {
+			t.Fatal("series-cap overshoot did not raise the truncation notice")
+		}
+		if txt := evalStr(t, ctx, `document.getElementById('metrics-truncation').textContent`); !strings.Contains(txt, "2000") {
+			t.Fatalf("truncation notice does not name the series cap: %q", txt)
+		}
+	})
 }
 
 /* ------------------------------------------------------- raw / filter ------ */
@@ -514,5 +565,94 @@ func TestUI_MetricsA11yStateNotColourAlone(t *testing.T) {
 	bad := evalInt(t, ctx, `Array.prototype.filter.call(document.querySelectorAll('.card[data-tile] .card-sev'), function(s){ return ['ok','warn','bad','\u2014'].indexOf(s.textContent) < 0; }).length`)
 	if bad != 0 {
 		t.Fatalf("%d tiles carry a severity text outside ok/warn/bad/em-dash", bad)
+	}
+}
+
+/* ----------------------------------------------------- B3 review LOWs ------ */
+
+// TestUI_MetricsNominalNoticeCountsUnknown (B3 LOW #2): the "no bad signals"
+// banner must not overstate health — it names how many tiles are unknown. The
+// default fixture emits two tile families (ready=3 and WAL write errors=0), so
+// 43 of 45 signals are unknown.
+func TestUI_MetricsNominalNoticeCountsUnknown(t *testing.T) {
+	stub := newStub()
+	srv := appServer(t, stub)
+	ctx, cancel := newTab(t)
+	defer cancel()
+
+	openMetrics(t, ctx, srv.URL, true, "")
+
+	notice := evalStr(t, ctx, `document.getElementById('metrics-notice').textContent`)
+	if !strings.Contains(notice, "unknown") {
+		t.Fatalf("nominal banner does not disclose unknown signals: %q", notice)
+	}
+	if !strings.Contains(notice, "43 of 45") {
+		t.Fatalf("nominal banner unknown count = %q, want 43 of 45", notice)
+	}
+	if strings.Contains(notice, "nominal") {
+		t.Fatalf("nominal banner still claims everything is nominal: %q", notice)
+	}
+}
+
+// TestUI_MetricsRawEndpointGated (B3 LOW #5): the raw-endpoint shortcut appears
+// only when metricsUrl is configured, and is a plain new-tab link.
+func TestUI_MetricsRawEndpointGated(t *testing.T) {
+	t.Run("present with metricsUrl", func(t *testing.T) {
+		stub := newStub()
+		srv := appServer(t, stub)
+		ctx, cancel := newTab(t)
+		defer cancel()
+		openMetrics(t, ctx, srv.URL, true, `window.__SQ_CONFIG__ = { metricsUrl: "http://127.0.0.1:9999/metrics" };`)
+		if n := evalInt(t, ctx, `document.querySelectorAll('#metrics-raw-endpoint').length`); n != 1 {
+			t.Fatalf("raw endpoint link count = %d, want 1", n)
+		}
+		if got := evalStr(t, ctx, `document.getElementById('metrics-raw-endpoint').getAttribute('href')`); got != "http://127.0.0.1:9999/metrics" {
+			t.Fatalf("raw endpoint href = %q", got)
+		}
+		if got := evalStr(t, ctx, `document.getElementById('metrics-raw-endpoint').getAttribute('target')`); got != "_blank" {
+			t.Fatalf("raw endpoint target = %q, want _blank", got)
+		}
+	})
+	t.Run("absent without metricsUrl", func(t *testing.T) {
+		stub := newStub()
+		srv := appServer(t, stub)
+		ctx, cancel := newTab(t)
+		defer cancel()
+		openMetrics(t, ctx, srv.URL, true, "")
+		if n := evalInt(t, ctx, `document.querySelectorAll('#metrics-raw-endpoint, a[target="_blank"][href$="/metrics"]').length`); n != 0 {
+			t.Fatalf("a raw /metrics link rendered without metricsUrl (%d)", n)
+		}
+	})
+}
+
+// TestUI_MetricsHostileTextIsInert (B3 LOW #5 / SEC-030): a HELP line and a
+// label value carrying markup render as inert text — no element from the
+// payload is created and no event handler runs.
+func TestUI_MetricsHostileTextIsInert(t *testing.T) {
+	hostile := "\"><img src=x onerror=window.__pwned=1>"
+	labelVal := strings.ReplaceAll(hostile, "\"", "\\\"")
+	stub := newStub()
+	stub.set(func(s *stubAPI) {
+		s.metricsText = metricFixture(
+			"# HELP amqp_hostile_total "+hostile,
+			"# TYPE amqp_hostile_total gauge",
+			`amqp_hostile_total{queue="`+labelVal+`"} 1`,
+		)
+	})
+	srv := appServer(t, stub)
+	ctx, cancel := newTab(t)
+	defer cancel()
+
+	openMetrics(t, ctx, srv.URL, true, "")
+
+	if n := evalInt(t, ctx, `document.querySelectorAll('#content img, #content script').length`); n != 0 {
+		t.Fatalf("hostile payload created %d element(s)", n)
+	}
+	if got := evalStr(t, ctx, `String(window.__pwned)`); got != "undefined" {
+		t.Fatalf("hostile onerror handler ran: window.__pwned = %s", got)
+	}
+	txt := evalStr(t, ctx, `document.getElementById('metrics-families').textContent`)
+	if !strings.Contains(txt, "onerror=window.__pwned=1") {
+		t.Fatalf("hostile text did not render inert: %q", txt)
 	}
 }

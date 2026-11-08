@@ -2675,7 +2675,7 @@
 
   function metricCardEl(t) {
     return h("div", { class: "card", dataset: { tile: t.id, severity: "unknown" } }, [
-      h("div", { class: "card-value", id: "metrics-tile-" + t.id, text: DASH }),
+      h("div", { class: "card-value", id: "metrics-tile-" + t.id, text: DASH, title: "not emitted by this broker" }),
       h("div", { class: "card-label", text: t.label }),
       h("span", { class: "card-sev", text: DASH })
     ]);
@@ -2775,7 +2775,8 @@
     }
     el.className = "notice empty";
     el.dataset.severity = "ok";
-    el.replaceChildren(h("p", { text: "All " + tiles.length + " vital signals nominal." }));
+    var unknown = tiles.filter(function (t) { return t.state === "unknown"; });
+    el.replaceChildren(h("p", { text: "No bad vital signals; " + unknown.length + " of " + tiles.length + " signals unknown." }));
   }
 
   function renderMetricsVitals(container, tiles) {
@@ -2786,7 +2787,10 @@
       if (!card) continue;
       card.dataset.severity = t.state;
       var value = card.querySelector(".card-value");
-      if (value) value.textContent = t.text;
+      if (value) {
+        value.textContent = t.text;
+        value.title = (t.state === "unknown") ? "not emitted by this broker" : "";
+      }
       var sev = card.querySelector(".card-sev");
       if (sev) sev.textContent = t.state === "unknown" ? DASH : t.state;
     }
@@ -2855,6 +2859,7 @@
       var res = metricFamilyNode(f);
       if (res.capped) capped = true;
       shownSeries += res.rendered;
+      if (shownSeries > METRICS_MAX_SERIES) capped = true;
       sections.push(res.node);
       shown++;
     }
