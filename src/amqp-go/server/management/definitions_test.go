@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/maxpert/amqp-go/broker"
 	"github.com/maxpert/amqp-go/config"
 	"github.com/maxpert/amqp-go/protocol"
 	"github.com/maxpert/amqp-go/server"
@@ -154,17 +155,22 @@ func TestDefinitionsExport_UserSectionGated(t *testing.T) {
 		ExcludedSections []string `json:"excluded_sections"`
 	}
 	_ = json.Unmarshal(monDoc["strangeq"], &marker)
-	for _, want := range []string{"users", "permissions", "bindings"} {
+	for _, want := range []string{"users", "permissions"} {
 		if !containsStr(marker.ExcludedSections, want) {
 			t.Fatalf("excluded_sections must name %q, got %v", want, marker.ExcludedSections)
 		}
+	}
+	// The real broker implements the binding seam, so `bindings` must NOT be
+	// excluded (WS5 finding 5: the mirror seam is gone).
+	if containsStr(marker.ExcludedSections, "bindings") {
+		t.Fatalf("bindings must not be excluded with the real seam present: %v", marker.ExcludedSections)
 	}
 }
 
 func TestDefinitionsExport_BindingsPopulated(t *testing.T) {
 	e := basicEnv(t, true, nil)
 	fake := installFakeBindings(t, e)
-	fake.seed(defsBindingView{Source: "events", Destination: "orders", DestinationType: "queue", RoutingKey: "order.*", Arguments: map[string]interface{}{"x-match": "all"}})
+	fake.seed(broker.BindingView{Source: "events", Destination: "orders", DestinationType: "queue", RoutingKey: "order.*", Arguments: map[string]interface{}{"x-match": "all"}})
 
 	rec := e.do(http.MethodGet, "/api/definitions", nil, basicAuthHeader())
 	wantStatus(t, rec, http.StatusOK)
@@ -406,7 +412,7 @@ func TestDefinitionsImport_OverCapFailsEntity(t *testing.T) {
 	e2.declareQueue(t, "capb-q2", queueDeclareRequest{})
 	e2.declareQueue(t, "capb-q3", queueDeclareRequest{})
 	fake := installFakeBindings(t, e2)
-	fake.seed(defsBindingView{Source: "amq.topic", Destination: "capb-q1", DestinationType: "queue", RoutingKey: "a"})
+	fake.seed(broker.BindingView{Source: "amq.topic", Destination: "capb-q1", DestinationType: "queue", RoutingKey: "a"})
 	bdoc := definitionsImportRequest{Bindings: []map[string]any{
 		{"source": "amq.topic", "destination": "capb-q2", "destination_type": "queue", "routing_key": "b"},
 		{"source": "amq.topic", "destination": "capb-q3", "destination_type": "queue", "routing_key": "c"},
@@ -445,17 +451,14 @@ func TestDefinitionsImport_CapCountsExistingQueue(t *testing.T) {
 	}
 }
 
-// TestDefinitionsImport_BindingSeamAbsentOnRealBroker PINS the current gap:
-// against the real UnifiedBroker (no aggregate ListBindings seam yet), the
-// planner's `cur.bindings` is empty, so re-importing the SAME binding reports
-// `created` both times rather than skipping the second as equivalent.
-//
-// REQUIRED INTEGRATION CHANGE: when mgmt-04 lands broker.BindingView and its
-// ListBindings seam, swap the local defsBindingView/defsBindingLister below for
-// that seam (definitions.go currentTopology); the dedup logic then uses the real
-// topology and the second import becomes `equivalent`. This test documents the
-// limitation explicitly rather than letting it surprise a reviewer.
-func TestDefinitionsImport_BindingSeamAbsentOnRealBroker(t *testing.T) {
+// TestDefinitionsImport_BindingDedupRealBroker pins the REAL binding seam
+// (WS5 review finding 5): definitions.go's currentTopology consumes the same
+// broker.BindingView seam handlers_bindings.go names, so against the real
+// StorageBrokerAdapter the planner sees the live topology. Importing one
+// binding TWICE must report it `skipped`/"equivalent" the second time and
+// create nothing — the pre-seam code re-created it (the gap this test used to
+// document).
+func TestDefinitionsImport_BindingDedupRealBroker(t *testing.T) {
 	e := basicEnv(t, true, func(cfg *config.AMQPConfig) {
 		cfg.Management.RateLimits.DefinitionsImportSeconds = 0
 	})
@@ -470,11 +473,36 @@ func TestDefinitionsImport_BindingSeamAbsentOnRealBroker(t *testing.T) {
 		t.Fatalf("first import must report the binding created: %+v", first.Applied)
 	}
 	second := decode[defsImportResponse](t, importDefs(t, e, "", body, nil))
-	if !containsName(second, second.Applied, "binding", "seam-q") {
-		t.Fatalf("with no seam the second import re-creates rather than skips: %+v", second)
+	if len(second.Applied) != 0 {
+		t.Fatalf("the real seam must dedup the existing binding: applied=%+v", second.Applied)
 	}
-	if len(second.Skipped) != 0 {
-		t.Fatalf("the absent seam means no equivalent skip yet: %+v", second.Skipped)
+	if len(second.Skipped) != 1 || second.Skipped[0].Reason != "equivalent" {
+		t.Fatalf("second import must skip the binding as equivalent: %+v", second.Skipped)
+	}
+	if second.Skipped[0].Destination != "seam-q" || second.Skipped[0].DestinationType != "queue" {
+		t.Fatalf("the equivalent skip must carry the binding identity: %+v", second.Skipped[0])
+	}
+}
+
+// TestDefinitionsExport_BindingsOnRealBroker proves production export includes
+// `bindings` when the real seam is present: a binding declared through the live
+// broker is exported without `excluded_sections:["bindings"]`.
+func TestDefinitionsExport_BindingsOnRealBroker(t *testing.T) {
+	e := basicEnv(t, true, nil)
+	e.declareExchange(t, "real-ex", "topic")
+	e.declareQueue(t, "real-q", queueDeclareRequest{})
+	wantStatus(t, e.bindQueue(t, "real-ex", "real-q", "rk", nil), http.StatusCreated)
+
+	doc := exportDoc(t, e)
+	if containsStr(doc.StrangeQ.ExcludedSections, "bindings") {
+		t.Fatalf("with the real seam present bindings must NOT be excluded: %v", doc.StrangeQ.ExcludedSections)
+	}
+	if len(doc.Bindings) != 1 {
+		t.Fatalf("bindings = %+v, want the one live binding", doc.Bindings)
+	}
+	b := doc.Bindings[0]
+	if b.Source != "real-ex" || b.Destination != "real-q" || b.DestinationType != "queue" || b.RoutingKey != "rk" {
+		t.Fatalf("binding identity = %+v", b)
 	}
 }
 
@@ -553,7 +581,7 @@ func TestDefinitionsImport_MultipartChunkedOverCap413(t *testing.T) {
 func TestDefinitionsImport_BindingDedupByPropertiesKey(t *testing.T) {
 	e := basicEnv(t, true, nil)
 	fake := installFakeBindings(t, e)
-	fake.seed(defsBindingView{Source: "amq.topic", Destination: "dedup-q", DestinationType: "queue", RoutingKey: "k", Arguments: map[string]interface{}{"a": "b"}})
+	fake.seed(broker.BindingView{Source: "amq.topic", Destination: "dedup-q", DestinationType: "queue", RoutingKey: "k", Arguments: map[string]interface{}{"a": "b"}})
 
 	doc := definitionsImportRequest{Bindings: []map[string]any{
 		// A bogus payload properties_key must be ignored; the recomputed key
@@ -933,7 +961,20 @@ func TestDefinitionsExportImport_RoundTrip(t *testing.T) {
 	src := basicEnv(t, true, nil)
 	wantStatus(t, src.do(http.MethodPut, "/api/exchanges/%2F/rt-ex", src.jsonBody(t, exchangeDeclareRequest{Type: "direct", Durable: true}), basicAuthHeader()), http.StatusCreated)
 	src.declareQueue(t, "rt-q", queueDeclareRequest{Durable: true})
+	wantStatus(t, src.bindQueue(t, "rt-ex", "rt-q", "rk", nil), http.StatusCreated)
 	body := src.do(http.MethodGet, "/api/definitions", nil, basicAuthHeader()).Body.Bytes()
+	// The export must carry the real binding (WS5 finding 5), not an excluded
+	// empty section.
+	var srcDoc definitionsExport
+	if err := json.Unmarshal(body, &srcDoc); err != nil {
+		t.Fatalf("decode source export: %v", err)
+	}
+	if len(srcDoc.Bindings) != 1 {
+		t.Fatalf("source export bindings = %+v, want the one live binding", srcDoc.Bindings)
+	}
+	if containsStr(srcDoc.StrangeQ.ExcludedSections, "bindings") {
+		t.Fatalf("source export must not exclude bindings: %v", srcDoc.StrangeQ.ExcludedSections)
+	}
 
 	dst := basicEnv(t, true, func(cfg *config.AMQPConfig) {
 		cfg.Management.RateLimits.DefinitionsImportSeconds = 0 // two imports in this test
@@ -941,6 +982,9 @@ func TestDefinitionsExportImport_RoundTrip(t *testing.T) {
 	res := decode[defsImportResponse](t, importDefs(t, dst, "", body, nil))
 	if !containsName(res, res.Applied, "exchange", "rt-ex") || !containsName(res, res.Applied, "queue", "rt-q") {
 		t.Fatalf("round-trip did not apply the user entities: applied=%v failed=%v", appliedNames(res), failedNames(res))
+	}
+	if !containsName(res, res.Applied, "binding", "rt-q") {
+		t.Fatalf("round-trip did not apply the binding: applied=%v failed=%v", appliedNames(res), failedNames(res))
 	}
 	wantStatus(t, dst.do(http.MethodGet, "/api/exchanges/%2F/rt-ex", nil, basicAuthHeader()), http.StatusOK)
 	wantStatus(t, dst.do(http.MethodGet, "/api/queues/%2F/rt-q", nil, basicAuthHeader()), http.StatusOK)
@@ -951,6 +995,16 @@ func TestDefinitionsExportImport_RoundTrip(t *testing.T) {
 		if it.Result == "created" {
 			t.Fatalf("a second import must create nothing: %+v", it)
 		}
+	}
+	// The re-imported binding is deduped as equivalent, not re-created.
+	var skippedBinding bool
+	for _, it := range res2.Skipped {
+		if it.Type == "binding" && it.Destination == "rt-q" && it.Reason == "equivalent" {
+			skippedBinding = true
+		}
+	}
+	if !skippedBinding {
+		t.Fatalf("the exported binding must re-import as equivalent: %+v", res2.Skipped)
 	}
 }
 
@@ -1000,22 +1054,22 @@ func BenchmarkPlanDefinitions_1000Entities(b *testing.B) {
 
 // --- fake binding seam -------------------------------------------------------
 
-// defsFakeBroker wraps the real UnifiedBroker and adds the optional aggregate
-// binding seam (defsBindingLister), so the definitions export/import can be
-// exercised end to end before the mgmt-04 broker seam is merged.
+// defsFakeBroker wraps the real UnifiedBroker and overrides the aggregate
+// binding seam (broker.BindingView / ListBindings), so definitions tests can
+// seed an isolated binding set without touching the wrapped broker's storage.
 type defsFakeBroker struct {
 	server.UnifiedBroker
 	mu       sync.Mutex
-	bindings []defsBindingView
+	bindings []broker.BindingView
 }
 
-func (b *defsFakeBroker) ListBindings() ([]defsBindingView, error) {
+func (b *defsFakeBroker) ListBindings() ([]broker.BindingView, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	return append([]defsBindingView(nil), b.bindings...), nil
+	return append([]broker.BindingView(nil), b.bindings...), nil
 }
 
-func (b *defsFakeBroker) seed(v defsBindingView) {
+func (b *defsFakeBroker) seed(v broker.BindingView) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	b.bindings = append(b.bindings, v)
@@ -1025,7 +1079,7 @@ func (b *defsFakeBroker) BindQueue(queue, exchange, rk string, args map[string]i
 	if err := b.UnifiedBroker.BindQueue(queue, exchange, rk, args); err != nil {
 		return err
 	}
-	b.seed(defsBindingView{Source: exchange, Destination: queue, DestinationType: "queue", RoutingKey: rk, Arguments: args})
+	b.seed(broker.BindingView{Source: exchange, Destination: queue, DestinationType: "queue", RoutingKey: rk, Arguments: args})
 	return nil
 }
 
@@ -1033,7 +1087,7 @@ func (b *defsFakeBroker) BindExchange(destination, source, rk string, args map[s
 	if err := b.UnifiedBroker.BindExchange(destination, source, rk, args); err != nil {
 		return err
 	}
-	b.seed(defsBindingView{Source: source, Destination: destination, DestinationType: "exchange", RoutingKey: rk, Arguments: args})
+	b.seed(broker.BindingView{Source: source, Destination: destination, DestinationType: "exchange", RoutingKey: rk, Arguments: args})
 	return nil
 }
 

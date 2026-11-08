@@ -687,7 +687,7 @@ func TestDefinitionsExport_NoHashesAndSubset(t *testing.T) {
 	if err := jsonUnmarshalStrict(monDoc["strangeq"], &monStrangeq); err != nil {
 		t.Fatalf("decode strangeq marker: %v", err)
 	}
-	for _, want := range []string{"users", "permissions", "bindings"} {
+	for _, want := range []string{"users", "permissions"} {
 		found := false
 		for _, got := range monStrangeq.ExcludedSections {
 			if got == want {
@@ -696,6 +696,13 @@ func TestDefinitionsExport_NoHashesAndSubset(t *testing.T) {
 		}
 		if !found {
 			t.Fatalf("excluded_sections must name %q, got %v", want, monStrangeq.ExcludedSections)
+		}
+	}
+	// The real broker implements the binding seam, so bindings are NOT an
+	// excluded section (WS5 finding 5).
+	for _, got := range monStrangeq.ExcludedSections {
+		if got == "bindings" {
+			t.Fatalf("bindings must not be excluded with the real seam: %v", monStrangeq.ExcludedSections)
 		}
 	}
 }

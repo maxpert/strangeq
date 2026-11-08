@@ -6,6 +6,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/maxpert/amqp-go/broker"
 	"github.com/maxpert/amqp-go/interfaces"
 )
 
@@ -189,26 +190,12 @@ const exportTimeFormat = "2006-01-02T15:04:05.000Z"
 
 // --- binding seam -----------------------------------------------------------
 
-// defsBindingView is the management view of one binding. It mirrors the fields
-// mgmt-04's broker.BindingView carries (Source/Destination/DestinationType/
-// RoutingKey/Arguments). It is declared locally so the definitions wave compiles
-// before the mgmt-04 binding seam is merged; when that seam lands, its adapter
-// is discovered through defsBindingLister below (an absent seam degrades to
-// bindings: [] plus an `excluded_sections` entry, per mgmt-05 §1).
-type defsBindingView struct {
-	Source          string
-	Destination     string
-	DestinationType string
-	RoutingKey      string
-	Arguments       map[string]interface{}
-}
-
-// defsBindingLister is the optional aggregate-binding seam. In a deployment
-// whose broker does not implement it, bindings are reported empty and disclosed
-// as an excluded section.
-type defsBindingLister interface {
-	ListBindings() ([]defsBindingView, error)
-}
+// The aggregate binding seam is broker.BindingView / ListBindings, declared by
+// BOB-4 (broker/management_bindings.go) and discovered here through the same
+// optional `bindingLister` interface handlers_bindings.go uses (snapshot.go).
+// Production's *server.StorageBrokerAdapter always implements it, so bindings
+// are exported; a custom UnifiedBroker without it degrades to `bindings: []`
+// plus an `excluded_sections` entry (mgmt-05 §1).
 
 // --- topology ---------------------------------------------------------------
 
@@ -218,7 +205,7 @@ type defsBindingLister interface {
 type defsTopology struct {
 	exchanges   map[string]defsExchange
 	queues      map[string]defsQueue
-	bindings    []defsBindingView
+	bindings    []broker.BindingView
 	bindingSeam bool
 }
 
@@ -253,7 +240,7 @@ func (s *Server) currentTopology() defsTopology {
 			Arguments:  q.Arguments,
 		}
 	}
-	if lister, ok := any(b).(defsBindingLister); ok {
+	if lister, ok := b.(bindingLister); ok {
 		if views, err := lister.ListBindings(); err == nil {
 			t.bindings = views
 			t.bindingSeam = true
@@ -291,8 +278,8 @@ type defsAction struct {
 	Vhost   string
 	Result  string
 	Reason  string
-	Binding *defsBindingView // set for binding actions (synthesised key included)
-	Key     string           // synthesised properties_key (bindings)
+	Binding *broker.BindingView // set for binding actions (synthesised key included)
+	Key     string              // synthesised properties_key (bindings)
 	rtype   interfaces.ResourceType
 	Apply   func() error
 }
@@ -429,7 +416,7 @@ func (s *Server) planDefinitions(p *definitionsPayload, cur defsTopology, caps d
 		// A binding whose identity cannot even be computed still carries the
 		// source/destination/properties_key it was given, so its failure item is
 		// as identifying as its skip item (§2.4 MUST).
-		view := &defsBindingView{Source: bn.Source, Destination: bn.Destination, DestinationType: bn.DestinationType, RoutingKey: bn.RoutingKey, Arguments: bn.Arguments}
+		view := &broker.BindingView{Source: bn.Source, Destination: bn.Destination, DestinationType: bn.DestinationType, RoutingKey: bn.RoutingKey, Arguments: bn.Arguments}
 		synth := propertiesKey(bn.RoutingKey, bn.Arguments)
 		if bn.DestinationType != "queue" && bn.DestinationType != "exchange" {
 			actions = append(actions, defsAction{Kind: defBinding, Name: bn.Destination, Vhost: "/", Result: "failed", Reason: "destination_type must be queue or exchange", Binding: view, Key: synth, rtype: interfaces.ResourceQueue})
