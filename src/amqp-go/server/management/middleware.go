@@ -132,8 +132,8 @@ func (s *Server) serveHTTP(w http.ResponseWriter, r *http.Request) {
 			"too many concurrent management requests", withHeader("Retry-After", "1")))
 		return
 	}
-	defer s.inflight.Add(-1)
 	s.sink.ManagementInFlight(int(s.inflight.Load()))
+	defer func() { s.sink.ManagementInFlight(int(s.inflight.Add(-1))) }()
 
 	if ae := negotiationError(r, strings.HasPrefix(path, "/api/definitions")); ae != nil {
 		s.writeAPIError(rw, r, ae)
