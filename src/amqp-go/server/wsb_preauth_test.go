@@ -150,7 +150,7 @@ func TestWSB_PreAuth_PendingLimitRefusesExcess(t *testing.T) {
 // handshake (not released at the protocol header), so a peer that sends 8
 // valid bytes and idles still occupies a bounded slot.
 func TestWSB_PreAuth_SlotHeldUntilOpenOK(t *testing.T) {
-	_, addr := startWSBServer(t, nil, func(s *Server) {
+	srv, addr := startWSBServer(t, nil, func(s *Server) {
 		s.pendingLimitOverride = 1
 	})
 
@@ -166,6 +166,11 @@ func TestWSB_PreAuth_SlotHeldUntilOpenOK(t *testing.T) {
 	tuneOK := make([]byte, 8)
 	r.send(0, 10, 31, tuneOK)
 
+	// The slot is held for this client until open-ok: wait for the accounting
+	// to settle before probing, so the refusal is not racing the accept.
+	require.Eventually(t, func() bool { return srv.pendingHandshakes.Load() == 1 },
+		2*time.Second, time.Millisecond, "first client's handshake slot must be held")
+
 	// Slot held: a second socket is refused.
 	second := dialSilentSocket(t, addr)
 	require.NoError(t, second.SetReadDeadline(time.Now().Add(1*time.Second)))
@@ -178,6 +183,12 @@ func TestWSB_PreAuth_SlotHeldUntilOpenOK(t *testing.T) {
 	require.NoError(t, err)
 	r.send(0, 10, 40, data)
 	r.expectMethod(10, 41) // open-ok
+
+	// open-ok is written BEFORE the server releases the slot, so waiting for the
+	// slot release here is the deterministic sync point: dialing immediately
+	// raced the async release (the CI flake).
+	require.Eventually(t, func() bool { return srv.pendingHandshakes.Load() == 0 },
+		2*time.Second, time.Millisecond, "slot must be released after open-ok")
 
 	conn, err := amqp.Dial("amqp://guest:guest@" + addr + "/")
 	require.NoError(t, err, "slot must be released after open-ok")

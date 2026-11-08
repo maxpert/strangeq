@@ -133,7 +133,11 @@ func TestDepthPark_ReturnsOnConnectionDone(t *testing.T) {
 
 	done := make(chan bool, 1)
 	go func() { done <- s.parkReaderWhileDepthBackpressured(conn) }()
-	time.Sleep(20 * time.Millisecond)
+	// Deterministic sync: wait until the goroutine has actually entered the
+	// park (it bumps publisherParkedNow before blocking) instead of guessing
+	// with a 20ms sleep. Closing Done then exercises the parked teardown path.
+	require.Eventually(t, func() bool { return s.publisherParkedNow.Load() == 1 },
+		5*time.Second, time.Millisecond, "the reader must enter the depth park before teardown")
 	close(conn.Done)
 	select {
 	case probing := <-done:

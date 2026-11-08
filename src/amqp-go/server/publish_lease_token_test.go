@@ -34,6 +34,7 @@ import (
 	"time"
 
 	"github.com/maxpert/amqp-go/protocol"
+	"github.com/stretchr/testify/require"
 )
 
 // ---- limiter grant path: tokens, not per-publish heap objects ----
@@ -254,14 +255,22 @@ func TestLeaseTokenConcurrentJoinsRaceClean(t *testing.T) {
 func TestLeaseFifoStrictOrderingUnchanged(t *testing.T) {
 	budget := leaseBytes(1024, 131072) // exactly one in-flight
 	l := NewPublishLimiter(budget)
+	// Serialize arrivals deterministically: BeforeReserve runs UNDER the limiter
+	// mutex, so the test controls the exact enqueue order. A wall-clock delay
+	// between launches cannot do that — on a loaded runner the goroutines reach
+	// Reserve out of launch order, which is the CI flake this replaces.
+	gate := newLimiterArrivalGate()
+	l.hooks = &LimiterHooks{BeforeReserve: gate.hook}
+
 	const nc = 4
 	res := make(chan protocol.PublishLeaseToken, nc)
 	var ord []int
 	var mu sync.Mutex
 	for i := 0; i < nc; i++ {
 		i := i
+		connID := "conn-" + string(rune('a'+i))
 		go func() {
-			tok, err := l.Reserve(context.Background(), "conn-"+string(rune('a'+i)), leaseBytes(1024, 131072))
+			tok, err := l.Reserve(context.Background(), connID, leaseBytes(1024, 131072))
 			mu.Lock()
 			ord = append(ord, i)
 			mu.Unlock()
@@ -269,7 +278,9 @@ func TestLeaseFifoStrictOrderingUnchanged(t *testing.T) {
 				res <- tok
 			}
 		}()
-		time.Sleep(2 * time.Millisecond) // deterministic arrival order
+		// Admit this arrival only after it has announced itself inside Reserve:
+		// enqueue order is exactly launch order, by construction.
+		require.Equal(t, connID, gate.admit(t), "arrival order must match launch order")
 	}
 	// Drain: releases grant strictly head-first.
 	for i := 0; i < nc; i++ {
@@ -363,7 +374,12 @@ func TestLeaseTokenCloseFailsWaitersOutstandingClean(t *testing.T) {
 		_, err := l.Reserve(context.Background(), "waiter", 1024)
 		errc <- err
 	}()
-	time.Sleep(10 * time.Millisecond)
+	// Wait until the waiter is actually QUEUED (not a wall-clock guess), so
+	// Close deterministically exercises the queued-waiter failure path.
+	require.Eventually(t, func() bool {
+		_, _, waiters := l.Stats()
+		return waiters == 1
+	}, 5*time.Second, time.Millisecond, "waiter must queue in the limiter before Close")
 	l.Close()
 	if err := <-errc; err != ErrLimiterClosed {
 		t.Fatalf("queued waiter err = %v, want ErrLimiterClosed", err)

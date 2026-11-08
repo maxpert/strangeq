@@ -569,11 +569,17 @@ func TestA2_AckProcessorNoGoroutineLeak(t *testing.T) {
 		t.Fatal("ackProcessor did not exit")
 	}
 
-	time.Sleep(100 * time.Millisecond)
-
-	after := runtime.NumGoroutine()
-	if leaked := after - before; leaked > 1 {
-		t.Errorf("goroutine leak: before=%d, after=%d, leaked=%d", before, after, leaked)
+	// The ackProcessor has already exited (done closed above). Wait, bounded, for
+	// the goroutine count to settle instead of a fixed 100ms sleep; fail clearly
+	// with the observed counts if it never does.
+	leakDeadline := time.Now().Add(5 * time.Second)
+	for runtime.NumGoroutine()-before > 1 {
+		if time.Now().After(leakDeadline) {
+			t.Errorf("goroutine leak: before=%d, after=%d, leaked=%d",
+				before, runtime.NumGoroutine(), runtime.NumGoroutine()-before)
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
 	}
 }
 

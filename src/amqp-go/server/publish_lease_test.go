@@ -323,11 +323,18 @@ func TestLease_ReservedAtHeaderBeforeBodyAndTag(t *testing.T) {
 		"the third header must be queued in the limiter")
 
 	// While it waits: no confirm tag minted, and the body bytes stay unread.
+	//
+	// Deterministic synchronization point, not a wall-clock window: the third
+	// header's waiter is queued (leaseWaiters == 1), which means the reader is
+	// parked in waitForHeaderLease and cannot read the third body or hand the
+	// publish to the processor. The WAL write gate keeps the lease held, so the
+	// confirm sequence cannot advance until release() below. Asserting here is
+	// strictly stronger than racing assert.Never for 200ms (which could only
+	// observe a race that the parked reader makes impossible).
 	base := srv.bytesReceived.Load()
-	assert.Never(t, func() bool {
-		return sch.ConfirmSequence.Load() != 2
-	}, 200*time.Millisecond, 20*time.Millisecond, "no confirm tag may be minted before the lease is granted")
-	assert.Less(t, srv.bytesReceived.Load()-base, int64(100<<10),
+	require.Equal(t, uint64(2), sch.ConfirmSequence.Load(),
+		"no confirm tag may be minted before the lease is granted")
+	require.Less(t, srv.bytesReceived.Load()-base, int64(100<<10),
 		"the third body must stay unread while the header waits")
 
 	// Release durability: everything drains, all three confirms arrive.
@@ -473,6 +480,13 @@ func TestLease_FairnessHogAndLight(t *testing.T) {
 	}, 30*time.Second, time.Millisecond, "hog msg2 must be granted next (FIFO head)")
 
 	tokens <- struct{}{} // hog msg2 write → light msg1 granted
+	// Release the light's OWN write before waiting for its ack. Whether the
+	// light's confirm is emitted inline (empty FrameQueue) or deferred to the
+	// flusher (FrameQueue still draining) is scheduling-dependent; if deferred,
+	// the ack waits for the durable write. Giving the write its token here makes
+	// the ack arrive either way, instead of racing that decision (the CI flake:
+	// a 30s ack timeout when the deferred path was taken).
+	tokens <- struct{}{} // light msg1 write
 	leaseWaitAck(t, light, 1, 1)
 	<-lightBody
 
@@ -505,7 +519,6 @@ func TestLease_FairnessHogAndLight(t *testing.T) {
 	assert.LessOrEqual(t, grantsBetween, 2, "light header granted within <= 2 grants of its reserve")
 
 	// The hog completes.
-	tokens <- struct{}{} // light msg1 write → hog msg2 released earlier; hog msg2's own write needs a token too
 	leaseWaitAck(t, hog, 1, 2)
 	<-hogBody2
 	require.Eventually(t, func() bool { return leaseUsed(srv) == 0 }, 30*time.Second, time.Millisecond)

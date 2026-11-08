@@ -8,6 +8,7 @@ import (
 
 	"github.com/maxpert/amqp-go/config"
 	"github.com/maxpert/amqp-go/protocol"
+	"github.com/stretchr/testify/require"
 	"go.uber.org/zap"
 )
 
@@ -290,12 +291,16 @@ func TestP0_WriteErrorRequeuesDeliveries(t *testing.T) {
 	conn.Channels.Store(uint16(1), ch)
 
 	// Start the delivery loop
+	rt := srv.runtimeFor(conn)
 	done := make(chan struct{})
 	conn.ConsumersDirty.Store(true)
-	go func() { srv.consumerDeliveryLoop(srv.runtimeFor(conn)); close(done) }()
+	go func() { srv.consumerDeliveryLoop(rt); close(done) }()
 
-	// Wait for consumer discovery
-	time.Sleep(100 * time.Millisecond)
+	// Wait for consumer discovery deterministically: the loop registers one
+	// forwarder goroutine per consumer on rt, so a live count of 1 means the
+	// consumer is discovered and its forwarder is running (no sleep needed).
+	require.Eventually(t, func() bool { return rt.liveGoroutines.Load() == 1 },
+		5*time.Second, time.Millisecond, "the consumer must be discovered before the delivery is sent")
 
 	// Send a delivery to the consumer's Messages channel
 	ch.Consumers["consumer-a"].Messages <- &protocol.Delivery{
