@@ -114,7 +114,7 @@ func mgmtScrapeCounter(t *testing.T, g prometheus.Gatherer, name string, labels 
 
 // TestManagementShedLoad_CountedAsPreRoute5xx (OPS-062, spec 06 §3.1): a request
 // refused by the in-flight cap is a 5xx and MUST be visible in
-// amqp_management_requests_total{status_class="5xx"}. It is shed before routing,
+// amqp_management_requests_total{status_class="5"}. It is shed before routing,
 // so its endpoint label is the bounded sentinel "pre_route" (OPS-004), never the
 // raw path. Before the fix the early return was uncounted, so the family was
 // blind to exactly the shed-load event OPS-062 exists to expose.

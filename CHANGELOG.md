@@ -35,6 +35,16 @@
 - A binding was counted as removed even when `DeleteBinding`/`DeleteExchangeBinding`
   returned an error, so `object_totals.bindings` could fall below `len(ListBindings())`.
   Only a successful delete now contributes to the binding delta.
+- The management `POST /api/exchanges/{vhost}/{name}/publish` endpoint now applies the full
+  `basic.properties` set, so `properties.delivery_mode: 2` produces a persistent message that
+  survives a restart (previously transient even on a durable queue); the raw properties map is
+  no longer copied into message headers.
+- Management requests refused before routing (the in-flight shed-load 503) are now counted in
+  `amqp_management_requests_total` under `status_class="5"` with the bounded `pre_route`
+  endpoint, instead of being invisible to the counter.
+- A delivery drained into the fan-in extras slice whose consumer had been removed is now
+  counted as `amqp_deliveries_dropped_total{reason="consumer_removed"}` rather than dropped
+  silently.
 
 ## [0.12.0] - 2026-11-07
 

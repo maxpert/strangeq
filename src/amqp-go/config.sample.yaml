@@ -356,3 +356,130 @@ telemetry:
   # Register /debug/pprof/* and enable mutex/block profiling (also
   # --enable-pprof). Heap/goroutine dumps are unauthenticated: loopback only.
   pprofenabled: false
+
+# ============================================================================
+# Management (control plane: REST API + embedded web UI)
+# ============================================================================
+# OFF BY DEFAULT and loopback-only by default (SEC-001/002). Enable with
+# management.enabled or the --management flag. The surface refuses to start on
+# an unsafe authentication combination rather than degrading silently, and logs
+# startup security warnings before it is exposed. See docs/MANAGEMENT.md.
+#
+# Keys are written in the loader's concatenated spelling (every segment is
+# lower-cased and underscores are dropped before binding), matching the rest of
+# this file.
+management:
+  # Enable the management REST API and web UI (default false).
+  enabled: false
+
+  # Bind address. Loopback by default; a non-loopback bind without TLS is
+  # refused unless deliberately allowed (SEC-110).
+  address: "127.0.0.1"
+
+  # HTTP port (RabbitMQ's management default: 15672).
+  port: 15672
+
+  # Node name reported by the API ("amqp-go@<hostname>" when empty).
+  nodename: ""
+
+  # Authentication: inherit | basic | none.
+  #   inherit = reuse the broker's authentication. With broker auth disabled it
+  #             additionally requires allowunauthenticated: true and a loopback
+  #             bind (AUTH-002/040).
+  #   basic   = a single HTTP Basic principal configured under basic.*.
+  #   none    = no authentication; loopback bind only (SEC-111).
+  authentication: inherit
+
+  # Permit unauthenticated loopback reads ("inherit" mode, broker auth off).
+  allowunauthenticated: false
+  # Permit unauthenticated loopback topology mutations (AUTH-041).
+  allowunauthenticatedmutations: false
+  # Permit the connection-close endpoint (AUTH-015).
+  allowconnectionclose: false
+
+  # Users granted administrator-equivalent capabilities (tags).
+  adminusers: []
+  # Reverse proxies whose forwarded client address may be trusted (CIDRs/IPs;
+  # an entry that forwards no client address fails closed) (SEC-112).
+  trustedproxies: []
+
+  # Single basic-auth principal (used when authentication: basic).
+  basic:
+    username: ""
+    # A bcrypt hash, never a plaintext password (AUTH-003).
+    passwordhash: ""
+    # Grant this principal administrator-equivalent capabilities (AUTH-042).
+    admin: false
+
+  # TLS for the management listener.
+  tls:
+    enabled: false
+    certfile: ""
+    keyfile: ""
+    # Client mTLS is refused until a certificate-to-identity mapping exists
+    # (OQ-015).
+    cafile: ""
+
+  # Cross-origin access. Empty means CORS is off; "*" is forbidden (SEC-094).
+  cors:
+    allowedorigins: []
+
+  # Server-side sessions.
+  session:
+    # Idle session timeout (seconds; default 28800 = 8 h).
+    idletimeoutseconds: 28800
+    # Maximum concurrent sessions (default 1024).
+    maxsessions: 1024
+
+  # Request/response limits (each must be positive once enabled).
+  limits:
+    # Largest page size a client may request (default 500).
+    maxpagesize: 500
+    # Per-request deadline (seconds).
+    requesttimeoutseconds: 30
+    # Concurrent in-flight requests before shed-load 503s (default 64; SEC-061).
+    maxinflight: 64
+    # Request body cap for non-import requests (bytes; default 2 MiB).
+    maxbodybytes: 2097152
+    # Request body cap for definitions imports (bytes; default 20 MiB).
+    maximportbodybytes: 20971520
+    # Response body cap (bytes; default 4 MiB).
+    maxresponsebytes: 4194304
+    # Cap on an entity name in bytes (default 256; SEC-085).
+    maxnamebytes: 256
+
+  # Fixed-window rate limits (requests per window; 0 = unlimited; SEC-067/068/069).
+  rate_limits:
+    publish: 0
+    get: 0
+    purge: 0
+    declare: 0
+    # One definitions import per principal per N seconds (0 disables; SEC-067).
+    definitionsimportseconds: 10
+
+  # Definition-import size caps (0 = unlimited; COMPAT-027).
+  definitions:
+    maxqueues: 0
+    maxexchanges: 0
+    maxbindings: 0
+
+  # Async job pool for large snapshot/import operations.
+  async:
+    # Spill to an async job past this many messages (default 10000).
+    messagethreshold: 10000
+    # Spill to an async job past this many entities (default 1000).
+    entitythreshold: 1000
+    # Maximum concurrent async jobs (default 128).
+    maxjobs: 128
+    # How long a completed job is retained (seconds).
+    jobretentionseconds: 3600
+
+  # Message-preview (bulk get) bounds.
+  get:
+    # Maximum messages one get returns (default 100).
+    maxcount: 100
+
+  # Audit log (non-destructive records may drop; destructive never do; SEC-084).
+  audit:
+    logfile: ""
+
