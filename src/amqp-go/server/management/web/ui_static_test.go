@@ -2,12 +2,14 @@ package web
 
 import (
 	"encoding/json"
+	"fmt"
 	"go/ast"
 	"go/parser"
 	"go/token"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
@@ -140,43 +142,186 @@ var webConsumedRoutes = []string{
 	"/api/definitions",
 }
 
-// TestUI_RoutesMatchAPI parses the real management API route table source
-// (../routes.go) with go/parser and asserts every path template the SPA calls
-// still exists there, so a rename on either side breaks a test. The API package
-// is owned by a separate stream and may not be present in every worktree; when
-// the route-table source is absent the test skips rather than fabricating a
-// contract. The composed real-mux assertion is a lead integration item.
-func TestUI_RoutesMatchAPI(t *testing.T) {
-	const routesSrc = "../routes.go"
-	if _, err := os.Stat(routesSrc); err != nil {
-		t.Skipf("management API route table %s not present in this worktree (owned by a separate stream): %v", routesSrc, err)
-	}
-	fset := token.NewFileSet()
-	file, err := parser.ParseFile(fset, routesSrc, nil, 0)
+// scanAPIRouteSources globs dir/*.go, parses each file, and returns the union
+// of string literals beginning "/api/" that appear as arguments to a route
+// registration call (get/post/put/del/add/addPublic). Restricting the scan to
+// registration call arguments means a stale top-level literal such as
+// `var legacy = "/api/queues"` cannot mask a removed registration.
+//
+// files is the number of .go files matched: zero means the API package is not
+// present at all, so the caller may skip; a non-zero files with an empty routes
+// set means the route table was renamed/refactored and the contract must be
+// updated (the caller fails).
+func scanAPIRouteSources(dir string) (routes map[string]bool, files int, err error) {
+	matches, err := filepath.Glob(filepath.Join(dir, "*.go"))
 	if err != nil {
-		t.Fatalf("parse %s: %v", routesSrc, err)
+		return nil, 0, err
 	}
-	have := map[string]bool{}
-	ast.Inspect(file, func(n ast.Node) bool {
-		lit, ok := n.(*ast.BasicLit)
-		if !ok || lit.Kind != token.STRING {
+	routes = map[string]bool{}
+	for _, m := range matches {
+		fset := token.NewFileSet()
+		file, perr := parser.ParseFile(fset, m, nil, 0)
+		if perr != nil {
+			return nil, files, perr
+		}
+		files++
+		ast.Inspect(file, func(n ast.Node) bool {
+			call, ok := n.(*ast.CallExpr)
+			if !ok || !isRouteRegistration(call.Fun) {
+				return true
+			}
+			for _, arg := range call.Args {
+				lit, ok := arg.(*ast.BasicLit)
+				if !ok || lit.Kind != token.STRING {
+					continue
+				}
+				s, uerr := strconv.Unquote(lit.Value)
+				if uerr != nil {
+					continue
+				}
+				if strings.HasPrefix(s, "/api/") {
+					routes[s] = true
+				}
+			}
 			return true
-		}
-		s, err := strconv.Unquote(lit.Value)
-		if err != nil {
-			return true
-		}
-		if strings.HasPrefix(s, "/api/") {
-			have[s] = true
-		}
-		return true
-	})
-	if len(have) == 0 {
-		t.Fatalf("%s parsed but no /api route templates were found", routesSrc)
+		})
+	}
+	return routes, files, nil
+}
+
+// isRouteRegistration reports whether fn names one of the route-registration
+// helpers used by buildRouter (a bare ident or an rt.add-style selector).
+func isRouteRegistration(fn ast.Expr) bool {
+	names := map[string]bool{"get": true, "post": true, "put": true, "del": true, "add": true, "addPublic": true}
+	switch f := fn.(type) {
+	case *ast.Ident:
+		return names[f.Name]
+	case *ast.SelectorExpr:
+		return names[f.Sel.Name]
+	}
+	return false
+}
+
+// TestUI_RoutesMatchAPI parses every .go file in the parent API package and
+// asserts every path template the SPA calls is still registered there, so a
+// rename on either side breaks a test. A missing package (no .go at all) skips;
+// a present package whose route registrations are gone fails rather than
+// silently skipping. The composed real-mux assertion is a lead integration
+// item.
+func TestUI_RoutesMatchAPI(t *testing.T) {
+	routes, files, err := scanAPIRouteSources("..")
+	if err != nil {
+		t.Fatalf("scan ../*.go: %v", err)
+	}
+	if skip, cerr := routeContractError(routes, files); cerr != nil {
+		t.Fatal(cerr)
+	} else if skip {
+		t.Skip("management API package not present in this worktree (owned by a separate stream)")
 	}
 	for _, r := range webConsumedRoutes {
-		if !have[r] {
+		if !routes[r] {
 			t.Errorf("the SPA consumes %q but the API route table no longer registers it", r)
 		}
+	}
+}
+
+// routeContractError decides the outcome of TestUI_RoutesMatchAPI from the scan
+// result: no .go files at all means the API package is absent, so skip; a
+// present package with no /api registrations means the route table was renamed
+// or refactored, so fail; otherwise the contract applies.
+func routeContractError(routes map[string]bool, files int) (skip bool, err error) {
+	if files == 0 {
+		return true, nil
+	}
+	if len(routes) == 0 {
+		return false, fmt.Errorf("%d .go files parsed but no /api route registrations were found: the route table was renamed or refactored and this contract must be updated", files)
+	}
+	return false, nil
+}
+
+// TestScanAPIRouteSources pins the parser's behaviour with temp-dir fixtures:
+// an empty directory yields no files (skip), a differently named file with
+// registrations is found, a file with no /api literals yields nothing (fatal),
+// and a stale non-registration literal does not count as a route.
+func TestScanAPIRouteSources(t *testing.T) {
+	t.Run("empty directory", func(t *testing.T) {
+		routes, files, err := scanAPIRouteSources(t.TempDir())
+		if err != nil {
+			t.Fatalf("scan: %v", err)
+		}
+		if files != 0 || len(routes) != 0 {
+			t.Fatalf("want 0 files / 0 routes, got %d / %d", files, len(routes))
+		}
+		if skip, cerr := routeContractError(routes, files); !skip || cerr != nil {
+			t.Fatalf("an empty package must skip: skip=%v err=%v", skip, cerr)
+		}
+	})
+	t.Run("renamed file registers routes", func(t *testing.T) {
+		dir := t.TempDir()
+		writeGoFixture(t, dir, "zz_custom_routes.go", `package fake
+
+func wire() {
+	get("/api/queues")
+	rt.add("GET", "/api/exchanges/{vhost}/{name}")
+}
+`)
+		routes, files, err := scanAPIRouteSources(dir)
+		if err != nil {
+			t.Fatalf("scan: %v", err)
+		}
+		if files != 1 {
+			t.Fatalf("want 1 file, got %d", files)
+		}
+		if !routes["/api/queues"] || !routes["/api/exchanges/{vhost}/{name}"] {
+			t.Fatalf("registrations not found: %v", routes)
+		}
+		if skip, cerr := routeContractError(routes, files); skip || cerr != nil {
+			t.Fatalf("a present package must be checked: skip=%v err=%v", skip, cerr)
+		}
+	})
+	t.Run("no api literals", func(t *testing.T) {
+		dir := t.TempDir()
+		writeGoFixture(t, dir, "x.go", `package fake
+
+var nope = "/not-api"
+`)
+		routes, files, err := scanAPIRouteSources(dir)
+		if err != nil {
+			t.Fatalf("scan: %v", err)
+		}
+		if files != 1 || len(routes) != 0 {
+			t.Fatalf("want 1 file / 0 routes, got %d / %d", files, len(routes))
+		}
+		if skip, cerr := routeContractError(routes, files); skip || cerr == nil {
+			t.Fatalf("a present package with no routes must fail, not skip: skip=%v err=%v", skip, cerr)
+		}
+	})
+	t.Run("stale literal is not a route", func(t *testing.T) {
+		dir := t.TempDir()
+		writeGoFixture(t, dir, "r.go", `package fake
+
+var legacy = "/api/queues"
+
+func wire() {
+	get("/api/exchanges")
+}
+`)
+		routes, _, err := scanAPIRouteSources(dir)
+		if err != nil {
+			t.Fatalf("scan: %v", err)
+		}
+		if routes["/api/queues"] {
+			t.Fatal("a stale non-registration literal must not count as a registered route")
+		}
+		if !routes["/api/exchanges"] {
+			t.Fatalf("the real registration was missed: %v", routes)
+		}
+	})
+}
+
+func writeGoFixture(t *testing.T, dir, name, src string) {
+	t.Helper()
+	if err := os.WriteFile(filepath.Join(dir, name), []byte(src), 0o600); err != nil {
+		t.Fatalf("write fixture %s: %v", name, err)
 	}
 }

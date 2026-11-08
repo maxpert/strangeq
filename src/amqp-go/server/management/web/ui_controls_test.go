@@ -91,16 +91,20 @@ func TestUI_QueuesPagination(t *testing.T) {
 	}
 }
 
-// TestUI_PaginationUnknownTotal (FR-UI-005/FR-UI-100) proves a list whose
-// envelope has no total_count renders an em-dash / "unknown", never a
-// fabricated 0.
+// TestUI_PaginationUnknownTotal (FR-UI-005/FR-UI-100) proves an envelope whose
+// total_count is absent renders an em-dash / "unknown", never a fabricated 0.
 func TestUI_PaginationUnknownTotal(t *testing.T) {
 	stub := newStub()
+	stub.set(func(s *stubAPI) {
+		s.queues = makeQueues(50)
+		s.queueTotal = 120
+		s.omitTotal = true
+	})
 	srv := appServer(t, stub)
 	ctx, cancel := newTab(t)
 	defer cancel()
 
-	mustDo(t, ctx, chromedp.Navigate(srv.URL+"/nodes"), chromedp.WaitVisible(chromedp.CSS(".pagination .pagination-total")))
+	mustDo(t, ctx, chromedp.Navigate(srv.URL+"/queues"), chromedp.WaitVisible(chromedp.CSS(".pagination .pagination-total")))
 	got := mustRun(t, ctx, chromedp.Text(chromedp.CSS(".pagination .pagination-total")))
 	if !strings.Contains(got, "unknown") || !strings.Contains(got, "\u2014") {
 		t.Fatalf("missing total_count must render an em-dash and %q, got %q", "unknown", got)
@@ -345,21 +349,15 @@ func TestUI_QueueEditorArgsAndNameValidation(t *testing.T) {
 	}
 }
 
-// TestUI_MiscControls (S1/S2/S7 + copy affordances) proves the remaining cheap
-// SHOULD features exist: the /metrics link, a publish properties editor,
-// per-message and deep-link copy affordances, and a per-row Close column.
+// TestUI_MiscControls (S2/S7 + copy affordances) proves the remaining cheap
+// SHOULD features exist: a publish properties editor, per-message and
+// deep-link copy affordances, and a per-row Close column. (The /metrics link is
+// config-driven and covered by TestUI_MetricsLink.)
 func TestUI_MiscControls(t *testing.T) {
 	stub := newStub()
 	srv := appServer(t, stub)
 	ctx, cancel := newTab(t)
 	defer cancel()
-
-	// S1: /metrics link from the overview (must not be swallowed by the SPA
-	// router, so it opens in a new tab).
-	mustDo(t, ctx, chromedp.Navigate(srv.URL+"/"), chromedp.WaitVisible(chromedp.CSS("#top-queues")))
-	if n := mustRun(t, ctx, chromedp.Evaluate[int](`document.querySelectorAll('a[href="/metrics"][target="_blank"]').length`)); n != 1 {
-		t.Errorf("overview must expose a /metrics link, found %d", n)
-	}
 
 	// S2: a per-row Close column on the connections list.
 	mustDo(t, ctx, chromedp.Navigate(srv.URL+"/connections"), chromedp.WaitVisible(chromedp.CSS("#content tbody tr")))

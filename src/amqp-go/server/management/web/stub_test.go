@@ -35,6 +35,24 @@ type stubAPI struct {
 	queues      []map[string]any
 	overview    map[string]any
 
+	// Item overrides for the list endpoints so a test can install >1 row and
+	// observe server-side reversal (sort_reverse=true).
+	exchangeItems   []map[string]any
+	connectionItems []map[string]any
+	channelItems    []map[string]any
+	consumerItems   []map[string]any
+	userItems       []map[string]any
+
+	// versionFail makes GET /api/strangeq/version return 500, so a test can
+	// exercise the "capability unknown" path. omitTotal makes the paged queues
+	// envelope omit total_count, exercising the em-dash/unknown indicator.
+	versionFail bool
+	omitTotal   bool
+
+	// reqLog records every request's endpoint kind and raw query string, so a
+	// test can assert on the parameters a screen actually sent.
+	reqLog []recordedReq
+
 	// healthStatus / healthReason drive GET /api/health so a test can flip the
 	// broker alarm state deterministically.
 	healthStatus string
@@ -53,7 +71,40 @@ type stubAPI struct {
 	hits             atomic.Int64
 }
 
+// recordedReq is one observed request: the endpoint kind (the segment after
+// /api/) and its raw query string.
+type recordedReq struct {
+	kind string
+	raw  string
+}
+
 func (s *stubAPI) hitCount() int64 { return s.hits.Load() }
+
+// queriesFor returns the raw query strings of every request for an endpoint.
+func (s *stubAPI) queriesFor(kind string) []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]string, 0, len(s.reqLog))
+	for _, e := range s.reqLog {
+		if e.kind == kind {
+			out = append(out, e.raw)
+		}
+	}
+	return out
+}
+
+// querySeen reports whether any request for the endpoint carried substr.
+func (s *stubAPI) querySeen(kind, substr string) bool {
+	for _, q := range s.queriesFor(kind) {
+		if strings.Contains(q, substr) {
+			return true
+		}
+	}
+	return false
+}
+
+// queryCount counts requests for an endpoint.
+func (s *stubAPI) queryCount(kind string) int { return len(s.queriesFor(kind)) }
 
 // queuePageSeen reports whether the queues list was requested for page n.
 func (s *stubAPI) queuePageSeen(n int) bool {
@@ -176,6 +227,9 @@ func (s *stubAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	kind := segs[1]
+	s.mu.Lock()
+	s.reqLog = append(s.reqLog, recordedReq{kind: kind, raw: r.URL.RawQuery})
+	s.mu.Unlock()
 
 	switch kind {
 	case "whoami":
@@ -206,7 +260,13 @@ func (s *stubAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if len(segs) >= 3 && segs[2] == "version" {
-			if s.getFail(w, r) {
+			s.mu.Lock()
+			fail := s.versionFail
+			s.mu.Unlock()
+			if fail || s.getFail(w, r) {
+				if fail {
+					writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "internal_error", "reason": "version unavailable"})
+				}
 				return
 			}
 			s.mu.Lock()
@@ -253,13 +313,25 @@ func (s *stubAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case "connections":
 		s.handleConnections(w, r, segs)
 	case "channels":
-		writeRead(w, r, envelope([]map[string]any{
-			{"number": 1, "connection": "c1", "user": "guest", "vhost": "/", "state": "running", "consumers": 1, "unacked": nil, "prefetch_count": nil, "confirm": true, "transactional": nil, "stats_partial": true},
-		}, 1))
+		s.mu.Lock()
+		chItems := s.channelItems
+		s.mu.Unlock()
+		if chItems == nil {
+			chItems = []map[string]any{
+				{"number": 1, "connection": "c1", "user": "guest", "vhost": "/", "state": "running", "consumers": 1, "unacked": nil, "prefetch_count": nil, "confirm": true, "transactional": nil, "stats_partial": true},
+			}
+		}
+		writeRead(w, r, envelope(maybeReverse(r, chItems), len(chItems)))
 	case "consumers":
-		writeRead(w, r, envelope([]map[string]any{
-			{"consumer_tag": "ctag-1", "queue": "orders", "channel": nil, "connection": nil, "ack_required": true, "exclusive": false, "prefetch_count": 10, "arguments": map[string]any{}, "unacked": nil},
-		}, 1))
+		s.mu.Lock()
+		coItems := s.consumerItems
+		s.mu.Unlock()
+		if coItems == nil {
+			coItems = []map[string]any{
+				{"consumer_tag": "ctag-1", "queue": "orders", "channel": nil, "connection": nil, "ack_required": true, "exclusive": false, "prefetch_count": 10, "arguments": map[string]any{}, "unacked": nil},
+			}
+		}
+		writeRead(w, r, envelope(maybeReverse(r, coItems), len(coItems)))
 	case "bindings":
 		s.mu.Lock()
 		notImpl := s.bindings501
@@ -279,12 +351,16 @@ func (s *stubAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case "users":
 		s.mu.Lock()
 		forbidden := s.users403
+		userItems := s.userItems
 		s.mu.Unlock()
 		if forbidden {
 			writeJSON(w, http.StatusForbidden, map[string]any{"error": "access_refused", "reason": "capability manage_users is required"})
 			return
 		}
-		writeRead(w, r, []map[string]any{{"name": "guest", "tags": []string{"administrator"}}})
+		if userItems == nil {
+			userItems = []map[string]any{{"name": "guest", "tags": []string{"administrator"}}}
+		}
+		writeRead(w, r, userItems)
 	case "permissions":
 		s.mu.Lock()
 		forbidden := s.users403
@@ -395,7 +471,9 @@ func (s *stubAPI) handleQueues(w http.ResponseWriter, r *http.Request, segs []st
 		qs := s.queues
 		total := s.queueTotal
 		pageCount := s.queuePageCount
+		omitTotal := s.omitTotal
 		s.mu.Unlock()
+		qs = maybeReverse(r, qs)
 		if total > 0 {
 			page := atoiDefault(r.URL.Query().Get("page"), 1)
 			size := atoiDefault(r.URL.Query().Get("page_size"), 50)
@@ -405,10 +483,15 @@ func (s *stubAPI) handleQueues(w http.ResponseWriter, r *http.Request, segs []st
 			if pageCount <= 0 {
 				pageCount = (total + size - 1) / size
 			}
-			writeRead(w, r, map[string]any{
+			env := map[string]any{
 				"items": qs, "total_count": total, "item_count": len(qs), "filtered_count": total,
 				"page": page, "page_size": size, "page_count": pageCount,
-			})
+			}
+			if omitTotal {
+				delete(env, "total_count")
+				delete(env, "filtered_count")
+			}
+			writeRead(w, r, env)
 			return
 		}
 		writeRead(w, r, envelope(qs, len(qs)))
@@ -477,11 +560,17 @@ func (s *stubAPI) handleQueues(w http.ResponseWriter, r *http.Request, segs []st
 
 func (s *stubAPI) handleExchanges(w http.ResponseWriter, r *http.Request, segs []string) {
 	if len(segs) == 2 {
-		writeRead(w, r, envelope([]map[string]any{
-			{"name": "", "vhost": "/", "type": "direct", "durable": true, "auto_delete": false, "internal": false, "arguments": map[string]any{}},
-			{"name": "amq.topic", "vhost": "/", "type": "topic", "durable": true, "auto_delete": false, "internal": false, "arguments": map[string]any{}},
-			{"name": "custom", "vhost": "/", "type": "fanout", "durable": false, "auto_delete": false, "internal": false, "arguments": map[string]any{}},
-		}, 3))
+		s.mu.Lock()
+		items := s.exchangeItems
+		s.mu.Unlock()
+		if items == nil {
+			items = []map[string]any{
+				{"name": "", "vhost": "/", "type": "direct", "durable": true, "auto_delete": false, "internal": false, "arguments": map[string]any{}},
+				{"name": "amq.topic", "vhost": "/", "type": "topic", "durable": true, "auto_delete": false, "internal": false, "arguments": map[string]any{}},
+				{"name": "custom", "vhost": "/", "type": "fanout", "durable": false, "auto_delete": false, "internal": false, "arguments": map[string]any{}},
+			}
+		}
+		writeRead(w, r, envelope(maybeReverse(r, items), len(items)))
 		return
 	}
 	if len(segs) >= 4 {
@@ -519,9 +608,15 @@ func (s *stubAPI) handleExchanges(w http.ResponseWriter, r *http.Request, segs [
 
 func (s *stubAPI) handleConnections(w http.ResponseWriter, r *http.Request, segs []string) {
 	if len(segs) == 2 {
-		writeRead(w, r, envelope([]map[string]any{
-			{"name": "c1", "user": "guest", "vhost": "/", "state": "running", "channels": 1, "protocol": "AMQP 0-9-1", "host": "127.0.0.1", "peer_host": "127.0.0.1", "peer_port": 5000, "connected_at": "2026-11-08T00:00:00Z", "last_activity": "2026-11-08T00:00:01Z", "timeout": nil, "recv_oct": nil, "send_oct": nil, "channels_detail": nil},
-		}, 1))
+		s.mu.Lock()
+		items := s.connectionItems
+		s.mu.Unlock()
+		if items == nil {
+			items = []map[string]any{
+				{"name": "c1", "user": "guest", "vhost": "/", "state": "running", "channels": 1, "protocol": "AMQP 0-9-1", "host": "127.0.0.1", "peer_host": "127.0.0.1", "peer_port": 5000, "connected_at": "2026-11-08T00:00:00Z", "last_activity": "2026-11-08T00:00:01Z", "timeout": nil, "recv_oct": nil, "send_oct": nil, "channels_detail": nil},
+			}
+		}
+		writeRead(w, r, envelope(maybeReverse(r, items), len(items)))
 		return
 	}
 	if len(segs) == 4 && segs[3] == "channels" {
@@ -542,6 +637,20 @@ func (s *stubAPI) handleConnections(w http.ResponseWriter, r *http.Request, segs
 		}
 	}
 	writeJSON(w, http.StatusNotFound, map[string]any{"error": "not_found"})
+}
+
+// maybeReverse returns items reversed when the request asked for
+// sort_reverse=true, modelling a server that honours the sort direction, so a
+// test can observe the order the SPA rendered.
+func maybeReverse(r *http.Request, items []map[string]any) []map[string]any {
+	if r.URL.Query().Get("sort_reverse") != "true" || len(items) < 2 {
+		return items
+	}
+	out := make([]map[string]any, len(items))
+	for i := range items {
+		out[i] = items[len(items)-1-i]
+	}
+	return out
 }
 
 func envelope(items any, total int) map[string]any {
