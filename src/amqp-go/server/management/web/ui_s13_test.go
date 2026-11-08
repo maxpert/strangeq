@@ -115,6 +115,15 @@ func TestUI_S13_DefinitionsDryRunThenConfirm(t *testing.T) {
 	if !seenApply {
 		t.Fatalf("Confirm import must issue a POST without dry_run; posts=%v", stub.postQueriesFor("definitions"))
 	}
+	// The SAME bytes must reach both endpoints: the apply body equals the
+	// dry-run body verbatim.
+	bodies := stub.definitionsBodies()
+	if len(bodies) < 2 {
+		t.Fatalf("want a dry-run POST and an apply POST, got %d", len(bodies))
+	}
+	if bodies[0] != bodies[1] {
+		t.Fatalf("apply body differs from the dry-run body:\ndry=%q\napply=%q", bodies[0], bodies[1])
+	}
 }
 
 // TestUI_S13_DefinitionsImportErrors surfaces the 413 and 429 reasons verbatim

@@ -73,6 +73,7 @@ type stubAPI struct {
 	defsSkipped      []map[string]any
 	defsFailed       []map[string]any
 	lastDefsBody     string
+	defsBodies       []string
 
 	declared         []string
 	lastQueueDeclare map[string]any
@@ -210,6 +211,14 @@ func (s *stubAPI) lastDefinitionsBody() string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.lastDefsBody
+}
+
+// definitionsBodies returns every raw import POST body in arrival order
+// (dry-run first, then apply).
+func (s *stubAPI) definitionsBodies() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]string(nil), s.defsBodies...)
 }
 
 func pathSegments(r *http.Request) []string {
@@ -411,6 +420,7 @@ func (s *stubAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			status := s.defsImportStatus
 			applied, skipped, failed := s.defsApplied, s.defsSkipped, s.defsFailed
 			s.lastDefsBody = string(body)
+			s.defsBodies = append(s.defsBodies, string(body))
 			s.mu.Unlock()
 			switch status {
 			case http.StatusRequestEntityTooLarge:
