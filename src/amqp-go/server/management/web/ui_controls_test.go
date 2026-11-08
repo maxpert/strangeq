@@ -91,8 +91,10 @@ func TestUI_QueuesPagination(t *testing.T) {
 	}
 }
 
-// TestUI_PaginationUnknownTotal (FR-UI-005/FR-UI-100) proves an envelope whose
-// total_count is absent renders an em-dash / "unknown", never a fabricated 0.
+// TestUI_PaginationUnknownTotal is the FR-UI-005 regression guard: an envelope
+// whose total_count is absent renders an em-dash / "unknown" and marks the
+// total unknown, never a fabricated 0. (The bare-array "N rows" behaviour is
+// pinned separately by TestUI_BareArrayListsNotPaged.)
 func TestUI_PaginationUnknownTotal(t *testing.T) {
 	stub := newStub()
 	stub.set(func(s *stubAPI) {
@@ -111,6 +113,9 @@ func TestUI_PaginationUnknownTotal(t *testing.T) {
 	}
 	if strings.Contains(got, "of 0") {
 		t.Fatalf("missing total_count rendered as 0: %q", got)
+	}
+	if known := evalStr(t, ctx, `document.querySelector('.pagination .pagination-total').dataset.totalKnown`); known != "false" {
+		t.Fatalf("missing total_count must mark the total unknown, dataset.totalKnown = %q", known)
 	}
 }
 

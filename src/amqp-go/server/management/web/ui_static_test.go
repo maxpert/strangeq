@@ -142,16 +142,19 @@ var webConsumedRoutes = []string{
 	"/api/definitions",
 }
 
-// scanAPIRouteSources globs dir/*.go, parses each file, and returns the union
-// of string literals beginning "/api/" that appear as arguments to a route
-// registration call (get/post/put/del/add/addPublic). Restricting the scan to
-// registration call arguments means a stale top-level literal such as
-// `var legacy = "/api/queues"` cannot mask a removed registration.
+// scanAPIRouteSources globs the production .go files in dir (test helpers are
+// skipped so a *_test.go `e.get("/api/...")` cannot count as a registration),
+// parses each file, and returns the union of string literals beginning "/api/"
+// that appear as arguments to a route registration call: a bare
+// get/post/put/del helper, or an rt.add / rt.addPublic call on the router
+// receiver. Restricting the scan to registration call arguments means a stale
+// top-level literal such as `var legacy = "/api/queues"` cannot mask a removed
+// registration either.
 //
-// files is the number of .go files matched: zero means the API package is not
-// present at all, so the caller may skip; a non-zero files with an empty routes
-// set means the route table was renamed/refactored and the contract must be
-// updated (the caller fails).
+// files is the number of production .go files matched: zero means the API
+// package is not present at all, so the caller may skip; a non-zero files with
+// an empty routes set means the route table was renamed/refactored and the
+// contract must be updated (the caller fails).
 func scanAPIRouteSources(dir string) (routes map[string]bool, files int, err error) {
 	matches, err := filepath.Glob(filepath.Join(dir, "*.go"))
 	if err != nil {
@@ -159,6 +162,9 @@ func scanAPIRouteSources(dir string) (routes map[string]bool, files int, err err
 	}
 	routes = map[string]bool{}
 	for _, m := range matches {
+		if strings.HasSuffix(m, "_test.go") {
+			continue
+		}
 		fset := token.NewFileSet()
 		file, perr := parser.ParseFile(fset, m, nil, 0)
 		if perr != nil {
@@ -189,15 +195,21 @@ func scanAPIRouteSources(dir string) (routes map[string]bool, files int, err err
 	return routes, files, nil
 }
 
-// isRouteRegistration reports whether fn names one of the route-registration
-// helpers used by buildRouter (a bare ident or an rt.add-style selector).
+// isRouteRegistration reports whether fn names a route-registration helper:
+// the bare get/post/put/del closures of buildRouter, or add/addPublic called
+// on the `rt` router receiver. It deliberately does not accept an arbitrary
+// receiver.method selector, so a test helper such as `e.get("/api/...")` is
+// not mistaken for a registration.
 func isRouteRegistration(fn ast.Expr) bool {
-	names := map[string]bool{"get": true, "post": true, "put": true, "del": true, "add": true, "addPublic": true}
 	switch f := fn.(type) {
 	case *ast.Ident:
-		return names[f.Name]
+		return f.Name == "get" || f.Name == "post" || f.Name == "put" || f.Name == "del"
 	case *ast.SelectorExpr:
-		return names[f.Sel.Name]
+		recv, ok := f.X.(*ast.Ident)
+		if !ok || recv.Name != "rt" {
+			return false
+		}
+		return f.Sel.Name == "add" || f.Sel.Name == "addPublic"
 	}
 	return false
 }
@@ -315,6 +327,24 @@ func wire() {
 		}
 		if !routes["/api/exchanges"] {
 			t.Fatalf("the real registration was missed: %v", routes)
+		}
+	})
+	t.Run("test helper does not mask a removed route", func(t *testing.T) {
+		dir := t.TempDir()
+		writeGoFixture(t, dir, "routes.go", "package fake\nfunc wire() { get(\"/api/queues\") }\n")
+		writeGoFixture(t, dir, "helper_test.go", "package fake\nfunc probe() { e.get(\"/api/overview\") }\n")
+		routes, files, err := scanAPIRouteSources(dir)
+		if err != nil {
+			t.Fatalf("scan: %v", err)
+		}
+		if files != 1 {
+			t.Fatalf("only production files must be scanned, got %d", files)
+		}
+		if routes["/api/overview"] {
+			t.Fatal("*_test.go helper call must not count as a route")
+		}
+		if !routes["/api/queues"] {
+			t.Fatalf("real registration missed: %v", routes)
 		}
 	})
 }

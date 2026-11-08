@@ -247,10 +247,16 @@ func TestUI_HealthAlarmThenDegraded(t *testing.T) {
 	if !waitFor(t, 5*time.Second, bannerHas("Alarm active")) {
 		t.Fatal("banner did not flip to alarm")
 	}
+	if txt, _ := evalStrOK(ctx, `document.getElementById('alarm-banner').textContent`); strings.Contains(txt, "degraded") {
+		t.Fatalf("alarm must take precedence over the degraded warning: %q", txt)
+	}
 	stub.set(func(s *stubAPI) { s.healthStatus = "ok"; s.healthReason = "" })
 	if !waitFor(t, 5*time.Second, bannerHas("broker booted degraded")) {
 		txt, _ := evalStrOK(ctx, `document.getElementById('alarm-banner').textContent`)
 		t.Fatalf("after the alarm cleared the banner stayed %q; it must fall back to the degraded warning", txt)
+	}
+	if txt, _ := evalStrOK(ctx, `document.getElementById('alarm-banner').textContent`); strings.Contains(txt, "Alarm active") {
+		t.Fatalf("the cleared alarm must not linger in the banner: %q", txt)
 	}
 }
 
@@ -273,6 +279,14 @@ func TestUI_ToolbarControls(t *testing.T) {
 		defer cancel()
 
 		mustDo(t, ctx, chromedp.Navigate(srv.URL+"/queues"), chromedp.WaitVisible(chromedp.CSS("#sort-select")))
+		// The toolbar must report the loader's effective default sort, so an
+		// Apply does not silently re-sort (round-2 #7, round-3 #2).
+		if v := evalStr(t, ctx, `document.getElementById('sort-select').value`); v != "messages_ready" {
+			t.Fatalf("#sort-select reports %q, want messages_ready", v)
+		}
+		if !evalBool(t, ctx, `document.getElementById('sort-reverse').checked`) {
+			t.Fatal("#sort-reverse must be checked for the default descending sort")
+		}
 		before := stub.queryCount("queues")
 		evalStr(t, ctx, `(function(){
 		  var inp = document.querySelector('.toolbar [data-filter="name"]');
@@ -368,10 +382,29 @@ func TestUI_QueuesDefaultSort(t *testing.T) {
 	if !evalBool(t, ctx, `document.getElementById('sort-reverse').checked`) {
 		t.Fatal("#sort-reverse must be checked for the default descending sort")
 	}
+	// The server's queue sort allowlist includes auto_delete/exclusive, which
+	// the UI renders as columns, so both headers must be sortable (round-3 #5a).
+	for _, col := range []string{"auto_delete", "exclusive"} {
+		if n := evalInt(t, ctx, fmt.Sprintf(`document.querySelectorAll('#content th[data-col="%s"].sortable').length`, col)); n != 1 {
+			t.Fatalf("queues header %q must be sortable (the server accepts it)", col)
+		}
+	}
 	if !waitFor(t, 3*time.Second, func() bool {
 		return stub.querySeen("queues", "sort=messages_ready") && stub.querySeen("queues", "sort_reverse=true")
 	}) {
 		t.Fatalf("the loader did not request the default sort; sent %v", stub.queriesFor("queues"))
+	}
+
+	// First click on the already-default-sorted column must toggle direction,
+	// not re-send the default: the route query is the source, falling back to
+	// the screen's declared default (round-3 #4).
+	mustDo(t, ctx, chromedp.Click(chromedp.CSS(`#content th[data-col="messages_ready"]`)))
+	if !waitFor(t, 3*time.Second, func() bool {
+		s, err := evalStrOK(ctx, `location.search`)
+		return err == nil && strings.Contains(s, "sort_reverse=false")
+	}) {
+		got, _ := evalStrOK(ctx, `location.search`)
+		t.Fatalf("first click on the default sort column did not flip direction: %q", got)
 	}
 }
 
@@ -422,7 +455,9 @@ func TestUI_MetricsLink(t *testing.T) {
 		ctx, cancel := newTab(t)
 		defer cancel()
 		mustDo(t, ctx, chromedp.Navigate(srv.URL+"/"), chromedp.WaitVisible(chromedp.CSS("#top-queues")))
-		if n := evalInt(t, ctx, `document.querySelectorAll('#metrics-link').length`); n != 0 {
+		// No link at all: not by id, and not any new-tab link whose href ends
+		// in /metrics (the pre-round-2 widget had no id).
+		if n := evalInt(t, ctx, `document.querySelectorAll('a[target="_blank"][href$="/metrics"], #metrics-link').length`); n != 0 {
 			t.Fatalf("metrics link rendered without a configured metricsUrl (%d)", n)
 		}
 	})
