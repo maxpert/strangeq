@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"math"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -254,7 +255,6 @@ func (s *Server) hPublish(w http.ResponseWriter, r *http.Request) {
 		Body:       payload,
 		Exchange:   name,
 		RoutingKey: req.RoutingKey,
-		Headers:    req.Properties,
 		// Mandatory makes a no-route publish observable: the broker returns
 		// ErrNoRoute instead of silently dropping, which is what lets the API
 		// report routed:false (FR-API-058).
@@ -316,7 +316,19 @@ func (s *Server) writePublishError(w http.ResponseWriter, r *http.Request, name 
 }
 
 // applyProperties copies the AMQP basic.properties fields from the request map
-// onto the message (DATA-074).
+// onto the message (DATA-074). It maps the FULL basic.properties set:
+// content_type, content_encoding, headers, delivery_mode, priority,
+// correlation_id, reply_to, expiration, message_id, timestamp, type, user_id,
+// app_id, cluster_id. A field absent from the map is left untouched.
+//
+// delivery_mode drives the broker's durability decision exactly as it does on
+// the AMQP basic.publish path: the storage layer keys persistence on
+// Message.DeliveryMode == 2 (storage.StorageEngine.StoreMessage), and this
+// handler publishes through the same broker path, so a `delivery_mode: 2`
+// publish is stored in the WAL and survives a restart.
+//
+// The `headers` field is the ONLY source of Message.Headers: the raw properties
+// map is never copied into headers.
 func applyProperties(msg *protocol.Message, props map[string]interface{}) {
 	asString := func(v any) string {
 		if s, ok := v.(string); ok {
@@ -354,11 +366,103 @@ func applyProperties(msg *protocol.Message, props map[string]interface{}) {
 	if v, ok := props["cluster_id"]; ok {
 		msg.ClusterID = asString(v)
 	}
+	if v, ok := props["delivery_mode"]; ok {
+		if n, ok := asUint8(v); ok {
+			msg.DeliveryMode = n
+		}
+	}
+	if v, ok := props["priority"]; ok {
+		if n, ok := asUint8(v); ok {
+			msg.Priority = n
+		}
+	}
+	if v, ok := props["timestamp"]; ok {
+		if n, ok := asUint64(v); ok {
+			msg.Timestamp = n
+		}
+	}
 	if v, ok := props["headers"]; ok {
 		if m, ok := v.(map[string]interface{}); ok {
 			msg.Headers = m
 		}
 	}
+}
+
+// asUint8 converts a property value to uint8, rejecting non-integral and
+// out-of-range numbers so an invalid delivery_mode/priority is ignored rather
+// than silently wrapped.
+func asUint8(v any) (uint8, bool) {
+	n, ok := asUint64(v)
+	if !ok || n > 255 {
+		return 0, false
+	}
+	return uint8(n), true
+}
+
+// asUint64 normalises a property value to a non-negative integer. JSON numbers
+// decode to float64; callers that build the properties map in Go may use any
+// integer type or json.Number. Non-numeric, negative, and non-integral values
+// are rejected.
+func asUint64(v any) (uint64, bool) {
+	// 2^53 is the largest integer a float64 represents exactly; larger JSON
+	// numbers (none of the basic.properties fields need one) are refused rather
+	// than truncated.
+	const maxExactFloat = 1 << 53
+	switch n := v.(type) {
+	case float64:
+		if n < 0 || n > maxExactFloat || n != math.Trunc(n) {
+			return 0, false
+		}
+		return uint64(n), true
+	case float32:
+		f := float64(n)
+		if f < 0 || f > maxExactFloat || f != math.Trunc(f) {
+			return 0, false
+		}
+		return uint64(f), true
+	case int:
+		if n < 0 {
+			return 0, false
+		}
+		return uint64(n), true
+	case int8:
+		if n < 0 {
+			return 0, false
+		}
+		return uint64(n), true
+	case int16:
+		if n < 0 {
+			return 0, false
+		}
+		return uint64(n), true
+	case int32:
+		if n < 0 {
+			return 0, false
+		}
+		return uint64(n), true
+	case int64:
+		if n < 0 {
+			return 0, false
+		}
+		return uint64(n), true
+	case uint:
+		return uint64(n), true
+	case uint8:
+		return uint64(n), true
+	case uint16:
+		return uint64(n), true
+	case uint32:
+		return uint64(n), true
+	case uint64:
+		return n, true
+	case json.Number:
+		i, err := n.Int64()
+		if err != nil || i < 0 {
+			return 0, false
+		}
+		return uint64(i), true
+	}
+	return 0, false
 }
 
 // --- queues ---
