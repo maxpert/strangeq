@@ -3,6 +3,7 @@ package storage
 import (
 	"io"
 	"os"
+	"sort"
 )
 
 // walTruncateTailDurable truncates the file at path to `size` and makes the
@@ -134,6 +135,11 @@ type walFileRef struct {
 //   - otherwise (force_flush, or any non-darwin): today's rule, byte-identical:
 //     the two newest files by number.
 func walTailRule(files []walFileRef, fence bool) func(uint64) bool {
+	// The frontier walk below is order-sensitive; enumerate ascending by
+	// number so it does not depend on the caller's ordering.
+	if fence {
+		sort.Slice(files, func(i, j int) bool { return files[i].num < files[j].num })
+	}
 	if !fence {
 		var firstNewest, secondNewest uint64
 		for _, f := range files {
