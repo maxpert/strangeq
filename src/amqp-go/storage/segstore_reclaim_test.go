@@ -216,7 +216,7 @@ func TestSegstoreSharedBodyLastAckReclaims(t *testing.T) {
 }
 
 func TestSegstorePurgeColdRangeUniqueCount(t *testing.T) {
-	ds, err := NewDisruptorStorageWithDataDir(t.TempDir())
+	ds, err := NewStorageEngineWithDataDir(t.TempDir())
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = ds.Close() })
 	const queue = "purge-q"

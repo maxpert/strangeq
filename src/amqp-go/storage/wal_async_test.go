@@ -21,7 +21,7 @@ import (
 //   A1 — a WriteAsync completion fires ONLY after the record's bytes are durable
 //        (fdatasync returned) AND the offset index is populated, in enqueue
 //        order (test 1).
-//   A2 — DisruptorStorage.StoreMessageAsync keeps ring.Store SYNCHRONOUS on the
+//   A2 — StorageEngine.StoreMessageAsync keeps ring.Store SYNCHRONOUS on the
 //        caller's goroutine: a durable message is ring-resident (retrievable)
 //        the instant StoreMessageAsync returns, BEFORE its fsync completes. A
 //        regression that deferred ring.Store into the completion callback would
@@ -189,7 +189,7 @@ func TestStoreMessageAsync_NotRetrievableBeforeFsync(t *testing.T) {
 	defer restore()
 	defer once.Do(func() { close(release) })
 
-	ds, err := NewDisruptorStorageWithEngineConfig(t.TempDir(), interfaces.EngineConfig{})
+	ds, err := NewStorageEngineWithConfig(t.TempDir(), interfaces.EngineConfig{})
 	require.NoError(t, err)
 	defer ds.Close()
 
@@ -443,7 +443,7 @@ func TestStoreMessageAsync_FsyncErrorNoRingStore(t *testing.T) {
 	})
 	defer restore()
 
-	ds, err := NewDisruptorStorageWithEngineConfig(t.TempDir(), interfaces.EngineConfig{})
+	ds, err := NewStorageEngineWithConfig(t.TempDir(), interfaces.EngineConfig{})
 	require.NoError(t, err)
 	defer ds.Close()
 

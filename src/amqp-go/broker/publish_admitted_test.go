@@ -21,7 +21,7 @@ func TestPublishMessageAdmitted_StoresAtHWMWithGate(t *testing.T) {
 	_, err := b.DeclareQueue("q", true, false, false, nil)
 	require.NoError(t, err)
 	qs := b.getOrCreateQueueState("q")
-	qs.SetDepthHighWM(1)
+	qs.SetMaxQueueBacklog(1)
 
 	// Under HWM: admitted, stored, no gate.
 	gate, err := b.PublishMessageAdmitted("", "q", &protocol.Message{

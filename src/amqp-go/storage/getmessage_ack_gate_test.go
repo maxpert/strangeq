@@ -1,7 +1,7 @@
 package storage
 
 // Commit 2's fixtures — the TWO acknowledgement guards in
-// DisruptorStorage.GetMessage, each attributed to its OWN observable.
+// StorageEngine.GetMessage, each attributed to its OWN observable.
 //
 // WHY THIS FILE EXISTS. segment_ack_gate_test.go covers the pair jointly and
 // cannot tell them apart: deleting either guard alone leaves it green, and only
@@ -109,7 +109,7 @@ const (
 // the segment tier is the only arm that can serve it, and holding qs.mutex
 // parks any reader of it at a known point.
 type ackGateFixture struct {
-	ds       *DisruptorStorage
+	ds       *StorageEngine
 	qs       *QueueSegments
 	victim   uint64
 	controls []uint64
@@ -164,7 +164,7 @@ func arrangeAckGate(t *testing.T) *ackGateFixture {
 
 	writeLegacyFixture(t, dir, ackGateQueue, legacySegmentRecords(ackGateQueue, tags)...)
 
-	ds, err := NewDisruptorStorageWithDataDir(dir)
+	ds, err := NewStorageEngineWithDataDir(dir)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = ds.Close() })
 
@@ -321,7 +321,7 @@ func serveControls(t *testing.T, f *ackGateFixture) {
 //
 // MUTATION THAT REDDENS IT: delete the re-validate (the second
 // `ds.wal.IsAcknowledged` block, the one after the tier reads) from
-// DisruptorStorage.GetMessage. The segment tier hands the record back and the
+// StorageEngine.GetMessage. The segment tier hands the record back and the
 // require.Error below fires. Deleting the PRE-READ gate instead leaves this
 // fixture GREEN, correctly: the acknowledgement had not happened when that gate
 // ran, so it never had anything to catch.
@@ -420,7 +420,7 @@ func TestGetMessage_ReValidateRefusesAnAckThatLandsDuringAColdRead(t *testing.T)
 //
 // MUTATION THAT REDDENS IT: delete the pre-read gate (the first
 // `ds.wal.IsAcknowledged` block, the one above the read-ahead lookup) from
-// DisruptorStorage.GetMessage. The reader is then observed parked and the
+// StorageEngine.GetMessage. The reader is then observed parked and the
 // t.Fatalf below fires. Deleting the RE-VALIDATE instead leaves this fixture
 // GREEN, correctly: it does not care which guard produces the error, only that
 // no cold tier was consulted to produce it.
@@ -514,7 +514,7 @@ func xqTag(ordinal, seq uint64) uint64 { return ordinal<<xqOrdinalShift | seq }
 // over-suppression control, and nothing else in this change set covers the axis
 // it covers.
 //
-// WHY IT EXISTS. Every cold tier DisruptorStorage.GetMessage consults is gated
+// WHY IT EXISTS. Every cold tier StorageEngine.GetMessage consults is gated
 // on WALManager.IsAcknowledged, so an acknowledgement on one queue must never
 // suppress a record on another. Two properties make that true, and this
 // fixture pins the BEHAVIOUR both of them produce: the acknowledgement bitmap
@@ -578,7 +578,7 @@ func TestGetMessage_AckOnOneQueueDoesNotSuppressAnother(t *testing.T) {
 		writeLegacyFixture(t, dir, q.name, legacySegmentRecords(q.name, tags)...)
 	}
 
-	ds, err := NewDisruptorStorageWithDataDir(dir)
+	ds, err := NewStorageEngineWithDataDir(dir)
 	require.NoError(t, err)
 	defer func() { _ = ds.Close() }()
 

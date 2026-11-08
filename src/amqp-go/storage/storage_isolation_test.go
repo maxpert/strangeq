@@ -7,8 +7,8 @@ import (
 	"testing"
 )
 
-// repoRelativeDataDir is the directory NewDisruptorStorage() hardcodes
-// (disruptor_storage.go: `return NewDisruptorStorageWithDataDir("./data")`),
+// repoRelativeDataDir is the directory NewStorageEngine() hardcodes
+// (storage_engine.go: `return NewStorageEngineWithDataDir("./data")`),
 // relative to this package's directory. `go test` runs each package with its
 // own directory as cwd, so this name denotes src/amqp-go/storage/data here and
 // src/amqp-go/data in the root package — which is why two contaminated
@@ -24,10 +24,10 @@ const repoRelativeDataDir = "data"
 // storage behind.
 //
 // The route that produced src/amqp-go/storage/data was the zero-argument
-// NewDisruptorStorage(), which hardcodes "./data": seven tests and benchmarks
+// NewStorageEngine(), which hardcodes "./data": seven tests and benchmarks
 // in pending_ack_index_test.go shared one directory with each other AND across
 // runs. They now take b.TempDir()/t.TempDir(). This assertion is what stops
-// the next caller of NewDisruptorStorage() from silently reinstating it — the
+// the next caller of NewStorageEngine() from silently reinstating it — the
 // directory is gitignored, so nothing else in the toolchain would report it.
 func TestMain(m *testing.M) {
 	// WS-C: arm the runtime invariant assertions (I3 and its segment twin)
@@ -58,8 +58,8 @@ func runWithStorageLeakCheck(dir string, run func() int) int {
 			"runs. It is gitignored, so `git status` cannot see it. Delete it and re-run.\n", abs)
 	} else {
 		fmt.Fprintf(os.Stderr, "\nFAIL: %s was created by this run: something resolved storage to "+
-			"a repo-relative path (most likely the zero-argument NewDisruptorStorage()) instead "+
-			"of t.TempDir()/b.TempDir(). Use NewDisruptorStorageWithDataDir(t.TempDir()).\n", abs)
+			"a repo-relative path (most likely the zero-argument NewStorageEngine()) instead "+
+			"of t.TempDir()/b.TempDir(). Use NewStorageEngineWithDataDir(t.TempDir()).\n", abs)
 	}
 	if code == 0 {
 		return 1

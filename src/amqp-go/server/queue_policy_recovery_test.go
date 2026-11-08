@@ -18,7 +18,7 @@ import (
 func TestRecovery_DurableQueuePolicyReResolved(t *testing.T) {
 	dataDir := t.TempDir()
 	engineConfig := interfaces.EngineConfig{
-		DepthHighWM:             52428,
+		MaxQueueBacklog:         52428,
 		WALBatchSize:            1000,
 		WALBatchTimeoutMS:       10,
 		ConsumerSelectTimeoutMS: 1,
@@ -26,7 +26,7 @@ func TestRecovery_DurableQueuePolicyReResolved(t *testing.T) {
 	}
 
 	// "First boot": declare a durable queue with policy arguments.
-	store1, err := storage.NewDisruptorStorageWithDataDir(dataDir)
+	store1, err := storage.NewStorageEngineWithDataDir(dataDir)
 	require.NoError(t, err)
 	broker1 := broker.NewStorageBroker(store1, engineConfig)
 
@@ -47,7 +47,7 @@ func TestRecovery_DurableQueuePolicyReResolved(t *testing.T) {
 
 	// "Restart": fresh storage over the same data dir, fresh broker, real
 	// RecoveryManager as wired by ServerBuilder.Build.
-	store2, err := storage.NewDisruptorStorageWithDataDir(dataDir)
+	store2, err := storage.NewStorageEngineWithDataDir(dataDir)
 	require.NoError(t, err)
 	defer store2.Close()
 	broker2 := broker.NewStorageBroker(store2, engineConfig)

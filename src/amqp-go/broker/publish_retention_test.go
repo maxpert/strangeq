@@ -164,14 +164,14 @@ type syncOnlyStorage struct{ interfaces.Storage }
 func newRetentionBroker(t *testing.T, mutate func(*retentionStorage)) (*StorageBroker, *retentionStorage, func()) {
 	t.Helper()
 	tmpDir := t.TempDir()
-	store, err := storage.NewDisruptorStorageWithDataDir(tmpDir)
+	store, err := storage.NewStorageEngineWithDataDir(tmpDir)
 	require.NoError(t, err)
 	fake := &retentionStorage{Storage: store}
 	if mutate != nil {
 		mutate(fake)
 	}
 	engineConfig := interfaces.EngineConfig{
-		DepthHighWM:             52428,
+		MaxQueueBacklog:         52428,
 		WALBatchSize:            1000,
 		WALBatchTimeoutMS:       10,
 		ConsumerSelectTimeoutMS: 1,
@@ -424,10 +424,10 @@ func TestRetention_WALClosed(t *testing.T) {
 // RB-7: a backend without async durable support: synchronous release.
 func TestRetention_NonAsyncBackendFallback(t *testing.T) {
 	tmpDir := t.TempDir()
-	store, err := storage.NewDisruptorStorageWithDataDir(tmpDir)
+	store, err := storage.NewStorageEngineWithDataDir(tmpDir)
 	require.NoError(t, err)
 	engineConfig := interfaces.EngineConfig{
-		DepthHighWM:             52428,
+		MaxQueueBacklog:         52428,
 		WALBatchSize:            1000,
 		WALBatchTimeoutMS:       10,
 		ConsumerSelectTimeoutMS: 1,

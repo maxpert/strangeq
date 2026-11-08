@@ -410,7 +410,7 @@ func TestWALPreopen_LeftoverParkedFileIsBenignOnBoot(t *testing.T) {
 	// The leftover pre-opened file: header only, never used.
 	writeSharedWALFile(t, dir, 3, walHeaderBytes())
 
-	st, err := NewDisruptorStorageWithEngineConfig(dir, interfaces.EngineConfig{})
+	st, err := NewStorageEngineWithConfig(dir, interfaces.EngineConfig{})
 	require.NoError(t, err, "a leftover pre-opened (header-only) WAL file must not refuse the boot")
 	defer st.Close()
 
@@ -466,7 +466,7 @@ func TestWALPreopen_RetiredFileTailDefectIsBenign(t *testing.T) {
 			// tolerated, never fatal.
 			writeSharedWALFile(t, dir, 3, walHeaderBytes())
 
-			st, err := NewDisruptorStorageWithEngineConfig(dir, mode.engineCfg)
+			st, err := NewStorageEngineWithConfig(dir, mode.engineCfg)
 			require.NoError(t, err,
 				"a bounded tail defect on the just-retired file must not refuse the boot")
 			defer st.Close()

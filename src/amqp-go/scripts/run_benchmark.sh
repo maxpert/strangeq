@@ -85,7 +85,7 @@ server:
   maxmessagesize: 16777216
   cleanupintervalms: 300000
 engine:
-  depthhighwm: 52428
+  maxqueuebacklog: 52428
   walbatchsize: 1000
   walbatchtimeoutms: 10
   walfilesize: 536870912

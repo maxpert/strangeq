@@ -114,7 +114,7 @@ server:
   loglevel: info
 
 engine:
-  depthhighwm: 209715
+  maxqueuebacklog: 209715
   walbatchsize: 1000
 
 resourcealarms:
@@ -161,8 +161,8 @@ telemetry:
 
 			// Unset keys retain DefaultConfig values; keys the snippet sets win.
 			def := DefaultConfig()
-			if !strings.Contains(tc.body, "depthhighwm") {
-				assert.Equal(t, def.Engine.DepthHighWM, cfg.Engine.DepthHighWM)
+			if !strings.Contains(tc.body, "maxqueuebacklog") {
+				assert.Equal(t, def.Engine.MaxQueueBacklog, cfg.Engine.MaxQueueBacklog)
 			}
 			assert.Equal(t, def.Server.MaxFrameSize, cfg.Server.MaxFrameSize)
 			if !strings.Contains(tc.body, "maxconnections") {

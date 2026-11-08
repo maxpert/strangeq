@@ -113,14 +113,14 @@ func TestDeclareQueue_RedeclareKeepsOriginalPolicy(t *testing.T) {
 func TestDeclareQueue_PolicySurvivesBrokerRestart(t *testing.T) {
 	dataDir := t.TempDir()
 	engineConfig := interfaces.EngineConfig{
-		DepthHighWM:             52428,
+		MaxQueueBacklog:         52428,
 		WALBatchSize:            1000,
 		WALBatchTimeoutMS:       10,
 		ConsumerSelectTimeoutMS: 1,
 		ConsumerMaxBatchSize:    100,
 	}
 
-	store1, err := storage.NewDisruptorStorageWithDataDir(dataDir)
+	store1, err := storage.NewStorageEngineWithDataDir(dataDir)
 	require.NoError(t, err)
 	broker1 := NewStorageBroker(store1, engineConfig)
 
@@ -133,7 +133,7 @@ func TestDeclareQueue_PolicySurvivesBrokerRestart(t *testing.T) {
 	require.NoError(t, store1.Close())
 
 	// "Restart": fresh storage over the same data dir, fresh broker.
-	store2, err := storage.NewDisruptorStorageWithDataDir(dataDir)
+	store2, err := storage.NewStorageEngineWithDataDir(dataDir)
 	require.NoError(t, err)
 	defer store2.Close()
 	broker2 := NewStorageBroker(store2, engineConfig)

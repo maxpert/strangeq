@@ -75,13 +75,13 @@ func (c *dropCountingCollector) RecordDeadLetterDropped()  { c.dropped.Add(1) }
 // metrics hook — a genuine loss must be observable, not silent.
 func TestDeadLetter_StoreFailure_IsObservableAndDrops(t *testing.T) {
 	tmpDir := t.TempDir()
-	real, err := storage.NewDisruptorStorageWithDataDir(tmpDir)
+	real, err := storage.NewStorageEngineWithDataDir(tmpDir)
 	require.NoError(t, err)
 	defer real.Close()
 
 	fs := &storeFailStorage{Storage: real, failQueue: "dlq"}
 	ec := interfaces.EngineConfig{
-		DepthHighWM:             52428,
+		MaxQueueBacklog:         52428,
 		WALBatchSize:            1000,
 		WALBatchTimeoutMS:       10,
 		ConsumerSelectTimeoutMS: 1,

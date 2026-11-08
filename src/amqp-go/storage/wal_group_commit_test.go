@@ -142,7 +142,7 @@ func TestWriteAsync_DurabilityBarrierOrdering(t *testing.T) {
 // WALManager.Write. With the default 10ms timeout that capped a single
 // publisher at ~100 durable (or spilled-transient) writes per second, which
 // presents as a publisher wedge once a queue ring crosses the spill threshold
-// (see TestDisruptorStorage_SpillPathNotBatchTimeoutBound below).
+// (see TestStorageEngine_SpillPathNotBatchTimeoutBound below).
 //
 // The tests use a deliberately huge BatchTimeout so that the pre-fix behavior
 // trips the watchdog deterministically, while the fixed drain-then-flush group
@@ -195,20 +195,20 @@ func TestWALWrite_LoneWriterNotBatchTimeoutBound(t *testing.T) {
 	}
 }
 
-// TestDisruptorStorage_SpillPathNotBatchTimeoutBound reproduces the
+// TestStorageEngine_SpillPathNotBatchTimeoutBound reproduces the
 // publisher-wedge shape end to end at the storage level: a fast transient
 // publisher whose queue ring crosses the spill threshold enters the WAL spill
-// path (DisruptorStorage.StoreMessage -> WALManager.Write) and, pre-fix,
+// path (StorageEngine.StoreMessage -> WALManager.Write) and, pre-fix,
 // stalls for a full BatchTimeout per message.
-func TestDisruptorStorage_SpillPathNotBatchTimeoutBound(t *testing.T) {
+func TestStorageEngine_SpillPathNotBatchTimeoutBound(t *testing.T) {
 	ec := interfaces.EngineConfig{
-		DepthHighWM:       819,
+		MaxQueueBacklog:   819,
 		WALBatchSize:      1000,
 		WALBatchTimeoutMS: 1000, // pre-fix: 1s per spilled message
 	}
-	ds, err := NewDisruptorStorageWithEngineConfig(t.TempDir(), ec)
+	ds, err := NewStorageEngineWithConfig(t.TempDir(), ec)
 	if err != nil {
-		t.Fatalf("NewDisruptorStorageWithEngineConfig: %v", err)
+		t.Fatalf("NewStorageEngineWithConfig: %v", err)
 	}
 	defer ds.Close()
 

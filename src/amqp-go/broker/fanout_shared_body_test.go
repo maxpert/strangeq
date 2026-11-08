@@ -12,15 +12,15 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// createSharedBodyBroker builds a broker over a real DisruptorStorage and returns
+// createSharedBodyBroker builds a broker over a real StorageEngine and returns
 // its data directory (for WAL record introspection) and the store handle.
-func createSharedBodyBroker(t testing.TB) (*StorageBroker, *storage.DisruptorStorage, string, func()) {
+func createSharedBodyBroker(t testing.TB) (*StorageBroker, *storage.StorageEngine, string, func()) {
 	tmpDir := t.TempDir()
-	store, err := storage.NewDisruptorStorageWithDataDir(tmpDir)
+	store, err := storage.NewStorageEngineWithDataDir(tmpDir)
 	require.NoError(t, err)
 
 	engineConfig := interfaces.EngineConfig{
-		DepthHighWM:             52428,
+		MaxQueueBacklog:         52428,
 		WALBatchSize:            1000,
 		WALBatchTimeoutMS:       10,
 		ConsumerSelectTimeoutMS: 1,

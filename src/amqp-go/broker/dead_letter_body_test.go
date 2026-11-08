@@ -417,7 +417,7 @@ func TestReject_IntoFullTargetReturnsPromptly(t *testing.T) {
 
 	// Wedge the target at its high-water mark: tiny WM + one ready message.
 	dlq := b.getOrCreateQueueState("dlq")
-	dlq.SetDepthHighWM(1)
+	dlq.SetMaxQueueBacklog(1)
 	fillTag := dlq.FrontierReserve()
 	require.NoError(t, b.storage.StoreMessage("dlq", &protocol.Message{
 		Body: []byte("fill"), RoutingKey: "src", DeliveryTag: fillTag,

@@ -68,7 +68,7 @@ engine:
 
   # Publisher backpressure depth high-water mark in messages (0 = default 52428).
   # A secondary gate: the hot-cache byte budget usually binds first.
-  depthhighwm: 52428
+  maxqueuebacklog: 52428
 
   # WAL settings (balance throughput vs latency)
   walbatchsize: 1000

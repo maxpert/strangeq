@@ -29,10 +29,10 @@ type atomic32 struct {
 func (a *atomic32) set(n int32) { a.v.Store(n) }
 func (a *atomic32) get() int32  { return a.v.Load() }
 
-// newNoCopyStorage builds a DisruptorStorage over a temp dir.
-func newNoCopyStorage(t *testing.T) *DisruptorStorage {
+// newNoCopyStorage builds a StorageEngine over a temp dir.
+func newNoCopyStorage(t *testing.T) *StorageEngine {
 	t.Helper()
-	ds, err := NewDisruptorStorageWithDataDir(t.TempDir())
+	ds, err := NewStorageEngineWithDataDir(t.TempDir())
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = ds.Close() })
 	return ds

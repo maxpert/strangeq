@@ -65,7 +65,7 @@ type parkedReader struct {
 //
 // The returned reader is released with release(); the reader then completes
 // and reports its message and its error.
-func parkDeliveryAtAdmission(t *testing.T, ds *DisruptorStorage, queue string, tag uint64) *parkedReader {
+func parkDeliveryAtAdmission(t *testing.T, ds *StorageEngine, queue string, tag uint64) *parkedReader {
 	t.Helper()
 
 	arrived := make(chan struct{})

@@ -85,7 +85,7 @@ func TestLogCompaction_FullLifecycle(t *testing.T) {
 	tmpDir := t.TempDir()
 	engineCfg := logCompactionEngineConfig()
 
-	ds, err := NewDisruptorStorageWithEngineConfig(tmpDir, engineCfg)
+	ds, err := NewStorageEngineWithConfig(tmpDir, engineCfg)
 	require.NoError(t, err)
 	qw := ds.wal.sharedWAL
 
@@ -165,7 +165,7 @@ func TestLogCompaction_FullLifecycle(t *testing.T) {
 	// that the DURABLE BYTES are still there.
 	require.NoError(t, ds.Close())
 
-	ds2, err := NewDisruptorStorageWithEngineConfig(tmpDir, engineCfg)
+	ds2, err := NewStorageEngineWithConfig(tmpDir, engineCfg)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = ds2.Close() })
 
@@ -584,7 +584,7 @@ func TestLogCompaction_TierFallback(t *testing.T) {
 		Message:   msg,
 	})
 
-	ds, err := NewDisruptorStorageWithEngineConfig(tmpDir, engineCfg)
+	ds, err := NewStorageEngineWithConfig(tmpDir, engineCfg)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = ds.Close() })
 

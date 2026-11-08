@@ -29,13 +29,13 @@ func (s *storeConsumerFailStorage) StoreConsumer(queueName, consumerID string, c
 
 func newStoreConsumerFailBroker(t *testing.T) (*StorageBroker, *storeConsumerFailStorage) {
 	t.Helper()
-	real, err := storage.NewDisruptorStorageWithDataDir(t.TempDir())
+	real, err := storage.NewStorageEngineWithDataDir(t.TempDir())
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = real.Close() })
 
 	fs := &storeConsumerFailStorage{Storage: real}
 	return NewStorageBroker(fs, interfaces.EngineConfig{
-		DepthHighWM:             52428,
+		MaxQueueBacklog:         52428,
 		WALBatchSize:            1000,
 		WALBatchTimeoutMS:       10,
 		ConsumerSelectTimeoutMS: 1,

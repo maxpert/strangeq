@@ -109,7 +109,7 @@ func DefaultConfig() *AMQPConfig {
 			// Publisher Backpressure Depth: per-queue message-count depth HWM.
 			// 52428 = the retired RingBufferSize (65536) x SpillThresholdPercent
 			// (80) / 100. 0 would also mean the default.
-			DepthHighWM: interfaces.DefaultDepthHighWM,
+			MaxQueueBacklog: interfaces.DefaultMaxQueueBacklog,
 
 			// Write-Ahead Log (WAL)
 			WALBatchSize:      1000,              // 1,000 messages per batch

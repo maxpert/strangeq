@@ -7,7 +7,7 @@ package storage
 // dead-lettered, removed from the ring and acknowledged — without bound. That is
 // the REACHABILITY evidence and it stands on its own.
 //
-// What it could not say is WHICH of DisruptorStorage.GetMessage's fall-through
+// What it could not say is WHICH of StorageEngine.GetMessage's fall-through
 // arms produced the message, and the fix depends entirely on that answer:
 //
 //	ring.LoadByTag        -> eliminated: the reaper's own deleteIfPresent removed it

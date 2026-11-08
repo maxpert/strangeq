@@ -163,7 +163,7 @@ func newConfBrokerCfg(t *testing.T, mutate func(*config.AMQPConfig)) *confBroker
 
 func (b *confBroker) startEmbedded() {
 	t := b.t
-	st, err := storage.NewDisruptorStorageWithEngineConfig(b.cfg.Storage.Path, b.cfg.GetEngine())
+	st, err := storage.NewStorageEngineWithConfig(b.cfg.Storage.Path, b.cfg.GetEngine())
 	require.NoError(t, err, "open storage at %s", b.cfg.Storage.Path)
 	b.st = st
 

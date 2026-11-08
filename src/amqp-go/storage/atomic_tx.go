@@ -8,7 +8,7 @@ import (
 )
 
 // txStagingStorage is the all-or-nothing storage view handed to the callback of
-// DisruptorStorage.ExecuteAtomic (SQ-8). It embeds the real *DisruptorStorage so
+// StorageEngine.ExecuteAtomic (SQ-8). It embeds the real *StorageEngine so
 // every read/metadata method is delegated unchanged, but it intercepts the two
 // mutating message operations — StoreMessage and DeleteMessage — and BUFFERS
 // them instead of applying them immediately.
@@ -24,7 +24,7 @@ import (
 // so a failure partway through a transaction's operations left the earlier
 // operations applied — the atomicity guarantee was a lie on partial failure.
 type txStagingStorage struct {
-	*DisruptorStorage
+	*StorageEngine
 
 	stores  []stagedStore
 	deletes []stagedDelete
@@ -41,7 +41,7 @@ type stagedDelete struct {
 }
 
 // StoreMessage buffers a publish. It performs the same up-front durability
-// validation as DisruptorStorage.StoreMessage so an impossible operation (a
+// validation as StorageEngine.StoreMessage so an impossible operation (a
 // durable message with no WAL) fails the callback and rolls the whole
 // transaction back, rather than being discovered mid-commit.
 func (s *txStagingStorage) StoreMessage(queueName string, message *protocol.Message) error {
@@ -60,7 +60,7 @@ func (s *txStagingStorage) DeleteMessage(queueName string, deliveryTag uint64) e
 
 // commit durably applies the whole staged operation set as one atomic unit.
 func (s *txStagingStorage) commit() error {
-	ds := s.DisruptorStorage
+	ds := s.StorageEngine
 
 	// Phase 1 — durability. Collect the durable publishes and write them to the
 	// WAL as a single all-or-nothing transaction unit bracketed by begin/commit
@@ -113,7 +113,7 @@ func (s *txStagingStorage) commit() error {
 
 // insertDurableIntoCache admits an already-WAL-durable message without doing
 // any further I/O. Oversized or inadmissible messages remain available in WAL.
-func (ds *DisruptorStorage) insertDurableIntoCache(queueName string, message *protocol.Message) error {
+func (ds *StorageEngine) insertDurableIntoCache(queueName string, message *protocol.Message) error {
 	queue := ds.getOrCreateQueueHot(queueName)
 	if ds.hot.Put(queueName, message, true) {
 		queue.ack.OnPublish(message.DeliveryTag)

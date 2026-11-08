@@ -47,8 +47,8 @@ func seedMultiFileWAL(t *testing.T, dataDir string, wantFiles, minTail int) []st
 	// on disk exactly, so pin the inline-roll path deterministically.
 	t.Cleanup(SetWALPreopenEnabledForTest(false))
 
-	// Seeded through WALManager rather than DisruptorStorage on purpose: a
-	// DisruptorStorage has a segment manager attached, and its Close() runs a
+	// Seeded through WALManager rather than StorageEngine on purpose: a
+	// StorageEngine has a segment manager attached, and its Close() runs a
 	// final performCheckpoint that UNLINKS every rolled WAL file — which would
 	// leave a one-file directory and make every quarantine assertion vacuous.
 	cfg := DefaultWALConfig()
@@ -131,7 +131,7 @@ func recordsIn(t *testing.T, path string) int {
 // recovered records for queue "q" plus the classified fault.
 func recoverAll(t *testing.T, dataDir string) (int, error) {
 	t.Helper()
-	st, err := NewDisruptorStorageWithEngineConfig(dataDir, interfaces.EngineConfig{
+	st, err := NewStorageEngineWithConfig(dataDir, interfaces.EngineConfig{
 		WALFileSize:    2048,
 		UnsafeRecovery: true,
 	})
@@ -330,7 +330,7 @@ func TestWALQuarantine_EveryFaultAcrossEveryFileIsEnumerated(t *testing.T) {
 	// refusal text asserts that its artifact list is complete; a construction
 	// -time refusal that enumerated only the first damaged file would make that
 	// sentence false and force an operator to bisect by restart.
-	if st, cerr := NewDisruptorStorageWithEngineConfig(dataDir, interfaces.EngineConfig{WALFileSize: 2048}); cerr == nil {
+	if st, cerr := NewStorageEngineWithConfig(dataDir, interfaces.EngineConfig{WALFileSize: 2048}); cerr == nil {
 		if st != nil {
 			_ = st.Close()
 		}
@@ -418,7 +418,7 @@ func TestWALTail_ZeroFilledTailBoundaryShapes(t *testing.T) {
 		// The scanner must SEE this as a torn tail. Today it parses the zero
 		// region as a run of zero-length zero-CRC records and reports nothing,
 		// so the same damage is silently tolerated here and fatal one byte over.
-		st, err := NewDisruptorStorageWithEngineConfig(dataDir, interfaces.EngineConfig{})
+		st, err := NewStorageEngineWithConfig(dataDir, interfaces.EngineConfig{})
 		if err != nil {
 			t.Fatalf("a torn tail must not refuse construction: %v", err)
 		}
@@ -636,7 +636,7 @@ func TestWALTail_TheWritePathNeverProducesAZeroLengthRecord(t *testing.T) {
 // artifact in the refusal is absolute.
 func TestListQueues_FaultNamesAnAbsolutePath(t *testing.T) {
 	dataDir := t.TempDir()
-	st, err := NewDisruptorStorageWithEngineConfig(dataDir, interfaces.EngineConfig{})
+	st, err := NewStorageEngineWithConfig(dataDir, interfaces.EngineConfig{})
 	if err != nil {
 		t.Fatalf("storage: %v", err)
 	}
@@ -720,7 +720,7 @@ func TestWALEnumeration_TheTwoDirectoryWalksAgree(t *testing.T) {
 		t.Fatalf("fixture premise broken: %s parses as a WAL segment stem", aside)
 	}
 
-	st, err := NewDisruptorStorageWithEngineConfig(dataDir, interfaces.EngineConfig{WALFileSize: 2048})
+	st, err := NewStorageEngineWithConfig(dataDir, interfaces.EngineConfig{WALFileSize: 2048})
 	if err != nil {
 		t.Fatalf("a non-segment .wal file must not refuse the boot (the boot-state rebuild cannot "+
 			"even see it, so recovery must not be fatal over it either): %v", err)

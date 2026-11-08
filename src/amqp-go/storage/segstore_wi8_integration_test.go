@@ -70,7 +70,7 @@ func TestDurableConfirmUsesGroupFsync(t *testing.T) {
 
 func TestNoCheckpointCopiesWALToLegacySegments(t *testing.T) {
 	dir := t.TempDir()
-	ds, err := NewDisruptorStorageWithDataDir(dir)
+	ds, err := NewStorageEngineWithDataDir(dir)
 	require.NoError(t, err)
 
 	const queue = "wal-only"
@@ -94,7 +94,7 @@ func TestNoCheckpointCopiesWALToLegacySegments(t *testing.T) {
 	_, err = os.Stat(rolledPath)
 	require.NoError(t, err, "an unacknowledged WAL file must survive close")
 
-	reopened, err := NewDisruptorStorageWithDataDir(dir)
+	reopened, err := NewStorageEngineWithDataDir(dir)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = reopened.Close() })
 	msg, err = reopened.wal.Read(queue, 1)
@@ -143,7 +143,7 @@ func TestLegacySegmentDrainAndDedup(t *testing.T) {
 		}},
 	)
 
-	ds, err := NewDisruptorStorageWithDataDir(dir)
+	ds, err := NewStorageEngineWithDataDir(dir)
 	require.NoError(t, err)
 	ds.getOrCreateQueueHot(queue)
 	for tag, body := range map[uint64]string{1: "newest-wal-copy", 3: "wal-only-survivor"} {
@@ -177,7 +177,7 @@ func TestLegacySegmentDrainAndDedup(t *testing.T) {
 	ds.wal.sharedWAL.tryReclaimOldFiles()
 	require.NoError(t, ds.Close())
 
-	reopened, err := NewDisruptorStorageWithDataDir(dir)
+	reopened, err := NewStorageEngineWithDataDir(dir)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = reopened.Close() })
 	recovered, err = reopened.GetRecoverableMessages()

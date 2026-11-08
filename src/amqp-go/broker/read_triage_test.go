@@ -31,7 +31,7 @@ import (
 // the broker's optional-interface assertions (ringDeleterDetailed and
 // friends) still resolve against it.
 type readTriageStorage struct {
-	*storage.DisruptorStorage
+	*storage.StorageEngine
 
 	mu         sync.Mutex
 	deliveries int
@@ -42,14 +42,14 @@ func (s *readTriageStorage) GetMessage(queueName string, deliveryTag uint64) (*p
 	s.mu.Lock()
 	s.peeks++
 	s.mu.Unlock()
-	return s.DisruptorStorage.GetMessage(queueName, deliveryTag)
+	return s.StorageEngine.GetMessage(queueName, deliveryTag)
 }
 
 func (s *readTriageStorage) GetMessageForDelivery(queueName string, deliveryTag uint64) (*protocol.Message, error) {
 	s.mu.Lock()
 	s.deliveries++
 	s.mu.Unlock()
-	return s.DisruptorStorage.GetMessageForDelivery(queueName, deliveryTag)
+	return s.StorageEngine.GetMessageForDelivery(queueName, deliveryTag)
 }
 
 func (s *readTriageStorage) counts() (deliveries, peeks int) {
@@ -60,11 +60,11 @@ func (s *readTriageStorage) counts() (deliveries, peeks int) {
 
 func newReadTriageBroker(t *testing.T) (*StorageBroker, *readTriageStorage, func()) {
 	t.Helper()
-	store, err := storage.NewDisruptorStorageWithDataDir(t.TempDir())
+	store, err := storage.NewStorageEngineWithDataDir(t.TempDir())
 	require.NoError(t, err)
-	fake := &readTriageStorage{DisruptorStorage: store}
+	fake := &readTriageStorage{StorageEngine: store}
 	engineConfig := interfaces.EngineConfig{
-		DepthHighWM:             52428,
+		MaxQueueBacklog:         52428,
 		WALBatchSize:            1000,
 		WALBatchTimeoutMS:       10,
 		ConsumerSelectTimeoutMS: 1,

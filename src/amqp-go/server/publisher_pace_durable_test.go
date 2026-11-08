@@ -44,7 +44,7 @@ import (
 // (interfaces.CrashModelBarrier -> barrier, CrashModelForceFlush -> flush).
 // Returns the server and its storage so the test can read the resident-byte
 // mirror.
-func newHotBudgetServer(t *testing.T, syncDisabled bool, crashModel string) (*Server, *storage.DisruptorStorage) {
+func newHotBudgetServer(t *testing.T, syncDisabled bool, crashModel string) (*Server, *storage.StorageEngine) {
 	t.Helper()
 	cfg := config.DefaultConfig()
 	cfg.Storage.Path = t.TempDir()
@@ -60,9 +60,9 @@ func newHotBudgetServer(t *testing.T, syncDisabled bool, crashModel string) (*Se
 	eng := cfg.GetEngine()
 	eng.HotCacheQueueBytes = 2048 // tiny: binds after a dozen small bodies
 	eng.HotCacheGlobalBytes = 1 << 20
-	eng.DepthHighWM = 52428 // depth HWM: never reached here
+	eng.MaxQueueBacklog = 52428 // depth HWM: never reached here
 
-	storageImpl, err := storage.NewDisruptorStorageWithEngineConfig(cfg.Storage.Path, eng)
+	storageImpl, err := storage.NewStorageEngineWithConfig(cfg.Storage.Path, eng)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = storageImpl.Close() })
 

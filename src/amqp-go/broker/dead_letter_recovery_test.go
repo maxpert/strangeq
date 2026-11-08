@@ -49,7 +49,7 @@ func recoverPersistentIntoQueues(t *testing.T, store interfaces.Storage, b *Stor
 func TestRecovery_DurableDeadLetter_RetainsXDeath(t *testing.T) {
 	dataDir := t.TempDir()
 	ec := interfaces.EngineConfig{
-		DepthHighWM:             52428,
+		MaxQueueBacklog:         52428,
 		WALBatchSize:            1000,
 		WALBatchTimeoutMS:       10,
 		ConsumerSelectTimeoutMS: 1,
@@ -57,7 +57,7 @@ func TestRecovery_DurableDeadLetter_RetainsXDeath(t *testing.T) {
 	}
 
 	// --- Boot 1: declare durable topology and dead-letter a durable message. ---
-	store1, err := storage.NewDisruptorStorageWithDataDir(dataDir)
+	store1, err := storage.NewStorageEngineWithDataDir(dataDir)
 	require.NoError(t, err)
 	b1 := NewStorageBroker(store1, ec)
 
@@ -82,7 +82,7 @@ func TestRecovery_DurableDeadLetter_RetainsXDeath(t *testing.T) {
 	require.NoError(t, store1.Close())
 
 	// --- Boot 2: reopen the same data dir, recover, and verify x-death. ---
-	store2, err := storage.NewDisruptorStorageWithDataDir(dataDir)
+	store2, err := storage.NewStorageEngineWithDataDir(dataDir)
 	require.NoError(t, err)
 	defer store2.Close()
 	b2 := NewStorageBroker(store2, ec)

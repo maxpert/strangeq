@@ -9,9 +9,9 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// TestDisruptorStorage_DurableMessageWALIntegration tests that durable messages
+// TestStorageEngine_DurableMessageWALIntegration tests that durable messages
 // are written to WAL before being stored in the ring buffer
-func TestDisruptorStorage_DurableMessageWALIntegration(t *testing.T) {
+func TestStorageEngine_DurableMessageWALIntegration(t *testing.T) {
 	tmpDir := t.TempDir()
 
 	// Create WAL manager
@@ -20,7 +20,7 @@ func TestDisruptorStorage_DurableMessageWALIntegration(t *testing.T) {
 	defer wal.Close()
 
 	// Create storage with WAL
-	storage, err := NewDisruptorStorageWithDataDir(tmpDir)
+	storage, err := NewStorageEngineWithDataDir(tmpDir)
 	require.NoError(t, err)
 	storage.wal = wal
 
@@ -61,9 +61,9 @@ func TestDisruptorStorage_DurableMessageWALIntegration(t *testing.T) {
 	assert.Equal(t, durableMsg.Body, retrievedMsg.Body)
 }
 
-// TestDisruptorStorage_TransientMessageNoWAL tests that transient messages
+// TestStorageEngine_TransientMessageNoWAL tests that transient messages
 // are NOT written to WAL (only to ring buffer)
-func TestDisruptorStorage_TransientMessageNoWAL(t *testing.T) {
+func TestStorageEngine_TransientMessageNoWAL(t *testing.T) {
 	tmpDir := t.TempDir()
 
 	// Create WAL manager
@@ -72,7 +72,7 @@ func TestDisruptorStorage_TransientMessageNoWAL(t *testing.T) {
 	defer wal.Close()
 
 	// Create storage with WAL
-	storage, err := NewDisruptorStorageWithDataDir(tmpDir)
+	storage, err := NewStorageEngineWithDataDir(tmpDir)
 	require.NoError(t, err)
 	storage.wal = wal
 
@@ -109,9 +109,9 @@ func TestDisruptorStorage_TransientMessageNoWAL(t *testing.T) {
 	assert.Equal(t, transientMsg.Body, retrievedMsg.Body)
 }
 
-// TestDisruptorStorage_DurableMessageAcknowledge tests that ACKs are
+// TestStorageEngine_DurableMessageAcknowledge tests that ACKs are
 // propagated to WAL
-func TestDisruptorStorage_DurableMessageAcknowledge(t *testing.T) {
+func TestStorageEngine_DurableMessageAcknowledge(t *testing.T) {
 	tmpDir := t.TempDir()
 
 	// Create WAL manager
@@ -120,7 +120,7 @@ func TestDisruptorStorage_DurableMessageAcknowledge(t *testing.T) {
 	defer wal.Close()
 
 	// Create storage with WAL
-	storage, err := NewDisruptorStorageWithDataDir(tmpDir)
+	storage, err := NewStorageEngineWithDataDir(tmpDir)
 	require.NoError(t, err)
 	storage.wal = wal
 
@@ -181,7 +181,7 @@ func TestDisruptorStorage_DurableMessageAcknowledge(t *testing.T) {
 		_, rerr := wal.Read("test_queue", uint64(i))
 		require.Error(t, rerr,
 			"ACKNOWLEDGED TAG STILL SERVED: message %d was acknowledged through "+
-				"DisruptorStorage.DeleteMessage, so the WAL must not return it as a live "+
+				"StorageEngine.DeleteMessage, so the WAL must not return it as a live "+
 				"message. Serving it re-expires and re-dead-letters the same record without "+
 				"bound and stalls the queue tail", i)
 	}
@@ -193,9 +193,9 @@ func TestDisruptorStorage_DurableMessageAcknowledge(t *testing.T) {
 	}
 }
 
-// TestDisruptorStorage_MultiQueueDurableMessages tests durable message routing
+// TestStorageEngine_MultiQueueDurableMessages tests durable message routing
 // across multiple queues
-func TestDisruptorStorage_MultiQueueDurableMessages(t *testing.T) {
+func TestStorageEngine_MultiQueueDurableMessages(t *testing.T) {
 	tmpDir := t.TempDir()
 
 	// Create WAL manager
@@ -204,7 +204,7 @@ func TestDisruptorStorage_MultiQueueDurableMessages(t *testing.T) {
 	defer wal.Close()
 
 	// Create storage with WAL
-	storage, err := NewDisruptorStorageWithDataDir(tmpDir)
+	storage, err := NewStorageEngineWithDataDir(tmpDir)
 	require.NoError(t, err)
 	storage.wal = wal
 
@@ -250,9 +250,9 @@ func TestDisruptorStorage_MultiQueueDurableMessages(t *testing.T) {
 	}
 }
 
-// TestDisruptorStorage_WALFallback tests that GetMessage falls back to WAL
+// TestStorageEngine_WALFallback tests that GetMessage falls back to WAL
 // when message is not in ring buffer
-func TestDisruptorStorage_WALFallback(t *testing.T) {
+func TestStorageEngine_WALFallback(t *testing.T) {
 	tmpDir := t.TempDir()
 
 	// Create WAL manager
@@ -261,7 +261,7 @@ func TestDisruptorStorage_WALFallback(t *testing.T) {
 	defer wal.Close()
 
 	// Create storage with WAL
-	storage, err := NewDisruptorStorageWithDataDir(tmpDir)
+	storage, err := NewStorageEngineWithDataDir(tmpDir)
 	require.NoError(t, err)
 	storage.wal = wal
 

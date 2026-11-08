@@ -71,7 +71,7 @@ const ackWindowWait = 2 * time.Second
 // It returns a channel that is closed once the acknowledgement has completed,
 // and a flag that reports whether the acknowledgement completed WHILE the
 // reader was still parked (i.e. the reader's window was open).
-func ackInWindow(t *testing.T, ds *DisruptorStorage, queue string, tag uint64, path string) (done <-chan struct{}, landedInWindow *atomic.Bool) {
+func ackInWindow(t *testing.T, ds *StorageEngine, queue string, tag uint64, path string) (done <-chan struct{}, landedInWindow *atomic.Bool) {
 	t.Helper()
 	ackFinished := make(chan struct{})
 	landed := &atomic.Bool{}

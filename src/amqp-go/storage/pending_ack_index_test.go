@@ -20,7 +20,7 @@ func newTestPendingAck(consumerTag string, deliveryTag uint64) *protocol.Pending
 }
 
 func TestConsumerPendingAcksIndex_BasicCorrectness(t *testing.T) {
-	ds, err := NewDisruptorStorageWithDataDir(t.TempDir())
+	ds, err := NewStorageEngineWithDataDir(t.TempDir())
 	require.NoError(t, err)
 
 	require.NoError(t, ds.StorePendingAck(newTestPendingAck("A", 1)))
@@ -82,7 +82,7 @@ func TestConsumerPendingAcksIndex_SupersetInvariant(t *testing.T) {
 	tagBase := func(c int, tag uint64) uint64 { return uint64(c)*1000 + tag }
 	ctag := func(c int) string { return fmt.Sprintf("C%d", c) }
 
-	ds, err := NewDisruptorStorageWithDataDir(t.TempDir())
+	ds, err := NewStorageEngineWithDataDir(t.TempDir())
 	require.NoError(t, err)
 	var wg sync.WaitGroup
 
@@ -216,7 +216,7 @@ func TestConsumerPendingAcksIndex_ReStoreRace(t *testing.T) {
 	const consumers = 16
 	const raceTags = 100
 
-	ds, err := NewDisruptorStorageWithDataDir(t.TempDir())
+	ds, err := NewStorageEngineWithDataDir(t.TempDir())
 	require.NoError(t, err)
 	var wg sync.WaitGroup
 	ctag := func(c int) string { return fmt.Sprintf("R%d", c) }
@@ -261,7 +261,7 @@ func TestConsumerPendingAcksIndex_AdversarialNoRaces(t *testing.T) {
 	const tags = 200
 	const iters = 80
 
-	ds, err := NewDisruptorStorageWithDataDir(t.TempDir())
+	ds, err := NewStorageEngineWithDataDir(t.TempDir())
 	require.NoError(t, err)
 	var wg sync.WaitGroup
 
@@ -285,7 +285,7 @@ func TestConsumerPendingAcksIndex_AdversarialNoRaces(t *testing.T) {
 	wg.Wait() // race detector validates the absence of data races here.
 }
 
-func assertIndexEqualsPrimary(t *testing.T, ds *DisruptorStorage) {
+func assertIndexEqualsPrimary(t *testing.T, ds *StorageEngine) {
 	t.Helper()
 
 	primary := make(map[string]map[uint64]struct{})
@@ -332,7 +332,7 @@ func assertIndexEqualsPrimary(t *testing.T, ds *DisruptorStorage) {
 	}
 }
 
-func mustGetAllConsumers(t *testing.T, ds *DisruptorStorage) map[string][]*protocol.PendingAck {
+func mustGetAllConsumers(t *testing.T, ds *StorageEngine) map[string][]*protocol.PendingAck {
 	t.Helper()
 	out := make(map[string][]*protocol.PendingAck)
 	ds.consumerPendingAcks.Range(func(cTag, innerVal interface{}) bool {
@@ -356,7 +356,7 @@ func deliveryTags(acks []*protocol.PendingAck) []uint64 {
 
 func errPendingAckNotFoundSentinel(t *testing.T) error {
 	t.Helper()
-	ds, err := NewDisruptorStorageWithDataDir(t.TempDir())
+	ds, err := NewStorageEngineWithDataDir(t.TempDir())
 	require.NoError(t, err)
 	_, err = ds.GetPendingAck("", 1<<30)
 	require.Error(t, err)
@@ -370,7 +370,7 @@ func BenchmarkGetConsumerPendingAcks_Indexed(b *testing.B) {
 	const consumers = 200
 	const tagsPerConsumer = 100
 
-	ds, err := NewDisruptorStorageWithDataDir(b.TempDir())
+	ds, err := NewStorageEngineWithDataDir(b.TempDir())
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -395,7 +395,7 @@ func BenchmarkGetConsumerPendingAcks_FullScanBaseline(b *testing.B) {
 	const consumers = 200
 	const tagsPerConsumer = 100
 
-	ds, err := NewDisruptorStorageWithDataDir(b.TempDir())
+	ds, err := NewStorageEngineWithDataDir(b.TempDir())
 	if err != nil {
 		b.Fatal(err)
 	}

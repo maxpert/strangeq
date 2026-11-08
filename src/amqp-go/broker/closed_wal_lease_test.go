@@ -35,7 +35,7 @@ func TestBroker_ClosedWALReleasesTheLeaseExactlyOnce(t *testing.T) {
 
 	// CLOSE THE WAL. The storage's Close closes the WAL (and only the WAL
 	// matters here).
-	require.NoError(t, fake.DisruptorStorage.Close())
+	require.NoError(t, fake.StorageEngine.Close())
 
 	ev := &retentionEvents{}
 	onDurable, lease := ev.callbacks()

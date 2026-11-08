@@ -32,16 +32,16 @@ import (
 
 // spillThresholdFor returns the per-queue publisher backpressure depth
 // high-water mark the broker resolves from the engine config: the configured
-// EngineConfig.DepthHighWM, or interfaces.DefaultDepthHighWM (52428) when it is
+// EngineConfig.MaxQueueBacklog, or interfaces.DefaultMaxQueueBacklog (52428) when it is
 // unset (0).
 //
 // It is computed, never written down. A test that hardcoded the number would
 // silently stop testing what it claims the next time the default moves.
 func spillThresholdFor(ec interfaces.EngineConfig) uint64 {
-	if ec.DepthHighWM > 0 {
-		return ec.DepthHighWM
+	if ec.MaxQueueBacklog > 0 {
+		return ec.MaxQueueBacklog
 	}
-	return interfaces.DefaultDepthHighWM
+	return interfaces.DefaultMaxQueueBacklog
 }
 
 // requireBacklogCrossesSpillThreshold asserts, at runtime, the premise the
@@ -60,18 +60,18 @@ func requireBacklogCrossesSpillThreshold(t *testing.T, cfg *config.AMQPConfig, b
 	threshold := spillThresholdFor(cfg.Engine)
 	require.NotZero(t, threshold,
 		"PREMISE BROKEN: this test's engine config resolves to a zero depth high-water mark "+
-			"(DepthHighWM=%d); there is no boundary left to cross",
-		cfg.Engine.DepthHighWM)
+			"(MaxQueueBacklog=%d); there is no boundary left to cross",
+		cfg.Engine.MaxQueueBacklog)
 
 	require.Greater(t, uint64(backlog), threshold,
 		"PREMISE BROKEN: the backlog standing at restart (%d) no longer exceeds this "+
-			"engine's depth high-water mark (%d = EngineConfig.DepthHighWM). At or below that "+
+			"engine's depth high-water mark (%d = EngineConfig.MaxQueueBacklog). At or below that "+
 			"threshold this test cannot detect anything. Raise the backlog or lower the knob "+
 			"— do not delete this check.",
 		backlog, threshold)
 
-	t.Logf("PREMISE: backlog=%d > live depth high-water mark=%d (depthhighwm=%d)",
-		backlog, threshold, cfg.Engine.DepthHighWM)
+	t.Logf("PREMISE: backlog=%d > live depth high-water mark=%d (maxqueuebacklog=%d)",
+		backlog, threshold, cfg.Engine.MaxQueueBacklog)
 	return threshold
 }
 
@@ -80,7 +80,7 @@ func requireBacklogCrossesSpillThreshold(t *testing.T, cfg *config.AMQPConfig, b
 // shipped defaults resolve their threshold through the same expression, and
 // that this test's threshold is genuinely below it.
 //
-// Without this, a config change that stopped honoring EngineConfig.DepthHighWM
+// Without this, a config change that stopped honoring EngineConfig.MaxQueueBacklog
 // would leave the lowered-knob tests green, fast, and measuring a regime
 // production no longer has — the exact shape of "a load-bearing premise living
 // in a comment".
@@ -374,7 +374,7 @@ func missingIDs(seen map[int]bool, n int) (missing int, firstMissing int) {
 // and because that runtime is set by the runner's fsync throughput, which is
 // the one input nobody controls on shared CI hardware.
 func loweredSpillEngine(cfg *config.AMQPConfig) {
-	cfg.Engine.DepthHighWM = 256 // the retired 1024 x 25 / 100
+	cfg.Engine.MaxQueueBacklog = 256 // the retired 1024 x 25 / 100
 }
 
 // ---------------------------------------------------------------------------

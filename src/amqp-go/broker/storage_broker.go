@@ -716,7 +716,7 @@ func (b *StorageBroker) maxLenTrimLoop(ch chan maxLenTrimReq, stop chan struct{}
 
 // ringDeleter is the optional storage capability the SQ-9 TTL reaper and
 // delivery head-check use to atomically claim a message removal (the
-// linearization token). DisruptorStorage implements it; a backend that does not
+// linearization token). StorageEngine implements it; a backend that does not
 // falls back to the unconditional DeleteMessage (treated as a win), which is
 // safe because such a backend is used single-writer in the paths that need it.
 type ringDeleter interface {
@@ -733,7 +733,7 @@ type ringDeleterDetailed interface {
 // asyncDurableWriter is the optional storage capability that decouples a durable
 // publish's fsync from the caller: the message is ring-stored synchronously and
 // its WAL write is enqueued for group commit, with the fsync completion reported
-// via onDurable. DisruptorStorage implements it; PublishMessageAsyncConfirm
+// via onDurable. StorageEngine implements it; PublishMessageAsyncConfirm
 // falls back to the synchronous PublishMessage for any backend that does not.
 type asyncDurableWriter interface {
 	// StoreMessageAsync enqueues the message's durable write.
@@ -755,7 +755,7 @@ const DefaultSharedBodyThreshold = 4096
 // unit (one shared BodyBlock + N reference records, one fsync) — writing the body
 // ONCE instead of N times. Each sub's OnDurable fires after that copy is durable,
 // exactly like StoreMessageAsync's completion, so per-queue visibility/confirm is
-// unchanged. DisruptorStorage implements it; a backend that does not simply keeps
+// unchanged. StorageEngine implements it; a backend that does not simply keeps
 // the per-queue StoreMessageAsync loop (correct, just N body copies on disk).
 type sharedDurableWriter interface {
 	StoreSharedAsync(subs []interfaces.SharedDurableSub) error
@@ -1074,7 +1074,7 @@ func (b *StorageBroker) createQueueStateLocked(queueName string) *QueueState {
 				interfaces.LogField{Key: "queue", Value: queueName},
 				interfaces.LogField{Key: "error", Value: gerr})
 		}
-		dead := NewQueueState(b.computeDepthHighWM())
+		dead := NewQueueState(b.computeMaxQueueBacklog())
 		dead.Close()
 		return dead
 	}
@@ -1101,12 +1101,12 @@ func (b *StorageBroker) createQueueStateLocked(queueName string) *QueueState {
 				interfaces.LogField{Key: "queue", Value: queueName},
 				interfaces.LogField{Key: "error", Value: oerr})
 		}
-		dead := NewQueueState(b.computeDepthHighWM())
+		dead := NewQueueState(b.computeMaxQueueBacklog())
 		dead.Close()
 		return dead
 	}
 
-	newState := NewQueueState(b.computeDepthHighWM())
+	newState := NewQueueState(b.computeMaxQueueBacklog())
 	newState.SetOrdinal(ordinal)
 	b.queueStates.Store(queueName, newState)
 	return newState
@@ -1124,16 +1124,16 @@ func (b *StorageBroker) GetQueuePolicy(queueName string) *QueuePolicy {
 	return val.(*QueueState).Policy()
 }
 
-// computeDepthHighWM returns the per-queue publisher backpressure depth
-// high-water mark in messages: that is the configured EngineConfig.DepthHighWM,
-// or interfaces.DefaultDepthHighWM (52428) when it is unset (0). This depth
+// computeMaxQueueBacklog returns the per-queue publisher backpressure depth
+// high-water mark in messages: that is the configured EngineConfig.MaxQueueBacklog,
+// or interfaces.DefaultMaxQueueBacklog (52428) when it is unset (0). This depth
 // (head - minAckCursor) is where publishers block or spill; it is a secondary
 // gate -- the hot-cache BYTE budget usually binds first (see publisherGate).
-func (b *StorageBroker) computeDepthHighWM() uint64 {
-	if b.engineConfig.DepthHighWM > 0 {
-		return b.engineConfig.DepthHighWM
+func (b *StorageBroker) computeMaxQueueBacklog() uint64 {
+	if b.engineConfig.MaxQueueBacklog > 0 {
+		return b.engineConfig.MaxQueueBacklog
 	}
-	return interfaces.DefaultDepthHighWM
+	return interfaces.DefaultMaxQueueBacklog
 }
 
 // hotCachePacer is the optional storage capability that paces a publisher to a
@@ -4374,7 +4374,7 @@ func (b *StorageBroker) GetQueueDepthHighWater(queueName string) uint64 {
 	if !ok {
 		return 0
 	}
-	return val.(*QueueState).DepthHighWaterSeen()
+	return val.(*QueueState).MaxBacklogSeen()
 }
 
 // GetQueueConsumerIDs returns the broker-internal identities (Consumer.ID) of

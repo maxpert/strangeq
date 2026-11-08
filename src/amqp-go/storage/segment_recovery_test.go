@@ -25,7 +25,7 @@ func TestSegmentResidentMessagesRecoveredAfterRestart(t *testing.T) {
 		WALChannelBuffer:  5000,
 	}
 
-	ds, err := NewDisruptorStorageWithEngineConfig(tmpDir, engineCfg)
+	ds, err := NewStorageEngineWithConfig(tmpDir, engineCfg)
 	require.NoError(t, err)
 
 	queueName := "restart-test-queue"
@@ -60,7 +60,7 @@ func TestSegmentResidentMessagesRecoveredAfterRestart(t *testing.T) {
 
 	ds.Close()
 
-	ds2, err := NewDisruptorStorageWithEngineConfig(tmpDir, engineCfg)
+	ds2, err := NewStorageEngineWithConfig(tmpDir, engineCfg)
 	require.NoError(t, err)
 	defer ds2.Close()
 

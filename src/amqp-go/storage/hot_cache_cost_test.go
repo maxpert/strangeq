@@ -142,7 +142,7 @@ func BenchmarkPerTagShardLockContended(b *testing.B) {
 // acknowledgement's I/O.
 func BenchmarkDeleteMessageAckPath(b *testing.B) {
 	c := newHotCache(64<<20, 256<<20)
-	ds := &DisruptorStorage{hot: c}
+	ds := &StorageEngine{hot: c}
 	const q = "bench-q"
 	ds.getOrCreateQueueHot(q)
 	b.ResetTimer()
@@ -192,7 +192,7 @@ func BenchmarkDeliveryAdmissionPath(b *testing.B) {
 // compare for the epoch check.
 func BenchmarkDeliveryAdmissionPathWithEpoch(b *testing.B) {
 	c := newHotCache(64<<20, 256<<20)
-	ds := &DisruptorStorage{hot: c}
+	ds := &StorageEngine{hot: c}
 	const q = "bench-q"
 	ds.getOrCreateQueueHot(q)
 	b.ResetTimer()

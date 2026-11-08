@@ -20,7 +20,7 @@ import (
 func TestRecovery_DurableQueueTTL_ExpiredWhileDown(t *testing.T) {
 	dataDir := t.TempDir()
 	ec := interfaces.EngineConfig{
-		DepthHighWM:             52428,
+		MaxQueueBacklog:         52428,
 		WALBatchSize:            1000,
 		WALBatchTimeoutMS:       10,
 		ConsumerSelectTimeoutMS: 1,
@@ -28,7 +28,7 @@ func TestRecovery_DurableQueueTTL_ExpiredWhileDown(t *testing.T) {
 	}
 
 	// --- Boot 1: declare durable topology and publish a durable TTL message. ---
-	store1, err := storage.NewDisruptorStorageWithDataDir(dataDir)
+	store1, err := storage.NewStorageEngineWithDataDir(dataDir)
 	require.NoError(t, err)
 	b1 := NewStorageBroker(store1, ec)
 	// A large TTL so boot 1's own reaper never expires it before shutdown; the
@@ -56,7 +56,7 @@ func TestRecovery_DurableQueueTTL_ExpiredWhileDown(t *testing.T) {
 	require.NoError(t, store1.Close()) // WAL fsync completes before close
 
 	// --- Boot 2: reopen, advance the clock past the deadline, recover. ---
-	store2, err := storage.NewDisruptorStorageWithDataDir(dataDir)
+	store2, err := storage.NewStorageEngineWithDataDir(dataDir)
 	require.NoError(t, err)
 	b2 := NewStorageBroker(store2, ec)
 	defer func() { b2.Close(); _ = store2.Close() }()
@@ -106,7 +106,7 @@ func TestRecovery_DurableQueueTTL_ExpiredWhileDown(t *testing.T) {
 func TestRecovery_DurableTxTTL_ExpiredWhileDown(t *testing.T) {
 	dataDir := t.TempDir()
 	ec := interfaces.EngineConfig{
-		DepthHighWM:             52428,
+		MaxQueueBacklog:         52428,
 		WALBatchSize:            1000,
 		WALBatchTimeoutMS:       10,
 		ConsumerSelectTimeoutMS: 1,
@@ -114,7 +114,7 @@ func TestRecovery_DurableTxTTL_ExpiredWhileDown(t *testing.T) {
 	}
 
 	// --- Boot 1: durable topology; publish a durable TTL message via a tx. ---
-	store1, err := storage.NewDisruptorStorageWithDataDir(dataDir)
+	store1, err := storage.NewStorageEngineWithDataDir(dataDir)
 	require.NoError(t, err)
 	b1 := NewStorageBroker(store1, ec)
 	b1.SetTTLClock(func() int64 { return 2_000_000 })
@@ -144,7 +144,7 @@ func TestRecovery_DurableTxTTL_ExpiredWhileDown(t *testing.T) {
 	require.NoError(t, store1.Close())
 
 	// --- Boot 2: reopen past the deadline, recover, verify dead-letter. ---
-	store2, err := storage.NewDisruptorStorageWithDataDir(dataDir)
+	store2, err := storage.NewStorageEngineWithDataDir(dataDir)
 	require.NoError(t, err)
 	b2 := NewStorageBroker(store2, ec)
 	defer func() { b2.Close(); _ = store2.Close() }()

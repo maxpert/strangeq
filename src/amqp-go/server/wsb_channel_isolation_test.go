@@ -23,7 +23,7 @@ func startWSBPanicBrokerServer(t *testing.T, pb *panicBroker, tweak func(*Server
 	cfg.Network.Address = "127.0.0.1:0"
 	cfg.Storage.Path = t.TempDir()
 	cfg.Server.LogLevel = "silent"
-	storageImpl, err := storage.NewDisruptorStorageWithDataDir(cfg.Storage.Path)
+	storageImpl, err := storage.NewStorageEngineWithDataDir(cfg.Storage.Path)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = storageImpl.Close() })
 	storageBroker := broker.NewStorageBroker(storageImpl, cfg.GetEngine())

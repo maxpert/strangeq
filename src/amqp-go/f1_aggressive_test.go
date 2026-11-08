@@ -37,7 +37,7 @@ func f1AggServer(t *testing.T, fsync bool, ringSize int, walChanBuf int) (string
 		cfg.Storage.Durability = interfaces.DurabilityNone
 	}
 	if ringSize > 0 {
-		cfg.Engine.DepthHighWM = uint64(ringSize) * 80 / 100
+		cfg.Engine.MaxQueueBacklog = uint64(ringSize) * 80 / 100
 	}
 	if walChanBuf > 0 {
 		cfg.Engine.WALChannelBuffer = walChanBuf

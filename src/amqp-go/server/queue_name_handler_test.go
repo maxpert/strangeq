@@ -38,7 +38,7 @@ func newTestServer(t *testing.T) *Server {
 	cfg := config.DefaultConfig()
 	cfg.Storage.Path = t.TempDir()
 
-	storageImpl, err := storage.NewDisruptorStorageWithDataDir(cfg.Storage.Path)
+	storageImpl, err := storage.NewStorageEngineWithDataDir(cfg.Storage.Path)
 	if err != nil {
 		t.Fatalf("failed to create storage: %v", err)
 	}
@@ -64,7 +64,7 @@ func newTestServer(t *testing.T) *Server {
 	}
 }
 
-// newTestServer and createTestStorage removed — using storage.NewDisruptorStorageWithDataDir directly.
+// newTestServer and createTestStorage removed — using storage.NewStorageEngineWithDataDir directly.
 
 // newPipeConn creates a protocol.Connection backed by a net.Pipe so that
 // response frames can be written without a real TCP connection. A background

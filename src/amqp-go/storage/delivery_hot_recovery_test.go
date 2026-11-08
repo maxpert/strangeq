@@ -20,7 +20,7 @@ import (
 // counted as a hit and a WAL-backed delivery as a cold read, with the cold
 // read's positional reads attributed to the queue.
 func TestDeliveryCacheStats_ClassifyHitAndCold(t *testing.T) {
-	ds, err := NewDisruptorStorageWithEngineConfig(t.TempDir(), interfaces.EngineConfig{})
+	ds, err := NewStorageEngineWithConfig(t.TempDir(), interfaces.EngineConfig{})
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = ds.Close() })
 
@@ -64,7 +64,7 @@ func TestDeliveryCacheStats_ClassifyHitAndCold(t *testing.T) {
 // directory.
 func TestHotCacheDelivery_MessageStillRecoversFromWALAfterRestart(t *testing.T) {
 	dir := t.TempDir()
-	ds, err := NewDisruptorStorageWithEngineConfig(dir, interfaces.EngineConfig{})
+	ds, err := NewStorageEngineWithConfig(dir, interfaces.EngineConfig{})
 	require.NoError(t, err)
 
 	const queue = "hot-recover-q"
@@ -91,7 +91,7 @@ func TestHotCacheDelivery_MessageStillRecoversFromWALAfterRestart(t *testing.T) 
 	// so an unacked message recovers exactly as after a crash.)
 	require.NoError(t, ds.Close())
 
-	reopened, err := NewDisruptorStorageWithEngineConfig(dir, interfaces.EngineConfig{})
+	reopened, err := NewStorageEngineWithConfig(dir, interfaces.EngineConfig{})
 	require.NoError(t, err)
 	defer reopened.Close()
 

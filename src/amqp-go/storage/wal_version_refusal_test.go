@@ -51,7 +51,7 @@ func TestWALVersion_ForeignHeaderIsFatalAtConstruction(t *testing.T) {
 	dataDir := t.TempDir()
 	walPath := plantForeignWAL(t, dataDir)
 
-	st, err := NewDisruptorStorageWithEngineConfig(dataDir, interfaces.EngineConfig{})
+	st, err := NewStorageEngineWithConfig(dataDir, interfaces.EngineConfig{})
 	if err == nil {
 		if st != nil {
 			_ = st.Close()
@@ -85,7 +85,7 @@ func TestWALVersion_ForeignHeaderIsNeverAppendedTo(t *testing.T) {
 	// --unsafe-recovery must let the broker start; it must NOT make it write
 	// v4 records after a foreign header. That is the self-perpetuating poison:
 	// every boot deepens the damage and nothing can ever read the file again.
-	st, cerr := NewDisruptorStorageWithEngineConfig(dataDir, interfaces.EngineConfig{UnsafeRecovery: true})
+	st, cerr := NewStorageEngineWithConfig(dataDir, interfaces.EngineConfig{UnsafeRecovery: true})
 	if cerr != nil {
 		t.Fatalf("--unsafe-recovery must permit construction, got: %v", cerr)
 	}
@@ -248,7 +248,7 @@ func setWALTailBoundForTest(unconfirmed, frame int64) func() {
 // single WAL file they landed in.
 func seedWAL(t *testing.T, dataDir string, n int) string {
 	t.Helper()
-	st, err := NewDisruptorStorageWithEngineConfig(dataDir, interfaces.EngineConfig{})
+	st, err := NewStorageEngineWithConfig(dataDir, interfaces.EngineConfig{})
 	if err != nil {
 		t.Fatalf("seed storage: %v", err)
 	}
@@ -340,7 +340,7 @@ func TestWALCRC_CleanFileIsBenignControl(t *testing.T) {
 		t.Fatalf("control premise broken: expected 5 physical records, walked %d", got)
 	}
 
-	st, err := NewDisruptorStorageWithEngineConfig(dataDir, interfaces.EngineConfig{})
+	st, err := NewStorageEngineWithConfig(dataDir, interfaces.EngineConfig{})
 	if err != nil {
 		t.Fatalf("uncorrupted directory must construct: %v", err)
 	}
@@ -377,7 +377,7 @@ func TestWALCRC_InteriorFailureIsFatal(t *testing.T) {
 	}
 	corruptRecordPayload(t, path, interior)
 
-	st, err := NewDisruptorStorageWithEngineConfig(dataDir, interfaces.EngineConfig{})
+	st, err := NewStorageEngineWithConfig(dataDir, interfaces.EngineConfig{})
 	if err == nil {
 		defer st.Close()
 		_, rerr := st.GetRecoverableMessages()
@@ -453,7 +453,7 @@ func TestWALCRC_TailFailureIsBenignNotFatal(t *testing.T) {
 	}
 
 	// And the boot is NOT gated: no flag, four records back.
-	st, err := NewDisruptorStorageWithEngineConfig(dataDir, interfaces.EngineConfig{})
+	st, err := NewStorageEngineWithConfig(dataDir, interfaces.EngineConfig{})
 	if err != nil {
 		t.Fatalf("a torn tail must not require --unsafe-recovery: %v", err)
 	}

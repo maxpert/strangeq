@@ -44,9 +44,9 @@ func exemptMsg(queue string, tag uint64) *protocol.Message {
 	}
 }
 
-func newPaceExemptStorage(t *testing.T, budget int64, syncDisabled bool, crashModel string) *DisruptorStorage {
+func newPaceExemptStorage(t *testing.T, budget int64, syncDisabled bool, crashModel string) *StorageEngine {
 	t.Helper()
-	ds, err := NewDisruptorStorageWithEngineConfig(t.TempDir(), interfaces.EngineConfig{
+	ds, err := NewStorageEngineWithConfig(t.TempDir(), interfaces.EngineConfig{
 		HotCacheQueueBytes: budget,
 		WALSyncDisabled:    syncDisabled,
 		CrashModel:         crashModel,

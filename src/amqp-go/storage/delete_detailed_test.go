@@ -15,9 +15,9 @@ import (
 // newSmallRingStorage builds storage with a 16-slot ring and a 50% spill
 // threshold so a handful of durable publishes crosses into WAL-only (spilled)
 // territory.
-func newSmallRingStorage(t *testing.T) *DisruptorStorage {
+func newSmallRingStorage(t *testing.T) *StorageEngine {
 	t.Helper()
-	ds, err := NewDisruptorStorageWithEngineConfig(t.TempDir(), interfaces.EngineConfig{
+	ds, err := NewStorageEngineWithConfig(t.TempDir(), interfaces.EngineConfig{
 		HotCacheQueueBytes:  6 * 600,
 		HotCacheGlobalBytes: 6 * 600,
 		WALBatchSize:        1000,
@@ -30,7 +30,7 @@ func newSmallRingStorage(t *testing.T) *DisruptorStorage {
 
 // storeDurable stores a durable message; past the spill threshold the ring
 // stays empty and the message is WAL-only (spilled).
-func storeDurable(t *testing.T, ds *DisruptorStorage, queue string, tag uint64) {
+func storeDurable(t *testing.T, ds *StorageEngine, queue string, tag uint64) {
 	t.Helper()
 	require.NoError(t, ds.StoreMessage(queue, &protocol.Message{
 		DeliveryTag:  tag,
@@ -41,7 +41,7 @@ func storeDurable(t *testing.T, ds *DisruptorStorage, queue string, tag uint64) 
 
 // spillTags returns (ringResident, walOnly) tags after storing n durable
 // messages, verified via the ring's own residency view.
-func spillTags(t *testing.T, ds *DisruptorStorage, queue string, n int) (resident, spilled []uint64) {
+func spillTags(t *testing.T, ds *StorageEngine, queue string, n int) (resident, spilled []uint64) {
 	t.Helper()
 	for i := 1; i <= n; i++ {
 		storeDurable(t, ds, queue, uint64(i))

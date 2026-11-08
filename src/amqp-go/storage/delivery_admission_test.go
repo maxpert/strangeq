@@ -16,8 +16,8 @@ package storage
 // So there are TWO reads, and they differ in exactly one thing: whether the
 // message they read is admitted.
 //
-//	DisruptorStorage.GetMessageForDelivery  — a DELIVERY: admits.
-//	DisruptorStorage.GetMessage             — a PEEK: does not admit.
+//	StorageEngine.GetMessageForDelivery  — a DELIVERY: admits.
+//	StorageEngine.GetMessage             — a PEEK: does not admit.
 //
 // The F8 contract (storage/cold_read_count_test.go) pins the peek's half;
 // this file pins the delivery's half and the budget's behaviour.
@@ -94,7 +94,7 @@ func TestPeekRead_DoesNotAdmitAColdMessage(t *testing.T) {
 // message to make room for itself. The admission is best-effort and
 // NON-EVICTING.
 func TestColdRead_TooBigToAdmitEvictsNothing(t *testing.T) {
-	ds, err := NewDisruptorStorageWithEngineConfig(t.TempDir(), interfaces.EngineConfig{
+	ds, err := NewStorageEngineWithConfig(t.TempDir(), interfaces.EngineConfig{
 		// A budget one small message fits into, and the big one does not.
 		HotCacheQueueBytes: 4096,
 	})

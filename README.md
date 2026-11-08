@@ -278,7 +278,7 @@ server:
   loglevel: info
 
 engine:
-  depthhighwm: 209715
+  maxqueuebacklog: 209715
   walbatchsize: 1000
 ```
 
@@ -286,7 +286,7 @@ Run it under systemd (see `deployment/systemd/`) rather than `daemonize: true`
 and a PID file; the unit handles restart, environment, and logging.
 
 Key engine tuning parameters:
-- `depthhighwm` — Per-queue publisher backpressure depth high-water mark in messages (default 52428; 0 = default). The hot-cache byte budget usually binds first.
+- `maxqueuebacklog` — Per-queue publisher backpressure depth high-water mark in messages (default 52428; 0 = default). The hot-cache byte budget usually binds first.
 - `walbatchsize` — Messages per WAL batch (default 1000)
 - `walbatchtimeoutms` — Retained for compatibility; WAL sync is drain-then-sync, not timer-gated
 - `walfilesize` — Size of each WAL file (default 512 MB)

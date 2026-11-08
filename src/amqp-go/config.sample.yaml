@@ -244,7 +244,7 @@ engine:
   #
   # This is a SECONDARY gate: the hot-cache BYTE budget
   # (hotcachequeuebytes) usually binds first.
-  depthhighwm: 52428
+  maxqueuebacklog: 52428
 
   # ========================================
   # Write-Ahead Log (WAL)

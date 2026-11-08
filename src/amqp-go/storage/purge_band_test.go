@@ -18,9 +18,9 @@ import (
 // written to the WAL unless the ring spills, which a handful of small
 // messages never does.
 func TestPurgeQueueRemovesOnlyTheRequestedTagBand(t *testing.T) {
-	ds, err := NewDisruptorStorageWithDataDir(t.TempDir())
+	ds, err := NewStorageEngineWithDataDir(t.TempDir())
 	if err != nil {
-		t.Fatalf("NewDisruptorStorageWithDataDir: %v", err)
+		t.Fatalf("NewStorageEngineWithDataDir: %v", err)
 	}
 	t.Cleanup(func() { _ = ds.Close() })
 

@@ -101,7 +101,7 @@ func (w *wedgingBroker) PublishMessageAsyncConfirm(exchangeName, routingKey stri
 // for writeTimeout) and the connection closes with 506.
 func TestLease_ProcessorStallCloses506(t *testing.T) {
 	tmpDir := t.TempDir()
-	store, err := storage.NewDisruptorStorageWithDataDir(tmpDir)
+	store, err := storage.NewStorageEngineWithDataDir(tmpDir)
 	require.NoError(t, err)
 	wedge := &wedgingBroker{UnifiedBroker: NewStorageBrokerAdapter(broker.NewStorageBroker(store, config.DefaultConfig().GetEngine())), gate: make(chan struct{})}
 	var unwedge sync.Once
@@ -193,7 +193,7 @@ func (p *panicUnregisterBroker) PublishMessageAdmitted(exchangeName, routingKey 
 
 func TestLease_CleanupPanicCannotLeakLeases(t *testing.T) {
 	tmpDir := t.TempDir()
-	store, err := storage.NewDisruptorStorageWithDataDir(tmpDir)
+	store, err := storage.NewStorageEngineWithDataDir(tmpDir)
 	require.NoError(t, err)
 	cfg := config.DefaultConfig()
 	cfg.Network.Address = "127.0.0.1:0"

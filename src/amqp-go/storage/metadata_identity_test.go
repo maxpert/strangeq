@@ -247,7 +247,7 @@ func TestStoragePath_ArtifactPathsAreAbsoluteAtShippedDefaults(t *testing.T) {
 	require.False(t, filepath.IsAbs(relative),
 		"PREMISE: the fixture must feed a RELATIVE data directory, or it asserts nothing")
 
-	ds, err := NewDisruptorStorageWithEngineConfig(relative, interfaces.EngineConfig{})
+	ds, err := NewStorageEngineWithConfig(relative, interfaces.EngineConfig{})
 	require.NoError(t, err)
 	defer ds.Close()
 

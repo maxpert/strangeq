@@ -117,7 +117,7 @@ type SegmentManager struct {
 	// reclaimed), a segment withdrawn from compaction, and segment faults
 	// discovered on the write path rather than at boot. nil means "no logging",
 	// so a caller that never wires one pays nothing. Wired by
-	// DisruptorStorage.SetLogger.
+	// StorageEngine.SetLogger.
 	//
 	// Before this existed, storage had no logger at all and every one of those
 	// conditions was invisible: review-4 B-2's symptom was "the disk fills up".
@@ -157,7 +157,7 @@ type QueueSegments struct {
 	loadFaults      []error
 	loadFaultsMutex sync.Mutex
 
-	// closed makes close() idempotent: DisruptorStorage.Close reaches
+	// closed makes close() idempotent: StorageEngine.Close reaches
 	// SegmentManager.Close, and so does any deferred Close in a caller. A
 	// second close(qs.stopChan) panics.
 	closed atomic.Bool
@@ -2214,7 +2214,7 @@ func (qs *QueueSegments) collectAllMessages() ([]*RecoveryMessage, error) {
 // directory, keyed by the queue that owns it, together with a classified fault
 // for anything that could not be interpreted.
 //
-// It honours the contract DisruptorStorage.GetRecoverableMessages states: a
+// It honours the contract StorageEngine.GetRecoverableMessages states: a
 // fatal fault is confined to the segment file that produced it, the scan
 // continues, and everything else comes back. Before Step 4 this returned
 // `result, nil` unconditionally — it swallowed its own ReadDir failure and
@@ -2277,7 +2277,7 @@ func (sm *SegmentManager) RecoverFromSegments() (map[string][]*RecoveryMessage, 
 }
 
 // close stops background goroutines and closes files.
-// It is idempotent: DisruptorStorage.Close reaches SegmentManager.Close, and a
+// It is idempotent: StorageEngine.Close reaches SegmentManager.Close, and a
 // deferred Close in any caller reaches it again; the second close(qs.stopChan)
 // used to panic during shutdown.
 func (qs *QueueSegments) close() {

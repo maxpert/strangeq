@@ -166,7 +166,7 @@ func BenchmarkPublishMessage_SingleQueue(b *testing.B) {
 
 	broker.DeclareQueue("bench-pub", false, false, false, nil)
 	qs := broker.getOrCreateQueueState("bench-pub")
-	qs.SetDepthHighWM(0)
+	qs.SetMaxQueueBacklog(0)
 
 	stop, cancel := makeStop()
 	var wg sync.WaitGroup
@@ -211,7 +211,7 @@ func BenchmarkPublishMessage_MultiQueue(b *testing.B) {
 		broker.DeclareQueue(qname, false, false, false, nil)
 		broker.BindQueue(qname, "bench-fanout", "", nil)
 		qss[i] = broker.getOrCreateQueueState(qname)
-		qss[i].SetDepthHighWM(0)
+		qss[i].SetMaxQueueBacklog(0)
 	}
 
 	stop, cancel := makeStop()
@@ -266,7 +266,7 @@ func BenchmarkPublishMessage_MultiQueueTopic(b *testing.B) {
 		// per binding, not just a literal-equality check.
 		broker.BindQueue(qname, "bench-topic", "bench.*.pub", nil)
 		qss[i] = broker.getOrCreateQueueState(qname)
-		qss[i].SetDepthHighWM(0)
+		qss[i].SetMaxQueueBacklog(0)
 	}
 
 	stop, cancel := makeStop()
@@ -315,7 +315,7 @@ func BenchmarkDeliverMessage_ManualAck(b *testing.B) {
 	defer broker.storage.UnregisterConsumerCursor(queueName, consumerTag)
 
 	qs := broker.getOrCreateQueueState(queueName)
-	qs.SetDepthHighWM(0)
+	qs.SetMaxQueueBacklog(0)
 
 	consumer := &protocol.Consumer{
 		Tag:      consumerTag,
@@ -414,7 +414,7 @@ func BenchmarkAcknowledgeMessage(b *testing.B) {
 	defer broker.activeConsumers.Delete("bench-ack-consumer")
 
 	qs := broker.getOrCreateQueueState("bench-ack")
-	qs.SetDepthHighWM(0)
+	qs.SetMaxQueueBacklog(0)
 
 	body := make([]byte, 256)
 	tag := uint64(0)
@@ -456,7 +456,7 @@ func BenchmarkPublishConsumeAck_Roundtrip(b *testing.B) {
 	broker.DeclareQueue("bench-rt", false, false, false, nil)
 	broker.storage.RegisterConsumerCursor("bench-rt", "bench-rt-consumer")
 	qs := broker.getOrCreateQueueState("bench-rt")
-	qs.SetDepthHighWM(0)
+	qs.SetMaxQueueBacklog(0)
 
 	stop, cancel := makeStop()
 	defer cancel()

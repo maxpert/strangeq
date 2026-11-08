@@ -131,7 +131,7 @@ func TestAsyncConfirm_AtHWMAdmitsWithoutParkAndReportsBackpressure(t *testing.T)
 	_, err := b.DeclareQueue("bpq", true, false, false, nil)
 	require.NoError(t, err)
 	qs := b.getOrCreateQueueState("bpq")
-	qs.SetDepthHighWM(2)
+	qs.SetMaxQueueBacklog(2)
 
 	// Fill exactly to HWM with transient publishes (waiting is incremented
 	// synchronously; each checks capacity BEFORE its own increment, so neither
@@ -518,8 +518,8 @@ func TestAsyncConfirm_FanoutConfirmOnlyAfterAllCopies(t *testing.T) {
 	defer restore()
 
 	ec := interfaces.EngineConfig{
-		DepthHighWM:  52428,
-		WALBatchSize: walBatchSize,
+		MaxQueueBacklog: 52428,
+		WALBatchSize:    walBatchSize,
 	}
 	walCfg := storage.WALConfigFromEngine(ec)
 	require.Equal(t, walBatchSize, walCfg.BatchSize,
@@ -527,7 +527,7 @@ func TestAsyncConfirm_FanoutConfirmOnlyAfterAllCopies(t *testing.T) {
 	require.False(t, walCfg.SyncDisabled,
 		"fixture premise broken: fsync must be enabled for the durability gate")
 
-	store, err := storage.NewDisruptorStorageWithEngineConfig(t.TempDir(), ec)
+	store, err := storage.NewStorageEngineWithConfig(t.TempDir(), ec)
 	require.NoError(t, err)
 	b := NewStorageBroker(store, ec)
 	var cleanupOnce sync.Once
@@ -634,10 +634,10 @@ func TestAsyncConfirm_FanoutConfirmOnlyAfterAllCopies(t *testing.T) {
 		"confirm must fire EXACTLY once for the fanout publish")
 }
 
-// flakyAsyncStore wraps a real DisruptorStorage and can fail StoreMessageAsync
+// flakyAsyncStore wraps a real StorageEngine and can fail StoreMessageAsync
 // on demand, to exercise the enqueue-error path (M1).
 type flakyAsyncStore struct {
-	*storage.DisruptorStorage
+	*storage.StorageEngine
 	failStoreAsync atomic.Bool
 }
 
@@ -645,7 +645,7 @@ func (f *flakyAsyncStore) StoreMessageAsync(queueName string, message *protocol.
 	if f.failStoreAsync.Load() {
 		return fmt.Errorf("injected StoreMessageAsync failure")
 	}
-	return f.DisruptorStorage.StoreMessageAsync(queueName, message, onWritten, onDurable)
+	return f.StorageEngine.StoreMessageAsync(queueName, message, onWritten, onDurable)
 }
 
 // TestFrontier_EnqueueErrorDoesNotWedgeQueue (M1). A durable publish reserves a
@@ -655,14 +655,14 @@ func (f *flakyAsyncStore) StoreMessageAsync(queueName string, message *protocol.
 // stuck tag. Asserts a subsequent durable publish still becomes visible.
 func TestFrontier_EnqueueErrorDoesNotWedgeQueue(t *testing.T) {
 	ec := interfaces.EngineConfig{
-		DepthHighWM:             52428,
+		MaxQueueBacklog:         52428,
 		WALBatchSize:            1000,
 		ConsumerSelectTimeoutMS: 1,
 		ConsumerMaxBatchSize:    100,
 	}
-	ds, err := storage.NewDisruptorStorageWithDataDir(t.TempDir())
+	ds, err := storage.NewStorageEngineWithDataDir(t.TempDir())
 	require.NoError(t, err)
-	fs := &flakyAsyncStore{DisruptorStorage: ds}
+	fs := &flakyAsyncStore{StorageEngine: ds}
 	b := NewStorageBroker(fs, ec)
 	defer func() { b.Close(); _ = ds.Close() }()
 
@@ -771,13 +771,13 @@ func TestAsyncConfirm_DropHeadDeadLetterFromCompletionNoDeadlock(t *testing.T) {
 func TestCrash_ConfirmedImpliesRecoverable(t *testing.T) {
 	dataDir := t.TempDir()
 	ec := interfaces.EngineConfig{
-		DepthHighWM:             52428,
+		MaxQueueBacklog:         52428,
 		WALBatchSize:            1000,
 		ConsumerSelectTimeoutMS: 1,
 		ConsumerMaxBatchSize:    100,
 	}
 
-	store1, err := storage.NewDisruptorStorageWithDataDir(dataDir)
+	store1, err := storage.NewStorageEngineWithDataDir(dataDir)
 	require.NoError(t, err)
 	b1 := NewStorageBroker(store1, ec)
 	_, err = b1.DeclareQueue("cq", true, false, false, nil)
@@ -809,7 +809,7 @@ func TestCrash_ConfirmedImpliesRecoverable(t *testing.T) {
 	require.NoError(t, store1.Close())
 
 	// Crash + restart: reopen the same data dir and recover from the WAL.
-	store2, err := storage.NewDisruptorStorageWithDataDir(dataDir)
+	store2, err := storage.NewStorageEngineWithDataDir(dataDir)
 	require.NoError(t, err)
 	defer store2.Close()
 

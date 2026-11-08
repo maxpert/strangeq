@@ -418,7 +418,7 @@ func (p *rootPanicBroker) PublishMessageAdmitted(exchangeName, routingKey string
 func TestPanicRecoveryWSB(t *testing.T) {
 	cfg := isolatedTestConfig(t, "127.0.0.1:0")
 	cfg.Server.LogLevel = "silent"
-	st, err := storage.NewDisruptorStorageWithDataDir(cfg.Storage.Path)
+	st, err := storage.NewStorageEngineWithDataDir(cfg.Storage.Path)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = st.Close() })
 	pb := &rootPanicBroker{declarePanic: "boom-q"}

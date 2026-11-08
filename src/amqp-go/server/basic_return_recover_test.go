@@ -21,12 +21,12 @@ import (
 func createTestStorageBroker(t testing.TB) (*broker.StorageBroker, func()) {
 	t.Helper()
 	tmpDir := t.TempDir()
-	store, err := storage.NewDisruptorStorageWithDataDir(tmpDir)
+	store, err := storage.NewStorageEngineWithDataDir(tmpDir)
 	if err != nil {
 		t.Fatalf("failed to create storage: %v", err)
 	}
 	engineConfig := interfaces.EngineConfig{
-		DepthHighWM:             52428,
+		MaxQueueBacklog:         52428,
 		WALBatchSize:            1000,
 		WALBatchTimeoutMS:       10,
 		ConsumerSelectTimeoutMS: 1,

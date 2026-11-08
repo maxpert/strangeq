@@ -158,7 +158,7 @@ func TestPurgeIncarnationRefusesSupersededIncarnation(t *testing.T) {
 
 	// Snapshot the successor's DISPATCH CURSORS, not just its storage residency.
 	// GetMessage falls back readAhead -> WAL -> segments
-	// (storage/disruptor_storage.go GetMessage), so a durable message stays
+	// (storage/storage_engine.go GetMessage), so a durable message stays
 	// retrievable even after its ring slot is wiped. Residency therefore CANNOT
 	// observe this defect: the confirm-then-strand failure is the cursor reset
 	// landing on the successor, which leaves every message intact on disk and

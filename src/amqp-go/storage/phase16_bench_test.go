@@ -25,7 +25,7 @@ import (
 // After: sync.Map provides lock-free reads, mutex only during queue creation.
 // Each goroutine publishes then immediately deletes to keep ring buffer empty.
 func BenchmarkMultiQueueConcurrentPublish(b *testing.B) {
-	ds, err := NewDisruptorStorageWithDataDir(b.TempDir())
+	ds, err := NewStorageEngineWithDataDir(b.TempDir())
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -65,7 +65,7 @@ func BenchmarkMultiQueueConcurrentPublish(b *testing.B) {
 // SINGLE queue — tests contention on the queue's ring buffer without
 // cross-queue lock interference. Each goroutine publishes then deletes.
 func BenchmarkSingleQueueConcurrentPublish(b *testing.B) {
-	ds, err := NewDisruptorStorageWithDataDir(b.TempDir())
+	ds, err := NewStorageEngineWithDataDir(b.TempDir())
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -143,7 +143,7 @@ func BenchmarkWALReadWithCache(b *testing.B) {
 // the hot path for consumer delivery when messages are in the ring buffer.
 // Limits to 10000 messages to stay within ring buffer capacity.
 func BenchmarkGetMessageRingBuffer(b *testing.B) {
-	ds, err := NewDisruptorStorageWithDataDir(b.TempDir())
+	ds, err := NewStorageEngineWithDataDir(b.TempDir())
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -183,7 +183,7 @@ func BenchmarkGetMessageRingBuffer(b *testing.B) {
 // BenchmarkDeleteMessage measures ACK/delete performance — the hot path
 // when consumers acknowledge messages.
 func BenchmarkDeleteMessage(b *testing.B) {
-	ds, err := NewDisruptorStorageWithDataDir(b.TempDir())
+	ds, err := NewStorageEngineWithDataDir(b.TempDir())
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -220,7 +220,7 @@ func BenchmarkDeleteMessage(b *testing.B) {
 // BenchmarkConcurrentGetAndDelete measures concurrent read + delete —
 // simulates consumer delivery + ACK under load.
 func BenchmarkConcurrentGetAndDelete(b *testing.B) {
-	ds, err := NewDisruptorStorageWithDataDir(b.TempDir())
+	ds, err := NewStorageEngineWithDataDir(b.TempDir())
 	if err != nil {
 		b.Fatal(err)
 	}

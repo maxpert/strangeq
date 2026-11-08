@@ -312,11 +312,11 @@ type ServerConfig struct {
 	CleanupIntervalMS int64 // Background cleanup interval
 }
 
-// DefaultDepthHighWM is the shipped per-queue publisher backpressure depth
+// DefaultMaxQueueBacklog is the shipped per-queue publisher backpressure depth
 // high-water mark, in MESSAGES. It is the value the retired pre-segstore knobs
 // implied: RingBufferSize (65536) x SpillThresholdPercent (80) / 100 = 52428.
-// An EngineConfig.DepthHighWM of 0 means "use this default".
-const DefaultDepthHighWM uint64 = 52428
+// An EngineConfig.MaxQueueBacklog of 0 means "use this default".
+const DefaultMaxQueueBacklog uint64 = 52428
 
 // EngineConfig holds internal engine tuning parameters
 // Phase 6G: Configurable hot-path parameters for performance optimization
@@ -325,17 +325,17 @@ type EngineConfig struct {
 	// Publisher Backpressure Depth
 	// ========================================
 
-	// DepthHighWM is the per-queue publisher backpressure depth high-water
+	// MaxQueueBacklog is the per-queue publisher backpressure depth high-water
 	// mark in MESSAGES: at this many messages in flight (head - minAckCursor)
 	// the publisher blocks or spills. It replaces the retired
-	// RingBufferSize x SpillThresholdPercent derivation and the separate
-	// DepthHighWMOverride key (both rejected at boot now).
+	// RingBufferSize x SpillThresholdPercent derivation and the separate legacy
+	// depth-override key (both rejected at boot now).
 	//
 	// It is a SECONDARY gate: the hot-cache BYTE budget (HotCacheQueueBytes)
 	// usually binds first (see broker.publisherGate).
 	//
-	// 0 means the default (DefaultDepthHighWM = 52428).
-	DepthHighWM uint64 `json:"depth_high_wm"`
+	// 0 means the default (DefaultMaxQueueBacklog = 52428).
+	MaxQueueBacklog uint64 `json:"max_queue_backlog"`
 
 	// ========================================
 	// Hot Cache (Segstore v1)

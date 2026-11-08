@@ -35,9 +35,9 @@ import (
 // newColdReadStorage builds a storage whose hot cache can hold anything, so
 // the only reason a read is COLD is that the caller evicted the message (or
 // the publish never fit).
-func newColdReadStorage(t *testing.T, dataDir string) *DisruptorStorage {
+func newColdReadStorage(t *testing.T, dataDir string) *StorageEngine {
 	t.Helper()
-	ds, err := NewDisruptorStorageWithEngineConfig(dataDir, interfaces.EngineConfig{})
+	ds, err := NewStorageEngineWithConfig(dataDir, interfaces.EngineConfig{})
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = ds.Close() })
 	return ds
@@ -45,7 +45,7 @@ func newColdReadStorage(t *testing.T, dataDir string) *DisruptorStorage {
 
 // publishOneColdCandidate publishes one durable message and evicts it from the
 // hot cache, so the next read of it is answered by the WAL (a COLD read).
-func publishOneColdCandidate(t *testing.T, ds *DisruptorStorage, queue string, tag uint64) *protocol.Message {
+func publishOneColdCandidate(t *testing.T, ds *StorageEngine, queue string, tag uint64) *protocol.Message {
 	t.Helper()
 	msg := &protocol.Message{
 		Exchange:     "amq.direct",
@@ -110,7 +110,7 @@ func TestColdRead_DoesNotChangeQueueMessageCount(t *testing.T) {
 // message was never a hot-resident published record), and the read of it is
 // cold. The count must stay 0 across the read.
 func TestColdRead_DoesNotChangeQueueMessageCount_SpilledPublish(t *testing.T) {
-	ds, err := NewDisruptorStorageWithEngineConfig(t.TempDir(), interfaces.EngineConfig{
+	ds, err := NewStorageEngineWithConfig(t.TempDir(), interfaces.EngineConfig{
 		// A budget no message can fit into: every publish is WAL-only.
 		HotCacheQueueBytes: 1,
 	})

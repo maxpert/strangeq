@@ -208,7 +208,7 @@ func TestWSB_Shutdown_ForceClosesNonCooperativeClient(t *testing.T) {
 // TestWSB_Shutdown_LeavesInjectedStorageOpen: storage provided via WithStorage
 // is NOT closed by Shutdown (the caller owns it).
 func TestWSB_Shutdown_LeavesInjectedStorageOpen(t *testing.T) {
-	st, err := storage.NewDisruptorStorageWithDataDir(t.TempDir())
+	st, err := storage.NewStorageEngineWithDataDir(t.TempDir())
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = st.Close() }) // the TEST owns and closes it
 

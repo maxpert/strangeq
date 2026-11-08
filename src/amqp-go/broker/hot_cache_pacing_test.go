@@ -49,13 +49,13 @@ func TestPublisherPacedToHotCacheCapacity(t *testing.T) {
 		// Room for a handful of 256-byte bodies — the point is that the gate
 		// binds on BYTES, not on the 1,000,000-message depth HWM below.
 		HotCacheQueueBytes: 3200,
-		DepthHighWM:        1_000_000,
+		MaxQueueBacklog:    1_000_000,
 		// fsync:false always wires the hot-cache pace gate. (Under the durable
 		// crash models it is wired only for an ordering-only fence; see
 		// TestHotCachePaceGateWiringByCrashModel.)
 		WALSyncDisabled: true,
 	}
-	store, err := storage.NewDisruptorStorageWithEngineConfig(t.TempDir(), ec)
+	store, err := storage.NewStorageEngineWithConfig(t.TempDir(), ec)
 	require.NoError(t, err)
 	b := NewStorageBroker(store, ec)
 	t.Cleanup(func() { b.Close(); _ = store.Close() })
@@ -63,7 +63,7 @@ func TestPublisherPacedToHotCacheCapacity(t *testing.T) {
 	require.NoError(t, err)
 
 	qs := b.getOrCreateQueueState(queue)
-	require.Equal(t, uint64(1_000_000), qs.DepthHighWM(),
+	require.Equal(t, uint64(1_000_000), qs.MaxQueueBacklog(),
 		"fixture premise: the depth HWM is far above the hot-cache byte budget")
 
 	tags := make([]uint64, 0, 8)
@@ -78,7 +78,7 @@ func TestPublisherPacedToHotCacheCapacity(t *testing.T) {
 	}
 	require.NotNil(t, armed,
 		"the publisher must be paced by the hot-cache byte budget, not only by the depth HWM")
-	require.Less(t, qs.Depth(), qs.DepthHighWM(),
+	require.Less(t, qs.Depth(), qs.MaxQueueBacklog(),
 		"hot-cache pacing must bind well before the message-count depth HWM")
 	require.LessOrEqual(t, len(tags), 8)
 
@@ -100,12 +100,12 @@ func TestDeliveryHeadStaysHotUnderSyntheticBacklog(t *testing.T) {
 	body := bytes.Repeat([]byte("b"), 256)
 	ec := interfaces.EngineConfig{
 		HotCacheQueueBytes: 50000, // ~63 bodies of ~786 bytes
-		DepthHighWM:        1_000_000,
+		MaxQueueBacklog:    1_000_000,
 		// fsync:false is the ONLY mode in which the hot-cache pace gate is
 		// wired (durable mode leaves the publisher path unpaced).
 		WALSyncDisabled: true,
 	}
-	store, err := storage.NewDisruptorStorageWithEngineConfig(t.TempDir(), ec)
+	store, err := storage.NewStorageEngineWithConfig(t.TempDir(), ec)
 	require.NoError(t, err)
 	b := NewStorageBroker(store, ec)
 	t.Cleanup(func() { b.Close(); _ = store.Close() })
@@ -142,6 +142,6 @@ func TestDeliveryHeadStaysHotUnderSyntheticBacklog(t *testing.T) {
 	require.GreaterOrEqual(t, ratio, 0.90,
 		"with the publisher paced to the hot-cache budget, at least 90%% of deliveries must be hot (got %.3f)",
 		ratio)
-	require.Less(t, qs.DepthHighWaterSeen(), qs.DepthHighWM(),
+	require.Less(t, qs.MaxBacklogSeen(), qs.MaxQueueBacklog(),
 		"the backlog high-water must stay far below the depth HWM")
 }

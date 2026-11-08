@@ -281,7 +281,7 @@ server:
   maxmessagesize: 16777216
   cleanupintervalms: 300000
 engine:
-  depthhighwm: 52428
+  maxqueuebacklog: 52428
   walbatchsize: 1000
   walbatchtimeoutms: 10
   walfilesize: 536870912
@@ -414,7 +414,7 @@ server:
   maxmessagesize: 16777216
   cleanupintervalms: 300000
 engine:
-  depthhighwm: 52428
+  maxqueuebacklog: 52428
   walbatchsize: 1000
   walbatchtimeoutms: 10
   walfilesize: 536870912
@@ -717,48 +717,50 @@ func TestLegacyDurabilityKeysRejected(t *testing.T) {
 	})
 }
 
-// TestEngineDepthHighWM_SingleKey pins the single honest key engine.depthhighwm:
+// TestEngineMaxQueueBacklog_SingleKey pins the single honest key engine.maxqueuebacklog:
 // DefaultConfig carries the shipped default (the old 65536 x 80 / 100 = 52428),
 // an absent key keeps it, an explicit value binds verbatim, and an explicit 0
 // binds to 0 at the config layer (the broker resolves 0 to the default at use).
-func TestEngineDepthHighWM_SingleKey(t *testing.T) {
-	assert.Equal(t, uint64(52428), interfaces.DefaultDepthHighWM)
-	assert.Equal(t, interfaces.DefaultDepthHighWM, DefaultConfig().Engine.DepthHighWM)
+func TestEngineMaxQueueBacklog_SingleKey(t *testing.T) {
+	assert.Equal(t, uint64(52428), interfaces.DefaultMaxQueueBacklog)
+	assert.Equal(t, interfaces.DefaultMaxQueueBacklog, DefaultConfig().Engine.MaxQueueBacklog)
 
 	t.Run("absent key keeps the default", func(t *testing.T) {
 		path := writeConfigFile(t, validYAMLWithEngineExtra(""))
 		cfg, report, err := LoadConfig(path)
 		require.NoError(t, err)
 		require.NoError(t, cfg.Validate())
-		assert.Equal(t, uint64(52428), cfg.Engine.DepthHighWM)
-		assert.NotContains(t, report.UnknownKeys, "engine.depthhighwm")
+		assert.Equal(t, uint64(52428), cfg.Engine.MaxQueueBacklog)
+		assert.NotContains(t, report.UnknownKeys, "engine.maxqueuebacklog")
 	})
 
 	t.Run("explicit value binds", func(t *testing.T) {
-		path := writeConfigFile(t, validYAMLWithEngineExtra("  depthhighwm: 1000\n"))
+		path := writeConfigFile(t, validYAMLWithEngineExtra("  maxqueuebacklog: 1000\n"))
 		cfg, report, err := LoadConfig(path)
 		require.NoError(t, err)
 		require.NoError(t, cfg.Validate())
-		assert.Equal(t, uint64(1000), cfg.Engine.DepthHighWM)
-		assert.NotContains(t, report.UnknownKeys, "engine.depthhighwm")
+		assert.Equal(t, uint64(1000), cfg.Engine.MaxQueueBacklog)
+		assert.NotContains(t, report.UnknownKeys, "engine.maxqueuebacklog")
 	})
 
 	t.Run("zero binds to zero at the config layer", func(t *testing.T) {
-		path := writeConfigFile(t, validYAMLWithEngineExtra("  depthhighwm: 0\n"))
+		path := writeConfigFile(t, validYAMLWithEngineExtra("  maxqueuebacklog: 0\n"))
 		cfg, report, err := LoadConfig(path)
 		require.NoError(t, err)
 		require.NoError(t, cfg.Validate(), "0 is legal: the broker resolves it to the default")
-		assert.Equal(t, uint64(0), cfg.Engine.DepthHighWM)
-		assert.NotContains(t, report.UnknownKeys, "engine.depthhighwm")
+		assert.Equal(t, uint64(0), cfg.Engine.MaxQueueBacklog)
+		assert.NotContains(t, report.UnknownKeys, "engine.maxqueuebacklog")
 	})
 }
 
 // TestLegacyEngineDepthKeysRejected pins the HARD rejection of the retired
 // engine.ringbuffersize / engine.spillthresholdpercent /
-// engine.depthhighwmoverride keys, from a file AND from the environment. They
-// must never fall through to the generic unknown-key warning: ignoring
-// ringbuffersize/spillthresholdpercent silently changes the per-queue publisher
-// backpressure depth, so the retired keys must be migrated, not dropped.
+// engine.depthhighwmoverride / engine.depthhighwm keys, from a file AND from the
+// environment. They must never fall through to the generic unknown-key warning:
+// ignoring ringbuffersize/spillthresholdpercent silently changes the per-queue
+// publisher backpressure depth, and ignoring depthhighwm silently drops the
+// publisher's chosen backlog to the default, so the retired keys must be
+// migrated, not dropped.
 func TestLegacyEngineDepthKeysRejected(t *testing.T) {
 	fileCases := []struct {
 		name string
@@ -768,6 +770,7 @@ func TestLegacyEngineDepthKeysRejected(t *testing.T) {
 		{"ringbuffersize", "  ringbuffersize: 65536\n", "engine.ringbuffersize"},
 		{"spillthresholdpercent", "  spillthresholdpercent: 80\n", "engine.spillthresholdpercent"},
 		{"depthhighwmoverride", "  depthhighwmoverride: 1000\n", "engine.depthhighwmoverride"},
+		{"depthhighwm", "  depthhighwm: 1000\n", "engine.depthhighwm"},
 	}
 	for _, tc := range fileCases {
 		t.Run("file/"+tc.name, func(t *testing.T) {
@@ -775,9 +778,10 @@ func TestLegacyEngineDepthKeysRejected(t *testing.T) {
 			_, report, err := LoadConfig(path)
 			require.Error(t, err, "a retired engine depth key must fail at boot")
 			assert.Nil(t, report, "LoadConfig must return no report on a hard error")
-			assert.Contains(t, err.Error(), tc.seen+" is no longer supported; use engine.depthhighwm instead")
-			assert.Contains(t, err.Error(), "ringbuffersize: N + spillthresholdpercent: P -> depthhighwm: N*P/100")
+			assert.Contains(t, err.Error(), tc.seen+" is no longer supported; use engine.maxqueuebacklog instead")
+			assert.Contains(t, err.Error(), "ringbuffersize: N + spillthresholdpercent: P -> maxqueuebacklog: N*P/100")
 			assert.Contains(t, err.Error(), "depthhighwmoverride: N")
+			assert.Contains(t, err.Error(), "depthhighwm: N")
 		})
 	}
 
@@ -798,6 +802,7 @@ func TestLegacyEngineDepthKeysRejected(t *testing.T) {
 		{"ringbuffersize", "AMQP_ENGINE_RINGBUFFERSIZE", "65536", "engine.ringbuffersize"},
 		{"spillthresholdpercent", "AMQP_ENGINE_SPILLTHRESHOLDPERCENT", "80", "engine.spillthresholdpercent"},
 		{"depthhighwmoverride", "AMQP_ENGINE_DEPTHHIGHWMOVERRIDE", "1000", "engine.depthhighwmoverride"},
+		{"depthhighwm", "AMQP_ENGINE_DEPTHHIGHWM", "1000", "engine.depthhighwm"},
 	}
 	for _, tc := range envCases {
 		t.Run("env/"+tc.name, func(t *testing.T) {
@@ -809,12 +814,12 @@ func TestLegacyEngineDepthKeysRejected(t *testing.T) {
 	}
 
 	t.Run("the new key means no error", func(t *testing.T) {
-		path := writeConfigFile(t, validYAMLWithEngineExtra("  depthhighwm: 4096\n"))
+		path := writeConfigFile(t, validYAMLWithEngineExtra("  maxqueuebacklog: 4096\n"))
 		cfg, report, err := LoadConfig(path)
 		require.NoError(t, err)
 		require.NoError(t, cfg.Validate())
-		assert.Equal(t, uint64(4096), cfg.Engine.DepthHighWM)
-		assert.NotContains(t, report.UnknownKeys, "engine.depthhighwm")
+		assert.Equal(t, uint64(4096), cfg.Engine.MaxQueueBacklog)
+		assert.NotContains(t, report.UnknownKeys, "engine.maxqueuebacklog")
 	})
 }
 

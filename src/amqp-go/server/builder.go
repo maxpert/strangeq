@@ -179,7 +179,7 @@ func (b *ServerBuilder) Build() (*Server, error) {
 		return nil, fmt.Errorf("invalid configuration: %w", err)
 	}
 
-	// Memory limits are handled at the disruptor/queue level via HWM and capacity settings
+	// Memory limits are handled at the storage engine/queue level via HWM and capacity settings
 
 	// Create logger if not provided
 	logger := b.logger
@@ -191,21 +191,21 @@ func (b *ServerBuilder) Build() (*Server, error) {
 		logger = &ZapLoggerAdapter{logger: zapLogger}
 	}
 
-	// Phase 1: Use disruptor-based in-memory storage
+	// Phase 1: Use the in-memory storage engine
 	var storageImpl interfaces.Storage
 	if b.storage != nil {
 		storageImpl = b.storage
 	} else {
-		// Create new disruptor storage with the engine config
+		// Create a new storage engine with the engine config
 		var err error
-		storageImpl, err = storage.NewDisruptorStorageWithEngineConfig(
+		storageImpl, err = storage.NewStorageEngineWithConfig(
 			b.config.Storage.Path,
 			b.config.GetEngine(),
 		)
 		if err != nil {
 			return nil, fmt.Errorf("failed to initialize durable storage at %q: %w", b.config.Storage.Path, err)
 		}
-		logger.Info("Using disruptor-based storage")
+		logger.Info("Using storage engine")
 	}
 
 	// The storage tiers have cold-path durability failures the call stack cannot

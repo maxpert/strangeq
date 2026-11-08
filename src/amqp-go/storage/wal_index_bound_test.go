@@ -206,7 +206,7 @@ func TestWALIndexBound_AckStateLivesInTheBitmap(t *testing.T) {
 //   - the storage read path reports it as not found.
 func TestWALIndexBound_AcknowledgedTagIsNotResurrectedByAnOlderCopy(t *testing.T) {
 	dir := t.TempDir()
-	ds, err := NewDisruptorStorageWithDataDir(dir)
+	ds, err := NewStorageEngineWithDataDir(dir)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = ds.Close() })
 

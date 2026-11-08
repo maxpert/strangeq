@@ -175,7 +175,7 @@ func (r *RecoveryManager) PerformRecovery() (*protocol.RecoveryStats, error) {
 // validateAndRepairStorage validates storage integrity and repairs corruption
 //
 // WS-C C6 seam: storage.ValidateStorageIntegrity/RepairCorruption are
-// intentionally NOT implemented by the disruptor backend (an empty success
+// intentionally NOT implemented by the storage engine (an empty success
 // would claim a validation that never ran; the classified recovery scan that
 // follows already enforces integrity fail-closed). ErrNotImplemented from
 // validation therefore means "capability unavailable" — log once and proceed

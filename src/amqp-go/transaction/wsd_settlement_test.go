@@ -13,16 +13,16 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// newRealTxStack builds a DisruptorStorage + StorageBroker + tx manager wired
+// newRealTxStack builds a StorageEngine + StorageBroker + tx manager wired
 // for atomic execution, mirroring the server's construction
 // (NewTransactionManagerWithStorage + UnifiedBrokerExecutor).
-func newRealTxStack(t *testing.T) (*storage.DisruptorStorage, *broker.StorageBroker, *DefaultTransactionManager) {
+func newRealTxStack(t *testing.T) (*storage.StorageEngine, *broker.StorageBroker, *DefaultTransactionManager) {
 	t.Helper()
-	ds, err := storage.NewDisruptorStorageWithDataDir(t.TempDir())
+	ds, err := storage.NewStorageEngineWithDataDir(t.TempDir())
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = ds.Close() })
 	b := broker.NewStorageBroker(ds, interfaces.EngineConfig{
-		DepthHighWM:             52428,
+		MaxQueueBacklog:         52428,
 		WALBatchSize:            1000,
 		WALBatchTimeoutMS:       10,
 		ConsumerSelectTimeoutMS: 1,

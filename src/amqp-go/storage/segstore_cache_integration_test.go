@@ -12,9 +12,9 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func newSegstoreCacheTestStorage(t *testing.T, queueBytes, globalBytes int64) *DisruptorStorage {
+func newSegstoreCacheTestStorage(t *testing.T, queueBytes, globalBytes int64) *StorageEngine {
 	t.Helper()
-	ds, err := NewDisruptorStorageWithEngineConfig(t.TempDir(), interfaces.EngineConfig{
+	ds, err := NewStorageEngineWithConfig(t.TempDir(), interfaces.EngineConfig{
 		HotCacheQueueBytes:  queueBytes,
 		HotCacheGlobalBytes: globalBytes,
 	})
@@ -25,7 +25,7 @@ func newSegstoreCacheTestStorage(t *testing.T, queueBytes, globalBytes int64) *D
 
 // evictResidentForCacheTest forces a cold read without acknowledging the tag.
 // WI3 replaces the ring operation with hotCache.Delete.
-func evictResidentForCacheTest(t *testing.T, ds *DisruptorStorage, queue string, tag uint64) {
+func evictResidentForCacheTest(t *testing.T, ds *StorageEngine, queue string, tag uint64) {
 	t.Helper()
 	require.True(t, ds.hot.Delete(queue, tag), "test premise: message starts hot")
 }

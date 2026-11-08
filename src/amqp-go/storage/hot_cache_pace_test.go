@@ -4,7 +4,7 @@ package storage
 //
 // The defect: the per-queue hot cache holds 64 MiB (~1,015 64 KiB bodies) while
 // the queue's message-count depth high-water mark is 52,428 messages (the
-// shipped engine.depthhighwm default). The publisher is therefore allowed
+// shipped engine.maxqueuebacklog default). The publisher is therefore allowed
 // to run ~51,000 messages ahead of the FIFO consumer; the delivered head is
 // evicted from RAM long before it is read, and ~96 % of deliveries take a cold
 // WAL pread.
@@ -27,9 +27,9 @@ import (
 // newPaceStorage builds a storage with a per-queue hot budget of exactly
 // budgetBytes. The WAL and segment tiers are real (the storage is fully
 // constructed) but these tests never touch them.
-func newPaceStorage(t *testing.T, budgetBytes int64) *DisruptorStorage {
+func newPaceStorage(t *testing.T, budgetBytes int64) *StorageEngine {
 	t.Helper()
-	ds, err := NewDisruptorStorageWithEngineConfig(t.TempDir(), interfaces.EngineConfig{
+	ds, err := NewStorageEngineWithConfig(t.TempDir(), interfaces.EngineConfig{
 		HotCacheQueueBytes: budgetBytes,
 	})
 	require.NoError(t, err)

@@ -210,25 +210,29 @@ func legacyDurabilityError(unused []string) error {
 
 // legacyEngineKeyMigration is the boot-time migration message for the retired
 // engine.ringbuffersize / engine.spillthresholdpercent /
-// engine.depthhighwmoverride keys. The first line names the retired key that was
-// seen; the table maps all three onto the single engine.depthhighwm option.
-// Kept as one string so file and env rejections read identically.
-const legacyEngineKeyMigration = `%s is no longer supported; use engine.depthhighwm instead:
-  ringbuffersize: N + spillthresholdpercent: P -> depthhighwm: N*P/100
-  depthhighwmoverride: N                        -> depthhighwm: N`
+// engine.depthhighwmoverride / engine.depthhighwm keys. The first line names the
+// retired key that was seen; the table maps all of them onto the single
+// engine.maxqueuebacklog option. engine.depthhighwm was the short-lived earlier
+// name of that option and is rejected too, rather than being silently dropped to
+// the default. Kept as one string so file and env rejections read identically.
+const legacyEngineKeyMigration = `%s is no longer supported; use engine.maxqueuebacklog instead:
+  ringbuffersize: N + spillthresholdpercent: P -> maxqueuebacklog: N*P/100
+  depthhighwmoverride: N                        -> maxqueuebacklog: N
+  depthhighwm: N                                -> maxqueuebacklog: N`
 
 // legacyEngineKeyError returns a hard boot-time error when a retired engine
 // depth key is present among the unbound keys, or nil when none is. The keys are
 // matched on their NORMALIZED dotted path (see normalizeKey), so both
 // ring_buffer_size and ringbuffersize match; the environment variables
-// AMQP_ENGINE_RINGBUFFERSIZE, AMQP_ENGINE_SPILLTHRESHOLDPERCENT and
-// AMQP_ENGINE_DEPTHHIGHWMOVERRIDE flow through envTransform onto the same paths
-// and are covered by the one check.
+// AMQP_ENGINE_RINGBUFFERSIZE, AMQP_ENGINE_SPILLTHRESHOLDPERCENT,
+// AMQP_ENGINE_DEPTHHIGHWMOVERRIDE and AMQP_ENGINE_DEPTHHIGHWM flow through
+// envTransform onto the same paths and are covered by the one check.
 //
 // This MUST be an error rather than the generic unknown-key warning: ignoring
 // ringbuffersize/spillthresholdpercent silently changes the per-queue publisher
-// backpressure depth, and ignoring depthhighwmoverride changes where the
-// producer parks, so the retired keys must be migrated, not dropped.
+// backpressure depth, ignoring depthhighwmoverride changes where the producer
+// parks, and ignoring depthhighwm quietly drops the publisher's chosen backlog
+// to the default, so the retired keys must be migrated, not dropped.
 func legacyEngineKeyError(unused []string) error {
 	for _, key := range unused {
 		switch strings.ToLower(key) {
@@ -238,6 +242,8 @@ func legacyEngineKeyError(unused []string) error {
 			return fmt.Errorf(legacyEngineKeyMigration, "engine.spillthresholdpercent")
 		case "engine.depthhighwmoverride":
 			return fmt.Errorf(legacyEngineKeyMigration, "engine.depthhighwmoverride")
+		case "engine.depthhighwm":
+			return fmt.Errorf(legacyEngineKeyMigration, "engine.depthhighwm")
 		}
 	}
 	return nil

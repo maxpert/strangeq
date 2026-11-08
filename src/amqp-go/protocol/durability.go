@@ -32,7 +32,7 @@ type DurableEntityMetadata struct {
 	Queues []*Queue `json:"queues"`
 
 	// NO BINDING FIELD. It existed, was initialised to an empty slice by
-	// DisruptorStorage.GetDurableEntityMetadata, and was never appended to, so
+	// StorageEngine.GetDurableEntityMetadata, and was never appended to, so
 	// RecoveryManager.recoverBindings' loop body never executed once.
 	//
 	// Durable bindings DO survive a restart, and not through recovery: the

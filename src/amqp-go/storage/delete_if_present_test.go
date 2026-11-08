@@ -15,7 +15,7 @@ import (
 // reaper and a racing consumer could both decrement queue depth for the same
 // waiting message.
 func TestDeleteMessageIfPresent_SingleWinner(t *testing.T) {
-	ds, err := NewDisruptorStorageWithDataDir(t.TempDir())
+	ds, err := NewStorageEngineWithDataDir(t.TempDir())
 	require.NoError(t, err)
 	defer ds.Close()
 
@@ -50,7 +50,7 @@ func TestDeleteMessageIfPresent_SingleWinner(t *testing.T) {
 // TestDeleteMessageIfPresent_AbsentTagFalse verifies a tag never stored reports
 // false (the reaper must not decrement depth for a non-existent tag).
 func TestDeleteMessageIfPresent_AbsentTagFalse(t *testing.T) {
-	ds, err := NewDisruptorStorageWithDataDir(t.TempDir())
+	ds, err := NewStorageEngineWithDataDir(t.TempDir())
 	require.NoError(t, err)
 	defer ds.Close()
 

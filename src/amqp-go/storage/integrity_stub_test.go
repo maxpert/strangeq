@@ -22,7 +22,7 @@ func interfacesEngineConfigZero() interfaces.EngineConfig {
 
 // TestValidateStorageIntegrity_FailsClosed (TDD test 22).
 func TestValidateStorageIntegrity_FailsClosed(t *testing.T) {
-	ds, err := NewDisruptorStorageWithEngineConfig(t.TempDir(), interfacesEngineConfigZero())
+	ds, err := NewStorageEngineWithConfig(t.TempDir(), interfacesEngineConfigZero())
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = ds.Close() })
 

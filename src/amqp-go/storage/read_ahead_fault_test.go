@@ -23,14 +23,14 @@ import (
 
 // newReadAheadCRCDisabledStorage is newReadAheadTestStorage's config with
 // WALCRCDisabled set (fsync already disabled by the base helper, matching it).
-func newReadAheadCRCDisabledStorage(t *testing.T, tmpDir string, ringSize int) *DisruptorStorage {
+func newReadAheadCRCDisabledStorage(t *testing.T, tmpDir string, ringSize int) *StorageEngine {
 	t.Helper()
 	ec := interfaces.EngineConfig{
-		DepthHighWM:     uint64(ringSize) * 80 / 100,
+		MaxQueueBacklog: uint64(ringSize) * 80 / 100,
 		WALSyncDisabled: true,
 		WALCRCDisabled:  true,
 	}
-	storage, err := NewDisruptorStorageWithEngineConfig(tmpDir, ec)
+	storage, err := NewStorageEngineWithConfig(tmpDir, ec)
 	require.NoError(t, err)
 	return storage
 }
@@ -216,19 +216,19 @@ func TestReadAhead_StopsAtBlankHeader(t *testing.T) {
 
 // newReadAheadTestStorageSync is newReadAheadTestStorage with fsync ENABLED
 // (real durability barriers on the write path).
-func newReadAheadTestStorageSync(t *testing.T, tmpDir string, ringSize int) *DisruptorStorage {
+func newReadAheadTestStorageSync(t *testing.T, tmpDir string, ringSize int) *StorageEngine {
 	t.Helper()
 	ec := interfaces.EngineConfig{
-		DepthHighWM: uint64(ringSize) * 80 / 100,
+		MaxQueueBacklog: uint64(ringSize) * 80 / 100,
 	}
-	storage, err := NewDisruptorStorageWithEngineConfig(tmpDir, ec)
+	storage, err := NewStorageEngineWithConfig(tmpDir, ec)
 	require.NoError(t, err)
 	return storage
 }
 
 // publishDurableMessagesSync is publishDurableMessages for a fsync-enabled
 // storage (StoreMessage blocks until the batch is durable).
-func publishDurableMessagesSync(t *testing.T, storage *DisruptorStorage, queueName string, n int) {
+func publishDurableMessagesSync(t *testing.T, storage *StorageEngine, queueName string, n int) {
 	t.Helper()
 	for i := 0; i < n; i++ {
 		msg := &protocol.Message{

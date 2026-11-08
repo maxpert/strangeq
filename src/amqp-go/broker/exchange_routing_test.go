@@ -13,11 +13,11 @@ import (
 // createTestBroker creates a test broker with in-memory storage
 func createTestBroker(t testing.TB) (*StorageBroker, func()) {
 	tmpDir := t.TempDir()
-	store, err := storage.NewDisruptorStorageWithDataDir(tmpDir)
+	store, err := storage.NewStorageEngineWithDataDir(tmpDir)
 	require.NoError(t, err)
 
 	engineConfig := interfaces.EngineConfig{
-		DepthHighWM:             52428,
+		MaxQueueBacklog:         52428,
 		WALBatchSize:            1000,
 		WALBatchTimeoutMS:       10,
 		ConsumerSelectTimeoutMS: 1,

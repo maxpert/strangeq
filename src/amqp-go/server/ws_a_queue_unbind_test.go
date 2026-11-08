@@ -23,7 +23,7 @@ func newUnbindTestServer(t *testing.T) (*Server, interfaces.Storage) {
 	cfg := config.DefaultConfig()
 	cfg.Storage.Path = t.TempDir()
 
-	storageImpl, err := storage.NewDisruptorStorageWithDataDir(cfg.Storage.Path)
+	storageImpl, err := storage.NewStorageEngineWithDataDir(cfg.Storage.Path)
 	if err != nil {
 		t.Fatalf("failed to create storage: %v", err)
 	}

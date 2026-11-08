@@ -84,7 +84,7 @@ func TestWALTail_BoundedHoleOnNewestFileStopsReplayAndTruncates(t *testing.T) {
 	}
 	path := writeSharedWALFile(t, dir, 1, buf)
 
-	st, err := NewDisruptorStorageWithEngineConfig(dir, interfaces.EngineConfig{})
+	st, err := NewStorageEngineWithConfig(dir, interfaces.EngineConfig{})
 	require.NoError(t, err,
 		"a bounded hole on the newest WAL file must NOT refuse the boot (R-TAIL-HOLE); "+
 			"the pre-change code returned a FatalFault here and abandoned the confirmed prefix")
@@ -131,7 +131,7 @@ func TestWALTail_TornChunkInNewestFileStopsReplay(t *testing.T) {
 	}
 	writeSharedWALFile(t, dir, 1, buf)
 
-	st, err := NewDisruptorStorageWithEngineConfig(dir, interfaces.EngineConfig{})
+	st, err := NewStorageEngineWithConfig(dir, interfaces.EngineConfig{})
 	require.NoError(t, err, "a bounded torn chunk on the newest file must not refuse the boot")
 	defer st.Close()
 
@@ -170,7 +170,7 @@ func TestWALTail_HoleOnThirdNewestFileStaysFatal(t *testing.T) {
 	}
 	writeSharedWALFile(t, dir, 3, clean3)
 
-	_, err := NewDisruptorStorageWithEngineConfig(dir, interfaces.EngineConfig{})
+	_, err := NewStorageEngineWithConfig(dir, interfaces.EngineConfig{})
 	require.Error(t, err,
 		"a hole in the third-newest WAL file is real interior corruption and must stay fatal (R-TAIL-HOLE)")
 	require.Contains(t, err.Error(), "00000000000000000001.wal",
@@ -206,7 +206,7 @@ func TestWALTail_OutOfBoundSuffixStaysFatal(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, f.Close())
 
-	_, cerr := NewDisruptorStorageWithEngineConfig(dir, interfaces.EngineConfig{})
+	_, cerr := NewStorageEngineWithConfig(dir, interfaces.EngineConfig{})
 	require.Error(t, cerr,
 		"a hole whose suffix is beyond walMaxUnconfirmedBytes+walMaxFrameBytes must stay fatal")
 	require.Contains(t, cerr.Error(), "00000000000000000001.wal")
@@ -220,7 +220,7 @@ func TestWALTail_AllZeroHeaderPreallocCrashIsEmptyBenign(t *testing.T) {
 	dir := t.TempDir()
 	writeSharedWALFile(t, dir, 1, make([]byte, 64*1024)) // all zeros
 
-	st, err := NewDisruptorStorageWithEngineConfig(dir, interfaces.EngineConfig{})
+	st, err := NewStorageEngineWithConfig(dir, interfaces.EngineConfig{})
 	require.NoError(t, err,
 		"an all-zero header block on an all-zero (prealloc-crash) WAL file must be treated as empty, not refused")
 	defer st.Close()

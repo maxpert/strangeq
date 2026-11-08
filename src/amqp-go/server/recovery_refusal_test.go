@@ -195,7 +195,7 @@ func TestRecovery_UnreadableQueueRecordRefusesToBoot(t *testing.T) {
 
 	// Boot 1: a real durable queue with a real confirmed durable message.
 	cfg := refusalTestConfig(t, dataDir)
-	st, err := storage.NewDisruptorStorageWithEngineConfig(dataDir, cfg.GetEngine())
+	st, err := storage.NewStorageEngineWithConfig(dataDir, cfg.GetEngine())
 	if err != nil {
 		t.Fatalf("boot 1 storage: %v", err)
 	}
@@ -272,7 +272,7 @@ func TestRecovery_DeletedQueueLeftoversStillBoot(t *testing.T) {
 	dataDir := t.TempDir()
 
 	cfg := refusalTestConfig(t, dataDir)
-	st, err := storage.NewDisruptorStorageWithEngineConfig(dataDir, cfg.GetEngine())
+	st, err := storage.NewStorageEngineWithConfig(dataDir, cfg.GetEngine())
 	if err != nil {
 		t.Fatalf("boot 1 storage: %v", err)
 	}
@@ -339,7 +339,7 @@ func TestRecovery_LegacyOrdinalZeroRecordStillRefuses(t *testing.T) {
 	dataDir := t.TempDir()
 
 	cfg := refusalTestConfig(t, dataDir)
-	st, err := storage.NewDisruptorStorageWithEngineConfig(dataDir, cfg.GetEngine())
+	st, err := storage.NewStorageEngineWithConfig(dataDir, cfg.GetEngine())
 	if err != nil {
 		t.Fatalf("boot 1 storage: %v", err)
 	}
@@ -447,7 +447,7 @@ func walRecordCount(t *testing.T, path string) int {
 // seedSixFileWAL builds a data directory holding exactly `wantFiles` shared-WAL
 // files of confirmed durable records for one durable queue, plus that queue's
 // metadata record. Seeded through storage.WALManager rather than
-// DisruptorStorage because the latter's Close() runs a final checkpoint that
+// StorageEngine because the latter's Close() runs a final checkpoint that
 // unlinks every rolled WAL file.
 func seedSixFileWAL(t *testing.T, dataDir string, wantFiles int) []string {
 	t.Helper()
@@ -627,7 +627,7 @@ func TestRecovery_DurableBindingsSurviveRestartWithoutBindingRecovery(t *testing
 	dataDir := t.TempDir()
 	cfg := refusalTestConfig(t, dataDir)
 
-	st1, err := storage.NewDisruptorStorageWithEngineConfig(dataDir, cfg.GetEngine())
+	st1, err := storage.NewStorageEngineWithConfig(dataDir, cfg.GetEngine())
 	if err != nil {
 		t.Fatalf("boot 1 storage: %v", err)
 	}
@@ -708,7 +708,7 @@ func TestRecovery_BindingDurabilityIsTheStorageRecord(t *testing.T) {
 	dataDir := t.TempDir()
 	cfg := refusalTestConfig(t, dataDir)
 
-	st1, err := storage.NewDisruptorStorageWithEngineConfig(dataDir, cfg.GetEngine())
+	st1, err := storage.NewStorageEngineWithConfig(dataDir, cfg.GetEngine())
 	if err != nil {
 		t.Fatalf("boot 1 storage: %v", err)
 	}

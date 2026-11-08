@@ -163,7 +163,7 @@ func TestA1Integration_BackpressureBlocksPublisher(t *testing.T) {
 
 	broker.DeclareQueue("test-bp", false, false, false, nil)
 	qs := broker.getOrCreateQueueState("test-bp")
-	qs.SetDepthHighWM(3)
+	qs.SetMaxQueueBacklog(3)
 
 	stop := qs.StopCh()
 

@@ -46,7 +46,7 @@ type QueueState struct {
 	requeueHead            int
 	requeueLen             int
 	requeueCount           atomic.Int64
-	depthHighWM            atomic.Uint64
+	maxQueueBacklog        atomic.Uint64
 	closed                 atomic.Bool
 	capacityFallbackMillis uint32 // configured before concurrent use; see SetCapacityFallback
 	stopCh                 chan struct{}
@@ -123,7 +123,7 @@ type QueueState struct {
 	pendingBytes atomic.Int64
 	frontierResv map[uint64]int64
 
-	// depthHighWaterSeen is the MAXIMUM Depth() (waiting+inflight) observed on
+	// maxBacklogSeen is the MAXIMUM Depth() (waiting+inflight) observed on
 	// this queue since it was created. Diagnostic only (Task 2): it lets the
 	// benchmark harness read a measured window's backlog high-water directly
 	// instead of inferring it from per-second ready samples. It is APPENDED at
@@ -131,7 +131,7 @@ type QueueState struct {
 	// unchanged (broker/queue_state_layout_test.go), and it is updated only
 	// when a publish exposes real messages (FrontierComplete), so it costs
 	// nothing on the delivery hot path.
-	depthHighWaterSeen atomic.Uint64
+	maxBacklogSeen atomic.Uint64
 }
 
 // Policy returns the queue's resolved policy, or nil if the queue has no
@@ -146,7 +146,7 @@ func (qs *QueueState) SetPolicy(p *QueuePolicy) {
 	qs.policy.Store(p)
 }
 
-func NewQueueState(depthHighWM uint64) *QueueState {
+func NewQueueState(maxQueueBacklog uint64) *QueueState {
 	qs := &QueueState{
 		wake:                   make(chan struct{}, 128),
 		capacityFallbackMillis: uint32(defaultCapacityFallback / time.Millisecond),
@@ -154,12 +154,12 @@ func NewQueueState(depthHighWM uint64) *QueueState {
 		parkTimeout:            1 * time.Millisecond,
 		requeueBuf:             make([]requeueEntry, requeueInitialCap),
 	}
-	qs.depthHighWM.Store(depthHighWM)
+	qs.maxQueueBacklog.Store(maxQueueBacklog)
 	return qs
 }
 
-func (qs *QueueState) SetDepthHighWM(wm uint64) {
-	qs.depthHighWM.Store(wm)
+func (qs *QueueState) SetMaxQueueBacklog(wm uint64) {
+	qs.maxQueueBacklog.Store(wm)
 }
 
 // SetOrdinal assigns this queue's composite-tag ordinal (broker/tag_packing.go)
@@ -430,16 +430,16 @@ func (qs *QueueState) FrontierComplete(tag uint64, real bool) {
 func (qs *QueueState) noteDepthHighWater() {
 	d := qs.Depth()
 	for {
-		cur := qs.depthHighWaterSeen.Load()
-		if d <= cur || qs.depthHighWaterSeen.CompareAndSwap(cur, d) {
+		cur := qs.maxBacklogSeen.Load()
+		if d <= cur || qs.maxBacklogSeen.CompareAndSwap(cur, d) {
 			return
 		}
 	}
 }
 
-// DepthHighWaterSeen returns the maximum Depth() (waiting+inflight) observed on
+// MaxBacklogSeen returns the maximum Depth() (waiting+inflight) observed on
 // this queue since it was created. Diagnostic only (Task 2).
-func (qs *QueueState) DepthHighWaterSeen() uint64 { return qs.depthHighWaterSeen.Load() }
+func (qs *QueueState) MaxBacklogSeen() uint64 { return qs.maxBacklogSeen.Load() }
 
 // frontierAdvanceLocked pops the contiguous done-prefix off the pending ring and
 // returns the new head target (lowest still-pending tag, or frontierMax+1 when
@@ -855,12 +855,12 @@ func (qs *QueueState) Depth() uint64 {
 	return uint64(w + i)
 }
 
-func (qs *QueueState) DepthHighWM() uint64 {
-	return qs.depthHighWM.Load()
+func (qs *QueueState) MaxQueueBacklog() uint64 {
+	return qs.maxQueueBacklog.Load()
 }
 
 func (qs *QueueState) AtHighWaterMark() bool {
-	wm := qs.depthHighWM.Load()
+	wm := qs.maxQueueBacklog.Load()
 	if wm == 0 {
 		return false
 	}

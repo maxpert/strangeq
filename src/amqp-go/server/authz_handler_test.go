@@ -53,7 +53,7 @@ func newB4Server(t *testing.T, authEnabled bool, users []auth.UserEntry) *Server
 	cfg.Security.AuthenticationEnabled = authEnabled
 	cfg.Security.AuthorizationEnabled = authEnabled
 
-	storageImpl, err := storage.NewDisruptorStorageWithDataDir(cfg.Storage.Path)
+	storageImpl, err := storage.NewStorageEngineWithDataDir(cfg.Storage.Path)
 	if err != nil {
 		t.Fatalf("failed to create storage: %v", err)
 	}

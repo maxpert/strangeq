@@ -73,7 +73,7 @@ func TestFrontier_BoundedDefectOnFrontierWithEmptyNewerStubsIsBenign(t *testing.
 	writeSharedWALFile(t, dir, 2, make([]byte, 64*1024)) // all-zero: data-empty
 	writeSharedWALFile(t, dir, 3, make([]byte, 64*1024)) // all-zero: data-empty
 
-	st, err := NewDisruptorStorageWithEngineConfig(dir, barrierEngineConfig())
+	st, err := NewStorageEngineWithConfig(dir, barrierEngineConfig())
 	require.NoError(t, err,
 		"a bounded defect on the newest DATA-BEARING file, with every newer file data-empty, "+
 			"must be a benign unconfirmed tail under the barrier frontier rule")
@@ -93,7 +93,7 @@ func TestFrontier_BoundedDefectOnFrontierWithHeaderOnlyStubIsBenign(t *testing.T
 	writeSharedWALFile(t, dir, 1, frontierPartialFile(t, 1, 5, 7))
 	writeSharedWALFile(t, dir, 2, walHeaderBytes()) // header-only pre-opened stub
 
-	st, err := NewDisruptorStorageWithEngineConfig(dir, barrierEngineConfig())
+	st, err := NewStorageEngineWithConfig(dir, barrierEngineConfig())
 	require.NoError(t, err,
 		"a header-only pre-opened stub newer than F must count as data-empty")
 	defer st.Close()
@@ -112,7 +112,7 @@ func TestFrontier_BoundedDefectOnOlderDataBearingFileStaysFatal(t *testing.T) {
 	writeSharedWALFile(t, dir, 2, frontierCleanFile(t, 10, 12))
 	writeSharedWALFile(t, dir, 3, frontierCleanFile(t, 20, 22))
 
-	_, err := NewDisruptorStorageWithEngineConfig(dir, barrierEngineConfig())
+	_, err := NewStorageEngineWithConfig(dir, barrierEngineConfig())
 	require.Error(t, err,
 		"a bounded defect on a data-bearing file that is not F or F- must stay FATAL")
 	require.Contains(t, err.Error(), "00000000000000000001.wal")
@@ -128,7 +128,7 @@ func TestFrontier_DefectBelowTwoDataBearingFilesStaysFatal(t *testing.T) {
 	writeSharedWALFile(t, dir, 3, frontierCleanFile(t, 10, 12))
 	writeSharedWALFile(t, dir, 4, frontierCleanFile(t, 20, 22))
 
-	_, err := NewDisruptorStorageWithEngineConfig(dir, barrierEngineConfig())
+	_, err := NewStorageEngineWithConfig(dir, barrierEngineConfig())
 	require.Error(t, err,
 		"a defect on a file two levels below the frontier (two data-bearing files newer) must stay FATAL")
 	require.Contains(t, err.Error(), "00000000000000000002.wal")
@@ -143,7 +143,7 @@ func TestFrontier_BoundedDefectOnFMinusWithEmptyNewerStubIsBenign(t *testing.T) 
 	writeSharedWALFile(t, dir, 2, frontierPartialFile(t, 4, 6, 8)) // F- carries the defect
 	writeSharedWALFile(t, dir, 3, walHeaderBytes())                // F: empty pre-opened stub
 
-	st, err := NewDisruptorStorageWithEngineConfig(dir, barrierEngineConfig())
+	st, err := NewStorageEngineWithConfig(dir, barrierEngineConfig())
 	require.NoError(t, err,
 		"a bounded defect on F- (the just-retired file) with F an empty stub must be benign")
 	defer st.Close()
@@ -161,7 +161,7 @@ func TestFrontier_ForceFlushKeepsTwoNewestRule(t *testing.T) {
 	writeSharedWALFile(t, dir, 2, make([]byte, 64*1024))
 	writeSharedWALFile(t, dir, 3, make([]byte, 64*1024))
 
-	_, err := NewDisruptorStorageWithEngineConfig(dir, forceFlushEngineConfig())
+	_, err := NewStorageEngineWithConfig(dir, forceFlushEngineConfig())
 	require.Error(t, err,
 		"under force_flush the two-newest-by-number rule is byte-identical to today: "+
 			"file 1 is not one of the two newest, so the defect is FATAL")
@@ -178,7 +178,7 @@ func TestFrontier_ForceFlushTwoNewestStillBenign(t *testing.T) {
 	writeSharedWALFile(t, dir, 2, frontierPartialFile(t, 4, 6, 8))
 	writeSharedWALFile(t, dir, 3, frontierCleanFile(t, 10, 12))
 
-	st, err := NewDisruptorStorageWithEngineConfig(dir, forceFlushEngineConfig())
+	st, err := NewStorageEngineWithConfig(dir, forceFlushEngineConfig())
 	require.NoError(t, err,
 		"force_flush keeps today's two-newest rule: the second-newest file's bounded defect is benign")
 	defer st.Close()
@@ -195,7 +195,7 @@ func TestFrontier_AllZeroNewerFileIsDataEmpty(t *testing.T) {
 	writeSharedWALFile(t, dir, 1, frontierPartialFile(t, 1, 2, 4))
 	writeSharedWALFile(t, dir, 2, make([]byte, 64*1024))
 
-	st, err := NewDisruptorStorageWithEngineConfig(dir, barrierEngineConfig())
+	st, err := NewStorageEngineWithConfig(dir, barrierEngineConfig())
 	require.NoError(t, err,
 		"an all-zero file newer than F is data-empty and must not push F out of the frontier")
 	defer st.Close()

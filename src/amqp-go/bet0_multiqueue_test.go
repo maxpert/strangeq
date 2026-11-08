@@ -2831,7 +2831,7 @@ func TestBet0_MultiQueueWithConfirmsDelivers(t *testing.T) {
 // on another goroutine while this one is parked) pass through untouched — the
 // window is pinned by identity, not by call ordering or timing.
 type c1PinnedStorage struct {
-	*storage.DisruptorStorage
+	*storage.StorageEngine
 
 	mu      sync.Mutex
 	armed   bool
@@ -2975,7 +2975,7 @@ func (s *c1PinnedStorage) recordProbeCounts() (absent, present int) {
 }
 
 func (s *c1PinnedStorage) GetQueue(name string) (*protocol.Queue, error) {
-	q, err := s.DisruptorStorage.GetQueue(name)
+	q, err := s.StorageEngine.GetQueue(name)
 	if ferr := s.fault(name); ferr != nil {
 		s.observeRecord(name, nil, ferr)
 		return nil, ferr
@@ -2986,7 +2986,7 @@ func (s *c1PinnedStorage) GetQueue(name string) (*protocol.Queue, error) {
 }
 
 func (s *c1PinnedStorage) GetExchangeBindings(exchangeName string) ([]*interfaces.QueueBinding, error) {
-	bs, err := s.DisruptorStorage.GetExchangeBindings(exchangeName)
+	bs, err := s.StorageEngine.GetExchangeBindings(exchangeName)
 	s.pin(exchangeName)
 	return bs, err
 }
@@ -3005,12 +3005,12 @@ func bet0PinnedServer(t *testing.T, dir string) (*server.Server, string, *c1Pinn
 	cfg.Storage.Path = dir
 	cfg.Server.LogLevel = "silent"
 
-	raw, err := storage.NewDisruptorStorageWithEngineConfig(
+	raw, err := storage.NewStorageEngineWithConfig(
 		dir,
 		cfg.GetEngine(),
 	)
 	require.NoError(t, err, "build storage")
-	pinned := &c1PinnedStorage{DisruptorStorage: raw}
+	pinned := &c1PinnedStorage{StorageEngine: raw}
 
 	srv, err := server.NewServerBuilder().WithConfig(cfg).WithStorage(pinned).Build()
 	require.NoError(t, err, "server build")
@@ -3911,12 +3911,12 @@ func bet0PinnedLoggingServer(t *testing.T, dir, logFile string) (*server.Server,
 	cfg.Server.LogLevel = "warn"
 	cfg.Server.LogFile = logFile
 
-	raw, err := storage.NewDisruptorStorageWithEngineConfig(
+	raw, err := storage.NewStorageEngineWithConfig(
 		dir,
 		cfg.GetEngine(),
 	)
 	require.NoError(t, err, "build storage")
-	pinned := &c1PinnedStorage{DisruptorStorage: raw}
+	pinned := &c1PinnedStorage{StorageEngine: raw}
 
 	srv, err := server.NewServerBuilder().WithConfig(cfg).WithStorage(pinned).Build()
 	require.NoError(t, err, "server build")

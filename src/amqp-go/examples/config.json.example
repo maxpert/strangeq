@@ -59,7 +59,7 @@
   },
   "engine": {
     "available_channel_buffer": 10000000,
-    "depth_high_wm": 52428,
+    "max_queue_backlog": 52428,
     "wal_batch_size": 1000,
     "wal_batch_timeout": 10000000,
     "wal_file_size": 536870912,

@@ -14,12 +14,12 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// gatedAsyncStore wraps a real DisruptorStorage and HOLDS every durable
+// gatedAsyncStore wraps a real StorageEngine and HOLDS every durable
 // completion until released, so tests can admit N publishes while the ready
 // counters have not yet moved (the §7 race window). It still ring-stores
 // synchronously, exactly like the real StoreMessageAsync.
 type gatedAsyncStore struct {
-	*storage.DisruptorStorage
+	*storage.StorageEngine
 	mu        sync.Mutex
 	held      []func(error)
 	failAsync atomic.Bool
@@ -30,7 +30,7 @@ func (g *gatedAsyncStore) StoreMessageAsync(queueName string, message *protocol.
 		return fmt.Errorf("injected StoreMessageAsync failure")
 	}
 	// Ring-store synchronously (mirrors the real path's visible half).
-	if err := g.DisruptorStorage.StoreMessage(queueName, message); err != nil {
+	if err := g.StorageEngine.StoreMessage(queueName, message); err != nil {
 		return err
 	}
 	if onWritten != nil {
@@ -61,15 +61,15 @@ func (g *gatedAsyncStore) heldCount() int {
 func newGatedBroker(t *testing.T) (*StorageBroker, *gatedAsyncStore, func()) {
 	t.Helper()
 	ec := interfaces.EngineConfig{
-		DepthHighWM:             52428,
+		MaxQueueBacklog:         52428,
 		WALBatchSize:            1000,
 		WALBatchTimeoutMS:       10,
 		ConsumerSelectTimeoutMS: 1,
 		ConsumerMaxBatchSize:    100,
 	}
-	ds, err := storage.NewDisruptorStorageWithDataDir(t.TempDir())
+	ds, err := storage.NewStorageEngineWithDataDir(t.TempDir())
 	require.NoError(t, err)
-	gs := &gatedAsyncStore{DisruptorStorage: ds}
+	gs := &gatedAsyncStore{StorageEngine: ds}
 	b := NewStorageBroker(gs, ec)
 	return b, gs, func() { b.Close(); _ = ds.Close() }
 }

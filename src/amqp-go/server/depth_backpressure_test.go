@@ -229,9 +229,9 @@ func newTinyRingServer(t *testing.T) *Server {
 	t.Helper()
 	cfg := config.DefaultConfig()
 	cfg.Storage.Path = t.TempDir()
-	cfg.Engine.DepthHighWM = 4 // the retired RingBufferSize 8 x 50% = 4
+	cfg.Engine.MaxQueueBacklog = 4 // the retired RingBufferSize 8 x 50% = 4
 
-	storageImpl, err := storage.NewDisruptorStorageWithDataDir(cfg.Storage.Path)
+	storageImpl, err := storage.NewStorageEngineWithDataDir(cfg.Storage.Path)
 	require.NoError(t, err)
 	storageBroker := broker.NewStorageBroker(storageImpl, cfg.GetEngine())
 	unifiedBroker := NewStorageBrokerAdapter(storageBroker)

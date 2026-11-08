@@ -26,9 +26,9 @@ func TestRequeueStillRedeliversUnderHotCachePacing(t *testing.T) {
 		// No message fits: every durable publish is WAL-only, so requeue
 		// redelivery is a cold read.
 		HotCacheQueueBytes: 1,
-		DepthHighWM:        1_000_000,
+		MaxQueueBacklog:    1_000_000,
 	}
-	store, err := storage.NewDisruptorStorageWithEngineConfig(t.TempDir(), ec)
+	store, err := storage.NewStorageEngineWithConfig(t.TempDir(), ec)
 	require.NoError(t, err)
 	b := NewStorageBroker(store, ec)
 	t.Cleanup(func() { b.Close(); _ = store.Close() })

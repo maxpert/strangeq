@@ -10,9 +10,9 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// atomicTestStorage builds a DisruptorStorage with a small, fast WAL for the
+// atomicTestStorage builds a StorageEngine with a small, fast WAL for the
 // atomicity tests.
-func atomicTestStorage(t *testing.T) *DisruptorStorage {
+func atomicTestStorage(t *testing.T) *StorageEngine {
 	t.Helper()
 	engineCfg := interfaces.EngineConfig{
 		WALBatchSize:      10,
@@ -20,7 +20,7 @@ func atomicTestStorage(t *testing.T) *DisruptorStorage {
 		WALFileSize:       1 << 20,
 		WALChannelBuffer:  1000,
 	}
-	ds, err := NewDisruptorStorageWithEngineConfig(t.TempDir(), engineCfg)
+	ds, err := NewStorageEngineWithConfig(t.TempDir(), engineCfg)
 	require.NoError(t, err)
 	t.Cleanup(func() { ds.Close() })
 	return ds
@@ -28,7 +28,7 @@ func atomicTestStorage(t *testing.T) *DisruptorStorage {
 
 // durableWALCount returns how many durable records for queueName are currently
 // recoverable from the WAL (i.e. committed and not yet acked).
-func durableWALCount(t *testing.T, ds *DisruptorStorage, queueName string) int {
+func durableWALCount(t *testing.T, ds *StorageEngine, queueName string) int {
 	t.Helper()
 	recovered, err := ds.wal.RecoverFromWAL()
 	require.NoError(t, err)

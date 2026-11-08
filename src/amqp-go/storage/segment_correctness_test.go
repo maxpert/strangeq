@@ -211,7 +211,7 @@ func TestSegmentPath_ClientControlledQueueNameCannotEscapeTheDataDirectory(t *te
 }
 
 // Found while building the S-7 fixture: SegmentManager.Close is reachable
-// twice on a real shutdown path (DisruptorStorage.Close calls it, and a
+// twice on a real shutdown path (StorageEngine.Close calls it, and a
 // deferred Close in any caller calls it again) and the second call panics on
 // `close of closed channel` — a panic during shutdown, on the tier that holds
 // the only copy of checkpointed data.
@@ -223,7 +223,7 @@ func TestSegmentManager_CloseIsIdempotent(t *testing.T) {
 
 	require.NoError(t, sm.Close())
 	require.NotPanics(t, func() { _ = sm.Close() },
-		"a second Close must not panic: DisruptorStorage.Close and any deferred Close both reach it")
+		"a second Close must not panic: StorageEngine.Close and any deferred Close both reach it")
 }
 
 func keysOf(m map[string][]*RecoveryMessage) []string {

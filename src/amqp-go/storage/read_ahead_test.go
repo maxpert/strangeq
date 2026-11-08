@@ -13,18 +13,18 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func newReadAheadTestStorage(t *testing.T, tmpDir string, ringSize int) *DisruptorStorage {
+func newReadAheadTestStorage(t *testing.T, tmpDir string, ringSize int) *StorageEngine {
 	t.Helper()
 	ec := interfaces.EngineConfig{
-		DepthHighWM:     uint64(ringSize) * 80 / 100,
+		MaxQueueBacklog: uint64(ringSize) * 80 / 100,
 		WALSyncDisabled: true,
 	}
-	storage, err := NewDisruptorStorageWithEngineConfig(tmpDir, ec)
+	storage, err := NewStorageEngineWithConfig(tmpDir, ec)
 	require.NoError(t, err)
 	return storage
 }
 
-func publishDurableMessages(t *testing.T, storage *DisruptorStorage, queueName string, n int) {
+func publishDurableMessages(t *testing.T, storage *StorageEngine, queueName string, n int) {
 	t.Helper()
 	for i := 0; i < n; i++ {
 		msg := &protocol.Message{
@@ -36,7 +36,7 @@ func publishDurableMessages(t *testing.T, storage *DisruptorStorage, queueName s
 	}
 }
 
-func clearRingForWALFallback(storage *DisruptorStorage, queueName string, n int) {
+func clearRingForWALFallback(storage *StorageEngine, queueName string, n int) {
 	for i := 0; i < n; i++ {
 		storage.hot.Delete(queueName, uint64(i))
 	}

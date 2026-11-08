@@ -10,7 +10,7 @@ import (
 
 func TestP3_HotCacheSizeFromConfig(t *testing.T) {
 	t.Parallel()
-	ds, err := NewDisruptorStorageWithEngineConfig(t.TempDir(), interfaces.EngineConfig{
+	ds, err := NewStorageEngineWithConfig(t.TempDir(), interfaces.EngineConfig{
 		HotCacheQueueBytes:  128 * 1024,
 		HotCacheGlobalBytes: 256 * 1024,
 	})
@@ -22,7 +22,7 @@ func TestP3_HotCacheSizeFromConfig(t *testing.T) {
 
 func TestP3_MessageRetrieval(t *testing.T) {
 	t.Parallel()
-	ds, err := NewDisruptorStorageWithEngineConfig(t.TempDir(), interfaces.EngineConfig{})
+	ds, err := NewStorageEngineWithConfig(t.TempDir(), interfaces.EngineConfig{})
 	require.NoError(t, err)
 	defer ds.Close()
 	msg := &protocol.Message{DeliveryTag: 256, Body: []byte("wrap-test"), DeliveryMode: 1}
@@ -34,7 +34,7 @@ func TestP3_MessageRetrieval(t *testing.T) {
 
 func TestP3_DefaultsWhenConfigZero(t *testing.T) {
 	t.Parallel()
-	ds, err := NewDisruptorStorageWithEngineConfig(t.TempDir(), interfaces.EngineConfig{})
+	ds, err := NewStorageEngineWithConfig(t.TempDir(), interfaces.EngineConfig{})
 	require.NoError(t, err)
 	defer ds.Close()
 	require.EqualValues(t, 64*1024*1024, ds.hot.queueBytes)

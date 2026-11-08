@@ -15,13 +15,13 @@ func createSmallRingBroker(t testing.TB) (*StorageBroker, func()) {
 	t.Helper()
 	tmpDir := t.TempDir()
 	engineConfig := interfaces.EngineConfig{
-		DepthHighWM:             100000,
+		MaxQueueBacklog:         100000,
 		WALBatchSize:            1000,
 		WALBatchTimeoutMS:       10,
 		ConsumerSelectTimeoutMS: 1,
 		ConsumerMaxBatchSize:    100,
 	}
-	store, err := storage.NewDisruptorStorageWithEngineConfig(tmpDir, engineConfig)
+	store, err := storage.NewStorageEngineWithConfig(tmpDir, engineConfig)
 	require.NoError(t, err)
 	b := NewStorageBroker(store, engineConfig)
 	return b, func() {
@@ -80,7 +80,7 @@ func TestGetNoAck_SpilledDepth_NoLeak_Broker(t *testing.T) {
 	require.Equal(t, int64(n), qs.WaitingCount())
 
 	// Verify the premise: at least one message is spilled (WAL-only).
-	ring := b.storage.(*storage.DisruptorStorage)
+	ring := b.storage.(*storage.StorageEngine)
 	_ = ring // ring residency is exercised implicitly by the small ring.
 
 	for i := 0; i < n; i++ {

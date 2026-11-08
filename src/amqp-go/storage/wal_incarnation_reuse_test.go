@@ -66,7 +66,7 @@ func incarnationSegmentConfig() SegmentConfig {
 
 // walIncarnation is one broker lifetime over a fixed data directory: a WAL
 // manager plus the segment manager production wires into it
-// (NewDisruptorStorageWithEngineConfig does exactly this pairing).
+// (NewStorageEngineWithConfig does exactly this pairing).
 type walIncarnation struct {
 	t   *testing.T
 	wal *WALManager

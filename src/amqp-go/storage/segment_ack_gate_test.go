@@ -11,7 +11,7 @@ package storage
 // path at all, and this fixture was RED, establishing that defect.
 //
 // It is now GREEN, and what closed it is the acknowledgement gate in
-// DisruptorStorage.GetMessage — WALManager.IsAcknowledged, consulted once below
+// StorageEngine.GetMessage — WALManager.IsAcknowledged, consulted once below
 // the ring read and re-validated after the tier read. QueueSegments itself is
 // still ungated and that is deliberate: the gate sits ABOVE all four tiers
 // rather than inside any of them. GetMessage consults them in this order:
@@ -83,7 +83,7 @@ const (
 )
 
 // TestSegmentTier_AcknowledgedRecordIsRefusedAfterCheckpoint drives only
-// DisruptorStorage's public surface for the ACT and the ASSERT — StoreMessage,
+// StorageEngine's public surface for the ACT and the ASSERT — StoreMessage,
 // DeleteMessage, GetMessage. It reaches into the package for two things only:
 // to OBSERVE premises (did the WAL roll, did the record reach a segment) and to
 // invoke performCheckpoint directly instead of sleeping out the 5-minute
@@ -93,7 +93,7 @@ func TestSegmentTier_AcknowledgedRecordIsRefusedAfterCheckpoint(t *testing.T) {
 	t.Skip("checkpoint copying removed in segstore v1")
 	dir := t.TempDir()
 
-	ds, err := NewDisruptorStorageWithEngineConfig(dir, interfaces.EngineConfig{
+	ds, err := NewStorageEngineWithConfig(dir, interfaces.EngineConfig{
 		WALFileSize: segGateWALFileSize,
 	})
 	require.NoError(t, err)
@@ -236,7 +236,7 @@ func TestSegmentTier_AcknowledgedRecordIsRefusedAfterCheckpoint(t *testing.T) {
 
 	require.Error(t, getErr,
 		"ACKNOWLEDGED RECORD SERVED FROM THE SEGMENT TIER: tag %d was acknowledged through "+
-			"DisruptorStorage.DeleteMessage, the WAL refuses it (err=%v), and the segment tier "+
+			"StorageEngine.DeleteMessage, the WAL refuses it (err=%v), and the segment tier "+
 			"answered anyway with MessageID %q. QueueSegments.readMessage consults no ack bitmap "+
 			"and acknowledgeInSegment only increments deletedCount — it never removes the offset "+
 			"from the segment index, so this tier is gated NOWHERE ELSE. broker/queue_reaper.go "+
@@ -244,7 +244,7 @@ func TestSegmentTier_AcknowledgedRecordIsRefusedAfterCheckpoint(t *testing.T) {
 			"answering re-expires and re-dead-letters the same record without bound, and its "+
 			"tail-advance loop breaks on any non-nil message so the tail never moves past the "+
 			"tag.\n"+
-			"WHAT TO SUSPECT: the acknowledgement gate in DisruptorStorage.GetMessage "+
+			"WHAT TO SUSPECT: the acknowledgement gate in StorageEngine.GetMessage "+
 			"(WALManager.IsAcknowledged, consulted below the ring read and re-validated after "+
 			"the tier read) is what covers this arm, and removing it is the expected cause of a "+
 			"red here. Deleting EITHER guard alone leaves this fixture green — each is "+

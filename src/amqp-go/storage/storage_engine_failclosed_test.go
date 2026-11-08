@@ -11,11 +11,11 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// TestNewDisruptorStorage_FailsWhenWALDirUnwritable verifies that the constructor
-// returns an error (not a silently degraded *DisruptorStorage) when WAL construction
+// TestNewStorageEngine_FailsWhenWALDirUnwritable verifies that the constructor
+// returns an error (not a silently degraded *StorageEngine) when WAL construction
 // fails due to a disk/permission error. Before the fix, the error was discarded and
 // the constructor returned a fully-constructed storage with wal=nil.
-func TestNewDisruptorStorage_FailsWhenWALDirUnwritable(t *testing.T) {
+func TestNewStorageEngine_FailsWhenWALDirUnwritable(t *testing.T) {
 	tmpDir := t.TempDir()
 
 	// Create a regular file where the WAL directory would be (<tmpDir>/wal).
@@ -23,32 +23,32 @@ func TestNewDisruptorStorage_FailsWhenWALDirUnwritable(t *testing.T) {
 	walDir := filepath.Join(tmpDir, "wal")
 	require.NoError(t, os.WriteFile(walDir, []byte("blocker"), 0644))
 
-	ds, err := NewDisruptorStorageWithEngineConfig(tmpDir, interfaces.EngineConfig{})
+	ds, err := NewStorageEngineWithConfig(tmpDir, interfaces.EngineConfig{})
 	require.Error(t, err, "constructor must fail when WAL dir cannot be created")
 	assert.Nil(t, ds, "no storage should be returned on construction failure")
 	assert.Contains(t, err.Error(), "WAL")
 }
 
-// TestNewDisruptorStorage_FailsWhenMetadataDirUnwritable verifies that metadata
+// TestNewStorageEngine_FailsWhenMetadataDirUnwritable verifies that metadata
 // store construction failure is also fatal.
-func TestNewDisruptorStorage_FailsWhenMetadataDirUnwritable(t *testing.T) {
+func TestNewStorageEngine_FailsWhenMetadataDirUnwritable(t *testing.T) {
 	tmpDir := t.TempDir()
 
 	// Block the metadata directory
 	metaDir := filepath.Join(tmpDir, "metadata")
 	require.NoError(t, os.WriteFile(metaDir, []byte("blocker"), 0644))
 
-	ds, err := NewDisruptorStorageWithEngineConfig(tmpDir, interfaces.EngineConfig{})
+	ds, err := NewStorageEngineWithConfig(tmpDir, interfaces.EngineConfig{})
 	require.Error(t, err)
 	assert.Nil(t, ds)
 	assert.Contains(t, err.Error(), "metadata")
 }
 
-// TestNewDisruptorStorage_SucceedsOnValidDir verifies the happy path still works.
-func TestNewDisruptorStorage_SucceedsOnValidDir(t *testing.T) {
+// TestNewStorageEngine_SucceedsOnValidDir verifies the happy path still works.
+func TestNewStorageEngine_SucceedsOnValidDir(t *testing.T) {
 	tmpDir := t.TempDir()
 
-	ds, err := NewDisruptorStorageWithEngineConfig(tmpDir, interfaces.EngineConfig{})
+	ds, err := NewStorageEngineWithConfig(tmpDir, interfaces.EngineConfig{})
 	require.NoError(t, err)
 	require.NotNil(t, ds)
 	assert.NotNil(t, ds.wal, "WAL should be initialized on valid dir")
@@ -58,12 +58,12 @@ func TestNewDisruptorStorage_SucceedsOnValidDir(t *testing.T) {
 }
 
 // TestStoreMessage_DurableWithoutWAL_ReturnsError verifies the defense-in-depth
-// check: even if a DisruptorStorage somehow has wal==nil, a durable (DeliveryMode=2)
+// check: even if a StorageEngine somehow has wal==nil, a durable (DeliveryMode=2)
 // publish is rejected with an explicit error rather than silently stored in-memory only.
 func TestStoreMessage_DurableWithoutWAL_ReturnsError(t *testing.T) {
-	// Construct a DisruptorStorage with wal==nil directly (simulates a degraded state
+	// Construct a StorageEngine with wal==nil directly (simulates a degraded state
 	// that should now be impossible via the public constructor, but tests the defense).
-	ds := &DisruptorStorage{
+	ds := &StorageEngine{
 		hot:          newHotCache(16*1024*1024, 256*1024*1024),
 		transactions: make(map[string]*interfaces.Transaction),
 		dataDir:      t.TempDir(),
@@ -83,7 +83,7 @@ func TestStoreMessage_DurableWithoutWAL_ReturnsError(t *testing.T) {
 // TestStoreMessage_TransientWithoutWAL_StillWorks verifies that transient (non-durable)
 // messages can still be stored when WAL is nil — only durable messages are rejected.
 func TestStoreMessage_TransientWithoutWAL_StillWorks(t *testing.T) {
-	ds := &DisruptorStorage{
+	ds := &StorageEngine{
 		hot:          newHotCache(16*1024*1024, 256*1024*1024),
 		transactions: make(map[string]*interfaces.Transaction),
 		dataDir:      t.TempDir(),

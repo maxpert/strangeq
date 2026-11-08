@@ -16,10 +16,10 @@ import (
 // fallback).
 func newBrokerWithPrefetchCap(t testing.TB, capValue int) *StorageBroker {
 	t.Helper()
-	store, err := storage.NewDisruptorStorageWithDataDir(t.TempDir())
+	store, err := storage.NewStorageEngineWithDataDir(t.TempDir())
 	require.NoError(t, err)
 	return NewStorageBroker(store, interfaces.EngineConfig{
-		DepthHighWM:             52428,
+		MaxQueueBacklog:         52428,
 		ConsumerSelectTimeoutMS: 1,
 		ConsumerMaxBatchSize:    100,
 		UnlimitedPrefetchCap:    capValue,

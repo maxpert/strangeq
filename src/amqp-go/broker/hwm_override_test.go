@@ -12,52 +12,52 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func TestDepthHighWM_Respected(t *testing.T) {
+func TestMaxQueueBacklog_Respected(t *testing.T) {
 	tmpDir := t.TempDir()
-	store, err := storage.NewDisruptorStorageWithDataDir(tmpDir)
+	store, err := storage.NewStorageEngineWithDataDir(tmpDir)
 	require.NoError(t, err)
 	defer store.Close()
 
 	broker := NewStorageBroker(store, interfaces.EngineConfig{
-		DepthHighWM: 1000,
+		MaxQueueBacklog: 1000,
 	})
 	defer broker.Close()
 
-	assert.Equal(t, uint64(1000), broker.computeDepthHighWM())
+	assert.Equal(t, uint64(1000), broker.computeMaxQueueBacklog())
 }
 
-func TestDepthHighWM_ZeroFallsBack(t *testing.T) {
+func TestMaxQueueBacklog_ZeroFallsBack(t *testing.T) {
 	tmpDir := t.TempDir()
-	store, err := storage.NewDisruptorStorageWithDataDir(tmpDir)
+	store, err := storage.NewStorageEngineWithDataDir(tmpDir)
 	require.NoError(t, err)
 	defer store.Close()
 
 	broker := NewStorageBroker(store, interfaces.EngineConfig{})
 	defer broker.Close()
 
-	assert.Equal(t, uint64(52428), broker.computeDepthHighWM())
+	assert.Equal(t, uint64(52428), broker.computeMaxQueueBacklog())
 }
 
-// TestComputeDepthHighWM_ConfiguredAndZeroValue pins the resolver itself: the
-// configured DepthHighWM is returned verbatim, and a zero-value EngineConfig
-// resolves to interfaces.DefaultDepthHighWM (52428).
-func TestComputeDepthHighWM_ConfiguredAndZeroValue(t *testing.T) {
-	zeroStore, err := storage.NewDisruptorStorageWithDataDir(t.TempDir())
+// TestComputeMaxQueueBacklog_ConfiguredAndZeroValue pins the resolver itself: the
+// configured MaxQueueBacklog is returned verbatim, and a zero-value EngineConfig
+// resolves to interfaces.DefaultMaxQueueBacklog (52428).
+func TestComputeMaxQueueBacklog_ConfiguredAndZeroValue(t *testing.T) {
+	zeroStore, err := storage.NewStorageEngineWithDataDir(t.TempDir())
 	require.NoError(t, err)
 	defer zeroStore.Close()
 	zero := NewStorageBroker(zeroStore, interfaces.EngineConfig{})
 	defer zero.Close()
-	assert.Equal(t, interfaces.DefaultDepthHighWM, zero.computeDepthHighWM())
+	assert.Equal(t, interfaces.DefaultMaxQueueBacklog, zero.computeMaxQueueBacklog())
 
-	cfgStore, err := storage.NewDisruptorStorageWithDataDir(t.TempDir())
+	cfgStore, err := storage.NewStorageEngineWithDataDir(t.TempDir())
 	require.NoError(t, err)
 	defer cfgStore.Close()
-	configured := NewStorageBroker(cfgStore, interfaces.EngineConfig{DepthHighWM: 12345})
+	configured := NewStorageBroker(cfgStore, interfaces.EngineConfig{MaxQueueBacklog: 12345})
 	defer configured.Close()
-	assert.Equal(t, uint64(12345), configured.computeDepthHighWM())
+	assert.Equal(t, uint64(12345), configured.computeMaxQueueBacklog())
 }
 
-// TestDepthHighWM_GatesAtConfiguredDepth proves the configured depth is wired
+// TestMaxQueueBacklog_GatesAtConfiguredDepth proves the configured depth is wired
 // into publisher backpressure, rather than merely computed: HWM-1 is admitted,
 // HWM is gated, and an ack releases the parked producer.
 //
@@ -66,16 +66,16 @@ func TestComputeDepthHighWM_ConfiguredAndZeroValue(t *testing.T) {
 // "deeper backlog has higher p50", including that scenario's incidental timing
 // sensitivity to FIFO/drain behavior. That relative-performance assertion was
 // load-dependent and is not retained in the pass/fail suite.
-func TestDepthHighWM_GatesAtConfiguredDepth(t *testing.T) {
+func TestMaxQueueBacklog_GatesAtConfiguredDepth(t *testing.T) {
 	const (
 		hwm                 = uint64(3)
 		unreachableFallback = 10 * time.Minute
 	)
 
 	ec := interfaces.EngineConfig{
-		DepthHighWM: hwm,
+		MaxQueueBacklog: hwm,
 	}
-	store, err := storage.NewDisruptorStorageWithEngineConfig(t.TempDir(), ec)
+	store, err := storage.NewStorageEngineWithConfig(t.TempDir(), ec)
 	require.NoError(t, err)
 	defer store.Close()
 
@@ -85,8 +85,8 @@ func TestDepthHighWM_GatesAtConfiguredDepth(t *testing.T) {
 	require.NoError(t, err)
 	qs := broker.getOrCreateQueueState("hwm-q")
 
-	require.Equal(t, hwm, qs.DepthHighWM(),
-		"DepthHighWM did not reach the queue's production predicate")
+	require.Equal(t, hwm, qs.MaxQueueBacklog(),
+		"MaxQueueBacklog did not reach the queue's production predicate")
 	qs.SetCapacityFallback(unreachableFallback)
 	require.Equal(t, unreachableFallback, qs.capacityFallback(),
 		"fixture premise broken: capacity fallback was not moved out of reach")
@@ -132,7 +132,7 @@ func TestDepthHighWM_GatesAtConfiguredDepth(t *testing.T) {
 	case err := <-publishDone:
 		require.NoError(t, err, "synchronous publish was refused instead of completing after ack released capacity")
 	case <-time.After(5 * time.Second):
-		t.Fatal("ack never released the synchronous publish parked at DepthHighWM; the 10-minute fallback was unreachable")
+		t.Fatal("ack never released the synchronous publish parked at MaxQueueBacklog; the 10-minute fallback was unreachable")
 	}
 }
 
@@ -148,7 +148,7 @@ func requireSynchronousPublishParked(t *testing.T, qs *QueueState, completed <-c
 		case err := <-completed:
 			t.Fatalf("synchronous PublishMessage returned (%v) without registering a producer park; production publish must traverse WaitForCapacity", err)
 		case <-deadline.C:
-			t.Fatal("synchronous PublishMessage never registered a producer park at DepthHighWM")
+			t.Fatal("synchronous PublishMessage never registered a producer park at MaxQueueBacklog")
 		default:
 			runtime.Gosched()
 		}
