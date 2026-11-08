@@ -2552,7 +2552,7 @@
     { id: "panics", label: "Recovered panics", group: "Health", sel: "sum(amqp_panics_total)", render: "count", sev: "bad" },
     { id: "storage_close_errors", label: "Storage close errors", group: "Health", sel: "amqp_storage_close_errors_total", render: "count", sev: "bad" },
     { id: "shutdown_incomplete", label: "Incomplete shutdowns", group: "Health", sel: "amqp_shutdown_total{result=\"incomplete\"}", render: "count", sev: "bad" },
-    { id: "mgmt_5xx", label: "Management 5xx", group: "Health", sel: "sum(amqp_management_requests_total{status_class=\"5xx\"})", render: "count", sev: "bad" },
+    { id: "mgmt_5xx", label: "Management 5xx", group: "Health", sel: "sum(amqp_management_requests_total{status_class=\"5\"})", render: "count", sev: "bad" },
     { id: "mgmt_rate_limited", label: "Management rate-limited", group: "Health", sel: "amqp_management_rate_limited_total", render: "count", sev: "bad" },
     { id: "lease_leaked", label: "Publish leases leaked", group: "Health", sel: "amqp_publish_lease_leaked_total", render: "count", sev: "bad" },
     { id: "disk_free", label: "Disk free", group: "Health", sel: "amqp_disk_free_bytes", render: "bytes", sev: null },
