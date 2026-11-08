@@ -172,6 +172,10 @@ func New(o Options) (*Server, error) {
 	}
 	s.jobs = newJobPool(mcfg.Async.MaxJobs,
 		time.Duration(mcfg.Async.JobRetentionSeconds)*time.Second, workers)
+	// Feed amqp_management_jobs{state} from the pool's lifecycle transitions
+	// (MEDIUM-2). The sink is the management surface's sink (noop when
+	// telemetry is disabled).
+	s.jobs.setSink(s.sink)
 
 	const window = time.Minute
 	s.authFailLimit = newCounterWindow(window, authFailureLimit(cfg), nil)
