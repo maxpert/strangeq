@@ -188,6 +188,12 @@ table.data-table { border-collapse: collapse; width: 100%; background: var(--pan
   white-space: nowrap;
 }
 .data-table th { position: sticky; top: 0; background: #eef1f5; cursor: pointer; }
+.data-table th.sortable { user-select: none; }
+.data-table th.sortable:hover { background: #e2e7ee; }
+.data-table th.sortable[aria-sort="ascending"]::after { content: " \2191"; color: var(--muted); }
+.data-table th.sortable[aria-sort="descending"]::after { content: " \2193"; color: var(--muted); }
+.data-table td .row-action { padding: 2px 8px; }
+.data-table td .copy-btn { padding: 2px 8px; }
 .data-table tbody tr:hover { background: #f0f4fa; }
 .data-table tbody tr[aria-selected="true"] { background: #e2ecfb; }
 .table-scroll { max-height: calc(100vh - 260px); overflow: auto; border: 1px solid var(--line); border-radius: var(--radius); }
