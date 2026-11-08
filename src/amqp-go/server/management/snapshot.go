@@ -41,6 +41,14 @@ type consumerViews interface {
 	ConsumerViews() []broker.ConsumerView
 }
 
+// bindingLister is the optional aggregate-binding seam (BOB-4). Production's
+// *server.StorageBrokerAdapter always implements it; a custom UnifiedBroker may
+// not, in which case every binding endpoint returns 501 (the pre-BOB-4
+// contract).
+type bindingLister interface {
+	ListBindings() ([]broker.BindingView, error)
+}
+
 func (s *Server) broker() server.UnifiedBroker {
 	if s.opts.Server == nil {
 		return nil
@@ -233,7 +241,7 @@ func (s *Server) hOverview(w http.ResponseWriter, r *http.Request) {
 			Queues:      totals.Queues,
 			Consumers:   totals.Consumers,
 			Exchanges:   totals.Exchanges,
-			Bindings:    nil,
+			Bindings:    totals.Bindings,
 		},
 		QueueTotals: queueTotalsJSON{
 			MessagesReady:      qt.messagesReady,
@@ -298,6 +306,7 @@ func (s *Server) capabilitiesReport() capabilitiesJSON {
 	b := s.broker()
 	_, queueTotalsOK := b.(queueMessageTotals)
 	_, consumerOK := b.(consumerViews)
+	_, bindingsOK := b.(bindingLister)
 	_, channelOK := any(s.opts.Server).(channelViews)
 	_, snapOK := any(s.opts.Server).(entitySnapshotter)
 	snapCoherent := false
@@ -307,8 +316,8 @@ func (s *Server) capabilitiesReport() capabilitiesJSON {
 	return capabilitiesJSON{
 		QueueMessageTotals: queueTotalsOK,
 		Channels:           channelOK,
-		Bindings:           false, // BOB-4 unbuilt
-		CloseConnection:    true,  // force-close exists, with the recorded divergence
+		Bindings:           bindingsOK,
+		CloseConnection:    true,  // graceful close (BOB-5) with the recorded divergence
 		UserCRUD:           false, // BOB-6 unbuilt
 		TagCapabilities:    true,
 		ConsumerCounts:     consumerOK,

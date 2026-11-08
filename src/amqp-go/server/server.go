@@ -179,8 +179,14 @@ type Server struct {
 	entityConsumers     int64
 	entityQueues        int64
 	entityExchanges     int64
+	entityBindings      int64
 	entityGeneration    uint64
 	entityObserverWired bool
+	// entityBindingsWired is true once InitEntityCounters has seeded the
+	// binding count from the broker's aggregate binding seam (BOB-4). It is
+	// the switch that makes SnapshotEntityTotals return a non-nil Bindings;
+	// a custom UnifiedBroker without the seam leaves it false (JSON null).
+	entityBindingsWired bool
 
 	// --- Management control plane (append-only; spec mgmt-01 §4) ---
 	//
@@ -530,6 +536,7 @@ func (s *Server) cleanupConnection(connection *protocol.Connection) {
 		}
 		channel.Consumers = make(map[string]*protocol.Consumer)
 		channel.Closed = true
+		channel.Transactional.Store(false) // BOB-3: leaving tx mode on teardown
 		channel.Mutex.Unlock()
 
 		connection.ChannelCount.Add(-1)

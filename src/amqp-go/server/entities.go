@@ -6,25 +6,25 @@ import (
 )
 
 // EntityTotals is a linearisable point-in-time count of the five broker entity
-// kinds plus a monotonic generation. Two reads that observe the same Generation
-// observed identical counts. Bindings is nil until the aggregate binding
-// accessor (BOB-4) exists.
+// kinds plus bindings and a monotonic generation. Two reads that observe the
+// same Generation observed identical counts. Bindings is nil only while the
+// aggregate binding accessor (BOB-4) is absent from the injected broker.
 type EntityTotals struct {
 	Connections int64  `json:"connections"`
 	Channels    int64  `json:"channels"`
 	Consumers   int64  `json:"consumers"`
 	Queues      int64  `json:"queues"`
 	Exchanges   int64  `json:"exchanges"`
-	Bindings    *int64 `json:"bindings"` // nil => JSON null (BOB-4 unbuilt)
+	Bindings    *int64 `json:"bindings"` // nil => JSON null (binding seam absent)
 	Generation  uint64 `json:"-"`
 }
 
-// SnapshotEntityTotals returns the five counts from one gate-held read.
+// SnapshotEntityTotals returns the entity counts from one gate-held read.
 // Bounded cost: O(1); it takes only Server.entityGate (permitted).
 func (s *Server) SnapshotEntityTotals() EntityTotals {
 	s.entityGate.Lock()
 	defer s.entityGate.Unlock()
-	return EntityTotals{
+	t := EntityTotals{
 		Connections: s.entityConnections,
 		Channels:    s.entityChannels,
 		Consumers:   s.entityConsumers,
@@ -32,6 +32,11 @@ func (s *Server) SnapshotEntityTotals() EntityTotals {
 		Exchanges:   s.entityExchanges,
 		Generation:  s.entityGeneration,
 	}
+	if s.entityBindingsWired {
+		n := s.entityBindings
+		t.Bindings = &n
+	}
+	return t
 }
 
 // EntityObserverWired reports whether the broker observer seam is installed.
@@ -54,6 +59,8 @@ func (s *Server) OnBrokerEntityChange(kind string, delta int64) {
 		s.entityExchanges += delta
 	case "consumer":
 		s.entityConsumers += delta
+	case "binding":
+		s.entityBindings += delta
 	default:
 		s.entityGate.Unlock()
 		return
@@ -108,12 +115,28 @@ func (s *Server) InitEntityCounters() {
 		consumers = int64(len(s.Broker.GetConsumers()))
 	}
 
+	// BOB-4: seed the binding count from the aggregate binding seam when the
+	// injected broker has one. A custom UnifiedBroker without it keeps the
+	// count unwired, so the overview renders object_totals.bindings: null.
+	var bindings int64
+	bindingsWired := false
+	if lister, ok := s.Broker.(interface {
+		ListBindings() ([]broker.BindingView, error)
+	}); ok {
+		if v, err := lister.ListBindings(); err == nil {
+			bindings = int64(len(v))
+			bindingsWired = true
+		}
+	}
+
 	s.entityGate.Lock()
 	s.entityConnections = connections
 	s.entityChannels = channels
 	s.entityQueues = queues
 	s.entityExchanges = exchanges
 	s.entityConsumers = consumers
+	s.entityBindings = bindings
+	s.entityBindingsWired = bindingsWired
 	s.entityGeneration++
 	s.entityGate.Unlock()
 
@@ -141,8 +164,10 @@ func (s *Server) wireEntityObserver() {
 
 // ChannelView is the lock-free management view of one live channel. Fields
 // whose backing value is guarded by protocol.Channel.Mutex are deliberately
-// absent: prefetch_count and transactional are reported null by the API, and
-// `closing` is not observable.
+// absent: the consumer count is derived from Broker.ConsumerViews(), and
+// prefetch_count/transactional are read from lock-free atomics (BOB-3).
+// `closing` is derived from the per-connection runtime, never from
+// Channel.Closed (which is written under Channel.Mutex).
 type ChannelView struct {
 	Number       uint16
 	ConnectionID string
@@ -153,6 +178,11 @@ type ChannelView struct {
 	FlowActive   bool  // Channel.FlowActive   (atomic.Bool) — safe
 	Unacked      int64 // BOB-8 sum over consumers on this channel
 	HasUnacked   bool  // false when any owning consumer has AckKnown==false
+
+	// BOB-3 fields.
+	PrefetchCount uint16 // Channel.PrefetchCount.Load() (0 = unlimited)
+	Transactional bool   // Channel.Transactional.Load()
+	Closing       bool   // connRuntime.isChannelClosing(ch.ID)
 }
 
 // ChannelViews enumerates live channels under Server.Mutex.RLock() only. It
@@ -197,6 +227,7 @@ func (s *Server) ChannelViews() []ChannelView {
 	s.Mutex.RLock()
 	for _, conn := range s.Connections {
 		connID := conn.ID
+		rt, hasRT := s.runtimes.Load(conn)
 		// PRE-EXISTING FOLLOW-UP (reviewer F6): Username and Vhost are written
 		// by the handshake goroutine (handleConnectionStartOK / handleConnectionOpen
 		// in connection_handlers.go) AFTER this connection was already published
@@ -210,13 +241,23 @@ func (s *Server) ChannelViews() []ChannelView {
 		conn.Channels.Range(func(_, value interface{}) bool {
 			ch := value.(*protocol.Channel)
 			view := ChannelView{
-				Number:       ch.ID,
-				ConnectionID: connID,
-				User:         user,
-				Vhost:        vhost,
-				Confirm:      ch.ConfirmMode.Load(),
-				FlowActive:   ch.FlowActive.Load(),
-				HasUnacked:   true,
+				Number:        ch.ID,
+				ConnectionID:  connID,
+				User:          user,
+				Vhost:         vhost,
+				Confirm:       ch.ConfirmMode.Load(),
+				FlowActive:    ch.FlowActive.Load(),
+				HasUnacked:    true,
+				PrefetchCount: uint16(ch.PrefetchCount.Load()),
+				Transactional: ch.Transactional.Load(),
+			}
+			// BOB-3: the closing signal comes from the per-connection runtime
+			// (markChannelClosing fires on every server-initiated channel
+			// close), never from Channel.Closed — which is written under
+			// Channel.Mutex and whose channel is already out of the registry by
+			// the time it is set.
+			if hasRT {
+				view.Closing = rt.(*connRuntime).isChannelClosing(ch.ID)
 			}
 			if a := perChannel[chanKey{connID: connID, number: ch.ID}]; a != nil {
 				view.Consumers = a.count

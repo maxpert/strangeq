@@ -5,9 +5,11 @@ import (
 	"net/http"
 	"runtime"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/maxpert/amqp-go/protocol"
+	"github.com/maxpert/amqp-go/server"
 )
 
 // vhostParam reads the {vhost} path segment and enforces the "only %2F
@@ -202,10 +204,25 @@ type channelInfo struct {
 	State         string `json:"state"`
 	Consumers     int    `json:"consumers"`
 	Unacked       any    `json:"unacked"`
-	PrefetchCount any    `json:"prefetch_count"`
+	PrefetchCount uint16 `json:"prefetch_count"`
 	Confirm       bool   `json:"confirm"`
-	Transactional any    `json:"transactional"`
+	Transactional bool   `json:"transactional"`
 	StatsPartial  bool   `json:"stats_partial"`
+}
+
+// channelState derives the DATA-006 `state` with the frozen precedence
+// closing > flow > running (spec mgmt-04 §3.4). It is never fabricated: an open
+// channel with flow active is running, a flow-stopped one is flow, and only a
+// server-initiated close awaiting close-ok is closing.
+func channelState(v server.ChannelView) string {
+	switch {
+	case v.Closing:
+		return "closing"
+	case !v.FlowActive:
+		return "flow"
+	default:
+		return "running"
+	}
 }
 
 func (s *Server) channelsSnapshot() []channelInfo {
@@ -219,21 +236,23 @@ func (s *Server) channelsSnapshot() []channelInfo {
 		out := make([]channelInfo, 0)
 		for _, v := range views.ChannelViews() {
 			ci := channelInfo{
-				Number:       v.Number,
-				Connection:   v.ConnectionID,
-				User:         v.User,
-				VHost:        v.Vhost,
-				Consumers:    v.Consumers,
-				Confirm:      v.Confirm,
-				StatsPartial: true, // prefetch_count/transactional are unobservable
+				Number:        v.Number,
+				Connection:    v.ConnectionID,
+				User:          v.User,
+				VHost:         v.Vhost,
+				Consumers:     v.Consumers,
+				Confirm:       v.Confirm,
+				PrefetchCount: v.PrefetchCount,
+				Transactional: v.Transactional,
 			}
-			if v.FlowActive {
-				ci.State = "running"
-			} else {
-				ci.State = "flow"
-			}
+			// BOB-3: state precedence closing > flow > running; never fabricated.
+			ci.State = channelState(v)
+			// unacked is the only remaining nullable field (mgmt-03 §2.1): it is
+			// null exactly when an owning consumer's delivered set is unknown.
 			if v.HasUnacked {
 				ci.Unacked = v.Unacked
+			} else {
+				ci.StatsPartial = true
 			}
 			out = append(out, ci)
 		}
@@ -241,8 +260,7 @@ func (s *Server) channelsSnapshot() []channelInfo {
 	}
 	_ = hasSeam
 	// Fallback: enumerate channels from the connection registry, reading only
-	// lock-free atomics. Consumers count requires the consumer seam and is
-	// reported as 0 with stats_partial unset only when the seam exists.
+	// lock-free atomics (BOB-3 promoted PrefetchCount/Transactional to atomics).
 	var out []channelInfo
 	srv.Mutex.RLock()
 	for id, conn := range srv.Connections {
@@ -252,12 +270,14 @@ func (s *Server) channelsSnapshot() []channelInfo {
 				return true
 			}
 			ci := channelInfo{
-				Number:       ch.ID,
-				Connection:   id,
-				User:         conn.Username,
-				VHost:        conn.Vhost,
-				Confirm:      ch.ConfirmMode.Load(),
-				StatsPartial: true,
+				Number:        ch.ID,
+				Connection:    id,
+				User:          conn.Username,
+				VHost:         conn.Vhost,
+				Confirm:       ch.ConfirmMode.Load(),
+				PrefetchCount: uint16(ch.PrefetchCount.Load()),
+				Transactional: ch.Transactional.Load(),
+				StatsPartial:  true, // unacked is unknown without the consumer seam
 			}
 			if ch.FlowActive.Load() {
 				ci.State = "running"
@@ -290,18 +310,66 @@ func (s *Server) hChannels(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) hChannel(w http.ResponseWriter, r *http.Request) {
 	raw := pathValue(endpointLabel(r), r.URL.EscapedPath(), "id")
-	n, err := strconv.Atoi(raw)
-	if err != nil {
-		s.writeAPIError(w, r, errNotFoundMsg("unknown channel"))
-		return
-	}
 	for _, c := range s.channelsSnapshot() {
-		if int(c.Number) == n {
+		if channelIDMatches(raw, c) {
 			s.writeJSON(w, r, http.StatusOK, c)
 			return
 		}
 	}
 	s.writeAPIError(w, r, errNotFoundMsg("unknown channel"))
+}
+
+// channelIDMatches resolves the `{id}` path key. The canonical key is the
+// percent-encoded "{connection}:{number}" composite (connection ids are
+// colon-free hex, so the split is unambiguous; spec mgmt-04 §3.6). A bare
+// integer is also accepted and matched against the channel number, which keeps
+// a single-connection lookup working and matches the pre-BOB-3 behaviour.
+func channelIDMatches(raw string, c channelInfo) bool {
+	if i := strings.IndexByte(raw, ':'); i >= 0 {
+		connID, numStr := raw[:i], raw[i+1:]
+		n, err := strconv.Atoi(numStr)
+		if err != nil {
+			return false
+		}
+		return c.Connection == connID && int(c.Number) == n
+	}
+	n, err := strconv.Atoi(raw)
+	if err != nil {
+		return false
+	}
+	return int(c.Number) == n
+}
+
+// hConnectionChannels serves GET /api/connections/{name}/channels (FR-API-024):
+// the connection's channels. An absent connection is 404.
+func (s *Server) hConnectionChannels(w http.ResponseWriter, r *http.Request) {
+	name := pathValue(endpointLabel(r), r.URL.EscapedPath(), "name")
+	found := false
+	for _, c := range s.connectionsSnapshot() {
+		if c.Name == name {
+			found = true
+			break
+		}
+	}
+	if !found {
+		s.writeAPIError(w, r, errNotFoundMsg("unknown connection"))
+		return
+	}
+	q, aerr := parseListQuery(r, s.mcfg.Limits.MaxPageSize)
+	if aerr != nil {
+		s.writeAPIError(w, r, aerr)
+		return
+	}
+	chans := s.channelsSnapshot()
+	items := make([]any, 0, len(chans))
+	for _, c := range chans {
+		if c.Connection == name {
+			items = append(items, c)
+		}
+	}
+	s.writeList(w, r, items, channelInfo{}, q,
+		func(v any) string { return strconv.Itoa(int(v.(channelInfo).Number)) },
+		sortFieldAllowlist([]string{"number", "connection", "user", "vhost", "state", "consumers"}))
 }
 
 // --- consumers ---

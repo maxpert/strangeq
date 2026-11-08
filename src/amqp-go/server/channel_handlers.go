@@ -207,6 +207,7 @@ func (s *Server) teardownChannel(conn *protocol.Connection, channelID uint16) {
 	}
 	channel.Consumers = make(map[string]*protocol.Consumer) // Clear all consumers
 	channel.Closed = true
+	channel.Transactional.Store(false) // BOB-3: leaving tx mode on teardown
 	channel.Mutex.Unlock()
 	conn.ConsumersDirty.Store(true)
 

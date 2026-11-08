@@ -329,15 +329,26 @@ type Channel struct {
 	// map is the authority on tag uniqueness: a duplicate key here is the
 	// 530 not-allowed case, while the same key on another channel is legal.
 	// Guarded by Mutex.
-	Consumers       map[string]*Consumer
-	DeliveryTag     uint64        // Used for delivery tags in acknowledgements
-	PrefetchCount   uint16        // Channel-level prefetch count
-	PrefetchSize    uint32        // Channel-level prefetch size (0 = unlimited)
-	GlobalPrefetch  bool          // Apply prefetch settings globally
-	CurrentQueue    string        // Last declared queue name (for empty-name resolution per AMQP spec)
-	FlowActive      atomic.Bool   // channel.flow state: true = content frames may be sent
-	FlowWake        chan struct{} // signaled to wake parked forwarders when flow resumes/closes
-	ConfirmMode     atomic.Bool   // confirm.select state: true = server sends basic.ack for each publish
+	Consumers      map[string]*Consumer
+	DeliveryTag    uint64        // Used for delivery tags in acknowledgements
+	PrefetchSize   uint32        // Channel-level prefetch size (0 = unlimited)
+	GlobalPrefetch bool          // Apply prefetch settings globally
+	CurrentQueue   string        // Last declared queue name (for empty-name resolution per AMQP spec)
+	FlowActive     atomic.Bool   // channel.flow state: true = content frames may be sent
+	FlowWake       chan struct{} // signaled to wake parked forwarders when flow resumes/closes
+	ConfirmMode    atomic.Bool   // confirm.select state: true = server sends basic.ack for each publish
+	// PrefetchCount is the channel-level basic.qos prefetch (0 = unlimited). It
+	// is written by basic.qos and read by the management surface (BOB-3). It is
+	// an atomic so both paths are race-free without taking Channel.Mutex, which
+	// is forbidden on a management request. It is NOT read on the publish/deliver
+	// hot path (spec 04 §3.1/§3.3).
+	PrefetchCount atomic.Uint32
+	// Transactional is a management-observable mirror of "this channel is in tx
+	// mode". Its ONLY writers are handleTxSelect (set), the failed-commit path
+	// (clear), teardownChannel (clear) and cleanupConnection (clear). The
+	// transaction manager remains the AMQP authority; this exists so
+	// Server.ChannelViews is lock-free (spec 04 §3.2/§3.3).
+	Transactional   atomic.Bool
 	ConfirmSequence atomic.Uint64 // channel-scoped delivery tag sequence for publisher confirms
 
 	// SQ-5: publisher-confirm batching state. The per-publish hot path touches
@@ -412,7 +423,6 @@ func NewChannel(id uint16, conn *Connection) *Channel {
 		Connection:     conn,
 		Consumers:      make(map[string]*Consumer),
 		DeliveryTag:    0,     // Will be incremented for each delivery
-		PrefetchCount:  0,     // No limit by default
 		PrefetchSize:   0,     // No limit by default
 		GlobalPrefetch: false, // Per-consumer by default
 		FlowWake:       make(chan struct{}, 1),
