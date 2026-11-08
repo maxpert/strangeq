@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"net"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -11,6 +12,7 @@ import (
 	"github.com/maxpert/amqp-go/interfaces"
 	"github.com/maxpert/amqp-go/metrics"
 	"github.com/maxpert/amqp-go/protocol"
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/zap"
@@ -342,6 +344,146 @@ func TestShutdownMetrics_Recorded(t *testing.T) {
 	_ = srv.Shutdown(ctx)
 
 	assert.Equal(t, int64(1), spy.shutdowns.Load(), "exactly one shutdown result is recorded")
+}
+
+// TestFanInExtras_ConsumerRemovedDropCounted (spec 06 §3.4, test #14's fan-in
+// half): the deliveries drained alongside a batch that belong to OTHER
+// consumers are the "extras". When a consumer is removed after its delivery was
+// forwarded, the extras loop drops that delivery; for a NoAck consumer the
+// broker already settled and deleted it on enqueue, so this fan-in copy is the
+// ONLY copy and the drop MUST be counted — exactly as the main dispatch path
+// counts it. Two consumers vanished in one discovery pass ⇒ two counted drops,
+// where the bug counted zero.
+func TestFanInExtras_ConsumerRemovedDropCounted(t *testing.T) {
+	spy := &wireSpy{}
+	s := &Server{Log: zap.NewNop(), MetricsCollector: spy}
+
+	clientConn, serverConn := net.Pipe()
+	defer clientConn.Close()
+	defer serverConn.Close()
+	conn := protocol.NewConnection(serverConn)
+
+	ch := protocol.NewChannel(1, conn)
+	ch.Mutex.Lock()
+	ch.Consumers = map[string]*protocol.Consumer{
+		"keep":   {ID: "keep", Tag: "keep", Queue: "q", Messages: make(chan *protocol.Delivery, 1)},
+		"gone-1": {ID: "gone-1", Tag: "gone-1", Queue: "q", Messages: make(chan *protocol.Delivery, 1)},
+		"gone-2": {ID: "gone-2", Tag: "gone-2", Queue: "q", Messages: make(chan *protocol.Delivery, 1)},
+	}
+	ch.Mutex.Unlock()
+	conn.Channels.Store(uint16(1), ch)
+
+	rt := s.runtimeFor(conn)
+	consumerInfos := make(map[string]*consumerInfo)
+	forwarders := make(map[string]chan struct{})
+	activeIDs := make(map[string]struct{})
+	fanIn := make(chan *protocol.Delivery, 8)
+
+	s.discoverConsumers(rt, consumerInfos, forwarders, activeIDs, fanIn)
+	require.Len(t, consumerInfos, 3, "all three consumers must be registered")
+
+	// Remove BOTH gone-* consumers in a single discovery pass: on the next loop
+	// iteration one of them would own the batch and the other becomes an extra.
+	ch.Mutex.Lock()
+	delete(ch.Consumers, "gone-1")
+	delete(ch.Consumers, "gone-2")
+	ch.Mutex.Unlock()
+	s.discoverConsumers(rt, consumerInfos, forwarders, activeIDs, fanIn)
+	require.Len(t, consumerInfos, 1)
+	_, keepAlive := consumerInfos["keep"]
+	require.True(t, keepAlive, "the surviving consumer must remain routable")
+
+	// The two vanished consumers' deliveries are the fan-in extras.
+	extras := []*protocol.Delivery{
+		fanInDelivery("gone-1", "m1", 1),
+		fanInDelivery("gone-2", "m2", 2),
+	}
+	require.True(t, s.sendExtraDeliveries(conn, consumerInfos, extras),
+		"no write is attempted for a vanished consumer")
+
+	assert.Equal(t, int64(2), spy.droppedCount(DeliveryDropConsumerRemoved),
+		"each vanished consumer's fan-in delivery must be counted as consumer_removed, never silently dropped")
+	assert.Equal(t, int64(2), spy.dropped.Load())
+
+	// Stop the surviving consumer's forwarder so the goroutine cannot leak.
+	for _, stop := range forwarders {
+		close(stop)
+	}
+	require.Eventually(t, func() bool { return rt.liveGoroutines.Load() == 0 },
+		2*time.Second, time.Millisecond, "forwarding goroutine leaked after the consumers were removed")
+}
+
+// recoveryStages are the DOCUMENTED metric stages of spec 06 §3.2. The dead
+// "recovery" arm was dropped from the enum (see recovery_metrics.go): no
+// classified fault ever carried it, so it was a permanently-zero series.
+var recoveryStages = []string{
+	RecoveryStageStorageValidation,
+	RecoveryStageMetadata,
+	RecoveryStageExchange,
+	RecoveryStageQueue,
+	RecoveryStageMessage,
+	RecoveryStageWALScan,
+	RecoveryStagePendingAcks,
+	RecoveryStageOrdinalAllocator,
+}
+
+// TestRecoveryStageEnum_AllDocumentedStagesProduceSeries pins the closed metric
+// enum of spec 06 §3.2: every documented recovery stage const must be usable as
+// a label and produce an amqp_recovery_faults_total series, so a stage rename or
+// a stray literal at a recording site is visible here rather than as an
+// unbounded label domain in production.
+func TestRecoveryStageEnum_AllDocumentedStagesProduceSeries(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	c := metrics.NewCollectorWithRegistry(reg, "amqp")
+	for _, st := range recoveryStages {
+		c.RecordRecoveryFault(st, RecoveryOutcomeDegraded)
+	}
+
+	fams, err := reg.Gather()
+	require.NoError(t, err)
+	seen := make(map[string]bool)
+	for _, f := range fams {
+		if f.GetName() != "amqp_recovery_faults_total" {
+			continue
+		}
+		for _, m := range f.GetMetric() {
+			for _, p := range m.GetLabel() {
+				if p.GetName() == "stage" {
+					seen[p.GetValue()] = true
+				}
+			}
+		}
+	}
+	for _, st := range recoveryStages {
+		assert.True(t, seen[st], "stage %q must produce an amqp_recovery_faults_total series", st)
+	}
+	assert.Len(t, seen, len(recoveryStages),
+		"the family must carry exactly the documented stages; a stray literal would add one")
+}
+
+// TestReaderCloseCause_OnceGuardUnderWriteError (spec 06 §3.5): the reader
+// goroutine's close cause and a concurrent write-error close of the SAME
+// connection must produce exactly ONE connections_closed_by_cause_total
+// increment. Before the fix the reader recorded directly, bypassing the
+// per-runtime once-guard, so the later write-error site added a second cause
+// for one close.
+func TestReaderCloseCause_OnceGuardUnderWriteError(t *testing.T) {
+	spy := &wireSpy{}
+	s := &Server{Log: zap.NewNop(), MetricsCollector: spy}
+	wconn, _ := newPipeConnWithFrames(t)
+	rt := s.runtimeFor(wconn)
+	require.NoError(t, wconn.Conn.Close()) // any subsequent write fails
+
+	// The reader goroutine discovers the close first and records its cause...
+	s.recordReaderClose(rt, wconn, ConnectionCloseHeartbeatTimeout)
+	// ...then the failing write path attempts its own cause for the same close.
+	require.Error(t, s.writeFrame(wconn, &protocol.Frame{Type: protocol.FrameHeartbeat}))
+
+	assert.Equal(t, int64(1), spy.closedByCause.Load(),
+		"one connection close records exactly one cause")
+	assert.Equal(t, int64(1), spy.causeCount(ConnectionCloseHeartbeatTimeout))
+	assert.Equal(t, int64(0), spy.causeCount(ConnectionCloseWriteError),
+		"the later write-error site must not add a second cause to the same close")
 }
 
 // The production collector must satisfy the recovery sink interface, so a
