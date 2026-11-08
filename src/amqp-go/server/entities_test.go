@@ -1,6 +1,7 @@
 package server
 
 import (
+	"fmt"
 	"go/ast"
 	"go/parser"
 	"go/token"
@@ -426,7 +427,8 @@ func TestForbiddenLockGate_HoldEveryForbiddenLock(t *testing.T) {
 // names that also exist on the immutable protocol.Consumer
 // (Consumers/Closed/PrefetchCount) are flagged only when the receiver is
 // provably a channel/connection — an explicitly annotated parameter/var, a
-// type-assertion target, or a conventional channel/connection identifier.
+// type-assertion target, a channel/connection-returning selector, or a
+// conventional channel/connection identifier.
 func TestForbiddenLockGate_ASTScan(t *testing.T) {
 	paths := []string{"entities.go", "queue_stats.go", "../broker/management_accessors.go"}
 
@@ -440,6 +442,77 @@ func TestForbiddenLockGate_ASTScan(t *testing.T) {
 		}
 	}
 
+	findings, err := scanForbidden(paths)
+	require.NoError(t, err, "scanForbidden must parse every management-facing source")
+	for _, f := range findings {
+		t.Error(f)
+	}
+}
+
+// TestForbiddenLockGate_ASTScan_CatchesEvasion is the deterministic negative
+// self-test for the selector-assignment evasion: an entity fetched through a
+// Channel/Connection selector and assigned to a neutral local must not escape
+// the gate.
+//
+//	x := f().Channel
+//	_ = x.Consumers
+func TestForbiddenLockGate_ASTScan_CatchesEvasion(t *testing.T) {
+	fixture := writeScanFixture(t, "evasion.go", `package fixture
+
+type inner struct{ Consumers int }
+type outer struct{ Channel inner }
+
+func f() outer { return outer{} }
+
+func use() {
+	x := f().Channel
+	_ = x.Consumers
+}
+`)
+
+	findings, err := scanForbidden([]string{fixture})
+	require.NoError(t, err)
+	require.Len(t, findings, 1, "the selector-assignment evasion must be caught: %v", findings)
+	require.Contains(t, findings[0], "Consumers")
+}
+
+// TestForbiddenLockGate_ASTScan_CatchesAlwaysForbidden is the second half of
+// the mutation-verification check: a bare channel-guarded field and an
+// always-forbidden lock field must both fail the gate. Delete either guard in
+// scanForbidden and this test stops seeing the corresponding finding.
+func TestForbiddenLockGate_ASTScan_CatchesAlwaysForbidden(t *testing.T) {
+	fixture := writeScanFixture(t, "always.go", `package fixture
+
+func use() {
+	ch := make(chan int)
+	_ = ch.PrefetchCount
+	var conn any
+	_ = conn.WriteMutex
+}
+`)
+
+	findings, err := scanForbidden([]string{fixture})
+	require.NoError(t, err)
+	joined := strings.Join(findings, "\n")
+	require.Contains(t, joined, "PrefetchCount", "a channel-guarded field must be caught: %v", findings)
+	require.Contains(t, joined, "WriteMutex", "an always-forbidden field must be caught: %v", findings)
+}
+
+// writeScanFixture writes a throwaway Go source file for the AST gate's
+// negative self-tests and returns its path.
+func writeScanFixture(t *testing.T, name, src string) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), name)
+	require.NoError(t, os.WriteFile(path, []byte(src), 0o600))
+	return path
+}
+
+// scanForbidden parses each path and returns one human-readable finding per
+// reference to a forbidden lock, field, or method. alwaysForbidden names are
+// flagged on any receiver; the names that also exist on the immutable
+// protocol.Consumer (Consumers/Closed/PrefetchCount) are flagged only when the
+// receiver is provably channel/connection-typed.
+func scanForbidden(paths []string) ([]string, error) {
 	alwaysForbidden := map[string]bool{
 		"GetStats":       true,
 		"WriteMutex":     true,
@@ -453,28 +526,39 @@ func TestForbiddenLockGate_ASTScan(t *testing.T) {
 		"PrefetchCount": true,
 	}
 	chanLikeNames := map[string]bool{
-		"ch": true, "channel": true, "chan": true, "conn": true, "connection": true,
+		"ch": true, "channel": true, "conn": true, "connection": true,
 	}
 
+	var findings []string
 	for _, path := range paths {
 		fset := token.NewFileSet()
 		f, err := parser.ParseFile(fset, path, nil, 0)
 		if err != nil {
-			t.Fatalf("parse %s: %v", path, err)
+			return findings, fmt.Errorf("parse %s: %w", path, err)
 		}
 
 		// Identifiers known to hold a channel/connection in this file.
 		chanTyped := map[string]bool{}
-		markTyped := func(id *ast.Ident, typ ast.Expr) {
-			if id != nil && isChanConnType(typ) {
+		markTyped := func(id *ast.Ident, chanConn bool) {
+			if id != nil && chanConn {
 				chanTyped[id.Name] = true
 			}
+		}
+		// A value read through a Channel/Connection field selector is itself a
+		// channel/connection (e.g. f().Channel), regardless of what it is
+		// assigned to.
+		isChanConnSelectorName := func(e ast.Expr) bool {
+			sel, ok := e.(*ast.SelectorExpr)
+			if !ok {
+				return false
+			}
+			return sel.Sel.Name == "Channel" || sel.Sel.Name == "Connection"
 		}
 		ast.Inspect(f, func(n ast.Node) bool {
 			switch d := n.(type) {
 			case *ast.Field:
 				for _, nm := range d.Names {
-					markTyped(nm, d.Type)
+					markTyped(nm, isChanConnType(d.Type))
 				}
 			case *ast.AssignStmt:
 				for i, rhs := range d.Rhs {
@@ -483,19 +567,24 @@ func TestForbiddenLockGate_ASTScan(t *testing.T) {
 					}
 					switch r := rhs.(type) {
 					case *ast.TypeAssertExpr:
-						markTyped(asIdent(d.Lhs[i]), r.Type)
-					case *ast.UnaryExpr: // &protocol.Channel{...}
-						if id := asIdent(d.Lhs[i]); id != nil {
-							_ = id
+						markTyped(asIdent(d.Lhs[i]), isChanConnType(r.Type))
+					default:
+						if lhs := asIdent(d.Lhs[i]); lhs != nil && isChanConnSelectorName(rhs) {
+							markTyped(lhs, true)
 						}
 					}
 				}
 			case *ast.ValueSpec:
 				for i, nm := range d.Names {
-					if i < len(d.Values) {
-						if ta, ok := d.Values[i].(*ast.TypeAssertExpr); ok {
-							markTyped(nm, ta.Type)
-						}
+					if i >= len(d.Values) {
+						break
+					}
+					if ta, ok := d.Values[i].(*ast.TypeAssertExpr); ok {
+						markTyped(nm, isChanConnType(ta.Type))
+						continue
+					}
+					if isChanConnSelectorName(d.Values[i]) {
+						markTyped(nm, true)
 					}
 				}
 			}
@@ -509,19 +598,21 @@ func TestForbiddenLockGate_ASTScan(t *testing.T) {
 			}
 			name := sel.Sel.Name
 			if alwaysForbidden[name] {
-				t.Errorf("%s:%d: forbidden selector %q", path, fset.Position(sel.Pos()).Line, name)
+				findings = append(findings, fmt.Sprintf("%s:%d: forbidden selector %q",
+					path, fset.Position(sel.Pos()).Line, name))
 				return true
 			}
 			if guardedOnChan[name] {
 				base := rootIdent(sel.X)
 				if chanLikeNames[base] || chanTyped[base] || isChanConnSelector(sel.X) {
-					t.Errorf("%s:%d: forbidden channel/connection field %q on receiver %q",
-						path, fset.Position(sel.Pos()).Line, name, base)
+					findings = append(findings, fmt.Sprintf("%s:%d: forbidden channel/connection field %q on receiver %q",
+						path, fset.Position(sel.Pos()).Line, name, base))
 				}
 			}
 			return true
 		})
 	}
+	return findings, nil
 }
 
 func asIdent(e ast.Expr) *ast.Ident {
