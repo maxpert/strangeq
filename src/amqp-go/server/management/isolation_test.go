@@ -22,11 +22,18 @@ func TestForbiddenLock_OverviewDoesNotBlock(t *testing.T) {
 	e.declareQueue(t, "locked-q", queueDeclareRequest{Durable: true})
 
 	// Put a live connection + channel into the registry, then hold the
-	// FORBIDDEN locks on them.
+	// FORBIDDEN locks on the EXACT objects the registry holds. Registering a
+	// different object than the one locked would make this test vacuous: the
+	// snapshot would never touch the locked mutex.
 	peer := e.injectConnection(t, "locked-conn", "u")
 	defer peer.Close()
 
-	conn := &protocol.Connection{ID: "locked-conn", Vhost: "/", Username: "u"}
+	e.srv.Mutex.Lock()
+	conn := e.srv.Connections["locked-conn"]
+	e.srv.Mutex.Unlock()
+	if conn == nil {
+		t.Fatalf("injected connection is not in the registry")
+	}
 	ch := protocol.NewChannel(1, conn)
 	conn.Channels.Store(uint16(1), ch)
 
@@ -35,7 +42,7 @@ func TestForbiddenLock_OverviewDoesNotBlock(t *testing.T) {
 	conn.WriteMutex.Lock()
 	defer conn.WriteMutex.Unlock()
 
-	for _, target := range []string{"/api/overview", "/api/queues", "/api/queues?page=1"} {
+	for _, target := range []string{"/api/overview", "/api/queues", "/api/queues?page=1", "/api/channels", "/api/channels/1"} {
 		done := make(chan int, 1)
 		go func(tgt string) {
 			done <- e.do(http.MethodGet, tgt, nil, basicAuthHeader()).Code
