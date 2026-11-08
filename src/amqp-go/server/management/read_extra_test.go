@@ -1,6 +1,7 @@
 package management
 
 import (
+	"fmt"
 	"net/http"
 	"strings"
 	"testing"
@@ -9,6 +10,15 @@ import (
 // TestOverview_FieldsAndCoherence (FR-API-001/002/008, spec §11 test 38).
 func TestOverview_FieldsAndCoherence(t *testing.T) {
 	e := basicEnv(t, true, nil)
+
+	// Declare a known number of queues BEFORE the snapshot so coherence can be
+	// verified honestly: object_totals.queues must equal exactly these.
+	const declared = 3
+	for i := 0; i < declared; i++ {
+		rec := e.do(http.MethodPut, "/api/queues/%2F/"+fmt.Sprintf("coh-q%d", i), e.jsonBody(t, queueDeclareRequest{Exclusive: true, AutoDelete: true}), basicAuthHeader())
+		wantStatus(t, rec, http.StatusCreated)
+	}
+
 	rec := e.do(http.MethodGet, "/api/overview", nil, basicAuthHeader())
 	wantStatus(t, rec, http.StatusOK)
 
@@ -35,14 +45,39 @@ func TestOverview_FieldsAndCoherence(t *testing.T) {
 	if v, present := totals["bindings"]; !present || v != nil {
 		t.Fatalf("object_totals.bindings must be present and null (BOB-4 unbuilt), got %#v", v)
 	}
-	// BOB-11 is unbuilt in this tree: the snapshot must honestly report
-	// incoherence rather than claim a coherent read it did not perform.
-	if coherent, ok := out["snapshot_coherent"].(bool); !ok || coherent {
-		t.Fatalf("snapshot_coherent must be false when the BOB-11 seam is absent, got %#v", out["snapshot_coherent"])
+	// BOB-11 is built: the snapshot is coherent, and coherence must be verified
+	// honestly — object_totals.queues equals the queues declared at snapshot
+	// time, and agrees with the queue list.
+	if coherent, ok := out["snapshot_coherent"].(bool); !ok || !coherent {
+		t.Fatalf("snapshot_coherent must be true with the BOB-11 seam wired, got %#v", out["snapshot_coherent"])
+	}
+	if got, ok := totals["queues"].(float64); !ok || int(got) != declared {
+		t.Fatalf("object_totals.queues = %#v, want %d declared queues", totals["queues"], declared)
+	}
+	list := decode[[]map[string]any](t, e.do(http.MethodGet, "/api/queues", nil, basicAuthHeader()))
+	if len(list) != declared {
+		t.Fatalf("queue list has %d items, want %d (overview must agree with the list)", len(list), declared)
 	}
 	listeners, _ := out["listeners"].([]any)
 	if len(listeners) != 1 {
 		t.Fatalf("listeners = %#v, want one amqp listener", out["listeners"])
+	}
+}
+
+// TestOverview_IncoherentWithoutObserverSeam pins the honest incoherence report
+// when the BOB-11 observer seam is absent: a broker built without
+// SetEntityObserver leaves EntityObserverWired false, so the overview must
+// report snapshot_coherent:false rather than claim a coherent read it did not
+// perform. WS3's TestBuild_ObserverWiredOnlyForStorageBroker covers the same
+// no-seam case at the server layer; this covers the management-layer mapping.
+func TestOverview_IncoherentWithoutObserverSeam(t *testing.T) {
+	e := observerlessEnv(t, true, nil)
+	rec := e.do(http.MethodGet, "/api/overview", nil, basicAuthHeader())
+	wantStatus(t, rec, http.StatusOK)
+
+	out := decode[map[string]any](t, rec)
+	if coherent, ok := out["snapshot_coherent"].(bool); !ok || coherent {
+		t.Fatalf("snapshot_coherent must be false without the BOB-11 seam, got %#v", out["snapshot_coherent"])
 	}
 }
 

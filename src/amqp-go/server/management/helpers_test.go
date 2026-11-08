@@ -14,9 +14,11 @@ import (
 	"testing"
 	"time"
 
+	"github.com/maxpert/amqp-go/broker"
 	"github.com/maxpert/amqp-go/config"
 	"github.com/maxpert/amqp-go/protocol"
 	"github.com/maxpert/amqp-go/server"
+	"github.com/maxpert/amqp-go/storage"
 	"go.uber.org/zap"
 	"golang.org/x/crypto/bcrypt"
 )
@@ -52,15 +54,7 @@ type env struct {
 // in-process broker is constructed (slower, needed for topology endpoints).
 func newEnv(t *testing.T, withBroker bool, mutate func(*config.AMQPConfig)) *env {
 	t.Helper()
-	cfg := config.DefaultConfig()
-	cfg.Storage.Path = t.TempDir()
-	cfg.Server.LogLevel = "silent"
-	cfg.Management.Enabled = true
-	cfg.Management.Authentication = config.ManagementAuthenticationNone
-	cfg.Management.Address = "127.0.0.1"
-	if mutate != nil {
-		mutate(cfg)
-	}
+	cfg := baseEnvConfig(t, mutate)
 
 	e := &env{t: t, cfg: cfg}
 	if withBroker {
@@ -79,8 +73,32 @@ func newEnv(t *testing.T, withBroker bool, mutate func(*config.AMQPConfig)) *env
 		})
 	}
 
+	e.mgmt = newManagement(t, e.srv, cfg)
+	return e
+}
+
+// baseEnvConfig returns the shared test config — a temp storage dir, silent
+// logging, and management enabled in "none" auth mode. mutate, when non-nil, is
+// applied last.
+func baseEnvConfig(t *testing.T, mutate func(*config.AMQPConfig)) *config.AMQPConfig {
+	t.Helper()
+	cfg := config.DefaultConfig()
+	cfg.Storage.Path = t.TempDir()
+	cfg.Server.LogLevel = "silent"
+	cfg.Management.Enabled = true
+	cfg.Management.Authentication = config.ManagementAuthenticationNone
+	cfg.Management.Address = "127.0.0.1"
+	if mutate != nil {
+		mutate(cfg)
+	}
+	return cfg
+}
+
+// newManagement constructs the management Server around srv (which may be nil).
+func newManagement(t *testing.T, srv *server.Server, cfg *config.AMQPConfig) *Server {
+	t.Helper()
 	opts := Options{
-		Server:    e.srv,
+		Server:    srv,
 		Config:    cfg,
 		AuthFile:  cfg.Security.AuthenticationFilePath,
 		Logger:    zap.NewNop(),
@@ -89,15 +107,14 @@ func newEnv(t *testing.T, withBroker bool, mutate func(*config.AMQPConfig)) *env
 		BuildDate: "2026-11-08",
 		GoVersion: "go1.27",
 	}
-	if e.srv != nil {
-		opts.Authenticator = e.srv.Authenticator
+	if srv != nil {
+		opts.Authenticator = srv.Authenticator
 	}
 	m, err := New(opts)
 	if err != nil {
 		t.Fatalf("management.New: %v", err)
 	}
-	e.mgmt = m
-	return e
+	return m
 }
 
 // do performs a request through the full management pipeline with a loopback
@@ -267,6 +284,67 @@ func freePort(t *testing.T) int {
 }
 
 func jsonUnmarshalStrict(b []byte, v any) error { return json.Unmarshal(b, v) }
+
+// observerlessBroker embeds a UnifiedBroker so it satisfies the interface but
+// does NOT promote the optional SetEntityObserver seam. Build therefore leaves
+// EntityObserverWired() false, and the management overview must honestly report
+// snapshot_coherent:false rather than claim a coherent read it did not perform.
+// Mirrors the wrapper in server/entities_build_test.go.
+type observerlessBroker struct {
+	server.UnifiedBroker
+}
+
+// PublishMessageAdmitted forwards to the wrapped broker so Build's
+// lease-enabled NonBlockingPublisher check still passes.
+func (b observerlessBroker) PublishMessageAdmitted(exchangeName, routingKey string, message *protocol.Message) (protocol.DepthGate, error) {
+	return b.UnifiedBroker.(server.NonBlockingPublisher).PublishMessageAdmitted(exchangeName, routingKey, message)
+}
+
+// observerlessEnv builds a basic-auth management env whose Options.Server was
+// built with a broker lacking the BOB-11 observer seam, so the coherence
+// property is genuinely false end to end.
+func observerlessEnv(t *testing.T, admin bool, mutate func(*config.AMQPConfig)) *env {
+	t.Helper()
+	hash := secretHash(t)
+	cfg := baseEnvConfig(t, func(cfg *config.AMQPConfig) {
+		cfg.Management.Authentication = config.ManagementAuthenticationBasic
+		cfg.Management.Basic.Username = "admin"
+		cfg.Management.Basic.PasswordHash = hash
+		cfg.Management.Basic.Admin = admin
+		if mutate != nil {
+			mutate(cfg)
+		}
+	})
+
+	store, err := storage.NewStorageEngineWithDataDir(cfg.Storage.Path)
+	if err != nil {
+		t.Fatalf("storage engine: %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+
+	sb := broker.NewStorageBroker(store, cfg.GetEngine())
+	t.Cleanup(sb.Close)
+
+	fake := observerlessBroker{UnifiedBroker: server.NewStorageBrokerAdapter(sb)}
+	srv, err := server.NewServerBuilder().
+		WithConfig(cfg).
+		WithZapLogger("silent").
+		WithStorage(store).
+		WithUnifiedBroker(fake).
+		Build()
+	if err != nil {
+		t.Fatalf("build observerless broker: %v", err)
+	}
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = srv.Shutdown(ctx)
+	})
+
+	e := &env{t: t, cfg: cfg, srv: srv}
+	e.mgmt = newManagement(t, srv, cfg)
+	return e
+}
 
 // consumerForTest builds a broker-registrable consumer with a unique identity.
 func consumerForTest(tag, queue string) *protocol.Consumer {
