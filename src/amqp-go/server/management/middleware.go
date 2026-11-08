@@ -2,6 +2,8 @@ package management
 
 import (
 	"bytes"
+	"context"
+	"crypto/subtle"
 	"fmt"
 	"net/http"
 	"net/netip"
@@ -65,6 +67,15 @@ func (s *Server) serveHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	r = r.WithContext(withRequestID(r.Context(), reqID))
 
+	// Per-request deadline (management.limits.request_timeout_seconds). A
+	// handler that respects the request context is bounded; zero means no
+	// deadline beyond the listener's own read/write timeouts.
+	if secs := s.mcfg.Limits.RequestTimeoutSeconds; secs > 0 {
+		ctx, cancel := context.WithTimeout(r.Context(), time.Duration(secs)*time.Second)
+		defer cancel()
+		r = r.WithContext(ctx)
+	}
+
 	rw := &responseRecorder{ResponseWriter: w}
 	path := r.URL.EscapedPath()
 
@@ -78,6 +89,23 @@ func (s *Server) serveHTTP(w http.ResponseWriter, r *http.Request) {
 	h.Set("Cache-Control", "no-store")
 	h.Set("Vary", "Authorization")
 	applySecurityHeaders(h)
+
+	// CORS (management.cors.allowed_origins, SEC-094). The origin is reflected
+	// only when it is explicitly allow-listed; credentials are permitted
+	// because the browser path is cookie-authenticated. A preflight is answered
+	// before routing/authentication so it carries no credential.
+	if origin := r.Header.Get("Origin"); origin != "" && s.corsAllows(origin) {
+		h.Set("Access-Control-Allow-Origin", origin)
+		h.Set("Access-Control-Allow-Credentials", "true")
+		addVary(h, "Origin")
+		if r.Method == http.MethodOptions {
+			h.Set("Access-Control-Allow-Methods", "GET, HEAD, POST, PUT, DELETE, OPTIONS")
+			h.Set("Access-Control-Allow-Headers", "Authorization, Content-Type, X-CSRF-Token, X-Request-Id, If-None-Match, If-Match")
+			h.Set("Access-Control-Max-Age", "600")
+			rw.WriteHeader(http.StatusNoContent)
+			return
+		}
+	}
 
 	if s.shuttingDwn.Load() {
 		s.writeAPIError(rw, r, apiErr(http.StatusServiceUnavailable, errUnavailable,
@@ -151,6 +179,13 @@ func (s *Server) serveHTTP(w http.ResponseWriter, r *http.Request) {
 			s.writeAPIError(rw, r, ae)
 			return
 		}
+		// AUTH-011: the principal must hold at least one vhost permission for
+		// the vhost the request targets. Built-in principals (p.User == nil)
+		// hold a synthesized full permission and pass automatically.
+		if ae := s.resourceReadGate(p, requestVhost(r)); ae != nil {
+			s.writeAPIError(rw, r, ae)
+			return
+		}
 		if ae := s.csrfGate(r, p); ae != nil {
 			s.writeAPIError(rw, r, ae)
 			return
@@ -158,6 +193,11 @@ func (s *Server) serveHTTP(w http.ResponseWriter, r *http.Request) {
 
 		r = r.WithContext(withPrincipal(r.Context(), p))
 		r = r.WithContext(withClient(r.Context(), ci))
+		// A cookie-authenticated response varies on the Cookie header, exactly
+		// as a Basic-authenticated one varies on Authorization (SEC-020).
+		if p.ViaCookie {
+			addVary(h, "Cookie")
+		}
 	} else {
 		r = r.WithContext(withClient(r.Context(), s.resolveClient(r)))
 	}
@@ -201,7 +241,7 @@ func (s *Server) csrfGate(r *http.Request, p *Principal) *apiError {
 		return errUnauth("session expired")
 	}
 	tok := r.Header.Get("X-CSRF-Token")
-	if tok == "" || tok != sess.csrf {
+	if tok == "" || subtle.ConstantTimeCompare([]byte(tok), []byte(sess.csrf)) != 1 {
 		return errRefused("CSRF token missing or invalid")
 	}
 	if !s.originMatches(r) {
@@ -244,6 +284,37 @@ func applySecurityHeaders(h http.Header) {
 	h.Set("X-Content-Type-Options", "nosniff")
 	h.Set("Referrer-Policy", "no-referrer")
 	h.Set("X-Frame-Options", "DENY")
+}
+
+// addVary appends a value to the Vary header, case-insensitively, without
+// duplicating an existing entry.
+func addVary(h http.Header, value string) {
+	existing := h.Get("Vary")
+	for _, part := range strings.Split(existing, ",") {
+		if strings.EqualFold(strings.TrimSpace(part), value) {
+			return
+		}
+	}
+	if strings.TrimSpace(existing) == "" {
+		h.Set("Vary", value)
+		return
+	}
+	h.Set("Vary", existing+", "+value)
+}
+
+// corsAllows reports whether origin is explicitly allow-listed
+// (management.cors.allowed_origins). An empty list means CORS is off.
+func (s *Server) corsAllows(origin string) bool {
+	origin = strings.TrimSpace(origin)
+	if origin == "" {
+		return false
+	}
+	for _, o := range s.mcfg.CORS.AllowedOrigins {
+		if strings.TrimSpace(o) == origin {
+			return true
+		}
+	}
+	return false
 }
 
 // serveUI serves the injected UI handler, or a minimal placeholder when none
@@ -337,8 +408,10 @@ func (s *Server) writeAPIError(w http.ResponseWriter, r *http.Request, e *apiErr
 	}
 	status := e.status
 	reason := e.reason
-	if status >= 500 {
-		// 500 carries only the request id and a generic reason (SEC-072).
+	if status == http.StatusInternalServerError {
+		// Only a genuine 500 is scrubbed to a generic reason (SEC-072). A 501
+		// keeps the subsystem text and a 503 keeps the backpressure text: both
+		// are actionable and reveal nothing the handler did not already state.
 		reason = "internal error"
 	}
 	env := errorEnvelope{Error: e.token, Reason: reason, RequestID: requestID(r)}
@@ -417,6 +490,43 @@ func (c *counterWindow) allow(key string) bool {
 	}
 	c.counts[key]++
 	return true
+}
+
+// peek reports the remaining allowance and the seconds until the current
+// fixed window resets, WITHOUT consuming anything. It is used to emit the
+// X-RateLimit-* advisory headers after allow() has run.
+func (c *counterWindow) peek(key string) (remaining, resetSeconds int) {
+	if c == nil || c.limit <= 0 {
+		return 0, 0
+	}
+	now := c.now()
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.start.IsZero() || now.Sub(c.start) >= c.window {
+		return c.limit, int(c.window.Seconds())
+	}
+	remaining = c.limit - c.counts[key]
+	if remaining < 0 {
+		remaining = 0
+	}
+	resetSeconds = int((c.window - now.Sub(c.start)).Seconds())
+	if resetSeconds < 0 {
+		resetSeconds = 0
+	}
+	return remaining, resetSeconds
+}
+
+// setRateLimitHeaders emits the advisory X-RateLimit-* headers for a limited
+// endpoint (limit<=0 is unlimited and emits nothing).
+func setRateLimitHeaders(w http.ResponseWriter, lim *counterWindow, key string) {
+	if lim == nil || lim.limit <= 0 {
+		return
+	}
+	remaining, resetSeconds := lim.peek(key)
+	h := w.Header()
+	h.Set("X-RateLimit-Limit", strconv.Itoa(lim.limit))
+	h.Set("X-RateLimit-Remaining", strconv.Itoa(remaining))
+	h.Set("X-RateLimit-Reset", strconv.Itoa(resetSeconds))
 }
 
 // parseProxyEntry accepts a CIDR prefix or a bare IP (treated as /32 or /128).

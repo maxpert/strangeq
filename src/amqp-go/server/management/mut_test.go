@@ -301,15 +301,55 @@ func TestPublish_Oversize413(t *testing.T) {
 
 // --- connection close ---
 
-// TestClose_ForceClose204AndAMQPSeesEOF (FC §7.6, spec §11 test 69).
+// TestClose_ForceClose204AndAMQPSeesEOF (FC §7.6, spec §11 test 69). With
+// broker authentication disabled, force-close is gated on the explicit
+// management.allow_connection_close opt-in (SEC-066); the AMQP peer must then
+// observe EOF.
 func TestClose_ForceClose204AndAMQPSeesEOF(t *testing.T) {
-	e := basicEnv(t, true, nil)
-	e.injectConnection(t, "conn-1", "someone")
+	e := basicEnv(t, true, func(cfg *config.AMQPConfig) {
+		cfg.Management.AllowConnectionClose = true
+	})
+	peer := e.injectConnection(t, "conn-1", "someone")
 
 	rec := e.do(http.MethodDelete, "/api/connections/conn-1", nil, basicAuthHeader())
 	wantStatus(t, rec, http.StatusNoContent)
 	if absent := e.do(http.MethodDelete, "/api/connections/missing", nil, basicAuthHeader()); absent.Code != http.StatusNotFound {
 		t.Fatalf("closing an absent connection must be 404, got %d", absent.Code)
+	}
+
+	// The AMQP peer must observe the socket closing: a bounded read deadline
+	// turns a silent hang into a deterministic failure.
+	mustSeeEOF(t, peer)
+}
+
+// TestCloseByUser_ForceClose204AndAMQPSeesEOF is the /username/{user} variant:
+// every connection for the user is force-closed and the peer sees EOF.
+func TestCloseByUser_ForceClose204AndAMQPSeesEOF(t *testing.T) {
+	e := basicEnv(t, true, func(cfg *config.AMQPConfig) {
+		cfg.Management.AllowConnectionClose = true
+	})
+	peer := e.injectConnection(t, "conn-u", "alice")
+
+	rec := e.do(http.MethodDelete, "/api/connections/username/alice", nil, basicAuthHeader())
+	wantStatus(t, rec, http.StatusNoContent)
+
+	mustSeeEOF(t, peer)
+}
+
+// mustSeeEOF requires peer.Read to fail within a bounded deadline: a closed
+// socket yields EOF (or a reset), never a successful read.
+func mustSeeEOF(t *testing.T, peer net.Conn) {
+	t.Helper()
+	if err := peer.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
+		t.Fatalf("set read deadline: %v", err)
+	}
+	buf := make([]byte, 1)
+	n, err := peer.Read(buf)
+	if err == nil {
+		t.Fatalf("the AMQP peer must observe EOF/reset after a force-close, read %d bytes", n)
+	}
+	if ne, ok := err.(net.Error); ok && ne.Timeout() {
+		t.Fatalf("the AMQP peer did not observe EOF within the deadline")
 	}
 }
 

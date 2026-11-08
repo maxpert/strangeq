@@ -437,20 +437,26 @@ func (s *Server) exchangeList() []exchangeInfo {
 	exs := b.GetExchanges()
 	out := make([]exchangeInfo, 0, len(exs))
 	for _, ex := range exs {
-		ei := exchangeInfo{
-			Name:       ex.Name,
-			VHost:      "/",
-			Type:       exchangeTypeName(ex.Kind),
-			Durable:    ex.Durable,
-			AutoDelete: ex.AutoDelete,
-			Internal:   ex.Internal,
-		}
-		if ex.Arguments != nil {
-			ei.Arguments = fieldTableJSON(ex.Arguments)
-		}
-		out = append(out, ei)
+		out = append(out, exchangeInfoOf(ex))
 	}
 	return out
+}
+
+// exchangeInfoOf renders one exchange exactly as the GET endpoint does, so an
+// If-Match validator computed from it matches the ETag a client fetched.
+func exchangeInfoOf(ex *protocol.Exchange) exchangeInfo {
+	ei := exchangeInfo{
+		Name:       ex.Name,
+		VHost:      "/",
+		Type:       exchangeTypeName(ex.Kind),
+		Durable:    ex.Durable,
+		AutoDelete: ex.AutoDelete,
+		Internal:   ex.Internal,
+	}
+	if ex.Arguments != nil {
+		ei.Arguments = fieldTableJSON(ex.Arguments)
+	}
+	return ei
 }
 
 func (s *Server) hExchanges(w http.ResponseWriter, r *http.Request) {
@@ -602,6 +608,18 @@ func (s *Server) queueFulls(summaries []queueSummaryInfo) []queueFullInfo {
 		})
 	}
 	return out
+}
+
+// queueRepresentation renders one queue exactly as the GET endpoint does so an
+// If-Match validator matches the ETag a client fetched. ok is false when the
+// queue does not exist.
+func (s *Server) queueRepresentation(name string) (queueFullInfo, bool) {
+	for _, qs := range s.queueSummaries() {
+		if qs.Name == name {
+			return s.queueFulls([]queueSummaryInfo{qs})[0], true
+		}
+	}
+	return queueFullInfo{}, false
 }
 
 type queueListQuery struct {

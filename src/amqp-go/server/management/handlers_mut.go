@@ -4,6 +4,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -42,9 +43,11 @@ func (s *Server) hExchangeDeclare(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if !s.declareLimit.allow(p.Name) {
+		setRateLimitHeaders(w, s.declareLimit, p.Name)
 		s.writeAPIError(w, r, apiErr(http.StatusTooManyRequests, errRateLimited, "declare rate limit exceeded", withHeader("Retry-After", "1")))
 		return
 	}
+	setRateLimitHeaders(w, s.declareLimit, p.Name)
 
 	body, aerr := s.readBodyLimited(r, s.mcfg.Limits.MaxBodyBytes)
 	if aerr != nil {
@@ -70,6 +73,17 @@ func (s *Server) hExchangeDeclare(w http.ResponseWriter, r *http.Request) {
 
 	existing := b.GetExchanges()[name]
 	newEntity := existing == nil
+	if existing != nil {
+		if aerr := s.ifMatchGate(r, true, exchangeInfoOf(existing)); aerr != nil {
+			s.auditMutation(r, "exchange", name, "declare", aerr.status)
+			s.writeAPIError(w, r, aerr)
+			return
+		}
+	} else if aerr := s.ifMatchGate(r, false, nil); aerr != nil {
+		s.auditMutation(r, "exchange", name, "declare", aerr.status)
+		s.writeAPIError(w, r, aerr)
+		return
+	}
 	if existing != nil {
 		// Equivalent re-declare ⇒ 204; any conflicting immutable property ⇒
 		// 400 inequivalent naming the field (FR-API-054).
@@ -137,6 +151,11 @@ func (s *Server) hExchangeDelete(w http.ResponseWriter, r *http.Request) {
 		s.writeAPIError(w, r, errNotFoundMsg("unknown exchange"))
 		return
 	}
+	if aerr := s.ifMatchGate(r, true, exchangeInfoOf(b.GetExchanges()[name])); aerr != nil {
+		s.auditMutation(r, "exchange", name, "delete", aerr.status)
+		s.writeAPIError(w, r, aerr)
+		return
+	}
 	ifUnused := false
 	if raw, ok := firstPresent(r.URL.Query(), "if-unused"); ok {
 		v, err := strconv.ParseBool(raw)
@@ -191,9 +210,11 @@ func (s *Server) hPublish(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if !s.publishLimit.allow(p.Name) {
+		setRateLimitHeaders(w, s.publishLimit, p.Name)
 		s.writeAPIError(w, r, apiErr(http.StatusTooManyRequests, errRateLimited, "publish rate limit exceeded", withHeader("Retry-After", "1")))
 		return
 	}
+	setRateLimitHeaders(w, s.publishLimit, p.Name)
 
 	body, aerr := s.readBodyLimited(r, s.mcfg.Limits.MaxBodyBytes)
 	if aerr != nil {
@@ -366,9 +387,11 @@ func (s *Server) hQueueDeclare(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if !s.declareLimit.allow(p.Name) {
+		setRateLimitHeaders(w, s.declareLimit, p.Name)
 		s.writeAPIError(w, r, apiErr(http.StatusTooManyRequests, errRateLimited, "declare rate limit exceeded", withHeader("Retry-After", "1")))
 		return
 	}
+	setRateLimitHeaders(w, s.declareLimit, p.Name)
 	body, aerr := s.readBodyLimited(r, s.mcfg.Limits.MaxBodyBytes)
 	if aerr != nil {
 		s.writeAPIError(w, r, aerr)
@@ -392,6 +415,19 @@ func (s *Server) hQueueDeclare(w http.ResponseWriter, r *http.Request) {
 	}
 	existing := b.GetQueues()[name]
 	newEntity := existing == nil
+	if existing != nil {
+		if repr, ok := s.queueRepresentation(name); ok {
+			if aerr := s.ifMatchGate(r, true, repr); aerr != nil {
+				s.auditMutation(r, "queue", name, "declare", aerr.status)
+				s.writeAPIError(w, r, aerr)
+				return
+			}
+		}
+	} else if aerr := s.ifMatchGate(r, false, nil); aerr != nil {
+		s.auditMutation(r, "queue", name, "declare", aerr.status)
+		s.writeAPIError(w, r, aerr)
+		return
+	}
 	if existing != nil {
 		if conflict := queueConflict(existing, req); conflict != "" {
 			s.auditMutation(r, "queue", name, "declare", http.StatusBadRequest)
@@ -518,6 +554,13 @@ func (s *Server) hQueueDelete(w http.ResponseWriter, r *http.Request) {
 		s.writeAPIError(w, r, errNotFoundMsg("unknown queue"))
 		return
 	}
+	if repr, ok := s.queueRepresentation(name); ok {
+		if aerr := s.ifMatchGate(r, true, repr); aerr != nil {
+			s.auditMutation(r, "queue", name, "delete", aerr.status)
+			s.writeAPIError(w, r, aerr)
+			return
+		}
+	}
 	if aerr := s.auditDestructive(r, "queue", name, "delete", 0); aerr != nil {
 		s.writeAPIError(w, r, aerr)
 		return
@@ -552,9 +595,11 @@ func (s *Server) hQueuePurge(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if !s.purgeLimit.allow(p.Name) {
+		setRateLimitHeaders(w, s.purgeLimit, p.Name)
 		s.writeAPIError(w, r, apiErr(http.StatusTooManyRequests, errRateLimited, "purge rate limit exceeded", withHeader("Retry-After", "1")))
 		return
 	}
+	setRateLimitHeaders(w, s.purgeLimit, p.Name)
 	b := s.broker()
 	if b == nil {
 		s.writeAPIError(w, r, errUnavailableMsg("broker unavailable"))
@@ -650,9 +695,11 @@ func (s *Server) hQueueGet(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if !s.getLimit.allow(p.Name) {
+		setRateLimitHeaders(w, s.getLimit, p.Name)
 		s.writeAPIError(w, r, apiErr(http.StatusTooManyRequests, errRateLimited, "get rate limit exceeded", withHeader("Retry-After", "1")))
 		return
 	}
+	setRateLimitHeaders(w, s.getLimit, p.Name)
 	body, aerr := s.readBodyLimited(r, s.mcfg.Limits.MaxBodyBytes)
 	if aerr != nil {
 		s.writeAPIError(w, r, aerr)
@@ -874,20 +921,29 @@ func (s *Server) hCloseConnectionsByUser(w http.ResponseWriter, r *http.Request)
 	w.WriteHeader(http.StatusNoContent)
 }
 
-// canClose enforces AUTH-015.
+// canClose enforces AUTH-015. With broker authentication disabled there is no
+// per-connection owner to compare against, so BOTH explicit opt-ins are
+// required and they are checked BEFORE any name comparison: the
+// unauthenticated principal is itself named "guest", so comparing p.Name with
+// an owner would otherwise authorise a close whenever the connection's
+// Username happened to be "guest" (SEC-066).
 func (s *Server) canClose(p *Principal, ownerUser string) *apiError {
 	if p == nil {
 		return errUnauth("authentication required")
 	}
-	if p.Name == ownerUser {
+	if !s.brokerAuthEnabled() {
+		if p.Unauthenticated && !s.mcfg.AllowUnauthenticatedMutations {
+			return errRefused("unauthenticated management mutations are disabled")
+		}
+		if !s.mcfg.AllowConnectionClose {
+			return errRefused("closing connections is disabled (management.allow_connection_close)")
+		}
+		return nil
+	}
+	if p.Authenticated && p.Name == ownerUser {
 		return nil
 	}
 	if p.Has(capCloseOthers) {
-		return nil
-	}
-	// With broker auth disabled there is no per-connection owner to compare
-	// against, so the operator must opt in explicitly (SEC-066).
-	if !s.brokerAuthEnabled() && s.mcfg.AllowConnectionClose {
 		return nil
 	}
 	return errRefused("not permitted to close another user's connection")
@@ -963,7 +1019,6 @@ func (s *Server) hDefinitionsExport(w http.ResponseWriter, r *http.Request) {
 			Excludes:   append(excludes, "users", "permissions"),
 		}
 	}
-	s.auditMutation(r, "definitions", "", "export", http.StatusOK)
 	s.writeJSON(w, r, http.StatusOK, resp)
 }
 
@@ -991,10 +1046,39 @@ func (s *Server) hDefinitionsImport(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	limit := s.mcfg.Limits.MaxImportBodyBytes
-	body, aerr := s.readBodyLimited(r, limit)
-	if aerr != nil {
-		s.writeAPIError(w, r, aerr)
-		return
+	var body []byte
+	if isMultipart(r) {
+		// multipart/form-data import (RabbitMQ-compatible): the definitions
+		// document is the "file" part. The pre-routing body cap has already
+		// bounded the request; the part itself is bounded here too.
+		if err := r.ParseMultipartForm(int64(limit)); err != nil {
+			s.writeAPIError(w, r, errBad("invalid multipart form: "+err.Error()))
+			return
+		}
+		part, _, ferr := r.FormFile("file")
+		if ferr != nil {
+			s.writeAPIError(w, r, errBad("multipart import requires a \"file\" part"))
+			return
+		}
+		defer func() { _ = part.Close() }()
+		data, rerr := io.ReadAll(io.LimitReader(part, int64(limit)+1))
+		if rerr != nil {
+			s.writeAPIError(w, r, errBad("could not read the multipart file part: "+rerr.Error()))
+			return
+		}
+		if len(data) > limit {
+			s.writeAPIError(w, r, apiErr(http.StatusRequestEntityTooLarge, errPayloadTooLarge,
+				"definitions import exceeds "+strconv.Itoa(limit)+" bytes"))
+			return
+		}
+		body = data
+	} else {
+		var aerr *apiError
+		body, aerr = s.readBodyLimited(r, limit)
+		if aerr != nil {
+			s.writeAPIError(w, r, aerr)
+			return
+		}
 	}
 	var req definitionsImportRequest
 	if err := json.Unmarshal(body, &req); err != nil {
@@ -1037,6 +1121,13 @@ func (s *Server) hDefinitionsImport(w http.ResponseWriter, r *http.Request) {
 			res.Failed = append(res.Failed, "exchange:"+name)
 			continue
 		}
+		// Per-target configure authorization (AUTH-012): the import must not
+		// bypass the resource gate a direct PUT /api/exchanges/{vhost}/{name}
+		// would apply. A denied target is reported, never declared.
+		if !s.definitionsConfigureAllowed(p, interfaces.ResourceExchange, name) {
+			res.Failed = append(res.Failed, "exchange:"+name)
+			continue
+		}
 		if existing := b.GetExchanges()[name]; existing != nil {
 			res.Skipped = append(res.Skipped, "exchange:"+name)
 			continue
@@ -1057,6 +1148,12 @@ func (s *Server) hDefinitionsImport(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		if s.mcfg.Definitions.MaxQueues > 0 && declaredQueues >= s.mcfg.Definitions.MaxQueues {
+			res.Failed = append(res.Failed, "queue:"+name)
+			continue
+		}
+		// Per-target configure authorization (AUTH-012), exactly as a direct
+		// PUT /api/queues/{vhost}/{name} would apply.
+		if !s.definitionsConfigureAllowed(p, interfaces.ResourceQueue, name) {
 			res.Failed = append(res.Failed, "queue:"+name)
 			continue
 		}
@@ -1102,6 +1199,50 @@ func (s *Server) hDefinitionsImport(w http.ResponseWriter, r *http.Request) {
 }
 
 // --- helpers ---
+
+// ifMatchGate implements the If-Match precondition (RFC 9110 §13.1.1) for a
+// single resource. current is the resource's canonical representation (the
+// same one the GET endpoint renders) and ok reports whether it exists. A
+// missing resource, or a present one whose ETag matches none of the supplied
+// validators, is 412 precondition_failed. An absent If-Match header is a no-op.
+// `If-Match: *` requires existence.
+func (s *Server) ifMatchGate(r *http.Request, ok bool, current any) *apiError {
+	raw := strings.TrimSpace(r.Header.Get("If-Match"))
+	if raw == "" {
+		return nil
+	}
+	if !ok {
+		return newAPIError(http.StatusPreconditionFailed, errPrecondition,
+			"the resource does not exist")
+	}
+	body, err := marshalCompact(current)
+	if err != nil {
+		return newAPIError(http.StatusInternalServerError, errInternal, "internal error")
+	}
+	if !etagMatches(raw, etagFor(body)) {
+		return newAPIError(http.StatusPreconditionFailed, errPrecondition,
+			"the resource has changed since it was read")
+	}
+	return nil
+}
+
+// definitionsConfigureAllowed reports whether the importing principal may
+// configure the named resource in the default vhost. Built-in principals
+// (p.User == nil) and a nil authenticator are exempt: requireCapability(capMutate)
+// already gated the request. An inherit-mode user with a per-vhost configure
+// pattern that refuses the name is denied (AUTH-012).
+func (s *Server) definitionsConfigureAllowed(p *Principal, rtype interfaces.ResourceType, name string) bool {
+	if p == nil || p.User == nil || s.opts.Authenticator == nil {
+		return true
+	}
+	op := interfaces.Operation{
+		Action:       interfaces.ActionConfigure,
+		ResourceType: rtype,
+		Resource:     name,
+		VHost:        "/",
+	}
+	return s.opts.Authenticator.Authorize(p.User, op) == nil
+}
 
 func boolParam(q url.Values, key string) (bool, *apiError) {
 	raw, ok := firstPresent(q, key)

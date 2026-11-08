@@ -96,8 +96,14 @@ func (s *Server) authMode() string {
 func (s *Server) authenticate(r *http.Request) (*Principal, clientInfo, *apiError) {
 	ci := s.resolveClient(r)
 
-	// Session cookie first: it is the browser path and needs no password.
+	// Session cookie first: it is the browser path and needs no password. The
+	// per-principal client restrictions (loopback_only + host ACLs) apply to a
+	// replayed cookie exactly as they do to a fresh Basic login (SEC-112/T-06):
+	// the cookie authenticates the identity, not a network location.
 	if p, ok := s.principalFromCookie(r, ci); ok {
+		if ae := s.checkPrincipalClient(p, ci); ae != nil {
+			return nil, ci, ae
+		}
 		return p, ci, nil
 	}
 
@@ -105,6 +111,9 @@ func (s *Server) authenticate(r *http.Request) (*Principal, clientInfo, *apiErro
 		p, err := s.login(r, user, pass, ci)
 		if err != nil {
 			return nil, ci, err
+		}
+		if ae := s.checkPrincipalClient(p, ci); ae != nil {
+			return nil, ci, ae
 		}
 		return p, ci, nil
 	}
@@ -213,19 +222,38 @@ func (s *Server) loginInherit(username, password string, ci clientInfo) (*Princi
 	if err != nil || user == nil {
 		return nil, errUnauth("invalid credentials")
 	}
-	if user.LoopbackOnly && !ci.Loopback {
-		return nil, errRefused("user is restricted to loopback connections")
-	}
-	if err := s.checkHostACL(ci); err != nil {
-		return nil, err
-	}
-	return &Principal{
+	p := &Principal{
 		Name:          user.Username,
 		Tags:          append([]string(nil), user.Tags...),
 		Caps:          capabilitiesFor(user.Tags, user.Username, s.adminUsers),
 		User:          user,
 		Authenticated: true,
-	}, nil
+	}
+	if ae := s.checkPrincipalClient(p, ci); ae != nil {
+		return nil, ae
+	}
+	return p, nil
+}
+
+// checkPrincipalClient applies the client restrictions attached to a
+// principal's broker user: loopback_only (AUTH-013) and the security.allowedhosts
+// / blockedhosts ACL (AUTH-009). It is shared by every authentication path —
+// Basic, the session cookie (SEC-112/T-06), and the session-create endpoint —
+// so a cookie minted on loopback cannot be replayed from a non-loopback client.
+// A built-in principal (p.User == nil) only enforces the host ACL.
+func (s *Server) checkPrincipalClient(p *Principal, ci clientInfo) *apiError {
+	if p == nil {
+		return nil
+	}
+	if p.User != nil {
+		p.User.RLock()
+		loopbackOnly := p.User.LoopbackOnly
+		p.User.RUnlock()
+		if loopbackOnly && !ci.Loopback {
+			return errRefused("user is restricted to loopback connections")
+		}
+	}
+	return s.checkHostACL(ci)
 }
 
 // checkHostACL applies security.allowedhosts / blockedhosts to the effective
@@ -298,6 +326,18 @@ func (s *Server) resourceReadGate(p *Principal, vhost string) *apiError {
 		}
 	}
 	return errRefused("access to vhost " + vhost + " refused for user " + p.Name)
+}
+
+// requestVhost resolves the vhost a request targets: the decoded {vhost} path
+// value when the matched route captures one, else the single default vhost
+// "/". It is read before dispatch (endpointLabel carries the matched template)
+// so every /api/* request can be checked against the principal's vhost
+// permissions (AUTH-011).
+func requestVhost(r *http.Request) string {
+	if v := pathValue(endpointLabel(r), r.URL.EscapedPath(), "vhost"); v != "" {
+		return v
+	}
+	return "/"
 }
 
 // mutationGates enforces the two gates for a state-changing request: the
