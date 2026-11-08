@@ -10,6 +10,9 @@
 (function () {
   var CONFIG = window.__SQ_CONFIG__ || {};
   var API = CONFIG.apiBase || '/api';
+  /* metricsUrl may point at a different listener than the SPA origin, so it is
+   * emitted only when configured (round-2 #9). */
+  var METRICS_URL = CONFIG.metricsUrl || '';
   var DEFAULT_REFRESH_MS = CONFIG.refreshInterval || 5000;
   var S1_REFRESH_MS = CONFIG.s1RefreshInterval || 2000;
   var MAX_BACKOFF_MS = 30000;
@@ -26,6 +29,7 @@
     authed: false,
     version: null,
     capabilities: {},
+    capabilitiesLoaded: false,
     route: null,
     currentLoad: null,
     etags: {},
@@ -390,12 +394,14 @@
       var th = h("th", { role: "columnheader", scope: "col", text: c.label, dataset: { col: c.key }, title: c.title || null });
       var sortable = opts.route && (!sortKeys || sortKeys.indexOf(c.key) >= 0);
       if (sortable) {
-        var cur = opts.route.query.get("sort");
+        var effectiveSort = opts.route.query.get("sort") || opts.defaultSort || null;
         th.classList.add("sortable");
         th.dataset.sort = c.key;
         th.tabIndex = 0;
-        if (cur === c.key) {
-          th.setAttribute("aria-sort", opts.route.query.get("sort_reverse") === "true" ? "descending" : "ascending");
+        if (effectiveSort === c.key) {
+          var curReverse = opts.route.query.get("sort_reverse");
+          var descending = curReverse === null ? opts.defaultSortReverse === true : curReverse === "true";
+          th.setAttribute("aria-sort", descending ? "descending" : "ascending");
         }
         th.addEventListener("click", function () { onSort(opts.route, c.key); });
         th.addEventListener("keydown", function (ev) { if (ev.key === "Enter") onSort(opts.route, c.key); });
@@ -490,10 +496,12 @@
     });
     if (opts.sortKeys && opts.sortKeys.length) {
       var sortSel = h("select", { id: "sort-select", "aria-label": "Sort by", dataset: { role: "sort" } });
+      if (!opts.defaultSort) sortSel.appendChild(option("", "sort: default"));
       opts.sortKeys.forEach(function (k) { sortSel.appendChild(option(k, "sort: " + k)); });
-      sortSel.value = route.query.get("sort") || opts.sortKeys[0];
+      sortSel.value = route.query.get("sort") || opts.defaultSort || "";
       var rev = h("input", { type: "checkbox", id: "sort-reverse" });
-      rev.checked = route.query.get("sort_reverse") === "true";
+      var curReverse = route.query.get("sort_reverse");
+      rev.checked = curReverse === null ? opts.defaultSortReverse === true : curReverse === "true";
       controls.push(sortSel, h("label", { for: "sort-reverse", text: "descending" }), rev);
     }
     var form = h("form", { class: "toolbar" }, controls.concat([
@@ -508,23 +516,31 @@
         else overrides[el.dataset.filter] = el.value;
       });
       if (opts.sortKeys && opts.sortKeys.length) {
-        overrides.sort = form.querySelector('[data-role="sort"]').value;
-        overrides.sort_reverse = form.querySelector("#sort-reverse").checked ? "true" : "false";
+        var chosen = form.querySelector('[data-role="sort"]').value;
+        overrides.sort = chosen;
+        overrides.sort_reverse = chosen ? (form.querySelector("#sort-reverse").checked ? "true" : "false") : "";
       }
       navigate(listHref(route, overrides));
     });
     return form;
   }
 
-  /* pagination renders the shared page controls. It reads page/page_size/
-   * total_count/filtered_count from the list envelope. A missing total_count
-   * renders an em-dash and "unknown", never a fabricated 0 (FR-UI-005). */
+  /* pagination renders the shared page controls for a list ENVELOPE. A bare
+   * array is not paged: it renders a read-only count with no page controls and
+   * never invents a page number (round-2 #2). An envelope whose total_count is
+   * missing renders an em-dash and "unknown", never a fabricated 0. */
   function pagination(data, route) {
-    var env = data && !Array.isArray(data) ? data : {};
     var items = itemsOf(data);
-    var page = toInt(env.page, toInt(route.query.get("page"), 1));
+    var env = data && typeof data === "object" && !Array.isArray(data) ? data : null;
+    var paged = !!env && (env.page != null || env.total_count != null || env.page_count != null);
+    if (!paged) {
+      return h("div", { class: "pagination", dataset: { paged: "false" } }, [
+        h("span", { class: "pagination-total", dataset: { totalKnown: "false" }, text: items.length + " rows" })
+      ]);
+    }
+    var page = toInt(env.page, 1);
     if (page < 1) page = 1;
-    var pageSize = toInt(env.page_size, toInt(route.query.get("page_size"), 50));
+    var pageSize = toInt(env.page_size, 50);
     var totalKnown = !isNull(env.total_count) && env.total_count !== "";
     var total = totalKnown ? Number(env.total_count) : null;
     var filteredKnown = !isNull(env.filtered_count) && env.filtered_count !== "";
@@ -871,8 +887,8 @@
       h("div", { class: "page-head" }, [
         h("h1", { text: "Overview" }),
         h("span", { class: "spacer" }),
-        h("a", { href: "/metrics", target: "_blank", rel: "noopener", title: "Open the Prometheus metrics endpoint" },
-          [h("button", { type: "button", text: "Metrics" })])
+        METRICS_URL ? h("a", { id: "metrics-link", href: METRICS_URL, target: "_blank", rel: "noopener", title: "Open the metrics endpoint" },
+          [h("button", { type: "button", text: "Metrics" })]) : null
       ]),
       cards,
       summary,
@@ -880,6 +896,10 @@
       topRows.length ? table : emptyState("No queues match the top-10 ready-depth view.")
     ]);
   }
+
+  var QUEUE_SORT_KEYS = ["name", "type", "durable", "messages_ready", "messages_unacknowledged", "messages", "consumers", "state"];
+  var QUEUE_DEFAULT_SORT = "messages_ready";
+  var QUEUE_DEFAULT_SORT_REVERSE = true;
 
   function loadQueues(container, route) {
     var q = route.query;
@@ -890,8 +910,8 @@
       durable: q.get("durable"),
       has_consumers: q.get("has_consumers"),
       non_empty: q.get("non_empty"),
-      sort: q.get("sort") || "messages_ready",
-      sort_reverse: q.get("sort_reverse") || "true"
+      sort: q.get("sort") || QUEUE_DEFAULT_SORT,
+      sort_reverse: q.get("sort_reverse") || (QUEUE_DEFAULT_SORT_REVERSE ? "true" : "false")
     };
     var path = API + "/queues" + qs(params);
     var key = "queues:" + path;
@@ -924,6 +944,8 @@
       items.length ? tableBlock(columns, items, {
         route: route,
         sortKeys: QUEUE_SORT_KEYS,
+        defaultSort: QUEUE_DEFAULT_SORT,
+        defaultSortReverse: QUEUE_DEFAULT_SORT_REVERSE,
         rowKey: function (r) { return r.name; },
         onRowClick: function (r) { navigate("/queues/" + encodeURIComponent(r.name)); }
       }) : emptyState("No queues exist yet.", "Declare queue", function () { openDeclareQueue(route); }),
@@ -931,13 +953,13 @@
     ]);
   }
 
-  var QUEUE_SORT_KEYS = ["name", "type", "durable", "messages_ready", "messages_unacknowledged", "messages", "consumers", "state"];
-
   function queuesToolbar(route) {
     var declareBtn = h("button", { type: "button", id: "declare-queue-btn", text: "Declare queue" });
     declareBtn.addEventListener("click", function () { openDeclareQueue(route); });
     return tableToolbar(route, {
       sortKeys: QUEUE_SORT_KEYS,
+      defaultSort: QUEUE_DEFAULT_SORT,
+      defaultSortReverse: QUEUE_DEFAULT_SORT_REVERSE,
       filters: [
         { name: "name", type: "search", label: "Filter queues by name", placeholder: "name filter" },
         { name: "durable", type: "select", label: "Filter by durable", options: [["", "durable: any"], ["true", "durable: true"], ["false", "durable: false"]] },
@@ -1041,7 +1063,7 @@
 
   function loadExchanges(container, route) {
     var q = route.query;
-    var params = { page: q.get("page") || 1, page_size: q.get("page_size") || 50, name: q.get("name"), type: q.get("type") };
+    var params = { page: q.get("page") || 1, page_size: q.get("page_size") || 50, name: q.get("name"), type: q.get("type"), sort: q.get("sort"), sort_reverse: q.get("sort_reverse") };
     var path = API + "/exchanges" + qs(params);
     return loadList(container, "exchanges:" + path, path, {
       render: function (r) { return buildExchanges(r.data, route); }
@@ -1122,7 +1144,7 @@
 
   function loadConnections(container, route) {
     var q = route.query;
-    var params = { page: q.get("page") || 1, page_size: q.get("page_size") || 50, name: q.get("name"), user: q.get("user") };
+    var params = { page: q.get("page") || 1, page_size: q.get("page_size") || 50, name: q.get("name"), user: q.get("user"), sort: q.get("sort"), sort_reverse: q.get("sort_reverse") };
     var path = API + "/connections" + qs(params);
     /* The per-row Close column is capability-gated, so ensure the capability
      * map is present before the first paint. */
@@ -1133,7 +1155,9 @@
     });
   }
 
-  var CONNECTION_SORT_KEYS = ["name", "user", "vhost", "state", "channels", "peer", "connected_at", "last_activity"];
+  /* The connections endpoint's sort allowlist is name/user/vhost/state/channels/
+   * connected_at/last_activity (peer is only sortable as peer_host). */
+  var CONNECTION_SORT_KEYS = ["name", "user", "vhost", "state", "channels", "connected_at", "last_activity"];
 
   function buildConnections(data, route) {
     var items = itemsOf(data);
@@ -1152,6 +1176,7 @@
       h("div", { class: "page-head" }, [h("h1", { text: "Connections" })]),
       h("p", { class: "null", text: "Entity data is global even if connection vhosts differ (D-1)." }),
       tableToolbar(route, {
+        sortKeys: CONNECTION_SORT_KEYS,
         filters: [
           { name: "name", type: "search", label: "Filter connections by name", placeholder: "name filter" },
           { name: "user", type: "search", label: "Filter connections by user", placeholder: "user filter" }
@@ -1167,17 +1192,26 @@
     ]);
   }
 
-  function closeConnectionSupported() {
-    return !(state.capabilities && state.capabilities.close_connection === false);
+  function closeConnectionState() {
+    var c = state.capabilities ? state.capabilities.close_connection : undefined;
+    if (c === true) return "on";
+    if (c === false) return "off";
+    return "unknown";
+  }
+
+  function closeConnectionDisabledReason(st) {
+    if (st === "off") return "Force-close is not implemented by this broker (close_connection capability is false)";
+    return "capability unknown (version lookup failed)";
   }
 
   /* rowCloseButton is the S2 per-row close control; it is disabled, with a
-   * tooltip, when the broker reports the capability is not implemented. */
+   * tooltip, when the broker reports the capability is unsupported or unknown. */
   function rowCloseButton(conn) {
     var btn = h("button", { type: "button", class: "danger row-action", text: "Close" });
-    if (!closeConnectionSupported()) {
+    var st = closeConnectionState();
+    if (st !== "on") {
       btn.disabled = true;
-      btn.title = "Force-close is not implemented by this broker (close_connection capability is false)";
+      btn.title = closeConnectionDisabledReason(st);
     }
     btn.addEventListener("click", function (ev) {
       ev.stopPropagation();
@@ -1204,9 +1238,10 @@
   function buildConnectionDetail(conn, route) {
     var name = String(conn.name);
     var closeBtn = h("button", { type: "button", id: "close-connection-btn", class: "danger", text: "Close" });
-    if (!closeConnectionSupported()) {
+    var closeState = closeConnectionState();
+    if (closeState !== "on") {
       closeBtn.disabled = true;
-      closeBtn.title = "Force-close is not implemented by this broker (close_connection capability is false)";
+      closeBtn.title = closeConnectionDisabledReason(closeState);
     }
     closeBtn.addEventListener("click", function () {
       if (closeBtn.disabled) return;
@@ -1239,11 +1274,13 @@
     ]);
   }
 
-  var CHANNEL_SORT_KEYS = ["number", "connection", "user", "vhost", "state", "consumers", "unacked", "prefetch_count", "confirm", "transactional"];
+  /* The channels endpoint's sort allowlist is number/connection/user/vhost/
+   * state/consumers; unacked/prefetch/confirm/transactional are not sortable. */
+  var CHANNEL_SORT_KEYS = ["number", "connection", "user", "vhost", "state", "consumers"];
 
   function loadChannels(container, route) {
     var q = route.query;
-    var path = API + "/channels" + qs({ page: q.get("page") || 1, page_size: q.get("page_size") || 100 });
+    var path = API + "/channels" + qs({ page: q.get("page") || 1, page_size: q.get("page_size") || 100, sort: q.get("sort"), sort_reverse: q.get("sort_reverse") });
     return loadList(container, "channels:" + path, path, {
       render: function (r) { return buildChannels(r.data, route); }
     });
@@ -1272,11 +1309,13 @@
     ]);
   }
 
-  var CONSUMER_SORT_KEYS = ["consumer_tag", "queue", "channel", "connection", "ack_required", "exclusive", "prefetch_count", "unacked"];
+  /* The consumers endpoint's sort allowlist is consumer_tag/queue/channel/
+   * connection/ack_required/exclusive/prefetch_count; unacked is not sortable. */
+  var CONSUMER_SORT_KEYS = ["consumer_tag", "queue", "channel", "connection", "ack_required", "exclusive", "prefetch_count"];
 
   function loadConsumers(container, route) {
     var q = route.query;
-    var path = API + "/consumers" + qs({ page: q.get("page") || 1, page_size: q.get("page_size") || 100, queue: q.get("queue"), connection: q.get("connection") });
+    var path = API + "/consumers" + qs({ page: q.get("page") || 1, page_size: q.get("page_size") || 100, queue: q.get("queue"), connection: q.get("connection"), sort: q.get("sort"), sort_reverse: q.get("sort_reverse") });
     return loadList(container, "consumers:" + path, path, {
       render: function (r) { return buildConsumers(r.data, route); }
     });
@@ -1350,8 +1389,6 @@
     });
   }
 
-  var NODE_SORT_KEYS = ["name", "type", "running", "mem_used", "disk_free", "uptime", "processors"];
-
   function buildNodes(data, route) {
     var nodes = itemsOf(data);
     if (route.params.name && !nodes.length) return notFound("/nodes", "Back to nodes");
@@ -1366,7 +1403,7 @@
         { key: "disk_free", label: "Disk free", render: function (r) { return num(r.disk_free); } },
         { key: "uptime", label: "Uptime", render: function (r) { return fmtDuration(r.uptime); } },
         { key: "processors", label: "Processors", render: function (r) { return num(r.processors); } }
-      ], nodes, { route: route, sortKeys: NODE_SORT_KEYS, rowKey: function (r) { return r.name; } }) : emptyState("No node information reported."),
+      ], nodes, { rowKey: function (r) { return r.name; } }) : emptyState("No node information reported."),
       pagination(data, route)
     ]);
   }
@@ -1414,7 +1451,7 @@
             { key: "configure", label: "Configure", render: function (x) { return h("span", { text: val(x.configure) }); } },
             { key: "write", label: "Write", render: function (x) { return h("span", { text: val(x.write) }); } },
             { key: "read", label: "Read", render: function (x) { return h("span", { text: val(x.read) }); } }
-          ], items, { route: route, sortKeys: ["user", "vhost", "configure", "write", "read"], rowKey: function (x) { return x.user; } }) : emptyState("No permissions configured."),
+          ], items, { rowKey: function (x) { return x.user; } }) : emptyState("No permissions configured."),
           pagination(r.data, route)
         ]);
       }
@@ -1962,7 +1999,8 @@
   }
 
   function ensureCapabilities() {
-    if (state.capabilities && Object.keys(state.capabilities).length) return Promise.resolve();
+    if (state.capabilitiesLoaded && Object.keys(state.capabilities).length) return Promise.resolve();
+    if (state.capabilitiesLoaded) return Promise.resolve();
     return loadVersion();
   }
 
@@ -1971,10 +2009,11 @@
       if (r.status < 400 && r.data) {
         state.version = r.data;
         state.capabilities = r.data.capabilities || {};
+        state.capabilitiesLoaded = true;
         var el = document.getElementById("app-version");
         if (el) el.textContent = r.data.version || "";
       }
-    }).catch(function () { /* version is best-effort */ });
+    }).catch(function () { state.capabilitiesLoaded = false; /* version is best-effort */ });
   }
 
   function updatePrincipal() {
