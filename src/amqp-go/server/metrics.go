@@ -24,8 +24,16 @@ type MetricsCollector interface {
 	RecordMessagePublished(size int)
 	RecordMessageDelivered(size int)
 	RecordMessageAcknowledged()
+	// RecordMessagesAcknowledged counts n deliveries settled by ONE cumulative
+	// (multiple=true) basic.ack. The singular form above is one settled
+	// delivery; this form exists because a cumulative ack settles len(refs)
+	// deliveries but used to be counted as one (finding 5).
+	RecordMessagesAcknowledged(n int)
 	RecordMessageRedelivered()
 	RecordMessageRejected()
+	// RecordMessagesRejected counts n deliveries settled by ONE cumulative
+	// (multiple=true) basic.nack (finding 5).
+	RecordMessagesRejected(n int)
 	RecordMessageUnroutable()
 
 	// Consumer metrics
@@ -225,8 +233,10 @@ func (n *NoOpMetricsCollector) RecordExchangeDeleted()                     {}
 func (n *NoOpMetricsCollector) RecordMessagePublished(size int)            {}
 func (n *NoOpMetricsCollector) RecordMessageDelivered(size int)            {}
 func (n *NoOpMetricsCollector) RecordMessageAcknowledged()                 {}
+func (n *NoOpMetricsCollector) RecordMessagesAcknowledged(count int)       {}
 func (n *NoOpMetricsCollector) RecordMessageRedelivered()                  {}
 func (n *NoOpMetricsCollector) RecordMessageRejected()                     {}
+func (n *NoOpMetricsCollector) RecordMessagesRejected(count int)           {}
 func (n *NoOpMetricsCollector) RecordMessageUnroutable()                   {}
 func (n *NoOpMetricsCollector) SetConsumersTotal(count int)                {}
 func (n *NoOpMetricsCollector) RecordTransactionStarted()                  {}

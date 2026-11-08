@@ -241,6 +241,12 @@ func (s *Server) teardownChannel(conn *protocol.Connection, channelID uint16) {
 				zap.Uint16("channel_id", channelID))
 		}
 	}
+	// A channel-only close unregisters consumers without touching the
+	// connection, so refresh amqp_consumers_total here too; before the fix the
+	// gauge kept counting a consumer that no longer existed (finding 6).
+	if len(consumerIDs) > 0 {
+		s.updateConsumersTotal()
+	}
 
 	// Remove channel from connection
 	conn.Channels.Delete(channelID)

@@ -1308,9 +1308,9 @@ func (s *Server) handleBasicAck(conn *protocol.Connection, channelID uint16, pay
 				return s.unknownDeliveryTag(conn, channelID, wireTag, protocol.BasicAck)
 			}
 		}
-		s.cumulativeSettle(channel, wireTag, settleAck, false)
+		settled := s.cumulativeSettle(channel, wireTag, settleAck, false)
 		if s.MetricsCollector != nil {
-			s.MetricsCollector.RecordMessageAcknowledged()
+			s.MetricsCollector.RecordMessagesAcknowledged(settled)
 		}
 		return nil
 	}
@@ -1422,9 +1422,9 @@ func (s *Server) handleBasicNack(conn *protocol.Connection, channelID uint16, pa
 				return s.unknownDeliveryTag(conn, channelID, wireTag, protocol.BasicNack)
 			}
 		}
-		s.cumulativeSettle(channel, wireTag, settleNack, requeue)
+		settled := s.cumulativeSettle(channel, wireTag, settleNack, requeue)
 		if s.MetricsCollector != nil {
-			s.MetricsCollector.RecordMessageRejected()
+			s.MetricsCollector.RecordMessagesRejected(settled)
 		}
 		return nil
 	}
@@ -1469,7 +1469,11 @@ const (
 // point), so credit accounting stays exact and requeue-reused msgIDs cannot be
 // over-settled. When channel is nil (legacy tests) it falls back to routing the
 // wire tag (== msgID) to the owning consumer's broker multi-ack.
-func (s *Server) cumulativeSettle(channel *protocol.Channel, wireTag uint64, kind settleKind, requeue bool) {
+//
+// It returns the number of deliveries actually settled, so the caller can
+// count one acknowledgement/rejection per settled delivery instead of one per
+// cumulative method (finding 5).
+func (s *Server) cumulativeSettle(channel *protocol.Channel, wireTag uint64, kind settleKind, requeue bool) int {
 	// Spec: delivery-tag 0 with multiple=true means "every outstanding delivery
 	// on the channel". Wire tags are 1-based, so 0 would otherwise match nothing
 	// and ack-all / nack-all would silently no-op.
@@ -1479,7 +1483,7 @@ func (s *Server) cumulativeSettle(channel *protocol.Channel, wireTag uint64, kin
 	if channel == nil {
 		ctag, ok := s.Broker.GetConsumerForDelivery(wireTag)
 		if !ok {
-			return
+			return 0
 		}
 		switch {
 		case ctag == "" && kind == settleAck:
@@ -1491,7 +1495,7 @@ func (s *Server) cumulativeSettle(channel *protocol.Channel, wireTag uint64, kin
 		default:
 			s.Broker.NacknowledgeMessage(ctag, wireTag, true, requeue)
 		}
-		return
+		return 1
 	}
 
 	refs := channel.TakeWireTagsUpTo(wireTag)
@@ -1507,6 +1511,7 @@ func (s *Server) cumulativeSettle(channel *protocol.Channel, wireTag uint64, kin
 			s.Broker.NacknowledgeMessage(ref.ConsumerID, ref.MsgID, false, requeue)
 		}
 	}
+	return len(refs)
 }
 
 func (s *Server) handleBasicRecover(conn *protocol.Connection, channelID uint16, payload []byte) error {
