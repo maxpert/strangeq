@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -34,11 +35,57 @@ type stubAPI struct {
 	queues      []map[string]any
 	overview    map[string]any
 
-	declared []string
-	hits     atomic.Int64
+	// healthStatus / healthReason drive GET /api/health so a test can flip the
+	// broker alarm state deterministically.
+	healthStatus string
+	healthReason string
+
+	// queueTotal / queuePageCount turn the /api/queues list into a paged
+	// envelope whose page/page_size echo the request, so the pagination
+	// controls can be exercised end to end. queuePages records every requested
+	// page.
+	queueTotal     int
+	queuePageCount int
+	queuePages     []int
+
+	declared         []string
+	lastQueueDeclare map[string]any
+	hits             atomic.Int64
 }
 
 func (s *stubAPI) hitCount() int64 { return s.hits.Load() }
+
+// queuePageSeen reports whether the queues list was requested for page n.
+func (s *stubAPI) queuePageSeen(n int) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, p := range s.queuePages {
+		if p == n {
+			return true
+		}
+	}
+	return false
+}
+
+// queuePageRequests counts how many queues-list requests targeted page n.
+func (s *stubAPI) queuePageRequests(n int) int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	c := 0
+	for _, p := range s.queuePages {
+		if p == n {
+			c++
+		}
+	}
+	return c
+}
+
+// queueDeclareBody returns the body of the most recent queue declaration.
+func (s *stubAPI) queueDeclareBody() map[string]any {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.lastQueueDeclare
+}
 
 func newStub() *stubAPI {
 	return &stubAPI{
@@ -174,7 +221,18 @@ func (s *stubAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	case "health":
-		writeJSON(w, http.StatusOK, map[string]any{"status": "ok", "uptime_seconds": 42})
+		s.mu.Lock()
+		st := s.healthStatus
+		reason := s.healthReason
+		s.mu.Unlock()
+		if st == "" {
+			st = "ok"
+		}
+		body := map[string]any{"status": st, "uptime_seconds": 42}
+		if reason != "" {
+			body["reason"] = reason
+		}
+		writeJSON(w, http.StatusOK, body)
 		return
 	}
 
@@ -335,7 +393,24 @@ func (s *stubAPI) handleQueues(w http.ResponseWriter, r *http.Request, segs []st
 	if len(segs) == 2 {
 		s.mu.Lock()
 		qs := s.queues
+		total := s.queueTotal
+		pageCount := s.queuePageCount
 		s.mu.Unlock()
+		if total > 0 {
+			page := atoiDefault(r.URL.Query().Get("page"), 1)
+			size := atoiDefault(r.URL.Query().Get("page_size"), 50)
+			s.mu.Lock()
+			s.queuePages = append(s.queuePages, page)
+			s.mu.Unlock()
+			if pageCount <= 0 {
+				pageCount = (total + size - 1) / size
+			}
+			writeRead(w, r, map[string]any{
+				"items": qs, "total_count": total, "item_count": len(qs), "filtered_count": total,
+				"page": page, "page_size": size, "page_count": pageCount,
+			})
+			return
+		}
 		writeRead(w, r, envelope(qs, len(qs)))
 		return
 	}
@@ -363,8 +438,12 @@ func (s *stubAPI) handleQueues(w http.ResponseWriter, r *http.Request, segs []st
 			if !s.guardCSRF(w, r) {
 				return
 			}
+			body, _ := io.ReadAll(r.Body)
+			var parsed map[string]any
+			_ = json.Unmarshal(body, &parsed)
 			s.mu.Lock()
 			s.declared = append(s.declared, "queue:"+name)
+			s.lastQueueDeclare = parsed
 			s.mu.Unlock()
 			w.WriteHeader(http.StatusCreated)
 			return
@@ -470,4 +549,16 @@ func envelope(items any, total int) map[string]any {
 		"items": items, "total_count": total, "item_count": total, "filtered_count": total,
 		"page": 1, "page_size": 100, "page_count": 1,
 	}
+}
+
+// atoiDefault parses s as an int, returning def for an empty or malformed value.
+func atoiDefault(s string, def int) int {
+	if s == "" {
+		return def
+	}
+	n, err := strconv.Atoi(s)
+	if err != nil {
+		return def
+	}
+	return n
 }

@@ -225,6 +225,29 @@ func TestAssets_UnknownAssetNotFound(t *testing.T) {
 	}
 }
 
+// TestAssets_PathTraversal (F13/SEC) proves a /assets/ request that escapes the
+// prefix through ".." is a 404 after path.Clean, never a shell fallback or a
+// file read.
+func TestAssets_PathTraversal(t *testing.T) {
+	h := Handler()
+	index := readAsset(t, "index.html")
+	for _, target := range []string{
+		"/assets/../app.js",
+		"/assets/../../etc/passwd",
+		"/assets/..%2f..%2fetc/passwd",
+		"/assets/..",
+		"/assets/../index.html",
+	} {
+		rec := do(h, http.MethodGet, target, nil)
+		if rec.Code != http.StatusNotFound {
+			t.Errorf("GET %s = %d, want 404", target, rec.Code)
+		}
+		if bytes.Equal(rec.Body.Bytes(), index) {
+			t.Errorf("GET %s fell back to the SPA shell", target)
+		}
+	}
+}
+
 // TestAssets_SecurityHeaders (MIL-011/SEC-031/032/035) proves the security
 // headers are present on asset, shell and error responses.
 func TestAssets_SecurityHeaders(t *testing.T) {

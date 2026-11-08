@@ -398,8 +398,8 @@ func TestUI_PermissionDeniedState(t *testing.T) {
 
 	mustDo(t, ctx, chromedp.Navigate(srv.URL+"/users"), chromedp.WaitVisible(chromedp.CSS("#content .notice.permission")))
 	txt := mustRun(t, ctx, chromedp.Text(chromedp.CSS("#content .notice.permission")))
-	if !strings.Contains(txt, "capability") && !strings.Contains(txt, "access_refused") {
-		t.Fatalf("permission-denied state lacks explanation: %q", txt)
+	if !strings.Contains(txt, "access_refused") {
+		t.Fatalf("permission-denied state must surface the server reason (access_refused): %q", txt)
 	}
 }
 
@@ -594,7 +594,8 @@ func TestUI_AuthChallengeDoesNotBlockShell(t *testing.T) {
 
 // TestUI_CapabilitiesHideUnsupported (COMPAT-043): the Bindings screen renders
 // the unsupported state when the capability is false and the controls when the
-// capability is true.
+// capability is true. The unsupported state must name the missing feature and
+// must not render a data table.
 func TestUI_CapabilitiesHideUnsupported(t *testing.T) {
 	t.Run("unsupported", func(t *testing.T) {
 		stub := newStub()
@@ -603,6 +604,13 @@ func TestUI_CapabilitiesHideUnsupported(t *testing.T) {
 		ctx, cancel := newTab(t)
 		defer cancel()
 		mustDo(t, ctx, chromedp.Navigate(srv.URL+"/bindings"), chromedp.WaitVisible(chromedp.CSS("#content .notice")))
+		txt := mustRun(t, ctx, chromedp.Text(chromedp.CSS("#content .notice")))
+		if !strings.Contains(txt, "not implemented") && !strings.Contains(txt, "BOB-4") {
+			t.Fatalf("unsupported notice did not name the missing feature: %q", txt)
+		}
+		if n := mustRun(t, ctx, chromedp.Evaluate[int](`document.querySelectorAll('#content .data-table').length`)); n != 0 {
+			t.Fatalf("unsupported state rendered a data table (%d)", n)
+		}
 	})
 	t.Run("supported", func(t *testing.T) {
 		stub := newStub()
