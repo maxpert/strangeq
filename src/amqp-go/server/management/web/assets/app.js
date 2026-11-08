@@ -527,13 +527,17 @@
     var pageSize = toInt(env.page_size, toInt(route.query.get("page_size"), 50));
     var totalKnown = !isNull(env.total_count) && env.total_count !== "";
     var total = totalKnown ? Number(env.total_count) : null;
+    var filteredKnown = !isNull(env.filtered_count) && env.filtered_count !== "";
+    var filtered = filteredKnown ? Number(env.filtered_count) : null;
     var pageCount = toInt(env.page_count, totalKnown && pageSize > 0 ? Math.max(1, Math.ceil(total / pageSize)) : null);
     var offset = (page - 1) * pageSize;
     var end = totalKnown ? Math.min(offset + items.length, total) : null;
+    var shown = "showing " + (totalKnown ? String(end) : DASH) + " of " + (totalKnown ? String(total) : "unknown");
+    if (filteredKnown && (!totalKnown || filtered !== total)) shown += " (filtered " + filtered + " of " + (totalKnown ? total : "unknown") + ")";
     var indicator = h("span", {
       class: "pagination-total",
       dataset: { totalKnown: totalKnown ? "true" : "false" },
-      text: "showing " + (totalKnown ? String(end) : DASH) + " of " + (totalKnown ? String(total) : "unknown")
+      text: shown
     });
     var sizes = [25, 50, 100, 250, 500];
     var sizeSel = h("select", { id: "page-size", "aria-label": "Page size" });
