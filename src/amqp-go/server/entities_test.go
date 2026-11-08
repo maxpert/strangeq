@@ -1,6 +1,7 @@
 package server
 
 import (
+	"errors"
 	"fmt"
 	"go/ast"
 	"go/parser"
@@ -23,6 +24,8 @@ import (
 	"github.com/maxpert/amqp-go/transaction"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
+	"go.uber.org/zap/zaptest/observer"
 )
 
 // newEntityTestServer builds a Server wired to a real StorageBroker over a
@@ -158,6 +161,36 @@ func TestSnapshotEntityTotals_BindingsNilWithoutSeam(t *testing.T) {
 	}
 	fake.InitEntityCounters()
 	require.Nil(t, fake.SnapshotEntityTotals().Bindings, "a broker without the binding seam must keep bindings null")
+}
+
+// bindingSeedErrBroker has the aggregate binding seam but its seed read fails.
+// capabilities.bindings will still be true (the seam is present), so the seed
+// failure must be logged rather than silently leaving object_totals.bindings
+// null forever (WS4 review finding 8).
+type bindingSeedErrBroker struct {
+	UnifiedBroker
+}
+
+func (b bindingSeedErrBroker) ListBindings() ([]broker.BindingView, error) {
+	return nil, errors.New("injected ListBindings failure")
+}
+
+// TestInitEntityCounters_BindingSeedErrorIsLogged pins the coherence fix: a
+// failing binding-seed read keeps object_totals.bindings null (honest: unknown,
+// never a fabricated 0) but logs the failure so the two cannot silently
+// disagree.
+func TestInitEntityCounters_BindingSeedErrorIsLogged(t *testing.T) {
+	srv, _ := newEntityTestServer(t)
+	core, logs := observer.New(zapcore.WarnLevel)
+	srv.Log = zap.New(core)
+	srv.Broker = bindingSeedErrBroker{UnifiedBroker: srv.Broker}
+
+	srv.InitEntityCounters()
+
+	require.Nil(t, srv.SnapshotEntityTotals().Bindings,
+		"an unreadable binding count stays null (honest), never a fabricated 0")
+	require.NotZero(t, logs.FilterMessageSnippet("binding").Len(),
+		"the binding-seed failure must be logged, not swallowed")
 }
 
 func TestEntityObserverWired_OnlyForSeamBroker(t *testing.T) {

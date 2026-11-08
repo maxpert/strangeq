@@ -3,6 +3,7 @@ package server
 import (
 	"github.com/maxpert/amqp-go/broker"
 	"github.com/maxpert/amqp-go/protocol"
+	"go.uber.org/zap"
 )
 
 // EntityTotals is a linearisable point-in-time count of the five broker entity
@@ -118,14 +119,25 @@ func (s *Server) InitEntityCounters() {
 	// BOB-4: seed the binding count from the aggregate binding seam when the
 	// injected broker has one. A custom UnifiedBroker without it keeps the
 	// count unwired, so the overview renders object_totals.bindings: null.
+	//
+	// If the seam IS present but the seed read FAILS, capabilities.bindings
+	// reports true while object_totals.bindings stays null. That is the honest
+	// state — the boot count is genuinely unknown, and seeding a fabricated 0
+	// (which the observer's later deltas would then compound) would be worse —
+	// but it must not be SILENT: log the failure so an operator can see the two
+	// disagree (WS4 review finding 8).
 	var bindings int64
 	bindingsWired := false
 	if lister, ok := s.Broker.(interface {
 		ListBindings() ([]broker.BindingView, error)
 	}); ok {
-		if v, err := lister.ListBindings(); err == nil {
+		v, err := lister.ListBindings()
+		if err == nil {
 			bindings = int64(len(v))
 			bindingsWired = true
+		} else if s.Log != nil {
+			s.Log.Warn("could not seed the binding entity count; object_totals.bindings will report null",
+				zap.Error(err))
 		}
 	}
 
