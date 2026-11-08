@@ -104,6 +104,14 @@ func handle(w http.ResponseWriter, r *http.Request) {
 		upath = "/"
 	}
 
+	// A request aimed at /assets/ that normalises out of the prefix (e.g.
+	// /assets/../secrets) must not fall through to the SPA shell: it is a 404.
+	rawAssets := r.URL.Path == assetsPathPrefix || strings.HasPrefix(r.URL.Path, assetsPathPrefix+"/")
+	if rawAssets && upath != assetsPathPrefix && !strings.HasPrefix(upath, assetsPathPrefix+"/") {
+		http.NotFound(w, r)
+		return
+	}
+
 	switch {
 	case upath == assetsPathPrefix || strings.HasPrefix(upath, assetsPathPrefix+"/"):
 		serveAsset(w, r, head, strings.TrimPrefix(upath, assetsPathPrefix+"/"))
