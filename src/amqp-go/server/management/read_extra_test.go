@@ -42,8 +42,8 @@ func TestOverview_FieldsAndCoherence(t *testing.T) {
 	if totals == nil {
 		t.Fatalf("object_totals missing")
 	}
-	if v, present := totals["bindings"]; !present || v != nil {
-		t.Fatalf("object_totals.bindings must be present and null (BOB-4 unbuilt), got %#v", v)
+	if v, present := totals["bindings"]; !present || v == nil {
+		t.Fatalf("object_totals.bindings must be a real count once the binding seam is wired (BOB-4), got %#v", v)
 	}
 	// BOB-11 is built: the snapshot is coherent, and coherence must be verified
 	// honestly — object_totals.queues equals the queues declared at snapshot

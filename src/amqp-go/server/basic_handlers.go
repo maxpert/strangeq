@@ -80,7 +80,7 @@ func (s *Server) handleBasicQos(conn *protocol.Connection, channelID uint16, pay
 
 	// Update channel prefetch settings
 	channel.Mutex.Lock()
-	channel.PrefetchCount = qosMethod.PrefetchCount
+	channel.PrefetchCount.Store(uint32(qosMethod.PrefetchCount))
 	channel.PrefetchSize = qosMethod.PrefetchSize
 	channel.GlobalPrefetch = qosMethod.Global
 	// Collect the broker-internal identities, not the wire tags: the broker's
@@ -733,7 +733,7 @@ func (s *Server) handleBasicConsume(conn *protocol.Connection, channelID uint16,
 		zap.String("consumer_tag", consumeMethod.ConsumerTag),
 		zap.Bool("no_ack", consumeMethod.NoAck),
 		zap.Bool("exclusive", consumeMethod.Exclusive),
-		zap.Uint16("prefetch_count", channel.PrefetchCount))
+		zap.Uint16("prefetch_count", uint16(channel.PrefetchCount.Load())))
 
 	// Authorization check: basic.consume requires read permission on queue
 	if err := s.authorize(conn, channelID, interfaces.Operation{
@@ -757,7 +757,7 @@ func (s *Server) handleBasicConsume(conn *protocol.Connection, channelID uint16,
 
 	s.Log.Debug("Creating consumer with bounded channel",
 		zap.String("consumer_tag", consumeMethod.ConsumerTag),
-		zap.Uint16("prefetch_count", channel.PrefetchCount),
+		zap.Uint16("prefetch_count", uint16(channel.PrefetchCount.Load())),
 		zap.Int("buffer_size", bufferSize))
 
 	// Create a new consumer. The broker-internal identity is minted HERE,
@@ -772,7 +772,7 @@ func (s *Server) handleBasicConsume(conn *protocol.Connection, channelID uint16,
 		NoAck:         consumeMethod.NoAck,
 		Exclusive:     consumeMethod.Exclusive,
 		Args:          consumeMethod.Arguments,
-		PrefetchCount: channel.PrefetchCount, // CRITICAL FIX: Must set prefetch for consumer poll loop
+		PrefetchCount: uint16(channel.PrefetchCount.Load()), // CRITICAL FIX: Must set prefetch for consumer poll loop
 
 		Messages: make(chan *protocol.Delivery, bufferSize), // BOUNDED: Buffer based on prefetch + margin
 		Cancel:   make(chan struct{}, 1),                    // Channel to signal cancellation

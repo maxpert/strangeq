@@ -133,6 +133,13 @@ type MetadataStore interface {
 	DeleteExchangeBinding(source, destination, routingKey string) error
 	GetExchangeBindingsFrom(source string) ([]*ExchangeBinding, error)
 
+	// SnapshotBindings returns every queue binding and every
+	// exchange-to-exchange binding in one bounded read (BOB-4). The queue
+	// bindings come from an authoritative sync.Map (no per-binding disk read);
+	// the exchange bindings are read from the metadata directory. The returned
+	// slices are freshly allocated and owned by the caller.
+	SnapshotBindings() (queue []*QueueBinding, exchange []*ExchangeBinding, err error)
+
 	// Consumer operations
 	StoreConsumer(queueName, consumerTag string, consumer *protocol.Consumer) error
 	GetConsumer(queueName, consumerTag string) (*protocol.Consumer, error)

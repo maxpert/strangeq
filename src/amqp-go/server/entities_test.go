@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -19,6 +20,7 @@ import (
 	"github.com/maxpert/amqp-go/interfaces"
 	"github.com/maxpert/amqp-go/protocol"
 	"github.com/maxpert/amqp-go/storage"
+	"github.com/maxpert/amqp-go/transaction"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/zap"
 )
@@ -122,10 +124,40 @@ func TestSnapshotEntityTotals_ChangesWithTopology(t *testing.T) {
 	require.Greater(t, afterDelete.Generation, afterDeclare.Generation)
 }
 
-func TestSnapshotEntityTotals_BindingsNil(t *testing.T) {
-	srv, _ := newEntityTestServer(t)
+func TestSnapshotEntityTotals_BindingsCounted(t *testing.T) {
+	srv, sb := newEntityTestServer(t)
 	srv.InitEntityCounters()
-	require.Nil(t, srv.SnapshotEntityTotals().Bindings, "BOB-4 is unbuilt; bindings must be JSON null")
+	// BOB-4 is built: the aggregate binding seam is present, so bindings is a
+	// real count (0 here) rather than JSON null.
+	first := srv.SnapshotEntityTotals()
+	require.NotNil(t, first.Bindings, "BOB-4 is built; the binding seam is present")
+	require.EqualValues(t, 0, *first.Bindings)
+
+	_, err := sb.DeclareQueue("q", false, false, false, nil)
+	require.NoError(t, err)
+	require.NoError(t, sb.DeclareExchange("x", "direct", false, false, false, nil))
+	require.NoError(t, sb.BindQueue("q", "x", "rk", nil))
+
+	after := srv.SnapshotEntityTotals()
+	require.NotNil(t, after.Bindings)
+	require.EqualValues(t, 1, *after.Bindings)
+	views, err := sb.ListBindings()
+	require.NoError(t, err)
+	require.Equal(t, len(views), int(*after.Bindings), "the count equals the aggregate listing")
+}
+
+func TestSnapshotEntityTotals_BindingsNilWithoutSeam(t *testing.T) {
+	// A custom UnifiedBroker lacking the binding seam keeps bindings nil so the
+	// overview renders object_totals.bindings: null.
+	fake := &Server{
+		Log:              zap.NewNop(),
+		Broker:           newAckTestBroker(),
+		Config:           config.DefaultConfig(),
+		Connections:      make(map[string]*protocol.Connection),
+		MetricsCollector: &NoOpMetricsCollector{},
+	}
+	fake.InitEntityCounters()
+	require.Nil(t, fake.SnapshotEntityTotals().Bindings, "a broker without the binding seam must keep bindings null")
 }
 
 func TestEntityObserverWired_OnlyForSeamBroker(t *testing.T) {
@@ -192,9 +224,15 @@ func TestChannelViews_LockFreeFields(t *testing.T) {
 	require.False(t, v2.FlowActive)
 	require.Equal(t, 0, v2.Consumers)
 
-	// The struct deliberately carries no Channel.Mutex-guarded field.
+	// The struct carries the BOB-3 lock-free fields and no Channel.Mutex-guarded
+	// field: PrefetchCount/Transactional are atomics, Closing is runtime-derived,
+	// and Closed (a plain bool under Channel.Mutex) is deliberately absent.
 	_, hasPrefetch := reflect.TypeOf(ChannelView{}).FieldByName("PrefetchCount")
-	require.False(t, hasPrefetch, "ChannelView must not expose Channel.PrefetchCount")
+	require.True(t, hasPrefetch, "ChannelView must expose the atomic prefetch_count (BOB-3)")
+	_, hasTx := reflect.TypeOf(ChannelView{}).FieldByName("Transactional")
+	require.True(t, hasTx, "ChannelView must expose the atomic transactional mirror (BOB-3)")
+	_, hasClosing := reflect.TypeOf(ChannelView{}).FieldByName("Closing")
+	require.True(t, hasClosing, "ChannelView must expose the runtime-derived closing signal (BOB-3)")
 	_, hasClosed := reflect.TypeOf(ChannelView{}).FieldByName("Closed")
 	require.False(t, hasClosed, "ChannelView must not expose Channel.Closed")
 }
@@ -278,6 +316,10 @@ func TestAccessors_RaceWithLiveTraffic(t *testing.T) {
 	srv, sb := newEntityTestServer(t)
 	_, err := sb.DeclareQueue("q", false, false, false, nil)
 	require.NoError(t, err)
+	err = sb.DeclareExchange("bind-x", "direct", false, false, false, nil)
+	require.NoError(t, err)
+	_, err = sb.DeclareQueue("bind-q", false, false, false, nil)
+	require.NoError(t, err)
 
 	conn := protocol.NewConnection(nil)
 	conn.ID = "race-conn"
@@ -324,11 +366,28 @@ func TestAccessors_RaceWithLiveTraffic(t *testing.T) {
 			for i := 0; i < iterations; i++ {
 				sb.QueueMessageCounts("q")
 				sb.ConsumerViews()
+				sb.ListBindings()
 				srv.SnapshotEntityTotals()
 				srv.ChannelViews()
 			}
 		}()
 	}
+
+	// Concurrent binding churn exercises the binding observer deltas against the
+	// ListBindings snapshot.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 60; i++ {
+			rk := "rk-" + strconv.Itoa(i%5)
+			if err := sb.BindQueue("bind-q", "bind-x", rk, nil); err != nil {
+				return
+			}
+			if err := sb.UnbindQueueWithArguments("bind-q", "bind-x", rk, nil); err != nil {
+				return
+			}
+		}
+	}()
 
 	// Concurrent topology churn exercises the observer deltas + entityGate
 	// against the snapshot read.
@@ -452,6 +511,7 @@ func TestForbiddenLockGate_HoldEveryForbiddenLock(t *testing.T) {
 			go func() {
 				sb.QueueMessageCounts("q")
 				sb.ConsumerViews()
+				sb.ListBindings()
 				srv.SnapshotEntityTotals()
 				srv.ChannelViews()
 				close(done)
@@ -470,6 +530,12 @@ func TestForbiddenLockGate_HoldEveryForbiddenLock(t *testing.T) {
 	run("channel.wireTagMu", func() func() { return lockUnexported(t, ch, "wireTagMu") })
 	run("channel.confirmOrderMu", func() func() { return lockUnexported(t, ch, "confirmOrderMu") })
 	run("channel.confirmFlushMu", func() func() { return lockUnexported(t, ch, "confirmFlushMu") })
+
+	// The transaction manager mutex is forbidden to management (BOB-3 §4). Attach
+	// a real manager so the hold-the-lock arm is not vacuous, then hold its
+	// unexported mutex across every management accessor.
+	srv.TransactionManager = transaction.NewTransactionManager()
+	run("transaction-manager.mutex", func() func() { return lockUnexported(t, srv.TransactionManager, "mutex") })
 }
 
 // TestForbiddenLockGate_ASTScan is the mechanical gate behind
@@ -485,7 +551,7 @@ func TestForbiddenLockGate_HoldEveryForbiddenLock(t *testing.T) {
 // receiver is tracked separately: Connection.Closed is an atomic and is
 // therefore allowed.
 func TestForbiddenLockGate_ASTScan(t *testing.T) {
-	paths := []string{"entities.go", "queue_stats.go", "../broker/management_accessors.go"}
+	paths := []string{"entities.go", "queue_stats.go", "close_connection.go", "../broker/management_accessors.go", "../broker/management_bindings.go"}
 
 	// The management package is owned by a sibling workstream; scan it when it
 	// exists (it does not on this branch).
@@ -540,17 +606,36 @@ func TestForbiddenLockGate_ASTScan_CatchesAlwaysForbidden(t *testing.T) {
 
 func use() {
 	ch := make(chan int)
-	_ = ch.PrefetchCount
+	_ = ch.Consumers
 	var conn any
 	_ = conn.WriteMutex
+	var srv any
+	_ = srv.TransactionManager
 }
 `)
 
 	findings, err := scanForbidden([]string{fixture})
 	require.NoError(t, err)
 	joined := strings.Join(findings, "\n")
-	require.Contains(t, joined, "PrefetchCount", "a channel-guarded field must be caught: %v", findings)
+	require.Contains(t, joined, "Consumers", "a channel-guarded field must be caught: %v", findings)
 	require.Contains(t, joined, "WriteMutex", "an always-forbidden field must be caught: %v", findings)
+	require.Contains(t, joined, "TransactionManager", "the tx-manager must be caught: %v", findings)
+}
+
+// TestForbiddenLockGate_ASTScan_CatchesChannelMutex pins the BOB-3 extension:
+// Channel.Mutex is forbidden to a management request (the receiver is
+// channel-typed), while an untyped/Server receiver named `s` is not flagged.
+func TestForbiddenLockGate_ASTScan_CatchesChannelMutex(t *testing.T) {
+	chanMutex := writeScanFixture(t, "chan_mutex.go", "package fixture\n\nfunc use(ch *protocol.Channel) {\n\tch.Mutex.Lock()\n}\n")
+	f, err := scanForbidden([]string{chanMutex})
+	require.NoError(t, err)
+	require.Len(t, f, 1, "Channel.Mutex must be flagged: %v", f)
+	require.Contains(t, f[0], "Mutex")
+
+	serverMutex := writeScanFixture(t, "server_mutex.go", "package fixture\n\nfunc use(s *Server) {\n\ts.Mutex.RLock()\n}\n")
+	f, err = scanForbidden([]string{serverMutex})
+	require.NoError(t, err)
+	require.Empty(t, f, "a Server.Mutex (permitted) must not be flagged: %v", f)
 }
 
 // TestForbiddenLockGate_ASTScan_ChannelVsConnection pins the Channel-vs-
@@ -604,7 +689,7 @@ func TestForbiddenLockGate_ASTScan_ChannelUnderConnectionName(t *testing.T) {
 	require.Len(t, f, 1, "a *protocol.Channel named conn must still be flagged: %v", f)
 	require.Contains(t, f[0], "Closed")
 
-	aliased := writeScanFixture(t, "chan_alias.go", "package fixture\n\nfunc use(ch *protocol.Channel) {\n\tconn := ch\n\t_ = conn.Consumers\n\tc := ch\n\t_ = c.PrefetchCount\n}\n")
+	aliased := writeScanFixture(t, "chan_alias.go", "package fixture\n\nfunc use(ch *protocol.Channel) {\n\tconn := ch\n\t_ = conn.Consumers\n\tc := ch\n\t_ = c.Consumers\n}\n")
 	f, err = scanForbidden([]string{aliased})
 	require.NoError(t, err)
 	require.Len(t, f, 2, "a channel aliased under any name must be flagged: %v", f)
@@ -634,17 +719,20 @@ func writeScanFixture(t *testing.T, name, src string) string {
 // read — and is deliberately NOT forbidden.
 func scanForbidden(paths []string) ([]string, error) {
 	alwaysForbidden := map[string]bool{
-		"GetStats":       true,
-		"WriteMutex":     true,
-		"wireTagMu":      true,
-		"confirmOrderMu": true,
-		"confirmFlushMu": true,
+		"GetStats":           true,
+		"WriteMutex":         true,
+		"wireTagMu":          true,
+		"confirmOrderMu":     true,
+		"confirmFlushMu":     true,
+		"TransactionManager": true,
 	}
-	// Channel-only, mutex-guarded fields.
+	// Channel-only, mutex-guarded fields. PrefetchCount/Transactional are now
+	// atomics (BOB-3) and are read lock-free by ChannelViews, so they are NOT
+	// forbidden; Consumers/Closed/Mutex remain Channel.Mutex-guarded.
 	chanOnlyFields := map[string]bool{
-		"Consumers":     true,
-		"Closed":        true,
-		"PrefetchCount": true,
+		"Consumers": true,
+		"Closed":    true,
+		"Mutex":     true,
 	}
 	// Conventional receiver identifiers mapped to the type they name.
 	chanLikeNames := map[string]recvKind{

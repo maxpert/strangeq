@@ -1792,17 +1792,26 @@ func (b *StorageBroker) DeleteExchange(name string, ifUnused bool) error {
 		b.storage.DeleteExchangeBinding(eb.Source, eb.Destination, eb.RoutingKey)
 	}
 
+	// BOB-4: the whole exchange teardown is ONE binding delta (spec §1.5/§5.1
+	// test 11): every queue binding whose source is this exchange, every e2e
+	// binding from it, and every e2e binding into it are removed together.
+	removedBindings := int64(len(queueBindings) + len(fromBindings))
+
 	allExchanges, _ := b.storage.ListExchanges()
 	for _, exch := range allExchanges {
 		exchBindings, _ := b.storage.GetExchangeBindingsFrom(exch.Name)
 		for _, eb := range exchBindings {
 			if eb.Destination == name {
 				b.storage.DeleteExchangeBinding(eb.Source, eb.Destination, eb.RoutingKey)
+				removedBindings++
 				// §12: the deleted exchange was the DESTINATION of this e2e
 				// binding; removing it may orphan an auto-delete SOURCE.
 				b.maybeAutoDeleteExchange(eb.Source)
 			}
 		}
+	}
+	if removedBindings > 0 {
+		b.notifyEntity("binding", -removedBindings)
 	}
 
 	err = b.storage.DeleteExchange(name)
@@ -2170,10 +2179,17 @@ func (b *StorageBroker) deleteQueueIncarnation(name string, wantOrdinal uint64, 
 	// activeConsumers.LoadAndDelete transitions, so a consumer already removed
 	// by UnregisterConsumer is never double-counted.
 	var removedConsumers int64
+	var removedBindings int64
 	var queueDeleted bool
 	defer func() {
 		for i := int64(0); i < removedConsumers; i++ {
 			b.notifyEntity("consumer", -1)
+		}
+		if removedBindings > 0 {
+			// BOB-4: exactly ONE binding delta for the whole sweep. The
+			// per-binding DeleteBinding calls below must not each fire, or the
+			// count would double-decrement. This defer runs after cmu.Unlock.
+			b.notifyEntity("binding", -removedBindings)
 		}
 		if queueDeleted {
 			b.notifyEntity("queue", -1)
@@ -2288,6 +2304,8 @@ func (b *StorageBroker) deleteQueueIncarnation(name string, wantOrdinal uint64, 
 			b.storage.DeleteBinding(binding.QueueName, binding.ExchangeName, binding.RoutingKey)
 			touched = append(touched, binding.ExchangeName)
 		}
+		// BOB-4: the whole sweep is one delta (see the defer above).
+		removedBindings = int64(len(bindings))
 	}
 
 	// Persisted-consumer sweep. The live consumers were already stopped and
@@ -2373,10 +2391,18 @@ func (b *StorageBroker) BindQueue(queueName, exchangeName, routingKey string, ar
 		}
 		return err
 	}
+	// BOB-4: a binding delta fires only for a genuinely NEW triple. The check
+	// runs in the same cmu critical section as the store, so a concurrent
+	// UnbindQueue cannot swap the answer between the two.
+	_, bindErr := b.storage.GetBinding(queueName, exchangeName, routingKey)
+	newBinding := errors.Is(bindErr, interfaces.ErrBindingNotFound)
 	err = b.storage.StoreBinding(queueName, exchangeName, routingKey, arguments)
 	cmu.Unlock()
 	if err != nil {
 		return err
+	}
+	if newBinding {
+		b.notifyEntity("binding", 1)
 	}
 
 	// Update durable entity metadata since bindings affect durable entities
@@ -2411,10 +2437,27 @@ func (b *StorageBroker) maybeAutoDeleteExchange(name string) {
 // UnbindQueue removes a binding between queue and exchange, matching on
 // (queue, exchange, routing-key) only. Kept for UnifiedBroker compatibility;
 // the AMQP queue.unbind path uses UnbindQueueWithArguments.
+//
+// BOB-4: the binding entity count drops exactly once, and only when a binding
+// actually existed (the existence check mirrors UnbindQueueWithArguments and
+// runs under the same per-queue create mutex).
 func (b *StorageBroker) UnbindQueue(queueName, exchangeName, routingKey string) error {
-	if err := b.storage.DeleteBinding(queueName, exchangeName, routingKey); err != nil {
+	cmu := b.getQueueCreateMutex(queueName)
+	cmu.Lock()
+	_, err := b.storage.GetBinding(queueName, exchangeName, routingKey)
+	if err != nil {
+		cmu.Unlock()
+		if errors.Is(err, interfaces.ErrBindingNotFound) {
+			return nil
+		}
 		return err
 	}
+	err = b.storage.DeleteBinding(queueName, exchangeName, routingKey)
+	cmu.Unlock()
+	if err != nil {
+		return err
+	}
+	b.notifyEntity("binding", -1)
 	b.maybeAutoDeleteExchange(exchangeName)
 	return nil
 }
@@ -2454,6 +2497,7 @@ func (b *StorageBroker) UnbindQueueWithArguments(queueName, exchangeName, routin
 	if err != nil {
 		return err
 	}
+	b.notifyEntity("binding", -1)
 	b.maybeAutoDeleteExchange(exchangeName)
 	return nil
 }
@@ -2507,13 +2551,44 @@ func (b *StorageBroker) BindExchange(destination, source, routingKey string, arg
 		return fmt.Errorf("exchange binding cycle detected: binding %s -> %s would create a cycle", destination, source)
 	}
 
-	return b.storage.StoreExchangeBinding(source, destination, routingKey, arguments)
+	// BOB-4: fire +1 only for a genuinely new (source,destination,rk) triple.
+	// The presence read runs before the store because StoreExchangeBinding
+	// invalidates the per-source cache.
+	existing, _ := b.storage.GetExchangeBindingsFrom(source)
+	present := false
+	for _, eb := range existing {
+		if eb.Source == source && eb.Destination == destination && eb.RoutingKey == routingKey {
+			present = true
+			break
+		}
+	}
+
+	if err := b.storage.StoreExchangeBinding(source, destination, routingKey, arguments); err != nil {
+		return err
+	}
+	if !present {
+		b.notifyEntity("binding", 1)
+	}
+	return nil
 }
 
 // UnbindExchange removes an exchange-to-exchange binding.
 func (b *StorageBroker) UnbindExchange(destination, source, routingKey string) error {
+	// BOB-4: −1 only when the triple existed.
+	existing, _ := b.storage.GetExchangeBindingsFrom(source)
+	present := false
+	for _, eb := range existing {
+		if eb.Source == source && eb.Destination == destination && eb.RoutingKey == routingKey {
+			present = true
+			break
+		}
+	}
+
 	if err := b.storage.DeleteExchangeBinding(source, destination, routingKey); err != nil {
 		return err
+	}
+	if present {
+		b.notifyEntity("binding", -1)
 	}
 
 	b.maybeAutoDeleteExchange(source)

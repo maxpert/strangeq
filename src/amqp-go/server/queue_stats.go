@@ -48,6 +48,16 @@ func (a *StorageBrokerAdapter) ConsumerViews() []broker.ConsumerView {
 	return a.broker.ConsumerViews()
 }
 
+// ListBindings returns every binding in the vhost (BOB-4). It is the optional
+// binding-lister seam the management layer discovers on the injected
+// UnifiedBroker; nil-safe like the other accessors.
+func (a *StorageBrokerAdapter) ListBindings() ([]broker.BindingView, error) {
+	if a == nil || a.broker == nil {
+		return nil, nil
+	}
+	return a.broker.ListBindings()
+}
+
 // SetEntityObserver installs the BOB-11 entity observer on the wrapped broker.
 // It is the optional-interface seam the server's entity-counter wiring
 // discovers; a broker without it leaves snapshot_coherent false.

@@ -147,7 +147,7 @@ func buildRouter(s *Server) *router {
 	// --- connections ---
 	get("/api/connections", s.hConnections)
 	get("/api/connections/username/{user}", s.hConnectionsByUser)
-	get("/api/connections/{name}/channels", s.hNotImplementedAggregate("channel listing for a connection"))
+	get("/api/connections/{name}/channels", s.hConnectionChannels)
 	get("/api/connections/{name}", s.hConnection)
 	del("/api/connections/username/{user}", s.hCloseConnectionsByUser)
 	del("/api/connections/{name}", s.hCloseConnection)
@@ -164,15 +164,14 @@ func buildRouter(s *Server) *router {
 	get("/api/exchanges", s.hExchanges)
 	put("/api/exchanges/{vhost}/{name}", s.hExchangeDeclare)
 	del("/api/exchanges/{vhost}/{name}", s.hExchangeDelete)
-	get("/api/exchanges/{vhost}/{name}/bindings/{source}", s.hNotImplementedAggregate("aggregate binding listing"))
-	get("/api/exchanges/{vhost}/{name}/bindings/{destination}", s.hNotImplementedAggregate("aggregate binding listing"))
+	get("/api/exchanges/{vhost}/{name}/bindings/{direction}", s.hExchangeBindings)
 	post("/api/exchanges/{vhost}/{name}/publish", s.hPublish)
 	get("/api/exchanges/{vhost}/{name}", s.hExchange)
 
 	// --- queues ---
 	get("/api/queues/detailed", s.hQueuesDetailed)
 	get("/api/queues", s.hQueues)
-	get("/api/queues/{vhost}/{name}/bindings", s.hNotImplementedAggregate("queue binding listing"))
+	get("/api/queues/{vhost}/{name}/bindings", s.hQueueBindings)
 	del("/api/queues/{vhost}/{name}/contents", s.hQueuePurge)
 	post("/api/queues/{vhost}/{name}/get", s.hQueueGet)
 	put("/api/queues/{vhost}/{name}", s.hQueueDeclare)
@@ -181,13 +180,13 @@ func buildRouter(s *Server) *router {
 	post("/api/queues/{vhost}", s.hQueueCreate)
 	get("/api/queues/{vhost}", s.hQueuesForVHost)
 
-	// --- bindings (aggregate listing is BOB-4, unbuilt) ---
-	get("/api/bindings", s.hNotImplementedAggregate("aggregate binding listing"))
-	get("/api/bindings/{vhost}", s.hNotImplementedAggregate("aggregate binding listing"))
-	post("/api/bindings/{vhost}/e/{source}/{destination}/{key}", s.hNotImplementedAggregate("binding creation"))
-	post("/api/bindings/{vhost}/e/{source}/{destination}/{key}/{props}", s.hNotImplementedAggregate("binding creation"))
-	del("/api/bindings/{vhost}/e/{source}/{destination}/{key}", s.hNotImplementedAggregate("binding deletion"))
-	del("/api/bindings/{vhost}/e/{source}/{destination}/{key}/{props}", s.hNotImplementedAggregate("binding deletion"))
+	// --- bindings (BOB-4) ---
+	get("/api/bindings", s.hBindings)
+	get("/api/bindings/{vhost}", s.hBindings)
+	// POST/DELETE /api/bindings/{vhost}/e/{source}/{dtype}/{destination}[/{props}]
+	// where dtype is "q" (queue destination) or "e" (exchange destination).
+	post("/api/bindings/{vhost}/e/{source}/{dtype}/{destination}", s.hBindingCreate)
+	del("/api/bindings/{vhost}/e/{source}/{dtype}/{destination}/{props}", s.hBindingDelete)
 
 	// --- vhosts (synthetic "/") ---
 	get("/api/vhosts", s.hVHosts)

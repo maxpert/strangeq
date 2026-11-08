@@ -1042,6 +1042,47 @@ func (pm *PersistentMetadataStore) removeBindingByIdentity(dir string, match fun
 	return nil
 }
 
+// SnapshotBindings returns every queue binding and every exchange-to-exchange
+// binding in one bounded read (BOB-4).
+//
+// The queue bindings are read from pm.bindingCache — the authoritative in-memory
+// mirror maintained by StoreBinding/DeleteBinding and preloaded at boot by
+// loadCacheFromDisk — so the queue path performs NO per-binding disk read and
+// takes NO lock. Exchange-to-exchange bindings are rare, deliberately have no
+// flat in-memory index (the per-source cache is invalidated on every write and
+// would go stale for a source mutated by another connection), and are read from
+// the metadata directory exactly as GetExchangeBindingsFrom already does.
+func (pm *PersistentMetadataStore) SnapshotBindings() ([]*interfaces.QueueBinding, []*interfaces.ExchangeBinding, error) {
+	var queue []*interfaces.QueueBinding
+	if pm.cacheEnabled {
+		pm.bindingCache.Range(func(_, value interface{}) bool {
+			if b, ok := value.(*interfaces.QueueBinding); ok {
+				queue = append(queue, b)
+			}
+			return true
+		})
+	} else {
+		// Cache disabled: fall back to the disk-backed listing (legacy path).
+		var err error
+		queue, err = pm.ListBindings()
+		if err != nil {
+			return nil, nil, err
+		}
+	}
+	if queue == nil {
+		queue = []*interfaces.QueueBinding{}
+	}
+
+	exchange, err := pm.loadExchangeBindingsFromDisk()
+	if err != nil {
+		return nil, nil, err
+	}
+	if exchange == nil {
+		exchange = []*interfaces.ExchangeBinding{}
+	}
+	return queue, exchange, nil
+}
+
 // ListBindings returns all bindings
 func (pm *PersistentMetadataStore) ListBindings() ([]*interfaces.QueueBinding, error) {
 	pm.mutex.RLock()

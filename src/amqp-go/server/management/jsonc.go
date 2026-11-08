@@ -361,4 +361,36 @@ func fieldTableJSON(v any) any {
 // do it, but header values need a plain string.
 func intToString(n int64) string { return strconv.FormatInt(n, 10) }
 
+// canonicalFieldTableJSON renders an AMQP field table as the exact canonical
+// JSON the management surface emits (FR-CONV-046: byte-sorted keys, compact,
+// no HTML escaping; FR-CONV-047: value mapping). It is the single hash input
+// for propertiesKey (FR-API-090), so the key a listing emits is the key a
+// DELETE matches (DATA-010/DIV-12).
+func canonicalFieldTableJSON(arguments map[string]any) []byte {
+	b, err := marshalCompact(fieldTableJSON(arguments))
+	if err != nil {
+		// fieldTableJSON yields only JSON-marshalable values; marshal cannot
+		// fail in practice. Return an empty object rather than nil so the hash
+		// stays deterministic.
+		return []byte("{}")
+	}
+	return b
+}
+
+// propertiesKey synthesises the binding's management key (FR-API-090/DATA-010):
+// the routing key alone when the arguments are empty (nil or empty map), else
+// `routing_key + "~" + lowercase-hex SHA-256` of the canonical field-table JSON
+// of the arguments. It is deterministic for a (routing_key, arguments) pair, so
+// a key produced by GET /api/bindings round-trips into DELETE
+// /api/bindings/... (DIV-12). It is a management-layer derivation only; the
+// broker never computes it. RabbitMQ's own hash is unspecified (recorded as
+// DIV-12), so a key constructed for RabbitMQ need not match.
+func propertiesKey(routingKey string, arguments map[string]any) string {
+	if len(arguments) == 0 {
+		return routingKey
+	}
+	sum := sha256.Sum256(canonicalFieldTableJSON(arguments))
+	return routingKey + "~" + hex.EncodeToString(sum[:])
+}
+
 var _ = json.Marshal

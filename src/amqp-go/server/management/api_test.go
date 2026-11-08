@@ -447,8 +447,11 @@ func TestVersion_CapabilitiesKeysAndEndpoints(t *testing.T) {
 		}
 	}
 	out := decode[versionResponse](t, rec)
-	if out.Capabilities.Bindings || out.Capabilities.UserCRUD || out.Capabilities.MessageRates {
-		t.Fatalf("BOB-2/4/6 capabilities must report false: %+v", out.Capabilities)
+	if !out.Capabilities.Bindings {
+		t.Fatalf("BOB-4 is built; capabilities.bindings must be true: %+v", out.Capabilities)
+	}
+	if out.Capabilities.UserCRUD || out.Capabilities.MessageRates {
+		t.Fatalf("BOB-2/6 capabilities must report false: %+v", out.Capabilities)
 	}
 	if !out.Capabilities.CloseConnection {
 		t.Fatalf("close_connection must be true (the operation exists)")
@@ -614,9 +617,6 @@ func TestHonestWrites_501(t *testing.T) {
 		{http.MethodPost, "/api/strangeq/rebalance"},
 		{http.MethodPut, "/api/vhosts/other"},
 		{http.MethodPost, "/api/nodes/" + "n@h"},
-		{http.MethodGet, "/api/bindings"},
-		{http.MethodGet, "/api/bindings/%2F"},
-		{http.MethodGet, "/api/queues/%2F/q/bindings"},
 	}
 	for _, c := range cases {
 		rec := e.do(c.method, c.path, []byte(`{}`), basicAuthHeader())

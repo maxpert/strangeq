@@ -77,6 +77,11 @@ func (s *Server) handleTxSelect(conn *protocol.Connection, channelID uint16, pay
 	if err := s.writeFrame(conn, response); err != nil {
 		return err
 	}
+	// BOB-3: mirror tx mode on the channel for lock-free management reads.
+	// handleTxSelect is the ONLY setter; the tx manager stays authoritative.
+	if val, ok := conn.Channels.Load(channelID); ok {
+		val.(*protocol.Channel).Transactional.Store(true)
+	}
 	if s.MetricsCollector != nil {
 		s.MetricsCollector.RecordTransactionStarted()
 	}
@@ -135,6 +140,11 @@ func (s *Server) handleTxCommit(conn *protocol.Connection, channelID uint16, pay
 				ClassID:  90,
 				MethodID: 20,
 				Cause:    err,
+			}
+			// BOB-3: the manager has already dropped this channel out of tx
+			// mode; clear the mirror on the same path that closes the channel.
+			if val, ok := conn.Channels.Load(channelID); ok {
+				val.(*protocol.Channel).Transactional.Store(false)
 			}
 			if rt.markChannelClosing(channelID) {
 				s.sendChannelClose(conn, channelID, ce.Code, ce.Text, 90, 20)

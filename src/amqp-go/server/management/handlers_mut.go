@@ -15,6 +15,7 @@ import (
 	"github.com/maxpert/amqp-go/interfaces"
 	"github.com/maxpert/amqp-go/protocol"
 	"github.com/maxpert/amqp-go/server"
+	"go.uber.org/zap"
 )
 
 // --- exchanges ---
@@ -874,6 +875,10 @@ func (s *Server) hCloseConnection(w http.ResponseWriter, r *http.Request) {
 		CloseConnection(id, reason string) error
 	}); ok {
 		if err := closer.CloseConnection(name, reason); err != nil {
+			if errors.Is(err, server.ErrConnectionNotFound) {
+				s.writeAPIError(w, r, errNotFoundMsg("unknown connection"))
+				return
+			}
 			s.writeAPIError(w, r, errBad("could not close connection: "+err.Error()))
 			return
 		}
@@ -892,6 +897,7 @@ func (s *Server) hCloseConnectionsByUser(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	p := principalFrom(r)
+	reason := sanitizeField(r.Header.Get("X-Reason"), s.mcfg.Limits.MaxNameBytes)
 	closed := 0
 	srv.Mutex.RLock()
 	targets := make([]*protocol.Connection, 0)
@@ -903,6 +909,9 @@ func (s *Server) hCloseConnectionsByUser(w http.ResponseWriter, r *http.Request)
 		}
 	}
 	srv.Mutex.RUnlock()
+	closer, hasCloser := any(srv).(interface {
+		CloseConnection(id, reason string) error
+	})
 	for i, conn := range targets {
 		if aerr := s.canClose(p, conn.Username); aerr != nil {
 			s.writeAPIError(w, r, aerr)
@@ -912,7 +921,15 @@ func (s *Server) hCloseConnectionsByUser(w http.ResponseWriter, r *http.Request)
 			s.writeAPIError(w, r, aerr)
 			return
 		}
-		if conn.Conn != nil {
+		if hasCloser {
+			// One bounded graceful close per connection (BOB-5); a connection
+			// that vanished between the snapshot and the call is a no-op.
+			if err := closer.CloseConnection(names[i], reason); err != nil && !errors.Is(err, server.ErrConnectionNotFound) {
+				s.log.Warn("could not close connection", zap.String("connection_id", names[i]), zap.Error(err))
+				continue
+			}
+			closed++
+		} else if conn.Conn != nil {
 			_ = conn.Conn.Close()
 			closed++
 		}

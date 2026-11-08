@@ -42,7 +42,7 @@ func TestForbiddenLock_OverviewDoesNotBlock(t *testing.T) {
 	conn.WriteMutex.Lock()
 	defer conn.WriteMutex.Unlock()
 
-	for _, target := range []string{"/api/overview", "/api/queues", "/api/queues?page=1", "/api/channels", "/api/channels/1"} {
+	for _, target := range []string{"/api/overview", "/api/queues", "/api/queues?page=1", "/api/channels", "/api/channels/1", "/api/bindings", "/api/connections/locked-conn/channels"} {
 		done := make(chan int, 1)
 		go func(tgt string) {
 			done <- e.do(http.MethodGet, tgt, nil, basicAuthHeader()).Code
@@ -71,22 +71,24 @@ func TestForbiddenLock_OverviewDoesNotBlock(t *testing.T) {
 func TestForbiddenLockGate_ASTScan(t *testing.T) {
 	// ALWAYS forbidden: an accessor whose mere presence takes a forbidden lock.
 	alwaysForbidden := map[string]bool{
-		"GetStats":       true, // Lifecycle.GetStats takes Channel.Mutex
-		"WriteMutex":     true,
-		"wireTagMu":      true,
-		"confirmOrderMu": true,
-		"confirmFlushMu": true,
+		"GetStats":           true, // Lifecycle.GetStats takes Channel.Mutex
+		"WriteMutex":         true,
+		"wireTagMu":          true,
+		"confirmOrderMu":     true,
+		"confirmFlushMu":     true,
+		"TransactionManager": true, // the tx-manager mutex is forbidden to management
 	}
-	// CHANNEL-GUARDED: protocol.Channel.Consumers/.PrefetchCount/.Closed are
-	// reachable only through a channel-typed receiver; flag them when the
-	// receiver identifier is channel-named. server.ChannelView exposes
-	// same-named LOCK-FREE fields and conn.Closed is protocol.Connection's
-	// atomic, so both are exempt. The hold-the-lock test above is the
-	// deterministic proof; this scan is the mechanical guard.
+	// CHANNEL-GUARDED: protocol.Channel.Consumers/.Closed/.Mutex are reachable
+	// only through a channel-typed receiver; flag them when the receiver
+	// identifier is channel-named. server.ChannelView exposes same-named
+	// LOCK-FREE fields and conn.Closed is protocol.Connection's atomic, so both
+	// are exempt. PrefetchCount/Transactional are now atomic (BOB-3) and are
+	// read lock-free, so they are NOT forbidden. The hold-the-lock test below is
+	// the deterministic proof; this scan is the mechanical guard.
 	channelFields := map[string]bool{
-		"Consumers":     true,
-		"PrefetchCount": true,
-		"Closed":        true,
+		"Consumers": true,
+		"Mutex":     true,
+		"Closed":    true,
 	}
 	channelReceivers := map[string]bool{
 		"ch": true, "channel": true, "chn": true, "chan": true, "protocolChannel": true,

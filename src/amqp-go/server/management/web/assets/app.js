@@ -1543,7 +1543,7 @@
         queue_message_totals: "queue unacked/total counts (BOB-1)",
         channels: "channel listing",
         bindings: "aggregate binding listing (BOB-4)",
-        close_connection: "force-close a connection (DIV-close)",
+        close_connection: "close a connection (connection.close 320 + reason)",
         user_crud: "user create/update/delete (BOB-6)",
         tag_capabilities: "tag-derived capability map",
         consumer_counts: "consumer channel/connection/unacked (BOB-8)",
@@ -1566,8 +1566,8 @@
         ["D-1", "entity data is global; vhosts are not independent"],
         ["D-2", "single-node broker; no cluster, no HA"],
         ["D-3", "classic queues only; no quorum/stream/priority"],
-        ["DIV-close", "close connection force-closes the socket; the peer is not sent connection.close"],
-        ["DIV-channel", "channel prefetch/transactional are read as null (mutex-guarded)"],
+        ["DIV-close", "close connection sends connection.close 320 with the operator reason; the peer is force-closed only if it does not reply close-ok within 3 s"],
+        ["DIV-channel", "channel prefetch_count/transactional are real lock-free atomics; state=closing is observable only while the channel is still registered"],
         ["DIV-15", "unanswerable health checks return 501, not a fake 200"]
       ];
       container.replaceChildren(h("div", { class: "screen screen-about" }, [
@@ -1829,7 +1829,7 @@
       title: "Close connection " + conn.name,
       body: h("div", null, [
         h("p", { class: "effect", text: "Close connection \u201c" + conn.name + "\u201d to " + val(conn.peer_host) + ":" + val(conn.peer_port) + "?" }),
-        h("p", { class: "error", text: "This force-closes the socket; the peer is not sent connection.close (DIV-close)." })
+        h("p", { class: "error", text: "This sends connection.close 320 with the operator reason; the connection is force-closed only if the peer does not reply close-ok within a few seconds." })
       ]),
       confirmLabel: "Close connection",
       onConfirm: function () {
