@@ -20,6 +20,7 @@ import (
 	"github.com/maxpert/amqp-go/metrics"
 	"github.com/maxpert/amqp-go/server"
 	"github.com/maxpert/amqp-go/server/management"
+	"github.com/maxpert/amqp-go/server/management/web"
 	"go.uber.org/zap"
 )
 
@@ -336,6 +337,16 @@ func main() {
 				mgmtSink = s
 			}
 		}
+		// The SPA renders its /metrics link from a CSP-safe <meta> the shell
+		// carries, so the management surface must know the telemetry URL. It is
+		// only reachable when the telemetry server is running on its own
+		// listener (SEC-004); otherwise the link is omitted.
+		var metricsURL string
+		if telemetryServer != nil {
+			if a := telemetryServer.Addr(); a != nil {
+				metricsURL = "http://" + a.String() + "/metrics"
+			}
+		}
 		mgmtServer, err = management.New(management.Options{
 			Server:        amqpServer,
 			Config:        cfg,
@@ -347,6 +358,7 @@ func main() {
 			Commit:        commit,
 			BuildDate:     date,
 			GoVersion:     runtime.Version(),
+			UIHandler:     web.HandlerWithOptions(web.Options{MetricsURL: metricsURL}),
 		})
 		if err != nil {
 			log.Fatalf("management: %v", err)
