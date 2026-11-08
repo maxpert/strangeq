@@ -1157,7 +1157,7 @@
           h("h3", { text: "Dry-run preview" }),
           h("p", { text: "vhosts: " + itemsOf(parsed.vhosts).length + ", exchanges: " + itemsOf(parsed.exchanges).length + ", queues: " + itemsOf(parsed.queues).length + ", bindings: " + itemsOf(parsed.bindings).length }),
           h("p", { class: "null", text: "Import is non-atomic; sections may partially apply (BOB-10)." }),
-          h("button", { type: "button", id: "definitions-apply", text: "Apply import" , onclick: function () { toast("Import submitted", "ok"); } })
+          h("button", { type: "button", id: "definitions-apply", text: "Apply import", onclick: function () { applyDefinitions(parsed, preview); } })
         ]));
       };
       reader.readAsText(file);
@@ -1172,6 +1172,21 @@
       h("div", { class: "form-row" }, [fileInput]),
       preview
     ]);
+  }
+
+  function applyDefinitions(doc, out) {
+    api(API + "/definitions", { method: "POST", body: doc }).then(function (r) {
+      if (r.status >= 400) { out.replaceChildren(errorState(r.data)); return; }
+      var res = r.data || {};
+      var atomic = res.strangeq && res.strangeq.atomic === true;
+      out.replaceChildren(h("div", { class: "fieldset" }, [
+        h("h3", { text: "Import result" }),
+        h("p", { text: "applied: " + itemsOf(res.applied).length + ", skipped: " + itemsOf(res.skipped).length + ", failed: " + itemsOf(res.failed).length }),
+        h("p", { class: atomic ? "null" : "stat-partial", text: atomic ? "atomic import" : "non-atomic import; sections may partially apply" })
+      ]));
+      toast("Import complete", "ok");
+      invalidateAll();
+    }, function () { out.replaceChildren(errorState(null)); });
   }
 
   function loadAbout(container) {

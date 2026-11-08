@@ -237,6 +237,16 @@ func (s *stubAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		writeRead(w, r, []map[string]any{{"user": "guest", "vhost": "/", "configure": ".*", "write": ".*", "read": ".*"}})
 	case "definitions":
+		if r.Method == http.MethodPost {
+			if !s.guardCSRF(w, r) {
+				return
+			}
+			writeJSON(w, http.StatusOK, map[string]any{
+				"applied": []string{}, "skipped": []string{"users", "permissions", "bindings"}, "failed": []string{},
+				"strangeq": map[string]any{"subset": true, "atomic": false},
+			})
+			return
+		}
 		writeRead(w, r, map[string]any{
 			"strangeq":  map[string]any{"product": "StrangeQ", "version": "0.4.0", "subset": true, "excludes": []string{"bindings"}},
 			"vhosts":    []map[string]any{{"name": "/", "synthetic": true}},
