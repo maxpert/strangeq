@@ -179,7 +179,10 @@ func New(o Options) (*Server, error) {
 	s.getLimit = newCounterWindow(window, mcfg.RateLimits.Get, nil)
 	s.purgeLimit = newCounterWindow(window, mcfg.RateLimits.Purge, nil)
 	s.declareLimit = newCounterWindow(window, mcfg.RateLimits.Declare, nil)
-	s.importLimit = newCounterWindow(window, mcfg.RateLimits.DefinitionsImportSeconds, nil)
+	// SEC-067: definitions_import_seconds is the minimum interval between
+	// imports by one principal, so the window IS that interval and exactly one
+	// import is allowed per window (0 = unlimited).
+	s.importLimit = newCounterWindow(time.Duration(mcfg.RateLimits.DefinitionsImportSeconds)*time.Second, 1, nil)
 
 	s.router = buildRouter(s)
 	s.endpoints = routeEndpointList(s.router)

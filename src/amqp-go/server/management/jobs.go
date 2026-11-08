@@ -169,6 +169,20 @@ func (p *jobPool) get(id, owner string) (*job, bool) {
 	return j, true
 }
 
+// viewOf returns the wire view of a job under the pool lock. It must be used by
+// any request path (hJob): a worker mutates a job's state under the same lock,
+// so reading the fields outside it is a data race.
+func (p *jobPool) viewOf(id, owner string) (JobView, bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.reapLocked(p.now())
+	j, ok := p.jobs[id]
+	if !ok || j.owner != owner {
+		return JobView{}, false
+	}
+	return j.view(), true
+}
+
 // stateOf reports a job's state under the pool lock. It exists so tests (and
 // any future internal caller) never read job fields unsynchronised.
 func (p *jobPool) stateOf(id, owner string) (string, bool) {

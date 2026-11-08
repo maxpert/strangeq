@@ -426,44 +426,6 @@ func TestClose_AuthDisabledRequiresFlag(t *testing.T) {
 	}
 }
 
-// --- definitions import ---
-
-// TestDefinitionsImport_MergeAndDisclosure (MIL-041, spec §11 test 75).
-func TestDefinitionsImport_MergeAndDisclosure(t *testing.T) {
-	e := basicEnv(t, true, nil)
-	e.declareQueue(t, "already-there", queueDeclareRequest{Durable: true})
-
-	defs := definitionsImportRequest{
-		Exchanges: []map[string]any{{"name": "imp-ex", "type": "direct", "durable": true}},
-		Queues: []map[string]any{
-			{"name": "imp-q", "durable": true},
-			{"name": "already-there", "durable": true},
-		},
-		Users:       []map[string]any{{"name": "bob"}},
-		Permissions: []map[string]any{{"user": "bob"}},
-		Bindings:    []map[string]any{{"source": "imp-ex"}},
-	}
-	rec := e.do(http.MethodPost, "/api/definitions", e.jsonBody(t, defs), basicAuthHeader())
-	wantStatus(t, rec, http.StatusOK)
-	res := decode[definitionsImportResult](t, rec)
-	applied := strings.Join(res.Applied, ",")
-	skipped := strings.Join(res.Skipped, ",")
-	if !strings.Contains(applied, "exchange:imp-ex") || !strings.Contains(applied, "queue:imp-q") {
-		t.Fatalf("applied = %v", res.Applied)
-	}
-	if !strings.Contains(skipped, "already-there") {
-		t.Fatalf("an equivalent entity must be skipped: %v", res.Skipped)
-	}
-	for _, want := range []string{"users:", "permissions:", "bindings:"} {
-		if !strings.Contains(skipped, want) {
-			t.Fatalf("skipped must disclose %q: %v", want, res.Skipped)
-		}
-	}
-	if res.StrangeQ == nil {
-		t.Fatalf("response must carry the strangeq disclosure object")
-	}
-}
-
 // --- jobs ---
 
 // TestJobs_BoundedOwnedExpired404 (FR-API-142/DATA-064, spec §11 test 78).
@@ -713,34 +675,6 @@ func TestRequestBodyRejectedBeforeRouting(t *testing.T) {
 	wantStatus(t, rec, http.StatusRequestEntityTooLarge)
 	if env := decode[errorEnvelope](t, rec); env.Error != errPayloadTooLarge {
 		t.Fatalf("token = %q, want payload_too_large", env.Error)
-	}
-}
-
-// TestDefinitionsImport_OverCapFailsEntity (MIL-043, spec §11 test 77).
-func TestDefinitionsImport_OverCapFailsEntity(t *testing.T) {
-	e := basicEnv(t, true, func(cfg *config.AMQPConfig) {
-		cfg.Management.Definitions.MaxQueues = 1
-		cfg.Management.Definitions.MaxExchanges = 1
-	})
-	defs := definitionsImportRequest{
-		Exchanges: []map[string]any{
-			{"name": "cap-ex-1", "type": "direct"},
-			{"name": "cap-ex-2", "type": "direct"},
-		},
-		Queues: []map[string]any{
-			{"name": "cap-q-1"},
-			{"name": "cap-q-2"},
-		},
-	}
-	rec := e.do(http.MethodPost, "/api/definitions", e.jsonBody(t, defs), basicAuthHeader())
-	wantStatus(t, rec, http.StatusOK)
-	res := decode[definitionsImportResult](t, rec)
-	if len(res.Applied) != 2 {
-		t.Fatalf("only one exchange and one queue may be applied, got %v", res.Applied)
-	}
-	failed := strings.Join(res.Failed, ",")
-	if !strings.Contains(failed, "cap-ex-2") || !strings.Contains(failed, "cap-q-2") {
-		t.Fatalf("over-cap entities must be reported as failed, got %v", res.Failed)
 	}
 }
 

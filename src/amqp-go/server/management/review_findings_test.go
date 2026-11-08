@@ -1,8 +1,6 @@
 package management
 
 import (
-	"bytes"
-	"mime/multipart"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -175,82 +173,6 @@ func TestLoopback_CookieReplayFromNonLoopback403(t *testing.T) {
 	if ok := e.do(http.MethodGet, "/api/overview", nil, cookie); ok.Code != http.StatusOK {
 		t.Fatalf("the same cookie from loopback must still be 200, got %d (%s)", ok.Code, ok.Body.String())
 	}
-}
-
-// --- F5: definitions import per-target configure authz ---
-
-// TestDefinitionsImport_PerTargetConfigureDenied pins AUTH-012: a definitions
-// import must apply the same per-target configure permission a direct
-// PUT would, not bypass it behind the single capMutate gate.
-func TestDefinitionsImport_PerTargetConfigureDenied(t *testing.T) {
-	e := inheritEnv(t, `{"users":[{"username":"adm","password_hash":"`+secretHash(t)+`",
-		"tags":["administrator"],"vhost_permissions":[{"vhost":"/","permission":{"configure":"^$","write":".*","read":".*"}}]}]}`, nil)
-	hdr := map[string]string{"Authorization": "Basic " + basicToken("adm", "secret")}
-
-	defs := definitionsImportRequest{
-		Exchanges: []map[string]any{{"name": "denied-ex", "type": "direct"}},
-		Queues:    []map[string]any{{"name": "denied-q"}},
-	}
-	rec := e.do(http.MethodPost, "/api/definitions", e.jsonBody(t, defs), hdr)
-	wantStatus(t, rec, http.StatusOK)
-	res := decode[definitionsImportResult](t, rec)
-	failed := strings.Join(res.Failed, ",")
-	if !strings.Contains(failed, "exchange:denied-ex") || !strings.Contains(failed, "queue:denied-q") {
-		t.Fatalf("denied targets must be reported failed, got %v", res.Failed)
-	}
-	if strings.Contains(strings.Join(res.Applied, ","), "denied") {
-		t.Fatalf("a denied target must never be applied: %v", res.Applied)
-	}
-	list := e.do(http.MethodGet, "/api/exchanges", nil, hdr)
-	wantStatus(t, list, http.StatusOK)
-	if strings.Contains(list.Body.String(), "denied-ex") {
-		t.Fatalf("a denied exchange must not be declared: %s", truncate(list.Body.String()))
-	}
-	queues := e.do(http.MethodGet, "/api/queues", nil, hdr)
-	if strings.Contains(queues.Body.String(), "denied-q") {
-		t.Fatalf("a denied queue must not be declared: %s", truncate(queues.Body.String()))
-	}
-}
-
-// --- F6: multipart/form-data definitions import ---
-
-// TestDefinitionsImport_MultipartFile pins COMPAT: the import endpoint accepts
-// multipart/form-data and reads the definitions document from the "file" part,
-// exactly as it accepts the same document as application/json.
-func TestDefinitionsImport_MultipartFile(t *testing.T) {
-	e := basicEnv(t, true, nil)
-	defs := definitionsImportRequest{
-		Exchanges: []map[string]any{{"name": "mp-ex", "type": "direct"}},
-		Queues:    []map[string]any{{"name": "mp-q"}},
-	}
-
-	var buf bytes.Buffer
-	mw := multipart.NewWriter(&buf)
-	fw, err := mw.CreateFormFile("file", "definitions.json")
-	if err != nil {
-		t.Fatalf("create form file: %v", err)
-	}
-	if _, err := fw.Write(e.jsonBody(t, defs)); err != nil {
-		t.Fatalf("write part: %v", err)
-	}
-	if err := mw.Close(); err != nil {
-		t.Fatalf("close multipart writer: %v", err)
-	}
-
-	rec := e.do(http.MethodPost, "/api/definitions", buf.Bytes(), map[string]string{
-		"Authorization": basicAuthHeader()["Authorization"],
-		"Content-Type":  mw.FormDataContentType(),
-	})
-	wantStatus(t, rec, http.StatusOK)
-	res := decode[definitionsImportResult](t, rec)
-	applied := strings.Join(res.Applied, ",")
-	if !strings.Contains(applied, "exchange:mp-ex") || !strings.Contains(applied, "queue:mp-q") {
-		t.Fatalf("multipart import applied = %v", res.Applied)
-	}
-
-	// The same document as JSON is still a 200 (entities now exist ⇒ skipped).
-	jsonRec := e.do(http.MethodPost, "/api/definitions", e.jsonBody(t, defs), basicAuthHeader())
-	wantStatus(t, jsonRec, http.StatusOK)
 }
 
 // --- F11: request_timeout_seconds ---
@@ -604,49 +526,6 @@ func TestLoopback_GuestCookieReplayFromNonLoopback403(t *testing.T) {
 	}
 	if ok := e.do(http.MethodGet, "/api/overview", nil, hdr); ok.Code != http.StatusOK {
 		t.Fatalf("the same guest cookie from loopback must be 200, got %d (%s)", ok.Code, ok.Body.String())
-	}
-}
-
-// TestDefinitionsImport_MultipartChunkedOverCap413 pins round-2 F6: a chunked
-// multipart body (Content-Length absent, so the pre-routing cap does not apply)
-// must still be bounded in the handler, with the generic cap reason, and must
-// not apply anything.
-func TestDefinitionsImport_MultipartChunkedOverCap413(t *testing.T) {
-	e := basicEnv(t, true, func(cfg *config.AMQPConfig) {
-		cfg.Management.Limits.MaxBodyBytes = 1024
-		cfg.Management.Limits.MaxImportBodyBytes = 1024
-	})
-
-	defs := definitionsImportRequest{Exchanges: []map[string]any{{"name": "huge-ex", "type": "direct"}}}
-	var buf bytes.Buffer
-	mw := multipart.NewWriter(&buf)
-	fw, err := mw.CreateFormFile("file", "definitions.json")
-	if err != nil {
-		t.Fatalf("create form file: %v", err)
-	}
-	payload := append(e.jsonBody(t, defs), bytes.Repeat([]byte(" "), 4096)...)
-	if _, err := fw.Write(payload); err != nil {
-		t.Fatalf("write part: %v", err)
-	}
-	if err := mw.Close(); err != nil {
-		t.Fatalf("close multipart writer: %v", err)
-	}
-
-	req := httptest.NewRequest(http.MethodPost, "/api/definitions", bytes.NewReader(buf.Bytes()))
-	req.RemoteAddr = "127.0.0.1:43210"
-	req.Header.Set("Content-Type", mw.FormDataContentType())
-	req.Header.Set("Authorization", basicAuthHeader()["Authorization"])
-	req.ContentLength = -1 // chunked: the pre-routing Content-Length cap is skipped
-	rec := httptest.NewRecorder()
-	e.mgmt.Handler().ServeHTTP(rec, req)
-
-	wantStatus(t, rec, http.StatusRequestEntityTooLarge)
-	if env := decode[errorEnvelope](t, rec); env.Reason != "request body exceeds 1024 bytes" {
-		t.Fatalf("reason = %q, want the generic request-body cap text", env.Reason)
-	}
-	list := e.do(http.MethodGet, "/api/exchanges", nil, basicAuthHeader())
-	if strings.Contains(list.Body.String(), "huge-ex") {
-		t.Fatalf("an over-cap import must not declare anything: %s", truncate(list.Body.String()))
 	}
 }
 

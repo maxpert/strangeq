@@ -9,7 +9,6 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
-	"time"
 
 	"github.com/maxpert/amqp-go/broker"
 	"github.com/maxpert/amqp-go/interfaces"
@@ -972,164 +971,80 @@ func (s *Server) canClose(p *Principal, ownerUser string) *apiError {
 }
 
 // --- definitions ---
+//
+// The export/import types and the parse -> plan -> apply engine live in
+// definitions.go (spec mgmt-05). These handlers are thin: they enforce the
+// vhost, body-limit, capability, and rate-limit gates, then delegate to the
+// single planner so dry-run and apply share one decision procedure.
 
-type definitionsStrangeQ struct {
-	Product    string   `json:"product"`
-	Version    string   `json:"version"`
-	ExportedAt string   `json:"exported_at"`
-	Subset     bool     `json:"subset"`
-	Excludes   []string `json:"excludes"`
-}
-
-type definitionsExport struct {
-	StrangeQ    any              `json:"strangeq"`
-	VHosts      []vhostInfo      `json:"vhosts"`
-	Exchanges   []exchangeInfo   `json:"exchanges"`
-	Queues      []queueFullInfo  `json:"queues"`
-	Bindings    []any            `json:"bindings"`
-	Users       []userInfo       `json:"users,omitempty"`
-	Permissions []permissionInfo `json:"permissions,omitempty"`
+// definitionsVhostOK enforces FR-CONV-003/D-1 for the {vhost} route variant: a
+// {vhost} segment that does not decode to "/" is 404 "unknown vhost".
+func definitionsVhostOK(r *http.Request) bool {
+	pat := endpointLabel(r)
+	if !strings.Contains(pat, "{vhost}") {
+		return true
+	}
+	return pathValue(pat, r.URL.EscapedPath(), "vhost") == "/"
 }
 
 func (s *Server) hDefinitionsExport(w http.ResponseWriter, r *http.Request) {
+	if !definitionsVhostOK(r) {
+		s.writeAPIError(w, r, errNotFoundMsg("unknown vhost"))
+		return
+	}
 	p := principalFrom(r)
-	if pathValue(endpointLabel(r), r.URL.EscapedPath(), "vhost") != "" {
-		if _, aerr := vhostParam(r); aerr != nil {
-			s.writeAPIError(w, r, aerr)
-			return
-		}
-	}
-	exchanges := s.exchangeList()
-	queues := s.queueFulls(s.queueSummaries())
-	exItems := make([]exchangeInfo, len(exchanges))
-	copy(exItems, exchanges)
-	qItems := make([]queueFullInfo, len(queues))
-	copy(qItems, queues)
-
-	excludes := []string{"bindings", "policies", "parameters", "global_parameters", "vhost_limits", "user_limits"}
-	resp := definitionsExport{
-		StrangeQ: definitionsStrangeQ{
-			Product:    "StrangeQ",
-			Version:    s.version(),
-			ExportedAt: time.Now().UTC().Format(time.RFC3339),
-			Subset:     true,
-			Excludes:   excludes,
-		},
-		VHosts:    []vhostInfo{singleVHost},
-		Exchanges: exItems,
-		Queues:    qItems,
-		Bindings:  []any{},
-	}
-	// users/permissions are included only with manage_users (AUTH-024).
-	if p.Has(capManageUsers) {
-		users := s.users.list()
-		resp.Users = make([]userInfo, 0, len(users))
-		for _, u := range users {
-			tags := u.Tags
-			if tags == nil {
-				tags = []string{}
-			}
-			resp.Users = append(resp.Users, userInfo{Name: u.Name, Tags: tags})
-		}
-		resp.Permissions = permissionInfos(s.users.permissions())
-	} else {
-		resp.StrangeQ = definitionsStrangeQ{
-			Product:    "StrangeQ",
-			Version:    s.version(),
-			ExportedAt: resp.StrangeQ.(definitionsStrangeQ).ExportedAt,
-			Subset:     true,
-			Excludes:   append(excludes, "users", "permissions"),
-		}
-	}
-	s.writeJSON(w, r, http.StatusOK, resp)
-}
-
-type definitionsImportRequest struct {
-	VHosts      []map[string]any `json:"vhosts"`
-	Exchanges   []map[string]any `json:"exchanges"`
-	Queues      []map[string]any `json:"queues"`
-	Bindings    []map[string]any `json:"bindings"`
-	Users       []map[string]any `json:"users"`
-	Permissions []map[string]any `json:"permissions"`
-	Parameters  []map[string]any `json:"parameters"`
-}
-
-type definitionsImportResult struct {
-	Applied  []string `json:"applied"`
-	Skipped  []string `json:"skipped"`
-	Failed   []string `json:"failed"`
-	StrangeQ any      `json:"strangeq"`
+	cur := s.currentTopology()
+	doc := s.buildDefinitionsExport(cur, p != nil && p.Has(capManageUsers))
+	s.writeJSON(w, r, http.StatusOK, doc)
 }
 
 func (s *Server) hDefinitionsImport(w http.ResponseWriter, r *http.Request) {
+	if !definitionsVhostOK(r) {
+		s.writeAPIError(w, r, errNotFoundMsg("unknown vhost"))
+		return
+	}
 	p := principalFrom(r)
+	// A principal lacking mutate_topology is refused 403 BEFORE parsing
+	// (FR-API-122, mgmt-05 §2.1).
 	if aerr := s.requireCapability(p, capMutate); aerr != nil {
 		s.writeAPIError(w, r, aerr)
 		return
 	}
+	dryRun, aerr := boolParam(r.URL.Query(), "dry_run")
+	if aerr != nil {
+		s.writeAPIError(w, r, aerr)
+		return
+	}
+	// Import rate limit (SEC-067). One import per definitions_import_seconds
+	// window, per principal; the dry-run counts against the same budget.
+	if !s.importLimit.allow(p.Name) {
+		setRateLimitHeaders(w, s.importLimit, p.Name)
+		// Retry-After is the rate-limit WINDOW (definitions_import_seconds),
+		// the shortest a client must wait for its next import to be admitted.
+		retryAfter := s.mcfg.RateLimits.DefinitionsImportSeconds
+		if retryAfter < 1 {
+			retryAfter = 1
+		}
+		s.writeAPIError(w, r, apiErr(http.StatusTooManyRequests, errRateLimited,
+			"definitions import rate limit exceeded", withHeader("Retry-After", strconv.Itoa(retryAfter))))
+		return
+	}
+	setRateLimitHeaders(w, s.importLimit, p.Name)
+
 	limit := s.mcfg.Limits.MaxImportBodyBytes
 	if limit <= 0 {
 		// A directly constructed Options may leave the import limit unset;
-		// mirror readBodyLimited's default rather than 413 every import.
-		limit = 2 << 20
+		// default to the documented 20 MiB rather than 413 every import.
+		limit = 20 << 20
 	}
-	var body []byte
-	if isMultipart(r) {
-		// multipart/form-data import (RabbitMQ-compatible): the definitions
-		// document is the "file" part. The pre-routing cap uses Content-Length
-		// and is bypassed by a chunked body (ContentLength == -1), so bound the
-		// reader here too: ParseMultipartForm(maxMemory) treats its argument as
-		// an in-memory threshold, NOT a hard cap, and would otherwise consume an
-		// unbounded stream.
-		r.Body = http.MaxBytesReader(w, r.Body, int64(limit))
-		if err := r.ParseMultipartForm(int64(limit)); err != nil {
-			var mbe *http.MaxBytesError
-			if errors.As(err, &mbe) {
-				s.writeAPIError(w, r, apiErr(http.StatusRequestEntityTooLarge, errPayloadTooLarge,
-					"request body exceeds "+strconv.Itoa(limit)+" bytes"))
-				return
-			}
-			s.writeAPIError(w, r, errBad("invalid multipart form: "+err.Error()))
-			return
-		}
-		part, _, ferr := r.FormFile("file")
-		if ferr != nil {
-			s.writeAPIError(w, r, errBad("multipart import requires a \"file\" part"))
-			return
-		}
-		defer func() { _ = part.Close() }()
-		data, rerr := io.ReadAll(io.LimitReader(part, int64(limit)+1))
-		if rerr != nil {
-			var mbe *http.MaxBytesError
-			if errors.As(rerr, &mbe) {
-				s.writeAPIError(w, r, apiErr(http.StatusRequestEntityTooLarge, errPayloadTooLarge,
-					"request body exceeds "+strconv.Itoa(limit)+" bytes"))
-				return
-			}
-			s.writeAPIError(w, r, errBad("could not read the multipart file part: "+rerr.Error()))
-			return
-		}
-		if len(data) > limit {
-			s.writeAPIError(w, r, apiErr(http.StatusRequestEntityTooLarge, errPayloadTooLarge,
-				"definitions import exceeds "+strconv.Itoa(limit)+" bytes"))
-			return
-		}
-		body = data
-	} else {
-		var aerr *apiError
-		body, aerr = s.readBodyLimited(r, limit)
-		if aerr != nil {
-			s.writeAPIError(w, r, aerr)
-			return
-		}
-	}
-	var req definitionsImportRequest
-	if err := json.Unmarshal(body, &req); err != nil {
-		s.writeAPIError(w, r, errBad("invalid definitions JSON: "+err.Error()))
+	body, aerr := s.readImportBody(w, r, limit)
+	if aerr != nil {
+		s.writeAPIError(w, r, aerr)
 		return
 	}
-	if aerr := s.auditDestructive(r, "definitions", "", "import", 0); aerr != nil {
-		s.writeAPIError(w, r, aerr)
+	payload, perr := parseDefinitions(body)
+	if perr != nil {
+		s.writeAPIError(w, r, errBad("invalid definitions JSON: "+perr.Error()))
 		return
 	}
 	b := s.broker()
@@ -1138,107 +1053,107 @@ func (s *Server) hDefinitionsImport(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	res := definitionsImportResult{Applied: []string{}, Skipped: []string{}, Failed: []string{}}
-	res.StrangeQ = map[string]any{"subset": true, "atomic": false}
+	cur := s.currentTopology()
+	caps := defsCaps{
+		MaxQueues:    s.mcfg.Definitions.MaxQueues,
+		MaxExchanges: s.mcfg.Definitions.MaxExchanges,
+		MaxBindings:  s.mcfg.Definitions.MaxBindings,
+	}
+	actions := s.planDefinitions(payload, cur, caps)
 
-	declaredExchanges := 0
-	for _, ex := range req.Exchanges {
-		name, _ := ex["name"].(string)
-		typ, _ := ex["type"].(string)
-		if name == "" {
-			res.Failed = append(res.Failed, "exchange:missing-name")
-			continue
-		}
-		if s.mcfg.Definitions.MaxExchanges > 0 && declaredExchanges >= s.mcfg.Definitions.MaxExchanges {
-			res.Failed = append(res.Failed, "exchange:"+name)
-			continue
-		}
-		durable, _ := ex["durable"].(bool)
-		autoDelete, _ := ex["auto_delete"].(bool)
-		internal, _ := ex["internal"].(bool)
-		var args map[string]interface{}
-		if a, ok := ex["arguments"].(map[string]any); ok {
-			args = a
-		}
-		if !validExchangeTypes[typ] {
-			res.Failed = append(res.Failed, "exchange:"+name)
-			continue
-		}
-		// Per-target configure authorization (AUTH-012): the import must not
-		// bypass the resource gate a direct PUT /api/exchanges/{vhost}/{name}
-		// would apply. A denied target is reported, never declared.
-		if !s.definitionsConfigureAllowed(p, interfaces.ResourceExchange, name) {
-			res.Failed = append(res.Failed, "exchange:"+name)
-			continue
-		}
-		if existing := b.GetExchanges()[name]; existing != nil {
-			res.Skipped = append(res.Skipped, "exchange:"+name)
-			continue
-		}
-		if err := b.DeclareExchange(name, typ, durable, autoDelete, internal, args); err != nil {
-			res.Failed = append(res.Failed, "exchange:"+name)
-			continue
-		}
-		res.Applied = append(res.Applied, "exchange:"+name)
-		declaredExchanges++
+	// Dry-run: plan only, no mutation, no audit (OPS-020: reads are not
+	// audited). The plan preview equals the apply outcome on the same topology
+	// because both run the same executor (D-3).
+	if dryRun {
+		applied, skipped, failed := s.runDefinitions(actions, p, true)
+		s.writeJSON(w, r, http.StatusOK, defsImportResponse{
+			Applied: applied, Skipped: skipped, Failed: failed,
+			StrangeQ: defsImportResultStrangeQ{Subset: true, Atomic: false, DryRun: true},
+		})
+		return
 	}
 
-	declaredQueues := 0
-	for _, q := range req.Queues {
-		name, _ := q["name"].(string)
-		if name == "" {
-			res.Failed = append(res.Failed, "queue:missing-name")
-			continue
-		}
-		if s.mcfg.Definitions.MaxQueues > 0 && declaredQueues >= s.mcfg.Definitions.MaxQueues {
-			res.Failed = append(res.Failed, "queue:"+name)
-			continue
-		}
-		// Per-target configure authorization (AUTH-012), exactly as a direct
-		// PUT /api/queues/{vhost}/{name} would apply.
-		if !s.definitionsConfigureAllowed(p, interfaces.ResourceQueue, name) {
-			res.Failed = append(res.Failed, "queue:"+name)
-			continue
-		}
-		durable, _ := q["durable"].(bool)
-		autoDelete, _ := q["auto_delete"].(bool)
-		exclusive, _ := q["exclusive"].(bool)
-		var args map[string]interface{}
-		if a, ok := q["arguments"].(map[string]any); ok {
-			args = a
-		}
-		if b.GetQueues()[name] != nil {
-			res.Skipped = append(res.Skipped, "queue:"+name)
-			continue
-		}
-		if _, err := b.DeclareQueue(name, durable, autoDelete, exclusive, args); err != nil {
-			res.Failed = append(res.Failed, "queue:"+name)
-			continue
-		}
-		res.Applied = append(res.Applied, "queue:"+name)
-		declaredQueues++
+	// Import is a destructive mutation (SEC-084): the audit record is durable
+	// BEFORE any entity is applied; a sink overflow ⇒ 503 and nothing applied.
+	if aerr := s.auditDestructive(r, "definitions", "", "import", 0); aerr != nil {
+		s.writeAPIError(w, r, aerr)
+		return
 	}
 
-	// Sections StrangeQ cannot apply are skipped with explicit reasons
-	// (COMPAT-024, FR-API-125).
-	for range req.Users {
-		res.Skipped = append(res.Skipped, "users:no-runtime-user-store")
-	}
-	for range req.Permissions {
-		res.Skipped = append(res.Skipped, "permissions:no-runtime-user-store")
-	}
-	for range req.Bindings {
-		res.Skipped = append(res.Skipped, "bindings:aggregate-listing-unavailable")
-	}
-	for range req.Parameters {
-		res.Skipped = append(res.Skipped, "parameters:not-implemented")
-	}
-	for range req.VHosts {
-		res.Skipped = append(res.Skipped, "vhosts:only-default-vhost")
+	// A large apply goes async on the bounded job pool (FR-API-140…143); the
+	// dry-run is always synchronous (the UI needs the preview immediately).
+	if thr := s.mcfg.Async.EntityThreshold; thr > 0 && countApply(actions) > thr {
+		job, jerr := s.jobs.submit("definitions_import", p.Name, map[string]any{"vhost": "/"}, func() (any, error) {
+			applied, skipped, failed := s.runDefinitions(actions, p, false)
+			return defsImportJobResult{Applied: applied, Skipped: skipped, Failed: failed}, nil
+		})
+		if jerr != nil {
+			s.writeAPIError(w, r, errUnavailableMsg("could not enqueue import job: "+jerr.Error()))
+			return
+		}
+		w.Header().Set("Location", "/api/strangeq/jobs/"+job.id)
+		w.Header().Set("Retry-After", "1")
+		s.auditMutation(r, "definitions", "", "import", http.StatusAccepted)
+		w.WriteHeader(http.StatusAccepted)
+		return
 	}
 
+	applied, skipped, failed := s.runDefinitions(actions, p, false)
 	s.auditMutation(r, "definitions", "", "import", http.StatusOK)
-	s.writeJSON(w, r, http.StatusOK, res)
+	s.writeJSON(w, r, http.StatusOK, defsImportResponse{
+		Applied: applied, Skipped: skipped, Failed: failed,
+		StrangeQ: defsImportResultStrangeQ{Subset: true, Atomic: false},
+	})
+}
+
+// readImportBody reads the definitions document, capping the body BEFORE any
+// JSON parsing (SEC-065/FR-API-124: http.MaxBytesReader wraps the stream). It
+// accepts application/json or a multipart/form-data "file" part.
+func (s *Server) readImportBody(w http.ResponseWriter, r *http.Request, limit int) ([]byte, *apiError) {
+	if isMultipart(r) {
+		// The pre-routing cap uses Content-Length and is bypassed by a chunked
+		// body (ContentLength == -1), so bound the reader here too:
+		// ParseMultipartForm(maxMemory) treats its argument as an in-memory
+		// threshold, NOT a hard cap, and would otherwise consume an unbounded
+		// stream.
+		r.Body = http.MaxBytesReader(w, r.Body, int64(limit))
+		if err := r.ParseMultipartForm(int64(limit)); err != nil {
+			var mbe *http.MaxBytesError
+			if errors.As(err, &mbe) {
+				return nil, apiErr(http.StatusRequestEntityTooLarge, errPayloadTooLarge,
+					"request body exceeds "+strconv.Itoa(limit)+" bytes")
+			}
+			return nil, errBad("invalid multipart form: " + err.Error())
+		}
+		part, _, ferr := r.FormFile("file")
+		if ferr != nil {
+			return nil, errBad("multipart import requires a \"file\" part")
+		}
+		defer func() { _ = part.Close() }()
+		data, rerr := io.ReadAll(io.LimitReader(part, int64(limit)+1))
+		if rerr != nil {
+			var mbe *http.MaxBytesError
+			if errors.As(rerr, &mbe) {
+				return nil, apiErr(http.StatusRequestEntityTooLarge, errPayloadTooLarge,
+					"request body exceeds "+strconv.Itoa(limit)+" bytes")
+			}
+			return nil, errBad("could not read the multipart file part: " + rerr.Error())
+		}
+		if len(data) > limit {
+			return nil, apiErr(http.StatusRequestEntityTooLarge, errPayloadTooLarge,
+				"definitions import exceeds "+strconv.Itoa(limit)+" bytes")
+		}
+		return data, nil
+	}
+	// application/json: cap first, then read (the JSON is never parsed when the
+	// cap trips, so an over-limit body cannot reach the decoder).
+	r.Body = http.MaxBytesReader(w, r.Body, int64(limit))
+	data, err := io.ReadAll(r.Body)
+	if err != nil {
+		return nil, apiErr(http.StatusRequestEntityTooLarge, errPayloadTooLarge,
+			"request body exceeds "+strconv.Itoa(limit)+" bytes")
+	}
+	return data, nil
 }
 
 // --- helpers ---
