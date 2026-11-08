@@ -32,6 +32,53 @@ func TestUI_NoFrameworkOrCDN(t *testing.T) {
 	}
 }
 
+// TestUI_MetricsSameOriginOnly pins the same-origin contract (spec mgmt-07 §8.4
+// test 15): the SPA declares "/metrics" (the route literal TestUI_StubContract
+// consumes), its only metrics fetch is the same-origin METRICS_API (never
+// METRICS_URL), and the CSP constant is not loosened.
+func TestUI_MetricsSameOriginOnly(t *testing.T) {
+	js := string(readAsset(t, "app.js"))
+	if !strings.Contains(js, `"/metrics"`) {
+		t.Error("app.js does not contain the /metrics route literal")
+	}
+	if re := regexp.MustCompile(`METRICS_API\s*=\s*API\s*\+\s*"/metrics"`); !re.MatchString(js) {
+		t.Error(`METRICS_API must be declared as API + "/metrics" (same origin)`)
+	}
+	if regexp.MustCompile(`(fetch|api)\s*\(\s*METRICS_URL`).MatchString(js) {
+		t.Error("METRICS_URL is passed to fetch/api; it may only be an href")
+	}
+	if !strings.Contains(cspPolicy, "connect-src 'self'") {
+		t.Errorf("the web CSP no longer allows same-origin connect-src: %q", cspPolicy)
+	}
+	if strings.Count(cspPolicy, "connect-src") != 1 {
+		t.Errorf("cspPolicy declares connect-src more than once: %q", cspPolicy)
+	}
+	if strings.Contains(cspPolicy, "http://") || strings.Contains(cspPolicy, "https://") {
+		t.Errorf("cspPolicy gained a cross-origin origin: %q", cspPolicy)
+	}
+}
+
+// TestUI_MetricsNavLinkIsPlain (spec test 36): the nav entry is a plain
+// same-origin link — no target=_blank and no #metrics-link id — so it can never
+// be mistaken for the raw-endpoint shortcut.
+func TestUI_MetricsNavLinkIsPlain(t *testing.T) {
+	idx := string(readAsset(t, "index.html"))
+	re := regexp.MustCompile(`<a[^>]*href="/metrics"[^>]*>`)
+	tag := re.FindString(idx)
+	if tag == "" {
+		t.Fatal("index.html has no nav link to /metrics")
+	}
+	if !strings.Contains(tag, `data-nav="metrics"`) {
+		t.Errorf("the /metrics nav link lacks data-nav=metrics: %s", tag)
+	}
+	if strings.Contains(tag, "_blank") {
+		t.Errorf("the /metrics nav link opens a new tab: %s", tag)
+	}
+	if strings.Contains(tag, "metrics-link") {
+		t.Errorf("the /metrics nav link reuses the raw-endpoint id: %s", tag)
+	}
+}
+
 // TestUI_StubContract proves the SPA still references every API route it
 // consumes and that the stub it is developed against answers the documented
 // top-level shape. It is a self-consistency check of the UI against its stub,
@@ -41,7 +88,7 @@ func TestUI_StubContract(t *testing.T) {
 	routes := []string{
 		"/whoami", "/strangeq/session", "/strangeq/version", "/health", "/overview",
 		"/queues", "/exchanges", "/connections", "/channels", "/consumers",
-		"/bindings", "/nodes", "/users", "/permissions", "/definitions",
+		"/bindings", "/nodes", "/users", "/permissions", "/definitions", "/metrics",
 	}
 	js := string(readAsset(t, "app.js"))
 	for _, r := range routes {
@@ -75,6 +122,7 @@ func TestUI_StubContract(t *testing.T) {
 		{path: "/api/permissions", status: 200, isArray: true},
 		{path: "/api/definitions", status: 200, keys: []string{"vhosts", "exchanges", "queues"}},
 		{path: "/api/bindings", status: 501, keys: []string{"error", "reason"}},
+		{path: "/api/metrics", status: 200, keys: []string{"text"}},
 	}
 	for _, c := range cases {
 		resp, err := http.Get(srv.URL + c.path)
@@ -146,6 +194,7 @@ var webConsumedRoutes = []string{
 	"/api/users",
 	"/api/permissions",
 	"/api/definitions",
+	"/api/metrics",
 }
 
 // scanAPIRouteSources globs the production .go files in dir (test helpers are

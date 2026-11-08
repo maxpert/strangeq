@@ -91,6 +91,12 @@ type stubAPI struct {
 	purgeStatus   int
 	purgeLocation string
 
+	// metricsText / metricsStatus drive GET /api/metrics (spec mgmt-07 §8.5).
+	// The default text is a small three-family fixture; metricsStatus=501/503
+	// exercises the telemetry-disabled and scrape-error notices.
+	metricsText   string
+	metricsStatus int
+
 	declared         []string
 	lastQueueDeclare map[string]any
 	hits             atomic.Int64
@@ -238,10 +244,27 @@ func defaultBindings() []map[string]any {
 	}
 }
 
+// defaultMetricsFixture is the three-family Prometheus text the stub answers
+// GET /api/metrics with unless a test overrides metricsText (spec mgmt-07
+// §8.5). It deliberately lacks amqp_wal_fsync_errors_total so a tile can be
+// shown rendering an em-dash, and carries amqp_wal_write_errors_total 0 so the
+// present-zero case is observable.
+const defaultMetricsFixture = `# HELP amqp_alpha_total Alpha counter
+# TYPE amqp_alpha_total counter
+amqp_alpha_total 5
+# HELP amqp_queue_messages_ready Ready messages
+# TYPE amqp_queue_messages_ready gauge
+amqp_queue_messages_ready{queue="orders"} 3
+# HELP amqp_wal_write_errors_total WAL write failures
+# TYPE amqp_wal_write_errors_total counter
+amqp_wal_write_errors_total 0
+`
+
 func newStub() *stubAPI {
 	return &stubAPI{
-		sessions: map[string]bool{},
-		token:    "csrf-token-abc",
+		sessions:    map[string]bool{},
+		token:       "csrf-token-abc",
+		metricsText: defaultMetricsFixture,
 		caps: map[string]any{
 			"queue_message_totals": true, "channels": true, "bindings": false,
 			"close_connection": true, "user_crud": false, "tag_capabilities": true,
@@ -345,6 +368,11 @@ func (s *stubAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	s.mu.Lock()
 	s.reqLog = append(s.reqLog, recordedReq{kind: kind, raw: r.URL.RawQuery, path: r.URL.EscapedPath(), method: r.Method})
 	s.mu.Unlock()
+
+	if kind == "metrics" {
+		s.handleMetrics(w, r)
+		return
+	}
 
 	switch kind {
 	case "whoami":
@@ -587,6 +615,28 @@ func (s *stubAPI) sessionOK(r *http.Request) bool {
 		return false
 	}
 	return s.sessions[c.Value]
+}
+
+// handleMetrics answers GET /api/metrics: 200 {text} for a scrape, or the
+// 501/503 envelope a test installs via metricsStatus (spec mgmt-07 §8.5).
+func (s *stubAPI) handleMetrics(w http.ResponseWriter, r *http.Request) {
+	s.mu.Lock()
+	status := s.metricsStatus
+	text := s.metricsText
+	s.mu.Unlock()
+	switch status {
+	case http.StatusNotImplemented:
+		writeJSON(w, http.StatusNotImplemented, map[string]any{"error": "not_implemented", "reason": "telemetry is disabled; no broker metrics are collected (set telemetry.enabled, or start with --enable-telemetry)"})
+		return
+	case http.StatusServiceUnavailable:
+		w.Header().Set("Retry-After", "1")
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": "unavailable", "reason": "metrics scrape failed"})
+		return
+	}
+	if text == "" {
+		text = defaultMetricsFixture
+	}
+	writeRead(w, r, map[string]any{"text": text})
 }
 
 // getFail returns true when it has written a 500 for a read request.
