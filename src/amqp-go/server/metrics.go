@@ -155,6 +155,15 @@ type PublisherParkStatsBinder interface {
 	BindPublisherParkStats(stats func() (count uint64, seconds float64, current int64))
 }
 
+// WALFullFlushSinkBinder is implemented by the production collector: the server
+// wires the storage tier's full-flush counter into the
+// amqp_wal_full_flush_total{site} metric at build time. GATED on the barrier
+// arm: it must stay 0 across the measured window.
+type WALFullFlushSinkBinder interface {
+	RecordWALFullFlush(site string)
+	InitWALFullFlushSites(sites []string)
+}
+
 // NoOpMetricsCollector is a metrics collector that does nothing
 type NoOpMetricsCollector struct{}
 

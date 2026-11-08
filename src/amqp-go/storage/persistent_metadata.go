@@ -74,10 +74,24 @@ type PersistentMetadataStore struct {
 	exchBindingsFromCache sync.Map // source -> []*interfaces.ExchangeBinding
 
 	cacheEnabled bool
+
+	// pol is the crash-model sync policy for atomicWrite. Under barrier mode
+	// the metadata temp-file fsync and directory sync use the fence; under
+	// force_flush they use the full drive-cache flush. A declare/topology
+	// change (which this path serves) can happen while the broker is serving
+	// traffic, so it is a fence site under barrier mode (§1).
+	pol syncPolicy
 }
 
-// NewPersistentMetadataStore creates a new persistent metadata store
+// NewPersistentMetadataStore creates a new persistent metadata store with the
+// default crash model (barrier).
 func NewPersistentMetadataStore(dataDir string) (*PersistentMetadataStore, error) {
+	return NewPersistentMetadataStoreWithCrashModel(dataDir, interfaces.CrashModelBarrier)
+}
+
+// NewPersistentMetadataStoreWithCrashModel creates a new persistent metadata
+// store whose atomicWrite follows the given crash model.
+func NewPersistentMetadataStoreWithCrashModel(dataDir, crashModel string) (*PersistentMetadataStore, error) {
 	baseDir := filepath.Join(dataDir, MetadataDir)
 
 	// Create directory structure
@@ -98,6 +112,7 @@ func NewPersistentMetadataStore(dataDir string) (*PersistentMetadataStore, error
 	store := &PersistentMetadataStore{
 		baseDir:      baseDir,
 		cacheEnabled: true, // Enable cache - investigating consumer bottleneck at high load
+		pol:          newSyncPolicy(confirmSyncFromCrashModel(crashModel)),
 	}
 
 	// Pre-populate cache on startup (if enabled)
@@ -237,7 +252,7 @@ func (pm *PersistentMetadataStore) loadBindingsFromDisk() ([]*interfaces.QueueBi
 // favored over speed. There is exactly one file fsync and one directory fsync
 // per write — no more syncing than required.
 func (pm *PersistentMetadataStore) atomicWrite(path string, data []byte) error {
-	return atomicWriteFile(path, data, 0644)
+	return atomicWriteFileWithPolicy(path, data, 0644, pm.pol.withSite(siteMetadataFile))
 }
 
 // StoreExchange persists an exchange to disk and updates cache

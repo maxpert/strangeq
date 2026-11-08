@@ -86,6 +86,13 @@ type Collector struct {
 	WALFsyncDuration    prometheus.Histogram
 	WALWriteErrorsTotal prometheus.Counter
 
+	// WALFullFlushTotal counts every fcntl(F_FULLFSYNC) the storage tier issues,
+	// labelled by the §1 durability site. It is the barrier-arm gate input: in
+	// crash_model: barrier it MUST stay 0 for the whole measured window (the
+	// only full flushes allowed fire off the traffic path, at boot and close).
+	// Fed by the storage tier through BindWALFullFlushSink.
+	WALFullFlushTotal *prometheus.CounterVec
+
 	// Segment metrics
 	SegmentCount           *prometheus.GaugeVec
 	SegmentSizeBytes       *prometheus.GaugeVec
@@ -426,6 +433,11 @@ func NewCollector(namespace string) *Collector {
 			Name:      "wal_write_errors_total",
 			Help:      "Total number of WAL write failures",
 		}),
+		WALFullFlushTotal: promauto.NewCounterVec(prometheus.CounterOpts{
+			Namespace: namespace,
+			Name:      "wal_full_flush_total",
+			Help:      "fcntl(F_FULLFSYNC) drive-cache flushes issued, by durability site. Barrier-mode gate: must stay 0 across the measured window.",
+		}, []string{"site"}),
 
 		// Segment metrics
 		SegmentCount: promauto.NewGaugeVec(prometheus.GaugeOpts{
@@ -949,6 +961,21 @@ func (c *Collector) RecordWALFsync(duration float64) {
 // RecordWALWriteError records a WAL write error
 func (c *Collector) RecordWALWriteError() {
 	c.WALWriteErrorsTotal.Inc()
+}
+
+// RecordWALFullFlush counts one issued fcntl(F_FULLFSYNC) at the given site. It
+// is the sink the storage tier calls through SetWALFullFlushSink.
+func (c *Collector) RecordWALFullFlush(site string) {
+	c.WALFullFlushTotal.WithLabelValues(site).Inc()
+}
+
+// InitWALFullFlushSites pre-initializes the per-site series to 0 so the metric
+// family is present (and therefore readable as 0) on a pristine barrier-mode
+// boot before any full flush has been issued.
+func (c *Collector) InitWALFullFlushSites(sites []string) {
+	for _, s := range sites {
+		c.WALFullFlushTotal.WithLabelValues(s).Add(0)
+	}
 }
 
 // UpdateSegmentMetrics updates segment count and size for a queue

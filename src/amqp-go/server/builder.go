@@ -369,6 +369,15 @@ func (b *ServerBuilder) Build() (*Server, error) {
 		binder.BindPublisherParkStats(server.PublisherParkStats)
 	}
 
+	// Barrier-mode gate: wire the storage tier's F_FULLFSYNC counter into the
+	// amqp_wal_full_flush_total{site} metric. Pre-initialize every known site
+	// so the family is present (readable as 0) on a pristine barrier boot. The
+	// bind is a no-op for any custom collector that lacks the sink.
+	if binder, ok := metricsCollector.(WALFullFlushSinkBinder); ok {
+		binder.InitWALFullFlushSites(storage.WALFullFlushSites())
+		storage.SetWALFullFlushSink(binder.RecordWALFullFlush)
+	}
+
 	// Create and attach lifecycle manager
 	server.Lifecycle = NewLifecycleManager(server, b.config)
 

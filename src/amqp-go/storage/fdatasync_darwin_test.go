@@ -61,7 +61,13 @@ func TestFdatasyncFile_Darwin(t *testing.T) {
 func TestSyncDirPlatformSync_DarwinWiring(t *testing.T) {
 	require.NotNil(t, syncDirPlatformSync, "darwin must install a directory Sync")
 	require.Equal(t,
-		reflect.ValueOf(fdatasyncFile).Pointer(),
+		reflect.ValueOf(fullFsyncDir).Pointer(),
 		reflect.ValueOf(syncDirPlatformSync).Pointer(),
-		"the darwin directory fsync must route through fdatasyncFile (preemptible F_FULLFSYNC), not os.File.Sync")
+		"the darwin directory full flush must route through fullFsyncDir (the preemptible F_FULLFSYNC, "+
+			"labelled for the full-flush counter), not os.File.Sync")
+	require.NotNil(t, syncDirPlatformFenceSync, "darwin must install a directory fence")
+	require.Equal(t,
+		reflect.ValueOf(barrierDirSyncFile).Pointer(),
+		reflect.ValueOf(syncDirPlatformFenceSync).Pointer(),
+		"the darwin directory fence must route through barrierDirSyncFile (F_BARRIERFSYNC with a plain-fsync fallback)")
 }

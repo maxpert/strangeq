@@ -29,11 +29,24 @@ import (
 // syncdir_darwin.go for macOS) so macOS can route it through the preemptible
 // F_FULLFSYNC.
 func syncDirPlatform(dir string) error {
+	return syncDirPlatformWith(dir, syncDirPlatformSync)
+}
+
+// syncDirPlatformFence is the crash_model: barrier directory barrier. On darwin
+// syncDirPlatformFenceSync issues fcntl(F_BARRIERFSYNC) on the directory fd
+// (with a plain-fsync fallback, never F_FULLFSYNC); on every other platform it
+// is a plain directory fsync, and the fence is never selected there anyway
+// (ConfirmFenceOrdersOnly is false).
+func syncDirPlatformFence(dir string) error {
+	return syncDirPlatformWith(dir, syncDirPlatformFenceSync)
+}
+
+func syncDirPlatformWith(dir string, sync func(*os.File) error) error {
 	d, err := os.Open(dir)
 	if err != nil {
 		return err
 	}
-	serr := syncDirPlatformSync(d)
+	serr := sync(d)
 	cerr := d.Close()
 	if serr != nil {
 		if isUnsupportedDirSyncError(serr) {

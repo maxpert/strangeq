@@ -7,12 +7,14 @@ package storage
 // the drive cache, so that call paid the whole previous file's backlog (~109 ms
 // for a 512 MiB file) while the committer held fileMutex — the F3 confirm tail.
 //
-// W8 moves both halves of that flush off the commit path into a helper
-// goroutine (preopenNext): step 1 flushes the retired file's tail; step 2
-// creates + opens + directory-F_FULLFSYNCs the next file and parks it. rollFile
-// then only swaps the parked handle. These tests pin the control flow with the
-// syncDir / walOpenFile seams and the pre-open completion hook, never with
-// sleeps.
+// W8 moves the CREATE off the commit path into a helper goroutine
+// (preopenNext): step 2 creates + opens + directory-syncs the next file and
+// parks it. rollFile then only swaps the parked handle. Under crash_model:
+// barrier step 1 (the retired file's tail flush) is DROPPED entirely — the
+// frontier recovery rule no longer depends on it and nothing defers media
+// writes any more; force_flush keeps it as shipped. These tests pin the control
+// flow with the syncDir / walOpenFile seams and the pre-open completion hook,
+// never with sleeps.
 
 import (
 	"fmt"
@@ -102,8 +104,8 @@ func TestWALPreopen_RollTakesParkedFileWithoutBlockingOnTheFlush(t *testing.T) {
 	defer restoreDone()
 
 	// Count every commit-path open and directory flush. The helper's own
-	// gated step-1 flush is deliberately NOT counted until the gate releases,
-	// so any delta during the armed roll is the roll's.
+	// directory barrier is gated (blocked) once armed, so any delta during the
+	// armed roll is the roll's.
 	var mu sync.Mutex
 	opens, syncs := 0, 0
 	armed := false
@@ -262,9 +264,10 @@ func TestWALPreopen_FailedPreopenFallsBackToInlineOpen(t *testing.T) {
 
 // TestWALPreopen_RollWaitsForInFlightOpen pins T-W8-5: a roll that needs the
 // exact file the helper is still opening WAITS for that result rather than
-// opening the same path a second time. The second directory sync (the helper's
-// step 1) is gated, so the helper is stuck inside the pre-open while the roll
-// arrives; the roll must block until the gate is released.
+// opening the same path a second time. The helper's second directory sync (the
+// creation sync inside its step 2 under barrier mode) is gated, so the helper
+// is stuck mid-open while the roll arrives; the roll must block until the gate
+// is released.
 func TestWALPreopen_RollWaitsForInFlightOpen(t *testing.T) {
 	dir := t.TempDir()
 	wm, err := NewWALManagerWithConfig(dir, coldTailWALConfig())
@@ -284,8 +287,8 @@ func TestWALPreopen_RollWaitsForInFlightOpen(t *testing.T) {
 		cur := n
 		mu.Unlock()
 		if cur == 2 {
-			// The helper's step 1: block it so it is mid-open when the roll
-			// arrives.
+			// The helper's creation directory sync (step 2 under barrier mode):
+			// block it so it is mid-open when the roll arrives.
 			<-gate
 		}
 		return nil
@@ -417,55 +420,66 @@ func TestWALPreopen_LeftoverParkedFileIsBenignOnBoot(t *testing.T) {
 		"every record in the two real files must be recovered; the empty newest file contributes nothing")
 }
 
-// TestWALPreopen_SwapBeforeRetiredFileFlushStaysWithinTwoNewestFiles is the
-// crash-after-swap-before-flush recovery test.
+// TestWALPreopen_RetiredFileTailDefectIsBenign is the crash-after-swap recovery
+// test, UPDATED FOR THE NO-FLUSH REALITY.
 //
-// W8 defers the retired file's tail flush to the helper's next step 1, which
-// runs AFTER the swap. So immediately after a swap the just-retired file
-// (second-newest) can carry an unflushed, and therefore possibly damaged, tail
-// while the pre-opened next file (newest) exists empty. R-TAIL-HOLE's bound must
-// still hold: a bounded non-zero defect on the second-newest file is a benign
-// unconfirmed tail, NOT interior corruption.
+// W8 no longer defers a retired-file tail flush: under barrier mode step 1 is
+// DROPPED entirely, and nothing defers media writes any more. But a crash can
+// still leave the just-retired file (F-) with a bounded tail defect while the
+// pre-opened next file (F) exists as a header-only, data-empty stub. The
+// frontier rule (see walTailRule) must treat a bounded defect on F- as benign,
+// exactly as R-TAIL-HOLE did for the second-newest file, and force_flush keeps
+// the two-newest rule.
 //
 // Fixture: file 1 clean, file 2 = [records][bounded hole][records], file 3 = the
 // pre-opened header-only file (newest). Boot must succeed and recover file 1
-// plus file 2's contiguous prefix.
-func TestWALPreopen_SwapBeforeRetiredFileFlushStaysWithinTwoNewestFiles(t *testing.T) {
-	dir := t.TempDir()
+// plus file 2's contiguous prefix, in BOTH modes.
+func TestWALPreopen_RetiredFileTailDefectIsBenign(t *testing.T) {
+	for _, mode := range []struct {
+		name      string
+		engineCfg interfaces.EngineConfig
+	}{
+		{"barrier_frontier", interfaces.EngineConfig{CrashModel: interfaces.CrashModelBarrier}},
+		{"force_flush_two_newest", interfaces.EngineConfig{CrashModel: interfaces.CrashModelForceFlush}},
+	} {
+		t.Run(mode.name, func(t *testing.T) {
+			dir := t.TempDir()
 
-	clean := walHeaderBytes()
-	for off := uint64(1); off <= 5; off++ {
-		clean = appendHoleRecord(t, clean, off)
-	}
-	writeSharedWALFile(t, dir, 1, clean)
+			clean := walHeaderBytes()
+			for off := uint64(1); off <= 5; off++ {
+				clean = appendHoleRecord(t, clean, off)
+			}
+			writeSharedWALFile(t, dir, 1, clean)
 
-	second := walHeaderBytes()
-	for off := uint64(11); off <= 15; off++ {
-		second = appendHoleRecord(t, second, off)
-	}
-	second = append(second, make([]byte, 64*1024)...) // the unflushed tail's hole
-	for off := uint64(16); off <= 18; off++ {
-		second = appendHoleRecord(t, second, off)
-	}
-	writeSharedWALFile(t, dir, 2, second)
+			second := walHeaderBytes()
+			for off := uint64(11); off <= 15; off++ {
+				second = appendHoleRecord(t, second, off)
+			}
+			second = append(second, make([]byte, 64*1024)...) // the bounded tail defect
+			for off := uint64(16); off <= 18; off++ {
+				second = appendHoleRecord(t, second, off)
+			}
+			writeSharedWALFile(t, dir, 2, second)
 
-	// The pre-opened next file exists and is newest, so file 2 is
-	// second-newest: its bounded hole must be tolerated, never fatal.
-	writeSharedWALFile(t, dir, 3, walHeaderBytes())
+			// The pre-opened next file exists and is newest (data-empty), so
+			// file 2 is F- (resp. second-newest): its bounded hole must be
+			// tolerated, never fatal.
+			writeSharedWALFile(t, dir, 3, walHeaderBytes())
 
-	st, err := NewDisruptorStorageWithEngineConfig(dir, interfaces.EngineConfig{})
-	require.NoError(t, err,
-		"a bounded tail defect on the SECOND-newest file (the just-retired file whose flush W8 "+
-			"deferred) must stay within R-TAIL-HOLE's two-newest bound, not refuse the boot")
-	defer st.Close()
+			st, err := NewDisruptorStorageWithEngineConfig(dir, mode.engineCfg)
+			require.NoError(t, err,
+				"a bounded tail defect on the just-retired file must not refuse the boot")
+			defer st.Close()
 
-	msgs, rerr := st.GetRecoverableMessages()
-	require.NoError(t, rerr)
-	require.Len(t, msgs["q"], 10,
-		"file 1 (5 records) plus file 2's contiguous prefix (5 records) must be recovered; "+
-			"replay stops at the first defect")
-	for _, m := range msgs["q"] {
-		require.True(t, m.DeliveryTag <= 5 || (m.DeliveryTag >= 11 && m.DeliveryTag <= 15),
-			"only the prefix before the defect may be recovered, got tag %d", m.DeliveryTag)
+			msgs, rerr := st.GetRecoverableMessages()
+			require.NoError(t, rerr)
+			require.Len(t, msgs["q"], 10,
+				"file 1 (5 records) plus file 2's contiguous prefix (5 records) must be recovered; "+
+					"replay stops at the first defect")
+			for _, m := range msgs["q"] {
+				require.True(t, m.DeliveryTag <= 5 || (m.DeliveryTag >= 11 && m.DeliveryTag <= 15),
+					"only the prefix before the defect may be recovered, got tag %d", m.DeliveryTag)
+			}
+		})
 	}
 }

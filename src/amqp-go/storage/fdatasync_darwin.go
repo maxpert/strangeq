@@ -44,13 +44,20 @@ import (
 // EINTR is retried and ENOTSUP falls back to fsync(2), mirroring
 // internal/poll.(*FD).Fsync on darwin (see Go issue #64215).
 func fdatasyncFile(f *os.File) error {
+	return fdatasyncFileSite(f, "")
+}
+
+// fdatasyncFileSite is fdatasyncFile with a site label for the full-flush
+// counter (amqp_wal_full_flush_total{site}). Every F_FULLFSYNC issued through
+// it is counted at the choke point below.
+func fdatasyncFileSite(f *os.File, site string) error {
 	rc, err := f.SyscallConn()
 	if err != nil {
 		return err
 	}
 	var syncErr error
 	cerr := rc.Control(func(fd uintptr) {
-		syncErr = fullFsyncFD(fd)
+		syncErr = fullFsyncFD(fd, site)
 	})
 	if cerr != nil {
 		return cerr
@@ -74,11 +81,19 @@ func fsyncFcntl(fd uintptr, cmd int) error {
 
 // fullFsyncFD issues F_FULLFSYNC on fd, retrying EINTR and falling back to
 // fsync(2) on ENOTSUP exactly like the standard library's darwin Fsync.
-func fullFsyncFD(fd uintptr) error {
+//
+// IT IS THE SINGLE FULL-FLUSH CHOKE POINT: every darwin F_FULLFSYNC this
+// process issues goes through here, so the amqp_wal_full_flush_total{site}
+// counter cannot be escaped by a site that forgets to count. The count is
+// incremented only when the F_FULLFSYNC step actually succeeded (whether the
+// real fcntl ran or a test's sync-cmd hook substituted for it); the ENOTSUP
+// fallback is a plain fsync, NOT a drive-cache flush, so it is not counted.
+func fullFsyncFD(fd uintptr, site string) error {
 	for {
 		err := fsyncFcntl(fd, unix.F_FULLFSYNC)
 		switch {
 		case err == nil:
+			recordFullFlush(site)
 			return nil
 		case errors.Is(err, syscall.EINTR):
 			continue
@@ -104,13 +119,20 @@ func fullFsyncFD(fd uintptr) error {
 // barrier order on drives that honour barriers. Only the two confirm sites use
 // this; every other durability site keeps the full F_FULLFSYNC (fdatasyncFile).
 func barrierSyncFile(f *os.File) error {
+	return barrierSyncFileSite(f, "")
+}
+
+// barrierSyncFileSite is barrierSyncFile with a site label for the full-flush
+// counter: if the device rejects F_BARRIERFSYNC the fallback issues a real
+// F_FULLFSYNC, which is counted under this site.
+func barrierSyncFileSite(f *os.File, site string) error {
 	rc, err := f.SyscallConn()
 	if err != nil {
 		return err
 	}
 	var syncErr error
 	cerr := rc.Control(func(fd uintptr) {
-		syncErr = barrierFsyncFD(fd)
+		syncErr = barrierFsyncFD(fd, site)
 	})
 	if cerr != nil {
 		return cerr
@@ -126,7 +148,7 @@ func barrierSyncFile(f *os.File) error {
 // primitive, so the fallback is always safe. One WARN is emitted (if a logger
 // was ever wired) so a device silently dropping to the slower primitive is
 // visible.
-func barrierFsyncFD(fd uintptr) error {
+func barrierFsyncFD(fd uintptr, site string) error {
 	for {
 		err := fsyncFcntl(fd, unix.F_BARRIERFSYNC)
 		switch {
@@ -146,11 +168,69 @@ func barrierFsyncFD(fd uintptr) error {
 						interfaces.LogField{Key: "err", Value: err.Error()})
 				}
 			}
-			return fullFsyncFD(fd)
+			return fullFsyncFD(fd, site+":"+siteFenceFallback)
 		default:
 			return err
 		}
 	}
+}
+
+// barrierDirFsyncFD issues F_BARRIERFSYNC on a DIRECTORY fd. It is the directory
+// analogue of barrierFsyncFD, with one deliberate difference: on EINVAL/ENOSYS/
+// ENOTSUP it falls back to a PLAIN fsync(2), NEVER to F_FULLFSYNC. A full-flush
+// fallback here would silently reintroduce the 100–300 ms whole-drive-cache
+// drain per roll that IS the bug this design removes. The next file barrier
+// (cmd 85) orders the directory's metadata I/O before later writes, so plain
+// fsync followed by a fence gives the required order.
+func barrierDirFsyncFD(fd uintptr) error {
+	for {
+		err := fsyncFcntl(fd, unix.F_BARRIERFSYNC)
+		switch {
+		case err == nil:
+			return nil
+		case errors.Is(err, syscall.EINTR):
+			continue
+		case errors.Is(err, syscall.EINVAL),
+			errors.Is(err, syscall.ENOSYS),
+			errors.Is(err, syscall.ENOTSUP),
+			errors.Is(err, syscall.EOPNOTSUPP):
+			if barrierDirFallbackWarned.CompareAndSwap(false, true) {
+				if l := storageWarnLogger.Load(); l != nil {
+					l.Warn("fcntl(F_BARRIERFSYNC) is not supported on a directory handle; "+
+						"the directory barrier falls back to plain fsync(2), NOT to F_FULLFSYNC "+
+						"(a full drive-cache flush would stall every concurrent barrier)",
+						interfaces.LogField{Key: "err", Value: err.Error()})
+				}
+			}
+			for {
+				if ferr := unix.Fsync(int(fd)); !errors.Is(ferr, syscall.EINTR) {
+					return ferr
+				}
+			}
+		default:
+			return err
+		}
+	}
+}
+
+// barrierDirFallbackWarned guards the one-time directory-fallback WARN above.
+var barrierDirFallbackWarned atomic.Bool
+
+// barrierDirSyncFile issues F_BARRIERFSYNC on a directory *os.File through the
+// preemptible x/sys path, with the plain-fsync fallback above.
+func barrierDirSyncFile(f *os.File) error {
+	rc, err := f.SyscallConn()
+	if err != nil {
+		return err
+	}
+	var syncErr error
+	cerr := rc.Control(func(fd uintptr) {
+		syncErr = barrierDirFsyncFD(fd)
+	})
+	if cerr != nil {
+		return cerr
+	}
+	return syncErr
 }
 
 // barrierFallbackWarned guards the one-time WARN above.

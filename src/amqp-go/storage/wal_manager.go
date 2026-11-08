@@ -536,24 +536,24 @@ type QueueWAL struct {
 	//
 	// The roll used to run its retired-file directory F_FULLFSYNC INLINE under
 	// fileMutex (rollFile -> openWALFile -> syncDir). Under crash_model: barrier
-	// nothing else flushes the drive cache, so that one call pays the WHOLE
+	// nothing else flushed the drive cache, so that one call paid the WHOLE
 	// previous file's backlog — ~109 ms measured for a 512 MiB file — while the
-	// committer holds fileMutex: the F3 confirm tail (p95 159–310 ms). W8 moves
-	// BOTH halves off the commit path:
+	// committer held fileMutex: the F3 confirm tail (p95 159–310 ms). W8 moves
+	// the CREATE off the commit path:
 	//
-	//   step 1  syncDir(dataDir): the retired file's tail flush, ordered BEFORE
-	//           the next file is created. Order matters: it keeps the
-	//           two-newest-file recovery bound EXACT by ensuring no younger
-	//           file's directory entry can outlive an unflushed older file.
-	//   step 2  openWALFile(next): create + header + creation dir F_FULLFSYNC,
-	//           parked for the next roll.
+	//   step 1  the retired file's tail flush, in force_flush only. Under
+	//           barrier it is DROPPED: the frontier recovery rule does not
+	//           depend on it and nothing defers media writes any more.
+	//   step 2  openWALFile(next): create + header + creation dir barrier,
+	//           parked for the next roll. The creation dir barrier is a FENCE
+	//           under barrier mode, a full flush under force_flush.
 	//
 	// rollFile then only swaps a parked handle — no syscall beyond the retired
 	// write fd's close. It falls back to the old inline open (the same stall)
 	// whenever no file is parked, so a failure or a lag degrades to today's
-	// behaviour, never to a wrong one. The recovery contract is unchanged: the
-	// full directory flush still happens once per file, before the file is used,
-	// and the confirmed-loss window still spans at most the two newest files.
+	// behaviour, never to a wrong one. The recovery contract is per the
+	// crash-model rule (walTailRule): two newest under force_flush, the frontier
+	// (F/F-, newer files data-empty) under barrier.
 	//
 	// preopenReq (capacity 1) coalesces signals: the helper re-reads fileNum+1
 	// at pickup, so a dropped duplicate prepares the same next file.
@@ -1120,14 +1120,18 @@ type walFsyncFn func(*os.File) error
 
 var walGroupCommitFsyncHook atomic.Pointer[walFsyncFn]
 
-func walGroupCommitFsync(f *os.File, force bool) error {
-	if p := walGroupCommitFsyncHook.Load(); p != nil {
-		return (*p)(f)
+func walGroupCommitFsync(f *os.File, p syncPolicy) error {
+	if h := walGroupCommitFsyncHook.Load(); h != nil {
+		return (*h)(f)
 	}
-	if force {
-		return fdatasyncFile(f)
-	}
-	return barrierSyncFile(f)
+	return p.file(f)
+}
+
+// policy returns the crash-model sync policy for one durability site, with the
+// site label used by the full-flush counter. It reads the mode from the
+// per-instance config so several storages in one test binary can differ.
+func (qw *QueueWAL) policy(site string) syncPolicy {
+	return newSyncPolicy(qw.cfg.ConfirmSync).withSite(site)
 }
 
 // SetWALGroupCommitFsyncForTest installs fn as the fsync used by the shared-WAL
@@ -1433,7 +1437,7 @@ func (qw *QueueWAL) writeTxAtomic(records []*RecoveryMessage) error {
 	// later records) share the one durable entry. A roll installs a fresh
 	// value, so a new file re-checks.
 	if !qw.currentFileDirEntryDurable {
-		if serr := syncDir(qw.dataDir); serr != nil {
+		if serr := qw.policy(siteTxDir).dir(qw.dataDir); serr != nil {
 			return fmt.Errorf("WAL transaction directory fsync failed: %w", serr)
 		}
 		qw.currentFileDirEntryDurable = true
@@ -1495,7 +1499,7 @@ func (qw *QueueWAL) writeTxAtomic(records []*RecoveryMessage) error {
 	// commit after restart and seed interior corruption once more data
 	// follows possibly-lost pages (fsyncgate). Truncate to startPos instead.
 	fsyncStart := time.Now()
-	fsyncErr := walTxFsync(qw.currentFile, qw.cfg.ConfirmSync == walConfirmForceFlush)
+	fsyncErr := walTxFsync(qw.currentFile, qw.policy(siteTxConfirm))
 	if qw.metrics != nil {
 		qw.metrics.RecordWALFsync(time.Since(fsyncStart).Seconds())
 		if fsyncErr != nil {
@@ -1794,9 +1798,11 @@ func (wm *WALManager) RecoverFromWAL() ([]*RecoveryMessage, error) {
 			"every durable message in the WAL directory is abandoned", err)
 	}
 
-	// The two newest file numbers, for the R-TAIL-HOLE bound. A trailing roll
-	// can leave unconfirmed bytes on both N and N+1.
-	var firstNewest, secondNewest uint64
+	// The benign-unconfirmed-tail rule for this scan's crash model: the frontier
+	// under barrier+darwin, the two newest by number under force_flush (and on
+	// every non-darwin platform). Same rule as the boot index, over the same
+	// directory, so the two walks cannot disagree.
+	var refs []walFileRef
 	for _, file := range files {
 		if !isWALFileName(file) {
 			continue
@@ -1805,17 +1811,9 @@ func (wm *WALManager) RecoverFromWAL() ([]*RecoveryMessage, error) {
 		if !ok {
 			continue
 		}
-		switch {
-		case num > firstNewest:
-			secondNewest = firstNewest
-			firstNewest = num
-		case num > secondNewest:
-			secondNewest = num
-		}
+		refs = append(refs, walFileRef{num: num, path: filepath.Join(sharedDir, file.Name())})
 	}
-	isTwoNewest := func(n uint64) bool {
-		return n == firstNewest || (secondNewest != 0 && n == secondNewest)
-	}
+	allowUnconfirmedTail := walTailRule(refs, newSyncPolicy(wm.sharedWAL.cfg.ConfirmSync).fence)
 
 	// Scan each WAL file. isWALFileName is the SINGLE enumeration predicate for
 	// this directory (canon rule 12) — rebuildBootState used to accept only
@@ -1828,11 +1826,11 @@ func (wm *WALManager) RecoverFromWAL() ([]*RecoveryMessage, error) {
 		}
 
 		filePath := filepath.Join(sharedDir, file.Name())
-		fileNewest := false
+		fileAllowsUnconfirmed := false
 		if num, ok := parseWALFileNum(file.Name()); ok {
-			fileNewest = isTwoNewest(num)
+			fileAllowsUnconfirmed = allowUnconfirmedTail(num)
 		}
-		res, serr := wm.sharedWAL.scanWALFileDetailed(filePath, -1, fileNewest)
+		res, serr := wm.sharedWAL.scanWALFileDetailed(filePath, -1, fileAllowsUnconfirmed)
 		if serr != nil {
 			fault := classifyWALScanError(filePath, serr)
 			faults = append(faults, fault)
@@ -2265,7 +2263,7 @@ func joinScanFaults(faults []error) error {
 // `newest` selects the R-TAIL-HOLE bound: a bounded non-zero suffix after the
 // first defect is a benign unconfirmed tail only on one of the two newest
 // files; elsewhere it is fatal.
-func (qw *QueueWAL) scanWALFileDetailed(filePath string, limit int64, newest bool) (*walScanResult, error) {
+func (qw *QueueWAL) scanWALFileDetailed(filePath string, limit int64, allowUnconfirmed bool) (*walScanResult, error) {
 	res := &walScanResult{unloadable: map[recordKey]string{}}
 
 	file, err := os.Open(filePath)
@@ -2353,7 +2351,7 @@ func (qw *QueueWAL) scanWALFileDetailed(filePath string, limit int64, newest boo
 			// walBlankRecordHeader: the write path cannot produce this.
 			//
 			// R-TAIL-HOLE: classify the region after the defect.
-			switch class, _ := classifyWALDefect(file, recStart, fileSize, newest); class {
+			switch class, _ := classifyWALDefect(file, recStart, fileSize, allowUnconfirmed); class {
 			case walDefectTornTail:
 				res.faults = append(res.faults, interfaces.BenignFault("wal-scan", filePath,
 					fmt.Sprintf("zero-filled tail from byte offset %d to end of file (%d bytes); those blocks never reached the platter, so nothing in them was ever fsynced or confirmed", recStart, fileSize-recStart)))
@@ -2389,7 +2387,7 @@ func (qw *QueueWAL) scanWALFileDetailed(filePath string, limit int64, newest boo
 			h.Write(data)
 			if crc != h.Sum32() {
 				// R-TAIL-HOLE: classify the region from the defect.
-				switch class, _ := classifyWALDefect(file, curRecStart, fileSize, newest); class {
+				switch class, _ := classifyWALDefect(file, curRecStart, fileSize, allowUnconfirmed); class {
 				case walDefectTornTail:
 					// TAIL. Drop this record only and stop; nothing
 					// intelligible follows it (Ra's is_last_record/3).
@@ -2943,7 +2941,7 @@ func (qw *QueueWAL) commitBatch(sb *stagedBatch) {
 	var fsyncErr error
 	if !qw.cfg.SyncDisabled {
 		fsyncStart := time.Now()
-		fsyncErr = walGroupCommitFsync(qw.currentFile, qw.cfg.ConfirmSync == walConfirmForceFlush)
+		fsyncErr = walGroupCommitFsync(qw.currentFile, qw.policy(siteGroupCommit))
 		fsyncDuration := time.Since(fsyncStart).Seconds()
 
 		// Record fsync metrics
@@ -4337,14 +4335,20 @@ func (qw *QueueWAL) preopenNext() (redo bool) {
 	qw.preopenMu.Unlock()
 
 	// STEP 1 (this file's predecessor's tail flush). This is the roll's old
-	// on-path directory F_FULLFSYNC, moved off the commit path. It is ordered
-	// BEFORE the next file is created so that no younger file's directory
-	// entry can outlive an older, unflushed file — which is what keeps the
-	// confirmed-loss window at the two newest files (R-TAIL-HOLE). Under
-	// SyncDisabled nothing in the file was durable, so the barrier is skipped
-	// exactly as the roll skipped it (D2).
-	if !qw.cfg.SyncDisabled {
-		if err := syncDir(qw.dataDir); err != nil {
+	// on-path directory F_FULLFSYNC, moved off the commit path by W8.
+	//
+	// IN BARRIER MODE IT IS DROPPED ENTIRELY. Its only job was to bound the
+	// confirmed-loss window to the two newest files under the FULL-flush
+	// recovery rule; the frontier rule (see walTailRule) no longer depends on
+	// it, and with the fence everywhere nothing defers media writes — the drive
+	// writes back lazily on its own. Keeping it would issue a whole-drive-cache
+	// flush 2–4.5×/s for a guarantee the design no longer needs.
+	//
+	// In force_flush mode it is kept exactly as shipped: every batch already
+	// flushed, so the step is harmless there (≈4 ms off the commit path), and
+	// force_flush must stay byte-identical.
+	if !qw.cfg.SyncDisabled && !qw.policy(sitePreopenFlush).fence {
+		if err := qw.policy(sitePreopenFlush).dir(qw.dataDir); err != nil {
 			qw.logWarn("WAL pre-open: the retired file's directory flush failed; its tail is not yet durable and the next roll may fall back to an inline open",
 				interfaces.LogField{Key: "dir", Value: qw.dataDir},
 				interfaces.LogField{Key: "error", Value: err.Error()})
@@ -4609,7 +4613,7 @@ func (qw *QueueWAL) openWALFile(num uint64) (w, r *os.File, size int64, dirEntry
 		// to the first transaction instead of paying it on every roll.
 		dirEntryDurable = false
 		if !qw.cfg.SyncDisabled {
-			if serr := syncDir(qw.dataDir); serr != nil {
+			if serr := qw.policy(siteRollDir).dir(qw.dataDir); serr != nil {
 				_ = file.Close()
 				_ = os.Remove(filename)
 				return nil, nil, 0, false, fmt.Errorf("WAL file directory fsync failed: %w", serr)
@@ -4864,7 +4868,7 @@ func (qw *QueueWAL) tryReclaimOldFiles() {
 	// itself is unconditional: it is the barrier, not the reclamation, that is
 	// gated.
 	if unlinkedAny && !qw.cfg.SyncDisabled {
-		if err := syncDir(qw.dataDir); err != nil {
+		if err := qw.policy(siteReclaimDir).dir(qw.dataDir); err != nil {
 			qw.logWarn("WAL directory fsync after reclaim failed; completed reclaim remains valid, but its directory mutations are not durable yet",
 				interfaces.LogField{Key: "dir", Value: qw.dataDir},
 				interfaces.LogField{Key: "error", Value: err.Error()})
@@ -5222,7 +5226,11 @@ func (qw *QueueWAL) close() {
 	defer qw.fileMutex.Unlock()
 
 	if qw.currentFile != nil {
-		_ = qw.currentFile.Sync()
+		// A clean shutdown is power-loss safe: the FULL drive-cache flush, in
+		// BOTH crash models, and deliberately fdatasyncFile (not os.File.Sync,
+		// which keeps the P for the whole flush on darwin — the known STW
+		// hazard). One bounded drain at shutdown, off the traffic path.
+		_ = fdatasyncFileSite(qw.currentFile, siteClose)
 		_ = qw.currentFile.Close()
 	}
 	if qw.currentReadFile != nil {

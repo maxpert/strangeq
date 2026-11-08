@@ -27,10 +27,32 @@ import (
 // wrapper maps that to nil after logging one WARN (if a logger was ever
 // wired; storage without a logger stays silent).
 func syncDir(dir string) error {
+	return syncDirVia(dir, syncDirPlatform)
+}
+
+// syncDirFence is the crash_model: barrier directory barrier: fsync the
+// directory's metadata to the drive and issue an ORDERING BARRIER instead of
+// flushing the drive's whole volatile write cache. It is the dir analogue of
+// barrierSyncFile and is used by every directory site that can fire while the
+// broker is serving traffic (roll, creation, reclaim, compaction, segment,
+// metadata). On a device that rejects the fence it falls back to PLAIN fsync,
+// NEVER to F_FULLFSYNC — a full flush here is the per-roll stall this design
+// removes.
+//
+// Like syncDir it routes through the single hookable seam and maps the
+// "filesystem cannot fsync directories" errno class to success.
+func syncDirFence(dir string) error {
+	return syncDirVia(dir, syncDirPlatformFence)
+}
+
+// syncDirVia is the shared body of syncDir/syncDirFence: hook first (tests
+// observe the ordering through it), then the platform primitive, then the
+// unsupported-errno mapping.
+func syncDirVia(dir string, plat func(string) error) error {
 	if p := syncDirHook.Load(); p != nil {
 		return (*p)(dir)
 	}
-	err := syncDirPlatform(dir)
+	err := plat(dir)
 	if errors.Is(err, errDirSyncUnsupported) {
 		if syncDirUnsupportedWarned.CompareAndSwap(false, true) {
 			if l := storageWarnLogger.Load(); l != nil {

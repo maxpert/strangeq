@@ -204,6 +204,10 @@ func WALConfigFromEngine(ec interfaces.EngineConfig) WALConfig {
 func SegmentConfigFromEngine(ec interfaces.EngineConfig) SegmentConfig {
 	cfg := DefaultSegmentConfig()
 	cfg.CRCDisabled = ec.WALCRCDisabled
+	// ConfirmSync: the zero value (walConfirmBarrier) is the default, so any
+	// value other than the explicit "force_flush" keeps the barrier. Mirrors
+	// WALConfigFromEngine.
+	cfg.ConfirmSync = confirmSyncFromCrashModel(ec.CrashModel)
 	if ec.SegmentSize > 0 {
 		cfg.SegmentSize = ec.SegmentSize
 	}
@@ -257,7 +261,7 @@ func NewDisruptorStorageWithEngineConfig(dataDir string, engineCfg interfaces.En
 	if hotCacheGlobalBytes <= 0 {
 		hotCacheGlobalBytes = DefaultHotCacheGlobalBytes
 	}
-	metadataStore, err := NewPersistentMetadataStore(dataDir)
+	metadataStore, err := NewPersistentMetadataStoreWithCrashModel(dataDir, engineCfg.CrashModel)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create metadata store: %w", err)
 	}

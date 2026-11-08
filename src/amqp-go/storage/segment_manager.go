@@ -69,6 +69,13 @@ type SegmentConfig struct {
 	// is zero). Zero value (false) = CRC ON, the safe default. Set via
 	// SegmentConfigFromEngine from the user's Storage.CRCCheck flag.
 	CRCDisabled bool
+
+	// ConfirmSync selects the crash-model sync primitive for the segment tier's
+	// durability sites (seal, compaction temp/dir, creation/reclaim dir syncs,
+	// the ownership marker). The zero value (walConfirmBarrier) is the default,
+	// so a zero-value SegmentConfig{} follows crash_model: barrier; set via
+	// SegmentConfigFromEngine from EngineConfig.CrashModel. See syncPolicy.
+	ConfirmSync walConfirmSync
 }
 
 // DefaultSegmentConfig returns a SegmentConfig with production defaults
@@ -179,6 +186,18 @@ type QueueSegments struct {
 	// new numbers strictly monotone within an incarnation and across restarts
 	// even if the wall clock steps backwards. Guarded by qs.mutex.
 	lastSegmentNum uint64
+
+	// pol is the crash-model sync policy for this queue's segment durability
+	// sites. Declared LAST so every field the ack/cold-read tiers pin keeps its
+	// offset (segment_layout_test.go). Under barrier mode the segment seal,
+	// temp-file fsync, compaction and directory syncs use the fence; under
+	// force_flush the full drive-cache flush.
+	pol syncPolicy
+}
+
+// syncPolicyFor returns the segment manager's crash-model policy for a site.
+func (sm *SegmentManager) syncPolicyFor(site string) syncPolicy {
+	return newSyncPolicy(sm.cfg.ConfirmSync).withSite(site)
 }
 
 // SegmentFile represents a single segment file
@@ -650,6 +669,12 @@ func decodeSegmentDirMarker(raw []byte) (string, error) {
 // atomicWriteFile a failed write leaves the directory MARKERLESS instead, which
 // is a state this file already handles correctly, rather than degenerate.
 func writeSegmentDirMarker(dir, queueName string) error {
+	return writeSegmentDirMarkerWithPolicy(dir, queueName, newSyncPolicy(walConfirmBarrier).withSite(siteSegmentMkdir))
+}
+
+// writeSegmentDirMarkerWithPolicy is writeSegmentDirMarker with an explicit
+// crash-model policy threaded into atomicWriteFileWithPolicy.
+func writeSegmentDirMarkerWithPolicy(dir, queueName string, pol syncPolicy) error {
 	if queueName == "" {
 		return errors.New("refusing to write an ownership marker for the empty queue name")
 	}
@@ -657,7 +682,7 @@ func writeSegmentDirMarker(dir, queueName string) error {
 		return fmt.Errorf("refusing to write an ownership marker for a %d byte queue name, above the %d byte shortstr maximum",
 			len(queueName), segmentDirMarkerMaxNameLen)
 	}
-	return atomicWriteFile(filepath.Join(dir, segmentDirMarkerName), encodeSegmentDirMarker(queueName), 0644)
+	return atomicWriteFileWithPolicy(filepath.Join(dir, segmentDirMarkerName), encodeSegmentDirMarker(queueName), 0644, pol)
 }
 
 // loadDirEntryNames returns the set of entry names in dir, spelled exactly as
@@ -1163,7 +1188,7 @@ func (sm *SegmentManager) getOrCreateQueueSegmentsAt(queueName, dirName string) 
 	// C4: make the queue directory's entry durable in its PARENT (segments/)
 	// before any segment file is created inside it — the marker's own
 	// atomicWriteFile already syncs queueDir itself.
-	if serr := syncDir(sm.dataDir); serr != nil {
+	if serr := sm.syncPolicyFor(siteSegmentMkdir).dir(sm.dataDir); serr != nil {
 		return nil, interfaces.DegradedFault("segment-open", sm.dataDir,
 			fmt.Sprintf("the segment directory for queue %q was created but its directory entry could not be made durable", queueName),
 			"this queue's messages are not checkpointed to cold storage; the source WAL file is NOT deleted, so nothing is lost, but the WAL will keep growing until this is fixed",
@@ -1200,7 +1225,7 @@ func (sm *SegmentManager) getOrCreateQueueSegmentsAt(queueName, dirName string) 
 			"this queue's messages are not checkpointed to cold storage; the source WAL file is NOT deleted, so nothing is lost, but the WAL will keep growing until this is fixed",
 			nil)
 	case !present:
-		if werr := writeSegmentDirMarker(queueDir, queueName); werr != nil {
+		if werr := writeSegmentDirMarkerWithPolicy(queueDir, queueName, sm.syncPolicyFor(siteMetadataFile)); werr != nil {
 			return nil, interfaces.DegradedFault("segment-open", filepath.Join(queueDir, segmentDirMarkerName),
 				fmt.Sprintf("the ownership marker for queue %q could not be written, so this directory cannot be proven to belong to it", queueName),
 				"this queue's messages are not checkpointed to cold storage; the source WAL file is NOT deleted, so nothing is lost, but the WAL will keep growing until this is fixed",
@@ -1216,6 +1241,7 @@ func (sm *SegmentManager) getOrCreateQueueSegmentsAt(queueName, dirName string) 
 		queueName:      queueName,
 		dataDir:        queueDir,
 		cfg:            sm.cfg,
+		pol:            newSyncPolicy(sm.cfg.ConfirmSync),
 		sealedSegments: make(map[uint64]*SegmentFile),
 		ackBitmap:      roaring64.New(),
 		ackChan:        make(chan uint64, ackChannelBuffer),
@@ -1351,8 +1377,10 @@ func (qs *QueueSegments) sealSegment() error {
 		return nil
 	}
 
-	// Sync to disk — must succeed for durability before sealing
-	if err := qs.currentSegment.file.Sync(); err != nil {
+	// Sync to durability before sealing. Under barrier mode this is the fence
+	// (an ordering barrier, no whole-drive flush); under force_flush the full
+	// drive-cache flush. Must succeed for durability before sealing.
+	if err := qs.pol.withSite(siteSegmentSeal).file(qs.currentSegment.file); err != nil {
 		return fmt.Errorf("failed to sync segment before sealing: %w", err)
 	}
 
@@ -1465,7 +1493,7 @@ func (qs *QueueSegments) createSegmentFileLocked() (*SegmentFile, *SegmentIndex,
 			}
 			return nil, nil, fmt.Errorf("failed to open segment file: %w", err)
 		}
-		if serr := syncDir(qs.dataDir); serr != nil {
+		if serr := qs.pol.withSite(siteSegmentDir).dir(qs.dataDir); serr != nil {
 			_ = f.Close()
 			_ = os.Remove(path)
 			return nil, nil, fmt.Errorf("segment dir fsync: %w", serr)
@@ -1619,7 +1647,7 @@ func (qs *QueueSegments) reclaimFullyAckedSegment(segment *SegmentFile) (bool, e
 		// The handle, file, registration, and index are all preserved for retry.
 		return true, fmt.Errorf("fully acknowledged segment %s could not be unlinked: %w", segment.path, err)
 	}
-	if err := syncDir(qs.dataDir); err != nil {
+	if err := qs.pol.withSite(siteSegmentDir).dir(qs.dataDir); err != nil {
 		// The completed unlink and in-memory removal remain authoritative.
 		return true, fmt.Errorf("segment reclaim directory fsync failed after %s was unlinked: %w", segment.path, err)
 	}
@@ -1753,7 +1781,7 @@ func (qs *QueueSegments) compactSegment(segment *SegmentFile) error {
 	// Sync the new file BEFORE it can become the segment. A discarded Sync
 	// error means the rename can publish a file whose contents are not on the
 	// platter.
-	if serr := tempFile.Sync(); serr != nil {
+	if serr := qs.pol.withSite(siteSegmentTemp).file(tempFile); serr != nil {
 		_ = tempFile.Close()
 		_ = os.Remove(tempPath)
 		return fmt.Errorf("segment compaction aborted: cannot fsync %s: %w", tempPath, serr)
@@ -1775,7 +1803,7 @@ func (qs *QueueSegments) compactSegment(segment *SegmentFile) error {
 	// A rename is not durable until the DIRECTORY entry is fsynced; without
 	// this a crash can leave the directory pointing at neither file. syncDir's
 	// own doc says so, and this is its second required site.
-	syncErr := syncDir(qs.dataDir)
+	syncErr := qs.pol.withSite(siteSegmentDir).dir(qs.dataDir)
 
 	// Reopen segment file. If this fails the compacted file is already the
 	// segment on disk, but qs's in-memory handle still refers to the (now
@@ -2263,7 +2291,7 @@ func (qs *QueueSegments) close() {
 	defer qs.mutex.Unlock()
 
 	if qs.currentSegment != nil {
-		_ = qs.currentSegment.file.Sync()
+		_ = qs.pol.withSite(siteSegmentClose).file(qs.currentSegment.file)
 		_ = qs.currentSegment.file.Close()
 	}
 

@@ -14,3 +14,8 @@ import "os"
 // must be defined by exactly one platform file per GOOS — it is the seam that
 // syncDirPlatform and SetSyncDirForTest use.
 var syncDirPlatformSync = func(f *os.File) error { return f.Sync() }
+
+// syncDirPlatformFenceSync is the directory barrier on the non-darwin POSIX
+// platforms. The fence is never selected there (ConfirmFenceOrdersOnly is
+// false), so this is simply the same plain fsync as syncDirPlatformSync.
+var syncDirPlatformFenceSync = func(f *os.File) error { return f.Sync() }

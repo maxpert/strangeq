@@ -9,3 +9,9 @@ package storage
 func syncDirPlatform(dir string) error {
 	return nil
 }
+
+// syncDirPlatformFence mirrors syncDirPlatform: a no-op on Windows, which
+// cannot fsync a directory handle. The fence is never selected here.
+func syncDirPlatformFence(dir string) error {
+	return nil
+}

@@ -44,6 +44,15 @@ import (
 // exactly one file fsync and one directory fsync per call, no more than
 // correctness requires.
 func atomicWriteFile(path string, data []byte, perm os.FileMode) error {
+	return atomicWriteFileWithPolicy(path, data, perm, newSyncPolicy(walConfirmBarrier).withSite(siteMetadataFile))
+}
+
+// atomicWriteFileWithPolicy is atomicWriteFile with an explicit crash-model
+// sync policy: under barrier mode the temp-file fsync and the directory sync
+// use the fence (this is a declare/topology path that CAN fire while the broker
+// is serving traffic), under force_flush the full drive-cache flush. The atomic
+// temp+rename shape is unchanged.
+func atomicWriteFileWithPolicy(path string, data []byte, perm os.FileMode, pol syncPolicy) error {
 	dir := filepath.Dir(path)
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		return fmt.Errorf("failed to create directory: %w", err)
@@ -61,7 +70,7 @@ func atomicWriteFile(path string, data []byte, perm os.FileMode) error {
 		_ = os.Remove(tempPath)
 		return fmt.Errorf("failed to write temp file: %w", err)
 	}
-	if err := f.Sync(); err != nil {
+	if err := pol.file(f); err != nil {
 		_ = f.Close()
 		_ = os.Remove(tempPath)
 		return fmt.Errorf("failed to fsync temp file: %w", err)
@@ -76,7 +85,7 @@ func atomicWriteFile(path string, data []byte, perm os.FileMode) error {
 		return fmt.Errorf("failed to rename temp file: %w", err)
 	}
 
-	if err := syncDir(dir); err != nil {
+	if err := pol.dir(dir); err != nil {
 		return fmt.Errorf("failed to fsync directory: %w", err)
 	}
 

@@ -37,7 +37,7 @@ func walTruncateTailDurable(path string, size int64) error {
 	if err := f.Truncate(size); err != nil {
 		return err
 	}
-	return fdatasyncFile(f)
+	return fdatasyncFileSite(f, siteBootTail)
 }
 
 // R-TAIL-HOLE.
@@ -56,14 +56,21 @@ func walTruncateTailDurable(path string, size int64) error {
 // everything after the FIRST defect is UNCONFIRMED (stop-replay semantics — a
 // defect at offset f can only be at or above the durable end D, and no barrier
 // ever covered bytes above the defect). A non-zero suffix of at most
-// walMaxUnconfirmedBytes + walMaxFrameBytes on one of the TWO NEWEST files is
-// therefore a bounded unconfirmed tail: benign, replay stops at f, and boot
-// durably truncates the file at f. A larger suffix, or any defect on an older
-// file, is real interior corruption and stays FATAL exactly as before.
+// walMaxUnconfirmedBytes + walMaxFrameBytes on a file the crash-model rule
+// allows is therefore a bounded unconfirmed tail: benign, replay stops at f, and
+// boot durably truncates the file at f. A larger suffix, or a defect on any
+// other file, is real interior corruption and stays FATAL.
 //
-// The two-newest rule exists because a trailing roll can leave unconfirmed
-// bytes on both N and N+1; a defect in the third-newest file cannot be an
-// unconfirmed tail, so it stays fatal.
+// WHICH FILES THE RULE ALLOWS is chosen per boot by walTailRule:
+//   - force_flush, and every non-darwin platform: the TWO NEWEST files by
+//     number, unchanged. A trailing roll can leave unconfirmed bytes on both N
+//     and N+1; a defect in the third-newest file cannot be an unconfirmed tail.
+//   - barrier + darwin: the FRONTIER — F (the newest data-bearing file) and F-
+//     (the newest data-bearing file older than F), provided every file newer
+//     than F is data-empty. Under the fence, a power loss persists an epoch
+//     prefix, so only F or F- can carry a tail defect, and newer files exist
+//     only as data-empty stubs (the W8 pre-opened file). See
+//     .notes/specs/task-barrier-everywhere.md §3.
 
 // walDefectClass is the classification of the region after the first defect
 // found in a WAL file.
@@ -85,11 +92,16 @@ const (
 // classifyWALDefect decides what a defect at byte offset defectAt means for
 // file f, whose intelligible data ends at `end` (the scan bound / EOF).
 //
+// allowUnconfirmed is the per-file membership in the benign set, computed once
+// per walk by walTailRule: under force_flush it is "one of the two newest files
+// by number" (byte-identical to before), under barrier+darwin it is the
+// frontier ("F or F-, with every newer file data-empty").
+//
 // It returns the class and z, the offset of the last non-zero byte in
 // [defectAt, end), or -1 when that region is all zeros. A read failure while
 // proving the tail is all zeros is treated as FATAL: an unprovable tail is
 // interior corruption (the safe direction).
-func classifyWALDefect(f *os.File, defectAt, end int64, newest bool) (walDefectClass, int64) {
+func classifyWALDefect(f *os.File, defectAt, end int64, allowUnconfirmed bool) (walDefectClass, int64) {
 	z, ok := walLastNonZeroOffset(f, defectAt, end)
 	if !ok {
 		return walDefectFatal, -1
@@ -97,10 +109,112 @@ func classifyWALDefect(f *os.File, defectAt, end int64, newest bool) (walDefectC
 	if z < 0 {
 		return walDefectTornTail, -1
 	}
-	if newest && z-defectAt <= walMaxUnconfirmedBytes+walMaxFrameBytes {
+	if allowUnconfirmed && z-defectAt <= walMaxUnconfirmedBytes+walMaxFrameBytes {
 		return walDefectUnconfirmedTail, z
 	}
 	return walDefectFatal, z
+}
+
+// walFileRef is a (file number, path) pair for a WAL file on disk.
+type walFileRef struct {
+	num  uint64
+	path string
+}
+
+// walTailRule returns the predicate "a bounded non-zero suffix after the first
+// defect is a benign unconfirmed tail on this file?" for the rule selected by
+// the configured crash model. files is the directory's WAL set (any order).
+//
+//   - fence (barrier + darwin): the FRONTIER rule. F is the newest DATA-BEARING
+//     file; F- the newest data-bearing file older than F. A file is benign iff
+//     it is F or F- AND every file newer than F is data-empty. Under the fence a
+//     power loss persists an epoch prefix, so only the newest data-bearing file
+//     (or the one before it, at a roll boundary) can carry a tail defect, and
+//     newer files exist only as data-empty stubs.
+//   - otherwise (force_flush, or any non-darwin): today's rule, byte-identical:
+//     the two newest files by number.
+func walTailRule(files []walFileRef, fence bool) func(uint64) bool {
+	if !fence {
+		var firstNewest, secondNewest uint64
+		for _, f := range files {
+			switch {
+			case f.num > firstNewest:
+				secondNewest = firstNewest
+				firstNewest = f.num
+			case f.num > secondNewest:
+				secondNewest = f.num
+			}
+		}
+		return func(n uint64) bool {
+			return n == firstNewest || (secondNewest != 0 && n == secondNewest)
+		}
+	}
+
+	// Frontier. Walk from the newest down to find F then F-. `bearing` records
+	// the data-bearing answer for the files above F (all of which are empty, by
+	// F's definition); older files are not needed for the newer-than-F check.
+	bearing := make(map[uint64]bool, len(files))
+	var frontier, frontierMinus uint64
+	for i := len(files) - 1; i >= 0; i-- {
+		b := walFileDataBearing(files[i].path)
+		bearing[files[i].num] = b
+		if !b {
+			continue
+		}
+		if frontier == 0 {
+			frontier = files[i].num
+			continue
+		}
+		frontierMinus = files[i].num
+		break
+	}
+
+	// Every file newer than F must be data-empty. (Files above F were visited
+	// first in the descending walk; re-check defensively.)
+	newerAllEmpty := true
+	for _, f := range files {
+		if f.num > frontier && bearing[f.num] {
+			newerAllEmpty = false
+			break
+		}
+	}
+
+	return func(n uint64) bool {
+		if !newerAllEmpty {
+			return false
+		}
+		if n == frontier {
+			return true
+		}
+		return frontierMinus != 0 && n == frontierMinus
+	}
+}
+
+// walFileDataBearing reports whether a WAL file holds data past its header: any
+// intelligible record, or any non-zero byte, past the header. A file smaller
+// than the header, a header-only file (the W8 pre-opened stub) and an all-zero
+// file (a prealloc crash) are DATA-EMPTY.
+//
+// It is conservative on error: an unreadable file is reported as data-bearing
+// so it participates in the frontier and never lets a defect be waved through.
+func walFileDataBearing(path string) bool {
+	st, err := os.Stat(path)
+	if err != nil {
+		return true
+	}
+	if st.Size() <= int64(WALHeaderSize) {
+		return false
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return true
+	}
+	defer f.Close()
+	last, ok := walLastNonZeroOffset(f, int64(WALHeaderSize), st.Size())
+	if !ok {
+		return true
+	}
+	return last >= 0
 }
 
 // walLastNonZeroOffset returns the offset of the last non-zero byte in

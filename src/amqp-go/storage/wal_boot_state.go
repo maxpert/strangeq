@@ -107,7 +107,7 @@ func parseWALFileNum(name string) (uint64, bool) {
 // shares scanWALFile's transaction rule: message records become live only when
 // a matching Commit is present. Discarded uncommitted records and a torn tail
 // are dead bytes, never live records.
-func indexWALFile(fileNum uint64, path string, newest bool) (inv *segmentInventory, hasSharedBody bool, durableEnd int64, truncateAt int64, err error) {
+func indexWALFile(fileNum uint64, path string, allowUnconfirmed bool) (inv *segmentInventory, hasSharedBody bool, durableEnd int64, truncateAt int64, err error) {
 	truncateAt = -1
 	inv = newSegmentInventory(0)
 	defer func() {
@@ -187,8 +187,9 @@ func indexWALFile(fileNum uint64, path string, newest bool) (inv *segmentInvento
 
 		if walBlankRecordHeader(crc, dataLen) {
 			// R-TAIL-HOLE: benign only when the region is all zero, or bounded
-			// and on one of the two newest files.
-			switch class, _ := classifyWALDefect(file, recStart, fileSize, newest); class {
+			// and on a file the crash-model rule allows (two newest under
+			// force_flush; the frontier under barrier+darwin).
+			switch class, _ := classifyWALDefect(file, recStart, fileSize, allowUnconfirmed); class {
 			case walDefectTornTail:
 				// durableEnd already points at the defect (the end of the last
 				// valid record); break so the tail is left as dead bytes. A
@@ -221,7 +222,7 @@ func indexWALFile(fileNum uint64, path string, newest bool) (inv *segmentInvento
 			if crc != h.Sum32() {
 				// R-TAIL-HOLE: the bad record is dead either way; only its
 				// classification differs.
-				switch class, _ := classifyWALDefect(file, curRecStart, fileSize, newest); class {
+				switch class, _ := classifyWALDefect(file, curRecStart, fileSize, allowUnconfirmed); class {
 				case walDefectTornTail:
 					recStart = curRecStart // the whole bad tail record is dead
 				case walDefectUnconfirmedTail:
@@ -583,23 +584,15 @@ func (qw *QueueWAL) rebuildBootState() error {
 		qw.fileNum.Store(maxNum)
 	}
 
-	// The two newest file numbers. R-TAIL-HOLE treats a bounded non-zero
-	// suffix after the first defect as a benign unconfirmed tail only on
-	// these files: a trailing roll can leave unconfirmed bytes on both N and
-	// N+1, while a defect on an older file is real interior corruption.
-	var firstNewest, secondNewest uint64
+	// The benign-unconfirmed-tail rule for this boot's crash model. Under
+	// barrier+darwin it is the FRONTIER rule (F / F-, every newer file
+	// data-empty); under force_flush and every non-darwin platform it is
+	// today's two-newest-by-number rule, byte-identical.
+	refs := make([]walFileRef, 0, len(files))
 	for _, f := range files {
-		switch {
-		case f.num > firstNewest:
-			secondNewest = firstNewest
-			firstNewest = f.num
-		case f.num > secondNewest:
-			secondNewest = f.num
-		}
+		refs = append(refs, walFileRef{num: f.num, path: f.path})
 	}
-	isTwoNewest := func(n uint64) bool {
-		return n == firstNewest || (secondNewest != 0 && n == secondNewest)
-	}
+	allowUnconfirmedTail := walTailRule(refs, newSyncPolicy(qw.cfg.ConfirmSync).fence)
 
 	// Deferred R-TAIL-HOLE truncations (path, offset), applied only once the
 	// boot is known to proceed — see the append site.
@@ -620,7 +613,7 @@ func (qw *QueueWAL) rebuildBootState() error {
 			info.createdAt = st.ModTime()
 		}
 
-		inv, hasSharedBody, _, truncateAt, ierr := indexWALFile(f.num, f.path, isTwoNewest(f.num))
+		inv, hasSharedBody, _, truncateAt, ierr := indexWALFile(f.num, f.path, allowUnconfirmedTail(f.num))
 		info.inv = inv
 		if ierr != nil {
 			// Unreadable/foreign/unsupported-version file: keep it, but with no
@@ -631,14 +624,16 @@ func (qw *QueueWAL) rebuildBootState() error {
 		}
 		info.hasSharedBody = hasSharedBody
 
-		// R-TAIL-HOLE: a newest file whose first defect is a BOUNDED
-		// UNCONFIRMED TAIL is durably truncated at that defect so a later boot
-		// never sees the shape again. A pure zero tail (walDefectTornTail) is
-		// left as-is — the pre-existing benign shape, not a truncation target.
-		// The truncation is DEFERRED until after the boot-gating check below:
-		// a refused boot must not mutate the data directory (the operator is
-		// about to inspect it). Only durable mode truncates: SyncDisabled keeps
-		// the byte-identical nofsync lifecycle.
+		// R-TAIL-HOLE: a file whose first defect is a BOUNDED UNCONFIRMED TAIL
+		// and which the crash-model rule allows (allowUnconfirmedTail: the two
+		// newest by number under force_flush; the frontier F/F- under
+		// barrier+darwin — see walTailRule) is durably truncated at that defect
+		// so a later boot never sees the shape again. A pure zero tail
+		// (walDefectTornTail) is left as-is — the pre-existing benign shape,
+		// not a truncation target. The truncation is DEFERRED until after the
+		// boot-gating check below: a refused boot must not mutate the data
+		// directory (the operator is about to inspect it). Only durable mode
+		// truncates: SyncDisabled keeps the byte-identical nofsync lifecycle.
 		if truncateAt >= 0 && !qw.cfg.SyncDisabled {
 			truncations = append(truncations, pendingTruncation{path: f.path, at: truncateAt})
 		}

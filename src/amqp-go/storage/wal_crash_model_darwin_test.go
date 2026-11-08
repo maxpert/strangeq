@@ -2,12 +2,18 @@
 
 package storage
 
-// crash_model (F_BARRIERFSYNC) site pins.
+// crash_model (F_BARRIERFSYNC) site pins — BARRIER-EVERYWHERE.
 //
 // The switch is darwin-only: on Linux and every other platform barrierSyncFile
 // IS fdatasyncFile, so there is no command to distinguish and crash_model has
 // no effect. These tests run on darwin, where the two primitives are the two
 // distinct fcntl commands F_BARRIERFSYNC (85) and F_FULLFSYNC (51).
+//
+// THE RULE (spec §1): in barrier mode EVERY sync that can fire while the broker
+// is serving traffic uses the fence (85; a directory falls back to PLAIN fsync,
+// never 51). F_FULLFSYNC (51) survives only at the one-shot lifecycle points —
+// clean close, boot, the I/O-error repair path — and in force_flush mode at
+// every site.
 //
 // THEY OBSERVE THE PRIMITIVE, NOT THE HOOK THAT REPLACES IT. The existing
 // walGroupCommitFsync / walTxFsync hooks substitute the whole fsync, so a test
@@ -149,9 +155,9 @@ func TestCrashModel_TxConfirmPrimitive(t *testing.T) {
 	}
 }
 
-// TestCrashModel_BarrierFallsBackToFullFlush pins the fallback: a drive that
-// rejects F_BARRIERFSYNC must fall back to F_FULLFSYNC (strictly stronger),
-// NEVER to plain fsync, which has no ordering barrier.
+// TestCrashModel_BarrierFallsBackToFullFlush pins the FILE fallback: a drive
+// that rejects F_BARRIERFSYNC must fall back to F_FULLFSYNC (strictly
+// stronger), NEVER to plain fsync, which has no ordering barrier.
 func TestCrashModel_BarrierFallsBackToFullFlush(t *testing.T) {
 	var rec syncCmdRecorder
 	restore := SetWALSyncCmdForTest(func(_ uintptr, cmd int) error {
@@ -176,12 +182,40 @@ func TestCrashModel_BarrierFallsBackToFullFlush(t *testing.T) {
 		"an ENOTSUP F_BARRIERFSYNC must fall back to F_FULLFSYNC, never to plain fsync")
 }
 
-// TestCrashModel_RetainedFullFlushSitesUnchanged pins every RETAINED
-// F_FULLFSYNC site that routes through fdatasyncFile: in BOTH modes it must
-// still issue F_FULLFSYNC (51) and never F_BARRIERFSYNC (85). A regression that
-// routes roll / reclaim / repair / compaction / tail-truncate through the fence
-// fails here.
-func TestCrashModel_RetainedFullFlushSitesUnchanged(t *testing.T) {
+// TestCrashModel_DirFenceFallbackUsesPlainFsyncNeverFull is T-BE-3: a directory
+// fd that rejects F_BARRIERFSYNC falls back to PLAIN fsync, NEVER to
+// F_FULLFSYNC (a full flush here would silently reintroduce the per-roll
+// whole-drive-cache drain). The hook sees the 85 attempt and no 51.
+func TestCrashModel_DirFenceFallbackUsesPlainFsyncNeverFull(t *testing.T) {
+	var rec syncCmdRecorder
+	restore := SetWALSyncCmdForTest(func(_ uintptr, cmd int) error {
+		rec.mu.Lock()
+		rec.cmds = append(rec.cmds, cmd)
+		rec.mu.Unlock()
+		if cmd == cmBarrier {
+			return unix.ENOTSUP
+		}
+		return nil
+	})
+	t.Cleanup(restore)
+
+	dir := t.TempDir()
+
+	rec.reset()
+	require.NoError(t, syncDirFence(dir),
+		"an ENOTSUP directory fence must fall back to plain fsync, not fail")
+	got := rec.snapshot()
+	require.Equal(t, []int{cmBarrier}, got,
+		"the directory fence must attempt 85 then fall back to plain fsync: never 51")
+	require.NotContains(t, got, cmFull)
+}
+
+// TestCrashModel_SitePins is T-BE-1: per site, per mode, the primitive.
+//
+//	barrier  -> 85 (fence) at every load-coupled site; 51 only at repair,
+//	            boot-tail, boot-mkdir and close.
+//	force    -> 51 everywhere.
+func TestCrashModel_SitePins(t *testing.T) {
 	for _, mode := range []struct {
 		name  string
 		force bool
@@ -190,8 +224,11 @@ func TestCrashModel_RetainedFullFlushSitesUnchanged(t *testing.T) {
 		{"force_flush", true},
 	} {
 		t.Run(mode.name, func(t *testing.T) {
-			// (1) The roll / creation directory barrier (openWALFile C4 -> syncDir).
-			t.Run("roll_dir_barrier", func(t *testing.T) {
+			fence := !mode.force // darwin: barrier == fence
+
+			// roll / creation directory barrier (openWALFile C4 -> policy.dir).
+			t.Run("roll_creation_dir", func(t *testing.T) {
+				t.Cleanup(SetWALPreopenEnabledForTest(false))
 				rec := &syncCmdRecorder{}
 				rec.install(t)
 				wm, err := NewWALManagerWithConfig(t.TempDir(), crashModelTestConfig(mode.force))
@@ -204,36 +241,12 @@ func TestCrashModel_RetainedFullFlushSitesUnchanged(t *testing.T) {
 				require.NoError(t, sw.rollFile())
 				sw.fileMutex.Unlock()
 
-				got := rec.snapshot()
-				require.Contains(t, got, cmFull, "the roll directory barrier must stay F_FULLFSYNC")
-				require.NotContains(t, got, cmBarrier, "the roll directory barrier must not use the fence")
+				assertSitePrimitive(t, rec.snapshot(), fence, "roll/creation dir")
 			})
 
-			// (1b) The W8 pre-open's directory barriers (step 1 retired-tail
-			// flush, step 2 creation sync). Both must stay F_FULLFSYNC and
-			// never use the confirm fence: they bound the power-loss window.
-			t.Run("preopen_dir_barrier", func(t *testing.T) {
-				rec := &syncCmdRecorder{}
-				rec.install(t)
-				wm, err := NewWALManagerWithConfig(t.TempDir(), crashModelTestConfig(mode.force))
-				require.NoError(t, err)
-				t.Cleanup(func() { _ = wm.Close() })
-
-				sw := wm.sharedWAL
-				// Drive the pre-open synchronously so the observed commands are
-				// exactly its two directory barriers.
-				rec.reset()
-				sw.preopenNext()
-
-				got := rec.snapshot()
-				require.Contains(t, got, cmFull,
-					"the pre-open directory barriers must stay F_FULLFSYNC")
-				require.NotContains(t, got, cmBarrier,
-					"the pre-open directory barriers must not use the confirm fence")
-			})
-
-			// (2) The reclaim sweep's post-unlink directory barrier.
-			t.Run("reclaim_dir_barrier", func(t *testing.T) {
+			// reclaim directory barrier.
+			t.Run("reclaim_dir", func(t *testing.T) {
+				t.Cleanup(SetWALPreopenEnabledForTest(false))
 				rec := &syncCmdRecorder{}
 				rec.install(t)
 				wm, err := NewWALManagerWithConfig(t.TempDir(), crashModelTestConfig(mode.force))
@@ -247,13 +260,58 @@ func TestCrashModel_RetainedFullFlushSitesUnchanged(t *testing.T) {
 				rec.reset()
 				wm.sharedWAL.tryReclaimOldFiles()
 
-				got := rec.snapshot()
-				require.Contains(t, got, cmFull, "the reclaim directory barrier must stay F_FULLFSYNC")
-				require.NotContains(t, got, cmBarrier, "the reclaim directory barrier must not use the fence")
+				assertSitePrimitive(t, rec.snapshot(), fence, "reclaim dir")
 			})
 
-			// (3) The write-error repair truncate (walTruncateDefault).
-			t.Run("repair_truncate", func(t *testing.T) {
+			// transaction directory barrier (writeTxAtomic under SyncDisabled).
+			t.Run("tx_dir", func(t *testing.T) {
+				rec := &syncCmdRecorder{}
+				rec.install(t)
+				cfg := crashModelTestConfig(mode.force)
+				cfg.SyncDisabled = true
+				wm, err := NewWALManagerWithConfig(t.TempDir(), cfg)
+				require.NoError(t, err)
+				t.Cleanup(func() { _ = wm.Close() })
+
+				sw := wm.sharedWAL
+				sw.fileMutex.Lock()
+				require.NoError(t, sw.rollFile())
+				sw.fileMutex.Unlock()
+
+				rec.reset()
+				require.NoError(t, wm.WriteTxAtomic([]*RecoveryMessage{{
+					QueueName: "txdir", Offset: 1, Message: crashModelTestMessage("txdir", 1),
+				}}))
+				got := rec.snapshot()
+				// tx dir + tx confirm, both the same primitive under either mode.
+				require.NotEmpty(t, got, "the tx path must issue its barriers")
+				for _, c := range got {
+					require.Equal(t, wantPrimitive(fence), c,
+						"every tx barrier in %s must be cmd %d, got %v", mode.name, wantPrimitive(fence), got)
+				}
+			})
+
+			// compaction file fsync + dir barrier. Driven directly with the
+			// production helper and the instance policy (the maintenance
+			// goroutine is not part of the site pin).
+			t.Run("compaction_file", func(t *testing.T) {
+				rec := &syncCmdRecorder{}
+				rec.install(t)
+				wm, err := NewWALManagerWithConfig(t.TempDir(), crashModelTestConfig(mode.force))
+				require.NoError(t, err)
+				t.Cleanup(func() { _ = wm.Close() })
+
+				f, err := os.CreateTemp(t.TempDir(), "compact")
+				require.NoError(t, err)
+				t.Cleanup(func() { _ = f.Close() })
+
+				rec.reset()
+				require.NoError(t, walCompactionFsync(f, wm.sharedWAL.policy(siteCompactionFile)))
+				assertSitePrimitive(t, rec.snapshot(), fence, "compaction file fsync")
+			})
+
+			// repair truncate: ALWAYS the full flush in both modes.
+			t.Run("repair_truncate_stays_full", func(t *testing.T) {
 				rec := &syncCmdRecorder{}
 				rec.install(t)
 				f, err := os.CreateTemp(t.TempDir(), "repair")
@@ -265,25 +323,11 @@ func TestCrashModel_RetainedFullFlushSitesUnchanged(t *testing.T) {
 				rec.reset()
 				require.NoError(t, walTruncate(f, 0, true))
 				require.Equal(t, []int{cmFull}, rec.snapshot(),
-					"the repair truncate barrier must stay F_FULLFSYNC")
+					"the repair truncate barrier is the full flush in BOTH modes")
 			})
 
-			// (4) The WAL compaction's fsync before the rename.
-			t.Run("compaction_fsync", func(t *testing.T) {
-				rec := &syncCmdRecorder{}
-				rec.install(t)
-				f, err := os.CreateTemp(t.TempDir(), "compact")
-				require.NoError(t, err)
-				t.Cleanup(func() { _ = f.Close() })
-
-				rec.reset()
-				require.NoError(t, walCompactionFsync(f))
-				require.Equal(t, []int{cmFull}, rec.snapshot(),
-					"the compaction fsync must stay F_FULLFSYNC")
-			})
-
-			// (5) The ported R-TAIL-HOLE boot truncate.
-			t.Run("tail_truncate", func(t *testing.T) {
+			// boot tail truncation: ALWAYS the full flush.
+			t.Run("boot_tail_stays_full", func(t *testing.T) {
 				rec := &syncCmdRecorder{}
 				rec.install(t)
 				path := filepath.Join(t.TempDir(), "tail.wal")
@@ -292,86 +336,144 @@ func TestCrashModel_RetainedFullFlushSitesUnchanged(t *testing.T) {
 				rec.reset()
 				require.NoError(t, walTruncateTailDurable(path, 4))
 				require.Equal(t, []int{cmFull}, rec.snapshot(),
-					"the tail truncate durability barrier must stay F_FULLFSYNC")
+					"the boot tail truncate is the full flush in BOTH modes")
+			})
+
+			// clean close: ALWAYS the full flush (via fdatasyncFile, not the fence).
+			t.Run("close_stays_full", func(t *testing.T) {
+				rec := &syncCmdRecorder{}
+				rec.install(t)
+				wm, err := NewWALManagerWithConfig(t.TempDir(), crashModelTestConfig(mode.force))
+				require.NoError(t, err)
+				require.NoError(t, wm.Write("q", crashModelTestMessage("q", 1), 1))
+
+				rec.reset()
+				require.NoError(t, wm.Close())
+				require.Contains(t, rec.snapshot(), cmFull,
+					"a clean close must issue the full flush")
+				require.NotContains(t, rec.snapshot(), cmBarrier,
+					"a clean close must never route through the fence")
 			})
 		})
 	}
 }
 
-// TestCrashModel_TxDirBarrierStaysFullFlush pins the transaction DIRECTORY
-// barrier distinctly from the transaction confirm barrier: within one tx the
-// directory entry must be made durable with F_FULLFSYNC even when the confirm
-// primitive is the fence. It rolls under SyncDisabled (so the file entry is not
-// durable yet) and then issues one transaction.
-func TestCrashModel_TxDirBarrierStaysFullFlush(t *testing.T) {
-	rec := &syncCmdRecorder{}
-	rec.install(t)
-
-	cfg := crashModelTestConfig(false)
-	cfg.SyncDisabled = true
-	wm, err := NewWALManagerWithConfig(t.TempDir(), cfg)
-	require.NoError(t, err)
-	t.Cleanup(func() { _ = wm.Close() })
-
-	sw := wm.sharedWAL
-	sw.fileMutex.Lock()
-	require.NoError(t, sw.rollFile())
-	sw.fileMutex.Unlock()
-
-	rec.reset()
-	require.NoError(t, wm.WriteTxAtomic([]*RecoveryMessage{{
-		QueueName: "txdir",
-		Offset:    1,
-		Message:   crashModelTestMessage("txdir", 1),
-	}}))
-
-	got := rec.snapshot()
-	require.Contains(t, got, cmFull,
-		"the transaction directory barrier must stay F_FULLFSYNC")
-	require.Contains(t, got, cmBarrier,
-		"the transaction confirm barrier must be the fence")
+// wantPrimitive maps fence-ness to the expected fcntl command.
+func wantPrimitive(fence bool) int {
+	if fence {
+		return cmBarrier
+	}
+	return cmFull
 }
 
-// TestCrashModel_CloseStaysFullFlush pins the clean close: QueueWAL.close calls
-// os.File.Sync (F_FULLFSYNC on darwin), which is NOT the fence seam. If close
-// were ever routed through barrierSyncFile the recorder would see 85 here.
-func TestCrashModel_CloseStaysFullFlush(t *testing.T) {
-	rec := &syncCmdRecorder{}
-	rec.install(t)
-
-	wm, err := NewWALManagerWithConfig(t.TempDir(), crashModelTestConfig(false))
-	require.NoError(t, err)
-	require.NoError(t, wm.Write("q", crashModelTestMessage("q", 1), 1))
-
-	rec.reset()
-	require.NoError(t, wm.Close())
-
-	require.NotContains(t, rec.snapshot(), cmBarrier,
-		"close must keep os.File.Sync (F_FULLFSYNC), never route through the fence")
+// assertSitePrimitive asserts the recorded commands are the expected primitive
+// and nothing else (a non-empty snapshot of exactly want, or empty only when
+// the site legitimately issued nothing).
+func assertSitePrimitive(t *testing.T, got []int, fence bool, site string) {
+	t.Helper()
+	want := wantPrimitive(fence)
+	require.NotEmpty(t, got, "%s: expected cmd %d", site, want)
+	for _, c := range got {
+		require.Equal(t, want, c, "%s: expected cmd %d, got %v", site, want, got)
+	}
 }
 
-// TestCrashModel_SegmentSealStaysFullFlush pins the segment seal: sealSegment
-// calls file.Sync directly (os.File.Sync, F_FULLFSYNC), so it must never reach
-// the fence seam even under the default crash_model.
-func TestCrashModel_SegmentSealStaysFullFlush(t *testing.T) {
-	rec := &syncCmdRecorder{}
-	rec.install(t)
+// TestCrashModel_SegmentSealAndAtomicWrite pins the segment seal and the
+// metadata atomic write: fence under barrier, full under force_flush.
+func TestCrashModel_SegmentSealAndAtomicWrite(t *testing.T) {
+	for _, force := range []bool{false, true} {
+		name := "barrier_default"
+		if force {
+			name = "force_flush"
+		}
+		want := cmBarrier
+		if force {
+			want = cmFull
+		}
+		t.Run(name, func(t *testing.T) {
+			rec := &syncCmdRecorder{}
+			rec.install(t)
 
-	sm, err := NewSegmentManagerWithConfig(t.TempDir(), DefaultSegmentConfig())
-	require.NoError(t, err)
-	t.Cleanup(func() { _ = sm.Close() })
+			cfg := DefaultSegmentConfig()
+			if force {
+				cfg.ConfirmSync = walConfirmForceFlush
+			}
+			sm, err := NewSegmentManagerWithConfig(t.TempDir(), cfg)
+			require.NoError(t, err)
+			t.Cleanup(func() { _ = sm.Close() })
 
-	require.NoError(t, writeLegacyForTest(sm, "segpin", crashModelTestMessage("segpin", 1), 1))
-	val, ok := sm.queueSegments.Load("segpin")
-	require.True(t, ok)
-	qs := val.(*QueueSegments)
+			require.NoError(t, writeLegacyForTest(sm, "segpin", crashModelTestMessage("segpin", 1), 1))
+			val, ok := sm.queueSegments.Load("segpin")
+			require.True(t, ok)
+			qs := val.(*QueueSegments)
 
-	rec.reset()
-	qs.mutex.Lock()
-	err = qs.sealSegment()
-	qs.mutex.Unlock()
-	require.NoError(t, err)
+			rec.reset()
+			qs.mutex.Lock()
+			err = qs.sealSegment()
+			qs.mutex.Unlock()
+			require.NoError(t, err)
+			require.Equal(t, []int{want}, rec.snapshot(),
+				"the segment seal must issue exactly cmd %d", want)
 
-	require.Empty(t, rec.snapshot(),
-		"the segment seal must keep os.File.Sync (F_FULLFSYNC), never route through the fence seam")
+			// The metadata atomic write: one file fsync + one dir sync, both
+			// the same primitive.
+			rec.reset()
+			path := filepath.Join(t.TempDir(), "meta.cbor")
+			pol := newSyncPolicy(walConfirmBarrier)
+			if force {
+				pol = newSyncPolicy(walConfirmForceFlush)
+			}
+			require.NoError(t, atomicWriteFileWithPolicy(path, []byte("x"), 0644, pol.withSite(siteMetadataFile)))
+			got := rec.snapshot()
+			require.Len(t, got, 2, "atomic write is one file fsync + one dir sync, got %v", got)
+			for _, c := range got {
+				require.Equal(t, want, c, "atomic write barrier must be cmd %d, got %v", want, got)
+			}
+		})
+	}
+}
+
+// TestCrashModel_W8Step1 pins the W8 adjustment: in barrier mode the pre-open
+// helper DROPS its retired-file flush step; in force_flush it keeps it. Step 2
+// (creation dir barrier) runs in both, with the mode's primitive.
+func TestCrashModel_W8Step1(t *testing.T) {
+	cases := []struct {
+		name     string
+		force    bool
+		wantBar  int
+		wantFull int
+		min      int
+	}{
+		// barrier: exactly one dir barrier (the creation), the fence.
+		{name: "barrier_default", force: false, min: 1},
+		// force_flush: step 1 + step 2, both full.
+		{name: "force_flush", force: true, min: 2},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			rec := &syncCmdRecorder{}
+			rec.install(t)
+			wm, err := NewWALManagerWithConfig(t.TempDir(), crashModelTestConfig(tc.force))
+			require.NoError(t, err)
+			t.Cleanup(func() { _ = wm.Close() })
+
+			sw := wm.sharedWAL
+			rec.reset()
+			sw.preopenNext()
+
+			got := rec.snapshot()
+			want := wantPrimitive(!tc.force)
+			for _, c := range got {
+				require.Equal(t, want, c,
+					"every pre-open directory barrier in %s must be cmd %d, got %v", tc.name, want, got)
+			}
+			if tc.force {
+				require.GreaterOrEqual(t, len(got), tc.min,
+					"force_flush keeps BOTH pre-open directory barriers (step 1 + step 2)")
+			} else {
+				require.Equal(t, tc.min, len(got),
+					"barrier mode DROPS the retired-file flush: only the creation barrier fires")
+			}
+		})
+	}
 }

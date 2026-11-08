@@ -383,7 +383,7 @@ func (qw *QueueWAL) compactOldFile(fileNum uint64) error {
 		newInv.addRecord(c.rec)
 	}
 
-	if err := walCompactionFsync(tmp); err != nil {
+	if err := walCompactionFsync(tmp, qw.policy(siteCompactionFile)); err != nil {
 		return fmt.Errorf("fsync compaction temp file %s: %w", tmpPath, err)
 	}
 	if err := tmp.Close(); err != nil {
@@ -444,7 +444,7 @@ func (qw *QueueWAL) compactOldFile(fileNum uint64) error {
 	// failure here does NOT invalidate the compaction: the rename has already
 	// happened, and a crash that loses the rename leaves the OLD file in
 	// place, which still holds every record.
-	syncErr := syncDir(qw.dataDir)
+	syncErr := qw.policy(siteCompactionDir).dir(qw.dataDir)
 
 	// Publish the new layout. The bytes on disk have already changed, so the
 	// index MUST describe the new layout even if the directory fsync failed.

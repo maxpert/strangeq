@@ -193,20 +193,16 @@ func SetWALSyncCmdForTest(fn func(fd uintptr, cmd int) error) (restore func()) {
 var walTxFsyncHook atomic.Pointer[walFsyncFn]
 
 // walTxFsync is the confirm barrier performed by writeTxAtomic. The hook, when
-// installed, wins and REPLACES the primitive entirely. Otherwise force selects
-// the full drive-cache flush (fdatasyncFile) — the crash_model: force_flush
-// path — and the default issues barrierSyncFile, the crash_model: barrier
-// fence. It is deliberately NOT routed through walGroupCommitFsync: tests that
-// fault the group-commit barrier must not break transaction commits (and vice
-// versa).
-func walTxFsync(f *os.File, force bool) error {
-	if p := walTxFsyncHook.Load(); p != nil {
-		return (*p)(f)
+// installed, wins and REPLACES the primitive entirely. Otherwise the policy
+// selects the primitive: in barrier mode the fence (barrierSyncFile), in
+// force_flush the full drive-cache flush (fdatasyncFile). It is deliberately
+// NOT routed through walGroupCommitFsync: tests that fault the group-commit
+// barrier must not break transaction commits (and vice versa).
+func walTxFsync(f *os.File, p syncPolicy) error {
+	if h := walTxFsyncHook.Load(); h != nil {
+		return (*h)(f)
 	}
-	if force {
-		return fdatasyncFile(f)
-	}
-	return barrierSyncFile(f)
+	return p.file(f)
 }
 
 // SetWALTxFsyncForTest installs fn as the fsync used by the transaction slow
@@ -241,7 +237,12 @@ func walTruncateDefault(f *os.File, size int64, sync bool) error {
 		return err
 	}
 	if sync {
-		return fdatasyncFile(f)
+		// DELIBERATELY the full drive-cache flush, in BOTH crash models: this
+		// is the I/O-error repair path (a truncated-back failed write must get
+		// real media confirmation before the broker retries). It fires off the
+		// traffic path by nature, so it is exempt from the barrier-everywhere
+		// rule (spec §2).
+		return fdatasyncFileSite(f, siteRepair)
 	}
 	return nil
 }
@@ -471,13 +472,16 @@ func SetCheckpointUnlinkForTest(fn func(path string) error) (restore func()) {
 var walCompactionFsyncHook atomic.Pointer[walFsyncFn]
 
 // walCompactionFsync is the fsync performed on a WAL compaction's temporary
-// file. Default: fdatasyncFile — identical to the group-commit fsync, so a
-// compacted file is as durable as a written one.
-func walCompactionFsync(f *os.File) error {
-	if p := walCompactionFsyncHook.Load(); p != nil {
-		return (*p)(f)
+// file. The hook, when installed, wins. Otherwise the policy selects the
+// primitive: in barrier mode the fence (a compaction is rare and off the commit
+// path, but a full flush here would still stall every concurrent confirm for
+// 100–300 ms — the §1 rule is "any call that can fire while serving traffic
+// uses the fence"), in force_flush the full drive-cache flush.
+func walCompactionFsync(f *os.File, p syncPolicy) error {
+	if h := walCompactionFsyncHook.Load(); h != nil {
+		return (*h)(f)
 	}
-	return fdatasyncFile(f)
+	return p.file(f)
 }
 
 // SetWALCompactionFsyncForTest installs fn as the fsync used by the WAL
