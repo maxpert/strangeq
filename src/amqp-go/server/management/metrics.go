@@ -29,6 +29,9 @@ type ManagementMetricsSink interface {
 	ManagementUnauthenticated(v bool)
 	ManagementInsecureBind(v bool)
 	ManagementUIRequests(statusClass int)
+	// ManagementPanic counts one recovered management-handler panic by the
+	// bounded route TEMPLATE (OPS-060). The endpoint is never a raw path.
+	ManagementPanic(endpoint string)
 }
 
 // noopSink implements ManagementMetricsSink as a no-op.
@@ -51,6 +54,7 @@ func (noopSink) ManagementCapabilityDenied(string)          {}
 func (noopSink) ManagementUnauthenticated(bool)             {}
 func (noopSink) ManagementInsecureBind(bool)                {}
 func (noopSink) ManagementUIRequests(int)                   {}
+func (noopSink) ManagementPanic(string)                     {}
 
 // sinkOrNoop returns the injected sink or a shared no-op.
 func sinkOrNoop(base any) ManagementMetricsSink {

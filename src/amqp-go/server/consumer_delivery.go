@@ -281,33 +281,49 @@ func (s *Server) consumerDeliveryLoop(rt *connRuntime) {
 // ensures no double-requeue with the connection teardown's UnregisterConsumer
 // cleanup (step 7), which also uses LoadAndDelete on the same index.
 func (s *Server) requeueFailedDeliveries(batch []*protocol.Delivery, extras []*protocol.Delivery) {
-	if s.MetricsCollector != nil {
-		// Every delivery handed to the requeue path after a write error is
-		// counted (spec 06 §3.4); the index LoadAndDelete guard in RejectMessage
-		// makes a double-requeue impossible, so the count matches what was
-		// actually requeued or dropped by a missing consumer.
-		s.MetricsCollector.RecordDeliveriesRequeued(DeliveryRequeueWriteError, len(batch)+len(extras))
+	var requeued, dropped int
+	count := func(d *protocol.Delivery) {
+		if s.requeueSingleDelivery(d) {
+			requeued++
+		} else {
+			dropped++
+		}
 	}
 	for _, d := range batch {
-		s.requeueSingleDelivery(d)
+		count(d)
 	}
 	for _, d := range extras {
-		s.requeueSingleDelivery(d)
+		count(d)
+	}
+	if s.MetricsCollector != nil {
+		// Count what was ACTUALLY requeued, not what was handed to the path:
+		// a delivery whose consumer vanished is stranded otherwise (neither
+		// requeued nor counted anywhere). The remainder is a bounded
+		// consumer_removed delivery loss (spec 06 §3.4).
+		s.MetricsCollector.RecordDeliveriesRequeued(DeliveryRequeueWriteError, requeued)
+		s.MetricsCollector.RecordDeliveriesDropped(DeliveryDropConsumerRemoved, dropped)
 	}
 }
 
-func (s *Server) requeueSingleDelivery(d *protocol.Delivery) {
+// requeueSingleDelivery requeues one failed delivery and reports whether the
+// requeue actually landed: true only when a live consumer was found AND
+// RejectMessage returned nil. A vanished consumer (no delivery-index entry) or
+// a failed RejectMessage returns false, so the caller counts it as a drop
+// rather than silently stranding it.
+func (s *Server) requeueSingleDelivery(d *protocol.Delivery) bool {
 	if d == nil {
-		return
+		return false
 	}
 	consumerID, ok := s.Broker.GetConsumerForDelivery(d.DeliveryTag)
 	if !ok {
-		return
+		return false
 	}
 	if err := s.Broker.RejectMessage(consumerID, d.DeliveryTag, true); err != nil {
 		s.Log.Warn("Failed to requeue delivery on write error",
 			zap.Uint64("delivery_tag", d.DeliveryTag),
 			zap.String("consumer_id", consumerID),
 			zap.Error(err))
+		return false
 	}
+	return true
 }

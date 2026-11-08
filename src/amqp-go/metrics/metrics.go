@@ -74,7 +74,6 @@ type Collector struct {
 	// Latency metrics
 	MessagePublishDuration  prometheus.Histogram
 	MessageDeliveryDuration prometheus.Histogram
-	MessageAge              *prometheus.GaugeVec
 
 	// Disk metrics
 	DiskFreeBytes  prometheus.Gauge
@@ -162,6 +161,13 @@ type Collector struct {
 	// to a private registry.
 	mgmtRegistry prometheus.Registerer
 
+	// ManagementPanics aliases the lazily-registered
+	// amqp_management_panics_total{endpoint} family (OPS-060) so tests and
+	// diagnostics can read it directly. It is nil until RegisterManagement
+	// runs, matching the disabled-surface contract (OPS-002). Production reads
+	// the family through the ManagementPanic sink method, not this field.
+	ManagementPanics *prometheus.CounterVec
+
 	// WS-MEMORY-CUT bookkeeping diagnostics (amqp_wal_bookkeeping_*). The three
 	// GaugeFuncs read the bound stats AT SCRAPE TIME (never stale); bind via
 	// BindWALBookkeepingStats. DIAGNOSTIC ONLY; never gated.
@@ -247,10 +253,20 @@ type Collector struct {
 	PanicsTotal                    *prometheus.CounterVec
 }
 
+// NewCollector creates a new metrics collector with all Prometheus metrics,
 // registered on the default (global) registerer. It is the production
 // constructor.
 func NewCollector(namespace string) *Collector {
 	return newCollector(prometheus.DefaultRegisterer, namespace)
+}
+
+// NewCollectorWithRegistry is the registry-injectable constructor: every family
+// is registered on reg instead of the process-global default. Tests use a
+// private registry so a collector can be built without the duplicate-
+// registration panic and without contaminating the default gatherer. A nil reg
+// falls back to prometheus.DefaultRegisterer.
+func NewCollectorWithRegistry(reg prometheus.Registerer, namespace string) *Collector {
+	return newCollector(reg, namespace)
 }
 
 // newCollector is the registry-injectable constructor. Production always uses
@@ -478,11 +494,6 @@ func newCollector(registerer prometheus.Registerer, namespace string) *Collector
 			Help:      "Time taken to deliver a message to consumer",
 			Buckets:   prometheus.ExponentialBuckets(0.0001, 2, 15), // 0.1ms to ~3s
 		}),
-		MessageAge: factory.NewGaugeVec(prometheus.GaugeOpts{
-			Namespace: namespace,
-			Name:      "message_age_seconds",
-			Help:      "Age of oldest message in queue",
-		}, []string{"queue", "vhost"}),
 
 		// Disk metrics
 		DiskFreeBytes: factory.NewGauge(prometheus.GaugeOpts{
@@ -1186,18 +1197,6 @@ func (c *Collector) RecordPublishLatency(duration float64) {
 // RecordDeliveryLatency records the time taken to deliver a message
 func (c *Collector) RecordDeliveryLatency(duration float64) {
 	c.MessageDeliveryDuration.Observe(duration)
-}
-
-// UpdateMessageAge updates the age of the oldest message in a queue
-func (c *Collector) UpdateMessageAge(queueName, vhost string, ageSeconds float64) {
-	labels := prometheus.Labels{"queue": queueName, "vhost": vhost}
-	c.MessageAge.With(labels).Set(ageSeconds)
-}
-
-// DeleteMessageAge removes message age metric for a deleted queue
-func (c *Collector) DeleteMessageAge(queueName, vhost string) {
-	labels := prometheus.Labels{"queue": queueName, "vhost": vhost}
-	c.MessageAge.Delete(labels)
 }
 
 // UpdateDiskMetrics updates disk usage metrics

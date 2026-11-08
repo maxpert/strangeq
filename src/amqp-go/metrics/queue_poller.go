@@ -140,7 +140,6 @@ func (p *queuePoller) pollOnce(q QueueStatsProvider, alarms AlarmStateProvider) 
 			continue
 		}
 		p.collector.DeleteQueueMetrics(key.name, key.vhost)
-		p.collector.DeleteMessageAge(key.name, key.vhost)
 	}
 	p.last = current
 

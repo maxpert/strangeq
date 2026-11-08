@@ -487,7 +487,7 @@ func (b *ServerBuilder) Build() (*Server, error) {
 	// Now the severity comes from the site that produced the error
 	// (interfaces.RecoveryOutcome), an unclassified error is FATAL by the
 	// type's zero value, and only --unsafe-recovery proceeds.
-	faults := interfaces.ExplainedFaults("recovery", err)
+	faults := interfaces.ExplainedFaults(RecoveryStageRecovery, err)
 	gating := gatingFaultList(faults)
 	if len(gating) > 0 && !b.config.Storage.UnsafeRecovery {
 		return nil, errors.New(interfaces.RecoveryRefusalMessage("recovery", gating))

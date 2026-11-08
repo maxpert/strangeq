@@ -34,6 +34,10 @@ type managementMetrics struct {
 	unauthenticated     prometheus.Gauge
 	insecureBind        prometheus.Gauge
 	uiRequests          *prometheus.CounterVec
+	// managementPanics counts recovered management-handler panics by bounded
+	// route TEMPLATE (OPS-060). It must stay 0; a non-zero value means the
+	// dispatch recover fired.
+	managementPanics *prometheus.CounterVec
 }
 
 // RegisterManagement creates and registers the amqp_management_* families on
@@ -140,13 +144,21 @@ func (c *Collector) RegisterManagement() {
 				Name:      "management_ui_requests_total",
 				Help:      "Management UI asset/route requests by status class",
 			}, []string{"status_class"}),
+			managementPanics: prometheus.NewCounterVec(prometheus.CounterOpts{
+				Namespace: ns,
+				Name:      "management_panics_total",
+				Help:      "Management handler panics recovered by the dispatch guard, by bounded route template (OPS-060)",
+			}, []string{"endpoint"}),
 		}
 		reg.MustRegister(
 			m.requests, m.requestDuration, m.inFlight, m.sessions, m.authFailures,
 			m.rateLimited, m.snapshotPartial, m.snapshotDuration, m.snapshotLockWait,
 			m.forbiddenLock, m.publishBackpressure, m.jobs, m.auditDropped,
 			m.capabilityDenied, m.unauthenticated, m.insecureBind, m.uiRequests,
+			m.managementPanics,
 		)
+		// Published for tests/diagnostics; nil while management is disabled.
+		c.ManagementPanics = m.managementPanics
 		c.mgmt.Store(m)
 	})
 }
@@ -279,6 +291,15 @@ func (c *Collector) ManagementInsecureBind(v bool) {
 func (c *Collector) ManagementUIRequests(statusClass int) {
 	if m := c.mgmtOrNil(); m != nil {
 		m.uiRequests.WithLabelValues(statusClassLabel(statusClass)).Inc()
+	}
+}
+
+// ManagementPanic counts one recovered management-handler panic by bounded
+// route TEMPLATE (OPS-060), never the raw path. No-op while management metrics
+// are disabled (OPS-002).
+func (c *Collector) ManagementPanic(endpoint string) {
+	if m := c.mgmtOrNil(); m != nil {
+		m.managementPanics.WithLabelValues(endpoint).Inc()
 	}
 }
 

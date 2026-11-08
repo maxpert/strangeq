@@ -111,13 +111,16 @@ func (s *Server) shutdown(ctx context.Context) (err error) {
 	for _, c := range conns {
 		if s.MetricsCollector != nil {
 			s.MetricsCollector.RecordShutdownConnectionForced()
-			s.MetricsCollector.RecordConnectionClosedByCause(ConnectionCloseForcedShutdown)
 		}
 		if rt, ok := s.runtimes.Load(c); ok && rt.(*connRuntime).handshakeDone.Load() {
+			// failConnection records the forced_shutdown cause once (the code
+			// is CONNECTION_FORCED), so this branch must NOT record it again.
 			go s.failConnection(rt.(*connRuntime), amqperrors.ConnectionForced,
 				"CONNECTION_FORCED - broker shutdown", 0, 0)
 		} else {
-			// Still handshaking (or no runtime): just close the socket.
+			// Still handshaking (or no runtime): just close the socket. There
+			// is no failConnection to record the cause, so record it here.
+			s.recordConnectionClose(c, ConnectionCloseForcedShutdown)
 			_ = c.Conn.Close()
 		}
 	}

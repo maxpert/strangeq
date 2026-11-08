@@ -17,7 +17,6 @@ func primeForInventory(c *Collector) {
 	// Base families with labels.
 	c.UpdateQueueReadyAndConsumers("q", "/", 1, true, 1, true, 1)
 	c.QueueDepthHighWater.WithLabelValues("q", "/").Set(1)
-	c.UpdateMessageAge("q", "/", 1)
 	c.RecordWALFullFlush("group_commit")
 	c.UpdateSegmentMetrics("q", 1, 1)
 	c.RecordConnectionError("read")
@@ -56,6 +55,7 @@ func primeForInventory(c *Collector) {
 	c.ManagementJobs("queued", 1)
 	c.ManagementCapabilityDenied("capView")
 	c.ManagementUIRequests(2)
+	c.ManagementPanic("/api/overview")
 }
 
 // gatheredFamilyNames returns the sorted family names on a registry.
@@ -118,7 +118,6 @@ func TestMetricInventory_PinsFullSeriesSet(t *testing.T) {
 		"amqp_memory_gc_pause_seconds",
 		"amqp_memory_heap_bytes",
 		"amqp_memory_used_bytes",
-		"amqp_message_age_seconds",
 		"amqp_message_delivery_duration_seconds",
 		"amqp_message_publish_duration_seconds",
 		"amqp_messages_acknowledged_total",
@@ -216,6 +215,7 @@ func TestMetricInventory_PinsFullSeriesSet(t *testing.T) {
 		"amqp_management_in_flight",
 		"amqp_management_insecure_bind",
 		"amqp_management_jobs",
+		"amqp_management_panics_total",
 		"amqp_management_publish_backpressure_total",
 		"amqp_management_rate_limited_total",
 		"amqp_management_request_duration_seconds",

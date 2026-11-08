@@ -40,6 +40,10 @@ type connRuntime struct {
 	connClosing           atomic.Bool // server sent connection.close, awaiting close-ok
 	closeHandshakeStarted atomic.Bool // either side started the connection close handshake
 	closeTimer            atomic.Pointer[time.Timer]
+	// closeCauseRecorded is the once-guard for amqp_connections_closed_by_cause:
+	// the first close site to win records the cause; every later site (and a
+	// second cause) is silent (spec 06 §3.5).
+	closeCauseRecorded atomic.Bool
 
 	closingChannels sync.Map     // uint16 → struct{}: server sent channel.close, awaiting close-ok/close
 	closingCount    atomic.Int32 // fast-path gate: 0 ⇒ no channel is closing

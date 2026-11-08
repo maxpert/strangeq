@@ -41,25 +41,22 @@ func (s *spyMetricsCollector) SetUnsafeRecoveryArtifacts(count int) {}
 func (s *spyMetricsCollector) RecordQueueDeleted()                  {}
 func (s *spyMetricsCollector) UpdateQueueMetrics(queueName, vhost string, ready, unacked, consumers int) {
 }
-func (s *spyMetricsCollector) DeleteQueueMetrics(queueName, vhost string) {}
-func (s *spyMetricsCollector) RecordExchangeDeclared()                    {}
-func (s *spyMetricsCollector) RecordExchangeDeleted()                     {}
-func (s *spyMetricsCollector) RecordMessagePublished(size int)            { s.published.Add(1) }
-func (s *spyMetricsCollector) RecordMessageDelivered(size int)            { s.delivered.Add(1) }
-func (s *spyMetricsCollector) RecordMessageAcknowledged()                 { s.acks.Add(1) }
-func (s *spyMetricsCollector) RecordMessageRedelivered()                  { s.redeliver.Add(1) }
-func (s *spyMetricsCollector) RecordMessageRejected()                     { s.rejects.Add(1) }
-func (s *spyMetricsCollector) RecordMessageUnroutable()                   { s.unroutable.Add(1) }
-func (s *spyMetricsCollector) SetConsumersTotal(count int)                { s.consumersTotal.Store(int64(count)) }
-func (s *spyMetricsCollector) RecordTransactionStarted()                  { s.txStart.Add(1) }
-func (s *spyMetricsCollector) RecordTransactionCommitted()                { s.txCommit.Add(1) }
-func (s *spyMetricsCollector) RecordTransactionRolledback()               { s.txRoll.Add(1) }
-func (s *spyMetricsCollector) UpdateServerUptime(seconds float64)         {}
-func (s *spyMetricsCollector) RecordPublishLatency(duration float64)      {}
-func (s *spyMetricsCollector) RecordDeliveryLatency(duration float64)     {}
-func (s *spyMetricsCollector) UpdateMessageAge(queueName, vhost string, ageSeconds float64) {
-}
-func (s *spyMetricsCollector) DeleteMessageAge(queueName, vhost string)       {}
+func (s *spyMetricsCollector) DeleteQueueMetrics(queueName, vhost string)     {}
+func (s *spyMetricsCollector) RecordExchangeDeclared()                        {}
+func (s *spyMetricsCollector) RecordExchangeDeleted()                         {}
+func (s *spyMetricsCollector) RecordMessagePublished(size int)                { s.published.Add(1) }
+func (s *spyMetricsCollector) RecordMessageDelivered(size int)                { s.delivered.Add(1) }
+func (s *spyMetricsCollector) RecordMessageAcknowledged()                     { s.acks.Add(1) }
+func (s *spyMetricsCollector) RecordMessageRedelivered()                      { s.redeliver.Add(1) }
+func (s *spyMetricsCollector) RecordMessageRejected()                         { s.rejects.Add(1) }
+func (s *spyMetricsCollector) RecordMessageUnroutable()                       { s.unroutable.Add(1) }
+func (s *spyMetricsCollector) SetConsumersTotal(count int)                    { s.consumersTotal.Store(int64(count)) }
+func (s *spyMetricsCollector) RecordTransactionStarted()                      { s.txStart.Add(1) }
+func (s *spyMetricsCollector) RecordTransactionCommitted()                    { s.txCommit.Add(1) }
+func (s *spyMetricsCollector) RecordTransactionRolledback()                   { s.txRoll.Add(1) }
+func (s *spyMetricsCollector) UpdateServerUptime(seconds float64)             {}
+func (s *spyMetricsCollector) RecordPublishLatency(duration float64)          {}
+func (s *spyMetricsCollector) RecordDeliveryLatency(duration float64)         {}
 func (s *spyMetricsCollector) UpdateDiskMetrics(freeBytes, usedBytes float64) {}
 func (s *spyMetricsCollector) UpdateWALSize(bytes float64)                    {}
 func (s *spyMetricsCollector) RecordWALWrite()                                {}

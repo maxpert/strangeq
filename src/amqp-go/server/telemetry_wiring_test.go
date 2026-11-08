@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -46,14 +47,36 @@ type wireSpy struct {
 	depthGateArmed    atomic.Int64
 	consumerRegErrors atomic.Int64
 	dropped           atomic.Int64
+	droppedByReason   sync.Map // string -> *atomic.Int64
 	requeued          atomic.Int64
 	sendErrors        atomic.Int64
 	closedByCause     atomic.Int64
+	causes            sync.Map // string -> *atomic.Int64
 	shutdowns         atomic.Int64
 	storageCloseErrs  atomic.Int64
 	alarmTrips        atomic.Int64
 	panics            atomic.Int64
 }
+
+// counter returns the per-key counter, creating it on first use.
+func counter(m *sync.Map, key string) *atomic.Int64 {
+	v, _ := m.LoadOrStore(key, &atomic.Int64{})
+	return v.(*atomic.Int64)
+}
+
+// counterValue reads a per-key counter, or 0.
+func counterValue(m *sync.Map, key string) int64 {
+	if v, ok := m.Load(key); ok {
+		return v.(*atomic.Int64).Load()
+	}
+	return 0
+}
+
+// causeCount is the number of closes recorded for one bounded cause.
+func (s *wireSpy) causeCount(cause string) int64 { return counterValue(&s.causes, cause) }
+
+// droppedCount is the number of deliveries dropped for one bounded reason.
+func (s *wireSpy) droppedCount(reason string) int64 { return counterValue(&s.droppedByReason, reason) }
 
 func (s *wireSpy) RecordPublishRefused(reason string) {
 	switch reason {
@@ -63,16 +86,22 @@ func (s *wireSpy) RecordPublishRefused(reason string) {
 		s.pubRefusedClosed.Add(1)
 	}
 }
-func (s *wireSpy) RecordDepthGateArmed()                    { s.depthGateArmed.Add(1) }
-func (s *wireSpy) RecordConsumerRegisterError()             { s.consumerRegErrors.Add(1) }
-func (s *wireSpy) RecordDeliveriesDropped(_ string, n int)  { s.dropped.Add(int64(n)) }
+func (s *wireSpy) RecordDepthGateArmed()        { s.depthGateArmed.Add(1) }
+func (s *wireSpy) RecordConsumerRegisterError() { s.consumerRegErrors.Add(1) }
+func (s *wireSpy) RecordDeliveriesDropped(reason string, n int) {
+	s.dropped.Add(int64(n))
+	counter(&s.droppedByReason, reason).Add(int64(n))
+}
 func (s *wireSpy) RecordDeliveriesRequeued(_ string, n int) { s.requeued.Add(int64(n)) }
 func (s *wireSpy) RecordDeliverySendError()                 { s.sendErrors.Add(1) }
-func (s *wireSpy) RecordConnectionClosedByCause(string)     { s.closedByCause.Add(1) }
-func (s *wireSpy) RecordShutdown(string, float64)           { s.shutdowns.Add(1) }
-func (s *wireSpy) RecordStorageCloseError()                 { s.storageCloseErrs.Add(1) }
-func (s *wireSpy) RecordResourceAlarmTrip(string)           { s.alarmTrips.Add(1) }
-func (s *wireSpy) RecordPanic(string)                       { s.panics.Add(1) }
+func (s *wireSpy) RecordConnectionClosedByCause(cause string) {
+	s.closedByCause.Add(1)
+	counter(&s.causes, cause).Add(1)
+}
+func (s *wireSpy) RecordShutdown(string, float64) { s.shutdowns.Add(1) }
+func (s *wireSpy) RecordStorageCloseError()       { s.storageCloseErrs.Add(1) }
+func (s *wireSpy) RecordResourceAlarmTrip(string) { s.alarmTrips.Add(1) }
+func (s *wireSpy) RecordPanic(string)             { s.panics.Add(1) }
 
 // TestRecoveryFaultSink_Forwards pins the recovery sink wiring (spec 06 §3.2):
 // a fault and a discarded-record count pass through to the sink by value.
@@ -185,14 +214,19 @@ func TestPublishRefused_QueueClosed(t *testing.T) {
 	assert.Equal(t, int64(0), spy.pubRefusedMaxLen.Load())
 }
 
-// TestDeliveriesRequeued_Counter (spec 06 §5 test #15, counter half): every
-// delivery handed to the requeue path after a write error is counted.
+// TestDeliveriesRequeued_Counter (spec 06 §5 test #15, counter half): a
+// vanished consumer's deliveries are DROPPED, not counted as requeued. The
+// requeue counter counts only deliveries whose RejectMessage actually landed.
 func TestDeliveriesRequeued_Counter(t *testing.T) {
 	spy := &wireSpy{}
 	s := &Server{Log: zap.NewNop(), MetricsCollector: spy, Broker: noConsumerBroker{}}
 	s.requeueFailedDeliveries(
 		[]*protocol.Delivery{{DeliveryTag: 1}, {DeliveryTag: 2}}, nil)
-	assert.Equal(t, int64(2), spy.requeued.Load())
+	assert.Equal(t, int64(0), spy.requeued.Load(),
+		"a vanished consumer must not be counted as a requeue")
+	assert.Equal(t, int64(2), spy.droppedCount(DeliveryDropConsumerRemoved),
+		"the stranded deliveries must be counted as consumer_removed drops")
+	assert.Equal(t, int64(2), spy.dropped.Load())
 }
 
 // TestConsumerRegisterError (spec 06 §5 test #16): a refused basic.consume
@@ -212,7 +246,8 @@ func TestConsumerRegisterError(t *testing.T) {
 }
 
 // TestConnectionsClosedByCause_ForcedShutdown (spec 06 §5 test #19): a live
-// connection torn down by broker shutdown records the forced_shutdown cause.
+// connection torn down by broker shutdown records the forced_shutdown cause,
+// and a failed socket write records exactly one write_error cause.
 func TestConnectionsClosedByCause_ForcedShutdown(t *testing.T) {
 	srv := newTransactionTestServer(t)
 	spy := &wireSpy{}
@@ -226,8 +261,19 @@ func TestConnectionsClosedByCause_ForcedShutdown(t *testing.T) {
 	defer cancel()
 	_ = srv.Shutdown(ctx)
 
-	assert.GreaterOrEqual(t, spy.closedByCause.Load(), int64(1),
+	assert.GreaterOrEqual(t, spy.causeCount(ConnectionCloseForcedShutdown), int64(1),
 		"a connection closed by shutdown must record the forced_shutdown cause")
+
+	// A hard write failure is its own bounded cause, recorded exactly once by
+	// the once-guarded close helper even though writeLocked is called again.
+	writeSrv := &Server{Log: zap.NewNop(), MetricsCollector: spy}
+	wconn, _ := newPipeConnWithFrames(t)
+	require.NoError(t, wconn.Conn.Close()) // any subsequent write fails
+	require.Error(t, writeSrv.writeFrame(wconn, &protocol.Frame{Type: protocol.FrameHeartbeat}))
+	// A second failed write must not double-count.
+	_ = writeSrv.writeFrame(wconn, &protocol.Frame{Type: protocol.FrameHeartbeat})
+	assert.Equal(t, int64(1), spy.causeCount(ConnectionCloseWriteError),
+		"a failed write must record exactly one write_error cause")
 }
 
 // TestDepthGateArmed_CounterAndGauge (spec 06 §5 test #13): arming the

@@ -50,8 +50,6 @@ type MetricsCollector interface {
 	// Latency metrics
 	RecordPublishLatency(duration float64)
 	RecordDeliveryLatency(duration float64)
-	UpdateMessageAge(queueName, vhost string, ageSeconds float64)
-	DeleteMessageAge(queueName, vhost string)
 
 	// Disk metrics
 	UpdateDiskMetrics(freeBytes, usedBytes float64)
@@ -238,10 +236,8 @@ func (n *NoOpMetricsCollector) UpdateServerUptime(seconds float64)         {}
 func (n *NoOpMetricsCollector) SetUnsafeRecoveryArtifacts(count int)       {}
 
 // Latency metrics
-func (n *NoOpMetricsCollector) RecordPublishLatency(duration float64)                        {}
-func (n *NoOpMetricsCollector) RecordDeliveryLatency(duration float64)                       {}
-func (n *NoOpMetricsCollector) UpdateMessageAge(queueName, vhost string, ageSeconds float64) {}
-func (n *NoOpMetricsCollector) DeleteMessageAge(queueName, vhost string)                     {}
+func (n *NoOpMetricsCollector) RecordPublishLatency(duration float64)  {}
+func (n *NoOpMetricsCollector) RecordDeliveryLatency(duration float64) {}
 
 // Disk metrics
 func (n *NoOpMetricsCollector) UpdateDiskMetrics(freeBytes, usedBytes float64) {}
