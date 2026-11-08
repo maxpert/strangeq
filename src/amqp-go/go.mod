@@ -3,7 +3,7 @@ module github.com/maxpert/amqp-go
 go 1.27.3
 
 require (
-	github.com/HdrHistogram/hdrhistogram-go v1.2.0
+	github.com/HdrHistogram/hdrhistogram-go v1.3.0
 	github.com/RoaringBitmap/roaring v1.9.4
 	github.com/chromedp/cdproto v0.159.0
 	github.com/chromedp/chromedp v0.23.0
