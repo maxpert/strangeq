@@ -213,6 +213,16 @@
     var hasRaw = opts.raw !== undefined && opts.raw !== null;
     var hasBody = hasRaw || (opts.body !== undefined && opts.body !== null);
     if (hasBody) headers["Content-Type"] = "application/json";
+    /* Caller-supplied headers (for example the X-Reason on a graceful
+     * connection.close). Applied before the CSRF token so a caller can never
+     * override it. */
+    if (opts.headers && typeof opts.headers === "object") {
+      Object.keys(opts.headers).forEach(function (hk) {
+        var hv = opts.headers[hk];
+        if (hv === null || hv === undefined || hv === "") return;
+        headers[hk] = String(hv);
+      });
+    }
     if (method !== "GET" && method !== "HEAD" && state.csrf) headers["X-CSRF-Token"] = state.csrf;
     if (opts.ifNoneMatch) headers["If-None-Match"] = opts.ifNoneMatch;
     var init = { method: method, headers: headers, credentials: "same-origin", cache: "no-store" };
@@ -301,6 +311,24 @@
 
   function exchangePath(vhost, name) {
     return API + "/exchanges/" + vhostPath(vhost) + "/" + encodeURIComponent(name);
+  }
+
+  /* bindingsPath is the canonical binding resource: an exchange source, a
+   * queue or exchange destination, and (for a delete) the synthesised
+   * properties_key. dtype is "q" or "e" (FR-API-091/093). */
+  function bindingsPath(vhost, source, dtype, destination, props) {
+    var p = API + "/bindings/" + vhostPath(vhost) + "/e/" + encodeURIComponent(source) +
+      "/" + dtype + "/" + encodeURIComponent(destination);
+    if (props !== undefined && props !== null) p += "/" + encodeURIComponent(props);
+    return p;
+  }
+
+  function bindingDtype(destinationType) {
+    return destinationType === "exchange" ? "e" : "q";
+  }
+
+  function bindingRowKey(b) {
+    return String(b.source) + "|" + String(b.destination_type) + "|" + String(b.destination) + "|" + String(b.properties_key);
   }
 
   /* ---------------------------------------------------------- feedback ----- */
@@ -1012,7 +1040,6 @@
 
   function buildQueueDetail(queue, route) {
     var name = String(queue.name);
-    var bindingsNotice = capabilityNotice({ error: "not_implemented", reason: "aggregate binding listing is not implemented (BOB-4)" }, "Bindings not available");
     var rows = [];
     var samples = state.samples[name] || (state.samples[name] = []);
     if (!isNull(queue.messages_ready)) {
@@ -1048,7 +1075,7 @@
       props,
       h("h2", { text: "Statistics" }), stats,
       h("h2", { text: "Arguments" }), renderArguments(queue.arguments),
-      h("h2", { text: "Bindings" }), bindingsNotice,
+      h("h2", { text: "Bindings" }), queueBindingsPanel("/", name),
       h("h2", { text: "Ready-depth sparkline" }), sparkline(samples),
       h("h2", { text: "Rows" }), tableBlock(
         [{ key: "ready", label: "ready", render: function (r) { return num(r.ready); } }],
@@ -1165,7 +1192,7 @@
       h("div", { class: "page-head" }, [h("h1", { text: name || "(default)" }), h("span", { class: "spacer" }), copyLinkButton(), publishBtn, deleteBtn]),
       props,
       h("h2", { text: "Arguments" }), renderArguments(exchange.arguments),
-      h("h2", { text: "Bindings" }), capabilityNotice({ error: "not_implemented", reason: "aggregate binding listing is not implemented (BOB-4)" }, "Bindings not available")
+      h("h2", { text: "Bindings" }), exchangeBindingsPanel("/", name)
     ]);
   }
 
@@ -1279,8 +1306,13 @@
       if (r.status === 501) channelsPanel.replaceChildren(h("p", { class: "null", text: "channel detail not available" }));
       else if (r.status >= 400) channelsPanel.replaceChildren(errorState(r.data));
       else channelsPanel.replaceChildren(tableBlock(
-        [{ key: "number", label: "Channel", render: function (c) { return num(c.number); } },
-         { key: "state", label: "State", render: function (c) { return stateCell(c.state); } }],
+        [{ key: "number", label: "Channel", render: function (c) { return channelLink(c); } },
+         { key: "state", label: "State", render: function (c) { return stateCell(c.state); } },
+         { key: "consumers", label: "Consumers", render: function (c) { return num(c.consumers); } },
+         { key: "unacked", label: "Unacked", render: function (c) { return num(c.unacked); } },
+         { key: "prefetch_count", label: "Prefetch", render: function (c) { return num(c.prefetch_count); } },
+         { key: "confirm", label: "Confirm", render: function (c) { return boolCell(c.confirm); } },
+         { key: "transactional", label: "Transactional", render: function (c) { return boolCell(c.transactional); } }],
         itemsOf(r.data), {}));
     }).catch(function () { channelsPanel.replaceChildren(h("p", { class: "null", text: "channel detail not available" })); });
     var props = h("dl", { class: "props" }, [
@@ -1316,7 +1348,7 @@
   function buildChannels(data, route) {
     var items = itemsOf(data);
     var columns = [
-      { key: "number", label: "Number", render: function (r) { return num(r.number); } },
+      { key: "number", label: "Number", render: function (r) { return channelLink(r); } },
       { key: "connection", label: "Connection", render: function (r) { return h("span", { text: val(r.connection) }); } },
       { key: "user", label: "User", render: function (r) { return h("span", { text: val(r.user) }); } },
       { key: "vhost", label: "Vhost", render: function (r) { return h("span", { text: val(r.vhost) }); } },
@@ -1325,7 +1357,7 @@
       { key: "unacked", label: "Unacked", render: function (r) { return num(r.unacked); } },
       { key: "prefetch_count", label: "Prefetch", render: function (r) { return num(r.prefetch_count); } },
       { key: "confirm", label: "Confirm", render: function (r) { return boolCell(r.confirm); } },
-      { key: "transactional", label: "Transactional", render: function (r) { return num(r.transactional); } }
+      { key: "transactional", label: "Transactional", render: function (r) { return boolCell(r.transactional); } }
     ];
     return h("div", { class: "screen screen-channels" }, [
       h("div", { class: "page-head" }, [h("h1", { text: "Channels" })]),
@@ -1333,6 +1365,46 @@
       tableToolbar(route, { sortKeys: CHANNEL_SORT_KEYS }),
       items.length ? tableBlock(columns, items, { route: route, sortKeys: CHANNEL_SORT_KEYS, rowKey: function (r) { return r.number; } }) : emptyState("No open channels."),
       pagination(data, route)
+    ]);
+  }
+
+  /* channelLink renders a channel number as a deep link to its detail screen,
+   * addressed by the canonical "{connection}:{number}" composite id. When the
+   * connection is not reported the number is not a usable key, so it renders
+   * as plain text rather than a dead link. */
+  function channelLink(c) {
+    if (isNull(c.connection) || isNull(c.number)) return num(c.number);
+    return link(String(c.number), "/channels/" + encodeURIComponent(String(c.connection) + ":" + String(c.number)));
+  }
+
+  function loadChannelDetail(container, route) {
+    var id = route.params.id;
+    var path = API + "/channels/" + encodeURIComponent(id);
+    return loadList(container, "channel:" + path, path, {
+      backHref: "/channels", backLabel: "Back to channels",
+      render: function (r) { return buildChannelDetail(r.data); }
+    });
+  }
+
+  function buildChannelDetail(c) {
+    var props = h("dl", { class: "props" }, [
+      h("dt", { text: "number" }), h("dd", null, [num(c.number)]),
+      h("dt", { text: "connection" }), h("dd", { text: val(c.connection) }),
+      h("dt", { text: "user" }), h("dd", { text: val(c.user) }),
+      h("dt", { text: "vhost" }), h("dd", { text: val(c.vhost) }),
+      h("dt", { text: "state" }), h("dd", null, [stateCell(c.state)]),
+      h("dt", { text: "consumers" }), h("dd", null, [num(c.consumers)]),
+      h("dt", { text: "unacked" }), h("dd", null, [num(c.unacked)]),
+      h("dt", { text: "prefetch_count" }), h("dd", null, [num(c.prefetch_count)]),
+      h("dt", { text: "confirm" }), h("dd", null, [boolCell(c.confirm)]),
+      h("dt", { text: "transactional" }), h("dd", null, [boolCell(c.transactional)]),
+      h("dt", { text: "stats" }), h("dd", null, [c.stats_partial ? h("span", { class: "stat-partial", text: "partial" }) : h("span", { text: "complete" })])
+    ]);
+    return h("div", { class: "screen screen-channel-detail" }, [
+      h("nav", { class: "breadcrumb" }, [link("Channels", "/channels"), h("span", { text: " / " }), h("span", { text: val(c.number) })]),
+      h("div", { class: "page-head" }, [h("h1", { text: "Channel " + val(c.number) }), h("span", { class: "spacer" }), copyLinkButton()]),
+      h("p", { class: "notice empty", role: "note", text: "Channels are read-only. There is no management close-channel operation; a channel closes when its client closes it or its connection is closed." }),
+      props
     ]);
   }
 
@@ -1380,32 +1452,142 @@
     return h("span", { text: String(v) });
   }
 
-  function loadBindings(container) {
-    if (state.capabilities && state.capabilities.bindings === false) {
-      container.replaceChildren(capabilityNotice(
-        { error: "not_implemented", reason: "aggregate binding listing is not implemented (BOB-4)" },
-        "Bindings not available"));
-      return Promise.resolve();
-    }
-    var path = API + "/bindings";
-    return loadList(container, "bindings", path, {
-      notImplementedTitle: "Bindings not available",
-      render: function (r) { return buildBindings(r.data); }
-    });
+  /* bindingsWriteState is the three-state capability gate for binding
+   * mutations: "on" (true), "off" (false) or "unknown" (missing/unreported). A
+   * control is only enabled for "on". */
+  function bindingsWriteState() {
+    var c = state.capabilities ? state.capabilities.bindings : undefined;
+    if (c === true) return "on";
+    if (c === false) return "off";
+    return "unknown";
   }
 
-  function buildBindings(data) {
-    var items = itemsOf(data);
-    var columns = [
+  function bindingsDisabledReason(st) {
+    if (st === "off") return "Binding management is not implemented by this broker (bindings capability is false)";
+    return "capability unknown (not reported by this broker / lookup failed)";
+  }
+
+  var BINDING_SORT_KEYS = ["source", "vhost", "destination", "destination_type", "routing_key", "properties_key"];
+
+  /* bindingColumns is the shared DATA-012 projection. withActions adds the
+   * per-row delete control used on the aggregate screen. */
+  function bindingColumns(vhost, withActions) {
+    var cols = [
       { key: "source", label: "Source", render: function (r) { return h("span", { text: val(r.source) }); } },
       { key: "destination", label: "Destination", render: function (r) { return h("span", { text: val(r.destination) }); } },
       { key: "destination_type", label: "Type", render: function (r) { return h("span", { text: val(r.destination_type) }); } },
-      { key: "routing_key", label: "Routing key", render: function (r) { return h("span", { text: val(r.routing_key) }); } }
+      { key: "routing_key", label: "Routing key", render: function (r) { return h("span", { text: val(r.routing_key) }); } },
+      { key: "properties_key", label: "Properties key", render: function (r) { return h("span", { text: val(r.properties_key) }); } }
     ];
+    if (withActions) {
+      cols.push({ key: "actions", label: "", render: function (r) { return rowDeleteBindingButton(vhost, r); } });
+    }
+    return cols;
+  }
+
+  function rowDeleteBindingButton(vhost, b) {
+    var btn = h("button", { type: "button", class: "danger row-action", text: "Delete" });
+    if (isNull(b.properties_key) || b.properties_key === "") {
+      btn.disabled = true;
+      btn.title = "This binding has no properties_key and cannot be addressed for deletion";
+      return btn;
+    }
+    btn.addEventListener("click", function (ev) {
+      ev.stopPropagation();
+      openDeleteBinding(vhost, b);
+    });
+    return btn;
+  }
+
+  function loadBindings(container, route) {
+    if (state.capabilities && state.capabilities.bindings === false) {
+      container.replaceChildren(capabilityNotice(
+        { error: "not_implemented", reason: "binding management is not available in this deployment" },
+        "Bindings not available"));
+      return Promise.resolve();
+    }
+    var q = route.query;
+    var vhost = q.get("vhost") || "/";
+    var params = {
+      page: q.get("page") || 1,
+      page_size: q.get("page_size") || 50,
+      source: q.get("source"),
+      destination: q.get("destination"),
+      sort: q.get("sort"),
+      sort_reverse: q.get("sort_reverse")
+    };
+    var path = API + "/bindings" + (vhost !== "/" ? "/" + vhostPath(vhost) : "") + qs(params);
+    return loadList(container, "bindings:" + path, path, {
+      notImplementedTitle: "Bindings not available",
+      render: function (r) { return buildBindings(r.data, route, vhost); }
+    });
+  }
+
+  function buildBindings(data, route, vhost) {
+    var items = itemsOf(data);
+    var createBtn = h("button", { type: "button", id: "create-binding-btn", text: "Create binding" });
+    var st = bindingsWriteState();
+    if (st !== "on") {
+      createBtn.disabled = true;
+      createBtn.title = bindingsDisabledReason(st);
+    }
+    createBtn.addEventListener("click", function () { if (!createBtn.disabled) openCreateBinding(route, vhost, null); });
     return h("div", { class: "screen screen-bindings" }, [
-      h("div", { class: "page-head" }, [h("h1", { text: "Bindings" })]),
-      items.length ? tableBlock(columns, items, {}) : emptyState("No bindings.")
+      h("div", { class: "page-head" }, [h("h1", { text: "Bindings" }), h("span", { class: "spacer" }), createBtn]),
+      tableToolbar(route, {
+        sortKeys: BINDING_SORT_KEYS,
+        filters: [
+          { name: "source", type: "search", label: "Filter bindings by source", placeholder: "source filter" },
+          { name: "destination", type: "search", label: "Filter bindings by destination", placeholder: "destination filter" }
+        ]
+      }),
+      items.length ? tableBlock(bindingColumns(vhost, true), items, {
+        route: route,
+        sortKeys: BINDING_SORT_KEYS,
+        rowKey: function (r) { return bindingRowKey(r); }
+      }) : emptyState("No bindings."),
+      pagination(data, route)
     ]);
+  }
+
+  /* queueBindingsPanel renders a queue's bindings (destination = the queue) from
+   * GET /api/queues/{vhost}/{name}/bindings. */
+  function queueBindingsPanel(vhost, name) {
+    var panel = h("div", { id: "queue-bindings" }, [itemsLoading()]);
+    if (state.capabilities && state.capabilities.bindings === false) {
+      panel.replaceChildren(capabilityNotice({ error: "not_implemented", reason: "binding management is not available in this deployment" }, "Bindings not available"));
+      return panel;
+    }
+    api(queuePath(vhost, name) + "/bindings").then(function (r) {
+      if (r.status === 501) { panel.replaceChildren(capabilityNotice(r.data, "Bindings not available")); return; }
+      if (r.status >= 400) { panel.replaceChildren(errorState(r.data)); return; }
+      var items = itemsOf(r.data);
+      panel.replaceChildren(items.length ? tableBlock(bindingColumns(vhost, false), items, {}) : emptyState("No bindings on this queue."));
+    }, function () { panel.replaceChildren(errorState(null)); });
+    return panel;
+  }
+
+  /* exchangeBindingsPanel renders an exchange's bindings in both directions:
+   * as source and as destination (FR-API-057). */
+  function exchangeBindingsPanel(vhost, name) {
+    var wrap = h("div", { id: "exchange-bindings" });
+    var off = state.capabilities && state.capabilities.bindings === false;
+    [["exchange-bindings-source", "As source", "source"],
+     ["exchange-bindings-destination", "As destination", "destination"]].forEach(function (spec) {
+      var box = h("div", { id: spec[0] }, [itemsLoading()]);
+      if (off) {
+        box.replaceChildren(capabilityNotice({ error: "not_implemented", reason: "binding management is not available in this deployment" }, "Bindings not available"));
+      } else {
+        api(exchangePath(vhost, name) + "/bindings/" + spec[2]).then(function (r) {
+          if (r.status === 501) { box.replaceChildren(capabilityNotice(r.data, "Bindings not available")); return; }
+          if (r.status >= 400) { box.replaceChildren(errorState(r.data)); return; }
+          var items = itemsOf(r.data);
+          box.replaceChildren(items.length ? tableBlock(bindingColumns(vhost, false), items, {}) : emptyState("No bindings " + spec[2] + " this exchange."));
+        }, function () { box.replaceChildren(errorState(null)); });
+      }
+      wrap.appendChild(h("div", null, [h("h3", { text: spec[1] }), box]));
+    });
+    return wrap;
   }
 
   function loadNodes(container, route) {
@@ -1605,8 +1787,8 @@
       var caps = v.capabilities || {};
       var explanations = {
         queue_message_totals: "queue unacked/total counts (BOB-1)",
-        channels: "channel listing",
-        bindings: "aggregate binding listing (BOB-4)",
+        channels: "channel listing with prefetch_count/transactional/state",
+        bindings: "binding listing and create/delete",
         close_connection: "close a connection (connection.close 320 + reason)",
         user_crud: "user create/update/delete (BOB-6)",
         tag_capabilities: "tag-derived capability map",
@@ -1630,6 +1812,7 @@
         ["D-1", "entity data is global; vhosts are not independent"],
         ["D-2", "single-node broker; no cluster, no HA"],
         ["D-3", "classic queues only; no quorum/stream/priority"],
+        ["DIV-bindings", "bindings list source/destination/destination_type/routing_key/properties_key; create/delete use /api/bindings/{vhost}/e/... with properties_key as the canonical delete key"],
         ["DIV-close", "close connection sends connection.close 320 with the operator reason; the peer is force-closed only if it does not reply close-ok within 3 s"],
         ["DIV-channel", "channel prefetch_count/transactional are real lock-free atomics; state=closing is observable only while the channel is still registered"],
         ["DIV-15", "unanswerable health checks return 501, not a fake 200"]
@@ -1888,16 +2071,97 @@
     });
   }
 
+  /* openCreateBinding declares a new binding. dtype is "q" (queue destination)
+   * or "e" (exchange destination); the body carries the routing key and the
+   * x-* arguments (FR-API-091/092). */
+  function openCreateBinding(route, vhost, prefill) {
+    prefill = prefill || {};
+    var sourceInput = h("input", { type: "text", id: "binding-source", value: prefill.source || "", "aria-label": "Source exchange" });
+    var dtypeSel = h("select", { id: "binding-dest-type", "aria-label": "Destination type" }, [option("q", "queue"), option("e", "exchange")]);
+    if (prefill.destinationType) dtypeSel.value = prefill.destinationType;
+    var destInput = h("input", { type: "text", id: "binding-destination", value: prefill.destination || "", "aria-label": "Destination" });
+    var rkInput = h("input", { type: "text", id: "binding-routing-key", value: prefill.routingKey || "", "aria-label": "Routing key" });
+    var argsInput = h("textarea", { id: "binding-arguments", rows: "3", cols: "30", placeholder: "x-arguments=value (one per line)" });
+    var err = h("p", { class: "error", id: "binding-error" });
+    var body = h("div", null, [
+      h("div", { class: "form-row" }, [h("label", { for: "binding-source", text: "Source (exchange)" }), sourceInput]),
+      h("div", { class: "form-row" }, [h("label", { for: "binding-dest-type", text: "Destination type" }), dtypeSel]),
+      h("div", { class: "form-row" }, [h("label", { for: "binding-destination", text: "Destination" }), destInput]),
+      h("div", { class: "form-row" }, [h("label", { for: "binding-routing-key", text: "Routing key" }), rkInput]),
+      h("div", { class: "form-row" }, [h("label", { for: "binding-arguments", text: "Arguments" }), argsInput]),
+      err
+    ]);
+    openModal({
+      title: "Create binding",
+      body: body,
+      confirmLabel: "Create",
+      guard: function () {
+        var src = sourceInput.value.trim();
+        var dst = destInput.value.trim();
+        return validEntityName(dst) && !/\s/.test(src);
+      },
+      initialFocus: sourceInput,
+      onConfirm: function () {
+        err.textContent = "";
+        var parsed = parseArguments(argsInput.value);
+        if (parsed.error) { err.textContent = parsed.error; return Promise.resolve(true); }
+        return api(bindingsPath(vhost, sourceInput.value.trim(), dtypeSel.value, destInput.value.trim()), {
+          method: "POST",
+          body: { routing_key: rkInput.value, arguments: parsed.arguments }
+        }).then(function (r) {
+          if (r.status >= 400) { err.textContent = errorDetail(r.data); return true; }
+          toast("Binding created", "ok");
+          invalidateAll();
+          navigate("/bindings");
+          return false;
+        }, function () { err.textContent = "request failed"; return true; });
+      }
+    });
+  }
+
+  /* openDeleteBinding removes one binding. The DELETE addresses the exact
+   * synthesised properties_key, so an acknowledgement is required (a routing
+   * change is destructive but does not delete messages). */
+  function openDeleteBinding(vhost, b) {
+    var ack = h("input", { type: "checkbox", id: "binding-delete-ack" });
+    var desc = val(b.source) + " \u2192 " + val(b.destination) + " (" + val(b.destination_type) + ", routing key \u201c" + val(b.routing_key) + "\u201d)";
+    openModal({
+      title: "Delete binding",
+      danger: true,
+      body: h("div", null, [
+        h("p", { class: "effect", text: "Delete binding " + desc + "?" }),
+        h("label", { class: "effect", for: "binding-delete-ack" }, [ack, h("span", { text: " I understand this removes the binding" })])
+      ]),
+      confirmLabel: "Delete binding",
+      guard: function () { return ack.checked; },
+      onConfirm: function () {
+        return api(bindingsPath(vhost, b.source, bindingDtype(b.destination_type), b.destination, b.properties_key), { method: "DELETE" }).then(function (r) {
+          if (r.status >= 400) { toast("Delete binding failed: " + errorDetail(r.data), "error"); return false; }
+          toast("Binding deleted", "ok");
+          invalidateAll();
+          navigate("/bindings");
+          return false;
+        }, function () { toast("Delete binding failed", "error"); return false; });
+      }
+    });
+  }
+
   function openCloseConnection(conn) {
+    var reason = h("input", { type: "text", id: "close-reason", "aria-label": "Optional close reason", placeholder: "optional operator reason" });
     openModal({
       title: "Close connection " + conn.name,
+      danger: true,
       body: h("div", null, [
         h("p", { class: "effect", text: "Close connection \u201c" + conn.name + "\u201d to " + val(conn.peer_host) + ":" + val(conn.peer_port) + "?" }),
+        h("div", { class: "form-row" }, [h("label", { for: "close-reason", text: "Reason (sent with connection.close 320)" }), reason]),
         h("p", { class: "error", text: "This sends connection.close 320 with the operator reason; the connection is force-closed only if the peer does not reply close-ok within a few seconds." })
       ]),
       confirmLabel: "Close connection",
+      initialFocus: reason,
       onConfirm: function () {
-        return api(API + "/connections/" + encodeURIComponent(conn.name), { method: "DELETE" }).then(function (r) {
+        var headers = {};
+        if (reason.value) headers["X-Reason"] = reason.value;
+        return api(API + "/connections/" + encodeURIComponent(conn.name), { method: "DELETE", headers: headers }).then(function (r) {
           if (r.status >= 400) { toast("Close failed: " + errorDetail(r.data), "error"); return false; }
           toast("Connection closed", "ok");
           invalidateAll();
@@ -2001,6 +2265,7 @@
     connections: loadConnections,
     connection: loadConnectionDetail,
     channels: loadChannels,
+    channel: loadChannelDetail,
     consumers: loadConsumers,
     bindings: loadBindings,
     nodes: loadNodes,
@@ -2019,7 +2284,7 @@
   function setActiveNav(screen) {
     var map = {
       overview: "overview", connections: "connections", connection: "connections",
-      channels: "channels", consumers: "consumers", exchanges: "exchanges", exchange: "exchanges",
+      channels: "channels", channel: "channels", consumers: "consumers", exchanges: "exchanges", exchange: "exchanges",
       queues: "queues", queue: "queues", bindings: "bindings", nodes: "nodes", node: "nodes",
       users: "users", permissions: "permissions", definitions: "definitions", about: "about", search: "overview"
     };
