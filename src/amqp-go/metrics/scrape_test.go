@@ -2,7 +2,11 @@ package metrics
 
 import (
 	"bytes"
+	"net/http"
+	"net/http/httptest"
+	"reflect"
 	"regexp"
+	"sort"
 	"strings"
 	"testing"
 )
@@ -56,5 +60,60 @@ func TestScrapeText_Uncompressed(t *testing.T) {
 	}
 	if !bytes.HasPrefix(body, []byte("# ")) {
 		t.Errorf("scrape does not begin with a comment line: %q", body[:16])
+	}
+}
+
+// typeNames returns the family names of every # TYPE line, sorted.
+func typeNames(text string) []string {
+	var out []string
+	for _, line := range strings.Split(text, "\n") {
+		if !strings.HasPrefix(line, "# TYPE ") {
+			continue
+		}
+		fields := strings.Fields(line)
+		if len(fields) >= 3 {
+			out = append(out, fields[2])
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+// sharedTypeNames drops the promhttp_* families, whose names are stable but
+// whose values differ per scrape (the two handlers share the instrumented
+// counter).
+func sharedTypeNames(names []string) []string {
+	out := make([]string, 0, len(names))
+	for _, n := range names {
+		if strings.HasPrefix(n, "promhttp_") {
+			continue
+		}
+		out = append(out, n)
+	}
+	return out
+}
+
+// TestScrapeText_MatchesTelemetryHandler pins that ScrapeText serves the SAME
+// registry the telemetry listener's /metrics handler does: their family-name
+// SETS (excluding the shared, value-varying promhttp_* handler family) must be
+// identical. If the telemetry mux ever switches to a custom gatherer, or
+// ScrapeText to a different registry, this fails.
+func TestScrapeText_MatchesTelemetryHandler(t *testing.T) {
+	s := NewServer(0, false)
+	rec := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("telemetry /metrics = %d, want 200", rec.Code)
+	}
+	viaHandler := sharedTypeNames(typeNames(rec.Body.String()))
+
+	body, err := ScrapeText()
+	if err != nil {
+		t.Fatalf("ScrapeText: %v", err)
+	}
+	viaScrape := sharedTypeNames(typeNames(string(body)))
+
+	if !reflect.DeepEqual(viaHandler, viaScrape) {
+		t.Fatalf("ScrapeText family-name set diverged from the telemetry /metrics handler:\n handler=%v\n scrape =%v", viaHandler, viaScrape)
 	}
 }
