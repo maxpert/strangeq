@@ -242,6 +242,116 @@ type TelemetryConfig struct {
 	PprofEnabled bool
 }
 
+// ManagementConfig configures the management (control-plane) HTTP surface
+// (spec mgmt-01 §2). The zero value is the safe default: DISABLED, loopback
+// bind, broker-auth inherited, mutations refused. Every key is deniable —
+// there is deliberately no capability-requirement knob (AUTH-023).
+//
+// Canonical keys: management.{enabled,address,port,node_name,authentication,
+// allow_unauthenticated,allow_unauthenticated_mutations,allow_connection_close,
+// admin_users,trusted_proxies,basic.*,tls.*,cors.*,session.*,limits.*,
+// rate_limits.*,definitions.*,async.*,get.*,audit.*}
+type ManagementConfig struct {
+	Enabled        bool   `json:"enabled"`        // default false (SEC-001)
+	Address        string `json:"address"`        // default "127.0.0.1" (SEC-002)
+	Port           int    `json:"port"`           // default 15672
+	NodeName       string `json:"node_name"`      // "" -> "amqp-go@"+hostname
+	Authentication string `json:"authentication"` // inherit|basic|none
+
+	AllowUnauthenticated          bool `json:"allow_unauthenticated"`
+	AllowUnauthenticatedMutations bool `json:"allow_unauthenticated_mutations"`
+	AllowConnectionClose          bool `json:"allow_connection_close"`
+
+	AdminUsers     []string `json:"admin_users"`
+	TrustedProxies []string `json:"trusted_proxies"` // CIDRs (SEC-112)
+
+	Basic ManagementBasicConfig `json:"basic"`
+	TLS   ManagementTLSConfig   `json:"tls"`
+	CORS  ManagementCORSConfig  `json:"cors"`
+
+	Session     ManagementSessionConfig     `json:"session"`
+	Limits      ManagementLimitsConfig      `json:"limits"`
+	RateLimits  ManagementRateLimitsConfig  `json:"rate_limits"`
+	Definitions ManagementDefinitionsConfig `json:"definitions"`
+	Async       ManagementAsyncConfig       `json:"async"`
+	Get         ManagementGetConfig         `json:"get"`
+	Audit       ManagementAuditConfig       `json:"audit"`
+}
+
+// ManagementBasicConfig is management.basic.* (AUTH-003).
+type ManagementBasicConfig struct {
+	Username     string `json:"username"`
+	PasswordHash string `json:"password_hash"`
+	Admin        bool   `json:"admin"`
+}
+
+// ManagementTLSConfig is management.tls.*. mTLS identity mapping is deferred
+// (OQ-015), so a CA file is accepted but client-certificate authentication is
+// refused until a mapping exists (secure default).
+type ManagementTLSConfig struct {
+	Enabled  bool   `json:"enabled"`
+	CertFile string `json:"cert_file"`
+	KeyFile  string `json:"key_file"`
+	CAFile   string `json:"ca_file"`
+}
+
+// ManagementCORSConfig is management.cors.*. Empty means CORS is off (SEC-094).
+type ManagementCORSConfig struct {
+	AllowedOrigins []string `json:"allowed_origins"`
+}
+
+// ManagementSessionConfig is management.session.* (AUTH-031/032, SEC-040/042).
+type ManagementSessionConfig struct {
+	IdleTimeoutSeconds int `json:"idle_timeout_seconds"` // default 28800
+	MaxSessions        int `json:"max_sessions"`         // default 1024
+}
+
+// ManagementLimitsConfig is management.limits.*.
+type ManagementLimitsConfig struct {
+	MaxPageSize          int `json:"max_page_size"` // default 500
+	RequestTimeoutSeconds int `json:"request_timeout_seconds"`
+	MaxInFlight          int `json:"max_in_flight"` // default 64 (SEC-061)
+	MaxBodyBytes         int `json:"max_body_bytes"`
+	MaxImportBodyBytes   int `json:"max_import_body_bytes"`
+	MaxResponseBytes     int `json:"max_response_bytes"` // default 4 MiB
+	MaxNameBytes         int `json:"max_name_bytes"`     // default 256 (SEC-085)
+}
+
+// ManagementRateLimitsConfig is management.rate_limits.* (SEC-067/068/069).
+// Zero means unlimited.
+type ManagementRateLimitsConfig struct {
+	Publish                  int `json:"publish"`
+	Get                      int `json:"get"`
+	Purge                    int `json:"purge"`
+	Declare                  int `json:"declare"`
+	DefinitionsImportSeconds int `json:"definitions_import_seconds"`
+}
+
+// ManagementDefinitionsConfig is management.definitions.* (COMPAT-027).
+type ManagementDefinitionsConfig struct {
+	MaxQueues    int `json:"max_queues"`
+	MaxExchanges int `json:"max_exchanges"`
+	MaxBindings  int `json:"max_bindings"`
+}
+
+// ManagementAsyncConfig is management.async.* (FR-API-140…143, FR-CONV-100).
+type ManagementAsyncConfig struct {
+	MessageThreshold    int `json:"message_threshold"` // default 10000
+	EntityThreshold     int `json:"entity_threshold"`  // default 1000
+	MaxJobs             int `json:"max_jobs"`          // default 128
+	JobRetentionSeconds int `json:"job_retention_seconds"`
+}
+
+// ManagementGetConfig is management.get.* (FR-API-081).
+type ManagementGetConfig struct {
+	MaxCount int `json:"max_count"` // default 100
+}
+
+// ManagementAuditConfig is management.audit.*.
+type ManagementAuditConfig struct {
+	Logfile string `json:"logfile"`
+}
+
 // ResourceAlarmConfig configures the RabbitMQ-style resource alarms (SQ-12):
 // when the broker process is low on memory or the storage disk is low on free
 // space, publishers are throttled (connection.blocked is emitted to opted-in

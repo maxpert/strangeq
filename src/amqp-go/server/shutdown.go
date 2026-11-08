@@ -17,6 +17,11 @@ import (
 // storage under them — a use-after-close).
 const shutdownForceJoinTimeout = 5 * time.Second
 
+// managementShutdownTimeout bounds the management surface's graceful stop
+// (OPS-043/NFR-024). The surface owns a separate listener, so a wedged admin
+// client can never delay broker teardown.
+const managementShutdownTimeout = 5 * time.Second
+
 // ErrShutdownIncomplete is returned (wrapping the context error) when
 // connection goroutines outlived the shutdown context AND the force-join
 // grace; storage is left open in that case.
@@ -57,6 +62,19 @@ func (s *Server) shutdown(ctx context.Context) error {
 			s.Lifecycle.stopTime = time.Now()
 			s.Lifecycle.stateMutex.Unlock()
 		}()
+	}
+
+	// 0. Stop the management (control-plane) surface FIRST, before any broker
+	//    teardown. It is a separate listener with its own goroutines; stopping
+	//    it first guarantees no management request can touch the broker while
+	//    it is being torn down, and its own 5 s budget keeps a wedged admin
+	//    client from delaying broker shutdown (OPS-043).
+	if s.management != nil {
+		mctx, cancel := context.WithTimeout(context.Background(), managementShutdownTimeout)
+		if err := s.management.Shutdown(mctx); err != nil {
+			s.Log.Warn("shutdown: management surface did not stop cleanly", zap.Error(err))
+		}
+		cancel()
 	}
 
 	// 1. Stop accepting (idempotent; Stop already sets ShuttingDown under Lock,

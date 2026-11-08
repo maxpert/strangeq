@@ -1,8 +1,10 @@
 package server
 
 import (
+	"context"
 	"errors"
 	"fmt"
+	"net"
 	"os"
 	"time"
 
@@ -25,6 +27,30 @@ type ServerBuilder struct {
 	storage       interfaces.Storage
 	authenticator interfaces.Authenticator
 	metrics       MetricsCollector
+	management    ManagementSurface
+}
+
+// ManagementSurface is a control-plane HTTP surface the builder can start and
+// stop. management.Server implements it; the server package does not import
+// management (no cycle). The builder stores it on the Server but does NOT
+// Start it — the caller starts it after Build, exactly as telemetry does
+// today. Shutdown stops it before storage closes (spec mgmt-01 §4).
+type ManagementSurface interface {
+	// Start binds the listener and begins serving. It returns the bind error
+	// synchronously so a bad address surfaces before the broker is up.
+	Start() error
+	// Addr returns the bound address, or nil before a successful Start.
+	Addr() net.Addr
+	// Shutdown stops the surface gracefully.
+	Shutdown(ctx context.Context) error
+}
+
+// WithManagement attaches a management (control-plane) surface. When it is
+// never called the Server has no management surface and pays nothing for it
+// (SEC-001).
+func (b *ServerBuilder) WithManagement(m ManagementSurface) *ServerBuilder {
+	b.management = m
+	return b
 }
 
 // NewServerBuilder creates a new server builder with default configuration
@@ -342,6 +368,9 @@ func (b *ServerBuilder) Build() (*Server, error) {
 		// SQ-12: resolve resource-alarm thresholds + samplers. nil when alarms
 		// are disabled, in which case the monitor is never spawned (zero-cost).
 		alarm: buildAlarmThresholds(b.config),
+		// Management control plane: stored, never started here. The caller
+		// starts it after Build (spec mgmt-01 §4); Shutdown stops it first.
+		management: b.management,
 	}
 
 	// Propagate metrics collector to storage if it supports SetMetrics.
