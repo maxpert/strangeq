@@ -480,12 +480,10 @@ func TestLease_FairnessHogAndLight(t *testing.T) {
 	}, 30*time.Second, time.Millisecond, "hog msg2 must be granted next (FIFO head)")
 
 	tokens <- struct{}{} // hog msg2 write → light msg1 granted
-	// Release the light's OWN write before waiting for its ack. Whether the
-	// light's confirm is emitted inline (empty FrameQueue) or deferred to the
-	// flusher (FrameQueue still draining) is scheduling-dependent; if deferred,
-	// the ack waits for the durable write. Giving the write its token here makes
-	// the ack arrive either way, instead of racing that decision (the CI flake:
-	// a 30s ack timeout when the deferred path was taken).
+	// Release the light's OWN write before waiting for its ack. The light's
+	// durable confirm is gated on its WAL append; whether that record is
+	// appended before or after the hog's is scheduling-dependent, so release the
+	// write token before waiting for the ack.
 	tokens <- struct{}{} // light msg1 write
 	leaseWaitAck(t, light, 1, 1)
 	<-lightBody
