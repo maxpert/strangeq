@@ -43,6 +43,16 @@ type stubAPI struct {
 	consumerItems   []map[string]any
 	userItems       []map[string]any
 
+	// bindingItems is the aggregate binding set; nil installs one default row.
+	bindingItems []map[string]any
+
+	// Binding mutations and the last connection-close reason, recorded so a
+	// test can assert the exact path, body and X-Reason header the SPA sent.
+	bindingCreates        []string
+	lastBindingCreateBody map[string]any
+	bindingDeletes        []string
+	lastReason            string
+
 	// versionFail makes GET /api/strangeq/version return 500, so a test can
 	// exercise the "capability unknown" path. omitTotal makes the paged queues
 	// envelope omit total_count, exercising the em-dash/unknown indicator.
@@ -81,10 +91,11 @@ type stubAPI struct {
 }
 
 // recordedReq is one observed request: the endpoint kind (the segment after
-// /api/), its raw query string, and the HTTP method.
+// /api/), its raw query string, its escaped path, and the HTTP method.
 type recordedReq struct {
 	kind   string
 	raw    string
+	path   string
 	method string
 }
 
@@ -101,6 +112,30 @@ func (s *stubAPI) queriesFor(kind string) []string {
 		}
 	}
 	return out
+}
+
+// pathsFor returns the escaped request path of every request whose endpoint
+// kind matches, so a test can pin which endpoint a screen actually called.
+func (s *stubAPI) pathsFor(kind string) []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]string, 0, len(s.reqLog))
+	for _, e := range s.reqLog {
+		if e.kind == kind {
+			out = append(out, e.path)
+		}
+	}
+	return out
+}
+
+// pathSeen reports whether any request for the endpoint had exactly the path.
+func (s *stubAPI) pathSeen(kind, path string) bool {
+	for _, p := range s.pathsFor(kind) {
+		if p == path {
+			return true
+		}
+	}
+	return false
 }
 
 // postQueriesFor returns the raw query strings of every POST for an endpoint,
@@ -160,6 +195,41 @@ func (s *stubAPI) queueDeclareBody() map[string]any {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.lastQueueDeclare
+}
+
+// bindingCreatePaths returns the path of every binding POST in arrival order.
+func (s *stubAPI) bindingCreatePaths() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]string(nil), s.bindingCreates...)
+}
+
+// bindingCreateBody returns the body of the most recent binding POST.
+func (s *stubAPI) bindingCreateBody() map[string]any {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.lastBindingCreateBody
+}
+
+// bindingDeletePaths returns the path of every binding DELETE in arrival order.
+func (s *stubAPI) bindingDeletePaths() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]string(nil), s.bindingDeletes...)
+}
+
+// closeReason returns the X-Reason header of the most recent connection close.
+func (s *stubAPI) closeReason() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.lastReason
+}
+
+// defaultBindings is the aggregate binding set used when a test installs none.
+func defaultBindings() []map[string]any {
+	return []map[string]any{
+		{"source": "amq.topic", "destination": "orders", "destination_type": "queue", "routing_key": "orders.#", "properties_key": "orders.#", "arguments": map[string]any{}},
+	}
 }
 
 func newStub() *stubAPI {
@@ -267,7 +337,7 @@ func (s *stubAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	kind := segs[1]
 	s.mu.Lock()
-	s.reqLog = append(s.reqLog, recordedReq{kind: kind, raw: r.URL.RawQuery, method: r.Method})
+	s.reqLog = append(s.reqLog, recordedReq{kind: kind, raw: r.URL.RawQuery, path: r.URL.EscapedPath(), method: r.Method})
 	s.mu.Unlock()
 
 	switch kind {
@@ -352,6 +422,10 @@ func (s *stubAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case "connections":
 		s.handleConnections(w, r, segs)
 	case "channels":
+		if len(segs) >= 3 {
+			s.handleChannelDetail(w, r, segs)
+			return
+		}
 		s.mu.Lock()
 		chItems := s.channelItems
 		s.mu.Unlock()
@@ -372,17 +446,7 @@ func (s *stubAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		writeRead(w, r, envelope(maybeReverse(r, coItems), len(coItems)))
 	case "bindings":
-		s.mu.Lock()
-		notImpl := s.bindings501
-		caps := s.caps
-		s.mu.Unlock()
-		if notImpl || caps["bindings"] != true {
-			writeJSON(w, http.StatusNotImplemented, map[string]any{"error": "not_implemented", "reason": "aggregate binding listing is not implemented (BOB-4)"})
-			return
-		}
-		writeRead(w, r, envelope([]map[string]any{
-			{"source": "amq.topic", "destination": "orders", "destination_type": "queue", "routing_key": "orders.#", "arguments": map[string]any{}},
-		}, 1))
+		s.handleBindings(w, r, segs)
 	case "nodes":
 		writeRead(w, r, []map[string]any{
 			{"name": "amqp-go@host", "type": "disc", "running": true, "mem_used": 123, "mem_limit": 456, "disk_free": 789, "disk_free_limit": 100, "uptime": 99, "processors": 8, "os": "darwin"},
@@ -538,6 +602,141 @@ func (s *stubAPI) guardCSRF(w http.ResponseWriter, r *http.Request) bool {
 	return true
 }
 
+// handleBindings serves the aggregate binding endpoints: GET returns the list
+// (501 unless capabilities.bindings is true), POST creates, DELETE removes. The
+// mutation paths and bodies are recorded for test assertions.
+func (s *stubAPI) handleBindings(w http.ResponseWriter, r *http.Request, segs []string) {
+	s.mu.Lock()
+	caps := s.caps
+	notImpl := s.bindings501
+	items := s.bindingItems
+	s.mu.Unlock()
+	if notImpl || caps["bindings"] != true {
+		writeJSON(w, http.StatusNotImplemented, map[string]any{"error": "not_implemented", "reason": "binding management is not available in this deployment"})
+		return
+	}
+	if items == nil {
+		items = defaultBindings()
+	}
+	items = filterBindingsStub(items, r)
+	if r.Method == http.MethodGet {
+		writeRead(w, r, envelope(maybeReverse(r, items), len(items)))
+		return
+	}
+	if !s.guardCSRF(w, r) {
+		return
+	}
+	switch r.Method {
+	case http.MethodPost:
+		body, _ := io.ReadAll(r.Body)
+		var parsed map[string]any
+		_ = json.Unmarshal(body, &parsed)
+		s.mu.Lock()
+		s.bindingCreates = append(s.bindingCreates, r.URL.EscapedPath())
+		s.lastBindingCreateBody = parsed
+		s.mu.Unlock()
+		w.WriteHeader(http.StatusCreated)
+	case http.MethodDelete:
+		s.mu.Lock()
+		s.bindingDeletes = append(s.bindingDeletes, r.URL.EscapedPath())
+		s.mu.Unlock()
+		w.WriteHeader(http.StatusNoContent)
+	default:
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "bad_request"})
+	}
+}
+
+// filterBindingsStub applies the reserved source/destination exact filters the
+// aggregate endpoint supports.
+func filterBindingsStub(items []map[string]any, r *http.Request) []map[string]any {
+	source, hasSource := r.URL.Query()["source"]
+	dest, hasDest := r.URL.Query()["destination"]
+	if !hasSource && !hasDest {
+		return items
+	}
+	out := make([]map[string]any, 0, len(items))
+	for _, it := range items {
+		if hasSource && it["source"] != source[0] {
+			continue
+		}
+		if hasDest && it["destination"] != dest[0] {
+			continue
+		}
+		out = append(out, it)
+	}
+	return out
+}
+
+// handleChannelDetail serves GET /api/channels/{id}, matching the composite
+// "{connection}:{number}" key or a bare number.
+func (s *stubAPI) handleChannelDetail(w http.ResponseWriter, r *http.Request, segs []string) {
+	raw := segs[2]
+	s.mu.Lock()
+	items := s.channelItems
+	s.mu.Unlock()
+	if items == nil {
+		items = []map[string]any{
+			{"number": 1, "connection": "c1", "user": "guest", "vhost": "/", "state": "running", "consumers": 1, "unacked": nil, "prefetch_count": nil, "confirm": true, "transactional": nil, "stats_partial": true},
+		}
+	}
+	for _, it := range items {
+		if channelIDMatchesStub(raw, it) {
+			writeRead(w, r, it)
+			return
+		}
+	}
+	writeJSON(w, http.StatusNotFound, map[string]any{"error": "not_found", "reason": "no such channel"})
+}
+
+func channelIDMatchesStub(raw string, item map[string]any) bool {
+	if i := strings.IndexByte(raw, ':'); i >= 0 {
+		n, err := strconv.Atoi(raw[i+1:])
+		if err != nil {
+			return false
+		}
+		return item["connection"] == raw[:i] && jsonInt(item["number"]) == n
+	}
+	n, err := strconv.Atoi(raw)
+	if err != nil {
+		return false
+	}
+	return jsonInt(item["number"]) == n
+}
+
+func jsonInt(v any) int {
+	switch n := v.(type) {
+	case float64:
+		return int(n)
+	case int:
+		return n
+	}
+	return 0
+}
+
+// perEntityBindings renders the bindings a predicate selects as a bare array,
+// mirroring the real API's list form without a page parameter.
+func (s *stubAPI) perEntityBindings(w http.ResponseWriter, r *http.Request, keep func(map[string]any) bool) {
+	s.mu.Lock()
+	caps := s.caps
+	notImpl := s.bindings501
+	items := s.bindingItems
+	s.mu.Unlock()
+	if notImpl || caps["bindings"] != true {
+		writeJSON(w, http.StatusNotImplemented, map[string]any{"error": "not_implemented", "reason": "binding management is not available in this deployment"})
+		return
+	}
+	if items == nil {
+		items = defaultBindings()
+	}
+	out := make([]map[string]any, 0, len(items))
+	for _, it := range items {
+		if keep(it) {
+			out = append(out, it)
+		}
+	}
+	writeRead(w, r, out)
+}
+
 func (s *stubAPI) handleQueues(w http.ResponseWriter, r *http.Request, segs []string) {
 	if len(segs) == 2 {
 		s.mu.Lock()
@@ -572,6 +771,12 @@ func (s *stubAPI) handleQueues(w http.ResponseWriter, r *http.Request, segs []st
 	}
 	if len(segs) >= 4 {
 		name := segs[3]
+		if len(segs) == 5 && segs[4] == "bindings" && r.Method == http.MethodGet {
+			s.perEntityBindings(w, r, func(it map[string]any) bool {
+				return it["destination_type"] == "queue" && it["destination"] == name
+			})
+			return
+		}
 		if len(segs) == 5 && segs[4] == "contents" && r.Method == http.MethodDelete {
 			if !s.guardCSRF(w, r) {
 				return
@@ -648,6 +853,16 @@ func (s *stubAPI) handleExchanges(w http.ResponseWriter, r *http.Request, segs [
 	}
 	if len(segs) >= 4 {
 		name := segs[3]
+		if len(segs) == 6 && segs[4] == "bindings" && r.Method == http.MethodGet {
+			direction := segs[5]
+			s.perEntityBindings(w, r, func(it map[string]any) bool {
+				if direction == "source" {
+					return it["source"] == name
+				}
+				return it["destination_type"] == "exchange" && it["destination"] == name
+			})
+			return
+		}
 		if len(segs) == 5 && segs[4] == "publish" && r.Method == http.MethodPost {
 			if !s.guardCSRF(w, r) {
 				return
@@ -693,7 +908,21 @@ func (s *stubAPI) handleConnections(w http.ResponseWriter, r *http.Request, segs
 		return
 	}
 	if len(segs) == 4 && segs[3] == "channels" {
-		writeJSON(w, http.StatusNotImplemented, map[string]any{"error": "not_implemented", "reason": "channel detail is not implemented (BOB-3)"})
+		s.mu.Lock()
+		chItems := s.channelItems
+		s.mu.Unlock()
+		if chItems == nil {
+			chItems = []map[string]any{
+				{"number": 1, "connection": "c1", "user": "guest", "vhost": "/", "state": "running", "consumers": 1, "unacked": nil, "prefetch_count": nil, "confirm": true, "transactional": nil, "stats_partial": true},
+			}
+		}
+		out := make([]map[string]any, 0, len(chItems))
+		for _, it := range chItems {
+			if it["connection"] == segs[2] {
+				out = append(out, it)
+			}
+		}
+		writeRead(w, r, out)
 		return
 	}
 	if len(segs) == 3 {
@@ -702,6 +931,9 @@ func (s *stubAPI) handleConnections(w http.ResponseWriter, r *http.Request, segs
 			writeRead(w, r, map[string]any{"name": segs[2], "user": "guest", "vhost": "/", "state": "running", "channels": 1, "protocol": "AMQP 0-9-1", "peer_host": "127.0.0.1", "peer_port": 5000, "connected_at": "2026-11-08T00:00:00Z", "last_activity": "2026-11-08T00:00:01Z"})
 			return
 		case http.MethodDelete:
+			s.mu.Lock()
+			s.lastReason = r.Header.Get("X-Reason")
+			s.mu.Unlock()
 			if !s.guardCSRF(w, r) {
 				return
 			}
