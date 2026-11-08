@@ -52,9 +52,9 @@ func TestPublisherPacedToHotCacheCapacity(t *testing.T) {
 		DepthHighWMOverride:   1_000_000,
 		RingBufferSize:        65536,
 		SpillThresholdPercent: 80,
-		// fsync:false is the ONLY mode in which the hot-cache pace gate is
-		// wired (durable mode leaves the publisher path unpaced); see
-		// TestDurableModeHotCachePaceGateInert.
+		// fsync:false always wires the hot-cache pace gate. (Under the durable
+		// crash models it is wired only for an ordering-only fence; see
+		// TestHotCachePaceGateWiringByCrashModel.)
 		WALSyncDisabled: true,
 	}
 	store, err := storage.NewDisruptorStorageWithEngineConfig(t.TempDir(), ec)

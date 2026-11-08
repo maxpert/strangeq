@@ -109,8 +109,8 @@ func TestForceFlushModeHotCachePaceGateInert(t *testing.T) {
 	for i := 0; i < 16; i++ {
 		gate, _ := publishDurableAwait(t, b, queue, body)
 		require.Nil(t, gate,
-			"durable mode must never pace the publisher (publish %d): the group-commit "+
-				"batch size is the throughput limiter, and parking starves it", i)
+			"force_flush mode must never pace the publisher (publish %d): the full drive-cache "+
+				"flush makes the group-commit batch size the throughput limiter, and parking starves it", i)
 		if i == 0 {
 			// The first publish is admitted: its resident bytes are one
 			// message's exact charge.

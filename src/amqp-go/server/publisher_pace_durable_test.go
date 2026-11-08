@@ -117,7 +117,7 @@ func TestForceFlushModePublishNeverParksReaderAtHotBudget(t *testing.T) {
 		}
 		require.NoError(t, srv.processCompleteMessage(conn, 1, makeDurablePendingMessage("", queue, body)))
 		require.False(t, conn.DepthBackpressure.Load(),
-			"durable mode must never arm reader backpressure for hot-cache pacing (publish %d)", i)
+			"force_flush mode must never arm reader backpressure for hot-cache pacing (publish %d)", i)
 		time.Sleep(time.Millisecond)
 	}
 
