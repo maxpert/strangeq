@@ -106,10 +106,10 @@ func DefaultConfig() *AMQPConfig {
 			CleanupIntervalMS:        300000,   // 5 minutes
 		},
 		Engine: interfaces.EngineConfig{
-			// Ring Buffer (Hot Path) — retained as legacy message-count depth-HWM input
-			RingBufferSize:        65536, // 64K messages = ~6.5 MB per queue
-			SpillThresholdPercent: 80,    // Start spilling at 80% = 51,200 messages
-			DepthHighWMOverride:   0,     // 0 = compute HWM from ring size × spill % (default)
+			// Publisher Backpressure Depth: per-queue message-count depth HWM.
+			// 52428 = the retired RingBufferSize (65536) x SpillThresholdPercent
+			// (80) / 100. 0 would also mean the default.
+			DepthHighWM: interfaces.DefaultDepthHighWM,
 
 			// Write-Ahead Log (WAL)
 			WALBatchSize:      1000,              // 1,000 messages per batch
@@ -343,11 +343,6 @@ func (c *AMQPConfig) Validate() error {
 		return fmt.Errorf("max exchanges must be >= 0 (0 = unlimited): %d", c.Server.MaxExchanges)
 	}
 
-	// Validate engine configuration
-	if c.Engine.RingBufferSize <= 0 {
-		return fmt.Errorf("ring buffer size must be positive: %d", c.Engine.RingBufferSize)
-	}
-
 	// Hot cache validation (segstore v1)
 	//
 	// THE COMPARISON IS BETWEEN THE EFFECTIVE BUDGETS.
@@ -390,9 +385,6 @@ func (c *AMQPConfig) Validate() error {
 	if effectiveGlobalBytes < effectiveQueueBytes {
 		return fmt.Errorf("hot cache global bytes must be at least the effective per-queue budget: global %d, per-queue %d",
 			effectiveGlobalBytes, effectiveQueueBytes)
-	}
-	if c.Engine.SpillThresholdPercent <= 0 || c.Engine.SpillThresholdPercent > 100 {
-		return fmt.Errorf("spill threshold percent must be between 1-100: %d", c.Engine.SpillThresholdPercent)
 	}
 
 	if c.Engine.WALBatchSize <= 0 {

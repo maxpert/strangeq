@@ -85,8 +85,7 @@ server:
   maxmessagesize: 16777216
   cleanupintervalms: 300000
 engine:
-  ringbuffersize: 65536
-  spillthresholdpercent: 80
+  depthhighwm: 52428
   walbatchsize: 1000
   walbatchtimeoutms: 10
   walfilesize: 536870912

@@ -20,8 +20,7 @@ import (
 func TestRecovery_DurableQueueTTL_ExpiredWhileDown(t *testing.T) {
 	dataDir := t.TempDir()
 	ec := interfaces.EngineConfig{
-		RingBufferSize:          65536,
-		SpillThresholdPercent:   80,
+		DepthHighWM:             52428,
 		WALBatchSize:            1000,
 		WALBatchTimeoutMS:       10,
 		ConsumerSelectTimeoutMS: 1,
@@ -107,8 +106,7 @@ func TestRecovery_DurableQueueTTL_ExpiredWhileDown(t *testing.T) {
 func TestRecovery_DurableTxTTL_ExpiredWhileDown(t *testing.T) {
 	dataDir := t.TempDir()
 	ec := interfaces.EngineConfig{
-		RingBufferSize:          65536,
-		SpillThresholdPercent:   80,
+		DepthHighWM:             52428,
 		WALBatchSize:            1000,
 		WALBatchTimeoutMS:       10,
 		ConsumerSelectTimeoutMS: 1,

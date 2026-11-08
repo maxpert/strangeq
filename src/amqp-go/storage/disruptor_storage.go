@@ -13,9 +13,6 @@ import (
 )
 
 const (
-	DefaultRingBufferSize        = 1024 * 256
-	DefaultSpillThresholdPercent = 80
-
 	// pendingAckShardCount is the number of striped locks used to make
 	// StorePendingAck and DeletePendingAck mutually exclusive for a given
 	// delivery tag. It is a power of two so deliveryTag&mask selects a shard.
@@ -24,7 +21,6 @@ const (
 
 type StorageMetrics interface {
 	UpdateDiskMetrics(freeBytes, usedBytes float64)
-	UpdateRingBufferUtilization(queueName string, utilization float64)
 	// RecordHotCacheDeliveryHit counts ONE GetMessageForDelivery served from
 	// the hot cache (no cold-tier read).
 	RecordHotCacheDeliveryHit(queue string)

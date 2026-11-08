@@ -16,9 +16,8 @@ import (
 func newReadAheadTestStorage(t *testing.T, tmpDir string, ringSize int) *DisruptorStorage {
 	t.Helper()
 	ec := interfaces.EngineConfig{
-		RingBufferSize:        ringSize,
-		SpillThresholdPercent: 80,
-		WALSyncDisabled:       true,
+		DepthHighWM:     uint64(ringSize) * 80 / 100,
+		WALSyncDisabled: true,
 	}
 	storage, err := NewDisruptorStorageWithEngineConfig(tmpDir, ec)
 	require.NoError(t, err)

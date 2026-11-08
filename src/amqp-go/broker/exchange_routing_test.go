@@ -17,8 +17,7 @@ func createTestBroker(t testing.TB) (*StorageBroker, func()) {
 	require.NoError(t, err)
 
 	engineConfig := interfaces.EngineConfig{
-		RingBufferSize:          65536,
-		SpillThresholdPercent:   80,
+		DepthHighWM:             52428,
 		WALBatchSize:            1000,
 		WALBatchTimeoutMS:       10,
 		ConsumerSelectTimeoutMS: 1,

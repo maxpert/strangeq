@@ -19,8 +19,7 @@ func newBrokerWithPrefetchCap(t testing.TB, capValue int) *StorageBroker {
 	store, err := storage.NewDisruptorStorageWithDataDir(t.TempDir())
 	require.NoError(t, err)
 	return NewStorageBroker(store, interfaces.EngineConfig{
-		RingBufferSize:          65536,
-		SpillThresholdPercent:   80,
+		DepthHighWM:             52428,
 		ConsumerSelectTimeoutMS: 1,
 		ConsumerMaxBatchSize:    100,
 		UnlimitedPrefetchCap:    capValue,

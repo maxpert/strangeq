@@ -63,13 +63,10 @@ func (s *spyMetricsCollector) RecordWALFsync(duration float64)                {}
 func (s *spyMetricsCollector) RecordWALWriteError()                           {}
 func (s *spyMetricsCollector) UpdateSegmentMetrics(queueName string, count, sizeBytes float64) {
 }
-func (s *spyMetricsCollector) DeleteSegmentMetrics(queueName string) {}
-func (s *spyMetricsCollector) RecordSegmentCompaction()              {}
-func (s *spyMetricsCollector) RecordSegmentCompactionFailure()       {}
-func (s *spyMetricsCollector) RecordSegmentReadError()               {}
-func (s *spyMetricsCollector) UpdateRingBufferUtilization(queueName string, utilization float64) {
-}
-func (s *spyMetricsCollector) DeleteRingBufferUtilization(queueName string)     {}
+func (s *spyMetricsCollector) DeleteSegmentMetrics(queueName string)            {}
+func (s *spyMetricsCollector) RecordSegmentCompaction()                         {}
+func (s *spyMetricsCollector) RecordSegmentCompactionFailure()                  {}
+func (s *spyMetricsCollector) RecordSegmentReadError()                          {}
 func (s *spyMetricsCollector) RecordHotCacheDeliveryHit(queue string)           {}
 func (s *spyMetricsCollector) RecordHotCacheDeliveryColdRead(queue string)      {}
 func (s *spyMetricsCollector) RecordHotCacheDeliveryPread(queue string, n int)  {}

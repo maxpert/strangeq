@@ -60,8 +60,7 @@ func newHotBudgetServer(t *testing.T, syncDisabled bool, crashModel string) (*Se
 	eng := cfg.GetEngine()
 	eng.HotCacheQueueBytes = 2048 // tiny: binds after a dozen small bodies
 	eng.HotCacheGlobalBytes = 1 << 20
-	eng.RingBufferSize = 65536
-	eng.SpillThresholdPercent = 80 // depth HWM = 52,428: never reached here
+	eng.DepthHighWM = 52428 // depth HWM: never reached here
 
 	storageImpl, err := storage.NewDisruptorStorageWithEngineConfig(cfg.Storage.Path, eng)
 	require.NoError(t, err)

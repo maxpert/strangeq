@@ -235,26 +235,16 @@ engine:
   # ========================================
 
   # ========================================
-  # Ring Buffer (Hot Path)
+  # Publisher Backpressure Depth
   # ========================================
 
-  # Ring buffer size for in-memory message storage (must be power of 2)
-  # Larger = more messages in fast memory before spilling to WAL
-  # Smaller = less memory, more frequent WAL writes
-  # Default: 65,536 (64K messages = ~6.5 MB per queue)
-  ringbuffersize: 65536
-
-  # Spill threshold percentage (when to start writing to WAL, 0-100)
-  # Higher = more tolerance for bursts, but less safety margin
-  # Lower = more conservative, earlier WAL writes
-  # Default: 80 (start spilling at 80% full = 51,200 messages for 64K ring)
-  spillthresholdpercent: 80
-
-  # Depth high-water-mark override (0 = compute from ring buffer size × spill %)
-  # When > 0, directly sets the per-queue backpressure high-water mark.
-  # Lowering it trades throughput for latency: a shallower queue means messages
-  # spend less time waiting. Default: 0 (computed, current behavior).
-  depthhighwmoverride: 0
+  # Per-queue publisher backpressure depth high-water mark, in MESSAGES: at
+  # this many messages in flight (head - min ack cursor) the publisher blocks
+  # or spills. 0 = the default 52428.
+  #
+  # This is a SECONDARY gate: the hot-cache BYTE budget
+  # (hotcachequeuebytes) usually binds first.
+  depthhighwm: 52428
 
   # ========================================
   # Write-Ahead Log (WAL)

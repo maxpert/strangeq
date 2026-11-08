@@ -64,8 +64,7 @@ func newReadTriageBroker(t *testing.T) (*StorageBroker, *readTriageStorage, func
 	require.NoError(t, err)
 	fake := &readTriageStorage{DisruptorStorage: store}
 	engineConfig := interfaces.EngineConfig{
-		RingBufferSize:          65536,
-		SpillThresholdPercent:   80,
+		DepthHighWM:             52428,
 		WALBatchSize:            1000,
 		WALBatchTimeoutMS:       10,
 		ConsumerSelectTimeoutMS: 1,

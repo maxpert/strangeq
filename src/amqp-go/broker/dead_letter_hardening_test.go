@@ -81,8 +81,7 @@ func TestDeadLetter_StoreFailure_IsObservableAndDrops(t *testing.T) {
 
 	fs := &storeFailStorage{Storage: real, failQueue: "dlq"}
 	ec := interfaces.EngineConfig{
-		RingBufferSize:          65536,
-		SpillThresholdPercent:   80,
+		DepthHighWM:             52428,
 		WALBatchSize:            1000,
 		WALBatchTimeoutMS:       10,
 		ConsumerSelectTimeoutMS: 1,

@@ -48,10 +48,8 @@ func TestPublisherPacedToHotCacheCapacity(t *testing.T) {
 	ec := interfaces.EngineConfig{
 		// Room for a handful of 256-byte bodies — the point is that the gate
 		// binds on BYTES, not on the 1,000,000-message depth HWM below.
-		HotCacheQueueBytes:    3200,
-		DepthHighWMOverride:   1_000_000,
-		RingBufferSize:        65536,
-		SpillThresholdPercent: 80,
+		HotCacheQueueBytes: 3200,
+		DepthHighWM:        1_000_000,
 		// fsync:false always wires the hot-cache pace gate. (Under the durable
 		// crash models it is wired only for an ordering-only fence; see
 		// TestHotCachePaceGateWiringByCrashModel.)
@@ -101,10 +99,8 @@ func TestDeliveryHeadStaysHotUnderSyntheticBacklog(t *testing.T) {
 	const queue = "backlog-q"
 	body := bytes.Repeat([]byte("b"), 256)
 	ec := interfaces.EngineConfig{
-		HotCacheQueueBytes:    50000, // ~63 bodies of ~786 bytes
-		DepthHighWMOverride:   1_000_000,
-		RingBufferSize:        65536,
-		SpillThresholdPercent: 80,
+		HotCacheQueueBytes: 50000, // ~63 bodies of ~786 bytes
+		DepthHighWM:        1_000_000,
 		// fsync:false is the ONLY mode in which the hot-cache pace gate is
 		// wired (durable mode leaves the publisher path unpaced).
 		WALSyncDisabled: true,

@@ -103,9 +103,6 @@ type Collector struct {
 	SegmentCompactionFailuresTotal prometheus.Counter
 	SegmentReadErrorsTotal         prometheus.Counter
 
-	// Ring buffer metrics
-	RingBufferUtilization *prometheus.GaugeVec
-
 	// Memory metrics
 	MemoryUsedBytes prometheus.Gauge
 	MemoryHeapBytes prometheus.Gauge
@@ -465,13 +462,6 @@ func NewCollector(namespace string) *Collector {
 			Name:      "segment_read_errors_total",
 			Help:      "Total number of segment read failures",
 		}),
-
-		// Ring buffer metrics
-		RingBufferUtilization: promauto.NewGaugeVec(prometheus.GaugeOpts{
-			Namespace: namespace,
-			Name:      "ring_buffer_utilization_ratio",
-			Help:      "Ring buffer utilization ratio (0-1)",
-		}, []string{"queue"}),
 
 		// Memory metrics
 		MemoryUsedBytes: promauto.NewGauge(prometheus.GaugeOpts{
@@ -1003,16 +993,6 @@ func (c *Collector) RecordSegmentCompactionFailure() {
 // RecordSegmentReadError records a segment read error
 func (c *Collector) RecordSegmentReadError() {
 	c.SegmentReadErrorsTotal.Inc()
-}
-
-// UpdateRingBufferUtilization updates ring buffer utilization for a queue
-func (c *Collector) UpdateRingBufferUtilization(queueName string, utilization float64) {
-	c.RingBufferUtilization.With(prometheus.Labels{"queue": queueName}).Set(utilization)
-}
-
-// DeleteRingBufferUtilization removes ring buffer metric for a deleted queue
-func (c *Collector) DeleteRingBufferUtilization(queueName string) {
-	c.RingBufferUtilization.Delete(prometheus.Labels{"queue": queueName})
 }
 
 // UpdateMemoryMetrics updates memory usage metrics

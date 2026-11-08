@@ -25,10 +25,8 @@ func TestRequeueStillRedeliversUnderHotCachePacing(t *testing.T) {
 	ec := interfaces.EngineConfig{
 		// No message fits: every durable publish is WAL-only, so requeue
 		// redelivery is a cold read.
-		HotCacheQueueBytes:    1,
-		DepthHighWMOverride:   1_000_000,
-		RingBufferSize:        65536,
-		SpillThresholdPercent: 80,
+		HotCacheQueueBytes: 1,
+		DepthHighWM:        1_000_000,
 	}
 	store, err := storage.NewDisruptorStorageWithEngineConfig(t.TempDir(), ec)
 	require.NoError(t, err)

@@ -171,8 +171,7 @@ func newRetentionBroker(t *testing.T, mutate func(*retentionStorage)) (*StorageB
 		mutate(fake)
 	}
 	engineConfig := interfaces.EngineConfig{
-		RingBufferSize:          65536,
-		SpillThresholdPercent:   80,
+		DepthHighWM:             52428,
 		WALBatchSize:            1000,
 		WALBatchTimeoutMS:       10,
 		ConsumerSelectTimeoutMS: 1,
@@ -428,8 +427,7 @@ func TestRetention_NonAsyncBackendFallback(t *testing.T) {
 	store, err := storage.NewDisruptorStorageWithDataDir(tmpDir)
 	require.NoError(t, err)
 	engineConfig := interfaces.EngineConfig{
-		RingBufferSize:          65536,
-		SpillThresholdPercent:   80,
+		DepthHighWM:             52428,
 		WALBatchSize:            1000,
 		WALBatchTimeoutMS:       10,
 		ConsumerSelectTimeoutMS: 1,

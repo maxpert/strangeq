@@ -229,8 +229,7 @@ func newTinyRingServer(t *testing.T) *Server {
 	t.Helper()
 	cfg := config.DefaultConfig()
 	cfg.Storage.Path = t.TempDir()
-	cfg.Engine.RingBufferSize = 8
-	cfg.Engine.SpillThresholdPercent = 50 // HWM = 8 * 50 / 100 = 4
+	cfg.Engine.DepthHighWM = 4 // the retired RingBufferSize 8 x 50% = 4
 
 	storageImpl, err := storage.NewDisruptorStorageWithDataDir(cfg.Storage.Path)
 	require.NoError(t, err)

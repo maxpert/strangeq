@@ -312,32 +312,30 @@ type ServerConfig struct {
 	CleanupIntervalMS int64 // Background cleanup interval
 }
 
+// DefaultDepthHighWM is the shipped per-queue publisher backpressure depth
+// high-water mark, in MESSAGES. It is the value the retired pre-segstore knobs
+// implied: RingBufferSize (65536) x SpillThresholdPercent (80) / 100 = 52428.
+// An EngineConfig.DepthHighWM of 0 means "use this default".
+const DefaultDepthHighWM uint64 = 52428
+
 // EngineConfig holds internal engine tuning parameters
 // Phase 6G: Configurable hot-path parameters for performance optimization
 type EngineConfig struct {
 	// ========================================
-	// Ring Buffer (Hot Path)
+	// Publisher Backpressure Depth
 	// ========================================
 
-	// RingBufferSize is the size of the in-memory ring buffer (must be power of 2)
-	// Larger = more messages in fast memory before spilling to WAL
-	// Smaller = less memory, more frequent WAL writes
-	// Default: 65,536 (64K messages)
-	// Memory: ~100 bytes per slot = ~6.5 MB per queue
-	RingBufferSize int `json:"ring_buffer_size"`
-
-	// SpillThresholdPercent is when to start writing to WAL (0-100)
-	// Higher = more tolerance for bursts, but less safety margin
-	// Lower = more conservative, earlier WAL writes
-	// Default: 80 (start spilling at 80% full = 51,200 messages)
-	SpillThresholdPercent int `json:"spill_threshold_percent"`
-
-	// DepthHighWMOverride, when > 0, directly sets the per-queue backpressure
-	// high-water mark instead of deriving it from RingBufferSize ×
-	// SpillThresholdPercent. Lowering it trades throughput for latency: a
-	// shallower queue means messages spend less time waiting. 0 (default) keeps
-	// the computed HWM (zero behavior regression).
-	DepthHighWMOverride uint64 `json:"depth_high_wm_override"`
+	// DepthHighWM is the per-queue publisher backpressure depth high-water
+	// mark in MESSAGES: at this many messages in flight (head - minAckCursor)
+	// the publisher blocks or spills. It replaces the retired
+	// RingBufferSize x SpillThresholdPercent derivation and the separate
+	// DepthHighWMOverride key (both rejected at boot now).
+	//
+	// It is a SECONDARY gate: the hot-cache BYTE budget (HotCacheQueueBytes)
+	// usually binds first (see broker.publisherGate).
+	//
+	// 0 means the default (DefaultDepthHighWM = 52428).
+	DepthHighWM uint64 `json:"depth_high_wm"`
 
 	// ========================================
 	// Hot Cache (Segstore v1)

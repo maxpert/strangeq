@@ -15,24 +15,22 @@ import (
 // newGetPurgeTestServer for the *testing.T equivalent — this one takes
 // testing.TB's *testing.B specifically and skips the network listener,
 // TransactionManager, etc. that processCompleteMessage's plain-publish path
-// never touches). A large ring buffer keeps every published message resident
-// in memory for the whole benchmark: this bench never drains its queue, and
-// storage's actual default (DisruptorStorage.DefaultRingBufferSize =
-// 1024*256, 80% spill = 209,715 messages) sits well within reach of the
-// large -benchtime this benchmark needs (see BenchmarkProcessCompleteMessage's
-// doc comment) — crossing it mid-run would silently switch the back half of
-// the run onto the synchronous WAL group-commit path instead of the pure
-// in-memory ring, which is both a correctness-of-measurement problem (only
-// LATER iterations pay a completely different cost) and, under real disk
-// contention, was observed to make the whole run stall for minutes waiting
-// on WAL batch commits. NewDisruptorStorageWithEngineConfig (not
-// NewDisruptorStorageWithDataDir, which ignores cfg.Engine entirely and
-// always uses the default) is what actually wires RingBufferSize through.
+// never touches). A large depth high-water mark keeps the publisher unparked
+// for the whole benchmark: this bench never drains its queue, and the broker's
+// per-queue depth gate parks a publisher once the in-flight depth reaches
+// EngineConfig.DepthHighWM. The shipped default (52,428) sits well within
+// reach of the large -benchtime this benchmark needs (see
+// BenchmarkProcessCompleteMessage's doc comment) — crossing it mid-run would
+// silently switch the back half of the run onto the synchronous WAL
+// group-commit path instead of the pure in-memory path, which is both a
+// correctness-of-measurement problem (only LATER iterations pay a completely
+// different cost) and, under real disk contention, was observed to make the
+// whole run stall for minutes waiting on WAL batch commits.
 func newProcessCompleteMessageBenchServer(b *testing.B) *Server {
 	b.Helper()
 	cfg := config.DefaultConfig()
 	cfg.Storage.Path = b.TempDir()
-	cfg.Engine.RingBufferSize = 1 << 21 // power of 2; ~1.67M-message spill threshold at 80%
+	cfg.Engine.DepthHighWM = 1 << 21 * 80 / 100 // ~1.67M, above any reachable depth
 
 	storageImpl, err := storage.NewDisruptorStorageWithEngineConfig(cfg.Storage.Path, cfg.GetEngine())
 	if err != nil {

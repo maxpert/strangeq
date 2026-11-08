@@ -24,44 +24,31 @@ import (
 	"github.com/maxpert/amqp-go/config"
 	"github.com/maxpert/amqp-go/interfaces"
 	"github.com/maxpert/amqp-go/server"
-	"github.com/maxpert/amqp-go/storage"
 )
 
 // ---------------------------------------------------------------------------
 // premise: the spill threshold, resolved at runtime from config
 // ---------------------------------------------------------------------------
 
-// spillThresholdFor mirrors NewDisruptorStorageWithEngineConfig's resolution of
-// the in-memory ring's spill threshold, including its zero-value fallbacks to
-// the storage package's own constants.
+// spillThresholdFor returns the per-queue publisher backpressure depth
+// high-water mark the broker resolves from the engine config: the configured
+// EngineConfig.DepthHighWM, or interfaces.DefaultDepthHighWM (52428) when it is
+// unset (0).
 //
-// It is computed, never written down. The shipped value has already moved once:
-// the storage package's DefaultRingBufferSize is 262144, but
-// config.DefaultConfig() sets Engine.RingBufferSize = 65536 and
-// NewDisruptorStorageWithEngineConfig prefers the non-zero engine value, so the
-// number that actually governs a default broker is 65536*80/100 = 52428 and not
-// anything the storage package declares. A test that hardcoded either number
-// would silently stop testing what it claims the next time one of them moves.
+// It is computed, never written down. A test that hardcoded the number would
+// silently stop testing what it claims the next time the default moves.
 func spillThresholdFor(ec interfaces.EngineConfig) uint64 {
-	ring := ec.RingBufferSize
-	if ring <= 0 {
-		ring = storage.DefaultRingBufferSize
+	if ec.DepthHighWM > 0 {
+		return ec.DepthHighWM
 	}
-	pct := ec.SpillThresholdPercent
-	if pct <= 0 {
-		pct = storage.DefaultSpillThresholdPercent
-	}
-	if ring <= 0 || pct <= 0 {
-		return 0
-	}
-	return uint64(ring) * uint64(pct) / 100
+	return interfaces.DefaultDepthHighWM
 }
 
 // requireBacklogCrossesSpillThreshold asserts, at runtime, the premise the
 // loss test depends on: the backlog standing at restart must exceed the live
-// spill threshold, because that is the boundary at which
-// DisruptorStorage.LoadMessageFromRecovery starts returning nil (dropping the
-// record) while recovery still counts it and widens the queue's tag range.
+// depth high-water mark, because that is the boundary the test's regime depends
+// on. Above it the broker parks the publisher rather than admitting the record
+// unconditionally.
 //
 // Canon rule 11: this is asserted rather than described in a comment. If the
 // engine defaults or this test's knobs drift so that the backlog no longer
@@ -72,39 +59,38 @@ func requireBacklogCrossesSpillThreshold(t *testing.T, cfg *config.AMQPConfig, b
 
 	threshold := spillThresholdFor(cfg.Engine)
 	require.NotZero(t, threshold,
-		"PREMISE BROKEN: this test's engine config resolves to a zero spill threshold "+
-			"(RingBufferSize=%d, SpillThresholdPercent=%d); there is no boundary left to cross",
-		cfg.Engine.RingBufferSize, cfg.Engine.SpillThresholdPercent)
+		"PREMISE BROKEN: this test's engine config resolves to a zero depth high-water mark "+
+			"(DepthHighWM=%d); there is no boundary left to cross",
+		cfg.Engine.DepthHighWM)
 
 	require.Greater(t, uint64(backlog), threshold,
 		"PREMISE BROKEN: the backlog standing at restart (%d) no longer exceeds this "+
-			"engine's spill threshold (%d = RingBufferSize %d x SpillThresholdPercent %d / 100). "+
-			"Above that threshold LoadMessageFromRecovery drops the record, which is the defect "+
-			"under test; at or below it, this test cannot detect anything. Raise the backlog or "+
-			"lower the knobs — do not delete this check.",
-		backlog, threshold, cfg.Engine.RingBufferSize, cfg.Engine.SpillThresholdPercent)
+			"engine's depth high-water mark (%d = EngineConfig.DepthHighWM). At or below that "+
+			"threshold this test cannot detect anything. Raise the backlog or lower the knob "+
+			"— do not delete this check.",
+		backlog, threshold)
 
-	t.Logf("PREMISE: backlog=%d > live spill threshold=%d (ring=%d, spill=%d%%)",
-		backlog, threshold, cfg.Engine.RingBufferSize, cfg.Engine.SpillThresholdPercent)
+	t.Logf("PREMISE: backlog=%d > live depth high-water mark=%d (depthhighwm=%d)",
+		backlog, threshold, cfg.Engine.DepthHighWM)
 	return threshold
 }
 
 // requireLoweredKnobsModelProduction asserts that a test running with a shrunk
-// ring is still a scale model of the shipped broker: that the shipped defaults
-// resolve their spill threshold through the same expression, and that this
-// test's threshold is genuinely below it.
+// depth high-water mark is still a scale model of the shipped broker: that the
+// shipped defaults resolve their threshold through the same expression, and
+// that this test's threshold is genuinely below it.
 //
-// Without this, a config change that stopped deriving the threshold from
-// RingBufferSize x SpillThresholdPercent would leave the lowered-knob tests
-// green, fast, and measuring a regime production no longer has — the exact
-// shape of "a load-bearing premise living in a comment".
+// Without this, a config change that stopped honoring EngineConfig.DepthHighWM
+// would leave the lowered-knob tests green, fast, and measuring a regime
+// production no longer has — the exact shape of "a load-bearing premise living
+// in a comment".
 func requireLoweredKnobsModelProduction(t *testing.T, cfg *config.AMQPConfig) {
 	t.Helper()
 	threshold := spillThresholdFor(cfg.Engine)
 	shipped := spillThresholdFor(config.DefaultConfig().Engine)
 	require.NotZero(t, shipped,
-		"PREMISE BROKEN: config.DefaultConfig() no longer resolves to a positive spill "+
-			"threshold, so a lowered-knob test is no longer a scale model of production")
+		"PREMISE BROKEN: config.DefaultConfig() no longer resolves to a positive depth "+
+			"high-water mark, so a lowered-knob test is no longer a scale model of production")
 	require.Less(t, threshold, shipped,
 		"PREMISE BROKEN: this test's threshold (%d) is not below the shipped default (%d); "+
 			"the knobs exist to make the same defect reachable at a CI-affordable volume",
@@ -369,10 +355,9 @@ func missingIDs(seen map[int]bool, n int) (missing int, firstMissing int) {
 	return missing, firstMissing
 }
 
-// loweredSpillEngine shrinks the ring buffer so that the spill threshold —
-// the boundary at which LoadMessageFromRecovery starts dropping recovered
-// records — is crossed by a few hundred messages instead of the 52,428 a
-// default broker needs.
+// loweredSpillEngine shrinks the depth high-water mark so that the boundary
+// under test — the point at which the broker parks the publisher — is crossed
+// by a few hundred messages instead of the 52,428 a default broker needs.
 //
 // This is a scale model, not a different defect: the threshold is resolved by
 // the same expression in the same function for both settings, and
@@ -389,8 +374,7 @@ func missingIDs(seen map[int]bool, n int) (missing int, firstMissing int) {
 // and because that runtime is set by the runner's fsync throughput, which is
 // the one input nobody controls on shared CI hardware.
 func loweredSpillEngine(cfg *config.AMQPConfig) {
-	cfg.Engine.RingBufferSize = 1024 // power of two, required by config.Validate
-	cfg.Engine.SpillThresholdPercent = 25
+	cfg.Engine.DepthHighWM = 256 // the retired 1024 x 25 / 100
 }
 
 // ---------------------------------------------------------------------------

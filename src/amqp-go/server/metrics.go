@@ -69,10 +69,6 @@ type MetricsCollector interface {
 	RecordSegmentCompactionFailure()
 	RecordSegmentReadError()
 
-	// Ring buffer metrics
-	UpdateRingBufferUtilization(queueName string, utilization float64)
-	DeleteRingBufferUtilization(queueName string)
-
 	// Hot-cache delivery-path metrics (Task 2). These mirror
 	// storage.StorageMetrics so the collector stays assignable to it, and they
 	// are what make the cold-read fix provable: the delivery hot-hit ratio is
@@ -212,10 +208,6 @@ func (n *NoOpMetricsCollector) DeleteSegmentMetrics(queueName string)           
 func (n *NoOpMetricsCollector) RecordSegmentCompaction()                                        {}
 func (n *NoOpMetricsCollector) RecordSegmentCompactionFailure()                                 {}
 func (n *NoOpMetricsCollector) RecordSegmentReadError()                                         {}
-
-// Ring buffer metrics
-func (n *NoOpMetricsCollector) UpdateRingBufferUtilization(queueName string, utilization float64) {}
-func (n *NoOpMetricsCollector) DeleteRingBufferUtilization(queueName string)                      {}
 
 // Hot-cache delivery-path metrics (Task 2)
 func (n *NoOpMetricsCollector) RecordHotCacheDeliveryHit(queue string)      {}

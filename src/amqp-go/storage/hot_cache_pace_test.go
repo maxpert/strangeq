@@ -3,8 +3,8 @@ package storage
 // TASK 2 — the publisher is paced to the hot cache's BYTE budget.
 //
 // The defect: the per-queue hot cache holds 64 MiB (~1,015 64 KiB bodies) while
-// the queue's message-count depth high-water mark is RingBufferSize ×
-// SpillThresholdPercent = 52,428 messages. The publisher is therefore allowed
+// the queue's message-count depth high-water mark is 52,428 messages (the
+// shipped engine.depthhighwm default). The publisher is therefore allowed
 // to run ~51,000 messages ahead of the FIFO consumer; the delivered head is
 // evicted from RAM long before it is read, and ~96 % of deliveries take a cold
 // WAL pread.

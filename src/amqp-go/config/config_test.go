@@ -281,8 +281,7 @@ server:
   maxmessagesize: 16777216
   cleanupintervalms: 300000
 engine:
-  ringbuffersize: 65536
-  spillthresholdpercent: 80
+  depthhighwm: 52428
   walbatchsize: 1000
   walbatchtimeoutms: 10
   walfilesize: 536870912
@@ -415,9 +414,48 @@ server:
   maxmessagesize: 16777216
   cleanupintervalms: 300000
 engine:
-  ringbuffersize: 65536
-  spillthresholdpercent: 80
+  depthhighwm: 52428
   walbatchsize: 1000
+  walbatchtimeoutms: 10
+  walfilesize: 536870912
+  walchannelbuffer: 10000
+  segmentsize: 1073741824
+  segmentcheckpointintervalms: 300000
+  compactionthreshold: 0.5
+  compactionintervalms: 1800000
+  consumerselecttimeoutms: 1
+  consumermaxbatchsize: 100
+  walcleanupcheckintervalms: 300000
+`
+}
+
+// validYAMLWithEngineExtra builds a full, Validate()-passing config YAML whose
+// engine section additionally carries the (already indented) lines in extra.
+// Pass "" to omit them. It backs the single depth-high-water-mark key tests and
+// the retired-engine-key rejection tests.
+func validYAMLWithEngineExtra(extra string) string {
+	return `
+network:
+  address: ":8080"
+  port: 8080
+  maxconnections: 1000
+  heartbeatintervalms: 60000
+  tcpkeepalive: true
+  tcpkeepaliveintervalms: 30000
+storage:
+  path: ./test-data
+  cachemb: 64
+  maxfiles: 100
+  retentionms: 86400000
+  checkpointintervalms: 5000
+server:
+  loglevel: debug
+  maxchannelsperconnection: 2047
+  maxframesize: 131072
+  maxmessagesize: 16777216
+  cleanupintervalms: 300000
+engine:
+` + extra + `  walbatchsize: 1000
   walbatchtimeoutms: 10
   walfilesize: 536870912
   walchannelbuffer: 10000
@@ -676,6 +714,107 @@ func TestLegacyDurabilityKeysRejected(t *testing.T) {
 		assert.NotContains(t, report.UnknownKeys, "storage.fsync")
 		assert.NotContains(t, report.UnknownKeys, "storage.crashmodel")
 		assert.Equal(t, interfaces.DurabilityFlush, cfg.Durability())
+	})
+}
+
+// TestEngineDepthHighWM_SingleKey pins the single honest key engine.depthhighwm:
+// DefaultConfig carries the shipped default (the old 65536 x 80 / 100 = 52428),
+// an absent key keeps it, an explicit value binds verbatim, and an explicit 0
+// binds to 0 at the config layer (the broker resolves 0 to the default at use).
+func TestEngineDepthHighWM_SingleKey(t *testing.T) {
+	assert.Equal(t, uint64(52428), interfaces.DefaultDepthHighWM)
+	assert.Equal(t, interfaces.DefaultDepthHighWM, DefaultConfig().Engine.DepthHighWM)
+
+	t.Run("absent key keeps the default", func(t *testing.T) {
+		path := writeConfigFile(t, validYAMLWithEngineExtra(""))
+		cfg, report, err := LoadConfig(path)
+		require.NoError(t, err)
+		require.NoError(t, cfg.Validate())
+		assert.Equal(t, uint64(52428), cfg.Engine.DepthHighWM)
+		assert.NotContains(t, report.UnknownKeys, "engine.depthhighwm")
+	})
+
+	t.Run("explicit value binds", func(t *testing.T) {
+		path := writeConfigFile(t, validYAMLWithEngineExtra("  depthhighwm: 1000\n"))
+		cfg, report, err := LoadConfig(path)
+		require.NoError(t, err)
+		require.NoError(t, cfg.Validate())
+		assert.Equal(t, uint64(1000), cfg.Engine.DepthHighWM)
+		assert.NotContains(t, report.UnknownKeys, "engine.depthhighwm")
+	})
+
+	t.Run("zero binds to zero at the config layer", func(t *testing.T) {
+		path := writeConfigFile(t, validYAMLWithEngineExtra("  depthhighwm: 0\n"))
+		cfg, report, err := LoadConfig(path)
+		require.NoError(t, err)
+		require.NoError(t, cfg.Validate(), "0 is legal: the broker resolves it to the default")
+		assert.Equal(t, uint64(0), cfg.Engine.DepthHighWM)
+		assert.NotContains(t, report.UnknownKeys, "engine.depthhighwm")
+	})
+}
+
+// TestLegacyEngineDepthKeysRejected pins the HARD rejection of the retired
+// engine.ringbuffersize / engine.spillthresholdpercent /
+// engine.depthhighwmoverride keys, from a file AND from the environment. They
+// must never fall through to the generic unknown-key warning: ignoring
+// ringbuffersize/spillthresholdpercent silently changes the per-queue publisher
+// backpressure depth, so the retired keys must be migrated, not dropped.
+func TestLegacyEngineDepthKeysRejected(t *testing.T) {
+	fileCases := []struct {
+		name string
+		line string
+		seen string
+	}{
+		{"ringbuffersize", "  ringbuffersize: 65536\n", "engine.ringbuffersize"},
+		{"spillthresholdpercent", "  spillthresholdpercent: 80\n", "engine.spillthresholdpercent"},
+		{"depthhighwmoverride", "  depthhighwmoverride: 1000\n", "engine.depthhighwmoverride"},
+	}
+	for _, tc := range fileCases {
+		t.Run("file/"+tc.name, func(t *testing.T) {
+			path := writeConfigFile(t, validYAMLWithEngineExtra(tc.line))
+			_, report, err := LoadConfig(path)
+			require.Error(t, err, "a retired engine depth key must fail at boot")
+			assert.Nil(t, report, "LoadConfig must return no report on a hard error")
+			assert.Contains(t, err.Error(), tc.seen+" is no longer supported; use engine.depthhighwm instead")
+			assert.Contains(t, err.Error(), "ringbuffersize: N + spillthresholdpercent: P -> depthhighwm: N*P/100")
+			assert.Contains(t, err.Error(), "depthhighwmoverride: N")
+		})
+	}
+
+	// The snake_case spelling normalizes onto the same dotted path.
+	t.Run("file/snake_case ring_buffer_size", func(t *testing.T) {
+		path := writeConfigFile(t, validYAMLWithEngineExtra("  ring_buffer_size: 65536\n"))
+		_, _, err := LoadConfig(path)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "engine.ringbuffersize is no longer supported")
+	})
+
+	envCases := []struct {
+		name  string
+		env   string
+		value string
+		seen  string
+	}{
+		{"ringbuffersize", "AMQP_ENGINE_RINGBUFFERSIZE", "65536", "engine.ringbuffersize"},
+		{"spillthresholdpercent", "AMQP_ENGINE_SPILLTHRESHOLDPERCENT", "80", "engine.spillthresholdpercent"},
+		{"depthhighwmoverride", "AMQP_ENGINE_DEPTHHIGHWMOVERRIDE", "1000", "engine.depthhighwmoverride"},
+	}
+	for _, tc := range envCases {
+		t.Run("env/"+tc.name, func(t *testing.T) {
+			t.Setenv(tc.env, tc.value)
+			_, _, err := LoadConfig("")
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), tc.seen+" is no longer supported")
+		})
+	}
+
+	t.Run("the new key means no error", func(t *testing.T) {
+		path := writeConfigFile(t, validYAMLWithEngineExtra("  depthhighwm: 4096\n"))
+		cfg, report, err := LoadConfig(path)
+		require.NoError(t, err)
+		require.NoError(t, cfg.Validate())
+		assert.Equal(t, uint64(4096), cfg.Engine.DepthHighWM)
+		assert.NotContains(t, report.UnknownKeys, "engine.depthhighwm")
 	})
 }
 

@@ -26,10 +26,9 @@ import (
 func newReadAheadCRCDisabledStorage(t *testing.T, tmpDir string, ringSize int) *DisruptorStorage {
 	t.Helper()
 	ec := interfaces.EngineConfig{
-		RingBufferSize:        ringSize,
-		SpillThresholdPercent: 80,
-		WALSyncDisabled:       true,
-		WALCRCDisabled:        true,
+		DepthHighWM:     uint64(ringSize) * 80 / 100,
+		WALSyncDisabled: true,
+		WALCRCDisabled:  true,
 	}
 	storage, err := NewDisruptorStorageWithEngineConfig(tmpDir, ec)
 	require.NoError(t, err)
@@ -220,8 +219,7 @@ func TestReadAhead_StopsAtBlankHeader(t *testing.T) {
 func newReadAheadTestStorageSync(t *testing.T, tmpDir string, ringSize int) *DisruptorStorage {
 	t.Helper()
 	ec := interfaces.EngineConfig{
-		RingBufferSize:        ringSize,
-		SpillThresholdPercent: 80,
+		DepthHighWM: uint64(ringSize) * 80 / 100,
 	}
 	storage, err := NewDisruptorStorageWithEngineConfig(tmpDir, ec)
 	require.NoError(t, err)

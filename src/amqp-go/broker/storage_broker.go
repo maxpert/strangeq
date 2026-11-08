@@ -1124,24 +1124,16 @@ func (b *StorageBroker) GetQueuePolicy(queueName string) *QueuePolicy {
 	return val.(*QueueState).Policy()
 }
 
-// computeDepthHighWM derives the per-queue backpressure high-water mark from
-// the engine config: ring buffer size × spill threshold % (message-count
-// depth, not bytes). This is the depth (head - minAckCursor) at which
-// publishers block or spill. Falls back to sensible defaults when config
-// fields are unset. (segstore v1: retained as legacy depth-HWM input)
+// computeDepthHighWM returns the per-queue publisher backpressure depth
+// high-water mark in messages: that is the configured EngineConfig.DepthHighWM,
+// or interfaces.DefaultDepthHighWM (52428) when it is unset (0). This depth
+// (head - minAckCursor) is where publishers block or spill; it is a secondary
+// gate -- the hot-cache BYTE budget usually binds first (see publisherGate).
 func (b *StorageBroker) computeDepthHighWM() uint64 {
-	if b.engineConfig.DepthHighWMOverride > 0 {
-		return b.engineConfig.DepthHighWMOverride
+	if b.engineConfig.DepthHighWM > 0 {
+		return b.engineConfig.DepthHighWM
 	}
-	ringSize := b.engineConfig.RingBufferSize
-	if ringSize <= 0 {
-		ringSize = 1024 * 256
-	}
-	spillPct := b.engineConfig.SpillThresholdPercent
-	if spillPct <= 0 {
-		spillPct = 80
-	}
-	return uint64(ringSize) * uint64(spillPct) / 100
+	return interfaces.DefaultDepthHighWM
 }
 
 // hotCachePacer is the optional storage capability that paces a publisher to a

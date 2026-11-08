@@ -17,7 +17,7 @@ import (
 // progresses normally throughout (the group-commit WAL is untouched).
 func TestLease_TxCommitParkDrainsQueuedLeases(t *testing.T) {
 	srv, addr, created, released, _ := leaseServer(t, 1<<20, func(cfg *config.AMQPConfig) {
-		cfg.Engine.DepthHighWMOverride = 1
+		cfg.Engine.DepthHighWM = 1
 	}, nil)
 
 	// Fill the tx target queue to HWM=1 with a transient publish.

@@ -61,8 +61,7 @@ func (g *gatedAsyncStore) heldCount() int {
 func newGatedBroker(t *testing.T) (*StorageBroker, *gatedAsyncStore, func()) {
 	t.Helper()
 	ec := interfaces.EngineConfig{
-		RingBufferSize:          65536,
-		SpillThresholdPercent:   80,
+		DepthHighWM:             52428,
 		WALBatchSize:            1000,
 		WALBatchTimeoutMS:       10,
 		ConsumerSelectTimeoutMS: 1,

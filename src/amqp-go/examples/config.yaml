@@ -66,9 +66,9 @@ server:
 # See config.sample.yaml for all available options
 engine:
 
-  # Ring Buffer (Hot Path)
-  ringbuffersize: 65536             # 64K messages
-  spillthresholdpercent: 80         # Start spilling at 80%
+  # Publisher backpressure depth high-water mark in messages (0 = default 52428).
+  # A secondary gate: the hot-cache byte budget usually binds first.
+  depthhighwm: 52428
 
   # WAL settings (balance throughput vs latency)
   walbatchsize: 1000

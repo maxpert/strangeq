@@ -37,7 +37,7 @@ func readDeliveryTag(t *testing.T, r *rawAMQP) uint64 {
 // completion (two-party join), then used == 0.
 func TestLease_TransientHWMStoredWithGate(t *testing.T) {
 	srv, addr, created, released, _ := leaseServer(t, 1<<20, func(cfg *config.AMQPConfig) {
-		cfg.Engine.DepthHighWMOverride = 1
+		cfg.Engine.DepthHighWM = 1
 	}, nil)
 
 	p := dialRaw(t, addr)
@@ -111,7 +111,7 @@ func TestLease_TransientHWMStoredWithGate(t *testing.T) {
 // wait and no close.
 func TestLease_TransientHWMMixedConnAckSchedule(t *testing.T) {
 	srv, addr, _, _, _ := leaseServer(t, 1<<20, func(cfg *config.AMQPConfig) {
-		cfg.Engine.DepthHighWMOverride = 2
+		cfg.Engine.DepthHighWM = 2
 	}, nil)
 
 	p := dialRaw(t, addr)

@@ -15,13 +15,11 @@ func createSmallRingBroker(t testing.TB) (*StorageBroker, func()) {
 	t.Helper()
 	tmpDir := t.TempDir()
 	engineConfig := interfaces.EngineConfig{
-		RingBufferSize:          16,
-		SpillThresholdPercent:   50,
+		DepthHighWM:             100000,
 		WALBatchSize:            1000,
 		WALBatchTimeoutMS:       10,
 		ConsumerSelectTimeoutMS: 1,
 		ConsumerMaxBatchSize:    100,
-		DepthHighWMOverride:     100000,
 	}
 	store, err := storage.NewDisruptorStorageWithEngineConfig(tmpDir, engineConfig)
 	require.NoError(t, err)

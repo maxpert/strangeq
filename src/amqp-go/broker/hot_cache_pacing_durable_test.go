@@ -45,12 +45,10 @@ func TestBarrierModeHotCachePaceGateActive(t *testing.T) {
 	const queue = "barrier-pace-q"
 	body := bytes.Repeat([]byte("b"), 256)
 	ec := interfaces.EngineConfig{
-		HotCacheQueueBytes:    3200,
-		DepthHighWMOverride:   1_000_000,
-		RingBufferSize:        65536,
-		SpillThresholdPercent: 80,
-		WALSyncDisabled:       false,
-		CrashModel:            interfaces.CrashModelBarrier,
+		HotCacheQueueBytes: 3200,
+		DepthHighWM:        1_000_000,
+		WALSyncDisabled:    false,
+		CrashModel:         interfaces.CrashModelBarrier,
 	}
 	store, err := storage.NewDisruptorStorageWithEngineConfig(t.TempDir(), ec)
 	require.NoError(t, err)
@@ -86,10 +84,8 @@ func TestForceFlushModeHotCachePaceGateInert(t *testing.T) {
 	ec := interfaces.EngineConfig{
 		// The exact budget and body the fsync:false pacing test uses, so the
 		// byte-budget-exceeded condition is reached identically.
-		HotCacheQueueBytes:    3200,
-		DepthHighWMOverride:   1_000_000,
-		RingBufferSize:        65536,
-		SpillThresholdPercent: 80,
+		HotCacheQueueBytes: 3200,
+		DepthHighWM:        1_000_000,
 		// DURABLE MODE with the full drive-cache flush, where pacing stays off
 		// (the 52e0a47 wiring).
 		WALSyncDisabled: false,

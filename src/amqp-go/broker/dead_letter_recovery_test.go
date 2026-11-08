@@ -49,8 +49,7 @@ func recoverPersistentIntoQueues(t *testing.T, store interfaces.Storage, b *Stor
 func TestRecovery_DurableDeadLetter_RetainsXDeath(t *testing.T) {
 	dataDir := t.TempDir()
 	ec := interfaces.EngineConfig{
-		RingBufferSize:          65536,
-		SpillThresholdPercent:   80,
+		DepthHighWM:             52428,
 		WALBatchSize:            1000,
 		WALBatchTimeoutMS:       10,
 		ConsumerSelectTimeoutMS: 1,

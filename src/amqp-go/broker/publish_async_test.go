@@ -518,9 +518,8 @@ func TestAsyncConfirm_FanoutConfirmOnlyAfterAllCopies(t *testing.T) {
 	defer restore()
 
 	ec := interfaces.EngineConfig{
-		RingBufferSize:        65536,
-		SpillThresholdPercent: 80,
-		WALBatchSize:          walBatchSize,
+		DepthHighWM:  52428,
+		WALBatchSize: walBatchSize,
 	}
 	walCfg := storage.WALConfigFromEngine(ec)
 	require.Equal(t, walBatchSize, walCfg.BatchSize,
@@ -656,8 +655,7 @@ func (f *flakyAsyncStore) StoreMessageAsync(queueName string, message *protocol.
 // stuck tag. Asserts a subsequent durable publish still becomes visible.
 func TestFrontier_EnqueueErrorDoesNotWedgeQueue(t *testing.T) {
 	ec := interfaces.EngineConfig{
-		RingBufferSize:          65536,
-		SpillThresholdPercent:   80,
+		DepthHighWM:             52428,
 		WALBatchSize:            1000,
 		ConsumerSelectTimeoutMS: 1,
 		ConsumerMaxBatchSize:    100,
@@ -773,8 +771,7 @@ func TestAsyncConfirm_DropHeadDeadLetterFromCompletionNoDeadlock(t *testing.T) {
 func TestCrash_ConfirmedImpliesRecoverable(t *testing.T) {
 	dataDir := t.TempDir()
 	ec := interfaces.EngineConfig{
-		RingBufferSize:          65536,
-		SpillThresholdPercent:   80,
+		DepthHighWM:             52428,
 		WALBatchSize:            1000,
 		ConsumerSelectTimeoutMS: 1,
 		ConsumerMaxBatchSize:    100,

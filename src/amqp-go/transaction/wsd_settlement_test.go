@@ -22,8 +22,7 @@ func newRealTxStack(t *testing.T) (*storage.DisruptorStorage, *broker.StorageBro
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = ds.Close() })
 	b := broker.NewStorageBroker(ds, interfaces.EngineConfig{
-		RingBufferSize:          65536,
-		SpillThresholdPercent:   80,
+		DepthHighWM:             52428,
 		WALBatchSize:            1000,
 		WALBatchTimeoutMS:       10,
 		ConsumerSelectTimeoutMS: 1,

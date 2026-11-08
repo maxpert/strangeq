@@ -202,10 +202,9 @@ func TestWALWrite_LoneWriterNotBatchTimeoutBound(t *testing.T) {
 // stalls for a full BatchTimeout per message.
 func TestDisruptorStorage_SpillPathNotBatchTimeoutBound(t *testing.T) {
 	ec := interfaces.EngineConfig{
-		RingBufferSize:        1024,
-		SpillThresholdPercent: 80, // spill threshold = 819
-		WALBatchSize:          1000,
-		WALBatchTimeoutMS:     1000, // pre-fix: 1s per spilled message
+		DepthHighWM:       819,
+		WALBatchSize:      1000,
+		WALBatchTimeoutMS: 1000, // pre-fix: 1s per spilled message
 	}
 	ds, err := NewDisruptorStorageWithEngineConfig(t.TempDir(), ec)
 	if err != nil {

@@ -458,9 +458,7 @@ func TestPurge_PreservesUnacked(t *testing.T) {
 // together.
 func TestPurge_SpilledReadyRemovedAndNotResurrected(t *testing.T) {
 	b := newRestartableBroker(t, func(cfg *config.AMQPConfig) {
-		cfg.Engine.RingBufferSize = 16
-		cfg.Engine.SpillThresholdPercent = 50
-		cfg.Engine.DepthHighWMOverride = 100000
+		cfg.Engine.DepthHighWM = 100000
 	})
 
 	conn, err := amqp.Dial(b.uri)
@@ -530,9 +528,7 @@ func TestPurge_SpilledReadyRemovedAndNotResurrected(t *testing.T) {
 // the queue's message-count stayed inflated forever.
 func TestGetNoAck_SpilledDepth_NoLeak(t *testing.T) {
 	b := newRestartableBroker(t, func(cfg *config.AMQPConfig) {
-		cfg.Engine.RingBufferSize = 16
-		cfg.Engine.SpillThresholdPercent = 50
-		cfg.Engine.DepthHighWMOverride = 100000
+		cfg.Engine.DepthHighWM = 100000
 	})
 
 	conn, err := amqp.Dial(b.uri)

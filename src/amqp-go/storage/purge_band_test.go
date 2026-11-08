@@ -39,7 +39,7 @@ func TestPurgeQueueRemovesOnlyTheRequestedTagBand(t *testing.T) {
 	inBandTag1 := band1Base + 1
 	inBandTag2 := band1Base + 2
 	// AtomicRing addresses its slot purely from the LOW bits of the tag
-	// (slot = tag & mask, mask sized off DefaultRingBufferSize — see
+	// (slot = tag & mask, mask sized off the ring's fixed slot count — see
 	// storage/atomic_ring.go); the ordinal lives entirely above the mask, so a
 	// low-seq collision with an in-band tag would alias to the same ring slot
 	// and get pushed to the WAL-spill path, masking exactly the ring-purge

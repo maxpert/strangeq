@@ -12,38 +12,52 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func TestDepthHighWMOverride_Respected(t *testing.T) {
+func TestDepthHighWM_Respected(t *testing.T) {
 	tmpDir := t.TempDir()
 	store, err := storage.NewDisruptorStorageWithDataDir(tmpDir)
 	require.NoError(t, err)
 	defer store.Close()
 
 	broker := NewStorageBroker(store, interfaces.EngineConfig{
-		RingBufferSize:        65536,
-		SpillThresholdPercent: 80,
-		DepthHighWMOverride:   1000,
+		DepthHighWM: 1000,
 	})
 	defer broker.Close()
 
 	assert.Equal(t, uint64(1000), broker.computeDepthHighWM())
 }
 
-func TestDepthHighWMOverride_ZeroFallsBack(t *testing.T) {
+func TestDepthHighWM_ZeroFallsBack(t *testing.T) {
 	tmpDir := t.TempDir()
 	store, err := storage.NewDisruptorStorageWithDataDir(tmpDir)
 	require.NoError(t, err)
 	defer store.Close()
 
-	broker := NewStorageBroker(store, interfaces.EngineConfig{
-		RingBufferSize:        65536,
-		SpillThresholdPercent: 80,
-	})
+	broker := NewStorageBroker(store, interfaces.EngineConfig{})
 	defer broker.Close()
 
 	assert.Equal(t, uint64(52428), broker.computeDepthHighWM())
 }
 
-// TestDepthHighWMOverride_GatesAtConfiguredDepth proves the override is wired
+// TestComputeDepthHighWM_ConfiguredAndZeroValue pins the resolver itself: the
+// configured DepthHighWM is returned verbatim, and a zero-value EngineConfig
+// resolves to interfaces.DefaultDepthHighWM (52428).
+func TestComputeDepthHighWM_ConfiguredAndZeroValue(t *testing.T) {
+	zeroStore, err := storage.NewDisruptorStorageWithDataDir(t.TempDir())
+	require.NoError(t, err)
+	defer zeroStore.Close()
+	zero := NewStorageBroker(zeroStore, interfaces.EngineConfig{})
+	defer zero.Close()
+	assert.Equal(t, interfaces.DefaultDepthHighWM, zero.computeDepthHighWM())
+
+	cfgStore, err := storage.NewDisruptorStorageWithDataDir(t.TempDir())
+	require.NoError(t, err)
+	defer cfgStore.Close()
+	configured := NewStorageBroker(cfgStore, interfaces.EngineConfig{DepthHighWM: 12345})
+	defer configured.Close()
+	assert.Equal(t, uint64(12345), configured.computeDepthHighWM())
+}
+
+// TestDepthHighWM_GatesAtConfiguredDepth proves the configured depth is wired
 // into publisher backpressure, rather than merely computed: HWM-1 is admitted,
 // HWM is gated, and an ack releases the parked producer.
 //
@@ -52,16 +66,14 @@ func TestDepthHighWMOverride_ZeroFallsBack(t *testing.T) {
 // "deeper backlog has higher p50", including that scenario's incidental timing
 // sensitivity to FIFO/drain behavior. That relative-performance assertion was
 // load-dependent and is not retained in the pass/fail suite.
-func TestDepthHighWMOverride_GatesAtConfiguredDepth(t *testing.T) {
+func TestDepthHighWM_GatesAtConfiguredDepth(t *testing.T) {
 	const (
 		hwm                 = uint64(3)
 		unreachableFallback = 10 * time.Minute
 	)
 
 	ec := interfaces.EngineConfig{
-		RingBufferSize:        65536,
-		SpillThresholdPercent: 80,
-		DepthHighWMOverride:   hwm,
+		DepthHighWM: hwm,
 	}
 	store, err := storage.NewDisruptorStorageWithEngineConfig(t.TempDir(), ec)
 	require.NoError(t, err)
@@ -74,7 +86,7 @@ func TestDepthHighWMOverride_GatesAtConfiguredDepth(t *testing.T) {
 	qs := broker.getOrCreateQueueState("hwm-q")
 
 	require.Equal(t, hwm, qs.DepthHighWM(),
-		"DepthHighWMOverride did not reach the queue's production predicate")
+		"DepthHighWM did not reach the queue's production predicate")
 	qs.SetCapacityFallback(unreachableFallback)
 	require.Equal(t, unreachableFallback, qs.capacityFallback(),
 		"fixture premise broken: capacity fallback was not moved out of reach")
@@ -120,7 +132,7 @@ func TestDepthHighWMOverride_GatesAtConfiguredDepth(t *testing.T) {
 	case err := <-publishDone:
 		require.NoError(t, err, "synchronous publish was refused instead of completing after ack released capacity")
 	case <-time.After(5 * time.Second):
-		t.Fatal("ack never released the synchronous publish parked at DepthHighWMOverride; the 10-minute fallback was unreachable")
+		t.Fatal("ack never released the synchronous publish parked at DepthHighWM; the 10-minute fallback was unreachable")
 	}
 }
 
@@ -136,7 +148,7 @@ func requireSynchronousPublishParked(t *testing.T, qs *QueueState, completed <-c
 		case err := <-completed:
 			t.Fatalf("synchronous PublishMessage returned (%v) without registering a producer park; production publish must traverse WaitForCapacity", err)
 		case <-deadline.C:
-			t.Fatal("synchronous PublishMessage never registered a producer park at DepthHighWMOverride")
+			t.Fatal("synchronous PublishMessage never registered a producer park at DepthHighWM")
 		default:
 			runtime.Gosched()
 		}
