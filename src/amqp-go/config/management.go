@@ -76,6 +76,12 @@ func (c *AMQPConfig) validateManagement() error {
 	// Trusted proxies must parse as CIDRs/IPs (SEC-112). A malformed entry is a
 	// startup error, never a silent no-op: an operator who wrote a proxy list
 	// expects it to be honoured.
+	//
+	// A trusted proxy MUST set or append the client address (X-Forwarded-For
+	// or X-Real-IP) on every request. When it forwards no client address, the
+	// socket peer is the PROXY, not the client: the request is failed closed
+	// (no loopback exemption, host ACL refuses) rather than being attributed
+	// to the proxy's address.
 	for _, entry := range m.TrustedProxies {
 		if err := parseCIDROrAddr(entry); err != nil {
 			return fmt.Errorf("management.trusted_proxies entry %q: %v", entry, err)

@@ -34,6 +34,14 @@ func (s *Server) resolveClient(r *http.Request) clientInfo {
 		ci.BehindProxy = true
 		if eff := s.forwardedClient(r); eff != "" {
 			ci.EffectiveIP = eff
+		} else {
+			// The peer is a TRUSTED PROXY that forwarded no client address.
+			// Treating the socket peer as the client would let a loopback
+			// proxy make every remote peer look loopback (and let a proxy
+			// that relays attacker X-Forwarded-For spoof it). Fail closed:
+			// the effective client stays unknown, so Loopback is false and
+			// the host ACL refuses. See management.trusted_proxies.
+			ci.EffectiveIP = ""
 		}
 	}
 	if addr, err := netip.ParseAddr(ci.EffectiveIP); err == nil {
@@ -120,6 +128,9 @@ func (s *Server) authenticate(r *http.Request) (*Principal, clientInfo, *apiErro
 
 	// No credential presented.
 	if p := s.unauthenticatedPrincipal(r, ci); p != nil {
+		if ae := s.checkPrincipalClient(p, ci); ae != nil {
+			return nil, ci, ae
+		}
 		return p, ci, nil
 	}
 	return nil, ci, errUnauth("authentication required")
@@ -243,11 +254,13 @@ func (s *Server) loginInherit(username, password string, ci clientInfo) (*Princi
 // checkPrincipalClient applies the client restrictions attached to a
 // principal: the guest identity is loopback-only (AUTH-041), a broker user may
 // carry loopback_only (AUTH-013), and every principal is subject to the
-// security.allowedhosts / blockedhosts ACL (AUTH-009). It is shared by every
-// authentication path — Basic, the session cookie (SEC-112/T-06), and the
-// session-create endpoint — so a cookie minted on loopback cannot be replayed
-// from a non-loopback client. A built-in principal (p.User == nil) still
-// enforces the guest loopback rule and the host ACL.
+// security.allowedhosts / blockedhosts ACL (AUTH-009). Every path that admits
+// a principal calls it: the Basic request path, the session cookie
+// (SEC-112/T-06), the no-credential guest path (AUTH-041), and the
+// session-create endpoint (AUTH-031) — so a cookie minted on loopback cannot
+// be replayed from a non-loopback client, and a blocked host is refused on the
+// guest and session-create paths too. A built-in principal (p.User == nil)
+// still enforces the guest loopback rule and the host ACL.
 func (s *Server) checkPrincipalClient(p *Principal, ci clientInfo) *apiError {
 	if p == nil {
 		return nil
@@ -352,7 +365,7 @@ func isEntityReadRoute(m *route) bool {
 		return false
 	}
 	switch m.segs[1] {
-	case "queues", "exchanges", "bindings", "consumers", "channels", "connections", "vhosts", "definitions":
+	case "queues", "exchanges", "bindings", "consumers", "channels", "connections", "vhosts", "definitions", "permissions":
 		return true
 	}
 	return false
