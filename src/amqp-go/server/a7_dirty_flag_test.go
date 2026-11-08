@@ -254,7 +254,11 @@ func TestA7_TimeoutFallbackSelfHeals(t *testing.T) {
 	go func() { srv.consumerDeliveryLoop(srv.runtimeFor(conn)); close(done) }()
 	defer func() {
 		conn.Closed.Store(true)
-		<-done
+		select {
+		case <-done:
+		case <-time.After(3 * time.Second):
+			t.Error("delivery loop did not exit on teardown")
+		}
 		clientConn.Close()
 		<-readerDone
 	}()
