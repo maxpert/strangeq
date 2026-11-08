@@ -184,6 +184,16 @@ func (s *Server) serveHTTP(w http.ResponseWriter, r *http.Request) {
 		// overview, …) are governed by the capability gate alone. Built-in
 		// principals (p.User == nil) hold a synthesized full permission.
 		if isEntityReadRoute(m) {
+			// FR-CONV-003/D-1: a route that captures a {vhost} accepts only
+			// the decoded "/". The vhost EXISTENCE check runs before the
+			// resource gate so an unknown vhost is 404 "unknown vhost" (what
+			// the handler itself would answer), not the 403 the resource gate
+			// produces for a principal with no permission on that
+			// (nonexistent) vhost.
+			if ae := entityVHostGuard(m, r); ae != nil {
+				s.writeAPIError(rw, r, ae)
+				return
+			}
 			if ae := s.resourceReadGate(p, requestVhost(r)); ae != nil {
 				s.writeAPIError(rw, r, ae)
 				return

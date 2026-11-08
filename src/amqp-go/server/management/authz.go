@@ -376,6 +376,23 @@ func isEntityReadRoute(m *route) bool {
 	return false
 }
 
+// entityVHostGuard enforces FR-CONV-003/D-1 for an entity route that captures a
+// {vhost}: only the decoded "/" (the broker's single vhost) is accepted, and
+// any other value is 404 "unknown vhost". It runs BEFORE resourceReadGate so an
+// unknown vhost is not masked by the 403 the resource gate returns for a
+// principal without a permission on that vhost (spec §11 test 31).
+func entityVHostGuard(m *route, r *http.Request) *apiError {
+	for _, seg := range m.segs {
+		if seg == "{vhost}" {
+			if requestVhost(r) != "/" {
+				return errNotFoundMsg("unknown vhost")
+			}
+			return nil
+		}
+	}
+	return nil
+}
+
 // requestVhost resolves the vhost a request targets: the decoded {vhost} path
 // value when the matched route captures one, else the single default vhost
 // "/". It is read before dispatch (endpointLabel carries the matched template)
