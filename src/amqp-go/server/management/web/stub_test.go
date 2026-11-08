@@ -66,16 +66,25 @@ type stubAPI struct {
 	queuePageCount int
 	queuePages     []int
 
+	// definitions-import controls: a forced status (413/429) and custom outcome
+	// tables, plus the last raw body for byte-fidelity assertions.
+	defsImportStatus int
+	defsApplied      []map[string]any
+	defsSkipped      []map[string]any
+	defsFailed       []map[string]any
+	lastDefsBody     string
+
 	declared         []string
 	lastQueueDeclare map[string]any
 	hits             atomic.Int64
 }
 
 // recordedReq is one observed request: the endpoint kind (the segment after
-// /api/) and its raw query string.
+// /api/), its raw query string, and the HTTP method.
 type recordedReq struct {
-	kind string
-	raw  string
+	kind   string
+	raw    string
+	method string
 }
 
 func (s *stubAPI) hitCount() int64 { return s.hits.Load() }
@@ -87,6 +96,20 @@ func (s *stubAPI) queriesFor(kind string) []string {
 	out := make([]string, 0, len(s.reqLog))
 	for _, e := range s.reqLog {
 		if e.kind == kind {
+			out = append(out, e.raw)
+		}
+	}
+	return out
+}
+
+// postQueriesFor returns the raw query strings of every POST for an endpoint,
+// so a test can distinguish a mutation from a read of the same path.
+func (s *stubAPI) postQueriesFor(kind string) []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]string, 0, len(s.reqLog))
+	for _, e := range s.reqLog {
+		if e.kind == kind && e.method == http.MethodPost {
 			out = append(out, e.raw)
 		}
 	}
@@ -182,6 +205,13 @@ func (s *stubAPI) declarations() []string {
 	return append([]string(nil), s.declared...)
 }
 
+// lastDefinitionsBody returns the raw POST body the import endpoint received.
+func (s *stubAPI) lastDefinitionsBody() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.lastDefsBody
+}
+
 func pathSegments(r *http.Request) []string {
 	ep := strings.Trim(r.URL.EscapedPath(), "/")
 	if ep == "" {
@@ -228,7 +258,7 @@ func (s *stubAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	kind := segs[1]
 	s.mu.Lock()
-	s.reqLog = append(s.reqLog, recordedReq{kind: kind, raw: r.URL.RawQuery})
+	s.reqLog = append(s.reqLog, recordedReq{kind: kind, raw: r.URL.RawQuery, method: r.Method})
 	s.mu.Unlock()
 
 	switch kind {
@@ -375,14 +405,47 @@ func (s *stubAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			if !s.guardCSRF(w, r) {
 				return
 			}
+			body, _ := io.ReadAll(r.Body)
+			dry := r.URL.Query().Get("dry_run") == "true"
+			s.mu.Lock()
+			status := s.defsImportStatus
+			applied, skipped, failed := s.defsApplied, s.defsSkipped, s.defsFailed
+			s.lastDefsBody = string(body)
+			s.mu.Unlock()
+			switch status {
+			case http.StatusRequestEntityTooLarge:
+				writeJSON(w, status, map[string]any{"error": "payload_too_large", "reason": "definitions body exceeds the import limit"})
+				return
+			case http.StatusTooManyRequests:
+				w.Header().Set("Retry-After", "1")
+				writeJSON(w, status, map[string]any{"error": "rate_limited", "reason": "definitions import rate limited"})
+				return
+			}
+			if applied == nil {
+				applied = []map[string]any{{"type": "exchange", "name": "events", "vhost": "/", "result": "created"}}
+			}
+			if skipped == nil {
+				skipped = []map[string]any{
+					{"type": "vhost", "name": "/", "reason": "already exists"},
+					{"type": "user", "name": "guest", "reason": "user/permission management is not implemented (BOB-6)"},
+					{"type": "permission", "name": "guest", "vhost": "/", "reason": "user/permission management is not implemented (BOB-6)"},
+				}
+			}
+			if failed == nil {
+				failed = []map[string]any{}
+			}
 			writeJSON(w, http.StatusOK, map[string]any{
-				"applied": []string{}, "skipped": []string{"users", "permissions", "bindings"}, "failed": []string{},
-				"strangeq": map[string]any{"subset": true, "atomic": false},
+				"applied": applied, "skipped": skipped, "failed": failed,
+				"strangeq": map[string]any{"subset": true, "atomic": false, "dry_run": dry},
 			})
 			return
 		}
 		writeRead(w, r, map[string]any{
-			"strangeq":  map[string]any{"product": "StrangeQ", "version": "0.4.0", "subset": true, "excludes": []string{"bindings"}},
+			"strangeq": map[string]any{
+				"product": "StrangeQ", "version": "0.4.0", "subset": true, "atomic": false,
+				"excludes":          []string{"user_password_hashes", "policies", "parameters", "vhosts_other_than_root", "implicit_default_bindings"},
+				"excluded_sections": []string{"users", "permissions", "bindings"},
+			},
 			"vhosts":    []map[string]any{{"name": "/", "synthetic": true}},
 			"exchanges": []map[string]any{}, "queues": []map[string]any{}, "bindings": []map[string]any{},
 		})

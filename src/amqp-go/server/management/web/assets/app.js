@@ -210,12 +210,14 @@
     opts = opts || {};
     var method = opts.method || "GET";
     var headers = { Accept: "application/json" };
-    var hasBody = opts.body !== undefined && opts.body !== null;
+    var hasRaw = opts.raw !== undefined && opts.raw !== null;
+    var hasBody = hasRaw || (opts.body !== undefined && opts.body !== null);
     if (hasBody) headers["Content-Type"] = "application/json";
     if (method !== "GET" && method !== "HEAD" && state.csrf) headers["X-CSRF-Token"] = state.csrf;
     if (opts.ifNoneMatch) headers["If-None-Match"] = opts.ifNoneMatch;
     var init = { method: method, headers: headers, credentials: "same-origin", cache: "no-store" };
-    if (hasBody) init.body = JSON.stringify(opts.body);
+    if (hasRaw) init.body = String(opts.raw);
+    else if (hasBody) init.body = JSON.stringify(opts.body);
     var timeout = opts.timeoutMs !== undefined ? opts.timeoutMs : REQUEST_TIMEOUT_MS;
     var timer = 0;
     if (timeout > 0 && typeof AbortController === "function") {
@@ -1483,53 +1485,115 @@
     });
   }
 
-  function loadDefinitions(container) {
-    var exportLink = h("a", { href: API + "/definitions", download: "strangeq-definitions.json" },
+  /* definitionsName renders the display name of one applied/skipped/failed
+   * item: exchanges/queues/users use `name`, bindings use source -> destination. */
+  function definitionsName(x) {
+    if (x && (x.type === "binding") && (x.source || x.destination)) {
+      return val(x.source) + " \u2192 " + val(x.destination);
+    }
+    return val(x && x.name);
+  }
+
+  /* definitionsTable renders one of the three outcome tables (applied/skipped/
+   * failed). Each item is `{type,name,vhost,result,reason}` or, for a binding,
+   * `{type,source,destination,destination_type,properties_key,result,reason}`. */
+  function definitionsTable(id, label, items) {
+    var rows = itemsOf(items);
+    var section = h("div", { class: "defs-section", id: id }, [h("h4", { text: label + " (" + rows.length + ")" })]);
+    if (!rows.length) {
+      section.appendChild(emptyState("none"));
+      return section;
+    }
+    section.appendChild(tableBlock([
+      { key: "type", label: "Type", render: function (x) { return h("span", { text: val(x.type) }); } },
+      { key: "name", label: "Name", render: function (x) { return h("span", { text: definitionsName(x) }); } },
+      { key: "vhost", label: "Vhost", render: function (x) { return h("span", { text: val(x.vhost) }); } },
+      { key: "result", label: "Result", render: function (x) { return h("span", { text: val(x.result) }); } },
+      { key: "reason", label: "Reason", render: function (x) { return h("span", { text: val(x.reason) }); } }
+    ], rows, {}));
+    return section;
+  }
+
+  /* renderDefinitionsOutcome renders the dry-run preview (would-be) or the real
+   * import result. The non-atomic disclosure and the "not supported (BOB-6)"
+   * user/permission note are always shown (FR-UI-092/FR-IA-082). */
+  function renderDefinitionsOutcome(doc, dryRun) {
+    doc = doc || {};
+    return h("div", { class: "fieldset", id: "definitions-result" }, [
+      h("h3", { id: "definitions-result-title", text: dryRun ? "Dry-run preview" : "Import result" }),
+      h("p", { class: "stat-partial", id: "definitions-atomic-status", text: "Non-atomic import: applied, skipped and failed are reported per entity; some entities may fail." }),
+      definitionsTable("definitions-applied", dryRun ? "Applied (would-be)" : "Applied", doc.applied),
+      definitionsTable("definitions-skipped", "Skipped", doc.skipped),
+      h("p", { class: "null", id: "definitions-bob6-note", text: "Not supported (BOB-6): users and permissions are always skipped." }),
+      definitionsTable("definitions-failed", "Failed", doc.failed)
+    ]);
+  }
+
+  function loadDefinitions(container, route) {
+    var exportLink = h("a", { href: API + "/definitions", download: "strangeq-definitions.json", id: "definitions-export" },
       [h("button", { type: "button", text: "Export definitions" })]);
-    var fileInput = h("input", { type: "file", id: "definitions-file", accept: "application/json" });
+    var exportNote = h("p", { id: "definitions-export-note", text: "Export is a subset: user credentials and policies are excluded. The export includes a timestamp." });
+    var fileInput = h("input", { type: "file", id: "definitions-file", accept: "application/json,.json" });
     var preview = h("div", { id: "definitions-preview" });
+    var confirmWrap = h("div", { id: "definitions-confirm-wrap", hidden: true });
+    var lastText = null;
+
+    /* Report what the export actually omits (strangeq.excluded_sections). */
+    api(API + "/definitions").then(function (r) {
+      if (r.status === 200 && r.data && r.data.strangeq) {
+        var secs = r.data.strangeq.excluded_sections || [];
+        exportNote.textContent = "Export is a subset (user credentials and policies are excluded); it includes a timestamp. Excluded sections: " +
+          (secs.length ? secs.join(", ") : "none") + ".";
+      }
+    }, function () { /* the note stays on its default text */ });
+
     fileInput.addEventListener("change", function () {
       var file = fileInput.files && fileInput.files[0];
       if (!file) return;
       var reader = new FileReader();
       reader.onload = function () {
-        var parsed = null;
-        try { parsed = JSON.parse(String(reader.result)); } catch (e) { parsed = null; }
-        if (!parsed) { preview.replaceChildren(errorState({ error: "bad_request", reason: "not valid JSON" })); return; }
-        preview.replaceChildren(h("div", { class: "fieldset" }, [
-          h("h3", { text: "Dry-run preview" }),
-          h("p", { text: "vhosts: " + itemsOf(parsed.vhosts).length + ", exchanges: " + itemsOf(parsed.exchanges).length + ", queues: " + itemsOf(parsed.queues).length + ", bindings: " + itemsOf(parsed.bindings).length }),
-          h("p", { class: "null", text: "Import is non-atomic; sections may partially apply (BOB-10)." }),
-          h("button", { type: "button", id: "definitions-apply", text: "Apply import", onclick: function () { applyDefinitions(parsed, preview); } })
-        ]));
+        lastText = String(reader.result);
+        preview.replaceChildren(itemsLoading());
+        confirmWrap.hidden = true;
+        /* Dry-run preview: the SAME bytes go to ?dry_run=true and later to the
+         * apply, so a preview cannot disagree with the real merge. */
+        api(API + "/definitions?dry_run=true", { method: "POST", raw: lastText }).then(function (r) {
+          if (r.status >= 400) { preview.replaceChildren(errorState(r.data)); return; }
+          preview.replaceChildren(renderDefinitionsOutcome(r.data, true));
+          confirmWrap.hidden = false;
+        }, function () { preview.replaceChildren(errorState(null)); });
       };
       reader.readAsText(file);
     });
-    return h("div", { class: "screen screen-definitions" }, [
+
+    var confirmBtn = h("button", { type: "button", id: "definitions-apply", text: "Confirm import" });
+    confirmBtn.addEventListener("click", function () {
+      if (lastText === null) return;
+      confirmBtn.disabled = true;
+      api(API + "/definitions", { method: "POST", raw: lastText }).then(function (r) {
+        confirmBtn.disabled = false;
+        if (r.status >= 400) { preview.replaceChildren(errorState(r.data)); return; }
+        preview.replaceChildren(renderDefinitionsOutcome(r.data, false));
+        confirmWrap.hidden = true;
+        toast("Import complete", "ok");
+        invalidateAll();
+      }, function () { confirmBtn.disabled = false; preview.replaceChildren(errorState(null)); });
+    });
+    confirmWrap.appendChild(confirmBtn);
+
+    container.replaceChildren(h("div", { class: "screen screen-definitions" }, [
       h("div", { class: "page-head" }, [h("h1", { text: "Definitions" })]),
       h("h2", { text: "Export" }),
-      h("p", { text: "Export omits users/permissions unless permitted, and omits bindings while BOB-4 is unbuilt." }),
+      exportNote,
       exportLink,
       h("h2", { text: "Import" }),
-      h("p", { class: "null", text: "Import is non-atomic. Skipped sections: users/permissions, bindings." }),
+      h("p", { class: "null", id: "definitions-atomic-note", text: "This import is not atomic; entities are applied one at a time and some may fail." }),
+      h("p", { class: "null", text: "User and permission sections are not imported (BOB-6)." }),
       h("div", { class: "form-row" }, [fileInput]),
-      preview
-    ]);
-  }
-
-  function applyDefinitions(doc, out) {
-    api(API + "/definitions", { method: "POST", body: doc }).then(function (r) {
-      if (r.status >= 400) { out.replaceChildren(errorState(r.data)); return; }
-      var res = r.data || {};
-      var atomic = res.strangeq && res.strangeq.atomic === true;
-      out.replaceChildren(h("div", { class: "fieldset" }, [
-        h("h3", { text: "Import result" }),
-        h("p", { text: "applied: " + itemsOf(res.applied).length + ", skipped: " + itemsOf(res.skipped).length + ", failed: " + itemsOf(res.failed).length }),
-        h("p", { class: atomic ? "null" : "stat-partial", text: atomic ? "atomic import" : "non-atomic import; sections may partially apply" })
-      ]));
-      toast("Import complete", "ok");
-      invalidateAll();
-    }, function () { out.replaceChildren(errorState(null)); });
+      preview,
+      confirmWrap
+    ]));
+    return Promise.resolve();
   }
 
   function loadAbout(container) {
