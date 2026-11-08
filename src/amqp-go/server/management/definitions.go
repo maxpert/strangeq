@@ -2,6 +2,7 @@ package management
 
 import (
 	"encoding/json"
+	"fmt"
 	"sort"
 	"strings"
 	"time"
@@ -209,14 +210,20 @@ type defsTopology struct {
 	bindingSeam bool
 }
 
-func (s *Server) currentTopology() defsTopology {
+// currentTopology reads the broker topology ONCE. It returns an error only when
+// the aggregate binding seam is present but its ListBindings call fails: that
+// must not be silently treated as an empty binding set, or the export would
+// claim `bindings: []` while capabilities.bindings is true and the import could
+// exceed MaxBindings (review finding 1). An absent seam is NOT an error — it
+// degrades byte-for-byte to bindings:[] + excluded_sections:["bindings"].
+func (s *Server) currentTopology() (defsTopology, error) {
 	t := defsTopology{
 		exchanges: map[string]defsExchange{},
 		queues:    map[string]defsQueue{},
 	}
 	b := s.broker()
 	if b == nil {
-		return t
+		return t, nil
 	}
 	for name, ex := range b.GetExchanges() {
 		t.exchanges[name] = defsExchange{
@@ -241,12 +248,16 @@ func (s *Server) currentTopology() defsTopology {
 		}
 	}
 	if lister, ok := b.(bindingLister); ok {
-		if views, err := lister.ListBindings(); err == nil {
-			t.bindings = views
-			t.bindingSeam = true
+		views, err := lister.ListBindings()
+		if err != nil {
+			// A half-read topology is not a valid planning input: refuse it
+			// rather than plan against an empty binding set.
+			return t, fmt.Errorf("could not list bindings: %w", err)
 		}
+		t.bindings = views
+		t.bindingSeam = true
 	}
-	return t
+	return t, nil
 }
 
 // --- planner ----------------------------------------------------------------

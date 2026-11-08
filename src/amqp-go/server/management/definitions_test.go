@@ -3,6 +3,7 @@ package management
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
@@ -190,6 +191,71 @@ func TestDefinitionsExport_BindingsPopulated(t *testing.T) {
 	}
 	if containsStr(doc.StrangeQ.ExcludedSections, "bindings") {
 		t.Fatalf("with the seam present, bindings must NOT be listed as excluded: %v", doc.StrangeQ.ExcludedSections)
+	}
+}
+
+// TestDefinitionsExport_BindingsAbsentSeam restores the absent-seam
+// definitions-layer pin: when the injected broker has no aggregate binding seam
+// (embedding UnifiedBroker does not promote ListBindings), the export degrades
+// byte-for-byte to `bindings: []` plus `excluded_sections:["bindings"]` and
+// stays 200 — it must NOT be swept up by finding 1's 503.
+func TestDefinitionsExport_BindingsAbsentSeam(t *testing.T) {
+	e := basicEnv(t, true, nil)
+	e.srv.Broker = noTotalsBroker{UnifiedBroker: e.srv.Broker}
+
+	rec := e.do(http.MethodGet, "/api/definitions", nil, basicAuthHeader())
+	wantStatus(t, rec, http.StatusOK)
+	var doc definitionsExport
+	if err := json.Unmarshal(rec.Body.Bytes(), &doc); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(doc.Bindings) != 0 {
+		t.Fatalf("bindings = %+v, want []", doc.Bindings)
+	}
+	if !strings.Contains(rec.Body.String(), `"bindings":[]`) {
+		t.Fatalf("the absent seam must export an empty bindings array: %s", truncate(rec.Body.String()))
+	}
+	if !containsStr(doc.StrangeQ.ExcludedSections, "bindings") {
+		t.Fatalf("the absent seam must be disclosed in excluded_sections: %v", doc.StrangeQ.ExcludedSections)
+	}
+}
+
+// errBindingsBroker has the aggregate binding seam but its ListBindings errors.
+// currentTopology must surface that error so export/import refuse with 503
+// instead of silently planning against an empty binding set (review finding 1).
+type errBindingsBroker struct {
+	server.UnifiedBroker
+}
+
+func (b errBindingsBroker) ListBindings() ([]broker.BindingView, error) {
+	return nil, errors.New("injected ListBindings failure")
+}
+
+// TestDefinitions_BindingSeamErrorRefuses503 pins review finding 1: a
+// ListBindings error must make BOTH export and import an explicit 503
+// (unavailable), matching /api/bindings, rather than a 200 over `bindings: []`
+// that can exceed MaxBindings.
+func TestDefinitions_BindingSeamErrorRefuses503(t *testing.T) {
+	e := basicEnv(t, true, func(cfg *config.AMQPConfig) {
+		cfg.Management.RateLimits.DefinitionsImportSeconds = 0
+	})
+	e.srv.Broker = errBindingsBroker{UnifiedBroker: e.srv.Broker}
+
+	exp := e.do(http.MethodGet, "/api/definitions", nil, basicAuthHeader())
+	wantStatus(t, exp, http.StatusServiceUnavailable)
+	if env := decode[errorEnvelope](t, exp); env.Error != errUnavailable {
+		t.Fatalf("export token = %q, want unavailable", env.Error)
+	}
+
+	doc := definitionsImportRequest{Queues: []map[string]any{{"name": "seam-err-q"}}}
+	imp := importDefs(t, e, "", e.jsonBody(t, doc), nil)
+	wantStatus(t, imp, http.StatusServiceUnavailable)
+	if env := decode[errorEnvelope](t, imp); env.Error != errUnavailable {
+		t.Fatalf("import token = %q, want unavailable", env.Error)
+	}
+	// The refusal happens BEFORE any entity is declared.
+	if got := e.do(http.MethodGet, "/api/queues/%2F/seam-err-q", nil, basicAuthHeader()); got.Code != http.StatusNotFound {
+		t.Fatalf("a refused import must declare nothing (queue exists: %d)", got.Code)
 	}
 }
 
