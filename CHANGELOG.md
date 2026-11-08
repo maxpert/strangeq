@@ -3,6 +3,14 @@
 ## [Unreleased]
 
 ### Added
+- Management **control plane**: an optional RabbitMQ-4.4-management-subset REST API and an
+  embedded single-binary web UI (assets `go:embed`-ed; no separate folder, build step, or
+  CDN). Off by default and loopback-only by default; enabled with `--management` /
+  `management.enabled`. It has a two-gate auth model (a capability gate plus a per-resource
+  vhost gate, deny-by-default, tags→capabilities), server-side sessions with CSRF
+  protection, loopback/host ACLs, fixed-window rate limits, and a startup refusal matrix
+  that refuses unsafe `management.authentication` combinations. See
+  [docs/MANAGEMENT.md](docs/MANAGEMENT.md).
 - Management UI **Metrics** tab (`/metrics`): the SPA renders the broker's
   Prometheus matrix — a 45-tile vital-stats panel, a grouped and searchable
   family list, and a raw-text view — from a new same-origin, auth-gated
@@ -11,6 +19,22 @@
   No new config key; when telemetry is disabled the route answers `501` and the
   screen shows a truthful notice. The telemetry listener, CORS and the CSP
   (`connect-src 'self'`) are unchanged.
+- Telemetry **broker outage families**: recovery faults/discards/duration/messages
+  recovered, WAL and segment durability failures, publish refusal, consumer-registration
+  errors, depth-gate/reader-pause back-pressure, deliveries requeued/dropped,
+  connections-closed-by-cause, shutdown result/duration, resource-alarm trips, and
+  recovered panics — every label domain a closed enum. The full `amqp_*` set is pinned by
+  a golden inventory test and documented in [docs/METRICS.md](docs/METRICS.md).
+- `--management`, `--management-address`, and `--management-port` flags.
+
+### Fixed
+- The AMQP handshake wrote `conn.Username`/`conn.Vhost` after the connection was published
+  into the registry and outside `Server.Mutex`, racing the management read path (which
+  reads them under `Mutex.RLock`). The handshake assignments now hold `Server.Mutex`, and
+  the management connection-close path reads the username inside its `RLock` window.
+- A binding was counted as removed even when `DeleteBinding`/`DeleteExchangeBinding`
+  returned an error, so `object_totals.bindings` could fall below `len(ListBindings())`.
+  Only a successful delete now contributes to the binding delta.
 
 ## [0.12.0] - 2026-11-07
 

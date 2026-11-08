@@ -40,6 +40,7 @@ RabbitMQ is the gold standard for AMQP 0.9.1, but it runs on the Erlang VM — a
 - Exclusive and auto-delete queues with automatic cleanup (exclusive queues deleted on owning-connection close; auto-delete queues deleted when the last consumer leaves)
 - Peak RSS is lower than RabbitMQ's best-measured configuration in every benchmark cell (12-83% less). Throughput beats RabbitMQ's best configuration on all five workloads in `none` mode and, except for a statistical tie on 64 KiB 1p/1c, in the default `barrier` mode; the power-loss-durable `flush` mode wins the 1 KiB workloads and trades 14-22% of 64 KiB throughput for the stronger guarantee. See [Performance](#performance)
 - Prometheus metrics and pprof profiling
+- Management control plane — a RabbitMQ-compatible REST API plus an embedded single-binary web UI (go:embed, no CDN), including a Metrics tab over the live Prometheus matrix
 - Byte-bounded per-queue hot cache with its own eviction budget
 - Batch TCP writes and ACK offloading
 
@@ -98,6 +99,9 @@ amqp-server --config config.yaml --enable-telemetry
 
 # Telemetry also with pprof (heap/goroutine dumps)
 amqp-server --config config.yaml --enable-telemetry --enable-pprof
+
+# With the management control plane (REST API + web UI at http://127.0.0.1:15672)
+amqp-server --config config.yaml --management
 ```
 
 ### Environment Variables
@@ -130,6 +134,9 @@ amqp-server [options]
   --telemetry-port int      Telemetry port (default from config: 9419)
   --telemetry-address string Telemetry bind address (default from config: 127.0.0.1)
   --enable-pprof            Enable pprof endpoints (off by default)
+  --management              Enable the management control plane (REST API + web UI)
+  --management-address string  Management API bind address (default from config: 127.0.0.1)
+  --management-port int     Management API port (default from config: 15672)
   --healthcheck             Probe the local /health endpoint and exit 0/1
   --unsafe-recovery         Start despite unrecoverable artifacts (DATA LOSS)
   --tls                     Enable TLS (amqps)
@@ -514,7 +521,7 @@ The following RabbitMQ features are not implemented:
 - SASL EXTERNAL
 - Global prefetch (`basic.qos` with `global=true`) — accepted but applied per-consumer, not enforced globally
 - Prefetch size (`basic.qos` with `prefetch_size > 0`) — rejected with a `540 not implemented` channel error rather than silently ignored
-- Management UI and CLI management tools
+- Management CLI tools (the REST API and web UI are available; see [docs/MANAGEMENT.md](docs/MANAGEMENT.md))
 
 ## Architecture
 
@@ -586,6 +593,37 @@ cd src/amqp-go/protocol
 docker-compose up
 ```
 
+## Management & Observability
+
+Two optional HTTP surfaces can be enabled independently of the broker listener:
+
+- **Management control plane** — a RabbitMQ-4.4-management-subset REST API plus an
+  embedded single-page web UI, served from the same binary (assets are `go:embed`-ed; no
+  separate folder, build step, or CDN). Off by default and loopback-only by default.
+
+  ```bash
+  amqp-server --config config.yaml --management
+  # Management API listening on http://127.0.0.1:15672
+  # open http://127.0.0.1:15672/ in a browser
+  ```
+
+  See [docs/MANAGEMENT.md](docs/MANAGEMENT.md) for enabling it, the startup refusal matrix,
+  the auth model (capabilities, sessions + CSRF, loopback/host ACLs, rate limits), the full
+  REST API reference, the UI screens, and the honest divergences from RabbitMQ.
+
+- **Telemetry** — Prometheus metrics, readiness, and optional pprof.
+
+  ```bash
+  amqp-server --config config.yaml --enable-telemetry
+  ```
+
+  See [docs/METRICS.md](docs/METRICS.md) for the serving endpoints, the full emitted
+  `amqp_*` metric reference, alerting queries, and what is deliberately not emitted.
+
+The management UI includes a **Metrics tab** that renders the same Prometheus matrix the
+telemetry listener exposes (a 45-tile vital-stats panel, a searchable family browser, and a
+raw view) from a same-origin, auth-gated `GET /api/metrics`.
+
 ## Monitoring
 
 Enable telemetry to expose Prometheus metrics and readiness:
@@ -606,7 +644,16 @@ with `OK (resource alarm active: memory,disk)` so consumers keep draining.
 curl http://localhost:9419/metrics
 ```
 
-Available metrics include message throughput, connection and channel counts, queue depths, memory usage, and storage utilization.
+The endpoint exposes the full `amqp_*` family set — message throughput and depth,
+connections, channels, consumers, queues and exchanges, publish/delivery latency,
+back-pressure and parking, WAL/segment durability and recovery, resource alarms, shutdown,
+panics, and (when the management surface is enabled) the `amqp_management_*` families. The
+complete reference, with types, labels and meanings, plus ready-to-use alerting queries, is
+in [docs/METRICS.md](docs/METRICS.md).
+
+The management UI's **Metrics tab** (`/metrics`) renders the same matrix in the browser
+through a same-origin, auth-gated `GET /api/metrics`, so no separate dashboard is required.
+When telemetry is disabled that route answers `501` and the screen shows a truthful notice.
 
 ### Profiling
 
@@ -697,6 +744,8 @@ Compatible with any AMQP 0.9.1 client library:
 ## Documentation
 
 - [Client Examples](CLIENT_EXAMPLES.md) — Complete examples for Python, Node.js, and Go
+- [Management Control Plane](docs/MANAGEMENT.md) — REST API, embedded web UI, auth model, and divergences
+- [Telemetry & Metrics](docs/METRICS.md) — Serving telemetry, the full metric reference, and alerting
 - [Authorization Guide](docs/AUTHORIZATION.md) — Permission model and access control
 - [TLS Configuration](docs/TLS.md) — TLS encryption and mutual TLS setup
 - [Contributing Guidelines](CONTRIBUTING.md) — How to contribute
