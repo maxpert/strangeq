@@ -33,6 +33,7 @@
     displayed: null,
     noticeDismissed: false,
     degraded: null,
+    health: null,
     samples: {},
     refresh: {
       timer: 0,
@@ -134,6 +135,17 @@
     return h("span", { class: "badge" + (kind ? " " + kind : ""), text: text });
   }
 
+  /* capabilityStatus derives a distinct status from the capability value: a
+   * boolean, an empty list (honest-empty), or an explicit 501 marker (F7). */
+  function capabilityStatus(value) {
+    if (value === true) return { label: "supported", kind: "" };
+    if (value === false) return { label: "blocked", kind: "warn" };
+    if (Array.isArray(value)) return value.length ? { label: "supported", kind: "" } : { label: "empty ([])", kind: "warn" };
+    if (value === 501 || value === "501") return { label: "not implemented (501)", kind: "warn" };
+    if (isNull(value)) return { label: "unknown", kind: "warn" };
+    return { label: "unavailable", kind: "warn" };
+  }
+
   function boolCell(v, trueText, falseText) {
     if (isNull(v)) return dash();
     return h("span", { text: v ? (trueText || "true") : (falseText || "false") });
@@ -141,6 +153,29 @@
 
   function link(text, href) {
     return h("a", { href: href, text: text });
+  }
+
+  function copyText(text, label) {
+    var btn = h("button", { type: "button", class: "copy-btn", text: label || "Copy" });
+    btn.addEventListener("click", function () {
+      try {
+        if (navigator.clipboard && navigator.clipboard.writeText) {
+          navigator.clipboard.writeText(text).then(
+            function () { toast("Copied", "ok"); },
+            function () { toast("Copy failed", "error"); });
+        } else {
+          toast("Clipboard unavailable", "error");
+        }
+      } catch (e) { toast("Copy failed", "error"); }
+    });
+    return btn;
+  }
+
+  function copyLinkButton() {
+    var btn = copyText(location.href, "Copy link");
+    btn.id = "copy-link-btn";
+    btn.title = "Copy a deep link to this page";
+    return btn;
   }
 
   /* --------------------------------------------------------------- API ----- */
@@ -350,8 +385,22 @@
 
   function renderTable(columns, rows, opts) {
     opts = opts || {};
+    var sortKeys = opts.sortKeys || null;
     var head = h("tr", null, columns.map(function (c) {
-      return h("th", { role: "columnheader", scope: "col", text: c.label, dataset: { col: c.key }, title: c.title || null });
+      var th = h("th", { role: "columnheader", scope: "col", text: c.label, dataset: { col: c.key }, title: c.title || null });
+      var sortable = opts.route && (!sortKeys || sortKeys.indexOf(c.key) >= 0);
+      if (sortable) {
+        var cur = opts.route.query.get("sort");
+        th.classList.add("sortable");
+        th.dataset.sort = c.key;
+        th.tabIndex = 0;
+        if (cur === c.key) {
+          th.setAttribute("aria-sort", opts.route.query.get("sort_reverse") === "true" ? "descending" : "ascending");
+        }
+        th.addEventListener("click", function () { onSort(opts.route, c.key); });
+        th.addEventListener("keydown", function (ev) { if (ev.key === "Enter") onSort(opts.route, c.key); });
+      }
+      return th;
     }));
     var body = h("tbody", null, rows.map(function (row) {
       var tr = h("tr", { role: "row", dataset: { key: opts.rowKey ? String(opts.rowKey(row)) : "" } });
@@ -379,6 +428,138 @@
     opts = opts || {};
     var table = renderTable(columns, rows, opts);
     return h("div", { class: "table-scroll" + (opts.scrollClass ? " " + opts.scrollClass : "") }, [table]);
+  }
+
+  /* --------------------------------------------- table toolbar + paging --- */
+
+  function toInt(v, def) {
+    if (v === null || v === undefined || v === "") return def;
+    var n = Number(v);
+    if (isNaN(n) || !isFinite(n)) return def;
+    return Math.floor(n);
+  }
+
+  /* listHref clones the current route query and applies overrides, dropping
+   * empties, so a sort/page/filter click never mutates the live query in place. */
+  function listHref(route, overrides) {
+    var p = new URLSearchParams(route.query.toString());
+    Object.keys(overrides || {}).forEach(function (k) {
+      var v = overrides[k];
+      if (v === null || v === undefined || v === "") p.delete(k);
+      else p.set(k, String(v));
+    });
+    var s = p.toString();
+    return route.path + (s ? "?" + s : "");
+  }
+
+  /* onSort re-queries page 1 with the chosen column; a repeat click flips the
+   * direction. The server does the sorting, so the DOM is never reordered
+   * optimistically. */
+  function onSort(route, key) {
+    var reverse = "true";
+    if (route.query.get("sort") === key) {
+      reverse = route.query.get("sort_reverse") === "true" ? "false" : "true";
+    }
+    navigate(listHref(route, { sort: key, sort_reverse: reverse, page: 1 }));
+  }
+
+  function filterControl(name, spec, current) {
+    if (spec.type === "select") {
+      var sel = h("select", { "aria-label": spec.label || name, dataset: { filter: name } });
+      (spec.options || []).forEach(function (o) { sel.appendChild(option(o[0], o[1])); });
+      sel.value = current || "";
+      return sel;
+    }
+    if (spec.type === "checkbox") {
+      var cb = h("input", { type: "checkbox", id: "filter-" + name, dataset: { filter: name } });
+      cb.checked = current === "true";
+      return h("span", null, [h("label", { for: "filter-" + name, text: spec.label || name }), cb]);
+    }
+    return h("input", {
+      type: "search", value: current || "", "aria-label": spec.label || name,
+      placeholder: spec.placeholder || spec.label || name, dataset: { filter: name }
+    });
+  }
+
+  /* tableToolbar renders the shared list controls: the spec's filters plus an
+   * optional sort selector, wired to navigate (never to a local mutation). */
+  function tableToolbar(route, opts) {
+    opts = opts || {};
+    var controls = (opts.filters || []).map(function (f) {
+      return filterControl(f.name, f, route.query.get(f.name));
+    });
+    if (opts.sortKeys && opts.sortKeys.length) {
+      var sortSel = h("select", { id: "sort-select", "aria-label": "Sort by", dataset: { role: "sort" } });
+      opts.sortKeys.forEach(function (k) { sortSel.appendChild(option(k, "sort: " + k)); });
+      sortSel.value = route.query.get("sort") || opts.sortKeys[0];
+      var rev = h("input", { type: "checkbox", id: "sort-reverse" });
+      rev.checked = route.query.get("sort_reverse") === "true";
+      controls.push(sortSel, h("label", { for: "sort-reverse", text: "descending" }), rev);
+    }
+    var form = h("form", { class: "toolbar" }, controls.concat([
+      h("button", { type: "submit", text: "Apply" }),
+      opts.action || null
+    ]));
+    form.addEventListener("submit", function (ev) {
+      ev.preventDefault();
+      var overrides = { page: 1 };
+      Array.prototype.forEach.call(form.querySelectorAll("[data-filter]"), function (el) {
+        if (el.type === "checkbox") overrides[el.dataset.filter] = el.checked ? "true" : "";
+        else overrides[el.dataset.filter] = el.value;
+      });
+      if (opts.sortKeys && opts.sortKeys.length) {
+        overrides.sort = form.querySelector('[data-role="sort"]').value;
+        overrides.sort_reverse = form.querySelector("#sort-reverse").checked ? "true" : "false";
+      }
+      navigate(listHref(route, overrides));
+    });
+    return form;
+  }
+
+  /* pagination renders the shared page controls. It reads page/page_size/
+   * total_count/filtered_count from the list envelope. A missing total_count
+   * renders an em-dash and "unknown", never a fabricated 0 (FR-UI-005). */
+  function pagination(data, route) {
+    var env = data && !Array.isArray(data) ? data : {};
+    var items = itemsOf(data);
+    var page = toInt(env.page, toInt(route.query.get("page"), 1));
+    if (page < 1) page = 1;
+    var pageSize = toInt(env.page_size, toInt(route.query.get("page_size"), 50));
+    var totalKnown = !isNull(env.total_count) && env.total_count !== "";
+    var total = totalKnown ? Number(env.total_count) : null;
+    var pageCount = toInt(env.page_count, totalKnown && pageSize > 0 ? Math.max(1, Math.ceil(total / pageSize)) : null);
+    var offset = (page - 1) * pageSize;
+    var end = totalKnown ? Math.min(offset + items.length, total) : null;
+    var indicator = h("span", {
+      class: "pagination-total",
+      dataset: { totalKnown: totalKnown ? "true" : "false" },
+      text: "showing " + (totalKnown ? String(end) : DASH) + " of " + (totalKnown ? String(total) : "unknown")
+    });
+    var sizes = [25, 50, 100, 250, 500];
+    var sizeSel = h("select", { id: "page-size", "aria-label": "Page size" });
+    sizes.forEach(function (n) { sizeSel.appendChild(option(String(n), String(n))); });
+    sizeSel.value = sizes.indexOf(pageSize) >= 0 ? String(pageSize) : "50";
+    sizeSel.addEventListener("change", function () {
+      navigate(listHref(route, { page: 1, page_size: sizeSel.value }));
+    });
+    var prev = h("button", { type: "button", id: "page-prev", text: "Prev" });
+    prev.disabled = page <= 1;
+    prev.addEventListener("click", function () {
+      if (prev.disabled) return;
+      navigate(listHref(route, { page: page - 1, page_size: pageSize }));
+    });
+    var next = h("button", { type: "button", id: "page-next", text: "Next" });
+    next.disabled = pageCount === null ? items.length < pageSize : page >= pageCount;
+    next.addEventListener("click", function () {
+      if (next.disabled) return;
+      navigate(listHref(route, { page: page + 1, page_size: pageSize }));
+    });
+    return h("div", { class: "pagination" }, [
+      h("span", { class: "pagination-page", text: "page " + page + (pageCount === null ? "" : " of " + pageCount) }),
+      prev, next,
+      h("label", { for: "page-size", text: "per page" }), sizeSel,
+      indicator
+    ]);
   }
 
   /* -------------------------------------------------------------- modal ---- */
@@ -467,40 +648,50 @@
   function applyHealth(h) {
     var el = document.getElementById("health");
     var txt = document.getElementById("health-text");
-    if (!el || !txt) return;
     var status = h && h.status ? h.status : "unknown";
     var mapped = status === "ok" ? "ok" : (status === "alarm" ? "alarm" : (status === "not_ready" ? "not_ready" : "unknown"));
-    el.dataset.state = mapped;
-    txt.textContent = mapped === "not_ready" ? "not ready" : mapped;
+    if (el) el.dataset.state = mapped;
+    if (txt) txt.textContent = mapped === "not_ready" ? "not ready" : mapped;
+    state.health = { mapped: mapped, reason: (h && h.reason) || "" };
+    renderBanner();
+  }
+
+  /* renderBanner merges the two banner sources (health alarm and boot-degraded
+   * recovery) so whichever function runs last cannot leave a stale banner.
+   * Precedence: alarm > not-ready > degraded. */
+  function renderBanner() {
     var banner = document.getElementById("alarm-banner");
     if (!banner) return;
-    if (mapped === "alarm") {
+    var h = state.health;
+    if (h && h.mapped === "alarm") {
       banner.hidden = false;
       banner.dataset.kind = "warn";
-      banner.textContent = "Alarm active: " + ((h && h.reason) || "yes");
-    } else if (mapped === "not_ready") {
+      banner.textContent = "Alarm active: " + (h.reason || "yes");
+      return;
+    }
+    if (h && h.mapped === "not_ready") {
       banner.hidden = false;
       banner.dataset.kind = "danger";
-      banner.textContent = "Not ready: " + ((h && h.reason) || "starting up");
-    } else if (!state.degraded) {
-      banner.hidden = true;
+      banner.textContent = "Not ready: " + (h.reason || "starting up");
+      return;
     }
+    if (state.degraded) {
+      banner.hidden = false;
+      banner.dataset.kind = "danger";
+      var discarded = isNull(state.degraded.discarded_artifacts) ? DASH : String(state.degraded.discarded_artifacts);
+      banner.textContent = "broker booted degraded; " + discarded + " artifacts discarded";
+      return;
+    }
+    banner.hidden = true;
   }
 
   function applyDegraded(overview) {
-    if (!overview || !overview.unsafe_recovery) return;
-    var u = overview.unsafe_recovery;
-    var banner = document.getElementById("alarm-banner");
-    if (u.degraded) {
-      state.degraded = u;
-      if (banner) {
-        banner.hidden = false;
-        banner.dataset.kind = "danger";
-        banner.textContent = "broker booted degraded; " + (u.discarded_artifacts || 0) + " artifacts discarded";
-      }
+    if (overview && overview.unsafe_recovery && overview.unsafe_recovery.degraded) {
+      state.degraded = overview.unsafe_recovery;
     } else {
       state.degraded = null;
     }
+    renderBanner();
   }
 
   function refreshHealth() {
@@ -522,8 +713,10 @@
     label.textContent = parts.join(" \u00b7 ");
   }
 
-  function backoffDelay(errCount, base) {
-    var steps = [base, base * 2, base * 4, MAX_BACKOFF_MS];
+  /* The retry ladder is fixed at 2/4/8/30 s (FR-UI-112), independent of the
+   * healthy refresh cadence, which is what sets the normal interval. */
+  function backoffDelay(errCount) {
+    var steps = [2000, 4000, 8000, MAX_BACKOFF_MS];
     var i = Math.min(errCount, steps.length) - 1;
     if (i < 0) i = 0;
     var d = steps[i];
@@ -547,7 +740,7 @@
   function onRefreshError() {
     state.refresh.errCount += 1;
     state.refresh.stale = true;
-    state.refresh.delay = backoffDelay(state.refresh.errCount, state.refresh.base);
+    state.refresh.delay = backoffDelay(state.refresh.errCount);
     updateRefreshStatus();
   }
 
@@ -575,7 +768,7 @@
     var segs = pathname.split("/").filter(Boolean).map(function (s) {
       try { return decodeURIComponent(s); } catch (e) { return s; }
     });
-    var r = { screen: "overview", params: {}, query: new URLSearchParams(search || "") };
+    var r = { screen: "overview", params: {}, query: new URLSearchParams(search || ""), path: pathname };
     if (!segs.length) return r;
     switch (segs[0]) {
       case "connections": r.screen = segs[1] ? "connection" : "connections"; r.params.name = segs[1]; break;
@@ -671,7 +864,12 @@
       { key: "state", label: "State", render: function (r) { return stateCell(r.state); } }
     ], topRows, { id: "top-queues", className: "overview-table" });
     return h("div", { class: "screen screen-overview" }, [
-      h("div", { class: "page-head" }, [h("h1", { text: "Overview" })]),
+      h("div", { class: "page-head" }, [
+        h("h1", { text: "Overview" }),
+        h("span", { class: "spacer" }),
+        h("a", { href: "/metrics", target: "_blank", rel: "noopener", title: "Open the Prometheus metrics endpoint" },
+          [h("button", { type: "button", text: "Metrics" })])
+      ]),
       cards,
       summary,
       h("h2", { text: "Top queues by ready depth" }),
@@ -701,7 +899,12 @@
   function buildQueues(data, route) {
     var items = itemsOf(data);
     var columns = [
-      { key: "name", label: "Name", render: function (r) { return link(String(r.name), "/queues/" + encodeURIComponent(r.name)); } },
+      { key: "name", label: "Name", render: function (r) {
+        return h("span", null, [
+          link(String(r.name), "/queues/" + encodeURIComponent(r.name)),
+          r.stats_partial ? h("span", { class: "stat-partial", text: " partial" }) : null
+        ]);
+      } },
       { key: "type", label: "Type", render: function (r) { return h("span", { text: val(r.type) }); } },
       { key: "durable", label: "Durable", render: function (r) { return boolCell(r.durable); } },
       { key: "auto_delete", label: "Auto-delete", render: function (r) { return boolCell(r.auto_delete); } },
@@ -715,40 +918,30 @@
     return h("div", { class: "screen screen-queues" }, [
       queuesToolbar(route),
       items.length ? tableBlock(columns, items, {
+        route: route,
+        sortKeys: QUEUE_SORT_KEYS,
+        rowKey: function (r) { return r.name; },
         onRowClick: function (r) { navigate("/queues/" + encodeURIComponent(r.name)); }
-      }) : emptyState("No queues exist yet.", "Declare queue", function () { openDeclareQueue(route); })
+      }) : emptyState("No queues exist yet.", "Declare queue", function () { openDeclareQueue(route); }),
+      pagination(data, route)
     ]);
   }
 
+  var QUEUE_SORT_KEYS = ["name", "type", "durable", "messages_ready", "messages_unacknowledged", "messages", "consumers", "state"];
+
   function queuesToolbar(route) {
-    var q = route.query;
-    var nameInput = h("input", { type: "search", value: q.get("name") || "", placeholder: "name filter", "aria-label": "Filter queues by name" });
-    var durableSel = h("select", { "aria-label": "Filter by durable" }, [
-      option("", "durable: any"), option("true", "durable: true"), option("false", "durable: false")
-    ]);
-    durableSel.value = q.get("durable") || "";
-    var consumersSel = h("select", { "aria-label": "Filter by consumers" }, [
-      option("", "consumers: any"), option("true", "has consumers"), option("false", "no consumers")
-    ]);
-    consumersSel.value = q.get("has_consumers") || "";
-    var nonEmpty = h("input", { type: "checkbox", id: "filter-non-empty" });
-    nonEmpty.checked = q.get("non_empty") === "true";
-    var form = h("form", { class: "toolbar" }, [
-      nameInput, durableSel, consumersSel,
-      h("label", { for: "filter-non-empty", text: "non-empty" }), nonEmpty,
-      h("button", { type: "submit", text: "Apply" }),
-      h("button", { type: "button", text: "Declare queue", onclick: function () { openDeclareQueue(route); } })
-    ]);
-    form.addEventListener("submit", function (ev) {
-      ev.preventDefault();
-      var p = new URLSearchParams();
-      if (nameInput.value) p.set("name", nameInput.value);
-      if (durableSel.value) p.set("durable", durableSel.value);
-      if (consumersSel.value) p.set("has_consumers", consumersSel.value);
-      if (nonEmpty.checked) p.set("non_empty", "true");
-      navigate("/queues" + (p.toString() ? "?" + p.toString() : ""));
+    var declareBtn = h("button", { type: "button", id: "declare-queue-btn", text: "Declare queue" });
+    declareBtn.addEventListener("click", function () { openDeclareQueue(route); });
+    return tableToolbar(route, {
+      sortKeys: QUEUE_SORT_KEYS,
+      filters: [
+        { name: "name", type: "search", label: "Filter queues by name", placeholder: "name filter" },
+        { name: "durable", type: "select", label: "Filter by durable", options: [["", "durable: any"], ["true", "durable: true"], ["false", "durable: false"]] },
+        { name: "has_consumers", type: "select", label: "Filter by consumers", options: [["", "consumers: any"], ["true", "has consumers"], ["false", "no consumers"]] },
+        { name: "non_empty", type: "checkbox", label: "non-empty" }
+      ],
+      action: declareBtn
     });
-    return form;
   }
 
   function option(value, label) {
@@ -798,7 +991,7 @@
     publishBtn.addEventListener("click", function () { openPublish(exchangePath("/", "amq.default"), "amq.default"); });
     return h("div", { class: "screen screen-queue-detail" }, [
       h("nav", { class: "breadcrumb" }, [link("Queues", "/queues"), h("span", { text: " / " }), h("span", { text: name })]),
-      h("div", { class: "page-head" }, [h("h1", { text: name }), h("span", { class: "spacer" }), getBtn, publishBtn, purgeBtn, deleteBtn]),
+      h("div", { class: "page-head" }, [h("h1", { text: name }), h("span", { class: "spacer" }), copyLinkButton(), getBtn, publishBtn, purgeBtn, deleteBtn]),
       props,
       h("h2", { text: "Statistics" }), stats,
       h("h2", { text: "Arguments" }), renderArguments(queue.arguments),
@@ -851,6 +1044,8 @@
     });
   }
 
+  var EXCHANGE_SORT_KEYS = ["name", "vhost", "type", "durable", "auto_delete", "internal"];
+
   function buildExchanges(data, route) {
     var items = itemsOf(data);
     var columns = [
@@ -868,8 +1063,20 @@
     declareBtn.addEventListener("click", function () { openDeclareExchange(route); });
     return h("div", { class: "screen screen-exchanges" }, [
       h("div", { class: "page-head" }, [h("h1", { text: "Exchanges" }), h("span", { class: "spacer" }), declareBtn]),
-      items.length ? tableBlock(columns, items, { onRowClick: function (r) { navigate("/exchanges/" + encodeURIComponent(r.name)); } })
-        : emptyState("No exchanges exist.")
+      tableToolbar(route, {
+        sortKeys: EXCHANGE_SORT_KEYS,
+        filters: [
+          { name: "name", type: "search", label: "Filter exchanges by name", placeholder: "name filter" },
+          { name: "type", type: "search", label: "Filter exchanges by type", placeholder: "type filter" }
+        ]
+      }),
+      items.length ? tableBlock(columns, items, {
+        route: route,
+        sortKeys: EXCHANGE_SORT_KEYS,
+        rowKey: function (r) { return r.name; },
+        onRowClick: function (r) { navigate("/exchanges/" + encodeURIComponent(r.name)); }
+      }) : emptyState("No exchanges exist."),
+      pagination(data, route)
     ]);
   }
 
@@ -902,7 +1109,7 @@
     ]);
     return h("div", { class: "screen screen-exchange-detail" }, [
       h("nav", { class: "breadcrumb" }, [link("Exchanges", "/exchanges"), h("span", { text: " / " }), h("span", { text: name || "(default)" })]),
-      h("div", { class: "page-head" }, [h("h1", { text: name || "(default)" }), h("span", { class: "spacer" }), publishBtn, deleteBtn]),
+      h("div", { class: "page-head" }, [h("h1", { text: name || "(default)" }), h("span", { class: "spacer" }), copyLinkButton(), publishBtn, deleteBtn]),
       props,
       h("h2", { text: "Arguments" }), renderArguments(exchange.arguments),
       h("h2", { text: "Bindings" }), capabilityNotice({ error: "not_implemented", reason: "aggregate binding listing is not implemented (BOB-4)" }, "Bindings not available")
@@ -914,11 +1121,13 @@
     var params = { page: q.get("page") || 1, page_size: q.get("page_size") || 50, name: q.get("name"), user: q.get("user") };
     var path = API + "/connections" + qs(params);
     return loadList(container, "connections:" + path, path, {
-      render: function (r) { return buildConnections(r.data); }
+      render: function (r) { return buildConnections(r.data, route); }
     });
   }
 
-  function buildConnections(data) {
+  var CONNECTION_SORT_KEYS = ["name", "user", "vhost", "state", "channels", "peer", "connected_at", "last_activity"];
+
+  function buildConnections(data, route) {
     var items = itemsOf(data);
     var columns = [
       { key: "name", label: "Name", render: function (r) { return link(String(r.name), "/connections/" + encodeURIComponent(r.name)); } },
@@ -928,29 +1137,73 @@
       { key: "channels", label: "Channels", render: function (r) { return num(r.channels); } },
       { key: "peer", label: "Peer", render: function (r) { return h("span", { text: val(r.peer_host) + ":" + val(r.peer_port) }); } },
       { key: "connected_at", label: "Connected at", render: function (r) { return fmtTime(r.connected_at); } },
-      { key: "last_activity", label: "Last activity", render: function (r) { return fmtTime(r.last_activity); } }
+      { key: "last_activity", label: "Last activity", render: function (r) { return fmtTime(r.last_activity); } },
+      { key: "actions", label: "", render: function (r) { return rowCloseButton(r); } }
     ];
     return h("div", { class: "screen screen-connections" }, [
       h("div", { class: "page-head" }, [h("h1", { text: "Connections" })]),
       h("p", { class: "null", text: "Entity data is global even if connection vhosts differ (D-1)." }),
-      items.length ? tableBlock(columns, items, { onRowClick: function (r) { navigate("/connections/" + encodeURIComponent(r.name)); } })
-        : emptyState("No client connections.")
+      tableToolbar(route, {
+        filters: [
+          { name: "name", type: "search", label: "Filter connections by name", placeholder: "name filter" },
+          { name: "user", type: "search", label: "Filter connections by user", placeholder: "user filter" }
+        ]
+      }),
+      items.length ? tableBlock(columns, items, {
+        route: route,
+        sortKeys: CONNECTION_SORT_KEYS,
+        rowKey: function (r) { return r.name; },
+        onRowClick: function (r) { navigate("/connections/" + encodeURIComponent(r.name)); }
+      }) : emptyState("No client connections."),
+      pagination(data, route)
     ]);
+  }
+
+  function closeConnectionSupported() {
+    return !(state.capabilities && state.capabilities.close_connection === false);
+  }
+
+  /* rowCloseButton is the S2 per-row close control; it is disabled, with a
+   * tooltip, when the broker reports the capability is not implemented. */
+  function rowCloseButton(conn) {
+    var btn = h("button", { type: "button", class: "danger row-action", text: "Close" });
+    if (!closeConnectionSupported()) {
+      btn.disabled = true;
+      btn.title = "Force-close is not implemented by this broker (close_connection capability is false)";
+    }
+    btn.addEventListener("click", function (ev) {
+      ev.stopPropagation();
+      if (btn.disabled) return;
+      openCloseConnection(conn);
+    });
+    return btn;
   }
 
   function loadConnectionDetail(container, route) {
     var name = route.params.name;
     var path = API + "/connections/" + encodeURIComponent(name);
-    return loadList(container, "connection:" + path, path, {
-      backHref: "/connections", backLabel: "Back to connections",
-      render: function (r) { return buildConnectionDetail(r.data, route); }
+    /* The close button is capability-gated, so make sure the capability map is
+     * loaded before the first render of this screen (a deep link may beat the
+     * boot-time version fetch). */
+    return ensureCapabilities().then(function () {
+      return loadList(container, "connection:" + path, path, {
+        backHref: "/connections", backLabel: "Back to connections",
+        render: function (r) { return buildConnectionDetail(r.data, route); }
+      });
     });
   }
 
   function buildConnectionDetail(conn, route) {
     var name = String(conn.name);
     var closeBtn = h("button", { type: "button", id: "close-connection-btn", class: "danger", text: "Close" });
-    closeBtn.addEventListener("click", function () { openCloseConnection(conn); });
+    if (!closeConnectionSupported()) {
+      closeBtn.disabled = true;
+      closeBtn.title = "Force-close is not implemented by this broker (close_connection capability is false)";
+    }
+    closeBtn.addEventListener("click", function () {
+      if (closeBtn.disabled) return;
+      openCloseConnection(conn);
+    });
     var channelsPanel = h("div", { id: "connection-channels" }, [itemsLoading()]);
     api(API + "/connections/" + encodeURIComponent(name) + "/channels").then(function (r) {
       if (r.status === 501) channelsPanel.replaceChildren(h("p", { class: "null", text: "channel detail not available" }));
@@ -971,21 +1224,24 @@
     ]);
     return h("div", { class: "screen screen-connection-detail" }, [
       h("nav", { class: "breadcrumb" }, [link("Connections", "/connections"), h("span", { text: " / " }), h("span", { text: name })]),
-      h("div", { class: "page-head" }, [h("h1", { text: name }), h("span", { class: "spacer" }), closeBtn]),
+      h("div", { class: "page-head" }, [h("h1", { text: name }), h("span", { class: "spacer" }), copyLinkButton(), closeBtn]),
       props,
       h("p", { class: "null", text: "Entity data is global even if connection vhosts differ (D-1)." }),
       h("h2", { text: "Channels" }), channelsPanel
     ]);
   }
 
-  function loadChannels(container) {
-    var path = API + "/channels" + qs({ page: 1, page_size: 100 });
-    return loadList(container, "channels", path, {
-      render: function (r) { return buildChannels(r.data); }
+  var CHANNEL_SORT_KEYS = ["number", "connection", "user", "vhost", "state", "consumers", "unacked", "prefetch_count", "confirm", "transactional"];
+
+  function loadChannels(container, route) {
+    var q = route.query;
+    var path = API + "/channels" + qs({ page: q.get("page") || 1, page_size: q.get("page_size") || 100 });
+    return loadList(container, "channels:" + path, path, {
+      render: function (r) { return buildChannels(r.data, route); }
     });
   }
 
-  function buildChannels(data) {
+  function buildChannels(data, route) {
     var items = itemsOf(data);
     var columns = [
       { key: "number", label: "Number", render: function (r) { return num(r.number); } },
@@ -1002,19 +1258,23 @@
     return h("div", { class: "screen screen-channels" }, [
       h("div", { class: "page-head" }, [h("h1", { text: "Channels" })]),
       h("p", { class: "notice empty", role: "note", text: "Channels are read-only. There is no management close-channel operation; a channel closes when its client closes it or its connection is closed." }),
-      items.length ? tableBlock(columns, items, {}) : emptyState("No open channels.")
+      tableToolbar(route, { sortKeys: CHANNEL_SORT_KEYS }),
+      items.length ? tableBlock(columns, items, { route: route, sortKeys: CHANNEL_SORT_KEYS, rowKey: function (r) { return r.number; } }) : emptyState("No open channels."),
+      pagination(data, route)
     ]);
   }
 
+  var CONSUMER_SORT_KEYS = ["consumer_tag", "queue", "channel", "connection", "ack_required", "exclusive", "prefetch_count", "unacked"];
+
   function loadConsumers(container, route) {
     var q = route.query;
-    var path = API + "/consumers" + qs({ page: 1, page_size: 100, queue: q.get("queue"), connection: q.get("connection") });
+    var path = API + "/consumers" + qs({ page: q.get("page") || 1, page_size: q.get("page_size") || 100, queue: q.get("queue"), connection: q.get("connection") });
     return loadList(container, "consumers:" + path, path, {
-      render: function (r) { return buildConsumers(r.data); }
+      render: function (r) { return buildConsumers(r.data, route); }
     });
   }
 
-  function buildConsumers(data) {
+  function buildConsumers(data, route) {
     var items = itemsOf(data);
     var columns = [
       { key: "consumer_tag", label: "Consumer tag", render: function (r) { return h("span", { text: val(r.consumer_tag) }); } },
@@ -1029,7 +1289,15 @@
     return h("div", { class: "screen screen-consumers" }, [
       h("div", { class: "page-head" }, [h("h1", { text: "Consumers" })]),
       h("p", { class: "null", text: "Consumer tags are not unique keys; the (connection, channel) pair identifies a consumer." }),
-      items.length ? tableBlock(columns, items, {}) : emptyState("No active consumers.")
+      tableToolbar(route, {
+        sortKeys: CONSUMER_SORT_KEYS,
+        filters: [
+          { name: "queue", type: "search", label: "Filter consumers by queue", placeholder: "queue filter" },
+          { name: "connection", type: "search", label: "Filter consumers by connection", placeholder: "connection filter" }
+        ]
+      }),
+      items.length ? tableBlock(columns, items, { route: route, sortKeys: CONSUMER_SORT_KEYS, rowKey: function (r) { return r.consumer_tag; } }) : emptyState("No active consumers."),
+      pagination(data, route)
     ]);
   }
 
@@ -1070,11 +1338,14 @@
     var path = route.params.name ? API + "/nodes/" + encodeURIComponent(route.params.name) : API + "/nodes";
     return loadList(container, "nodes:" + path, path, {
       backHref: "/nodes", backLabel: "Back to nodes",
-      render: function (r) { return buildNodes(itemsOf(r.data), route); }
+      render: function (r) { return buildNodes(r.data, route); }
     });
   }
 
-  function buildNodes(nodes, route) {
+  var NODE_SORT_KEYS = ["name", "type", "running", "mem_used", "disk_free", "uptime", "processors"];
+
+  function buildNodes(data, route) {
+    var nodes = itemsOf(data);
     if (route.params.name && !nodes.length) return notFound("/nodes", "Back to nodes");
     return h("div", { class: "screen screen-nodes" }, [
       h("div", { class: "page-head" }, [h("h1", { text: "Nodes" })]),
@@ -1087,18 +1358,19 @@
         { key: "disk_free", label: "Disk free", render: function (r) { return num(r.disk_free); } },
         { key: "uptime", label: "Uptime", render: function (r) { return fmtDuration(r.uptime); } },
         { key: "processors", label: "Processors", render: function (r) { return num(r.processors); } }
-      ], nodes, {}) : emptyState("No node information reported.")
+      ], nodes, { route: route, sortKeys: NODE_SORT_KEYS, rowKey: function (r) { return r.name; } }) : emptyState("No node information reported."),
+      pagination(data, route)
     ]);
   }
 
-  function loadUsers(container) {
+  function loadUsers(container, route) {
     return loadList(container, "users", API + "/users", {
       render: function (r) {
         var users = itemsOf(r.data);
         var userBlock = users.length ? tableBlock([
           { key: "name", label: "User", render: function (u) { return h("span", { text: val(u.name) }); } },
           { key: "tags", label: "Tags", render: function (u) { return h("span", { text: Array.isArray(u.tags) ? u.tags.join(", ") : val(u.tags) }); } }
-        ], users, {}) : emptyState("No users configured.");
+        ], users, { rowKey: function (u) { return u.name; } }) : emptyState("No users configured.");
         var perms = h("div", { id: "permissions-panel" }, [itemsLoading()]);
         api(API + "/permissions").then(function (p) {
           if (p.status >= 400) { perms.replaceChildren(permissionDenied(p.data)); return; }
@@ -1114,14 +1386,14 @@
         return h("div", { class: "screen screen-users" }, [
           h("div", { class: "page-head" }, [h("h1", { text: "Users & Permissions" })]),
           h("p", { class: "null", text: "Read-only. User and permission mutation controls are absent (BOB-6); no password hashes are ever returned." }),
-          h("h2", { text: "Users" }), userBlock,
+          h("h2", { text: "Users" }), userBlock, pagination(r.data, route),
           h("h2", { text: "Permissions" }), perms
         ]);
       }
     });
   }
 
-  function loadPermissions(container) {
+  function loadPermissions(container, route) {
     return loadList(container, "permissions", API + "/permissions", {
       render: function (r) {
         var items = itemsOf(r.data);
@@ -1134,7 +1406,8 @@
             { key: "configure", label: "Configure", render: function (x) { return h("span", { text: val(x.configure) }); } },
             { key: "write", label: "Write", render: function (x) { return h("span", { text: val(x.write) }); } },
             { key: "read", label: "Read", render: function (x) { return h("span", { text: val(x.read) }); } }
-          ], items, {}) : emptyState("No permissions configured.")
+          ], items, { route: route, sortKeys: ["user", "vhost", "configure", "write", "read"], rowKey: function (x) { return x.user; } }) : emptyState("No permissions configured."),
+          pagination(r.data, route)
         ]);
       }
     });
@@ -1212,10 +1485,10 @@
       };
       var keys = Object.keys(caps).length ? Object.keys(caps) : Object.keys(explanations);
       var rows = keys.map(function (k) {
-        var enabled = caps[k] === true;
+        var st = capabilityStatus(caps[k]);
         return h("tr", { role: "row" }, [
           h("td", { text: k }),
-          h("td", null, [badge(enabled ? "supported" : "unavailable", enabled ? "" : "warn")]),
+          h("td", null, [badge(st.label, st.kind)]),
           h("td", { text: explanations[k] || "" })
         ]);
       });
@@ -1289,6 +1562,44 @@
 
   /* ------------------------------------------------------------- actions --- */
 
+  /* validEntityName rejects an empty name or one containing whitespace, which
+   * the broker would refuse (S6 name validation). */
+  function validEntityName(name) {
+    return name.length > 0 && !/\s/.test(name);
+  }
+
+  /* parseArguments turns "key=value" lines into an arguments object. Keys must
+   * start with "x-" (S8); a malformed line or a bad key returns {error} so the
+   * caller can refuse locally instead of sending a doomed request. */
+  function parseArguments(text) {
+    var out = {};
+    var lines = String(text || "").split("\n");
+    for (var i = 0; i < lines.length; i++) {
+      var line = lines[i].trim();
+      if (!line) continue;
+      var eq = line.indexOf("=");
+      if (eq <= 0) return { error: "arguments must be key=value, one per line" };
+      var key = line.slice(0, eq).trim();
+      var value = line.slice(eq + 1).trim();
+      if (key.indexOf("x-") !== 0) return { error: "argument keys must start with \"x-\" (got \"" + key + "\")" };
+      var parsed = value;
+      try { parsed = JSON.parse(value); } catch (e) { parsed = value; }
+      out[key] = parsed;
+    }
+    return { arguments: out };
+  }
+
+  /* parseJSONObject parses a textarea holding a JSON object, returning {} for
+   * empty input and null for malformed or non-object input (S7). */
+  function parseJSONObject(text) {
+    var t = String(text || "").trim();
+    if (!t) return {};
+    var parsed = null;
+    try { parsed = JSON.parse(t); } catch (e) { return null; }
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return null;
+    return parsed;
+  }
+
   function openDeclareExchange(route) {
     var nameInput = h("input", { type: "text", id: "declare-name", "aria-label": "Exchange name" });
     var typeSel = h("select", { id: "declare-type", "aria-label": "Exchange type" }, [
@@ -1297,6 +1608,7 @@
     var durable = h("input", { type: "checkbox", id: "declare-durable" }); durable.checked = true;
     var autoDelete = h("input", { type: "checkbox", id: "declare-auto-delete" });
     var internal = h("input", { type: "checkbox", id: "declare-internal" });
+    var argsInput = h("textarea", { id: "declare-arguments", rows: "3", cols: "30", placeholder: "x-arguments=value (one per line)" });
     var err = h("p", { class: "error", id: "declare-error" });
     var body = h("div", null, [
       h("div", { class: "form-row" }, [h("label", { for: "declare-name", text: "Name" }), nameInput]),
@@ -1304,18 +1616,21 @@
       h("div", { class: "form-row" }, [h("label", { for: "declare-durable", text: "Durable" }), durable]),
       h("div", { class: "form-row" }, [h("label", { for: "declare-auto-delete", text: "Auto-delete" }), autoDelete]),
       h("div", { class: "form-row" }, [h("label", { for: "declare-internal", text: "Internal" }), internal]),
+      h("div", { class: "form-row" }, [h("label", { for: "declare-arguments", text: "Arguments" }), argsInput]),
       err
     ]);
     openModal({
       title: "Declare exchange",
       body: body,
       confirmLabel: "Declare",
-      guard: function () { return nameInput.value.trim().length > 0; },
+      guard: function () { return validEntityName(nameInput.value.trim()); },
       onConfirm: function () {
         err.textContent = "";
+        var parsed = parseArguments(argsInput.value);
+        if (parsed.error) { err.textContent = parsed.error; return Promise.resolve(true); }
         return api(exchangePath("/", nameInput.value.trim()), {
           method: "PUT",
-          body: { type: typeSel.value, durable: durable.checked, auto_delete: autoDelete.checked, internal: internal.checked, arguments: {} }
+          body: { type: typeSel.value, durable: durable.checked, auto_delete: autoDelete.checked, internal: internal.checked, arguments: parsed.arguments }
         }).then(function (r) {
           if (r.status >= 400) { err.textContent = errorDetail(r.data); return true; }
           toast("Exchange declared", "ok");
@@ -1331,23 +1646,28 @@
     var nameInput = h("input", { type: "text", id: "declare-queue-name", "aria-label": "Queue name" });
     var durable = h("input", { type: "checkbox", id: "declare-queue-durable" }); durable.checked = true;
     var autoDelete = h("input", { type: "checkbox", id: "declare-queue-auto-delete" });
-    var err = h("p", { class: "error" });
+    var argsInput = h("textarea", { id: "declare-queue-arguments", rows: "3", cols: "30", placeholder: "x-message-ttl=60000" });
+    var err = h("p", { class: "error", id: "declare-error" });
     var body = h("div", null, [
       h("div", { class: "form-row" }, [h("label", { for: "declare-queue-name", text: "Name" }), nameInput]),
       h("div", { class: "form-row" }, [h("label", { for: "declare-queue-durable", text: "Durable" }), durable]),
       h("div", { class: "form-row" }, [h("label", { for: "declare-queue-auto-delete", text: "Auto-delete" }), autoDelete]),
-      h("p", { class: "null", text: "Arguments: only x-message-ttl, x-expires, x-dead-letter-exchange, x-dead-letter-routing-key, x-max-length, x-max-length-bytes and x-overflow are supported. Priority and lazy queues are never available (D-3)." }),
+      h("div", { class: "form-row" }, [h("label", { for: "declare-queue-arguments", text: "Arguments" }), argsInput]),
+      h("p", { class: "null", text: "Only x-* argument keys are accepted. Supported: x-message-ttl, x-expires, x-dead-letter-exchange, x-dead-letter-routing-key, x-max-length, x-max-length-bytes and x-overflow. Priority and lazy queues are never available (D-3)." }),
       err
     ]);
     openModal({
       title: "Declare queue",
       body: body,
       confirmLabel: "Declare",
-      guard: function () { return nameInput.value.trim().length > 0; },
+      guard: function () { return validEntityName(nameInput.value.trim()); },
       onConfirm: function () {
+        err.textContent = "";
+        var parsed = parseArguments(argsInput.value);
+        if (parsed.error) { err.textContent = parsed.error; return Promise.resolve(true); }
         return api(queuePath("/", nameInput.value.trim()), {
           method: "PUT",
-          body: { durable: durable.checked, auto_delete: autoDelete.checked, arguments: {} }
+          body: { durable: durable.checked, auto_delete: autoDelete.checked, arguments: parsed.arguments }
         }).then(function (r) {
           if (r.status >= 400) { err.textContent = errorDetail(r.data); return true; }
           toast("Queue declared", "ok");
@@ -1458,6 +1778,7 @@
     var routingKey = h("input", { type: "text", id: "publish-routing-key", value: "" });
     var payload = h("textarea", { id: "publish-payload", rows: "5", cols: "40" });
     var encoding = h("select", { id: "publish-encoding" }, [option("string", "string"), option("base64", "base64")]);
+    var props = h("textarea", { id: "publish-properties", rows: "3", cols: "40", placeholder: '{"headers": {"x-trace": "abc"}}' });
     var result = h("div", { id: "publish-result" });
     openModal({
       title: "Publish to " + label,
@@ -1467,13 +1788,19 @@
         h("div", { class: "form-row" }, [h("label", { for: "publish-routing-key", text: "Routing key" }), routingKey]),
         h("div", { class: "form-row" }, [h("label", { for: "publish-payload", text: "Payload" }), payload]),
         h("div", { class: "form-row" }, [h("label", { for: "publish-encoding", text: "Encoding" }), encoding]),
+        h("div", { class: "form-row" }, [h("label", { for: "publish-properties", text: "Properties" }), props]),
         result
       ]),
       initialFocus: routingKey,
       onConfirm: function () {
+        var properties = parseJSONObject(props.value);
+        if (properties === null) {
+          result.replaceChildren(errorState({ error: "bad_request", reason: "properties must be a JSON object" }));
+          return Promise.resolve(true);
+        }
         return api(path + "/publish", {
           method: "POST",
-          body: { properties: {}, routing_key: routingKey.value, payload: payload.value, payload_encoding: encoding.value }
+          body: { properties: properties, routing_key: routingKey.value, payload: payload.value, payload_encoding: encoding.value }
         }).then(function (r) {
           result.replaceChildren(h("pre", { class: "payload", text: JSON.stringify(r.data) }));
           toast("Publish result: " + JSON.stringify(r.data), r.status >= 400 ? "error" : "ok");
@@ -1512,13 +1839,15 @@
           if (r.status >= 400) { out.replaceChildren(errorState(r.data)); return true; }
           var msgs = itemsOf(r.data);
           out.replaceChildren(h("div", null, msgs.map(function (m) {
-            var body = m.payload;
+            var full = m.payload;
+            var body = full;
             var truncated = false;
             if (typeof body === "string" && body.length > 512) { body = body.slice(0, 512); truncated = true; }
             return h("div", { class: "fieldset" }, [
               h("p", { text: "encoding: " + val(m.payload_encoding) + ", routing_key: " + val(m.routing_key) + ", redelivered: " + val(m.redelivered) }),
               h("pre", { class: "payload", text: val(body) }),
-              truncated ? h("p", { class: "stat-partial", text: "truncated" }) : null
+              truncated ? h("p", { class: "stat-partial", text: "truncated" }) : null,
+              copyText(isNull(full) ? "" : String(full), "Copy body")
             ]);
           })));
           return true;
@@ -1622,6 +1951,11 @@
     });
     var container = document.getElementById("content");
     container.replaceChildren(h("div", { class: "screen screen-login" }, [form]));
+  }
+
+  function ensureCapabilities() {
+    if (state.capabilities && Object.keys(state.capabilities).length) return Promise.resolve();
+    return loadVersion();
   }
 
   function loadVersion() {
