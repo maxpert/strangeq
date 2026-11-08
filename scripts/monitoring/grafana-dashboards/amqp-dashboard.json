@@ -733,7 +733,8 @@
       "targets": [
         {"expr": "rate(amqp_wal_write_errors_total[1m])", "legendFormat": "WAL Write Errors", "refId": "A"},
         {"expr": "rate(amqp_segment_read_errors_total[1m])", "legendFormat": "Segment Read Errors", "refId": "B"},
-        {"expr": "rate(amqp_messages_dropped_total[1m])", "legendFormat": "Messages Dropped - {{queue}} ({{reason}})", "refId": "C"}
+        {"expr": "sum by (reason) (rate(amqp_deliveries_dropped_total[1m]))", "legendFormat": "Deliveries Dropped - {{reason}}", "refId": "C"},
+        {"expr": "sum by (reason) (rate(amqp_publish_refused_total[1m]))", "legendFormat": "Publish Refused - {{reason}}", "refId": "D"}
       ],
       "title": "Storage & Message Errors",
       "type": "timeseries"

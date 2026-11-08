@@ -70,7 +70,7 @@ name, routing key, or exchange name is ever a label on the broker-outage familie
 | `amqp_memory_heap_bytes` | gauge | — | Heap memory in use. |
 | `amqp_memory_gc_pause_seconds` | summary | — | GC pause duration (p50/p90/p99). |
 | `amqp_goroutines_total` | gauge | — | Number of active goroutines. |
-| `amqp_file_descriptors_open` | gauge | — | Number of open file descriptors. |
+| `amqp_file_descriptors_open` | gauge | — | Number of open file descriptors. **Linux only**: read from `/proc/self/fd`, so it is a permanent `0` on Darwin/Windows (the platform caveat is deliberate — `sysctl kern.num_files` reports a system-wide count, not this process's, so it is not a correct substitute). |
 | `amqp_disk_free_bytes` | gauge | — | Free disk space in the data directory. |
 | `amqp_disk_usage_bytes` | gauge | — | Total disk used by server data. |
 | `amqp_unsafe_recovery_discarded_artifacts` | gauge | — | Artifacts discarded at boot because `--unsafe-recovery` was set; `0` on a clean boot. **Non-zero means the broker is serving from data it could not fully recover.** |
@@ -198,7 +198,7 @@ name, routing key, or exchange name is ever a label on the broker-outage familie
 | `amqp_wal_full_flush_total` | counter | `site` | `fcntl(F_FULLFSYNC)` drive-cache flushes issued, by durability site. In `barrier` mode this must stay `0` across the measured window. Site labels: `group_commit`, `tx_confirm`, `tx_dir`, `roll_dir`, `preopen_flush`, `reclaim_dir`, `compaction_file`, `compaction_dir`, `segment_seal`, `segment_temp`, `segment_dir`, `segment_close`, `segment_mkdir`, `metadata_file`, `metadata_dir`, `repair`, `boot_tail`, `boot_mkdir`, `close`, `dir_full`, `fence_fallback`. |
 | `amqp_wal_inventory_records` | gauge (func) | — | Records held in the active WAL file's inventory (diagnostic). |
 | `amqp_wal_index_copies` | gauge (func) | — | Physical copies across every WAL index shard (diagnostic). |
-| `amqp_wal_settle_drained_total` | gauge (func) | — | Settled records deleted from the active WAL inventory (diagnostic). |
+| `amqp_wal_settle_drained` | gauge (func) | — | Settled records deleted from the active WAL inventory (diagnostic; a gauge, **do not `rate()`**). |
 | `amqp_storage_close_errors_total` | counter | — | Failures closing the storage tier during shutdown. |
 
 ### Segments

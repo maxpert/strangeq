@@ -171,9 +171,9 @@ type Collector struct {
 	// WS-MEMORY-CUT bookkeeping diagnostics (amqp_wal_bookkeeping_*). The three
 	// GaugeFuncs read the bound stats AT SCRAPE TIME (never stale); bind via
 	// BindWALBookkeepingStats. DIAGNOSTIC ONLY; never gated.
-	WALInventoryRecords   prometheus.GaugeFunc
-	WALIndexCopies        prometheus.GaugeFunc
-	WALSettleDrainedTotal prometheus.GaugeFunc
+	WALInventoryRecords prometheus.GaugeFunc
+	WALIndexCopies      prometheus.GaugeFunc
+	WALSettleDrained    prometheus.GaugeFunc
 
 	// walBookkeeping points at the binding the GaugeFunc closures read
 	// (nil func → zero gauges). Set once by BindWALBookkeepingStats.
@@ -732,10 +732,15 @@ func newCollector(registerer prometheus.Registerer, namespace string) *Collector
 			}
 			return 0
 		}),
-		WALSettleDrainedTotal: factory.NewGaugeFunc(prometheus.GaugeOpts{
+		// WALSettleDrained is a GAUGE, not a counter: it reads the number of
+		// settled records deleted from the active WAL inventory at scrape time.
+		// The name deliberately has NO `_total` suffix — that suffix is
+		// reserved for counters, and rate() over a gauge is meaningless
+		// (finding 13).
+		WALSettleDrained: factory.NewGaugeFunc(prometheus.GaugeOpts{
 			Namespace: namespace,
-			Name:      "wal_settle_drained_total",
-			Help:      "Settled records deleted from the active WAL inventory (WS-MEMORY-CUT; diagnostic)",
+			Name:      "wal_settle_drained",
+			Help:      "Settled records deleted from the active WAL inventory (WS-MEMORY-CUT; diagnostic gauge, do not rate)",
 		}, func() float64 {
 			if fn, ok := walBookkeeping.Load().(func() (int, int, uint64)); ok && fn != nil {
 				_, _, drained := fn()
@@ -1124,6 +1129,13 @@ func (c *Collector) RecordMessageAcknowledged() {
 	c.MessagesAcknowledged.Inc()
 }
 
+// RecordMessagesAcknowledged records n messages settled by one cumulative
+// (multiple=true) basic.ack. Add(0) is a no-op, so a cumulative ack that
+// settles nothing is counted as zero rather than one (finding 5).
+func (c *Collector) RecordMessagesAcknowledged(n int) {
+	c.MessagesAcknowledged.Add(float64(n))
+}
+
 // RecordMessageRedelivered records a redelivered message
 func (c *Collector) RecordMessageRedelivered() {
 	c.MessagesRedelivered.Inc()
@@ -1132,6 +1144,12 @@ func (c *Collector) RecordMessageRedelivered() {
 // RecordMessageRejected records a rejected message
 func (c *Collector) RecordMessageRejected() {
 	c.MessagesRejected.Inc()
+}
+
+// RecordMessagesRejected records n messages settled by one cumulative
+// (multiple=true) basic.nack (finding 5).
+func (c *Collector) RecordMessagesRejected(n int) {
+	c.MessagesRejected.Add(float64(n))
 }
 
 // RecordMessageUnroutable records an unroutable message
@@ -1148,7 +1166,13 @@ func (c *Collector) UpdateQueueMetrics(queueName, vhost string, ready, unacked, 
 	c.QueueConsumers.With(labels).Set(float64(consumers))
 }
 
-// DeleteQueueMetrics removes metrics for a deleted queue
+// DeleteQueueMetrics removes every per-queue series for a deleted queue.
+//
+// The poller reads this as the reclamation point when a queue vanishes
+// (queue_poller.go). It must therefore drop not only the vhost-labelled queue
+// gauges but ALSO the queue-only-labelled families that share the queue name:
+// the segment gauges and the three hot-cache delivery counters. Leaving those
+// behind leaks one permanent series per deleted queue name (spec 06 §3.6).
 func (c *Collector) DeleteQueueMetrics(queueName, vhost string) {
 	labels := prometheus.Labels{"queue": queueName, "vhost": vhost}
 	c.QueueMessagesReady.Delete(labels)
@@ -1156,6 +1180,15 @@ func (c *Collector) DeleteQueueMetrics(queueName, vhost string) {
 	c.QueueMessagesTotal.Delete(labels)
 	c.QueueConsumers.Delete(labels)
 	c.QueueDepthHighWater.Delete(labels)
+
+	// The segment and hot-cache families carry only the queue label (no vhost):
+	// the broker is not vhost-scoped yet, so the label set must match exactly.
+	queueOnly := prometheus.Labels{"queue": queueName}
+	c.SegmentCount.Delete(queueOnly)
+	c.SegmentSizeBytes.Delete(queueOnly)
+	c.HotCacheDeliveryHits.Delete(queueOnly)
+	c.HotCacheDeliveryColdReads.Delete(queueOnly)
+	c.HotCacheDeliveryPreads.Delete(queueOnly)
 }
 
 // SetConsumersTotal sets the total number of consumers

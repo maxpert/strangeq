@@ -252,6 +252,24 @@ func (c *Collector) ManagementPublishBackpressure() {
 	}
 }
 
+// ManagementMessagePublished counts one message successfully published through
+// the management HTTP API. It increments the CORE published counters (the same
+// families the AMQP basic.publish path writes), NOT an amqp_management_* family:
+// a management-API publish is a real publish and must be visible in
+// amqp_messages_published_total{,_bytes_total} (finding 9). It is intentionally
+// NOT gated on RegisterManagement — the core families are always registered.
+func (c *Collector) ManagementMessagePublished(size int) {
+	c.RecordMessagePublished(size)
+}
+
+// ManagementMessageUnroutable counts one management-API publish accepted but
+// matched to no binding, mirroring the AMQP mandatory-publish path. Like
+// ManagementMessagePublished it writes the CORE family, not an
+// amqp_management_* one.
+func (c *Collector) ManagementMessageUnroutable() {
+	c.RecordMessageUnroutable()
+}
+
 // ManagementJobs sets the job-pool count for a state.
 func (c *Collector) ManagementJobs(state string, n int) {
 	if m := c.mgmtOrNil(); m != nil {
