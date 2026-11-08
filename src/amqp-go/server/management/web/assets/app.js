@@ -57,7 +57,6 @@
     etags: {},
     cache: {},
     displayed: null,
-    noticeDismissed: false,
     degraded: null,
     health: null,
     samples: {},
@@ -2434,22 +2433,12 @@
       });
     }
 
-    var dismiss = document.getElementById("capability-dismiss");
-    var notice = document.getElementById("capability-notice");
-    if (dismiss && notice) {
-      dismiss.addEventListener("click", function () {
-        state.noticeDismissed = true;
-        notice.hidden = true;
-      });
-    }
-
     api(API + "/whoami", { timeoutMs: AUTH_TIMEOUT_MS }).then(function (r) {
       if (r.status === 401) { renderLogin(); return; }
       if (r.status >= 400) { renderLogin(); return; }
       state.principal = r.data;
       state.authed = true;
       if (!state.csrf) state.csrf = readCSRFCookie();
-      if (notice && !state.noticeDismissed) notice.hidden = false;
       updatePrincipal();
       loadVersion();
       refreshHealth();

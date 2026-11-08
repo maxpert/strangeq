@@ -122,18 +122,6 @@ button.danger { color: var(--danger); border-color: var(--danger); background: v
 }
 .banner[data-kind="warn"] { background: var(--warn-bg); border-color: var(--warn); color: var(--warn); }
 
-.capability-notice {
-  flex: 0 0 auto;
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  margin: 6px 12px 0;
-  padding: 6px 12px;
-  border-radius: var(--radius);
-  background: var(--warn-bg);
-  border: 1px solid var(--warn);
-}
-
 .layout {
   flex: 1 1 auto;
   min-height: 0;
