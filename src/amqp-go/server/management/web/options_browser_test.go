@@ -16,7 +16,7 @@ func TestUI_MetricsLinkFromInjectedMeta(t *testing.T) {
 	stub := newStub()
 	mux := http.NewServeMux()
 	mux.Handle("/api/", stub)
-	mux.Handle("/", HandlerWithOptions(Options{MetricsURL: "/prom/metrics"}))
+	mux.Handle("/", HandlerWithOptions(Options{MetricsURL: "http://127.0.0.1:9999/prom/metrics"}))
 	srv := httptest.NewServer(mux)
 	t.Cleanup(srv.Close)
 
@@ -26,11 +26,34 @@ func TestUI_MetricsLinkFromInjectedMeta(t *testing.T) {
 		chromedp.Navigate(srv.URL+"/"),
 		chromedp.WaitVisible(chromedp.CSS("#metrics-link")),
 	)
-	if href := evalStr(t, ctx, `document.getElementById('metrics-link').getAttribute('href')`); href != "/prom/metrics" {
-		t.Fatalf("metrics link href = %q, want /prom/metrics (from the injected meta)", href)
+	if href := evalStr(t, ctx, `document.getElementById('metrics-link').getAttribute('href')`); href != "http://127.0.0.1:9999/prom/metrics" {
+		t.Fatalf("metrics link href = %q, want the injected absolute URL", href)
 	}
 	if target := evalStr(t, ctx, `document.getElementById('metrics-link').getAttribute('target')`); target != "_blank" {
 		t.Fatalf("metrics link target = %q, want _blank", target)
+	}
+}
+
+// TestUI_MetricsLinkRejectsNonHTTPScheme (FR-UI-024) proves a metricsUrl that is
+// not an absolute http(s) URL is never promoted into an href: a hostile
+// javascript: value (or a scheme-relative //evil.example) yields no link.
+func TestUI_MetricsLinkRejectsNonHTTPScheme(t *testing.T) {
+	for _, bad := range []string{"javascript:alert(1)", "data:text/html,<script>", "//evil.example/metrics", "/metrics"} {
+		t.Run(bad, func(t *testing.T) {
+			stub := newStub()
+			mux := http.NewServeMux()
+			mux.Handle("/api/", stub)
+			mux.Handle("/", HandlerWithOptions(Options{MetricsURL: bad}))
+			srv := httptest.NewServer(mux)
+			t.Cleanup(srv.Close)
+
+			ctx, cancel := newTab(t)
+			defer cancel()
+			mustDo(t, ctx, chromedp.Navigate(srv.URL+"/"), chromedp.WaitVisible(chromedp.CSS("#top-queues")))
+			if n := evalInt(t, ctx, `document.querySelectorAll('#metrics-link, a[target="_blank"][href$="/metrics"]').length`); n != 0 {
+				t.Fatalf("a non-http(s) metricsUrl (%q) rendered a link (%d)", bad, n)
+			}
+		})
 	}
 }
 

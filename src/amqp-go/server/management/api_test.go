@@ -305,6 +305,25 @@ func TestSecurityHeaders_OnAPIAndUI(t *testing.T) {
 	}
 }
 
+// TestBareAPIPath_JSONEnvelope pins that "/api" (no trailing slash) is an API
+// path: it must reach the router and return the JSON 404 envelope, not fall
+// through to the UI handler and serve the SPA shell.
+func TestBareAPIPath_JSONEnvelope(t *testing.T) {
+	e := newEnv(t, false, nil)
+	rec := e.get("/api")
+	wantStatus(t, rec, http.StatusNotFound)
+	if got := rec.Header().Get("Content-Type"); !strings.HasPrefix(got, "application/json") {
+		t.Fatalf("GET /api Content-Type = %q, want application/json", got)
+	}
+	if strings.Contains(rec.Body.String(), "<html") {
+		t.Fatalf("GET /api leaked an HTML body: %s", rec.Body.String())
+	}
+	env := decode[errorEnvelope](t, rec)
+	if env.Error != "not_found" {
+		t.Fatalf("GET /api error = %q, want not_found", env.Error)
+	}
+}
+
 // TestETag_DeterministicAnd304 (FR-CONV-064, spec §11 test 34).
 func TestETag_DeterministicAnd304(t *testing.T) {
 	e := basicEnv(t, true, nil)

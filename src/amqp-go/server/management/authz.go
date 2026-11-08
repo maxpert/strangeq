@@ -360,6 +360,11 @@ func (s *Server) resourceReadGate(p *Principal, vhost string) *apiError {
 // under a vhost, and therefore must pass resourceReadGate (AUTH-011). The
 // non-entity surface — health, whoami, overview, nodes, jobs, session, version,
 // static UI — is governed by the capability gate alone.
+//
+// "permissions" belongs here because a permission record names a vhost, so
+// listing it is a read of an entity in that vhost (AUTH-011). "/api/users" is
+// deliberately absent: user records are global, not vhost-scoped, and are
+// governed by the manage_users capability alone.
 func isEntityReadRoute(m *route) bool {
 	if m == nil || len(m.segs) < 2 || m.segs[0] != "api" {
 		return false

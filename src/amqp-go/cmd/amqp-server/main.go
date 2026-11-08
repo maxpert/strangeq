@@ -338,14 +338,12 @@ func main() {
 			}
 		}
 		// The SPA renders its /metrics link from a CSP-safe <meta> the shell
-		// carries, so the management surface must know the telemetry URL. It is
-		// only reachable when the telemetry server is running on its own
-		// listener (SEC-004); otherwise the link is omitted.
+		// carries, so the management surface must know the telemetry URL.
+		// metricsURLFor omits the link for a wildcard bind and picks the
+		// scheme from the control-plane TLS posture; see its doc comment.
 		var metricsURL string
 		if telemetryServer != nil {
-			if a := telemetryServer.Addr(); a != nil {
-				metricsURL = "http://" + a.String() + "/metrics"
-			}
+			metricsURL = metricsURLFor(telemetryServer.Addr(), cfg.Management.TLS.Enabled)
 		}
 		mgmtServer, err = management.New(management.Options{
 			Server:        amqpServer,

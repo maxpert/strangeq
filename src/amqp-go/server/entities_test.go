@@ -592,6 +592,29 @@ func use(conn *protocol.Connection) {
 	require.Contains(t, findings[0], "WriteMutex")
 }
 
+// TestForbiddenLockGate_ASTScan_ChannelUnderConnectionName pins the alias
+// evasion that the Channel-vs-Connection refinement introduced: a plain
+// *protocol.Channel declared under a Connection-conventional name, or reached
+// through a bare-identifier alias, must still be flagged, while a genuine
+// *protocol.Connection (atomic Closed) stays clean.
+func TestForbiddenLockGate_ASTScan_ChannelUnderConnectionName(t *testing.T) {
+	declared := writeScanFixture(t, "chan_conn_name.go", "package fixture\n\nfunc use() {\n\tvar conn *protocol.Channel\n\t_ = conn.Closed\n}\n")
+	f, err := scanForbidden([]string{declared})
+	require.NoError(t, err)
+	require.Len(t, f, 1, "a *protocol.Channel named conn must still be flagged: %v", f)
+	require.Contains(t, f[0], "Closed")
+
+	aliased := writeScanFixture(t, "chan_alias.go", "package fixture\n\nfunc use(ch *protocol.Channel) {\n\tconn := ch\n\t_ = conn.Consumers\n\tc := ch\n\t_ = c.PrefetchCount\n}\n")
+	f, err = scanForbidden([]string{aliased})
+	require.NoError(t, err)
+	require.Len(t, f, 2, "a channel aliased under any name must be flagged: %v", f)
+
+	connOK := writeScanFixture(t, "conn_atomic2.go", "package fixture\n\nfunc use() {\n\tvar conn *protocol.Connection\n\t_ = conn.Closed.Load()\n}\n")
+	f, err = scanForbidden([]string{connOK})
+	require.NoError(t, err)
+	require.Empty(t, f, "Connection.Closed is an atomic and must stay clean: %v", f)
+}
+
 // writeScanFixture writes a throwaway Go source file for the AST gate's
 // negative self-tests and returns its path.
 func writeScanFixture(t *testing.T, name, src string) string {
@@ -645,6 +668,23 @@ func scanForbidden(paths []string) ([]string, error) {
 				typed[id.Name] = kind
 			}
 		}
+		// valueKind resolves the kind of an assigned expression: a
+		// Channel/Connection field selector, else a bare identifier whose
+		// declared kind is already known (falling back to the conventional
+		// name), so `conn := ch` / `c := ch` propagate the channel kind
+		// instead of escaping as unknown.
+		valueKind := func(e ast.Expr) recvKind {
+			if kind := isChanConnSelector(e); kind != recvUnknown {
+				return kind
+			}
+			if id, ok := e.(*ast.Ident); ok {
+				if kind, ok := typed[id.Name]; ok {
+					return kind
+				}
+				return chanLikeNames[id.Name]
+			}
+			return recvUnknown
+		}
 		ast.Inspect(f, func(n ast.Node) bool {
 			switch d := n.(type) {
 			case *ast.Field:
@@ -661,12 +701,22 @@ func scanForbidden(paths []string) ([]string, error) {
 						markTyped(asIdent(d.Lhs[i]), isChanConnType(r.Type))
 					default:
 						// A value read through a Channel/Connection field
-						// selector is itself that type (e.g. f().Channel),
-						// regardless of what it is assigned to.
-						markTyped(asIdent(d.Lhs[i]), isChanConnSelector(rhs))
+						// selector, or an alias of an identifier already known
+						// to hold one, is itself that type regardless of the
+						// name it is bound to.
+						markTyped(asIdent(d.Lhs[i]), valueKind(rhs))
 					}
 				}
 			case *ast.ValueSpec:
+				// A declared type is authoritative even with no initializer:
+				// `var conn *protocol.Channel` records the Channel kind before
+				// the "conn" name-based fallback could misclassify it as a
+				// Connection and hide `conn.Closed`.
+				if d.Type != nil {
+					for _, nm := range d.Names {
+						markTyped(nm, isChanConnType(d.Type))
+					}
+				}
 				for i, nm := range d.Names {
 					if i >= len(d.Values) {
 						break
@@ -675,7 +725,7 @@ func scanForbidden(paths []string) ([]string, error) {
 						markTyped(nm, isChanConnType(ta.Type))
 						continue
 					}
-					markTyped(nm, isChanConnSelector(d.Values[i]))
+					markTyped(nm, valueKind(d.Values[i]))
 				}
 			}
 			return true

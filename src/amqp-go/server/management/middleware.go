@@ -79,7 +79,7 @@ func (s *Server) serveHTTP(w http.ResponseWriter, r *http.Request) {
 	rw := &responseRecorder{ResponseWriter: w}
 	path := r.URL.EscapedPath()
 
-	if !strings.HasPrefix(path, "/api/") {
+	if path != "/api" && !strings.HasPrefix(path, "/api/") {
 		s.serveUI(rw, r, reqID)
 		return
 	}

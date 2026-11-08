@@ -467,12 +467,12 @@ func TestUI_MetricsLink(t *testing.T) {
 		ctx, cancel := newTab(t)
 		defer cancel()
 		mustDo(t, ctx,
-			onNewDocument(`window.__SQ_CONFIG__ = { metricsUrl: "/prom/metrics" };`),
+			onNewDocument(`window.__SQ_CONFIG__ = { metricsUrl: "http://127.0.0.1:9999/prom/metrics" };`),
 			chromedp.Navigate(srv.URL+"/"),
 			chromedp.WaitVisible(chromedp.CSS("#metrics-link")),
 		)
-		if href := evalStr(t, ctx, `document.getElementById('metrics-link').getAttribute('href')`); href != "/prom/metrics" {
-			t.Fatalf("metrics link href = %q, want /prom/metrics", href)
+		if href := evalStr(t, ctx, `document.getElementById('metrics-link').getAttribute('href')`); href != "http://127.0.0.1:9999/prom/metrics" {
+			t.Fatalf("metrics link href = %q, want http://127.0.0.1:9999/prom/metrics", href)
 		}
 		if target := evalStr(t, ctx, `document.getElementById('metrics-link').getAttribute('target')`); target != "_blank" {
 			t.Fatalf("metrics link target = %q, want _blank", target)

@@ -31,9 +31,10 @@
     } catch (e) { /* a malformed meta must never break the SPA */ }
   }
   var API = CONFIG.apiBase || '/api';
-  /* metricsUrl may point at a different listener than the SPA origin, so it is
-   * emitted only when configured (round-2 #9). */
-  var METRICS_URL = CONFIG.metricsUrl || '';
+  /* Only an absolute http(s) URL may become an href. A hostile or malformed
+   * config value (javascript:, data:, vbscript:, an off-origin
+   * scheme-relative URL) is rejected so it can never be promoted into a link. */
+  var METRICS_URL = /^https?:[/][/]/i.test(CONFIG.metricsUrl || '') ? CONFIG.metricsUrl : '';
   var DEFAULT_REFRESH_MS = CONFIG.refreshInterval || 5000;
   var S1_REFRESH_MS = CONFIG.s1RefreshInterval || 2000;
   var MAX_BACKOFF_MS = 30000;
