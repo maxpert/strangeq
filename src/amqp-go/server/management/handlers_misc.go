@@ -147,12 +147,15 @@ func (s *Server) hJob(w http.ResponseWriter, r *http.Request) {
 	if p != nil {
 		owner = p.Name
 	}
-	job, ok := s.jobs.get(id, owner)
+	// viewOf renders the job under the pool lock: a worker transitions the job
+	// concurrently, so reading its fields here (outside the lock) would be a
+	// data race.
+	view, ok := s.jobs.viewOf(id, owner)
 	if !ok {
 		s.writeAPIError(w, r, errNotFoundMsg("unknown job"))
 		return
 	}
-	s.writeJSON(w, r, http.StatusOK, job.view())
+	s.writeJSON(w, r, http.StatusOK, view)
 }
 
 // --- health ---
