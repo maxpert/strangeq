@@ -213,7 +213,7 @@ func TestConfigSaveLoad(t *testing.T) {
 	originalConfig.Network.Address = ":8080"
 	originalConfig.Network.MaxConnections = 500
 	originalConfig.Storage.Path = "/tmp/amqp-data"
-	originalConfig.Storage.Fsync = boolPtr(true)
+	originalConfig.Storage.Durability = interfaces.DurabilityBarrier
 	originalConfig.Server.LogLevel = "debug"
 
 	// Save the config
@@ -232,8 +232,7 @@ func TestConfigSaveLoad(t *testing.T) {
 	assert.Equal(t, ":8080", loadedConfig.Network.Address)
 	assert.Equal(t, 500, loadedConfig.Network.MaxConnections)
 	assert.Equal(t, "/tmp/amqp-data", loadedConfig.Storage.Path)
-	require.NotNil(t, loadedConfig.Storage.Fsync)
-	assert.Equal(t, true, *loadedConfig.Storage.Fsync)
+	assert.Equal(t, interfaces.DurabilityBarrier, loadedConfig.Durability())
 	assert.Equal(t, "debug", loadedConfig.Server.LogLevel)
 }
 
@@ -270,7 +269,7 @@ network:
   tcpkeepaliveintervalms: 30000
 storage:
   path: ./test-data
-  fsync: false
+  durability: none
   cachemb: 64
   maxfiles: 100
   retentionms: 86400000
@@ -304,8 +303,8 @@ engine:
 	assert.NoError(t, err)
 	assert.Equal(t, ":8080", config.Network.Address)
 	assert.Equal(t, "debug", config.Server.LogLevel)
-	require.NotNil(t, config.Storage.Fsync)
-	assert.Equal(t, false, *config.Storage.Fsync)
+	assert.Equal(t, interfaces.DurabilityNone, config.Storage.Durability)
+	assert.Equal(t, interfaces.DurabilityNone, config.Durability())
 }
 
 func TestConfigBuilder(t *testing.T) {
@@ -314,7 +313,7 @@ func TestConfigBuilder(t *testing.T) {
 		WithPort(9090).
 		WithMaxConnections(2000).
 		WithStoragePath("/tmp/test-storage").
-		WithFsync(true).
+		WithDurability(interfaces.DurabilityFlush).
 		WithLogging("debug", "/var/log/amqp.log").
 		WithServerInfo("test-server", "1.0.0", "Test AMQP", "Test", "Test Corp").
 		Build()
@@ -325,8 +324,7 @@ func TestConfigBuilder(t *testing.T) {
 	assert.Equal(t, 9090, config.Network.Port)
 	assert.Equal(t, 2000, config.Network.MaxConnections)
 	assert.Equal(t, "/tmp/test-storage", config.Storage.Path)
-	require.NotNil(t, config.Storage.Fsync)
-	assert.Equal(t, true, *config.Storage.Fsync)
+	assert.Equal(t, interfaces.DurabilityFlush, config.Durability())
 	assert.Equal(t, "debug", config.Server.LogLevel)
 	assert.Equal(t, "/var/log/amqp.log", config.Server.LogFile)
 	assert.Equal(t, "test-server", config.Server.Name)
@@ -391,9 +389,11 @@ func TestConfigBuilderBuildUnsafe(t *testing.T) {
 	assert.Error(t, err)
 }
 
-// validYAMLWithFsync builds a full, Validate()-passing config YAML whose
-// storage.fsync line is fsyncLine (pass "" to omit the key entirely).
-func validYAMLWithFsync(fsyncLine string) string {
+// validYAMLWithStorageExtra builds a full, Validate()-passing config YAML whose
+// storage section additionally carries the (already indented) lines in extra.
+// Pass "" to omit them. It backs both the durability-key tests and the CRC
+// tri-state tests.
+func validYAMLWithStorageExtra(extra string) string {
 	return `
 network:
   address: ":8080"
@@ -404,7 +404,7 @@ network:
   tcpkeepaliveintervalms: 30000
 storage:
   path: ./test-data
-` + fsyncLine + `  cachemb: 64
+` + extra + `  cachemb: 64
   maxfiles: 100
   retentionms: 86400000
   checkpointintervalms: 5000
@@ -431,87 +431,96 @@ engine:
 `
 }
 
+// validYAMLWithDurability is validYAMLWithStorageExtra specialised to a single
+// storage.durability line ("" omits the key).
+func validYAMLWithDurability(durabilityLine string) string {
+	return validYAMLWithStorageExtra(durabilityLine)
+}
+
 func loadYAML(t *testing.T, content string) *AMQPConfig {
 	t.Helper()
 	dir := t.TempDir()
 	f := filepath.Join(dir, "cfg.yaml")
 	require.NoError(t, os.WriteFile(f, []byte(content), 0644))
 	// The file-load path in cmd/amqp-server seeds a ZERO-VALUE AMQPConfig{}
-	// before Load (not DefaultConfig), so the tri-state must be exercised from
-	// the zero value: an omitted fsync key stays nil there.
+	// before Load (not DefaultConfig), so an omitted durability key must be
+	// exercised from the zero value.
 	c := &AMQPConfig{}
 	require.NoError(t, c.Load(f))
 	return c
 }
 
-// TestFsyncTriState_LoadPaths pins the tri-state user flag semantics and the
-// loader trap: on a zero-value AMQPConfig{} (the --config path) an OMITTED
-// fsync key must default to ON (durable), so honoring the flag can never
-// silently make an upgraded broker non-durable. Only an explicit fsync:false
-// disables it.
-func TestFsyncTriState_LoadPaths(t *testing.T) {
-	// Default flip: DefaultConfig is explicitly durable (non-nil true).
-	def := DefaultConfig()
-	require.NotNil(t, def.Storage.Fsync, "DefaultConfig must set an explicit fsync")
-	assert.True(t, *def.Storage.Fsync)
-	assert.True(t, def.FsyncEnabled())
+// TestDurability_DefaultsAndOverlay pins the single durability option end to
+// end at the config layer: the barrier is the default, a zero-value config
+// normalizes "" to the barrier, and GetEngine maps each of the three values
+// onto the internal (WALSyncDisabled, CrashModel) transport.
+func TestDurability_DefaultsAndOverlay(t *testing.T) {
+	// DefaultConfig is explicitly durable (the barrier).
+	assert.Equal(t, interfaces.DurabilityBarrier, DefaultConfig().Storage.Durability)
+	assert.Equal(t, interfaces.DurabilityBarrier, DefaultConfig().Durability())
 
-	// (i) omitted key on a zero-value config => nil => ON.
-	cOmit := loadYAML(t, validYAMLWithFsync(""))
-	assert.Nil(t, cOmit.Storage.Fsync, "omitted fsync must stay nil on a zero-value load")
-	assert.True(t, cOmit.FsyncEnabled(), "omitted fsync must default to ON (durable)")
+	// A zero-value config (and an omitted key) normalizes "" -> barrier.
+	assert.Equal(t, interfaces.DurabilityBarrier, (&AMQPConfig{}).Durability())
 
-	// (ii) explicit false => opt out.
-	cFalse := loadYAML(t, validYAMLWithFsync("  fsync: false\n"))
-	require.NotNil(t, cFalse.Storage.Fsync)
-	assert.False(t, *cFalse.Storage.Fsync)
-	assert.False(t, cFalse.FsyncEnabled())
+	// The mapping table: each value -> (WALSyncDisabled, CrashModel).
+	for _, tc := range []struct {
+		dur         string
+		wantSyncDis bool
+		wantCrash   string
+	}{
+		{interfaces.DurabilityNone, true, ""},
+		{interfaces.DurabilityBarrier, false, ""},
+		{interfaces.DurabilityFlush, false, interfaces.CrashModelForceFlush},
+	} {
+		t.Run(tc.dur, func(t *testing.T) {
+			c := DefaultConfig()
+			c.Storage.Durability = tc.dur
+			e := c.GetEngine()
+			assert.Equal(t, tc.wantSyncDis, e.WALSyncDisabled, "WALSyncDisabled for durability %q", tc.dur)
+			assert.Equal(t, tc.wantCrash, e.CrashModel, "CrashModel for durability %q", tc.dur)
+			assert.Equal(t, tc.dur, e.Durability, "engine mirrors the durability mode")
+		})
+	}
 
-	// (iii) explicit true => ON.
-	cTrue := loadYAML(t, validYAMLWithFsync("  fsync: true\n"))
-	require.NotNil(t, cTrue.Storage.Fsync)
-	assert.True(t, *cTrue.Storage.Fsync)
-	assert.True(t, cTrue.FsyncEnabled())
-}
-
-// TestFsyncTriState_EngineOverlay pins that the user flag threads to the engine
-// view as the INVERTED WALSyncDisabled, and that every zero value means ON.
-func TestFsyncTriState_EngineOverlay(t *testing.T) {
-	// (iv) EngineConfig zero value => sync ON.
+	// A raw zero-value EngineConfig{} stays durable (fsync ON, barrier).
 	assert.False(t, interfaces.EngineConfig{}.WALSyncDisabled, "zero-value EngineConfig must fsync")
-
-	// Default config's engine view fsyncs.
-	assert.False(t, DefaultConfig().GetEngine().WALSyncDisabled)
-
-	// nil user flag (zero-value config) => engine view fsyncs.
-	assert.False(t, (&AMQPConfig{}).GetEngine().WALSyncDisabled)
-
-	// Explicit opt-out threads through GetEngine as WALSyncDisabled=true.
-	c := DefaultConfig()
-	dis := false
-	c.Storage.Fsync = &dis
-	assert.True(t, c.GetEngine().WALSyncDisabled, "fsync:false must set WALSyncDisabled=true")
+	assert.Equal(t, "", interfaces.EngineConfig{}.CrashModel)
 }
 
-// TestCRCTriState_LoadPaths pins the tri-state user flag semantics for CRC,
-// mirroring TestFsyncTriState_LoadPaths: an OMITTED crc_check key must default
-// to ON (safe), so honoring the flag can never silently disable integrity checks.
+// TestDurability_LoadPaths pins the file-load path: an omitted key stays "" on
+// a zero-value load but resolves to the barrier, and each explicit value
+// round-trips.
+func TestDurability_LoadPaths(t *testing.T) {
+	cOmit := loadYAML(t, validYAMLWithDurability(""))
+	assert.Equal(t, "", cOmit.Storage.Durability, "omitted durability stays empty on a zero-value load")
+	assert.Equal(t, interfaces.DurabilityBarrier, cOmit.Durability(), "omitted durability defaults to the barrier")
+
+	for _, v := range []string{interfaces.DurabilityNone, interfaces.DurabilityBarrier, interfaces.DurabilityFlush} {
+		c := loadYAML(t, validYAMLWithDurability("  durability: "+v+"\n"))
+		assert.Equal(t, v, c.Storage.Durability)
+		assert.Equal(t, v, c.Durability())
+	}
+}
+
+// TestCRCTriState_LoadPaths pins the tri-state user flag semantics for CRC: an
+// OMITTED crc_check key must default to ON (safe), so honoring the flag can
+// never silently disable integrity checks.
 func TestCRCTriState_LoadPaths(t *testing.T) {
 	def := DefaultConfig()
 	require.NotNil(t, def.Storage.CRCCheck, "DefaultConfig must set an explicit crc_check")
 	assert.True(t, *def.Storage.CRCCheck)
 	assert.True(t, def.CRCEnabled())
 
-	cOmit := loadYAML(t, validYAMLWithFsync(""))
+	cOmit := loadYAML(t, validYAMLWithStorageExtra(""))
 	assert.Nil(t, cOmit.Storage.CRCCheck, "omitted crc_check must stay nil on a zero-value load")
 	assert.True(t, cOmit.CRCEnabled(), "omitted crc_check must default to ON (safe)")
 
-	cFalse := loadYAML(t, validYAMLWithFsync("  crccheck: false\n"))
+	cFalse := loadYAML(t, validYAMLWithStorageExtra("  crccheck: false\n"))
 	require.NotNil(t, cFalse.Storage.CRCCheck)
 	assert.False(t, *cFalse.Storage.CRCCheck)
 	assert.False(t, cFalse.CRCEnabled())
 
-	cTrue := loadYAML(t, validYAMLWithFsync("  crccheck: true\n"))
+	cTrue := loadYAML(t, validYAMLWithStorageExtra("  crccheck: true\n"))
 	require.NotNil(t, cTrue.Storage.CRCCheck)
 	assert.True(t, *cTrue.Storage.CRCCheck)
 	assert.True(t, cTrue.CRCEnabled())
@@ -584,89 +593,111 @@ func TestValidateHotCacheEffectiveBudgets(t *testing.T) {
 	})
 }
 
-// TestCrashModel_DefaultsAndOverlay pins the durable-confirm crash model
-// plumbing end-to-end at the config layer: omitted and "barrier" both mean the
-// ordered barrier, "force_flush" is the only value that selects the full
-// drive-cache flush, and every zero-value path stays on the safe barrier.
-func TestCrashModel_DefaultsAndOverlay(t *testing.T) {
-	// Zero-value paths normalize to the barrier default.
-	assert.Equal(t, interfaces.CrashModelBarrier, DefaultConfig().CrashModel())
-	assert.Equal(t, interfaces.CrashModelBarrier, (&AMQPConfig{}).CrashModel())
-	assert.False(t, DefaultConfig().CrashModelForceFlush())
-	assert.False(t, (&AMQPConfig{}).CrashModelForceFlush())
+// TestDurability_InvalidRejectedAtBoot pins that a value outside the three
+// documented ones FAILS at boot through both entry points: the file-load path
+// (Load) and Validate directly (which cmd/amqp-server and server.Builder call).
+func TestDurability_InvalidRejectedAtBoot(t *testing.T) {
+	for _, bad := range []string{"bogus", "true", "NONE", "force_flush", "flushed"} {
+		t.Run(bad, func(t *testing.T) {
+			f := filepath.Join(t.TempDir(), "cfg.yaml")
+			require.NoError(t, os.WriteFile(f, []byte(validYAMLWithDurability("  durability: "+bad+"\n")), 0644))
 
-	// The engine transport carries the normalized effective value, so a
-	// zero-value EngineConfig keeps the safe barrier default.
-	assert.Equal(t, interfaces.CrashModelBarrier, DefaultConfig().GetEngine().CrashModel)
-	assert.Equal(t, interfaces.CrashModelBarrier, (&AMQPConfig{}).GetEngine().CrashModel)
-	// A raw zero-value EngineConfig{} carries "" — the storage layer maps
-	// anything other than the explicit "force_flush" to the barrier (pinned in
-	// storage by TestWALConfigFromEngine_CrashModelMapping).
-	assert.Equal(t, "", interfaces.EngineConfig{}.CrashModel)
+			c := &AMQPConfig{}
+			err := c.Load(f)
+			require.Error(t, err, "an unknown durability must fail at boot")
+			assert.Contains(t, err.Error(), "storage.durability")
+			assert.Contains(t, err.Error(), interfaces.DurabilityNone)
+			assert.Contains(t, err.Error(), interfaces.DurabilityBarrier)
+			assert.Contains(t, err.Error(), interfaces.DurabilityFlush)
 
-	// Explicit force_flush threads through CrashModel()/CrashModelForceFlush()
-	// and the engine overlay.
-	c := DefaultConfig()
-	c.Storage.CrashModel = interfaces.CrashModelForceFlush
-	assert.Equal(t, interfaces.CrashModelForceFlush, c.CrashModel())
-	assert.True(t, c.CrashModelForceFlush())
-	assert.Equal(t, interfaces.CrashModelForceFlush, c.GetEngine().CrashModel)
+			// Validate directly, the entry point main and server.Builder use.
+			v := DefaultConfig()
+			v.Storage.Durability = bad
+			require.Error(t, v.Validate(), "Validate must reject an unknown durability")
+		})
+	}
 }
 
-// TestCrashModel_LoadPaths pins the file-load path: an omitted crash_model key
-// stays "" on a zero-value load but resolves to the barrier, and each explicit
-// value round-trips to the engine overlay.
-func TestCrashModel_LoadPaths(t *testing.T) {
-	cOmit := loadYAML(t, validYAMLWithFsync(""))
-	assert.Equal(t, "", cOmit.Storage.CrashModel, "omitted crash_model stays empty on a zero-value load")
-	assert.Equal(t, interfaces.CrashModelBarrier, cOmit.CrashModel(), "omitted crash_model defaults to the barrier")
+// TestLegacyDurabilityKeysRejected pins the HARD rejection of the retired
+// storage.fsync and storage.crash_model keys, from a file AND from the
+// environment. They must never fall through to the generic unknown-key warning,
+// because ignoring them silently downgrades durability (crash_model: force_flush
+// -> barrier) or silently changes throughput (fsync: false -> barrier).
+func TestLegacyDurabilityKeysRejected(t *testing.T) {
+	fileCases := []struct {
+		name string
+		body string
+	}{
+		{"fsync true", validYAMLWithStorageExtra("  fsync: true\n")},
+		{"fsync false", validYAMLWithStorageExtra("  fsync: false\n")},
+		{"crash_model barrier", validYAMLWithStorageExtra("  crash_model: barrier\n")},
+		{"crash_model force_flush", validYAMLWithStorageExtra("  crash_model: force_flush\n")},
+	}
+	for _, tc := range fileCases {
+		t.Run("file/"+tc.name, func(t *testing.T) {
+			path := writeConfigFile(t, tc.body)
+			_, report, err := LoadConfig(path)
+			require.Error(t, err, "a retired durability key must fail at boot")
+			assert.Nil(t, report, "LoadConfig must return no report on a hard error")
+			assert.Contains(t, err.Error(), "storage.durability")
+			assert.Contains(t, err.Error(), "durability: none")
+			assert.Contains(t, err.Error(), "durability: barrier")
+			assert.Contains(t, err.Error(), "durability: flush")
+		})
+	}
 
-	cBarrier := loadYAML(t, validYAMLWithFsync("  crash_model: barrier\n"))
-	assert.Equal(t, interfaces.CrashModelBarrier, cBarrier.CrashModel())
-	assert.False(t, cBarrier.CrashModelForceFlush())
+	t.Run("method/Load rejects fsync", func(t *testing.T) {
+		path := writeConfigFile(t, validYAMLWithStorageExtra("  fsync: true\n"))
+		c := &AMQPConfig{}
+		err := c.Load(path)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "storage.durability")
+	})
 
-	cForce := loadYAML(t, validYAMLWithFsync("  crash_model: force_flush\n"))
-	assert.Equal(t, interfaces.CrashModelForceFlush, cForce.CrashModel())
-	assert.True(t, cForce.CrashModelForceFlush())
-	assert.Equal(t, interfaces.CrashModelForceFlush, cForce.GetEngine().CrashModel)
+	t.Run("env/AMQP_STORAGE_FSYNC", func(t *testing.T) {
+		t.Setenv("AMQP_STORAGE_FSYNC", "false")
+		_, _, err := LoadConfig("")
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "storage.durability")
+	})
 
-	// fsync:false + force_flush is a coherent combination: the group-commit
-	// barrier is skipped entirely, and the always-on transaction path uses the
-	// full flush.
-	cMixed := loadYAML(t, validYAMLWithFsync("  fsync: false\n  crash_model: force_flush\n"))
-	assert.False(t, cMixed.FsyncEnabled())
-	assert.True(t, cMixed.CrashModelForceFlush())
-	assert.True(t, cMixed.GetEngine().WALSyncDisabled)
-	assert.Equal(t, interfaces.CrashModelForceFlush, cMixed.GetEngine().CrashModel)
+	t.Run("env/AMQP_STORAGE_CRASH_MODEL", func(t *testing.T) {
+		t.Setenv("AMQP_STORAGE_CRASH_MODEL", "force_flush")
+		_, _, err := LoadConfig("")
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "storage.durability")
+	})
+
+	t.Run("no legacy key means no error", func(t *testing.T) {
+		path := writeConfigFile(t, validYAMLWithDurability("  durability: flush\n"))
+		cfg, report, err := LoadConfig(path)
+		require.NoError(t, err)
+		require.NoError(t, cfg.Validate())
+		assert.NotContains(t, report.UnknownKeys, "storage.fsync")
+		assert.NotContains(t, report.UnknownKeys, "storage.crashmodel")
+		assert.Equal(t, interfaces.DurabilityFlush, cfg.Durability())
+	})
 }
 
-// TestCrashModel_InvalidRejectedAtBoot pins that an unknown crash_model FAILS at
-// boot through both entry points: the file-load path (Load) and Validate
-// directly (which cmd/amqp-server and server.Builder both call).
-func TestCrashModel_InvalidRejectedAtBoot(t *testing.T) {
-	dir := t.TempDir()
-	f := filepath.Join(dir, "cfg.yaml")
-	require.NoError(t, os.WriteFile(f, []byte(validYAMLWithFsync("  crash_model: bogus\n")), 0644))
-
-	c := &AMQPConfig{}
-	err := c.Load(f)
-	require.Error(t, err, "an unknown crash_model must fail at boot")
-	assert.Contains(t, err.Error(), "crash_model")
-	assert.Contains(t, err.Error(), interfaces.CrashModelBarrier)
-	assert.Contains(t, err.Error(), interfaces.CrashModelForceFlush)
-
-	// Validate directly, the entry point main and server.Builder use.
-	v := DefaultConfig()
-	v.Storage.CrashModel = "bogus"
-	require.Error(t, v.Validate(), "Validate must reject an unknown crash_model")
-}
-
-// TestCrashModel_BuilderWiring pins the fluent builder setter.
-func TestCrashModel_BuilderWiring(t *testing.T) {
-	cfg, err := NewConfigBuilder().WithCrashModel(interfaces.CrashModelForceFlush).Build()
+// TestGenerateConfig_EmitsDurability pins that --generate-config writes the new
+// key and none of the retired ones.
+func TestGenerateConfig_EmitsDurability(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "generated.yaml")
+	require.NoError(t, DefaultConfig().Save(path))
+	data, err := os.ReadFile(path)
 	require.NoError(t, err)
-	assert.True(t, cfg.CrashModelForceFlush())
+	out := string(data)
+	assert.Contains(t, out, "durability: barrier")
+	assert.NotContains(t, out, "fsync")
+	assert.NotContains(t, out, "crash_model")
+}
 
-	_, err = NewConfigBuilder().WithCrashModel("bogus").Build()
-	require.Error(t, err, "Build must reject an unknown crash_model")
+// TestDurability_BuilderWiring pins the fluent builder setter.
+func TestDurability_BuilderWiring(t *testing.T) {
+	cfg, err := NewConfigBuilder().WithDurability(interfaces.DurabilityFlush).Build()
+	require.NoError(t, err)
+	assert.Equal(t, interfaces.DurabilityFlush, cfg.Durability())
+
+	_, err = NewConfigBuilder().WithDurability("bogus").Build()
+	require.Error(t, err, "Build must reject an unknown durability")
 }

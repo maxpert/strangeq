@@ -11,6 +11,7 @@ import (
 	amqp "github.com/rabbitmq/amqp091-go"
 
 	"github.com/maxpert/amqp-go/config"
+	"github.com/maxpert/amqp-go/interfaces"
 	"github.com/maxpert/amqp-go/server"
 )
 
@@ -41,9 +42,13 @@ func f1Server(t *testing.T, fsync bool) (string, func()) {
 	cfg.Network.Address = addr
 	cfg.Storage.Path = t.TempDir()
 	cfg.Server.LogLevel = "silent"
-	// Tri-state fsync: false disables the WAL fdatasync barrier.
-	fsyncVal := fsync
-	cfg.Storage.Fsync = &fsyncVal
+	// fsync=false is the "none" durability level: it disables the WAL
+	// group-commit barrier and leaves no fence at the confirm site.
+	if fsync {
+		cfg.Storage.Durability = interfaces.DurabilityBarrier
+	} else {
+		cfg.Storage.Durability = interfaces.DurabilityNone
+	}
 
 	srv, err := server.NewServerBuilder().WithConfig(cfg).Build()
 	if err != nil {

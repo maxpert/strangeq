@@ -153,8 +153,7 @@ func newConfBrokerCfg(t *testing.T, mutate func(*config.AMQPConfig)) *confBroker
 	b.cfg.Server.LogLevel = "silent"
 	b.cfg.Network.Address = "127.0.0.1:0" // OS-assigned free port
 	b.cfg.Storage.Path = b.storeDir
-	fsyncOn := true
-	b.cfg.Storage.Fsync = &fsyncOn // strict durability for the round-trip case
+	b.cfg.Storage.Durability = interfaces.DurabilityBarrier // strict durability for the round-trip case
 	if mutate != nil {
 		mutate(b.cfg)
 	}

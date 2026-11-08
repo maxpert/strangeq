@@ -23,9 +23,11 @@ network:
 
 storage:
   path: ./data
-  # Fsync after each WAL batch write (the durable default; matches RabbitMQ
-  # persistent-message semantics). Set false only to trade durability for speed.
-  fsync: true
+  # Durability of a confirmed message: none | barrier (default) | flush.
+  # barrier fences the group-commit batch to the drive (OS-crash safe);
+  # flush adds the full drive-cache flush (power-loss safe); none skips the
+  # group-commit barrier. Transactions always fsync regardless.
+  durability: barrier
   # CRC32 integrity checks for WAL/segment records (the safe default).
   # Set false to trade integrity checking for speed (~8% CPU savings).
   crccheck: true

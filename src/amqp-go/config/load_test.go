@@ -6,6 +6,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/maxpert/amqp-go/interfaces"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -167,8 +168,7 @@ telemetry:
 			if !strings.Contains(tc.body, "maxconnections") {
 				assert.Equal(t, def.Network.MaxConnections, cfg.Network.MaxConnections)
 			}
-			require.NotNil(t, cfg.Storage.Fsync)
-			assert.True(t, *cfg.Storage.Fsync)
+			assert.Equal(t, interfaces.DurabilityBarrier, cfg.Durability())
 			assert.Equal(t, []string{"PLAIN"}, def.Security.AuthMechanisms)
 
 			if tc.authEnabled != nil {
