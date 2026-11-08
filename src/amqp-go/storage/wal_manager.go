@@ -531,6 +531,51 @@ type QueueWAL struct {
 	// AT THIS INSTANT. The drain takes ONE shard at a time, so it is 0 or 1;
 	// the test-only hook reads it to prove the lock order (T2).
 	drainHeldShards atomic.Int32
+
+	// --- W8: eager next-file pre-open (off the commit path). ---
+	//
+	// The roll used to run its retired-file directory F_FULLFSYNC INLINE under
+	// fileMutex (rollFile -> openWALFile -> syncDir). Under crash_model: barrier
+	// nothing else flushes the drive cache, so that one call pays the WHOLE
+	// previous file's backlog — ~109 ms measured for a 512 MiB file — while the
+	// committer holds fileMutex: the F3 confirm tail (p95 159–310 ms). W8 moves
+	// BOTH halves off the commit path:
+	//
+	//   step 1  syncDir(dataDir): the retired file's tail flush, ordered BEFORE
+	//           the next file is created. Order matters: it keeps the
+	//           two-newest-file recovery bound EXACT by ensuring no younger
+	//           file's directory entry can outlive an unflushed older file.
+	//   step 2  openWALFile(next): create + header + creation dir F_FULLFSYNC,
+	//           parked for the next roll.
+	//
+	// rollFile then only swaps a parked handle — no syscall beyond the retired
+	// write fd's close. It falls back to the old inline open (the same stall)
+	// whenever no file is parked, so a failure or a lag degrades to today's
+	// behaviour, never to a wrong one. The recovery contract is unchanged: the
+	// full directory flush still happens once per file, before the file is used,
+	// and the confirmed-loss window still spans at most the two newest files.
+	//
+	// preopenReq (capacity 1) coalesces signals: the helper re-reads fileNum+1
+	// at pickup, so a dropped duplicate prepares the same next file.
+	preopenReq chan struct{}
+	// preopenMu guards preopenNum, preopenDone and preopened.
+	preopenMu   sync.Mutex
+	preopenNum  uint64        // number the helper is opening now; 0 = idle
+	preopenDone chan struct{} // closed when the open of preopenNum finishes; nil = idle
+	preopened   *preopenedFile
+}
+
+// preopenedFile is the handle triple for a WAL file the pre-open helper has
+// already created, header-written and directory-F_FULLFSYNC'd (W8). rollFile
+// consumes it without any commit-path syscall. openWALFile reports whether the
+// entry is durable; it is always true for a created file under fsync, so the
+// swap never installs a file whose directory entry is not yet durable.
+type preopenedFile struct {
+	num             uint64
+	w               *os.File
+	r               *os.File
+	size            int64
+	dirEntryDurable bool
 }
 
 // WALBatchSealBytesDefault is the default byte-based WAL batch seal (64 MiB):
@@ -2509,6 +2554,8 @@ func (wm *WALManager) createSharedWAL() (*QueueWAL, error) {
 		oldFiles:           make(map[uint64]*walFileInfo),
 		oldFileCache:       make(map[uint64]*os.File),
 		stopChan:           make(chan struct{}),
+		// W8: the pre-open helper's request channel (capacity 1 = coalescing).
+		preopenReq: make(chan struct{}, 1),
 		// WS-F phase 1: the pipelined group-commit hand-off. commitCh is
 		// unbuffered by design (see the QueueWAL field comment); free's
 		// capacity is the exact staged-batch object count.
@@ -2537,10 +2584,12 @@ func (wm *WALManager) createSharedWAL() (*QueueWAL, error) {
 	// Start background goroutines (single set for all queues!)
 	// WS-F phase 1: three goroutines — the stager (batchWriterLoop), the
 	// committer (walCommitLoop), and cleanup. close() waits on all of them (D5).
-	wal.wg.Add(3)
+	// W8 adds a fourth: the pre-open helper.
+	wal.wg.Add(4)
 	go wal.batchWriterLoop()
 	go wal.walCommitLoop()
 	go wal.cleanupLoop()
+	go wal.walPreopenLoop()
 
 	return wal, nil
 }
@@ -4138,8 +4187,15 @@ func (qw *QueueWAL) rollFile() error {
 	curNum := qw.fileNum.Load()
 	num := curNum + 1
 
-	// 1. Open the next file FIRST; the current file is untouched.
-	w, r, size, dirEntryDurable, err := qw.openWALFile(num)
+	// 1. Get the next file FIRST; the current file is untouched.
+	//
+	// W8: when the helper has parked the next file, this is a pure pointer
+	// hand-off — NO directory flush, NO open, on the commit path. The parked
+	// file's creation F_FULLFSYNC already completed, so its directory entry is
+	// durable before the swap below and the first confirm in the new file is
+	// safe. When nothing is parked (helper still working, or it failed) this
+	// falls back to the inline openWALFile, i.e. the pre-W8 behaviour.
+	w, r, size, dirEntryDurable, err := qw.takePreopenedOrOpen(num)
 	if err != nil {
 		return fmt.Errorf("WAL roll: %w", err)
 	}
@@ -4214,7 +4270,170 @@ func (qw *QueueWAL) rollFile() error {
 	qw.nextRollAttempt = time.Time{}
 	qw.rollFailures = 0
 	qw.assertOffsetInvariantLocked()
+	// W8: ask the helper to prepare file num+1 while this file fills. The
+	// helper's FIRST action is the retired file's tail flush (step 1), so the
+	// just-retired file is made durable off the commit path.
+	qw.signalPreopen()
 	return nil
+}
+
+// --- W8: the pre-open helper. ---
+
+// walPreopenLoop is the pre-open helper goroutine (W8). It is event-driven
+// (no timer, acceptance rule 9): a signal arrives after each successful roll,
+// and it prepares the NEXT WAL file off the commit path. It exits on stopChan
+// and is joined by close() (wg). It NEVER takes fileMutex.
+func (qw *QueueWAL) walPreopenLoop() {
+	defer qw.wg.Done()
+	for {
+		select {
+		case <-qw.preopenReq:
+		case <-qw.stopChan:
+			return
+		}
+		for qw.preopenNext() {
+			// preopenNext returns true when its result went stale (the WAL
+			// rolled during the open). Today that cannot happen — the roll for
+			// that number waits on preopenDone — but the loop self-heals if it
+			// ever does, instead of leaving no parked file behind.
+		}
+	}
+}
+
+// signalPreopen asks the helper to prepare the next WAL file. Non-blocking:
+// the request channel has capacity 1 and a duplicate is a no-op because the
+// helper re-reads fileNum+1 at pickup, so a coalesced signal prepares the same
+// next file. Called from rollFile (commit path, under fileMutex) — it never
+// waits on the helper.
+func (qw *QueueWAL) signalPreopen() {
+	if !walPreopenEnabled.Load() {
+		return
+	}
+	select {
+	case qw.preopenReq <- struct{}{}:
+	default:
+	}
+}
+
+// preopenNext prepares the next WAL file off the commit path. It returns true
+// when it had to discard a stale result (the WAL already rolled past the file
+// it opened), so the caller re-runs immediately.
+func (qw *QueueWAL) preopenNext() (redo bool) {
+	qw.preopenMu.Lock()
+	num := qw.fileNum.Load() + 1
+	if qw.preopened != nil && qw.preopened.num == num {
+		// Already parked: a duplicate request.
+		qw.preopenMu.Unlock()
+		return false
+	}
+	if qw.preopened != nil {
+		// A stale park (the WAL moved on without consuming it). Drop it so we
+		// never leak a handle or a header-only stub.
+		qw.discardPreopenedLocked()
+	}
+	qw.preopenNum = num
+	done := make(chan struct{})
+	qw.preopenDone = done
+	qw.preopenMu.Unlock()
+
+	// STEP 1 (this file's predecessor's tail flush). This is the roll's old
+	// on-path directory F_FULLFSYNC, moved off the commit path. It is ordered
+	// BEFORE the next file is created so that no younger file's directory
+	// entry can outlive an older, unflushed file — which is what keeps the
+	// confirmed-loss window at the two newest files (R-TAIL-HOLE). Under
+	// SyncDisabled nothing in the file was durable, so the barrier is skipped
+	// exactly as the roll skipped it (D2).
+	if !qw.cfg.SyncDisabled {
+		if err := syncDir(qw.dataDir); err != nil {
+			qw.logWarn("WAL pre-open: the retired file's directory flush failed; its tail is not yet durable and the next roll may fall back to an inline open",
+				interfaces.LogField{Key: "dir", Value: qw.dataDir},
+				interfaces.LogField{Key: "error", Value: err.Error()})
+		}
+	}
+
+	// STEP 2 (create + open + creation dir F_FULLFSYNC the next file).
+	// openWALFile's creation barrier makes the new file's directory entry
+	// durable, which is the precondition the roll's swap relies on.
+	w, r, size, dirEntryDurable, err := qw.openWALFile(num)
+
+	qw.preopenMu.Lock()
+	qw.preopenNum = 0
+	qw.preopenDone = nil
+	switch {
+	case err == nil && qw.fileNum.Load() == num-1:
+		qw.preopened = &preopenedFile{num: num, w: w, r: r, size: size, dirEntryDurable: dirEntryDurable}
+	case err != nil:
+		// Failed: nothing is parked, so the roll opens inline as before.
+		if w != nil {
+			_ = w.Close()
+		}
+		if r != nil {
+			_ = r.Close()
+		}
+	default:
+		// Opened, but the WAL already rolled past num (unreachable today; the
+		// roll for num waits on preopenDone). Do not leak the file: close and
+		// remove it — it holds a header only.
+		if w != nil {
+			_ = w.Close()
+		}
+		if r != nil {
+			_ = r.Close()
+		}
+		_ = os.Remove(filepath.Join(qw.dataDir, fmt.Sprintf("%020d%s", num, WALFileExtension)))
+		redo = true
+	}
+	close(done)
+	qw.preopenMu.Unlock()
+	walPreopenDoneHookFire()
+	return redo
+}
+
+// discardPreopenedLocked closes and removes a parked pre-opened file. The
+// caller holds preopenMu. The file is header-only (0 records), so removing it
+// is safe: the next boot's fileNum seeding advances onto it harmlessly, and the
+// reclaim would unlink it as fully acknowledged anyway.
+func (qw *QueueWAL) discardPreopenedLocked() {
+	p := qw.preopened
+	qw.preopened = nil
+	if p == nil {
+		return
+	}
+	if p.w != nil {
+		_ = p.w.Close()
+	}
+	if p.r != nil {
+		_ = p.r.Close()
+	}
+	_ = os.Remove(filepath.Join(qw.dataDir, fmt.Sprintf("%020d%s", p.num, WALFileExtension)))
+}
+
+// takePreopenedOrOpen returns the handle triple for WAL file `num`,
+// preferring the helper's parked (fully prepared, directory entry durable)
+// file. It WAITS for an in-flight pre-open of the same number rather than
+// racing a second create of the same path; otherwise it falls back to the old
+// inline open (the pre-W8 behaviour, stall and all).
+//
+// Precondition: caller holds fileMutex. It blocks only while the helper is
+// opening exactly `num` — the one moment its result is required — and the
+// helper never takes fileMutex, so the wait cannot deadlock.
+func (qw *QueueWAL) takePreopenedOrOpen(num uint64) (w, r *os.File, size int64, dirEntryDurable bool, err error) {
+	for {
+		qw.preopenMu.Lock()
+		if p := qw.preopened; p != nil && p.num == num {
+			qw.preopened = nil
+			qw.preopenMu.Unlock()
+			return p.w, p.r, p.size, p.dirEntryDurable, nil
+		}
+		if qw.preopenNum == num && qw.preopenDone != nil {
+			done := qw.preopenDone
+			qw.preopenMu.Unlock()
+			<-done
+			continue
+		}
+		qw.preopenMu.Unlock()
+		return qw.openWALFile(num)
+	}
 }
 
 // errRollBackoff is returned by tryRollLocked when the next roll attempt is
@@ -4983,6 +5202,12 @@ func (qw *QueueWAL) close() {
 
 	close(qw.stopChan)
 	qw.wg.Wait()
+
+	// W8: the helper has stopped; drop any parked (unused, header-only) file so
+	// it does not linger in the directory.
+	qw.preopenMu.Lock()
+	qw.discardPreopenedLocked()
+	qw.preopenMu.Unlock()
 
 	// Close cached old file handles
 	qw.oldFileCacheMutex.Lock()

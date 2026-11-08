@@ -43,6 +43,10 @@ import (
 func seedMultiFileWAL(t *testing.T, dataDir string, wantFiles, minTail int) []string {
 	t.Helper()
 
+	// W8 creates the next WAL file ahead of time; this fixture counts the files
+	// on disk exactly, so pin the inline-roll path deterministically.
+	t.Cleanup(SetWALPreopenEnabledForTest(false))
+
 	// Seeded through WALManager rather than DisruptorStorage on purpose: a
 	// DisruptorStorage has a segment manager attached, and its Close() runs a
 	// final performCheckpoint that UNLINKS every rolled WAL file — which would

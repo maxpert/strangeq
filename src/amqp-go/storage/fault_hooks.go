@@ -294,6 +294,51 @@ func SetWALOpenFileForTest(fn func(name string, flag int, perm os.FileMode) (*os
 	return func() { walOpenFileHook.Store(prev) }
 }
 
+// --- W8 pre-open helper completion (observability) ------------------------
+
+// walPreopenDoneFn is the signature of the pre-open completion hook.
+type walPreopenDoneFn func()
+
+var walPreopenDoneHook atomic.Pointer[walPreopenDoneFn]
+
+// walPreopenDoneHookFire fires after each pre-open attempt that did work, on
+// the helper goroutine. Never called by production code; nil = no observation.
+func walPreopenDoneHookFire() {
+	if p := walPreopenDoneHook.Load(); p != nil {
+		(*p)()
+	}
+}
+
+// SetWALPreopenDoneForTest installs fn to run on the pre-open helper goroutine
+// after each pre-open attempt that did work. TEST-ONLY: the W8 tests use it to
+// wait for a parked file (or a failed pre-open) deterministically instead of
+// sleeping.
+func SetWALPreopenDoneForTest(fn func()) (restore func()) {
+	prev := walPreopenDoneHook.Load()
+	f := walPreopenDoneFn(fn)
+	walPreopenDoneHook.Store(&f)
+	return func() { walPreopenDoneHook.Store(prev) }
+}
+
+// walPreopenEnabled (TEST-ONLY) pins the pre-W8 inline-roll behaviour when set
+// false, so a fixture that counts or inspects the EXACT on-disk WAL file set is
+// deterministic: the background pre-open otherwise creates the next WAL file
+// (header only) ahead of time. Production never calls the setter, so the helper
+// is always enabled there.
+var walPreopenEnabled atomic.Bool
+
+func init() { walPreopenEnabled.Store(true) }
+
+// SetWALPreopenEnabledForTest toggles the background pre-open of the next WAL
+// file (W8). TEST-ONLY: with it false, signalPreopen is a no-op and rollFile
+// therefore never finds a parked file, taking the inline open — exactly the
+// pre-W8 roll path. Install it BEFORE the WAL is created (or before its first
+// roll) so no file is already parked.
+func SetWALPreopenEnabledForTest(enabled bool) (restore func()) {
+	prev := walPreopenEnabled.Swap(enabled)
+	return func() { walPreopenEnabled.Store(prev) }
+}
+
 // --- segment write ---------------------------------------------------------
 
 // segmentWriteFn is the signature of the segment record-append.

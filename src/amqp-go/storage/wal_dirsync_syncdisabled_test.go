@@ -50,6 +50,9 @@ func (c *dirSyncCounter) snapshot() []string {
 // SyncDisabled is true and present when it is false. The file creation itself
 // and the roll must succeed in both modes.
 func TestWAL_Roll_DirSyncHonorsSyncDisabled(t *testing.T) {
+	// W8 pre-creates the next WAL file; these tests count directory fsyncs
+	// exactly, so pin the inline-roll path (no background pre-open).
+	t.Cleanup(SetWALPreopenEnabledForTest(false))
 	sharedDir := func(dir string) string { return filepath.Join(dir, "wal", "shared") }
 
 	cases := []struct {
@@ -96,6 +99,9 @@ func TestWAL_Roll_DirSyncHonorsSyncDisabled(t *testing.T) {
 // when it is false. The UNLINK itself is independent of the fsync gate: a fully
 // acknowledged file is removed in both modes.
 func TestWAL_Reclaim_DirSyncHonorsSyncDisabled(t *testing.T) {
+	// W8 pre-creates the next WAL file; these tests count directory fsyncs
+	// exactly, so pin the inline-roll path (no background pre-open).
+	t.Cleanup(SetWALPreopenEnabledForTest(false))
 	sharedDir := func(dir string) string { return filepath.Join(dir, "wal", "shared") }
 
 	cases := []struct {
@@ -270,6 +276,9 @@ func TestWAL_Tx_DirSyncFailureAbortsTx(t *testing.T) {
 // barrier is not paid when fsync is on: the roll already made the file's
 // directory entry durable, so WriteTxAtomic must add no directory sync.
 func TestWAL_Tx_NoExtraSyncWhenFsyncEnabled(t *testing.T) {
+	// W8 pre-creates the next WAL file; these tests count directory fsyncs
+	// exactly, so pin the inline-roll path (no background pre-open).
+	t.Cleanup(SetWALPreopenEnabledForTest(false))
 	dir := t.TempDir()
 	wm, err := NewWALManagerWithConfig(dir, txDirSyncWALConfig(false))
 	require.NoError(t, err)

@@ -82,6 +82,9 @@ type walIncarnation struct {
 
 func bootIncarnation(t *testing.T, dir string) *walIncarnation {
 	t.Helper()
+	// W8 creates the next WAL file ahead of time; these fixtures reason about
+	// the EXACT on-disk file set, so pin the inline-roll path deterministically.
+	t.Cleanup(SetWALPreopenEnabledForTest(false))
 	wal, err := NewWALManagerWithConfig(dir, incarnationWALConfig())
 	require.NoError(t, err)
 	seg, err := NewSegmentManagerWithConfig(dir, incarnationSegmentConfig())

@@ -1034,6 +1034,9 @@ func TestWALPipeline_RollBetweenStagedBatches(t *testing.T) {
 // bind to the fresh file (its offsets decode from the newest file, A's do
 // not), be readable in-session, and survive restart.
 func TestWALPipeline_PoisonRollWithStagedSuccessor(t *testing.T) {
+	// W8 pre-creates the next WAL file; this test inspects the EXACT newest
+	// on-disk WAL file, so pin the inline-roll path deterministically.
+	t.Cleanup(SetWALPreopenEnabledForTest(false))
 	dir := t.TempDir()
 	cfg := DefaultWALConfig()
 	cfg.BatchSize = 8

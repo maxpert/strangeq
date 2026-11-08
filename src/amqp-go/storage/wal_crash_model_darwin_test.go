@@ -209,6 +209,29 @@ func TestCrashModel_RetainedFullFlushSitesUnchanged(t *testing.T) {
 				require.NotContains(t, got, cmBarrier, "the roll directory barrier must not use the fence")
 			})
 
+			// (1b) The W8 pre-open's directory barriers (step 1 retired-tail
+			// flush, step 2 creation sync). Both must stay F_FULLFSYNC and
+			// never use the confirm fence: they bound the power-loss window.
+			t.Run("preopen_dir_barrier", func(t *testing.T) {
+				rec := &syncCmdRecorder{}
+				rec.install(t)
+				wm, err := NewWALManagerWithConfig(t.TempDir(), crashModelTestConfig(mode.force))
+				require.NoError(t, err)
+				t.Cleanup(func() { _ = wm.Close() })
+
+				sw := wm.sharedWAL
+				// Drive the pre-open synchronously so the observed commands are
+				// exactly its two directory barriers.
+				rec.reset()
+				sw.preopenNext()
+
+				got := rec.snapshot()
+				require.Contains(t, got, cmFull,
+					"the pre-open directory barriers must stay F_FULLFSYNC")
+				require.NotContains(t, got, cmBarrier,
+					"the pre-open directory barriers must not use the confirm fence")
+			})
+
 			// (2) The reclaim sweep's post-unlink directory barrier.
 			t.Run("reclaim_dir_barrier", func(t *testing.T) {
 				rec := &syncCmdRecorder{}
