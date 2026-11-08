@@ -1,5 +1,7 @@
 package server
 
+import "github.com/maxpert/amqp-go/broker"
+
 // QueueReadyCount reports a queue's READY depth (messages available for
 // delivery, excluding delivered-but-unacked). Unknown queues report 0. It backs
 // the telemetry queue poller without widening UnifiedBroker, and requires no
@@ -24,4 +26,34 @@ func (a *StorageBrokerAdapter) QueueDepthHighWater(name string) uint64 {
 		return 0
 	}
 	return a.broker.GetQueueDepthHighWater(name)
+}
+
+// QueueMessageCounts reports a queue's ready/unacked/total depth (BOB-1). It is
+// the optional-interface seam (queueMessageTotals) the management layer
+// discovers on the injected UnifiedBroker; nil-safe like QueueReadyCount.
+func (a *StorageBrokerAdapter) QueueMessageCounts(name string) broker.QueueMessageCounts {
+	if a == nil || a.broker == nil {
+		return broker.QueueMessageCounts{}
+	}
+	return a.broker.QueueMessageCounts(name)
+}
+
+// ConsumerViews returns one management view per live consumer (BOB-8), the
+// optional-interface seam (consumerViews) the management layer discovers on the
+// injected UnifiedBroker.
+func (a *StorageBrokerAdapter) ConsumerViews() []broker.ConsumerView {
+	if a == nil || a.broker == nil {
+		return nil
+	}
+	return a.broker.ConsumerViews()
+}
+
+// SetEntityObserver installs the BOB-11 entity observer on the wrapped broker.
+// It is the optional-interface seam the server's entity-counter wiring
+// discovers; a broker without it leaves snapshot_coherent false.
+func (a *StorageBrokerAdapter) SetEntityObserver(o broker.EntityObserver) {
+	if a == nil || a.broker == nil {
+		return
+	}
+	a.broker.SetEntityObserver(o)
 }
