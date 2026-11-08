@@ -57,7 +57,7 @@ network:
 
 storage:
   path: /var/lib/amqp/data
-  fsync: true
+  durability: barrier
 
 security:
   tlsenabled: true
