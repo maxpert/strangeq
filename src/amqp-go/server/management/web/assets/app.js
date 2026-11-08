@@ -403,8 +403,8 @@
           var descending = curReverse === null ? opts.defaultSortReverse === true : curReverse === "true";
           th.setAttribute("aria-sort", descending ? "descending" : "ascending");
         }
-        th.addEventListener("click", function () { onSort(opts.route, c.key); });
-        th.addEventListener("keydown", function (ev) { if (ev.key === "Enter") onSort(opts.route, c.key); });
+        th.addEventListener("click", function () { onSort(opts.route, c.key, opts.defaultSort, opts.defaultSortReverse); });
+        th.addEventListener("keydown", function (ev) { if (ev.key === "Enter") onSort(opts.route, c.key, opts.defaultSort, opts.defaultSortReverse); });
       }
       return th;
     }));
@@ -459,13 +459,16 @@
   }
 
   /* onSort re-queries page 1 with the chosen column; a repeat click flips the
-   * direction. The server does the sorting, so the DOM is never reordered
-   * optimistically. */
-  function onSort(route, key) {
+   * direction. The current key/direction is the route query when present, else
+   * the screen's declared default, so the first click on the already-default
+   * column actually toggles. The server does the sorting, so the DOM is never
+   * reordered optimistically. */
+  function onSort(route, key, defaultSort, defaultSortReverse) {
+    var curKey = route.query.get("sort") || defaultSort || null;
+    var curReverseRaw = route.query.get("sort_reverse");
+    var curReverse = curReverseRaw === null ? defaultSortReverse === true : curReverseRaw === "true";
     var reverse = "true";
-    if (route.query.get("sort") === key) {
-      reverse = route.query.get("sort_reverse") === "true" ? "false" : "true";
-    }
+    if (curKey === key) reverse = curReverse ? "false" : "true";
     navigate(listHref(route, { sort: key, sort_reverse: reverse, page: 1 }));
   }
 
@@ -897,7 +900,7 @@
     ]);
   }
 
-  var QUEUE_SORT_KEYS = ["name", "type", "durable", "messages_ready", "messages_unacknowledged", "messages", "consumers", "state"];
+  var QUEUE_SORT_KEYS = ["name", "type", "durable", "auto_delete", "exclusive", "messages_ready", "messages_unacknowledged", "messages", "consumers", "state"];
   var QUEUE_DEFAULT_SORT = "messages_ready";
   var QUEUE_DEFAULT_SORT_REVERSE = true;
 
@@ -1201,7 +1204,7 @@
 
   function closeConnectionDisabledReason(st) {
     if (st === "off") return "Force-close is not implemented by this broker (close_connection capability is false)";
-    return "capability unknown (version lookup failed)";
+    return "capability unknown (not reported by this broker / lookup failed)";
   }
 
   /* rowCloseButton is the S2 per-row close control; it is disabled, with a
