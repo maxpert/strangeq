@@ -198,6 +198,33 @@ func TestChannelViews_LockFreeFields(t *testing.T) {
 	require.False(t, hasClosed, "ChannelView must not expose Channel.Closed")
 }
 
+// TestChannelViews_UnackedUnknownPropagates locks the aggregation contract: a
+// channel whose only consumer has AckKnown==false reports HasUnacked==false, so
+// the API renders unacked as null rather than 0.
+func TestChannelViews_UnackedUnknownPropagates(t *testing.T) {
+	srv, sb := newEntityTestServer(t)
+	_, err := sb.DeclareQueue("q", false, false, false, nil)
+	require.NoError(t, err)
+
+	conn := protocol.NewConnection(nil)
+	conn.ID = "conn-unk"
+	ch := protocol.NewChannel(1, conn)
+
+	// Manual-ack, prefetch-0 => AckKnown == false.
+	require.NoError(t, sb.RegisterConsumer("q", "p0", &protocol.Consumer{
+		ID: "p0", Tag: "t", Queue: "q", Channel: ch,
+		Messages: make(chan *protocol.Delivery, 4),
+	}))
+
+	attachConnection(srv, "conn-unk", "u", "/", ch)
+	srv.InitEntityCounters()
+
+	views := srv.ChannelViews()
+	require.Len(t, views, 1)
+	require.Equal(t, 1, views[0].Consumers)
+	require.False(t, views[0].HasUnacked, "a prefetch-0 consumer's unacked set is unknown")
+}
+
 func TestChannelViews_DoesNotBlockOnChannelMutex(t *testing.T) {
 	srv, _ := newEntityTestServer(t)
 	conn := protocol.NewConnection(nil)
