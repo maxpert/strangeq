@@ -142,15 +142,23 @@ func TestSegstoreReclaimUnlinkFailureRetainsReads(t *testing.T) {
 	_, err = os.Stat(path)
 	require.NoError(t, err)
 	qw := wm.sharedWAL
-	require.Contains(t, qw.oldFiles, fileNum)
 	key := recordKey{queueName: "q", deliveryTag: 7}
-	// THE EAGER SETTLING: the acknowledged record left the physical index,
-	// so the index is not what a failed unlink has to retain. What it has to
-	// retain is the FILE and its REGISTRATION, so the next sweep retries the
-	// unlink -- and the durable bytes it holds.
+	// TWO-PHASE RECLAIM (2026-11-07): phase A UNREGISTERS AND UNINDEXES the
+	// file before phase B attempts the deletion, so a failed deletion leaves
+	// the file ON DISK with NO in-memory reference (the registration is gone,
+	// the record has left the physical index) and its path queued in
+	// pendingUnlink for the next sweep. What a failed unlink must still retain
+	// is the FILE itself and its DURABLE BYTES -- which is what the restart
+	// below proves.
 	require.False(t, walIndexHasCopy(qw, key),
 		"the record must have left the physical index")
-	require.Contains(t, qw.oldFiles, fileNum)
+	require.NotContains(t, qw.oldFiles, fileNum,
+		"a failed deletion leaves the file unregistered (phase A already ran)")
+	qw.oldFilesMutex.RLock()
+	pending := append([]string(nil), qw.pendingUnlink...)
+	qw.oldFilesMutex.RUnlock()
+	require.Contains(t, pending, path,
+		"the failed path must be queued for the next sweep")
 
 	// Acks are process-volatile, and a RESTART is what models that: the boot
 	// rebuilds the physical index from the durable bytes. So the record is

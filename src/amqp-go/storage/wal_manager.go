@@ -393,6 +393,29 @@ type QueueWAL struct {
 	oldFiles      map[uint64]*walFileInfo
 	oldFilesMutex sync.RWMutex
 
+	// pendingUnlink holds the PATHS of sealed WAL files the reclaim sweep has
+	// already UNREGISTERED (removed from oldFiles) and UNINDEXED (its records
+	// removed from the sharded index) but whose physical deletion did not yet
+	// succeed. It is the retry ledger for the reclaim's PHASE B: the os.Remove
+	// syscall runs OUTSIDE every index-shard lock and outside fileMutex so a
+	// slow unlink can never stall the group-commit's indexRecord, and a unlink
+	// that fails (or a crash before it runs) leaves the file on disk with no
+	// in-memory reference to it.
+	//
+	// GUARDED BY oldFilesMutex. The ledger is only ever mutated by the reclaim
+	// sweep, of which there is exactly one in production (cleanupLoop), so the
+	// mutex is for the concurrent-sweep tests and for the invariant that the
+	// slice is never read while written.
+	//
+	// ORPHAN SAFETY: a path left here (crash between phase A and phase B) is a
+	// <digits>.wal file whose every record was acknowledged. rebuildBootState
+	// re-enumerates exactly those names at boot and re-indexes the file, so an
+	// unreferenced orphan is TOLERATED (it is re-registered, not refused) and
+	// its all-acked records are simply redelivered -- the same at-least-once
+	// duplicate today's "crash before the unlink" already produces. No boot
+	// path treats an unknown <digits>.wal as fatal.
+	pendingUnlink []string
+
 	// File handle cache for old WAL files (avoids open/close per read)
 	oldFileCache      map[uint64]*os.File
 	oldFileCacheMutex sync.RWMutex
@@ -4788,11 +4811,42 @@ func (qw *QueueWAL) cleanupLoop() {
 // tryReclaimOldFiles reclaims sealed WAL files whose valid physical inventory
 // has no unacknowledged records. Retention time never authorizes deletion:
 // unacknowledged data remains until it is acknowledged, regardless of age.
+//
+// TWO PHASES, WITH NO SYSCALL-HEAVY WORK UNDER A LOCK (2026-11-07).
+//
+// PHASE A (under every index shard's write lock + oldFilesMutex): decide
+// eligibility, close the cached descriptor, UNINDEX the file's records, and
+// remove the file's registration from oldFiles. Phase A performs NO filesystem
+// mutation beyond the descriptor close.
+//
+// PHASE B (after every lock is released): the actual os.Remove of each
+// reclaimed path. The unlink is a large APFS extent-free transaction that
+// competes with the group-commit's fence transactions; if it ran while every
+// shard's write lock was held, the committer -- which needs ONE shard lock for
+// indexRecord while holding fileMutex -- would stall, and every confirm and
+// durable delivery behind it would freeze with it (measured: 516 ms of syscall
+// delay per 6 s window, confirm p99.9 431 ms).
+//
+// SOUNDNESS OF THE SPLIT. Sealed readers hold their shard's read lock through
+// ReadAt (see withOldFileHandle), so phase A's all-shard write section proves no
+// reader is inside a file it is about to unregister, and after phase A no index
+// entry or registration points at the file -- so no NEW reader can reach it.
+// The phase-B unlink of an unreferenced path therefore cannot race a read.
+//
+// SEMANTICS CHANGE ON UNLINK FAILURE. The old code left a file whose unlink
+// failed REGISTERED AND INDEXED so the next sweep could retry it. Now phase A
+// has already unregistered and unindexed it, so a failed unlink leaves the file
+// ON DISK with no in-memory reference; the path is recorded in pendingUnlink
+// and retried on the next tick. Nothing live is lost: the file is only ever a
+// reclaim CANDIDATE when every record in it is acknowledged, and a restart
+// before the retry succeeds re-indexes the file at boot (rebuildBootState
+// enumerates <digits>.wal) -- the same at-least-once redelivery a crash before
+// the unlink already produced.
 func (qw *QueueWAL) tryReclaimOldFiles() {
-	// EVERY SHARD'S WRITE LOCK, IN ASCENDING ORDER. This is the sharded
-	// equivalent of the old single global index lock: it excludes the sealed
-	// readers through their ReadAt (so no reader is inside a file that is
-	// being unlinked) and prevents a late acknowledgement from acquiring a
+	// PHASE A — EVERY SHARD'S WRITE LOCK, IN ASCENDING ORDER. This is the
+	// sharded equivalent of the old single global index lock: it excludes the
+	// sealed readers through their ReadAt (so no reader is inside a file that
+	// is being unlinked) and prevents a late acknowledgement from acquiring a
 	// copy while its file is reclaimed.
 	//
 	// The lock order is shard -> oldFilesMutex, which is the order the
@@ -4800,7 +4854,7 @@ func (qw *QueueWAL) tryReclaimOldFiles() {
 	qw.lockAllIndexShards()
 	qw.oldFilesMutex.Lock()
 
-	unlinkedAny := false
+	var toUnlink []string
 	for fileNum, info := range qw.oldFiles {
 		// oldFiles normally contains sealed files only. Keep the explicit active
 		// guard so a malformed registration can never make the writer's file a
@@ -4827,16 +4881,9 @@ func (qw *QueueWAL) tryReclaimOldFiles() {
 		}
 
 		// Readers of sealed files hold their shard's read lock through ReadAt,
-		// so no cached descriptor is in use here. If unlink fails the registration
-		// and every index entry remain intact; the handle is lazily reopened for
-		// the next read and the next sweep retries the unlink.
+		// so no cached descriptor is in use here. The descriptor close is the
+		// ONLY syscall phase A performs.
 		qw.closeOldFileHandle(fileNum)
-		if err := walUnlink(info.path); err != nil && !errors.Is(err, fs.ErrNotExist) {
-			qw.logError("fully-acknowledged WAL file could not be unlinked; it stays registered and indexed for retry",
-				interfaces.LogField{Key: "path", Value: info.path},
-				interfaces.LogField{Key: "error", Value: err.Error()})
-			continue
-		}
 
 		for _, record := range info.inv.records {
 			// EVERY SHARD'S WRITE LOCK IS HELD HERE (see the top of this
@@ -4852,11 +4899,56 @@ func (qw *QueueWAL) tryReclaimOldFiles() {
 			qw.shardForTag(record.deliveryTag).unindexRecordLocked(record)
 		}
 		delete(qw.oldFiles, fileNum)
-		unlinkedAny = true
+		toUnlink = append(toUnlink, info.path)
 	}
 
 	qw.oldFilesMutex.Unlock()
 	qw.unlockAllIndexShards()
+
+	// PHASE B — the deletions, with NO index shard lock and NO fileMutex held.
+	qw.reclaimUnlinkPass(toUnlink)
+}
+
+// reclaimUnlinkPass performs the physical deletions of a reclaim sweep's phase
+// A candidates plus any paths a previous sweep could not delete, and makes the
+// directory mutations durable once.
+//
+// IT MUST NEVER BE CALLED WITH AN INDEX SHARD LOCK OR fileMutex HELD: the whole
+// point of splitting the reclaim is that the unlink syscall runs outside them.
+//
+// The ledger (pendingUnlink) is swapped out and the failures written back under
+// oldFilesMutex; the walUnlink calls themselves run OUTSIDE that mutex so a slow
+// unlink cannot block a sealed reader taking oldFilesMutex.RLock.
+func (qw *QueueWAL) reclaimUnlinkPass(newPaths []string) {
+	qw.oldFilesMutex.Lock()
+	paths := make([]string, 0, len(qw.pendingUnlink)+len(newPaths))
+	paths = append(paths, qw.pendingUnlink...)
+	paths = append(paths, newPaths...)
+	qw.pendingUnlink = nil
+	qw.oldFilesMutex.Unlock()
+
+	if len(paths) == 0 {
+		return
+	}
+
+	unlinkedAny := false
+	var failed []string
+	for _, path := range paths {
+		if err := walUnlink(path); err != nil && !errors.Is(err, fs.ErrNotExist) {
+			failed = append(failed, path)
+			qw.logError("fully-acknowledged WAL file could not be unlinked; it is already unregistered and unindexed, so the file is orphaned on disk until a later sweep retries",
+				interfaces.LogField{Key: "path", Value: path},
+				interfaces.LogField{Key: "error", Value: err.Error()})
+			continue
+		}
+		unlinkedAny = true
+	}
+
+	if len(failed) > 0 {
+		qw.oldFilesMutex.Lock()
+		qw.pendingUnlink = append(qw.pendingUnlink, failed...)
+		qw.oldFilesMutex.Unlock()
+	}
 
 	// Make this sweep's directory mutations durable exactly once. The reclaim
 	// is already complete in memory even if this barrier fails; only fully acked
