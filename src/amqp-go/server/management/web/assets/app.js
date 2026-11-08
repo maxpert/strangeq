@@ -35,6 +35,17 @@
    * config value (javascript:, data:, vbscript:, an off-origin
    * scheme-relative URL) is rejected so it can never be promoted into a link. */
   var METRICS_URL = /^https?:[/][/]/i.test(CONFIG.metricsUrl || '') ? CONFIG.metricsUrl : '';
+  /* METRICS_API is the same-origin, auth-gated data source for the Metrics
+   * screen: the management listener's JSON {text} wrapper around the process
+   * registry scrape. connect-src 'self' covers it, so the CSP is untouched.
+   * METRICS_URL above stays the RAW Prometheus URL (a different listener),
+   * injected CSP-safely as <meta name="sq-config">; it is rendered only as a
+   * plain new-tab link and is NEVER fetched. */
+  var METRICS_API = API + "/metrics";
+  /* nowMs is the deterministic clock seam for the metrics rate derivation: a
+   * headless test installs CONFIG.nowMs as a counter so rates are exact with no
+   * sleeps. Only state.metrics uses it; the refresh chrome keeps Date.now(). */
+  function nowMs() { return typeof CONFIG.nowMs === "function" ? CONFIG.nowMs() : Date.now(); }
   var DEFAULT_REFRESH_MS = CONFIG.refreshInterval || 5000;
   var S1_REFRESH_MS = CONFIG.s1RefreshInterval || 2000;
   var MAX_BACKOFF_MS = 30000;
@@ -60,6 +71,7 @@
     degraded: null,
     health: null,
     samples: {},
+    metrics: { filter: "", samples: {}, model: null, tiles: null, text: "", at: 0 },
     refresh: {
       timer: 0,
       base: DEFAULT_REFRESH_MS,
@@ -885,6 +897,7 @@
       case "users": r.screen = "users"; break;
       case "permissions": r.screen = "permissions"; break;
       case "definitions": r.screen = "definitions"; break;
+      case "metrics": r.screen = "metrics"; break;
       case "about": r.screen = "about"; break;
       case "search": r.screen = "search"; break;
       default: r.screen = "notfound";
@@ -1853,7 +1866,11 @@
         ["DIV-close", "close connection sends connection.close 320 with the operator reason; the peer is force-closed only if it does not reply close-ok within 3 s"],
         ["DIV-channel", "channel prefetch_count/transactional are real lock-free atomics; state=closing is observable only while the channel is still registered"],
         ["DIV-channel-id", "GET /api/channels/{id} takes the canonical {connection}:{number} composite; a bare channel number is accepted only when it is unambiguous and is otherwise a deterministic 404 (tooling should use the composite form)"],
-        ["DIV-15", "unanswerable health checks return 501, not a fake 200"]
+        ["DIV-15", "unanswerable health checks return 501, not a fake 200"],
+        ["DIV-metrics-1", "two /metrics: on the telemetry listener /metrics is the unauthenticated Prometheus text; on the management listener /metrics is the SPA deep link. Different origins, different content"],
+        ["DIV-metrics-2", "/api/metrics is a StrangeQ extension with no RabbitMQ counterpart; the JSON {text} wrapper is ours"],
+        ["DIV-metrics-3", "a management Metrics-tab refresh increments promhttp_metric_handler_requests_total because ScrapeText uses the shared instrumented handler"],
+        ["DIV-metrics-4", "the raw /metrics link is absent when metricsUrl is unset (telemetry disabled or a wildcard bind); the in-SPA matrix is same-origin and still works"]
       ];
       container.replaceChildren(h("div", { class: "screen screen-about" }, [
         h("div", { class: "page-head" }, [h("h1", { text: "About / Capabilities" })]),
@@ -2301,6 +2318,671 @@
     });
   }
 
+  /* ----------------------------------------------------------- metrics ----- */
+
+  /* Hard caps (spec mgmt-07 §6.3): truthful truncation, never a partial matrix
+   * presented as complete. */
+  var METRICS_MAX_BYTES = 8 * 1024 * 1024;
+  var METRICS_MAX_FAMILIES = 400;
+  var METRICS_MAX_SERIES = 2000;
+  var METRICS_MAX_SERIES_PER_FAMILY = 200;
+
+  /* Ordered prefix table (spec §4.3): first prefix match wins; anything left
+   * lands in "Other" so a new family is never dropped. */
+  var METRIC_GROUPS = [
+    ["Broker \u2014 connections", ["amqp_connections_", "amqp_connection_errors_"]],
+    ["Broker \u2014 channels", ["amqp_channels_", "amqp_channel_errors_"]],
+    ["Broker \u2014 consumers", ["amqp_consumers_"]],
+    ["Broker \u2014 exchanges", ["amqp_exchanges_"]],
+    ["Broker \u2014 queues", ["amqp_queues_", "amqp_queue_"]],
+    ["Broker \u2014 messages", ["amqp_messages_", "amqp_message_"]],
+    ["Broker \u2014 hot cache", ["amqp_hot_cache_"]],
+    ["Back-pressure", ["amqp_publisher_par", "amqp_publish_lease_", "amqp_depth_gate", "amqp_reader_paused"]],
+    ["Durability \u2014 WAL", ["amqp_wal_"]],
+    ["Durability \u2014 segments", ["amqp_segment_"]],
+    ["Recovery", ["amqp_recovery_", "amqp_unsafe_recovery_"]],
+    ["Resources", ["amqp_disk_", "amqp_memory_", "amqp_goroutines_", "amqp_file_descriptors_", "amqp_resource_alarm_"]],
+    ["Authentication", ["amqp_auth_failures_"]],
+    ["Transactions", ["amqp_transactions_"]],
+    ["Server", ["amqp_server_", "amqp_build_info", "amqp_panics_", "amqp_shutdown_", "amqp_storage_close_"]],
+    ["Management surface", ["amqp_management_"]],
+    ["Go runtime", ["go_"]],
+    ["Process", ["process_"]],
+    ["Scrape handler", ["promhttp_"]]
+  ];
+
+  function metricGroup(name) {
+    for (var i = 0; i < METRIC_GROUPS.length; i++) {
+      var prefixes = METRIC_GROUPS[i][1];
+      for (var j = 0; j < prefixes.length; j++) {
+        if (name.indexOf(prefixes[j]) === 0) return METRIC_GROUPS[i][0];
+      }
+    }
+    return "Other";
+  }
+
+  function unescapeLabel(v) {
+    var out = "";
+    for (var i = 0; i < v.length; i++) {
+      var c = v.charAt(i);
+      if (c === "\\" && i + 1 < v.length) {
+        var nx = v.charAt(i + 1);
+        if (nx === "\\") { out += "\\"; i++; continue; }
+        if (nx === '"') { out += '"'; i++; continue; }
+        if (nx === "n") { out += "\n"; i++; continue; }
+        out += c;
+        continue;
+      }
+      out += c;
+    }
+    return out;
+  }
+
+  /* parseSampleLine parses "name{k=\"v\",k2=\"v2\"} value". It returns null for
+   * a malformed line so the caller can skip it rather than invent data. */
+  function parseSampleLine(line) {
+    var i = 0, n = line.length;
+    while (i < n && line.charAt(i) !== "{" && line.charAt(i) !== " " && line.charAt(i) !== "\t") i++;
+    var name = line.slice(0, i);
+    if (!name) return null;
+    var labels = {};
+    if (line.charAt(i) === "{") {
+      i++;
+      while (i < n && line.charAt(i) !== "}") {
+        while (i < n && (line.charAt(i) === " " || line.charAt(i) === "\t" || line.charAt(i) === ",")) i++;
+        if (line.charAt(i) === "}") break;
+        var keyStart = i;
+        while (i < n && line.charAt(i) !== "=") i++;
+        var key = line.slice(keyStart, i).trim();
+        i++;
+        if (line.charAt(i) !== '"') return null;
+        i++;
+        var buf = "";
+        while (i < n && line.charAt(i) !== '"') {
+          if (line.charAt(i) === "\\" && i + 1 < n) { buf += line.charAt(i) + line.charAt(i + 1); i += 2; continue; }
+          buf += line.charAt(i);
+          i++;
+        }
+        i++;
+        if (key) labels[key] = unescapeLabel(buf);
+      }
+      i++;
+    }
+    while (i < n && (line.charAt(i) === " " || line.charAt(i) === "\t")) i++;
+    var rest = line.slice(i).trim();
+    if (rest === "") return null;
+    var sp = rest.indexOf(" ");
+    var raw = sp < 0 ? rest : rest.slice(0, sp);
+    return { name: name, labels: labels, raw: raw, value: parseFloat(raw) };
+  }
+
+  /* parseProm is a pure, dependency-free Prometheus text parser (spec §4). It
+   * has no DOM access and is exposed on window.SQ for the headless tests. */
+  function parseProm(text) {
+    var lines = String(text).split("\n");
+    var help = {}, type = {};
+    var incoming = [];
+    for (var i = 0; i < lines.length; i++) {
+      var line = lines[i];
+      if (line === "" || line.charAt(0) === "\r") continue;
+      if (line.charAt(0) === "#") {
+        var m = line.match(/^#\s+(HELP|TYPE)\s+([a-zA-Z_:][a-zA-Z0-9_:]*)\s?(.*)$/);
+        if (m) {
+          if (m[1] === "HELP") help[m[2]] = m[3];
+          else type[m[2]] = m[3].trim();
+        }
+        continue;
+      }
+      var s = parseSampleLine(line);
+      if (s) incoming.push(s);
+    }
+    var byName = {};
+    var order = [];
+    for (var j = 0; j < incoming.length; j++) {
+      var smp = incoming[j];
+      var fname = smp.name;
+      if (!type[fname]) {
+        var base = fname.replace(/^(.+?)(_bucket|_sum|_count)$/, "$1");
+        if (base !== fname && (type[base] === "histogram" || type[base] === "summary")) fname = base;
+      }
+      var fam = byName[fname];
+      if (!fam) {
+        var declared = type[fname] || (/_total$/.test(fname) ? "counter" : "untyped");
+        fam = { name: fname, type: declared, help: help[fname] || "", group: metricGroup(fname), series: 0, samples: [] };
+        byName[fname] = fam;
+        order.push(fname);
+      }
+      fam.samples.push(smp);
+      fam.series = fam.samples.length;
+    }
+    var families = order.map(function (name) { return byName[name]; });
+    families.sort(function (a, b) { return a.name < b.name ? -1 : (a.name > b.name ? 1 : 0); });
+    var totalSeries = 0;
+    for (var k = 0; k < families.length; k++) totalSeries += families[k].series;
+    return { families: families, familyCount: families.length, totalSeries: totalSeries, bytes: String(text).length };
+  }
+
+  /* Deterministic formatting (spec §4.2): no toLocaleString anywhere. */
+  function groupInt(n) {
+    var v = Number(n);
+    if (isNaN(v) || !isFinite(v)) return String(n);
+    if (Math.floor(v) !== v) return String(v);
+    var s = String(v);
+    var neg = s.charAt(0) === "-";
+    if (neg) s = s.slice(1);
+    var out = "";
+    var c = 0;
+    for (var i = s.length - 1; i >= 0; i--) {
+      out = s.charAt(i) + out;
+      c++;
+      if (c % 3 === 0 && i > 0) out = "," + out;
+    }
+    return (neg ? "-" : "") + out;
+  }
+
+  function fmtRate(v) {
+    if (v === null || v === undefined || typeof v !== "number" || !isFinite(v)) return DASH;
+    return v.toFixed(2) + "/s";
+  }
+
+  function fmtBytes(v) {
+    if (v === null || v === undefined) return DASH;
+    var n = Number(v);
+    if (isNaN(n) || !isFinite(n)) return String(v);
+    var units = ["B", "KiB", "MiB", "GiB", "TiB"];
+    var x = Math.abs(n);
+    var i = 0;
+    while (x >= 1024 && i < units.length - 1) { x = x / 1024; i++; }
+    var mag = i === 0 ? groupInt(Math.round(n)) : x.toFixed(1);
+    return mag + " " + units[i];
+  }
+
+  function fmtDurationStr(seconds) {
+    if (seconds === null || seconds === undefined) return DASH;
+    var s = Number(seconds);
+    if (isNaN(s) || !isFinite(s)) return String(seconds);
+    if (s < 60) return s + "s";
+    if (s < 3600) return Math.floor(s / 60) + "m" + (s % 60) + "s";
+    if (s < 86400) return Math.floor(s / 3600) + "h" + Math.floor((s % 3600) / 60) + "m";
+    return Math.floor(s / 86400) + "d" + Math.floor((s % 86400) / 3600) + "h";
+  }
+
+  /* The vital-stat tiles (spec §5.1), rendered in declaration order and grouped
+   * into three rows. Every tile is a selector evaluated against the parsed
+   * text; nothing here is a literal metric value. */
+  var VITALS = [
+    { id: "pub_rate", label: "Messages in", group: "Throughput", sel: "rate(amqp_messages_published_total)", render: "rate", sev: null },
+    { id: "deliv_rate", label: "Messages out", group: "Throughput", sel: "rate(amqp_messages_delivered_total)", render: "rate", sev: null },
+    { id: "pub_bps", label: "Bytes in", group: "Throughput", sel: "rate(amqp_messages_published_bytes_total)", render: "bytesrate", sev: null },
+    { id: "deliv_bps", label: "Bytes out", group: "Throughput", sel: "rate(amqp_messages_delivered_bytes_total)", render: "bytesrate", sev: null },
+    { id: "ack_rate", label: "Acked", group: "Throughput", sel: "rate(amqp_messages_acknowledged_total)", render: "rate", sev: null },
+    { id: "uptime", label: "Uptime", group: "Throughput", sel: "amqp_server_uptime_seconds", render: "duration", sev: null },
+
+    { id: "connections", label: "Connections", group: "Topology", sel: "amqp_connections_total", render: "count", sev: null },
+    { id: "channels", label: "Channels", group: "Topology", sel: "amqp_channels_total", render: "count", sev: null },
+    { id: "consumers", label: "Consumers", group: "Topology", sel: "amqp_consumers_total", render: "count", sev: null },
+    { id: "queues", label: "Queues", group: "Topology", sel: "amqp_queues_total", render: "count", sev: null },
+    { id: "exchanges", label: "Exchanges", group: "Topology", sel: "amqp_exchanges_total", render: "count", sev: null },
+    { id: "ready", label: "Messages ready", group: "Topology", sel: "sum(amqp_queue_messages_ready)", render: "count", sev: null },
+    { id: "max_depth", label: "Max queue depth", group: "Topology", sel: "max(amqp_queue_depth_high_water)", render: "count", sev: null },
+    { id: "inflight", label: "In flight", group: "Topology", sel: "amqp_messages_inflight", render: "count", sev: null },
+    { id: "parked_now", label: "Publishers parked", group: "Topology", sel: "amqp_publisher_parked_current", render: "count", sev: "warn" },
+    { id: "depth_gated", label: "Depth-gated conns", group: "Topology", sel: "amqp_depth_gated_current", render: "count", sev: "warn" },
+    { id: "reader_paused", label: "Readers paused", group: "Topology", sel: "amqp_reader_paused_current", render: "count", sev: "warn" },
+
+    { id: "alarms", label: "Resource alarms", group: "Health", sel: "max(amqp_resource_alarm_active)", render: "alarm", sev: "alarm" },
+    { id: "unsafe_artifacts", label: "Unsafe-recovery discards", group: "Health", sel: "amqp_unsafe_recovery_discarded_artifacts", render: "count", sev: "bad" },
+    { id: "recovery_faults", label: "Recovery faults", group: "Health", sel: "sum(amqp_recovery_faults_total{outcome!=\"benign\"})", render: "count", sev: "bad" },
+    { id: "recovery_discarded", label: "Recovery discards", group: "Health", sel: "sum(amqp_recovery_discarded_records_total)", render: "count", sev: "bad" },
+    { id: "unroutable", label: "Unroutable", group: "Health", sel: "amqp_messages_unroutable_total", render: "count", sev: "bad" },
+    { id: "refused", label: "Publish refused", group: "Health", sel: "sum(amqp_publish_refused_total)", render: "count", sev: "bad" },
+    { id: "dropped", label: "Deliveries dropped", group: "Health", sel: "sum(amqp_deliveries_dropped_total)", render: "count", sev: "bad" },
+    { id: "redelivered", label: "Redelivered", group: "Health", sel: "amqp_messages_redelivered_total", render: "count", sev: "warn" },
+    { id: "rejected", label: "Rejected", group: "Health", sel: "amqp_messages_rejected_total", render: "count", sev: "warn" },
+    { id: "conn_errors", label: "Connection errors", group: "Health", sel: "sum(amqp_connection_errors_total)", render: "count", sev: "bad" },
+    { id: "chan_errors", label: "Channel errors", group: "Health", sel: "sum(amqp_channel_errors_total)", render: "count", sev: "bad" },
+    { id: "auth_failures", label: "Auth failures", group: "Health", sel: "sum(amqp_auth_failures_total)", render: "count", sev: "warn" },
+    { id: "wal_write_errors", label: "WAL write errors", group: "Health", sel: "amqp_wal_write_errors_total", render: "count", sev: "bad" },
+    { id: "wal_fsync_errors", label: "WAL fsync errors", group: "Health", sel: "amqp_wal_fsync_errors_total", render: "count", sev: "bad" },
+    { id: "wal_full_flush", label: "WAL full flushes", group: "Health", sel: "sum(amqp_wal_full_flush_total)", render: "count", sev: null },
+    { id: "wal_files", label: "WAL files", group: "Health", sel: "amqp_wal_files", render: "count", sev: null },
+    { id: "segment_read_errors", label: "Segment read errors", group: "Health", sel: "amqp_segment_read_errors_total", render: "count", sev: "bad" },
+    { id: "segment_fsync_errors", label: "Segment fsync errors", group: "Health", sel: "amqp_segment_fsync_errors_total", render: "count", sev: "bad" },
+    { id: "segment_compaction_failures", label: "Segment compaction withdrawn", group: "Health", sel: "amqp_segment_compaction_failures_total", render: "count", sev: "bad" },
+    { id: "panics", label: "Recovered panics", group: "Health", sel: "sum(amqp_panics_total)", render: "count", sev: "bad" },
+    { id: "storage_close_errors", label: "Storage close errors", group: "Health", sel: "amqp_storage_close_errors_total", render: "count", sev: "bad" },
+    { id: "shutdown_incomplete", label: "Incomplete shutdowns", group: "Health", sel: "amqp_shutdown_total{result=\"incomplete\"}", render: "count", sev: "bad" },
+    { id: "mgmt_5xx", label: "Management 5xx", group: "Health", sel: "sum(amqp_management_requests_total{status_class=\"5xx\"})", render: "count", sev: "bad" },
+    { id: "mgmt_rate_limited", label: "Management rate-limited", group: "Health", sel: "amqp_management_rate_limited_total", render: "count", sev: "bad" },
+    { id: "lease_leaked", label: "Publish leases leaked", group: "Health", sel: "amqp_publish_lease_leaked_total", render: "count", sev: "bad" },
+    { id: "disk_free", label: "Disk free", group: "Health", sel: "amqp_disk_free_bytes", render: "bytes", sev: null },
+    { id: "memory_used", label: "Memory used", group: "Health", sel: "amqp_memory_used_bytes", render: "bytes", sev: null },
+    { id: "goroutines", label: "Goroutines", group: "Health", sel: "amqp_goroutines_total", render: "count", sev: null }
+  ];
+
+  function parseSelector(selText) {
+    var out = { agg: "none", rate: false, name: "", filter: null };
+    var s = String(selText).trim();
+    var m = s.match(/^(rate|sum|max)\((.*)\)$/);
+    if (m) {
+      if (m[1] === "rate") out.rate = true;
+      else out.agg = m[1];
+      s = m[2].trim();
+    }
+    var fm = s.match(/^([a-zA-Z_:][a-zA-Z0-9_:]*)\s*(?:\{(.*)\})?$/);
+    if (!fm) return null;
+    out.name = fm[1];
+    if (fm[2] !== undefined && fm[2] !== null && fm[2] !== "") {
+      var lm = fm[2].match(/^\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*(!=|=)\s*"((?:[^"\\]|\\.)*)"\s*$/);
+      if (lm) out.filter = { label: lm[1], op: lm[2], value: unescapeLabel(lm[3]) };
+    }
+    return out;
+  }
+
+  function familyByName(model, name) {
+    if (!model) return null;
+    for (var i = 0; i < model.families.length; i++) {
+      if (model.families[i].name === name) return model.families[i];
+    }
+    return null;
+  }
+
+  function matchingSamples(fam, filter) {
+    var out = [];
+    for (var i = 0; i < fam.samples.length; i++) {
+      var smp = fam.samples[i];
+      if (filter) {
+        var v = smp.labels[filter.label];
+        if (filter.op === "=") { if (v !== filter.value) continue; }
+        else if (v === filter.value) continue;
+      }
+      out.push(smp);
+    }
+    return out;
+  }
+
+  function buildSamples(model, at) {
+    var out = {};
+    for (var i = 0; i < model.families.length; i++) {
+      var f = model.families[i];
+      var sum = 0;
+      for (var j = 0; j < f.samples.length; j++) {
+        if (!isFinite(f.samples[j].value)) { sum = NaN; break; }
+        sum += f.samples[j].value;
+      }
+      out[f.name] = { value: sum, at: at };
+    }
+    return out;
+  }
+
+  /* evalTile returns {found, value}: found is false when the family is absent
+   * or the arithmetic is undefined, so the tile renders an em-dash, never a
+   * fabricated zero or Infinity (spec §5.2). */
+  function evalTile(model, selText, ctx) {
+    var sel = parseSelector(selText);
+    if (!sel) return { found: false };
+    if (sel.rate) {
+      var p = ctx.prev[sel.name];
+      var c = ctx.curr[sel.name];
+      if (!p || !c) return { found: false };
+      if (!isFinite(p.value) || !isFinite(c.value)) return { found: false };
+      var dt = (c.at - p.at) / 1000;
+      if (dt <= 0) return { found: false };
+      if (c.value < p.value) return { found: false };
+      return { found: true, value: (c.value - p.value) / dt };
+    }
+    var fam = familyByName(model, sel.name);
+    if (!fam) return { found: false };
+    var matches = matchingSamples(fam, sel.filter);
+    if (!matches.length) return { found: false };
+    var acc = 0;
+    for (var i = 0; i < matches.length; i++) {
+      if (!isFinite(matches[i].value)) return { found: false };
+      if (sel.agg === "max") acc = i === 0 ? matches[i].value : Math.max(acc, matches[i].value);
+      else acc += matches[i].value;
+    }
+    return { found: true, value: acc };
+  }
+
+  function renderTile(kind, v) {
+    if (kind === "rate") return fmtRate(v);
+    if (kind === "bytesrate") return fmtBytes(v) + "/s";
+    if (kind === "bytes") return fmtBytes(v);
+    if (kind === "duration") return fmtDurationStr(v);
+    return groupInt(v);
+  }
+
+  function computeTiles(model, prev, curr) {
+    var out = [];
+    for (var i = 0; i < VITALS.length; i++) {
+      var t = VITALS[i];
+      var ev = evalTile(model, t.sel, { prev: prev, curr: curr });
+      var state = "unknown";
+      var text = DASH;
+      if (ev.found) {
+        if (t.render === "alarm") {
+          state = ev.value === 1 ? "bad" : "ok";
+          text = ev.value === 1 ? "set" : "none";
+        } else {
+          state = (t.sev && ev.value > 0) ? t.sev : "ok";
+          text = renderTile(t.render, ev.value);
+        }
+      }
+      out.push({ id: t.id, label: t.label, group: t.group, state: state, text: text });
+    }
+    return out;
+  }
+
+  function metricCardEl(t) {
+    return h("div", { class: "card", dataset: { tile: t.id, severity: "unknown" } }, [
+      h("div", { class: "card-value", id: "metrics-tile-" + t.id, text: DASH, title: "not emitted by this broker" }),
+      h("div", { class: "card-label", text: t.label }),
+      h("span", { class: "card-sev", text: DASH })
+    ]);
+  }
+
+  function pad2(n) { return (n < 10 ? "0" : "") + n; }
+
+  function buildMetricsSkeleton(container, route) {
+    var groups = ["Throughput", "Topology", "Health"];
+    var rows = groups.map(function (g) {
+      var cards = h("div", { class: "cards", dataset: { group: g } });
+      VITALS.forEach(function (t) { if (t.group === g) cards.appendChild(metricCardEl(t)); });
+      return h("div", { class: "card-group" }, [h("h2", { text: g }), cards]);
+    });
+
+    var filter = h("input", {
+      id: "metrics-filter", type: "search", "aria-label": "Filter metric families",
+      placeholder: "Filter families by name", autocomplete: "off"
+    });
+    filter.value = state.metrics.filter || "";
+    filter.addEventListener("input", function () {
+      state.metrics.filter = filter.value;
+      renderMetricsFamilies(container, state.metrics.model, isRawView());
+    });
+    var count = h("span", { id: "metrics-filter-count", class: "null" });
+    var toolbar = h("form", { class: "toolbar" }, [filter, count]);
+    toolbar.addEventListener("submit", function (ev) { ev.preventDefault(); });
+
+    var toggle = h("button", { type: "button", id: "metrics-view-toggle", text: "Raw text" });
+    toggle.addEventListener("click", function () {
+      navigate(listHref(state.route, { view: isRawView() ? "" : "raw" }));
+    });
+
+    var rawLink = METRICS_URL ? h("a", {
+      id: "metrics-raw-endpoint", href: METRICS_URL, target: "_blank", rel: "noopener",
+      title: "Open the raw Prometheus endpoint"
+    }, [h("button", { type: "button", text: "Raw endpoint" })]) : null;
+
+    var screen = h("div", { class: "screen screen-metrics", id: "metrics-screen" }, [
+      h("div", { class: "page-head" }, [
+        h("h1", { text: "Metrics" }),
+        h("span", { class: "spacer" }),
+        h("span", { id: "metrics-scraped", class: "null" }),
+        rawLink,
+        toggle
+      ]),
+      h("div", { id: "metrics-notice" }),
+      h("div", { id: "metrics-truncation", hidden: true }),
+      h("div", { id: "metrics-vitals" }, rows),
+      toolbar,
+      h("div", { id: "metrics-families" }),
+      h("div", { id: "metrics-raw", hidden: true }, [h("pre", { class: "payload" })])
+    ]);
+    container.replaceChildren(screen);
+  }
+
+  function ensureMetricsSkeleton(container, route) {
+    if (!container.querySelector("#metrics-screen")) buildMetricsSkeleton(container, route);
+  }
+
+  function isRawView() {
+    return !!(state.route && state.route.query && state.route.query.get("view") === "raw");
+  }
+
+  function setMetricsNotice(container, text, kind) {
+    var el = container.querySelector("#metrics-notice");
+    if (!el) return;
+    el.className = kind === "danger" ? "notice permission" : (kind === "warn" ? "notice" : "notice empty");
+    el.dataset.severity = kind || "ok";
+    el.replaceChildren(h("p", { text: text }));
+  }
+
+  function renderMetricsNotice(container, tiles, model) {
+    var el = container.querySelector("#metrics-notice");
+    if (!el) return;
+    if (!tiles) { el.className = "notice empty"; el.replaceChildren(); return; }
+    var hasAmqp = model && model.families.some(function (f) { return f.name.indexOf("amqp_") === 0; });
+    if (!hasAmqp) {
+      el.className = "notice empty";
+      el.dataset.severity = "unknown";
+      el.replaceChildren(h("p", { text: "the endpoint emitted no amqp_* families; there is nothing truthful to show." }));
+      return;
+    }
+    var bad = tiles.filter(function (t) { return t.state === "bad"; });
+    var warn = tiles.filter(function (t) { return t.state === "warn"; });
+    if (bad.length) {
+      el.className = "notice permission";
+      el.dataset.severity = "bad";
+      el.replaceChildren(h("p", { class: "error", text: bad.length + " vital signal(s) need attention: " + bad.map(function (t) { return t.label; }).join(", ") }));
+      return;
+    }
+    if (warn.length) {
+      el.className = "notice";
+      el.dataset.severity = "warn";
+      el.replaceChildren(h("p", { text: warn.length + " vital signal(s) are noise-grade: " + warn.map(function (t) { return t.label; }).join(", ") }));
+      return;
+    }
+    el.className = "notice empty";
+    el.dataset.severity = "ok";
+    var unknown = tiles.filter(function (t) { return t.state === "unknown"; });
+    el.replaceChildren(h("p", { text: "No bad vital signals; " + unknown.length + " of " + tiles.length + " signals unknown." }));
+  }
+
+  function renderMetricsVitals(container, tiles) {
+    if (!tiles) return;
+    for (var i = 0; i < tiles.length; i++) {
+      var t = tiles[i];
+      var card = container.querySelector('.card[data-tile="' + t.id + '"]');
+      if (!card) continue;
+      card.dataset.severity = t.state;
+      var value = card.querySelector(".card-value");
+      if (value) {
+        value.textContent = t.text;
+        value.title = (t.state === "unknown") ? "not emitted by this broker" : "";
+      }
+      var sev = card.querySelector(".card-sev");
+      if (sev) sev.textContent = t.state === "unknown" ? DASH : t.state;
+    }
+  }
+
+  function metricFamilyNode(f) {
+    var header = h("h3", null, [
+      h("span", { text: f.name }),
+      h("span", { class: "badge", text: f.type }),
+      h("span", { class: "metric-group", text: f.group }),
+      h("span", { class: "null", text: " " + f.series + " series" })
+    ]);
+    var unlabelled = f.series === 1 && Object.keys(f.samples[0].labels).length === 0;
+    var body;
+    var rendered = 0;
+    var capped = false;
+    if (unlabelled) {
+      body = h("span", { class: "metric-single-value", text: f.samples[0].raw });
+      rendered = 1;
+    } else {
+      var limit = Math.min(f.samples.length, METRICS_MAX_SERIES_PER_FAMILY);
+      if (f.samples.length > METRICS_MAX_SERIES_PER_FAMILY) capped = true;
+      var rows = [];
+      for (var i = 0; i < limit; i++) {
+        var smp = f.samples[i];
+        var labelText = Object.keys(smp.labels).sort().map(function (k) {
+          return k + '="' + smp.labels[k] + '"';
+        }).join(", ");
+        rows.push(h("tr", { role: "row" }, [h("td", { text: labelText }), h("td", { text: smp.raw })]));
+      }
+      body = h("table", { class: "data-table", role: "grid" }, [
+        h("thead", null, [h("tr", null, [h("th", { text: "Labels" }), h("th", { text: "Value" })])]),
+        h("tbody", null, rows)
+      ]);
+      rendered = limit;
+    }
+    var node = h("section", { class: "metric-family", dataset: { family: f.name, group: f.group } }, [
+      header,
+      h("p", { text: f.help || "no help line" }),
+      body
+    ]);
+    return { node: node, rendered: rendered, capped: capped };
+  }
+
+  function renderMetricsFamilies(container, model, raw) {
+    var region = container.querySelector("#metrics-families");
+    var trunc = container.querySelector("#metrics-truncation");
+    var count = container.querySelector("#metrics-filter-count");
+    if (!region) return;
+    if (!model || raw) {
+      region.replaceChildren();
+      if (trunc) { trunc.hidden = true; trunc.textContent = ""; }
+      if (count) count.textContent = "";
+      return;
+    }
+    var filter = (state.metrics.filter || "").toLowerCase();
+    var cap = Math.min(model.families.length, METRICS_MAX_FAMILIES);
+    var capped = model.families.length > METRICS_MAX_FAMILIES;
+    var sections = [];
+    var shownSeries = 0;
+    var shown = 0;
+    for (var i = 0; i < cap; i++) {
+      var f = model.families[i];
+      if (shownSeries >= METRICS_MAX_SERIES) { capped = true; break; }
+      if (filter && f.name.toLowerCase().indexOf(filter) < 0) continue;
+      var res = metricFamilyNode(f);
+      if (res.capped) capped = true;
+      shownSeries += res.rendered;
+      if (shownSeries > METRICS_MAX_SERIES) capped = true;
+      sections.push(res.node);
+      shown++;
+    }
+    region.replaceChildren();
+    for (var s = 0; s < sections.length; s++) region.appendChild(sections[s]);
+    if (trunc) {
+      if (capped) {
+        trunc.hidden = false;
+        trunc.textContent = "showing " + shown + " of " + model.families.length +
+          " families (" + shownSeries + " of " + model.totalSeries + " series; hard caps " +
+          METRICS_MAX_FAMILIES + " families / " + METRICS_MAX_SERIES + " series)";
+      } else {
+        trunc.hidden = true;
+        trunc.textContent = "";
+      }
+    }
+    if (count) count.textContent = shown + " of " + model.familyCount + " families";
+  }
+
+  function renderMetricsRaw(container, text, raw) {
+    var pre = container.querySelector("#metrics-raw pre.payload");
+    if (pre) pre.textContent = raw ? (text || "") : "";
+  }
+
+  function renderMetricsScraped(container, model) {
+    var el = container.querySelector("#metrics-scraped");
+    if (!el) return;
+    if (!model) { el.textContent = ""; return; }
+    var when = state.metrics.at > 0 ? new Date(state.metrics.at) : new Date();
+    var stamp = pad2(when.getHours()) + ":" + pad2(when.getMinutes()) + ":" + pad2(when.getSeconds());
+    var kib = Math.round((state.metrics.text ? state.metrics.text.length : 0) / 1024);
+    el.textContent = "scraped " + stamp + " \u00b7 " + model.familyCount + " families \u00b7 " +
+      model.totalSeries + " series \u00b7 " + kib + " KiB";
+  }
+
+  function renderMetrics(container, route) {
+    var raw = isRawView();
+    var toggle = container.querySelector("#metrics-view-toggle");
+    if (toggle) toggle.textContent = raw ? "Matrix" : "Raw text";
+    var famRegion = container.querySelector("#metrics-families");
+    if (famRegion) famRegion.hidden = raw;
+    var rawRegion = container.querySelector("#metrics-raw");
+    if (rawRegion) rawRegion.hidden = !raw;
+    renderMetricsNotice(container, state.metrics.tiles, state.metrics.model);
+    renderMetricsVitals(container, state.metrics.tiles);
+    renderMetricsFamilies(container, state.metrics.model, raw);
+    renderMetricsRaw(container, state.metrics.text, raw);
+    renderMetricsScraped(container, state.metrics.model);
+  }
+
+  function renderMetricsUnavailable(container, route, detail, text, raw) {
+    ensureMetricsSkeleton(container, route);
+    state.metrics.model = null;
+    state.metrics.tiles = null;
+    state.metrics.text = text || "";
+    setMetricsNotice(container, detail, "danger");
+    renderMetricsVitals(container, []);
+    renderMetricsFamilies(container, null, raw);
+    renderMetricsRaw(container, text || "", raw);
+    renderMetricsScraped(container, null);
+    var toggle = container.querySelector("#metrics-view-toggle");
+    if (toggle) toggle.textContent = raw ? "Matrix" : "Raw text";
+    var famRegion = container.querySelector("#metrics-families");
+    if (famRegion) famRegion.hidden = raw;
+    var rawRegion = container.querySelector("#metrics-raw");
+    if (rawRegion) rawRegion.hidden = !raw;
+  }
+
+  function loadMetrics(container, route) {
+    var raw = isRawView();
+    return api(METRICS_API, { ifNoneMatch: state.etags.metrics }).then(function (r) {
+      if (r.status === 401) return; /* handleUnauthorized already rendered login */
+      if (r.status === 403) {
+        state.displayed = "metrics";
+        container.replaceChildren(permissionDenied(r.data));
+        return;
+      }
+      if (r.status === 501) {
+        state.displayed = "metrics";
+        renderMetricsUnavailable(container, route,
+          "Metrics are not implemented: " + errorDetail(r.data), "", raw);
+        return;
+      }
+      if (r.status >= 400 && r.status !== 304) {
+        state.displayed = "metrics";
+        ensureMetricsSkeleton(container, route);
+        setMetricsNotice(container, errorDetail(r.data), "danger");
+        var err = new Error("metrics failed: " + r.status);
+        err.status = r.status;
+        throw err;
+      }
+      if (r.status === 304) {
+        /* A 304 is not a scrape: keep the recorded samples and the last
+         * computed tiles (spec §5.2). */
+        if (!state.metrics.tiles) {
+          state.metrics.model = { families: [], familyCount: 0, totalSeries: 0, bytes: 0 };
+          state.metrics.tiles = computeTiles(state.metrics.model, {}, {});
+        }
+      } else {
+        if (r.etag) state.etags.metrics = r.etag;
+        var text = (r.data && typeof r.data.text === "string") ? r.data.text : "";
+        if (text.length > METRICS_MAX_BYTES) {
+          state.displayed = "metrics";
+          renderMetricsUnavailable(container, route,
+            "scrape too large to render (" + Math.round(text.length / 1024) + " KiB)", text, raw);
+          return;
+        }
+        var model = parseProm(text);
+        var at = nowMs();
+        var prev = state.metrics.samples || {};
+        var curr = buildSamples(model, at);
+        state.metrics.text = text;
+        state.metrics.model = model;
+        state.metrics.tiles = computeTiles(model, prev, curr);
+        state.metrics.samples = curr;
+        state.metrics.at = at;
+      }
+      state.displayed = "metrics";
+      ensureMetricsSkeleton(container, route);
+      renderMetrics(container, route);
+    });
+  }
+
   /* --------------------------------------------------------------- boot ---- */
 
   var SCREENS = {
@@ -2320,6 +3002,7 @@
     users: loadUsers,
     permissions: loadPermissions,
     definitions: loadDefinitions,
+    metrics: loadMetrics,
     about: loadAbout,
     search: loadSearch,
     notfound: function (container) {
@@ -2333,7 +3016,8 @@
       overview: "overview", connections: "connections", connection: "connections",
       channels: "channels", channel: "channels", consumers: "consumers", exchanges: "exchanges", exchange: "exchanges",
       queues: "queues", queue: "queues", bindings: "bindings", nodes: "nodes", node: "nodes",
-      users: "users", permissions: "permissions", definitions: "definitions", about: "about", search: "overview"
+      users: "users", permissions: "permissions", definitions: "definitions", about: "about", search: "overview",
+      metrics: "metrics"
     };
     var active = map[screen] || "overview";
     var links = document.querySelectorAll("#nav a[data-nav]");
@@ -2352,7 +3036,8 @@
     var container = document.getElementById("content");
     container.replaceChildren(itemsLoading());
     state.displayed = null;
-    state.refresh.base = route.screen === "overview" ? S1_REFRESH_MS : DEFAULT_REFRESH_MS;
+    state.refresh.base = route.screen === "overview" ? S1_REFRESH_MS
+      : (route.screen === "metrics" ? (CONFIG.metricsRefreshMs || DEFAULT_REFRESH_MS) : DEFAULT_REFRESH_MS);
     state.refresh.errCount = 0;
     state.refresh.delay = state.refresh.base;
     var loader = SCREENS[route.screen] || SCREENS.notfound;
@@ -2496,7 +3181,8 @@
     esc: esc,
     refreshNow: refreshNow,
     navigate: navigate,
-    render: render
+    render: render,
+    parseProm: parseProm
   };
 
   if (document.readyState === "loading") {

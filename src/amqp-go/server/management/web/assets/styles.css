@@ -165,6 +165,27 @@ h2 { font-size: 16px; margin: 16px 0 6px; }
 .card .card-value { font-size: 22px; font-weight: 700; line-height: 1.1; }
 .card .card-label { color: var(--muted); font-size: 12px; }
 
+/* Metrics vitals: two severities plus ok/unknown, conveyed by text as well as
+ * colour (FR-UI-009). */
+.card .card-sev { display: inline-block; font-size: 10px; text-transform: uppercase; letter-spacing: 0.04em; color: var(--muted); }
+.card[data-severity="ok"] { border-color: var(--ok); }
+.card[data-severity="ok"] .card-sev { color: var(--ok); }
+.card[data-severity="warn"] { border-color: var(--warn); background: var(--warn-bg); }
+.card[data-severity="warn"] .card-sev { color: var(--warn); font-weight: 700; }
+.card[data-severity="bad"] { border-color: var(--danger); background: var(--danger-bg); }
+.card[data-severity="bad"] .card-sev { color: var(--danger); font-weight: 700; }
+.card[data-severity="unknown"] .card-sev { color: var(--muted); }
+.card[data-severity="unknown"] .card-value { color: var(--muted); }
+
+.card-group { margin-bottom: 10px; }
+.card-group h2 { margin: 6px 0; }
+
+.metric-family { border: 1px solid var(--line); border-radius: var(--radius); background: var(--panel); padding: 8px 10px; margin: 8px 0; }
+.metric-family h3 { margin: 0 0 4px; font-size: 14px; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.metric-family p { margin: 0 0 6px; color: var(--muted); }
+.metric-family .metric-single-value { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+.metric-family .metric-group { color: var(--muted); font-size: 12px; }
+
 .summary-strip { display: flex; flex-wrap: wrap; gap: 16px; margin: 8px 0; }
 .summary-strip .coherent[data-coherent="false"] { color: var(--warn); }
 

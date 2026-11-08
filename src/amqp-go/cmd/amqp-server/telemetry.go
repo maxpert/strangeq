@@ -232,3 +232,15 @@ func metricsURLFor(addr net.Addr, tlsEnabled bool) string {
 	}
 	return scheme + "://" + net.JoinHostPort(host, port) + "/metrics"
 }
+
+// metricsScrapeFunc is the management surface's GET /api/metrics seam (spec
+// mgmt-07 §2.3). It returns nil when telemetry is disabled (no telemetry
+// server), which makes the route answer 501 naming telemetry.enabled; otherwise
+// it returns the process registry scrape, so the SPA and the Prometheus
+// listener serve byte-identical text.
+func metricsScrapeFunc(telemetry *metrics.Server) func() ([]byte, error) {
+	if telemetry == nil {
+		return nil
+	}
+	return metrics.ScrapeText
+}

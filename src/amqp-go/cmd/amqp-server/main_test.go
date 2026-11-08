@@ -239,6 +239,22 @@ func TestHealthcheckAddress(t *testing.T) {
 	assert.Equal(t, "http://[::1]:9419/health", healthcheckURL("::1", 9419))
 }
 
+// TestMetricsScrapeFunc_NilWithoutTelemetry pins the metrics scrape injection:
+// no telemetry server means a nil seam, which makes GET /api/metrics answer 501
+// (spec mgmt-07 §2.3 / §8.3 test 14). A constructed server yields a working
+// scrape func.
+func TestMetricsScrapeFunc_NilWithoutTelemetry(t *testing.T) {
+	if fn := metricsScrapeFunc(nil); fn != nil {
+		t.Fatal("a nil telemetry server must yield a nil scrape func (501)")
+	}
+	s := metrics.NewServerWithOptions(metrics.ServerOptions{Port: 9419})
+	fn := metricsScrapeFunc(s)
+	require.NotNil(t, fn, "a constructed telemetry server must yield a non-nil scrape func")
+	body, err := fn()
+	require.NoError(t, err)
+	require.NotEmpty(t, body)
+}
+
 // TestMetricsURLFor pins the SPA /metrics link glue: an absolute loopback URL,
 // https when the control plane is TLS, and NO link for a wildcard bind or a
 // missing listener (a non-connectable host must not be advertised).

@@ -1,6 +1,7 @@
 package metrics
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -176,6 +177,55 @@ func NewServer(port int, enableProfiling bool) *Server {
 
 // Handler returns the HTTP handler, for tests.
 func (s *Server) Handler() http.Handler { return s.httpServer.Handler }
+
+// ScrapeText renders the process registry exactly as a Prometheus scraper
+// receives it from GET /metrics on the telemetry listener: the same
+// promhttp.Handler(), an uncompressed text/plain; version=0.0.4 body. It is the
+// same-origin source for the management surface's GET /api/metrics (spec
+// mgmt-07), so the two can never drift.
+//
+// The instrumented handler shares promhttp_metric_handler_requests_total with
+// the telemetry listener, so a management-tab refresh is a real scrape
+// (documented divergence DIV-metrics-3). The synthetic request carries no
+// Accept-Encoding, so the body is never gzip-compressed and the SPA can parse
+// it verbatim.
+func ScrapeText() ([]byte, error) {
+	req, err := http.NewRequest(http.MethodGet, "/metrics", nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Accept", "text/plain")
+	rec := &bufRecorder{header: http.Header{}}
+	promhttp.Handler().ServeHTTP(rec, req)
+	if rec.status != http.StatusOK {
+		return nil, fmt.Errorf("metrics scrape: status %d", rec.status)
+	}
+	return rec.body.Bytes(), nil
+}
+
+// bufRecorder is the minimal http.ResponseWriter ScrapeText needs: a header
+// map, a status, and a body sink. It deliberately does not implement Flusher or
+// Hijacker so promhttp cannot stream.
+type bufRecorder struct {
+	header http.Header
+	body   bytes.Buffer
+	status int
+}
+
+func (r *bufRecorder) Header() http.Header { return r.header }
+
+func (r *bufRecorder) Write(b []byte) (int, error) {
+	if r.status == 0 {
+		r.status = http.StatusOK
+	}
+	return r.body.Write(b)
+}
+
+func (r *bufRecorder) WriteHeader(code int) {
+	if r.status == 0 {
+		r.status = code
+	}
+}
 
 // Listen binds the telemetry socket synchronously so callers see bind errors
 // before serving. The port never silently defaults: config supplies 9419.

@@ -138,6 +138,9 @@ func buildRouter(s *Server) *router {
 	get("/api/health/checks", s.hHealthChecks)
 	get("/api/health/checks/{check}", s.hHealthCheck)
 
+	// --- metrics (spec mgmt-07; 501 when telemetry.enabled is false) ---
+	get("/api/metrics", s.hMetrics)
+
 	// --- nodes (synthetic, single) ---
 	get("/api/nodes", s.hNodes)
 	get("/api/nodes/{name}", s.hNode)
