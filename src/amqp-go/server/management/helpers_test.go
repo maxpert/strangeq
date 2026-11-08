@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/maxpert/amqp-go/config"
+	"github.com/maxpert/amqp-go/protocol"
 	"github.com/maxpert/amqp-go/server"
 	"go.uber.org/zap"
 	"golang.org/x/crypto/bcrypt"
@@ -266,3 +267,12 @@ func freePort(t *testing.T) int {
 }
 
 func jsonUnmarshalStrict(b []byte, v any) error { return json.Unmarshal(b, v) }
+
+// consumerForTest builds a broker-registrable consumer with a unique identity.
+func consumerForTest(tag, queue string) *protocol.Consumer {
+	return &protocol.Consumer{
+		ID:    "cid-" + tag + "-" + queue,
+		Tag:   tag,
+		Queue: queue,
+	}
+}

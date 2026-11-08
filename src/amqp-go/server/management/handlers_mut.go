@@ -234,6 +234,10 @@ func (s *Server) hPublish(w http.ResponseWriter, r *http.Request) {
 		Exchange:   name,
 		RoutingKey: req.RoutingKey,
 		Headers:    req.Properties,
+		// Mandatory makes a no-route publish observable: the broker returns
+		// ErrNoRoute instead of silently dropping, which is what lets the API
+		// report routed:false (FR-API-058).
+		Mandatory: true,
 	}
 	applyProperties(msg, req.Properties)
 
@@ -253,6 +257,11 @@ func (s *Server) hPublish(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if err != nil {
+			if errors.Is(err, broker.ErrNoRoute) {
+				s.auditMutation(r, "exchange", name, "publish", http.StatusOK)
+				s.writeJSON(w, r, http.StatusOK, publishResponse{Routed: false})
+				return
+			}
 			s.writePublishError(w, r, name, err)
 			return
 		}
@@ -438,7 +447,6 @@ func (s *Server) hQueueCreate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req queueDeclareRequest
-	req.Name = ""
 	if len(body) > 0 {
 		if err := json.Unmarshal(body, &req); err != nil {
 			s.writeAPIError(w, r, errBad("invalid JSON body"))
@@ -449,14 +457,20 @@ func (s *Server) hQueueCreate(w http.ResponseWriter, r *http.Request) {
 		s.writeAPIError(w, r, errBad("only classic queues are supported"))
 		return
 	}
+	// An empty name is SERVER-NAMED: the management layer mints the amq.gen.*
+	// name and reports it in Location (FR-API-076/DIV-14).
+	name := strings.TrimSpace(req.Name)
+	if name == "" {
+		name = protocol.GenerateQueueName()
+	}
 	b := s.broker()
 	if b == nil {
 		s.writeAPIError(w, r, errEmpty())
 		return
 	}
-	q, err := b.DeclareQueue(req.Name, req.Durable, req.AutoDelete, req.Exclusive, req.Arguments)
+	q, err := b.DeclareQueue(name, req.Durable, req.AutoDelete, req.Exclusive, req.Arguments)
 	if err != nil {
-		s.auditMutation(r, "queue", req.Name, "declare", http.StatusBadRequest)
+		s.auditMutation(r, "queue", name, "declare", http.StatusBadRequest)
 		s.writeAPIError(w, r, errBad("could not declare queue: "+err.Error()))
 		return
 	}

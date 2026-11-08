@@ -169,8 +169,19 @@ func (p *jobPool) get(id, owner string) (*job, bool) {
 	return j, true
 }
 
-func (p *jobPool) reapLocked(now time.Time) {
-	if p.retention <= 0 {
+// stateOf reports a job's state under the pool lock. It exists so tests (and
+// any future internal caller) never read job fields unsynchronised.
+func (p *jobPool) stateOf(id, owner string) (string, bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	j, ok := p.jobs[id]
+	if !ok || j.owner != owner {
+		return "", false
+	}
+	return j.state, true
+}
+
+func (p *jobPool) reapLocked(now time.Time) {	if p.retention <= 0 {
 		return
 	}
 	keep := p.order[:0]
