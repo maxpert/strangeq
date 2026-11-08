@@ -23,6 +23,15 @@ type ManagementMetricsSink interface {
 	// TestForbiddenLockMetric_NotRuntimeReachable.
 	ManagementForbiddenLock(lock string)
 	ManagementPublishBackpressure()
+	// ManagementMessagePublished counts one message published through the
+	// management HTTP API that the broker routed and stored. It feeds the SAME
+	// core families as the AMQP publish path (amqp_messages_published_total /
+	// _bytes_total), so a management publish is no longer invisible (finding 9).
+	ManagementMessagePublished(size int)
+	// ManagementMessageUnroutable counts one management-API publish that was
+	// accepted but matched no binding (amqp_messages_unroutable_total),
+	// mirroring the AMQP mandatory-publish path.
+	ManagementMessageUnroutable()
 	ManagementJobs(state string, n int)
 	ManagementAuditDropped()
 	ManagementCapabilityDenied(capability string)
@@ -48,6 +57,8 @@ func (noopSink) ManagementSnapshotDuration(string, float64) {}
 func (noopSink) ManagementSnapshotLockWait(float64)         {}
 func (noopSink) ManagementForbiddenLock(string)             {}
 func (noopSink) ManagementPublishBackpressure()             {}
+func (noopSink) ManagementMessagePublished(int)             {}
+func (noopSink) ManagementMessageUnroutable()               {}
 func (noopSink) ManagementJobs(string, int)                 {}
 func (noopSink) ManagementAuditDropped()                    {}
 func (noopSink) ManagementCapabilityDenied(string)          {}

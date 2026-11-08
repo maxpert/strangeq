@@ -3,6 +3,7 @@ package server
 import (
 	"encoding/binary"
 	"net"
+	"time"
 
 	"github.com/maxpert/amqp-go/protocol"
 	"go.uber.org/zap"
@@ -114,6 +115,7 @@ func (s *Server) sendBatchedDeliveries(conn *protocol.Connection, channelID uint
 		zap.Int("batch_size", len(deliveries)),
 		zap.Int("total_bytes", len(*batchBuf)))
 
+	writeStart := time.Now()
 	err := s.writeBytes(conn, *batchBuf)
 
 	if err != nil {
@@ -125,8 +127,14 @@ func (s *Server) sendBatchedDeliveries(conn *protocol.Connection, channelID uint
 	}
 
 	if s.MetricsCollector != nil {
+		// Observe the whole-batch write duration once per delivered message:
+		// this batched writer is a production delivery path, and
+		// amqp_message_delivery_duration_seconds had no producer on it
+		// (finding 2).
+		elapsed := time.Since(writeStart).Seconds()
 		for _, delivery := range deliveries {
 			s.MetricsCollector.RecordMessageDelivered(len(delivery.Message.Body))
+			s.MetricsCollector.RecordDeliveryLatency(elapsed)
 		}
 	}
 
@@ -370,5 +378,19 @@ func (s *Server) sendBatchedDeliveriesVectored(conn *protocol.Connection, channe
 		bodySizes[i] = len(d.Message.Body)
 	}
 
-	return s.writeVectored(conn, &bufs, bodySizes, consumerTag, channelID)
+	writeStart := time.Now()
+	if err := s.writeVectored(conn, &bufs, bodySizes, consumerTag, channelID); err != nil {
+		return err
+	}
+
+	if s.MetricsCollector != nil {
+		// Observe the whole-batch write duration once per delivered message:
+		// the vectored writer is the other production delivery path and must
+		// feed amqp_message_delivery_duration_seconds too (finding 2).
+		elapsed := time.Since(writeStart).Seconds()
+		for range deliveries {
+			s.MetricsCollector.RecordDeliveryLatency(elapsed)
+		}
+	}
+	return nil
 }

@@ -27,8 +27,8 @@ func TestWALBookkeepingGaugesReadStatsAtScrape(t *testing.T) {
 	if got := testutil.ToFloat64(c.WALIndexCopies); got != 1 {
 		t.Fatalf("wal_index_copies = %v, want 1", got)
 	}
-	if got := testutil.ToFloat64(c.WALSettleDrainedTotal); got != 7 {
-		t.Fatalf("wal_settle_drained_total = %v, want 7", got)
+	if got := testutil.ToFloat64(c.WALSettleDrained); got != 7 {
+		t.Fatalf("wal_settle_drained = %v, want 7", got)
 	}
 
 	// Live at scrape: a change is visible on the next scrape with no Set.

@@ -559,6 +559,12 @@ func (s *Server) cleanupConnection(connection *protocol.Connection) {
 
 		connection.ChannelCount.Add(-1)
 		s.withEntityDelta("channels", -1)
+		// Record the channel close here too: connection teardown bypasses
+		// teardownChannel, so without this a still-open channel on a dropped
+		// connection left amqp_channels_total permanently high (finding 3).
+		if s.MetricsCollector != nil {
+			s.MetricsCollector.RecordChannelClosed()
+		}
 
 		// Clean up transaction state for this channel to prevent
 		// cross-connection state leak where stale tx state keyed by
@@ -605,6 +611,12 @@ func (s *Server) cleanupConnection(connection *protocol.Connection) {
 						zap.String("connection_id", connection.ID),
 						zap.Error(err))
 				} else {
+					// An exclusive/auto-delete queue reclaimed by connection
+					// teardown is a queue deletion and must move the counter,
+					// or amqp_queues_deleted_total under-reports (finding 8).
+					if s.MetricsCollector != nil {
+						s.MetricsCollector.RecordQueueDeleted()
+					}
 					s.Log.Debug("Deleted exclusive queue on connection close",
 						zap.String("queue", qName),
 						zap.String("connection_id", connection.ID))

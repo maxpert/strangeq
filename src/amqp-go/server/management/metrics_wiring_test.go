@@ -233,6 +233,42 @@ func TestManagementJobsGauge_TracksQueueLifecycle(t *testing.T) {
 	}
 }
 
+// TestManagementPublishCountsCoreFamilies (FINDING 9): the management HTTP
+// publish path called the broker directly and never moved
+// amqp_messages_published_total / _bytes_total, so a management publish was
+// invisible in the message metrics. A routed management publish must count one
+// published message with its byte size.
+func TestManagementPublishCountsCoreFamilies(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	c := metrics.NewCollectorWithRegistry(reg, "amqp")
+	e := basicEnv(t, true, nil)
+	e.mgmt.sink = c
+
+	e.declareQueue(t, "mgmt-pub-q", queueDeclareRequest{Durable: true})
+	created := e.do(http.MethodPut, "/api/exchanges/%2F/mgmt-pub-ex",
+		e.jsonBody(t, exchangeDeclareRequest{Type: "direct"}), basicAuthHeader())
+	wantStatus(t, created, http.StatusCreated)
+	if err := e.srv.Broker.BindQueue("mgmt-pub-q", "mgmt-pub-ex", "mgmt-pub-rk", nil); err != nil {
+		t.Fatalf("bind: %v", err)
+	}
+
+	if got := mgmtScrapeCounter(t, reg, "amqp_messages_published_total", nil); got != 0 {
+		t.Fatalf("published counter = %v before the publish, want 0", got)
+	}
+
+	rec := e.do(http.MethodPost, "/api/exchanges/%2F/mgmt-pub-ex/publish",
+		e.jsonBody(t, publishRequest{RoutingKey: "mgmt-pub-rk", Payload: "hi", PayloadEncoding: "string"}),
+		basicAuthHeader())
+	wantStatus(t, rec, http.StatusOK)
+
+	if got := mgmtScrapeCounter(t, reg, "amqp_messages_published_total", nil); got != 1 {
+		t.Fatalf("amqp_messages_published_total = %v after one management publish, want 1", got)
+	}
+	if got := mgmtScrapeCounter(t, reg, "amqp_messages_published_bytes_total", nil); got != 2 {
+		t.Fatalf("amqp_messages_published_bytes_total = %v, want 2 (len(\"hi\"))", got)
+	}
+}
+
 // TestManagementSnapshotLockWait_RecordedOnConnectionSnapshot (MEDIUM-2): the
 // permitted Server.Mutex.RLock a management snapshot takes is timed. The
 // overview's production path uses the lock-free entity seam, so the reachable

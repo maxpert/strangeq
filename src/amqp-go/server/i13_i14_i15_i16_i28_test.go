@@ -19,7 +19,9 @@ type spyMetricsCollector struct {
 	// not break this double.
 	NoOpMetricsCollector
 	acks           atomic.Int64
+	msgsAcked      atomic.Int64
 	rejects        atomic.Int64
+	msgsRejected   atomic.Int64
 	redeliver      atomic.Int64
 	txStart        atomic.Int64
 	txCommit       atomic.Int64
@@ -47,8 +49,10 @@ func (s *spyMetricsCollector) RecordExchangeDeleted()                         {}
 func (s *spyMetricsCollector) RecordMessagePublished(size int)                { s.published.Add(1) }
 func (s *spyMetricsCollector) RecordMessageDelivered(size int)                { s.delivered.Add(1) }
 func (s *spyMetricsCollector) RecordMessageAcknowledged()                     { s.acks.Add(1) }
+func (s *spyMetricsCollector) RecordMessagesAcknowledged(n int)               { s.msgsAcked.Add(int64(n)) }
 func (s *spyMetricsCollector) RecordMessageRedelivered()                      { s.redeliver.Add(1) }
 func (s *spyMetricsCollector) RecordMessageRejected()                         { s.rejects.Add(1) }
+func (s *spyMetricsCollector) RecordMessagesRejected(n int)                   { s.msgsRejected.Add(int64(n)) }
 func (s *spyMetricsCollector) RecordMessageUnroutable()                       { s.unroutable.Add(1) }
 func (s *spyMetricsCollector) SetConsumersTotal(count int)                    { s.consumersTotal.Store(int64(count)) }
 func (s *spyMetricsCollector) RecordTransactionStarted()                      { s.txStart.Add(1) }
