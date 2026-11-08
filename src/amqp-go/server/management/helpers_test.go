@@ -97,15 +97,24 @@ func baseEnvConfig(t *testing.T, mutate func(*config.AMQPConfig)) *config.AMQPCo
 // newManagement constructs the management Server around srv (which may be nil).
 func newManagement(t *testing.T, srv *server.Server, cfg *config.AMQPConfig) *Server {
 	t.Helper()
+	return newManagementWithScrape(t, srv, cfg, nil)
+}
+
+// newManagementWithScrape constructs the management Server with the
+// MetricsScrape seam injected (spec mgmt-07 §2.2). A nil fn models telemetry
+// being disabled, which makes GET /api/metrics answer 501.
+func newManagementWithScrape(t *testing.T, srv *server.Server, cfg *config.AMQPConfig, fn func() ([]byte, error)) *Server {
+	t.Helper()
 	opts := Options{
-		Server:    srv,
-		Config:    cfg,
-		AuthFile:  cfg.Security.AuthenticationFilePath,
-		Logger:    zap.NewNop(),
-		Version:   "9.9.9",
-		Commit:    "deadbeef",
-		BuildDate: "2026-11-08",
-		GoVersion: "go1.27",
+		Server:        srv,
+		Config:        cfg,
+		AuthFile:      cfg.Security.AuthenticationFilePath,
+		Logger:        zap.NewNop(),
+		Version:       "9.9.9",
+		Commit:        "deadbeef",
+		BuildDate:     "2026-11-08",
+		GoVersion:     "go1.27",
+		MetricsScrape: fn,
 	}
 	if srv != nil {
 		opts.Authenticator = srv.Authenticator

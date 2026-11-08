@@ -38,6 +38,12 @@ type Options struct {
 	// page is served at "/" instead. The management package never imports the
 	// UI package; the UI is injected (no cycle).
 	UIHandler http.Handler
+
+	// MetricsScrape, when non-nil, supplies the Prometheus text exposition of
+	// the process registry for GET /api/metrics (spec mgmt-07). nil ⇒ the route
+	// answers 501 (telemetry disabled). It is injected exactly like UIHandler:
+	// the management package never imports metrics, prometheus or promhttp.
+	MetricsScrape func() ([]byte, error)
 }
 
 // Server is the management control-plane HTTP surface.
