@@ -176,7 +176,42 @@ func applyAddressPortReconciliation(cfg *AMQPConfig, k *koanf.Koanf) error {
 	return nil
 }
 
-// decodeInto decodes k onto cfg and records keys that matched no field.
+// legacyDurabilityMigration is the boot-time migration message for the retired
+// storage.fsync / storage.crash_model keys. The first line names the retired
+// key that was seen; the table maps both onto the single storage.durability
+// option. Kept as one string so file and env rejections read identically.
+const legacyDurabilityMigration = `%s is no longer supported; use storage.durability instead:
+  fsync: false                           -> durability: none
+  fsync: true                            -> durability: barrier   (default)
+  fsync: true + crash_model: force_flush -> durability: flush`
+
+// legacyDurabilityError returns a hard boot-time error when a retired
+// durability key is present among the unbound keys, or nil when none is. The
+// keys are matched on their NORMALIZED dotted path (see normalizeKey), so both
+// crash_model and crashmodel match; the environment variables
+// AMQP_STORAGE_FSYNC and AMQP_STORAGE_CRASH_MODEL flow through envTransform
+// onto the same paths and are covered by the one check.
+//
+// This MUST be an error rather than the generic unknown-key warning: ignoring
+// crash_model: force_flush silently downgrades durability (power loss ->
+// barrier) and ignoring fsync: false silently changes throughput, so the
+// legacy keys must never fall through to the warning.
+func legacyDurabilityError(unused []string) error {
+	for _, key := range unused {
+		switch strings.ToLower(key) {
+		case "storage.fsync":
+			return fmt.Errorf(legacyDurabilityMigration, "storage.fsync")
+		case "storage.crashmodel":
+			return fmt.Errorf(legacyDurabilityMigration, "storage.crash_model")
+		}
+	}
+	return nil
+}
+
+// decodeInto decodes k onto cfg and records keys that matched no field. A
+// retired durability key in the unbound set is a hard error (see
+// legacyDurabilityError) and is checked BEFORE the unknown-key fallthrough so
+// it can never be silently warned and ignored.
 func decodeInto(k *koanf.Koanf, cfg *AMQPConfig, report *LoadReport) error {
 	var md mapstructure.Metadata
 	err := k.UnmarshalWithConf("", cfg, koanf.UnmarshalConf{DecoderConfig: &mapstructure.DecoderConfig{
@@ -190,6 +225,9 @@ func decodeInto(k *koanf.Koanf, cfg *AMQPConfig, report *LoadReport) error {
 	}})
 	if err != nil {
 		return fmt.Errorf("failed to unmarshal config: %w", err)
+	}
+	if err := legacyDurabilityError(md.Unused); err != nil {
+		return err
 	}
 	if report != nil {
 		unknown := make([]string, 0, len(md.Unused))

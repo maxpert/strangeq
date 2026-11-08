@@ -21,7 +21,7 @@ network:
   address: "127.0.0.1:${amqp_port}"
 storage:
   path: "${escaped}"
-  fsync: true
+  durability: barrier
 telemetry:
   enabled: true
   address: 127.0.0.1

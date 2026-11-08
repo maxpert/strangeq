@@ -42,15 +42,12 @@ func DefaultConfig() *AMQPConfig {
 		},
 		Storage: interfaces.StorageConfig{
 			Path: "./data",
-			// Durable by default: an explicit non-nil true so --generate-config
-			// emits `fsync: true` (not `fsync: null`) and the no-config path is
-			// unambiguously durable. Set fsync:false to opt out of the barrier.
-			Fsync:    boolPtr(true),
-			CRCCheck: boolPtr(true),
-			// Durable-confirm crash model: F_BARRIERFSYNC on macOS (the
-			// default). Set force_flush to restore the full F_FULLFSYNC
-			// drive-cache flush. No effect off darwin.
-			CrashModel:  interfaces.CrashModelBarrier,
+			// Durable by default: the barrier. Set durability: none to opt out
+			// of the group-commit fence, or durability: flush for the full
+			// F_FULLFSYNC drive-cache flush (power-loss safe). Emitted by
+			// --generate-config so the no-config path is unambiguous.
+			Durability:  interfaces.DurabilityBarrier,
+			CRCCheck:    boolPtr(true),
 			CacheMB:     64,       // 64 MB metadata cache
 			MaxFiles:    100,      // Max open file handles
 			RetentionMS: 86400000, // 24 hours
@@ -211,11 +208,16 @@ func (c *AMQPConfig) GetServer() interfaces.ServerConfig {
 	return c.Server
 }
 
-// FsyncEnabled reports whether the WAL group-commit fsync durability barrier is
-// active. The tri-state Storage.Fsync defaults to ON: nil (omitted) or an
-// explicit true both enable it; only an explicit false disables it.
-func (c *AMQPConfig) FsyncEnabled() bool {
-	return c.Storage.Fsync == nil || *c.Storage.Fsync
+// Durability returns the effective durability level. An omitted key ("" on a
+// zero-value Load caller) normalizes to DurabilityBarrier, the safe shipped
+// default, so every zero-value path stays on the ordered barrier.
+func (c *AMQPConfig) Durability() string {
+	switch c.Storage.Durability {
+	case interfaces.DurabilityNone, interfaces.DurabilityBarrier, interfaces.DurabilityFlush:
+		return c.Storage.Durability
+	default:
+		return interfaces.DurabilityBarrier
+	}
 }
 
 // CRCEnabled reports whether WAL/segment record CRC32 integrity checks are
@@ -225,36 +227,34 @@ func (c *AMQPConfig) CRCEnabled() bool {
 	return c.Storage.CRCCheck == nil || *c.Storage.CRCCheck
 }
 
-// CrashModel returns the effective durable-confirm crash model. An omitted key
-// ("" on a zero-value Load caller) normalizes to CrashModelBarrier, the safe
-// shipped default, so every zero-value path stays on the ordered barrier.
-func (c *AMQPConfig) CrashModel() string {
-	if c.Storage.CrashModel == "" {
-		return interfaces.CrashModelBarrier
-	}
-	return c.Storage.CrashModel
-}
-
-// CrashModelForceFlush reports whether the full drive-cache flush
-// (crash_model: force_flush, F_FULLFSYNC on darwin) is selected. "" and
-// "barrier" both map to false; only an explicit "force_flush" is true.
-func (c *AMQPConfig) CrashModelForceFlush() bool {
-	return c.CrashModel() == interfaces.CrashModelForceFlush
-}
-
-// GetEngine returns engine tuning configuration. It overlays the single user
-// fsync knob onto the internal (inverted) WALSyncDisabled transport and the
-// CRC knob onto WALCRCDisabled so the storage layer honors both while every
-// zero-value path stays durable and integrity-checked. The crash-model knob
-// rides the same overlay (same sense: the zero value = the safe barrier
-// default), and Storage.UnsafeRecovery too (false = refuse to start on an
-// unrecoverable directory) because storage CONSTRUCTION is where an
-// unparseable WAL framing version is first detected.
+// GetEngine returns engine tuning configuration. It maps the single
+// StorageConfig.Durability option onto the internal (WALSyncDisabled,
+// CrashModel) transport and the CRC knob onto WALCRCDisabled so the storage
+// layer honors both while every zero-value path stays durable and
+// integrity-checked:
+//
+//	none    -> WALSyncDisabled=true,  CrashModel=""  (skip the group-commit fence)
+//	barrier -> WALSyncDisabled=false, CrashModel=""  (empty == fence; the default)
+//	flush   -> WALSyncDisabled=false, CrashModel="force_flush"
+//
+// Storage.UnsafeRecovery rides the same overlay (false = refuse to start on an
+// unrecoverable directory) because storage CONSTRUCTION is where an unparseable
+// WAL framing version is first detected.
 func (c *AMQPConfig) GetEngine() interfaces.EngineConfig {
 	e := c.Engine
-	e.WALSyncDisabled = !c.FsyncEnabled()
 	e.WALCRCDisabled = !c.CRCEnabled()
-	e.CrashModel = c.CrashModel()
+	switch c.Durability() {
+	case interfaces.DurabilityNone:
+		e.WALSyncDisabled = true
+		e.CrashModel = ""
+	case interfaces.DurabilityFlush:
+		e.WALSyncDisabled = false
+		e.CrashModel = interfaces.CrashModelForceFlush
+	default: // DurabilityBarrier
+		e.WALSyncDisabled = false
+		e.CrashModel = ""
+	}
+	e.Durability = c.Durability()
 	e.UnsafeRecovery = c.Storage.UnsafeRecovery
 	return e
 }
@@ -290,15 +290,15 @@ func (c *AMQPConfig) Validate() error {
 		return fmt.Errorf("storage path cannot be empty")
 	}
 
-	// The durable-confirm crash model. "" is accepted for zero-value Load
-	// callers and normalizes to the barrier default; anything else outside the
-	// two documented values FAILS at boot rather than silently selecting a
-	// primitive nobody asked for.
-	switch c.Storage.CrashModel {
-	case "", interfaces.CrashModelBarrier, interfaces.CrashModelForceFlush:
+	// The single durability option. "" is accepted for zero-value Load callers
+	// and normalizes to the barrier default; anything else outside the three
+	// documented values FAILS at boot rather than silently selecting a
+	// durability level nobody asked for.
+	switch c.Storage.Durability {
+	case "", interfaces.DurabilityNone, interfaces.DurabilityBarrier, interfaces.DurabilityFlush:
 	default:
-		return fmt.Errorf("invalid storage.crash_model %q: allowed values are %q and %q (omit for the default %q)",
-			c.Storage.CrashModel, interfaces.CrashModelBarrier, interfaces.CrashModelForceFlush, interfaces.CrashModelBarrier)
+		return fmt.Errorf("invalid storage.durability %q: allowed values are %q, %q, and %q (omit for the default %q)",
+			c.Storage.Durability, interfaces.DurabilityNone, interfaces.DurabilityBarrier, interfaces.DurabilityFlush, interfaces.DurabilityBarrier)
 	}
 
 	// Validate security configuration

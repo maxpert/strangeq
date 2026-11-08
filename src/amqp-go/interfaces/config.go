@@ -112,22 +112,51 @@ const (
 	CrashModelForceFlush = "force_flush"
 )
 
+// Accepted values of StorageConfig.Durability — the single user-facing
+// durability option. Each names the crash class a confirmed message is
+// guaranteed to survive on darwin; on Linux and every non-darwin platform all
+// three use fdatasync (which already flushes the drive cache), so the choice is
+// inert there and any value is power-loss safe.
+const (
+	// DurabilityNone issues no WAL group-commit barrier (the retired
+	// fsync: false): a confirmed message survives the broker staying up but
+	// not a process kill. Transactions (WriteTxAtomic) always fsync.
+	DurabilityNone = "none"
+
+	// DurabilityBarrier is the default: fcntl(F_BARRIERFSYNC) on macOS. A
+	// confirmed message survives a process kill and an OS crash; a sudden
+	// power loss can still lose the most recent confirmed messages the drive
+	// accepted but had not written from its volatile cache (the retired
+	// fsync: true + crash_model: barrier).
+	DurabilityBarrier = "barrier"
+
+	// DurabilityFlush is the full drive-cache flush: fcntl(F_FULLFSYNC) on
+	// macOS, so confirmed messages also survive power loss (the retired
+	// fsync: true + crash_model: force_flush).
+	DurabilityFlush = "flush"
+)
+
 // StorageConfig holds storage-related configuration
 type StorageConfig struct {
 	// Path is the directory where all persistent data is stored
 	Path string
 
-	// Fsync controls the WAL group-commit durability barrier. It is a TRI-STATE
-	// pointer so an omitted config key is distinguishable from an explicit false:
-	//   nil   = default (fsync ON, durable) — the safe default
-	//   true  = fsync after each WAL batch (safer but slower)
-	//   false = skip the group-commit fsync (faster, relies on OS page cache;
-	//           NOT crash-durable). Only an EXPLICIT false disables durability.
-	// The tri-state still protects zero-value Load callers and EngineConfig{}
-	// literals: the amqp-server --config path now seeds DefaultConfig(), so an
-	// omitted key there means "default ON" with or without the pointer.
-	// Transactions (WriteTxAtomic) always fdatasync regardless of this flag.
-	Fsync *bool
+	// Durability is the single user-facing durability option. It is one of
+	// DurabilityNone, DurabilityBarrier (the default when the key is absent or
+	// ""), or DurabilityFlush:
+	//
+	//   none    - no WAL group-commit barrier (the retired fsync: false).
+	//   barrier - fcntl(F_BARRIERFSYNC) on macOS: a confirmed message survives
+	//             a process kill and an OS crash; a power loss may still lose
+	//             the drive-cache tail (the retired fsync: true + barrier).
+	//   flush   - fcntl(F_FULLFSYNC) on macOS: confirmed messages also survive
+	//             power loss (the retired fsync: true + force_flush).
+	//
+	// GetEngine maps this onto the internal EngineConfig transport
+	// (WALSyncDisabled / CrashModel); nothing under the storage engine reads
+	// this field directly. Any value other than the three above is rejected by
+	// Validate. Transactions (WriteTxAtomic) always fdatasync regardless.
+	Durability string
 
 	// CRCCheck controls whether WAL/segment records carry a CRC32 integrity
 	// checksum. It is a TRI-STATE pointer mirroring Fsync:
@@ -139,31 +168,6 @@ type StorageConfig struct {
 	// when disabled. The read path skips verification when the stored CRC is
 	// zero, so mixed files (some with CRC, some without) are handled gracefully.
 	CRCCheck *bool
-
-	// CrashModel selects the primitive the TWO WAL confirm barriers — the
-	// group-commit batch fsync and the transaction slow-path fsync — issue on
-	// macOS. It is the crash-consistency contract a publisher confirm implies:
-	//
-	//   "" or "barrier" (default)
-	//        fcntl(F_BARRIERFSYNC): fsync the batch's bytes to the drive, then
-	//        issue an ORDERING BARRIER instead of flushing the drive's volatile
-	//        write cache. A confirmed message survives a process kill (kill -9)
-	//        and an operating-system crash, because the bytes were handed to
-	//        the drive. On a SUDDEN POWER LOSS the most recently confirmed
-	//        messages that the drive accepted but had not yet written from its
-	//        volatile cache can be lost; on drives that honour barriers what
-	//        survives is a prefix of the log in write order.
-	//
-	//   "force_flush"
-	//        fcntl(F_FULLFSYNC): the full drive-cache flush. Confirmed messages
-	//        also survive power loss. This restores the pre-barrier behaviour
-	//        byte-for-byte and is the opt-in for drives that do not order
-	//        across barrier epochs.
-	//
-	// On Linux and every non-darwin platform both values use fdatasync, which
-	// already flushes the drive cache, so this setting has NO effect there.
-	// Any value other than the two above is rejected by Validate.
-	CrashModel string
 
 	// Message settings
 	MessageTTL int64 // Message TTL in seconds (0 = no TTL)
@@ -391,25 +395,33 @@ type EngineConfig struct {
 	// path skips verification for zero-CRC records.
 	WALCRCDisabled bool `json:"wal_crc_disabled"`
 
-	// WALSyncDisabled is the internal (inverted-sense) transport for the user
-	// Storage.Fsync flag. Zero value (false) = fsync ON (the durable default),
-	// so every zero-value EngineConfig{} — used by many constructors and tests —
-	// stays durable. Only the config layer sets it, from GetEngine():
-	// WALSyncDisabled = !FsyncEnabled(). When true, the WAL group-commit
-	// fdatasync is skipped (Storage.Fsync=false). It never disables the
-	// transaction fsync (WriteTxAtomic is always durable).
+	// WALSyncDisabled is the internal (inverted-sense) transport for the
+	// StorageConfig.Durability "none" level. Zero value (false) = fsync ON
+	// (the durable default), so every zero-value EngineConfig{} — used by many
+	// constructors and tests — stays durable. Only the config layer sets it,
+	// from GetEngine(): a durability of none sets it true. When true, the WAL
+	// group-commit fdatasync is skipped. It never disables the transaction
+	// fsync (WriteTxAtomic is always durable).
 	WALSyncDisabled bool `json:"wal_sync_disabled"`
 
-	// CrashModel is the internal transport for the user Storage.CrashModel
-	// flag. Zero value ("") and "barrier" both request the group-commit and
-	// transaction confirm barriers issue fcntl(F_BARRIERFSYNC) on darwin;
-	// "force_flush" requests fcntl(F_FULLFSYNC), the pre-barrier full
-	// drive-cache flush. On Linux and every non-darwin platform both behave
-	// identically (fdatasync), so the value is inert there. Only the config
-	// layer sets it, from GetEngine(); storage maps anything other than
-	// "force_flush" to the barrier default, so a zero-value EngineConfig{}
-	// stays on the safe-by-default barrier.
+	// CrashModel is the internal transport for the StorageConfig.Durability
+	// "flush" level. Zero value ("") and "barrier" both request the
+	// group-commit and transaction confirm barriers issue
+	// fcntl(F_BARRIERFSYNC) on darwin; "force_flush" requests
+	// fcntl(F_FULLFSYNC), the pre-barrier full drive-cache flush. On Linux and
+	// every non-darwin platform both behave identically (fdatasync), so the
+	// value is inert there. Only the config layer sets it, from GetEngine();
+	// storage maps anything other than "force_flush" to the barrier default,
+	// so a zero-value EngineConfig{} stays on the safe-by-default barrier.
 	CrashModel string `json:"wal_crash_model"`
+
+	// Durability is the internal MIRROR of the user-facing
+	// StorageConfig.Durability choice. It is written only by the config
+	// layer's GetEngine mapping and is NOT read by the storage engine, which
+	// consumes WALSyncDisabled and CrashModel above. It exists so an operator
+	// or tool reading EngineConfig can see the selected mode without
+	// re-deriving it from the two transport fields.
+	Durability string `json:"wal_durability"`
 
 	// UnsafeRecovery is the internal transport for the user-facing
 	// StorageConfig.UnsafeRecovery flag (--unsafe-recovery). Zero value

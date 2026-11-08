@@ -72,11 +72,11 @@ func (b *ConfigBuilder) WithStoragePath(path string) *ConfigBuilder {
 	return b
 }
 
-// WithFsync enables/disables fsync for writes. It sets the tri-state flag to an
-// explicit value (never nil), so building via the fluent API always expresses a
-// concrete durability choice.
-func (b *ConfigBuilder) WithFsync(enabled bool) *ConfigBuilder {
-	b.config.Storage.Fsync = &enabled
+// WithDurability sets the single durability option: interfaces.DurabilityNone,
+// interfaces.DurabilityBarrier (the default), or interfaces.DurabilityFlush.
+// Any other value is rejected by Validate/Build.
+func (b *ConfigBuilder) WithDurability(durability string) *ConfigBuilder {
+	b.config.Storage.Durability = durability
 	return b
 }
 
@@ -85,14 +85,6 @@ func (b *ConfigBuilder) WithFsync(enabled bool) *ConfigBuilder {
 // the fluent API always expresses a concrete integrity choice.
 func (b *ConfigBuilder) WithCRCCheck(enabled bool) *ConfigBuilder {
 	b.config.Storage.CRCCheck = &enabled
-	return b
-}
-
-// WithCrashModel sets the durable-confirm crash model: interfaces.CrashModelBarrier
-// (F_BARRIERFSYNC, the default) or interfaces.CrashModelForceFlush
-// (F_FULLFSYNC). Any other value is rejected by Validate/Build.
-func (b *ConfigBuilder) WithCrashModel(model string) *ConfigBuilder {
-	b.config.Storage.CrashModel = model
 	return b
 }
 

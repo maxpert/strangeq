@@ -80,28 +80,30 @@ storage:
   # Directory path for persistent storage
   path: ./data
 
-  # Enable synchronous writes (fsync after each WAL batch write)
-  # true = safer but slower (fsync after each batch) — the durable default
-  # false = faster but less durable (relies on OS page cache; opt-in only)
-  # Omitting this key defaults to fsync ON (durable). Transactions always fsync.
-  fsync: true
+  # Durability of a confirmed message — the single option that names the crash
+  # class a publisher confirm is guaranteed to survive (macOS; on Linux and every
+  # non-darwin platform all three values use fdatasync, so the choice is inert
+  # there and any value is power-loss safe).
+  #
+  #   none    = no WAL group-commit barrier (the retired fsync: false). A
+  #             confirmed message survives the broker staying up but NOT a
+  #             process kill. Transactions always fsync.
+  #   barrier = fcntl(F_BARRIERFSYNC) (the default): the batch is handed to the
+  #             drive under an ordering barrier. Confirmed messages survive
+  #             kill -9 and an OS crash; a sudden power loss can lose the most
+  #             recent confirmed messages still in the drive's volatile cache
+  #             (survivors are a prefix in WAL order).
+  #   flush   = fcntl(F_FULLFSYNC): the full drive-cache flush, so confirmed
+  #             messages also survive power loss.
+  #
+  # Omitting this key defaults to barrier. Anything else fails at boot.
+  durability: barrier
 
   # Enable CRC32 integrity checks for WAL/segment records
   # true = compute and verify CRC32 per record (safe, costs ~8% CPU) — the default
   # false = skip CRC computation (write zero, skip verification on read; faster)
   # Omitting this key defaults to CRC ON (safe). Record format is unchanged.
   crccheck: true
-
-  # Crash model for the durable confirm barrier (macOS only; no effect on Linux,
-  # where both values use fdatasync).
-  # barrier (default) = fcntl(F_BARRIERFSYNC): the batch is handed to the drive
-  #   under an ordering barrier. Confirmed messages survive kill -9 and an OS
-  #   crash; a sudden power loss can lose the most recent confirmed messages
-  #   still in the drive's volatile cache (survivors are a prefix in WAL order).
-  # force_flush = fcntl(F_FULLFSYNC): the full drive-cache flush, so confirmed
-  #   messages also survive power loss. Restores the pre-barrier behaviour.
-  # Anything else fails at boot.
-  crash_model: barrier
 
   # Message TTL in seconds (0 = no expiration)
   messagettl: 0

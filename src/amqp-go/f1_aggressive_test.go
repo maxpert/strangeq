@@ -12,6 +12,7 @@ import (
 	amqp "github.com/rabbitmq/amqp091-go"
 
 	"github.com/maxpert/amqp-go/config"
+	"github.com/maxpert/amqp-go/interfaces"
 	"github.com/maxpert/amqp-go/server"
 )
 
@@ -30,8 +31,11 @@ func f1AggServer(t *testing.T, fsync bool, ringSize int, walChanBuf int) (string
 	cfg.Network.Address = addr
 	cfg.Storage.Path = t.TempDir()
 	cfg.Server.LogLevel = "silent"
-	fsyncVal := fsync
-	cfg.Storage.Fsync = &fsyncVal
+	if fsync {
+		cfg.Storage.Durability = interfaces.DurabilityBarrier
+	} else {
+		cfg.Storage.Durability = interfaces.DurabilityNone
+	}
 	if ringSize > 0 {
 		cfg.Engine.RingBufferSize = ringSize
 	}

@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/maxpert/amqp-go/interfaces"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -43,5 +44,5 @@ func TestCrashScript_ConfigGeneration(t *testing.T) {
 	assert.True(t, cfg.Telemetry.Enabled)
 	assert.Equal(t, 23457, cfg.Telemetry.Port)
 	assert.Equal(t, "127.0.0.1", cfg.Telemetry.Address)
-	assert.True(t, cfg.FsyncEnabled())
+	assert.Equal(t, interfaces.DurabilityBarrier, cfg.Durability())
 }

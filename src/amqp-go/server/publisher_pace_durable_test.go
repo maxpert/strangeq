@@ -38,19 +38,23 @@ import (
 
 // newHotBudgetServer builds a server whose hot-cache byte budget is tiny and
 // whose message-count depth HWM is huge, so the ONLY thing that could arm
-// reader backpressure is the hot-cache pace gate. syncDisabled selects
-// fsync:false (true) vs durable (false, the shipped default); crashModel
-// selects the durable confirm fence (interfaces.CrashModelBarrier /
-// CrashModelForceFlush), or "" to leave the config default. Returns the server
-// and its storage so the test can read the resident-byte mirror.
+// reader backpressure is the hot-cache pace gate. syncDisabled selects the
+// durability none level (true) vs a fenced level (false, the shipped default);
+// crashModel selects the confirm fence within the fenced levels
+// (interfaces.CrashModelBarrier -> barrier, CrashModelForceFlush -> flush).
+// Returns the server and its storage so the test can read the resident-byte
+// mirror.
 func newHotBudgetServer(t *testing.T, syncDisabled bool, crashModel string) (*Server, *storage.DisruptorStorage) {
 	t.Helper()
 	cfg := config.DefaultConfig()
 	cfg.Storage.Path = t.TempDir()
-	fsyncOn := !syncDisabled
-	cfg.Storage.Fsync = &fsyncOn // tri-state: explicit fsync for this mode
-	if crashModel != "" {
-		cfg.Storage.CrashModel = crashModel
+	switch {
+	case syncDisabled:
+		cfg.Storage.Durability = interfaces.DurabilityNone
+	case crashModel == interfaces.CrashModelForceFlush:
+		cfg.Storage.Durability = interfaces.DurabilityFlush
+	default:
+		cfg.Storage.Durability = interfaces.DurabilityBarrier
 	}
 
 	eng := cfg.GetEngine()
