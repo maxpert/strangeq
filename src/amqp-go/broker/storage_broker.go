@@ -311,6 +311,13 @@ type StorageBroker struct {
 	maxQueues, maxExchanges   atomic.Int64
 	queueCount, exchangeCount atomic.Int64
 	exchangeCreateMuByName    sync.Map
+
+	// entityObserver, when installed (BOB-11), is notified after every
+	// queue/exchange/consumer registration or removal. Appended at the end of
+	// the struct so no pre-existing field moves. Set once by the server's
+	// entity-counter wiring; nil means no observer. Read lock-free on the
+	// control-plane mutation paths.
+	entityObserver atomic.Pointer[EntityObserver]
 }
 
 // maxLenTrimReq is a deferred drop-head trim handed from an async publish
@@ -1723,6 +1730,11 @@ func (b *StorageBroker) DeclareExchange(name, exchangeType string, durable, auto
 		}
 	}
 
+	// BOB-11: a new exchange entity now exists (default/amq.* included — they
+	// are entities the UI lists). Fired outside the per-name create mutex,
+	// which was released above; the idempotent re-declare path returned early.
+	b.notifyEntity("exchange", 1)
+
 	return nil
 }
 
@@ -1794,8 +1806,15 @@ func (b *StorageBroker) DeleteExchange(name string, ifUnused bool) error {
 	}
 
 	err = b.storage.DeleteExchange(name)
-	if err == nil && name != "" && !strings.HasPrefix(name, "amq.") {
-		b.exchangeCount.Add(-1) // §15: release the deleted user exchange's slot
+	if err == nil {
+		// BOB-11: the exchange entity is gone (default/amq.* included). Fired
+		// on the same success condition as the §15 slot release, but for every
+		// name — exchangeCount deliberately excludes default/amq.*, the entity
+		// counter does not.
+		b.notifyEntity("exchange", -1)
+		if name != "" && !strings.HasPrefix(name, "amq.") {
+			b.exchangeCount.Add(-1) // §15: release the deleted user exchange's slot
+		}
 	}
 	return err
 }
@@ -1952,6 +1971,11 @@ func (b *StorageBroker) DeclareQueue(name string, durable, autoDelete, exclusive
 			// Log but don't fail - metadata update is not critical for operation
 		}
 	}
+
+	// BOB-11: a new queue entity now exists. Fired only on this new-queue
+	// branch (the redeclare branch returned earlier), outside the per-name
+	// create mutex released above.
+	b.notifyEntity("queue", 1)
 
 	return queue, nil
 }
@@ -2139,6 +2163,23 @@ func (b *StorageBroker) deleteQueueIncarnation(name string, wantOrdinal uint64, 
 		}
 	}
 
+	// BOB-11: consumer and queue entity deltas are accumulated here and fired
+	// from the defer below. That defer is registered BEFORE cmu's unlock defer,
+	// so (LIFO) it runs AFTER cmu.Unlock — the observer is never called with a
+	// broker lock held. removedConsumers counts only genuine
+	// activeConsumers.LoadAndDelete transitions, so a consumer already removed
+	// by UnregisterConsumer is never double-counted.
+	var removedConsumers int64
+	var queueDeleted bool
+	defer func() {
+		for i := int64(0); i < removedConsumers; i++ {
+			b.notifyEntity("consumer", -1)
+		}
+		if queueDeleted {
+			b.notifyEntity("queue", -1)
+		}
+	}()
+
 	// The consumer sweep runs BEFORE the incarnation is revalidated, and is
 	// deliberately left that way.
 	//
@@ -2175,7 +2216,9 @@ func (b *StorageBroker) deleteQueueIncarnation(name string, wantOrdinal uint64, 
 		for _, state := range consumers {
 			state.gate.stop()
 			state.stopOnce.Do(func() { close(state.stopCh) })
-			b.activeConsumers.Delete(state.consumer.ID)
+			if _, loaded := b.activeConsumers.LoadAndDelete(state.consumer.ID); loaded {
+				removedConsumers++
+			}
 		}
 	}
 	b.queueConsumers.Delete(name)
@@ -2262,7 +2305,9 @@ func (b *StorageBroker) deleteQueueIncarnation(name string, wantOrdinal uint64, 
 	if err == nil {
 		for _, consumer := range consumers {
 			b.storage.DeleteConsumer(name, consumer.ID)
-			b.activeConsumers.Delete(consumer.ID)
+			if _, loaded := b.activeConsumers.LoadAndDelete(consumer.ID); loaded {
+				removedConsumers++
+			}
 		}
 	}
 
@@ -2275,6 +2320,7 @@ func (b *StorageBroker) deleteQueueIncarnation(name string, wantOrdinal uint64, 
 		return purgedCount, err
 	}
 	b.queueCount.Add(-1) // §15: release the deleted record's slot
+	queueDeleted = true
 	return purgedCount, nil
 }
 
@@ -2620,6 +2666,12 @@ func (b *StorageBroker) RegisterConsumer(queueName, consumerID string, consumer 
 
 	b.activeConsumers.Store(consumerID, state)
 
+	// BOB-11: a new consumer entity now exists. consumerID is process-unique
+	// (minted at basic.consume), so this Store is always a fresh key and the +1
+	// is exact. No broker lock is held here (the queueConsumers mutex was
+	// released above and is re-taken below).
+	b.notifyEntity("consumer", 1)
+
 	b.storage.RegisterConsumerCursor(queueName, consumerID)
 
 	mu.Lock()
@@ -2678,7 +2730,11 @@ func (b *StorageBroker) UnregisterConsumer(consumerID string) error {
 	//    LoadAndDelete for the same reason). Only one side wins the
 	//    LoadAndDelete; the other sees !loaded and skips — no double
 	//    decrement of the inflight counter, no double requeue.
-	b.activeConsumers.Delete(consumerID)
+	if _, loaded := b.activeConsumers.LoadAndDelete(consumerID); loaded {
+		// BOB-11: exactly-once consumer entity removal (a consumer already
+		// swept by queue teardown is not double-counted). No broker lock held.
+		b.notifyEntity("consumer", -1)
+	}
 
 	// 6. Drain consumer.Messages — these are deliveries that were buffered
 	//    in the channel but not yet pulled by the server's forwarder
