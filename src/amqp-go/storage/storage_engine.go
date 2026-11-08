@@ -1190,6 +1190,14 @@ func (ds *StorageEngine) GetQueueBindings(queueName string) ([]*interfaces.Queue
 	return ds.metadataStore.GetQueueBindings(queueName)
 }
 
+// SnapshotBindings forwards to the metadata store (BOB-4).
+func (ds *StorageEngine) SnapshotBindings() ([]*interfaces.QueueBinding, []*interfaces.ExchangeBinding, error) {
+	if ds.metadataStore == nil {
+		return nil, nil, fmt.Errorf("metadata store not initialized")
+	}
+	return ds.metadataStore.SnapshotBindings()
+}
+
 func (ds *StorageEngine) GetExchangeBindings(exchangeName string) ([]*interfaces.QueueBinding, error) {
 	if ds.metadataStore == nil {
 		return nil, fmt.Errorf("metadata store not initialized")
