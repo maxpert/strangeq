@@ -239,7 +239,7 @@ var unanswerableChecks = map[string]string{
 }
 
 func (s *Server) hHealthCheck(w http.ResponseWriter, r *http.Request) {
-	name := pathValue(r.URL.EscapedPath(), "/api/health/checks/{check}", "check")
+	name := pathValue("/api/health/checks/{check}", r.URL.EscapedPath(), "check")
 	if reason, bad := unanswerableChecks[name]; bad {
 		s.writeAPIError(w, r, apiErr(http.StatusNotImplemented, errNotImplemented, reason))
 		return

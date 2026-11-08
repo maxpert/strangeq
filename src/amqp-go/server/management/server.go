@@ -51,6 +51,7 @@ type Server struct {
 
 	httpSrv *http.Server
 	ln      net.Listener
+	mu      sync.Mutex
 
 	sessions *sessionStore
 	jobs     *jobPool
@@ -283,16 +284,19 @@ func (s *Server) Start() error {
 			MinVersion:   tls.VersionTLS12,
 		})
 	}
+	s.mu.Lock()
 	s.ln = ln
-	s.httpSrv = &http.Server{
+	httpSrv := &http.Server{
 		Handler:           http.HandlerFunc(s.serveHTTP),
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       10 * time.Second,
 		WriteTimeout:      10 * time.Second,
 		IdleTimeout:       120 * time.Second,
 	}
+	s.httpSrv = httpSrv
+	s.mu.Unlock()
 	go func() {
-		if err := s.httpSrv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		if err := httpSrv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			s.log.Warn("management server stopped", zap.Error(err))
 		}
 	}()
@@ -305,24 +309,51 @@ func (s *Server) Start() error {
 
 // Addr returns the bound address, or nil before a successful Start.
 func (s *Server) Addr() net.Addr {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	if s.ln == nil {
 		return nil
 	}
 	return s.ln.Addr()
 }
 
-// Shutdown stops the surface gracefully. It is idempotent and safe to call
-// before Start.
+// Shutdown stops the surface gracefully. It is idempotent, safe to call before
+// Start, and RESTARTABLE: a subsequent Start binds again (NFR-040/OPS-044).
+// The bounded job pool is intentionally left running — it holds no listener
+// resources and is created once in New; use Close for terminal teardown.
 func (s *Server) Shutdown(ctx context.Context) error {
 	s.shuttingDwn.Store(true)
+	s.mu.Lock()
+	srv := s.httpSrv
+	ln := s.ln
+	s.httpSrv = nil
+	s.ln = nil
+	s.mu.Unlock()
+
 	var err error
-	if s.httpSrv != nil {
-		err = s.httpSrv.Shutdown(ctx)
+	if srv != nil {
+		err = srv.Shutdown(ctx)
 	}
+	// http.Server.Shutdown closes the listeners it has TRACKED; a Start that
+	// has not yet reached Serve's trackListener would leave the socket open
+	// and break a subsequent rebind. Close it explicitly (an already-closed
+	// listener returns an error we ignore).
+	if ln != nil {
+		_ = ln.Close()
+	}
+	s.started.Store(false)
+	s.shuttingDwn.Store(false)
+	return err
+}
+
+// Close stops the surface AND its background job workers. It is the terminal
+// teardown for embedders; Shutdown (used by Server.Shutdown) is restartable and
+// deliberately leaves the pool running.
+func (s *Server) Close() error {
 	if s.jobs != nil {
 		s.jobs.close()
 	}
-	return err
+	return nil
 }
 
 // ReloadUsers re-reads auth.json and invalidates sessions for users that

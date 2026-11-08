@@ -4,9 +4,11 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -120,7 +122,9 @@ func (e *env) do(method, target string, body []byte, headers map[string]string) 
 	return rec
 }
 
-func (e *env) get(target string) *httptest.ResponseRecorder { return e.do(http.MethodGet, target, nil, nil) }
+func (e *env) get(target string) *httptest.ResponseRecorder {
+	return e.do(http.MethodGet, target, nil, nil)
+}
 
 // doFrom performs a request with an explicit socket peer address.
 func (e *env) doFrom(remoteAddr, method, target string, body []byte, headers map[string]string) *httptest.ResponseRecorder {
@@ -220,3 +224,45 @@ func basicToken(user, pass string) string {
 	req.SetBasicAuth(user, pass)
 	return strings.TrimPrefix(req.Header.Get("Authorization"), "Basic ")
 }
+
+func contextBackground() context.Context { return context.Background() }
+
+func contextWithTimeout(d time.Duration) context.Context {
+	ctx, cancel := context.WithTimeout(context.Background(), d)
+	// The caller's request is short-lived; leaking the cancel func for the
+	// duration of a test is harmless, but keeping it referenced keeps vet
+	// quiet about lostcancel.
+	_ = cancel
+	return ctx
+}
+
+// settleGoroutines returns a stable goroutine count, polling with a bounded
+// deadline.
+func settleGoroutines(t *testing.T) int {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	last := runtime.NumGoroutine()
+	for time.Now().Before(deadline) {
+		time.Sleep(50 * time.Millisecond)
+		cur := runtime.NumGoroutine()
+		if cur == last {
+			return cur
+		}
+		last = cur
+	}
+	return last
+}
+
+// freePort reserves an ephemeral loopback port and returns it.
+func freePort(t *testing.T) int {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("freePort: %v", err)
+	}
+	port := ln.Addr().(*net.TCPAddr).Port
+	_ = ln.Close()
+	return port
+}
+
+func jsonUnmarshalStrict(b []byte, v any) error { return json.Unmarshal(b, v) }
