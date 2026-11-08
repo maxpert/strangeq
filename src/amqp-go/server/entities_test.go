@@ -189,8 +189,12 @@ func TestInitEntityCounters_BindingSeedErrorIsLogged(t *testing.T) {
 
 	require.Nil(t, srv.SnapshotEntityTotals().Bindings,
 		"an unreadable binding count stays null (honest), never a fabricated 0")
-	require.NotZero(t, logs.FilterMessageSnippet("binding").Len(),
-		"the binding-seed failure must be logged, not swallowed")
+	require.GreaterOrEqual(t, logs.Len(), 1,
+		"the binding-seed failure must be logged at WarnLevel, not swallowed")
+	entries := logs.All()
+	require.Equal(t, zapcore.WarnLevel, entries[0].Level)
+	require.NotNil(t, entries[0].ContextMap()["error"],
+		"the seed failure must be logged with its error field")
 }
 
 func TestEntityObserverWired_OnlyForSeamBroker(t *testing.T) {
