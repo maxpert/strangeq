@@ -37,6 +37,10 @@ var (
 	vitalLabelRe = regexp.MustCompile(`^([a-zA-Z_][a-zA-Z0-9_]*)\s*(!=|=)\s*"((?:[^"\\]|\\.)*)"$`)
 	// inventoryNameRe pulls the amqp_* family names out of the golden list.
 	inventoryNameRe = regexp.MustCompile(`"(amqp_[a-zA-Z0-9_]+)"`)
+	// inventoryWantRe bounds that list to the test's `want := []string{...}`
+	// literal, so a family merely mentioned in a comment is not treated as part
+	// of the pinned set.
+	inventoryWantRe = regexp.MustCompile(`(?s)want\s*:=\s*\[\]string\{(.*?)\n\s*\}`)
 )
 
 // labelDomains is the enumerable label-literal domain for every family the
@@ -128,7 +132,9 @@ func loadInventoryGolden(t *testing.T) map[string]bool {
 	path := filepath.Join("..", "..", "..", "metrics", "inventory_test.go")
 	data, err := os.ReadFile(path)
 	require.NoErrorf(t, err, "reading the metric inventory golden %s", path)
-	names := inventoryNameRe.FindAllStringSubmatch(string(data), -1)
+	block := inventoryWantRe.FindSubmatch(data)
+	require.NotNilf(t, block, "the inventory golden %s no longer has a `want := []string{...}` list", path)
+	names := inventoryNameRe.FindAllStringSubmatch(string(block[1]), -1)
 	require.Greaterf(t, len(names), 100, "the inventory golden %s yielded only %d names", path, len(names))
 	golden := make(map[string]bool, len(names))
 	for _, n := range names {
