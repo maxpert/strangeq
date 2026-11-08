@@ -41,6 +41,7 @@ func (s *Server) processChannelSpecificMethod(conn *protocol.Connection, channel
 				fmt.Sprintf("CHANNEL_ERROR - second 'channel.open' seen on channel %d", channelID), 20, 10)
 		}
 		conn.ChannelCount.Add(1)
+		s.withEntityDelta("channels", 1)
 
 		s.Log.Debug("Channel opened",
 			zap.Uint16("channel_id", channelID),
@@ -243,6 +244,7 @@ func (s *Server) teardownChannel(conn *protocol.Connection, channelID uint16) {
 	// Remove channel from connection
 	conn.Channels.Delete(channelID)
 	conn.ChannelCount.Add(-1)
+	s.withEntityDelta("channels", -1)
 
 	// Clean up transaction state for this channel (conn-scoped, D-NEW-1:
 	// closing this connection's channel must not drop another connection's

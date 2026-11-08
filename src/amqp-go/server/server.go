@@ -161,6 +161,26 @@ type Server struct {
 	publisherParkCount atomic.Uint64
 	publisherParkNanos atomic.Int64
 	publisherParkedNow atomic.Int64
+
+	// --- BOB-11: coherent entity counters (append-only) ---
+	//
+	// entityGate serialises every update to the five entity counters plus the
+	// monotonic generation, and the snapshot read. It is a control-plane lock:
+	// taken only when an entity is added or removed (connection accept/
+	// teardown, channel open/close, queue/exchange declare/delete, consumer
+	// register/unregister) and by SnapshotEntityTotals. It is NEVER taken on
+	// the per-message publish/consume path. Plain int64 (not atomics) are
+	// correct because the gate is the synchronisation; a torn read is
+	// impossible. entityObserverWired records whether the broker observer seam
+	// was installed, so the management layer can report snapshot_coherent.
+	entityGate          sync.Mutex
+	entityConnections   int64
+	entityChannels      int64
+	entityConsumers     int64
+	entityQueues        int64
+	entityExchanges     int64
+	entityGeneration    uint64
+	entityObserverWired bool
 }
 
 // PublisherParkStats returns (number of completed reader parks, total parked
@@ -441,6 +461,7 @@ func (s *Server) handleConnection(conn net.Conn) {
 		return
 	}
 	s.Connections[connection.ID] = connection
+	s.withEntityDelta("connections", 1)
 	s.Mutex.Unlock()
 
 	// Record connection created
@@ -499,6 +520,7 @@ func (s *Server) cleanupConnection(connection *protocol.Connection) {
 		channel.Mutex.Unlock()
 
 		connection.ChannelCount.Add(-1)
+		s.withEntityDelta("channels", -1)
 
 		// Clean up transaction state for this channel to prevent
 		// cross-connection state leak where stale tx state keyed by
@@ -555,6 +577,7 @@ func (s *Server) cleanupConnection(connection *protocol.Connection) {
 
 	s.Mutex.Lock()
 	delete(s.Connections, connection.ID)
+	s.withEntityDelta("connections", -1)
 	s.Mutex.Unlock()
 
 	if s.MetricsCollector != nil {
