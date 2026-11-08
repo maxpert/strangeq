@@ -176,12 +176,22 @@ type definitionsExport struct {
 // defsExcludes is the fixed list of things a StrangeQ export never carries
 // (SEC-070, COMPAT-025/026). It is stated on the wire so a client can see the
 // divergence rather than infer it.
+//
+// "binary_field_table_values_become_base64_strings" (LOW-6) is a MAPPING
+// divergence, not an omission: a field-table value is emitted through
+// fieldTableJSON (FR-CONV-047), so a []byte (or non-UTF-8 long string) becomes
+// a base64 JSON STRING and a time.Time becomes integer seconds. A headers
+// binding re-imported from the export therefore carries a string, not bytes.
+// The properties_key is unaffected: it is the SHA-256 of that SAME canonical
+// JSON, so a key exported from GET /api/bindings still matches the DELETE
+// endpoint (DIV-12). See TestFieldTableJSON_ValueMappingDivergence.
 var defsExcludes = []string{
 	"user_password_hashes",
 	"policies",
 	"parameters",
 	"vhosts_other_than_root",
 	"implicit_default_bindings",
+	"binary_field_table_values_become_base64_strings",
 }
 
 // exportTimeFormat is RFC 3339 UTC with milliseconds (FR-CONV-042). It is the
