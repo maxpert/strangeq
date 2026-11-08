@@ -1782,28 +1782,34 @@ func (b *StorageBroker) DeleteExchange(name string, ifUnused bool) error {
 		}
 	}
 
+	// BOB-4: the whole exchange teardown is ONE binding delta (spec §1.5/§5.1
+	// test 11): every queue binding whose source is this exchange, every e2e
+	// binding from it, and every e2e binding into it are removed together. A
+	// delete that FAILS leaves its binding row in place, so it must NOT be
+	// counted — else the entity count would fall below len(ListBindings()).
 	queueBindings, _ := b.storage.GetExchangeBindings(name)
+	var removedBindings int64
 	for _, bnd := range queueBindings {
-		b.storage.DeleteBinding(bnd.QueueName, bnd.ExchangeName, bnd.RoutingKey)
+		if err := b.storage.DeleteBinding(bnd.QueueName, bnd.ExchangeName, bnd.RoutingKey); err == nil {
+			removedBindings++
+		}
 	}
 
 	fromBindings, _ := b.storage.GetExchangeBindingsFrom(name)
 	for _, eb := range fromBindings {
-		b.storage.DeleteExchangeBinding(eb.Source, eb.Destination, eb.RoutingKey)
+		if err := b.storage.DeleteExchangeBinding(eb.Source, eb.Destination, eb.RoutingKey); err == nil {
+			removedBindings++
+		}
 	}
-
-	// BOB-4: the whole exchange teardown is ONE binding delta (spec §1.5/§5.1
-	// test 11): every queue binding whose source is this exchange, every e2e
-	// binding from it, and every e2e binding into it are removed together.
-	removedBindings := int64(len(queueBindings) + len(fromBindings))
 
 	allExchanges, _ := b.storage.ListExchanges()
 	for _, exch := range allExchanges {
 		exchBindings, _ := b.storage.GetExchangeBindingsFrom(exch.Name)
 		for _, eb := range exchBindings {
 			if eb.Destination == name {
-				b.storage.DeleteExchangeBinding(eb.Source, eb.Destination, eb.RoutingKey)
-				removedBindings++
+				if err := b.storage.DeleteExchangeBinding(eb.Source, eb.Destination, eb.RoutingKey); err == nil {
+					removedBindings++
+				}
 				// §12: the deleted exchange was the DESTINATION of this e2e
 				// binding; removing it may orphan an auto-delete SOURCE.
 				b.maybeAutoDeleteExchange(eb.Source)
@@ -2301,11 +2307,14 @@ func (b *StorageBroker) deleteQueueIncarnation(name string, wantOrdinal uint64, 
 	bindings, err := b.storage.GetQueueBindings(name)
 	if err == nil {
 		for _, binding := range bindings {
-			b.storage.DeleteBinding(binding.QueueName, binding.ExchangeName, binding.RoutingKey)
+			// A failed DeleteBinding leaves the row in place, so only a
+			// successful removal may count toward the binding delta (else
+			// object_totals.bindings could fall below len(ListBindings())).
+			if derr := b.storage.DeleteBinding(binding.QueueName, binding.ExchangeName, binding.RoutingKey); derr == nil {
+				removedBindings++
+			}
 			touched = append(touched, binding.ExchangeName)
 		}
-		// BOB-4: the whole sweep is one delta (see the defer above).
-		removedBindings = int64(len(bindings))
 	}
 
 	// Persisted-consumer sweep. The live consumers were already stopped and
