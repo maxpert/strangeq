@@ -91,8 +91,8 @@ func (s *Server) connectionsSnapshot() []connectionInfo {
 		return nil
 	}
 	alarm := srv.AlarmState() != 0
-	out := make([]connectionInfo, 0, len(srv.Connections))
 	srv.Mutex.RLock()
+	out := make([]connectionInfo, 0, len(srv.Connections))
 	for id, conn := range srv.Connections {
 		info := connectionInfo{
 			Name:     id,
