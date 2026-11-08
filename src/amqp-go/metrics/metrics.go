@@ -1,6 +1,7 @@
 package metrics
 
 import (
+	"sync"
 	"sync/atomic"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -145,6 +146,22 @@ type Collector struct {
 	// (nil func → zero gauges). Set once by BindPublishLeaseStats.
 	publishLeaseStats *atomic.Value
 
+	// namespace is the Prometheus namespace ("amqp") the lazily-registered
+	// amqp_management_* families reuse (mgmt-01 §9).
+	namespace string
+
+	// mgmt holds the amqp_management_* families once RegisterManagement runs;
+	// nil until then, so every ManagementMetricsSink method is a no-op
+	// (SEC-001) and management-disabled registers nothing (OPS-002).
+	mgmt     atomic.Pointer[managementMetrics]
+	mgmtOnce sync.Once
+
+	// mgmtRegistry is where RegisterManagement registers the management
+	// families. Production leaves it at prometheus.DefaultRegisterer (the
+	// telemetry registry promhttp.Handler() scrapes); a test may redirect it
+	// to a private registry.
+	mgmtRegistry prometheus.Registerer
+
 	// WS-MEMORY-CUT bookkeeping diagnostics (amqp_wal_bookkeeping_*). The three
 	// GaugeFuncs read the bound stats AT SCRAPE TIME (never stale); bind via
 	// BindWALBookkeepingStats. DIAGNOSTIC ONLY; never gated.
@@ -200,6 +217,8 @@ func NewCollector(namespace string) *Collector {
 	publisherParkStats := &atomic.Value{}
 
 	c := &Collector{
+		namespace:    namespace,
+		mgmtRegistry: prometheus.DefaultRegisterer,
 		// Connection metrics
 		ConnectionsTotal: promauto.NewGauge(prometheus.GaugeOpts{
 			Namespace: namespace,

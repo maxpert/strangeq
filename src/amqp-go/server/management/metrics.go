@@ -14,6 +14,13 @@ type ManagementMetricsSink interface {
 	ManagementSnapshotPartial(endpoint string)
 	ManagementSnapshotDuration(endpoint string, seconds float64)
 	ManagementSnapshotLockWait(seconds float64)
+	// ManagementForbiddenLock counts an acquisition of a forbidden hot-path
+	// lock by a management request. It is NOT runtime-reachable: no management
+	// request path calls it. The AST gate (TestForbiddenLockGate_ASTScan) and
+	// the hold-the-lock deadline test (TestForbiddenLock_OverviewDoesNotBlock)
+	// are the real barrier (NFR-011); the family exists only so a future
+	// regression has a name to fire. See
+	// TestForbiddenLockMetric_NotRuntimeReachable.
 	ManagementForbiddenLock(lock string)
 	ManagementPublishBackpressure()
 	ManagementJobs(state string, n int)
