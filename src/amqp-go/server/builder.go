@@ -449,6 +449,12 @@ func (b *ServerBuilder) Build() (*Server, error) {
 			interfaces.LogField{Key: "faults", Value: len(faults)})
 	}
 
+	// BOB-11: seed the five entity counters from the post-recovery registries
+	// and wire the broker observer. MUST run AFTER PerformRecovery so recovered
+	// entities are seeded rather than double-counted by later observer events,
+	// and BEFORE the management listener starts (mgmt-03 §5).
+	server.InitEntityCounters()
+
 	return server, nil
 }
 
