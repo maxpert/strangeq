@@ -1161,10 +1161,37 @@ func TestLease_InterleavedChannelsWithinBudget(t *testing.T) {
 
 // SL-15: ch1 owed while another connection's waiter is queued: ch2's nested
 // TryReserve fails → 506 close; ch2 content is never processed; teardown
-// releases everything.
+// releases everything. "Ch2 is never admitted" is asserted on X's OWN grant
+// count, not on the global `created` counter, which X's teardown moves.
 func TestLease_NestedHeaderOverBudgetCloses(t *testing.T) {
 	release := gateWALWrite(t)
 	srv, addr, created, released, probe := leaseServer(t, 1<<20, nil, nil)
+
+	// PER-CONNECTION grant accounting. The limiter reports every grant it
+	// makes as "grant:<connID>" through the step hook, so the invariant this
+	// test exists to pin — ch2's nested header is NEVER admitted unleased —
+	// can be asserted on X's OWN grant count. It must not be asserted on the
+	// process-wide `created` counter at an instant: the 506 below tears X's
+	// connection down, and its teardown ABORTS ch1's still-pending lease
+	// (releasing 615272 bytes and granting Y's queued waiter, taking `created`
+	// to 2) as soon as the connection's goroutines finish joining — ~5 ms after
+	// the 506 on darwin, and a polling goroutine can be descheduled past that
+	// window under CI load. That makes an instant `created == 1` check a race
+	// (the same state flips to 2 on a schedule the test does not control),
+	// whereas X's grant count is 1 forever: X sends exactly two headers, ch1's
+	// (granted) and ch2's (rejected).
+	var grantMu sync.Mutex
+	grantsByConn := make(map[string]int)
+	srv.Mutex.Lock()
+	srv.limiterStepHook = func(step string) {
+		if len(step) < 6 || step[:6] != "grant:" {
+			return
+		}
+		grantMu.Lock()
+		grantsByConn[step[6:]]++
+		grantMu.Unlock()
+	}
+	srv.Mutex.Unlock()
 
 	// X: ch1 publishes 600 KiB (lease ≈ 615272) but only sends part of the
 	// body — the leased body stays owed.
@@ -1178,6 +1205,21 @@ func TestLease_NestedHeaderOverBudgetCloses(t *testing.T) {
 	leaseSendHeader(t, x, 1, 600<<10, true, "")
 	leaseSendBody(t, x, 1, leaseBody(100<<10)) // 500 KiB still owed
 	require.Eventually(t, func() bool { return created.Load() == 1 }, 30*time.Second, time.Millisecond)
+
+	// X's connection id: ch1's header is the only grant so far and Y has not
+	// connected yet, so the single recorded granter IS X.
+	var xConnID string
+	require.Eventually(t, func() bool {
+		grantMu.Lock()
+		defer grantMu.Unlock()
+		if len(grantsByConn) != 1 {
+			return false
+		}
+		for id := range grantsByConn {
+			xConnID = id
+		}
+		return true
+	}, 30*time.Second, time.Millisecond, "ch1's header lease must be granted to X's connection")
 
 	// Y: a full 600 KiB durable publish — its header's blocking Reserve queues
 	// (used + lease > G), and its body stays unread.
@@ -1216,9 +1258,18 @@ func TestLease_NestedHeaderOverBudgetCloses(t *testing.T) {
 	// else: socket closed without a frame — also acceptable.
 
 	require.Eventually(t, func() bool { return probe.overbudgetCloses.Load() == 1 }, 30*time.Second, time.Millisecond)
-	assert.Equal(t, int64(1), created.Load(), "ch2's header is never leased (never admitted)")
+	// ch2's header is never leased (never admitted): X's connection holds
+	// exactly ONE grant — ch1's header. A second grant on X could only be
+	// ch2's nested header, which the TryReserve above refused. The count is
+	// read after the 506 is observed, so a ch2 grant (had one happened) is
+	// already recorded; it does not depend on when X's teardown runs.
+	grantMu.Lock()
+	xGrants := grantsByConn[xConnID]
+	grantMu.Unlock()
+	assert.Equal(t, 1, xGrants, "ch2's header is never leased (never admitted)")
 
-	// X's teardown releases ch1's pending lease, which grants Y's waiter.
+	// X's teardown (triggered by the 506 above) releases ch1's pending lease,
+	// which grants Y's waiter; Y's own WAL write is still held by the gate.
 	release() // let every fsync through
 	leaseWaitAck(t, y, 1, 1)
 	<-yBody
