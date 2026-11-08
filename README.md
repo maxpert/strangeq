@@ -297,17 +297,17 @@ Key engine tuning parameters:
 
 ## Performance
 
-Throughput is measured as **end-to-end delivered messages per second (msg/s)**: every published message is delivered and acknowledged, and `lost=0`. Both brokers are driven by the same client ([`cmd/perftest`](src/amqp-go/cmd/perftest), built on [amqp091-go](https://github.com/rabbitmq/amqp091-go)) with identical flags. Shipped release is `v0.13.0`. The `none` and `barrier` StrangeQ columns are from the `ab-release` campaign (5 stall-free repetitions per cell, profiling-free harness, zero invalid cells); the `flush` rows are separate full-flush reference measurements — see **Repetitions** below.
+Throughput is measured as **end-to-end delivered messages per second (msg/s)**: every published message is delivered and acknowledged, and `lost=0`. Both brokers are driven by the same client ([`cmd/perftest`](src/amqp-go/cmd/perftest), built on [amqp091-go](https://github.com/rabbitmq/amqp091-go)) with identical flags. Shipped release is `v0.13.0`. The `none` and `barrier` StrangeQ columns are from the release benchmark matrix (5 stall-free repetitions per cell, profiling-free harness, zero invalid cells); the `flush` rows are separate full-flush reference measurements — see **Repetitions** below.
 
 ### How to read this
 
 **Contract (both brokers).** One 16-core Apple Silicon machine (M4 Max) with an APFS data volume; one broker runs at a time. Durable queue (RabbitMQ Classic; StrangeQ durable), persistent messages, publisher confirms, consumer prefetch 100, an outstanding window of 1000, and manual acknowledgements. A 10 s warm-up is followed by a 30 s measured window; throughput is the median per-second receive rate over seconds 6–30.
 
-**Repetitions and stalled cells.** Every `none` and `barrier` figure is the **median of 5 stall-free repetitions** from the `ab-release` matrix. The `flush` rows are reference measurements from separate full-flush runs on an earlier tree (the 1 KiB rows predate the barrier-everywhere change and carry fewer repetitions); they are indicative of the power-loss mode's cost and are **not** part of the gated matrix. A repetition whose consumer throughput collapses part-way through the measured window is excluded even when it passes the harness gate: the gate checks counts (`lost=0`, `published == confirmed == delivered`, queue depth back to 0), not the shape of the per-second series, so a mid-window stall can pass it. Stalled repetitions are detected separately and re-run; none remain in the matrix below.
+**Repetitions and stalled cells.** Every `none` and `barrier` figure is the **median of 5 stall-free repetitions** from the release benchmark matrix. The `flush` rows are reference measurements from separate full-flush runs on an earlier tree (the 1 KiB rows predate the barrier-everywhere change and carry fewer repetitions); they are indicative of the power-loss mode's cost and are **not** part of the gated matrix. A repetition whose consumer throughput collapses part-way through the measured window is excluded even when it passes the harness gate: the gate checks counts (`lost=0`, `published == confirmed == delivered`, queue depth back to 0), not the shape of the per-second series, so a mid-window stall can pass it. Stalled repetitions are detected separately and re-run; none remain in the matrix below.
 
 **Validity.** Each cell is a complete run behind a gate: `lost=0`, `unconfirmed=0`, `nacked=0`, `published == confirmed == delivered`, the queue drains to empty, the queue type is verified (`classic`), the broker binary sha256 matches, and no process panicked. Every cell in the matrix cleared the gate.
 
-**RabbitMQ reference.** The RabbitMQ columns are RabbitMQ 4.4 Classic at its **best-measured configuration for that workload** — its default where tuning does not help, and the best of the tuning arms where it does. The `none`/`barrier` StrangeQ columns are medians from the `ab-release` session; the RabbitMQ figures are the reference figures. Ratios across the two sessions carry a few percent of uncertainty; `none`-vs-`barrier` comparisons are same-session and exact, while any comparison involving a `flush` row is across separate campaigns and carries a few percent of uncertainty.
+**RabbitMQ reference.** The RabbitMQ columns are RabbitMQ 4.4 Classic at its **best-measured configuration for that workload** — its default where tuning does not help, and the best of the tuning arms where it does. The `none`/`barrier` StrangeQ columns are medians from the release benchmark session; the RabbitMQ figures are the reference figures. Ratios across the two sessions carry a few percent of uncertainty; `none`-vs-`barrier` comparisons are same-session and exact, while any comparison involving a `flush` row is across separate campaigns and carries a few percent of uncertainty.
 
 **WAL size.** StrangeQ ran with its shipped default WAL file size of **512 MiB** (`walfilesize: 536870912`), matching the shipped sample. WAL file size is the knob behind the 1 KiB peaks: a smaller WAL buys a lower peak on the small-message rows and costs 64 KiB 10p/10c throughput.
 
@@ -403,7 +403,7 @@ docker run -d --name rabbitmq-bench --platform linux/arm64 -p 5672:5672 rabbitmq
 
 The strongest durability guarantee depends on the platform's device-sync primitive, so run on the same kind of storage you intend to deploy against. A Go microbenchmark (`BenchmarkVersus`) also exists for allocation and latency profiling of the hot path.
 
-> See `.notes/benchmarks/ab-release/` for the full per-rep `none`/`barrier` data and evidence gate results.
+Per-repetition throughput and RSS figures were collected with the same `cmd/perftest` client shown above; run any cell repeatedly to reproduce the medians.
 
 ## Feature Comparison vs RabbitMQ
 
