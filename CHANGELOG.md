@@ -2,6 +2,16 @@
 
 ## [Unreleased]
 
+### Added
+- Management UI **Metrics** tab (`/metrics`): the SPA renders the broker's
+  Prometheus matrix — a 45-tile vital-stats panel, a grouped and searchable
+  family list, and a raw-text view — from a new same-origin, auth-gated
+  `GET /api/metrics` on the management listener. It re-serves the same process
+  registry the telemetry `/metrics` endpoint exposes, so the two never drift.
+  No new config key; when telemetry is disabled the route answers `501` and the
+  screen shows a truthful notice. The telemetry listener, CORS and the CSP
+  (`connect-src 'self'`) are unchanged.
+
 ## [0.12.0] - 2026-11-07
 
 ### Changed
