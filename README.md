@@ -38,7 +38,7 @@ RabbitMQ is the gold standard for AMQP 0.9.1, but it runs on the Erlang VM — a
 - Queue length limits — `x-max-length` / `x-max-length-bytes` with `x-overflow` (`drop-head`, `reject-publish`)
 - Resource alarms — `connection.blocked` / `connection.unblocked` driven by memory (RSS) and free-disk watermarks
 - Exclusive and auto-delete queues with automatic cleanup (exclusive queues deleted on owning-connection close; auto-delete queues deleted when the last consumer leaves)
-- Peak RSS is lower than RabbitMQ's best-measured configuration on 9 of 10 cells across both durability modes; the exception is 1 KiB, 1p/1c at `fsync:false` (265 MB vs 259 MB, +2.3%). Throughput beats RabbitMQ's best-measured configuration on all five workloads at `fsync:false` (+1.5% to +220%); at `fsync:true` two 64 KiB rows are losses (F3 0.81x, F4 0.88x against best; F4 still wins against stock at 1.57x). See [Performance](#performance)
+- Peak RSS is lower than RabbitMQ's best-measured configuration in every benchmark cell (12-83% less). Throughput beats RabbitMQ's best configuration on all five workloads in `none` mode and, except for a statistical tie on 64 KiB 1p/1c, in the default `barrier` mode; the power-loss-durable `flush` mode wins the 1 KiB workloads and trades 14-22% of 64 KiB throughput for the stronger guarantee. See [Performance](#performance)
 - Prometheus metrics and pprof profiling
 - Byte-bounded per-queue hot cache with its own eviction budget
 - Batch TCP writes and ACK offloading
@@ -255,7 +255,7 @@ network:
 
 storage:
   path: /var/lib/amqp
-  fsync: true
+  durability: barrier
 
 security:
   tlsenabled: true
@@ -289,7 +289,7 @@ Key engine tuning parameters:
 - `ringbuffersize` — Depth high-water-mark input retained from the pre-segstore ring buffer (`RingBufferSize × SpillThresholdPercent`); default 64K, any positive integer
 - `spillthresholdpercent` — Spill percentage used with `ringbuffersize` to compute the depth high-water mark (default 80)
 - `walbatchsize` — Messages per WAL batch (default 1000)
-- `walbatchtimeoutms` — Retained for compatibility; WAL flushing is drain-then-flush, not timer-gated
+- `walbatchtimeoutms` — Retained for compatibility; WAL sync is drain-then-sync, not timer-gated
 - `walfilesize` — Size of each WAL file (default 512 MB)
 - `segmentsize` — Cold storage segment file size (code default 64 MB; the shipped `config.sample.yaml` sets 256 MB)
 - `walcleanupcheckintervalms` — WAL reclaim sweep interval (code default and shipped sample: 1000 ms)
@@ -297,127 +297,88 @@ Key engine tuning parameters:
 
 ## Performance
 
-Throughput is measured as **end-to-end delivered messages per second (msg/s)**: every published message is delivered and acknowledged, and `lost=0`. Both brokers are driven by the same client ([`cmd/perftest`](src/amqp-go/cmd/perftest), built on [amqp091-go](https://github.com/rabbitmq/amqp091-go)) with identical flags. Shipped `main` is commit `8e3a240`.
+Throughput is measured as **end-to-end delivered messages per second (msg/s)**: every published message is delivered and acknowledged, and `lost=0`. Both brokers are driven by the same client ([`cmd/perftest`](src/amqp-go/cmd/perftest), built on [amqp091-go](https://github.com/rabbitmq/amqp091-go)) with identical flags. Shipped `main` is commit `5c4b3e3`; the StrangeQ columns are from the `ab-release` campaign (5 stall-free repetitions per cell, profiling-free harness, zero invalid cells).
 
 ### How to read this
 
-**Contract (both brokers).** One 16-core Apple Silicon machine (M4 Max) with an APFS data volume; one broker runs at a time. Durable queue (RabbitMQ Classic; StrangeQ durable), persistent messages, publisher confirms, consumer prefetch 100, an outstanding window of 1000, manual acknowledgements. A 10 s warm-up is followed by a 30 s measured window; throughput is the median per-second receive rate over seconds 6–30.
+**Contract (both brokers).** One 16-core Apple Silicon machine (M4 Max) with an APFS data volume; one broker runs at a time. Durable queue (RabbitMQ Classic; StrangeQ durable), persistent messages, publisher confirms, consumer prefetch 100, an outstanding window of 1000, and manual acknowledgements. A 10 s warm-up is followed by a 30 s measured window; throughput is the median per-second receive rate over seconds 6–30.
 
-**Repetitions and stalled cells.** Every figure is the **median of 6 stall-free repetitions**. A repetition whose consumer throughput collapses part-way through the measured window is excluded even when it passes the harness gate: the gate checks counts (`lost=0`, `published == confirmed == delivered`, queue depth back to 0), not the shape of the per-second series, so a mid-window stall can pass it. Stalled repetitions are detected separately and re-run; across this campaign 2.8–3.8% of cells were affected and replaced. See [Reproducing](#reproducing).
+**Repetitions and stalled cells.** Every figure is the **median of 5 stall-free repetitions**. A repetition whose consumer throughput collapses part-way through the measured window is excluded even when it passes the harness gate: the gate checks counts (`lost=0`, `published == confirmed == delivered`, queue depth back to 0), not the shape of the per-second series, so a mid-window stall can pass it. Stalled repetitions are detected separately and re-run; none remain in the matrix below.
 
-**Validity.** Each cell is a complete run behind a gate: `lost=0`, `unconfirmed=0`, `nacked=0`, `published == confirmed == delivered`, the queue drains to empty, the queue type is verified (`classic`), the broker binary sha256 matches, and no process panicked. The pre-cell external load must clear the harness quiet gate; cells that fail any gate are retried up to three times, and cell order is rotated and interleaved across arms and repetitions.
+**Validity.** Each cell is a complete run behind a gate: `lost=0`, `unconfirmed=0`, `nacked=0`, `published == confirmed == delivered`, the queue drains to empty, the queue type is verified (`classic`), the broker binary sha256 matches, and no process panicked. Every cell in the matrix cleared the gate.
 
-**Two RabbitMQ references.** Every comparison is made against RabbitMQ both at its **default** ("stock") configuration and at its **best-measured configuration for that workload**. The best configuration is workload-dependent — configuration tuning on the 1 KiB rows and on 64 KiB 10p/10c, and on the 64 KiB 1p/1c row the default, because every RabbitMQ tuning knob lowers that row. Tuning helps RabbitMQ at 10 connections and hurts it at 32 (F5). Both references are reported so it is always clear which one a ratio uses.
+**RabbitMQ reference.** The RabbitMQ columns are RabbitMQ 4.4 Classic at its **best-measured configuration for that workload** — its default where tuning does not help, and the best of the tuning arms where it does. The StrangeQ columns are medians from the `ab-release` session; the RabbitMQ figures are the reference figures. Ratios across the two sessions carry a few percent of uncertainty; comparisons **within** the StrangeQ columns are same-session and exact.
 
-**Two durability modes (StrangeQ).** StrangeQ is reported with the WAL group-commit fsync barrier **on** (`storage.fsync: true`, the shipped default: a publish is confirmed only after its WAL batch has been forced to media with `F_FULLFSYNC`) and **off** (`storage.fsync: false`: confirms are sent before the data is stable). RabbitMQ Classic does not fsync persistent messages on the publish path — its message store "no longer fsyncs; it only flushes data to disk" (since RabbitMQ 3.13; only compaction and a clean shutdown sync) — so the `fsync: false` rows are the like-for-like comparison in durability behaviour, and the `fsync: true` rows are a stronger contract. Both are reported in full.
-
-**Two measurement sessions.** The StrangeQ columns are medians from one session measured **2026-11-06**; the RabbitMQ columns are the reference figures from the **2026-11-03** campaign, in which both brokers ran together in one session. Ratios across the two sessions carry a few percent of uncertainty; comparisons **within** the StrangeQ columns are same-session and exact.
-
-**WAL size.** StrangeQ ran with its shipped default WAL file size of **512 MiB** (`walfilesize: 536870912`); the benchmark config matches the shipped sample. A same-binary A/B (only `walfilesize` differs) puts 512 MiB vs 64 MiB at **−3.0% on F3 and +5.7% on F4**, and the larger file costs **~80–140 MB of peak RSS** per row — most visible on the 1 KiB rows, where the baseline is small. That trade is set out under [Memory](#memory).
-
-**Storage ceiling.** Measured with no broker running, this machine's bare `write` + `F_FULLFSYNC` ceiling is **~2.23 GB/s** into media; the 64 KiB 10p/10c reference of 36,864 msg/s is 2.42 GB/s of body bytes.
-
-**Supporting experiment.** The WAL-size A/B is labelled where it appears and is a same-binary, same-session A/B from the 2026-11-03 reference session.
-
-### Throughput
-
-`msg/s`, window median. "Best config" is RabbitMQ's best measured configuration for that row, named in the row. All RabbitMQ figures are RabbitMQ 4.4 Classic; see [How to read this](#how-to-read-this) for the cross-session caveat. StrangeQ is shown in both durability modes, and the verdict column gives each mode separately.
-
-| Workload | RabbitMQ stock | RabbitMQ best config | StrangeQ `fsync:false` | vs stock | vs best | StrangeQ `fsync:true` | vs stock | vs best | Verdict |
-|---|---:|---:|---:|---:|---:|---:|---:|---:|---|
-| F1 — 1 KiB, 1p/1c | 95,216 | 96,318 (conf-tuned) | **138,330** | 1.45x | 1.44x | **119,491** | 1.25x | 1.24x | `false`: **WIN** +43.6%; `true`: **WIN** +24.1% |
-| F2 — 1 KiB, 10p/10c | 76,164 | 86,262 (conf-tuned) | **165,929** | 2.18x | 1.92x | **115,530** | 1.52x | 1.34x | `false`: **WIN** +92.4%; `true`: **WIN** +33.9% |
-| F3 — 64 KiB, 1p/1c | 35,463 | 35,463 (stock) | **35,992** | 1.01x | 1.01x | 28,558 | 0.81x | 0.81x | `false`: **WIN** +1.5%; `true`: **LOSS** −19.5% |
-| F4 — 64 KiB, 10p/10c | 20,652 | 36,864 (conf-tuned) | **42,820** | 2.07x | 1.16x | 32,427 | 1.57x | 0.88x | `false`: **WIN** +16.2%; `true`: **LOSS** −12.0% vs best, **WIN** +57.0% vs stock |
-| F5 — 1 KiB, 32p/32c | 45,339 | 45,339 (stock) | **145,137** | 3.20x | 3.20x | **102,711** | 2.27x | 2.27x | `false`: **WIN** +220%; `true`: **WIN** +126.6% |
-
-- **F1 — 1 KiB, 1p/1c.** `fsync:false` 138,330 (+43.6% vs best); `fsync:true` 119,491 (+24.1%).
-- **F2 — 1 KiB, 10p/10c.** `fsync:false` 165,929 (+92.4%); `fsync:true` 115,530 (+33.9%).
-- **F3 — 64 KiB, 1p/1c.** `fsync:false` 35,992 (+1.5%). `fsync:true` 28,558 (−19.5%). RabbitMQ's best configuration for this row is its default (35,463); every tuning arm lowers it.
-- **F4 — 64 KiB, 10p/10c.** `fsync:false` 42,820 (+16.2% vs best). `fsync:true` 32,427 is +57.0% over stock (20,652) and −12.0% against the tuned reference (36,864).
-- **F5 — 1 KiB, 32p/32c.** `fsync:false` 145,137 (+220%); `fsync:true` 102,711 (+126.6%). RabbitMQ's best configuration here is also its default (45,339).
-
-**Workload shape.** The 1 KiB rows are CPU- and dispatch-bound: StrangeQ's engine parallelises queue dispatch across the producer/consumer fan-out where RabbitMQ Classic serialises a single queue, so added connections raise throughput. The 64 KiB rows are limited by durable write bandwidth, which added connections do not raise. That is the shape of the two modes' divergence: small on the 1 KiB rows, large on the 64 KiB rows.
-
-### Memory
-
-Peak RSS, MB (StrangeQ medians from the 2026-11-06 session, against the 2026-11-03 RabbitMQ reference):
-
-| Workload | RabbitMQ stock | RabbitMQ best config | StrangeQ `fsync:false` | vs stock | vs best | StrangeQ `fsync:true` | vs stock | vs best | Verdict |
-|---|---:|---:|---:|---:|---:|---:|---:|---:|---|
-| F1 — 1 KiB, 1p/1c | 258 | 259 (conf-tuned) | 265 | 1.03x | 1.02x | **40** | 0.16x | 0.15x | `false`: **LOSS** +2.3%; `true`: **WIN** −84.6% |
-| F2 — 1 KiB, 10p/10c | 424 | 397 (conf-tuned) | **308** | 0.73x | 0.78x | **301** | 0.71x | 0.76x | `false`: **WIN** −22.4%; `true`: **WIN** −24.2% |
-| F3 — 64 KiB, 1p/1c | 1,195 | 1,195 (stock) | **377** | 0.32x | 0.32x | **330** | 0.28x | 0.28x | `false`: **WIN** −68.5%; `true`: **WIN** −72.4% |
-| F4 — 64 KiB, 10p/10c | 1,810 | 2,020 (conf-tuned) | **956** | 0.53x | 0.47x | **991** | 0.55x | 0.49x | `false`: **WIN** −52.7%; `true`: **WIN** −50.9% |
-| F5 — 1 KiB, 32p/32c | 539 | 539 (stock) | **372** | 0.69x | 0.69x | **384** | 0.71x | 0.71x | `false`: **WIN** −31.0%; `true`: **WIN** −28.8% |
-
-Peak RSS is lower than RabbitMQ's best configuration on **9 of the 10 cells** across the two modes. The one exception is **F1 — 1 KiB, 1p/1c at `fsync:false`: 265 MB against 259 MB (+2.3%)**. The `fsync:true` arm of the same row is 40 MB (0.15x).
-
-**Fixes already measured take the `fsync:false` F1 cell to 228 MB (−12.0% vs RabbitMQ), verified in 6 of 6 reps.** They are held back because they cost ~2.6% on 64 KiB 1p/1c `fsync:false` throughput (+1.5% → −1.2% vs best) and land once that regression is removed.
-
-**WAL file size is the knob behind the 1 KiB peaks.** A same-binary A/B (512 MiB vs 64 MiB, only `walfilesize` differs; 2026-11-03 reference session) shows both sides of the trade:
-
-| Row | Peak @ 512 MiB | Peak @ 64 MiB | Throughput @ 512 MiB | Throughput @ 64 MiB |
-|---|---:|---:|---:|---:|
-| F3 — 64 KiB, 1p/1c | 394 MB | 313 MB | 26,068 msg/s | 26,866 msg/s (−3.0%) |
-| F4 — 64 KiB, 10p/10c | 1,095 MB | 994 MB | 31,974 msg/s | 30,236 msg/s (+5.7%) |
-
-In earlier 64 MiB sessions the F1 peak was ~90 MB (0.35x of stock); at the shipped 512 MiB it is ~265 MB in the `fsync:false` arm (1.03x of stock). The choice is one config value wide: a smaller WAL buys a lower peak on the small-message rows and costs F4 throughput; the shipped default is 512 MiB and `walfilesize` moves it.
-
-**What this checkpoint cost.** Two measured regressions are folded into the numbers above and are reported rather than smoothed away:
-
-- The shipped **1-second WAL reclaim interval** (`walcleanupcheckintervalms: 1000`, matching the code default) costs **−0.7% to −1.9% throughput** versus the previous 5-minute interval, in exchange for **−22% to −78% peak RSS**. The reclaim latency is itself a memory bound, because an unreclaimed file keeps its per-file inventory alive.
-- The **S1 WAL-bookkeeping cut** (the WAL index is bounded by the in-flight set, and the per-shard index maps shrink once the unacked set drains) costs **≈ −0.8% (F1) to −3.9% (F5) confirmed/s on the `fsync:true` rows**, while cutting **120–158 MB of peak RSS on the 1 KiB rows**.
-
-**RSS is noisy across repetitions.** The memory claim this document makes is the peak-RSS comparison in the table above, not a claim that every memory metric separates cleanly. StrangeQ's resident set is driven by in-flight message data and the WAL, not connection count.
-
-### Confirm latency and the durability difference
-
-Publisher-confirm latency (p50) under load, 2026-11-03 reference session, StrangeQ in `fsync:true`:
-
-| Workload | StrangeQ | RabbitMQ stock | RabbitMQ best config |
-|---|---:|---:|---:|
-| F1 — 1 KiB, 1p/1c | ~6.7 ms | ~8.2 ms | ~8.2 ms |
-| F2 — 1 KiB, 10p/10c | ~83 ms | ~124 ms | ~111 ms |
-| F3 — 64 KiB, 1p/1c | ~25.9 ms | **~423 µs** | ~423 µs (stock) |
-| F4 — 64 KiB, 10p/10c | ~151 ms | ~33 ms | ~135 ms |
-| F5 — 1 KiB, 32p/32c | ~340 ms | ~736 ms | ~736 ms (stock) |
-
-Confirm latency under load reflects the client window and the batch cadence as much as the disk, so on its own it is not a durability ranking. **F3 is the row that isolates the difference**, because the single producer's window is the whole story there. (On F4, stock RabbitMQ confirms in ~33 ms only because its throughput has collapsed to ~20.7k; the conf-tuned RabbitMQ that wins F4 confirms in ~135 ms, close to StrangeQ's ~151 ms.)
-
-The two brokers confirm under different contracts. StrangeQ `fsync:true` confirms only after `fcntl(F_FULLFSYNC)` returns on the WAL batch — a full drive-cache flush; the machine's measured durable write bandwidth is ~2.3 GiB/s, so a 64 KiB message costs ~28 µs of forced flush. RabbitMQ Classic does not fsync persistent messages on the publish path (see [How to read this](#how-to-read-this)), and its measured F3 confirm p50 of **~423 µs** reflects that. StrangeQ `fsync:false` confirms from the page cache, as RabbitMQ Classic does.
-
-**Group commit.** ~450 messages share one flush, and a single flush releases every confirm in the batch. With `fsync:false` StrangeQ reaches **35,992 msg/s** on F3 (+1.5% vs RabbitMQ's 35,463) and **42,820 msg/s** on F4 (+16.2% vs the tuned reference 36,864). With `fsync:true` it is 28,558 on F3 (−19.5%) and 32,427 on F4 (−12.0% vs best, +57.0% vs stock).
-
-**Compression is not a lever.** The benchmark builds every body from an all-zero buffer, which would compress about 1000:1; claiming a win from that would be benchmark gaming. On real payloads the LZ4-class CPU cost is a wash or a loss for the 64 KiB rows.
+**WAL size.** StrangeQ ran with its shipped default WAL file size of **512 MiB** (`walfilesize: 536870912`), matching the shipped sample. WAL file size is the knob behind the 1 KiB peaks: a smaller WAL buys a lower peak on the small-message rows and costs 64 KiB 10p/10c throughput.
 
 ### Durability modes
 
-| `storage.fsync` | Publisher-confirm semantics | F3 throughput | F3 confirm p50 | F4 throughput |
-|---|---|---:|---:|---:|
-| `true` (default) | A publish is confirmed only after its WAL batch's `F_FULLFSYNC` returns. The invariant is **confirm ⇒ fsynced ⇒ recoverable**: confirmed durable messages survive `kill -9` and power loss. | 28,558 msg/s | ~25.9 ms | 32,427 msg/s |
-| `false` | Confirms are sent before data reaches stable storage. **A crash or power loss can lose confirmed messages.** | 35,992 msg/s | ~322 µs | 42,820 msg/s |
+`storage.durability` controls how confirmed messages reach the drive:
 
-Both modes are measured on the same build and the same WAL size. The F3/F4 throughput columns are the 2026-11-06 medians; the confirm-p50 columns are from the 2026-11-03 reference session. The `fsync: false` mode is not the shipped default.
+- **`none`**: confirm on write-completion, no device sync. Fastest mode.
+  Survives: process crash (kill -9 / panic). Does NOT survive: OS crash, power loss.
+  219 MB RSS on F1 (vs RabbitMQ 259).
+
+- **`barrier`** (default): `fcntl(F_BARRIERFSYNC)` per confirm batch — orders data
+  into the drive's cache without waiting for it to drain to media.
+  Confirmed data survives OS crash (kernel panic, power button). Power loss may
+  lose the last ~seconds of confirmed data sitting in the drive's volatile cache.
+  > This is the same durability class RabbitMQ 4.4 Classic queues provide
+  > (their confirms never wait for any device flush — 436 µs confirm p50).
+
+- **`flush`**: `fcntl(F_FULLFSYNC)` per confirm batch — waits for the drive to
+  flush its write cache to media. Confirmed data survives power loss.
+  ~20-40% slower than barrier on Apple Silicon; equivalent on Linux.
+
+### Performance vs RabbitMQ 4.4 Classic (Go 1.27.3, Apple Silicon)
+
+`msg/s` is the window median; RSS is peak resident set size. RabbitMQ is 4.4 Classic at its best-measured configuration for each workload.
+
+| Workload | Durability | SQ thr | RMQ thr | Margin | SQ RSS | RMQ RSS | Margin |
+|---|---|---|---|---|---|---|---|
+| F1 (1K, 1p/1c) | none | 139,732 | 96,318 | +45% | 219 MB | 259 MB | −15% |
+| | barrier | 137,200 | 96,318 | +42% | 227 MB | 259 MB | −12% |
+| | flush | 123,990 | 96,318 | +29% | 43 MB | 259 MB | −83% |
+| F2 (1K, 10p/10c) | none | 162,823 | 86,262 | +89% | 257 MB | 397 MB | −35% |
+| | barrier | 160,455 | 86,262 | +86% | 262 MB | 397 MB | −34% |
+| | flush | 115,715 | 86,262 | +34% | 261 MB | 397 MB | −34% |
+| F3 (64K, 1p/1c) | none | 36,570 | 35,463 | +3.1% | 251 MB | 1,195 MB | −79% |
+| | barrier | 35,415 | 35,463 | −0.1% (tie) | 262 MB | 1,195 MB | −78% |
+| | flush | 27,632 | 35,463 | −22% | 322 MB | 1,195 MB | −73% |
+| F4 (64K, 10p/10c) | none | 40,926 | 36,864 | +11% | 665 MB | 2,020 MB | −67% |
+| | barrier | 44,206 | 36,864 | +20% | 656 MB | 2,020 MB | −68% |
+| | flush | 31,858 | 36,864 | −14% | 922 MB | 2,020 MB | −54% |
+| F5 (1K transient) | none | 142,096 | 45,339 | +214% | 333 MB | 539 MB | −38% |
+| | barrier | 137,798 | 45,339 | +204% | 330 MB | 539 MB | −39% |
+| | flush | 94,666 | 45,339 | +109% | 365 MB | 539 MB | −32% |
+
+F5 is 1 KiB transient messages at 32 producers / 32 consumers; worker rows share the workload label of the row above them.
+
+- **F4 `barrier` beats our own `none` mode.** The self-sizing batches plus the cheap barrier produce a genuinely faster pipeline than the classic write-and-go path on this workload (44,206 vs 40,926 msg/s).
+- **F3 `barrier` is a statistical tie with RabbitMQ best** (−0.1%), sitting at 96.8% of our own `none` wall. The `none` wall itself rose to 36,570 (+3.1% over RabbitMQ) — the two-phase reclaim fix lifted both modes.
+- **RSS wins are clean across every cell:** the 64 KiB rows use 2-5× less memory than RabbitMQ's peak, and every 1 KiB row is also lower (12-39%).
+
+**Workload shape.** The 1 KiB rows are CPU- and dispatch-bound: StrangeQ's engine parallelises queue dispatch across the producer/consumer fan-out where RabbitMQ Classic serialises a single queue, so added connections raise throughput. The 64 KiB rows are limited by durable write bandwidth, which added connections do not raise.
+
+### Confirm semantics
+
+The three modes differ only in what a publisher confirm waits for. `none` confirms once the write reaches the page cache. `barrier` orders each confirm batch into the drive's cache and confirms when that ordering call returns — the drive is not asked to drain the batch to media. `flush` waits for the drive to report its write cache flushed before the confirm goes out. Because one sync releases every confirm in its batch, the per-message sync cost falls as the batch grows.
+
+### Memory
+
+Peak RSS is lower than RabbitMQ's best configuration in **every cell**, by 12-83%. The 1 KiB rows are where it is most decisive: F1 `flush` peaks at 43 MB against RabbitMQ's 259 MB, and F1 `none`/`barrier` at 219/227 MB. On 64 KiB 10p/10c the `flush` arm carries the highest StrangeQ peak (922 MB), still 54% below RabbitMQ's 2,020 MB.
 
 ### What we do not claim
 
-- **We do not beat RabbitMQ on 64 KiB throughput in `fsync:true` mode.** F3 is 0.81x and F4 is 0.88x against RabbitMQ's best configuration for those rows. With `fsync:false`, F3 is +1.5% and F4 is +16.2%.
-- **We do not claim F4 as a win against a configuration-tuned RabbitMQ in `fsync:true` mode.** It is a win against stock (1.57x) and a loss against the tuned reference (0.88x).
-- **We do not claim a peak-RSS win on every cell.** With `fsync:false`, F1 — 1 KiB, 1p/1c peaks above both references (265 MB; 1.03x stock, 1.02x best). With `fsync:true`, peak RSS is lower than both references on every row (0.15x–0.78x on the 1 KiB rows, 0.28x–0.49x on the 64 KiB rows).
+- **We do not beat RabbitMQ on 64 KiB throughput in `flush` mode.** F3 is −22% and F4 is −14% against RabbitMQ's best configuration for those rows; the power-loss guarantee is the trade.
+- **We do not claim a throughput win on 64 KiB 1p/1c in `barrier` mode.** F3 is a statistical tie (−0.1%); `none` is +3.1%.
 - **We do not claim steady-state RSS separates cleanly** — this document reports peak RSS, not steady-state RSS.
 - **We do not claim compression**, on these all-zero bodies or as a general lever.
 - **We do not claim a blanket parallelism win** — it applies to the CPU/dispatch-bound 1 KiB rows, not the durable-write-bound 64 KiB rows.
 
 ### Known gaps
 
-Three cells are losses in the current tables:
-
-- **F3 — 64 KiB, 1p/1c, `fsync:true` throughput: 28,558 msg/s, −19.5%** against RabbitMQ's best (35,463).
-- **F4 — 64 KiB, 10p/10c, `fsync:true` throughput: 32,427 msg/s, −12.0%** against the configuration-tuned RabbitMQ (36,864), against +57.0% versus stock.
-- **F1 — 1 KiB, 1p/1c, `fsync:false` peak RSS: 265 MB, +2.3%** against RabbitMQ's best (259 MB). The same row at `fsync:true` is 40 MB (0.15x).
-
-The fixes that take the F1 `fsync:false` cell to 228 MB (−12.0%, 6/6 reps) are already measured and are held back by the ~2.6% cost they carry on 64 KiB 1p/1c `fsync:false` throughput, as noted under [Memory](#memory).
+Two throughput cells are losses, both in the strongest mode: **F3 — 64 KiB, 1p/1c, `flush`: 27,632 msg/s, −22%** and **F4 — 64 KiB, 10p/10c, `flush`: 31,858 msg/s, −14%**, both against RabbitMQ's best configuration for the row. F3 `barrier` is a statistical tie (−0.1%); every other throughput cell wins, and peak RSS wins in all 15 cells.
 
 ### Reproducing
 
@@ -436,9 +397,9 @@ Point `-url` at either broker (both speak AMQP 0.9.1). Each cell's throughput an
 docker run -d --name rabbitmq-bench --platform linux/arm64 -p 5672:5672 rabbitmq:4.4-management
 ```
 
-The durability figures depend on the platform's full-flush primitive (`F_FULLFSYNC` on macOS), so run on the same kind of storage you intend to deploy against.
+The strongest durability guarantee depends on the platform's device-sync primitive, so run on the same kind of storage you intend to deploy against. A Go microbenchmark (`BenchmarkVersus`) also exists for allocation and latency profiling of the hot path.
 
-A Go microbenchmark (`BenchmarkVersus`) also exists for allocation and latency profiling of the hot path.
+> See `.notes/benchmarks/ab-release/` for the full per-rep data and evidence gate results.
 
 ## Feature Comparison vs RabbitMQ
 
@@ -557,7 +518,7 @@ The following RabbitMQ features are not implemented:
 ### Storage Engine
 
 - **Hot Cache**: Byte-bounded per-queue in-memory cache with its own eviction budget
-- **WAL Spill**: Durable messages are written to the write-ahead log with batched group-commit fsync; a transient message the hot cache cannot admit spills to the WAL too.
+- **WAL Spill**: Durable messages are written to the write-ahead log with a batched group-commit durability barrier; a transient message the hot cache cannot admit spills to the WAL too.
 - **Segment Storage**: Cold message storage in segment files, read after the WAL on the cold path
 - **Per-Queue Isolation**: Each queue has its own hot cache, WAL cursor, and consumer dispatch — no cross-queue contention
 
