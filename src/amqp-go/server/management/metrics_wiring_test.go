@@ -114,7 +114,7 @@ func mgmtScrapeCounter(t *testing.T, g prometheus.Gatherer, name string, labels 
 
 // TestManagementShedLoad_CountedAsPreRoute5xx (OPS-062, spec 06 §3.1): a request
 // refused by the in-flight cap is a 5xx and MUST be visible in
-// amqp_management_requests_total{status_class="5xx"}. It is shed before routing,
+// amqp_management_requests_total{status_class="5"}. It is shed before routing,
 // so its endpoint label is the bounded sentinel "pre_route" (OPS-004), never the
 // raw path. Before the fix the early return was uncounted, so the family was
 // blind to exactly the shed-load event OPS-062 exists to expose.
@@ -230,6 +230,42 @@ func TestManagementJobsGauge_TracksQueueLifecycle(t *testing.T) {
 	}
 	if got := mgmtScrapeGauge(t, "amqp_management_jobs", map[string]string{"state": "queued"}); got != 0 {
 		t.Fatalf("amqp_management_jobs{state=queued} = %v after completion, want 0", got)
+	}
+}
+
+// TestManagementPublishCountsCoreFamilies (FINDING 9): the management HTTP
+// publish path called the broker directly and never moved
+// amqp_messages_published_total / _bytes_total, so a management publish was
+// invisible in the message metrics. A routed management publish must count one
+// published message with its byte size.
+func TestManagementPublishCountsCoreFamilies(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	c := metrics.NewCollectorWithRegistry(reg, "amqp")
+	e := basicEnv(t, true, nil)
+	e.mgmt.sink = c
+
+	e.declareQueue(t, "mgmt-pub-q", queueDeclareRequest{Durable: true})
+	created := e.do(http.MethodPut, "/api/exchanges/%2F/mgmt-pub-ex",
+		e.jsonBody(t, exchangeDeclareRequest{Type: "direct"}), basicAuthHeader())
+	wantStatus(t, created, http.StatusCreated)
+	if err := e.srv.Broker.BindQueue("mgmt-pub-q", "mgmt-pub-ex", "mgmt-pub-rk", nil); err != nil {
+		t.Fatalf("bind: %v", err)
+	}
+
+	if got := mgmtScrapeCounter(t, reg, "amqp_messages_published_total", nil); got != 0 {
+		t.Fatalf("published counter = %v before the publish, want 0", got)
+	}
+
+	rec := e.do(http.MethodPost, "/api/exchanges/%2F/mgmt-pub-ex/publish",
+		e.jsonBody(t, publishRequest{RoutingKey: "mgmt-pub-rk", Payload: "hi", PayloadEncoding: "string"}),
+		basicAuthHeader())
+	wantStatus(t, rec, http.StatusOK)
+
+	if got := mgmtScrapeCounter(t, reg, "amqp_messages_published_total", nil); got != 1 {
+		t.Fatalf("amqp_messages_published_total = %v after one management publish, want 1", got)
+	}
+	if got := mgmtScrapeCounter(t, reg, "amqp_messages_published_bytes_total", nil); got != 2 {
+		t.Fatalf("amqp_messages_published_bytes_total = %v, want 2 (len(\"hi\"))", got)
 	}
 }
 

@@ -279,6 +279,7 @@ func (s *Server) hPublish(w http.ResponseWriter, r *http.Request) {
 		}
 		if err != nil {
 			if errors.Is(err, broker.ErrNoRoute) {
+				s.sink.ManagementMessageUnroutable()
 				s.auditMutation(r, "exchange", name, "publish", http.StatusOK)
 				s.writeJSON(w, r, http.StatusOK, publishResponse{Routed: false})
 				return
@@ -286,6 +287,7 @@ func (s *Server) hPublish(w http.ResponseWriter, r *http.Request) {
 			s.writePublishError(w, r, name, err)
 			return
 		}
+		s.sink.ManagementMessagePublished(len(payload))
 		s.auditMutation(r, "exchange", name, "publish", http.StatusOK)
 		s.writeJSON(w, r, http.StatusOK, publishResponse{Routed: true})
 		return
@@ -293,6 +295,7 @@ func (s *Server) hPublish(w http.ResponseWriter, r *http.Request) {
 
 	err := b.PublishMessage(name, req.RoutingKey, msg)
 	if errors.Is(err, broker.ErrNoRoute) {
+		s.sink.ManagementMessageUnroutable()
 		s.auditMutation(r, "exchange", name, "publish", http.StatusOK)
 		s.writeJSON(w, r, http.StatusOK, publishResponse{Routed: false})
 		return
@@ -301,6 +304,7 @@ func (s *Server) hPublish(w http.ResponseWriter, r *http.Request) {
 		s.writePublishError(w, r, name, err)
 		return
 	}
+	s.sink.ManagementMessagePublished(len(payload))
 	s.auditMutation(r, "exchange", name, "publish", http.StatusOK)
 	s.writeJSON(w, r, http.StatusOK, publishResponse{Routed: true})
 }
