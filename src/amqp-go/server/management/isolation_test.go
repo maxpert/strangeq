@@ -56,9 +56,10 @@ func TestForbiddenLock_OverviewDoesNotBlock(t *testing.T) {
 			t.Fatalf("GET %s did not return within 1s while a forbidden lock is held", target)
 		}
 	}
-	if n := e.mgmt.forbiddenLockHits.Load(); n != 0 {
-		t.Fatalf("amqp_management_forbidden_lock_acquired_total = %d, want 0", n)
-	}
+	// The deadline checks above are the real content. The
+	// forbiddenLockHits counter is NOT asserted here: it is never incremented
+	// (the runtime cannot detect a lock acquisition), so an assertion on it
+	// would be vacuous. TestForbiddenLockGate_ASTScan is the mechanical barrier.
 }
 
 // TestForbiddenLockGate_ASTScan is the mechanical gate behind
