@@ -246,6 +246,7 @@
         status: res.status,
         ok: res.ok,
         etag: res.headers.get("ETag"),
+        location: res.headers.get("Location"),
         purged: res.headers.get("X-Sq-Messages-Purged"),
         deleted: res.headers.get("X-Sq-Messages-Deleted")
       };
@@ -343,6 +344,30 @@
     var node = h("div", { class: "toast" + (kind ? " " + kind : ""), text: message });
     root.appendChild(node);
     setTimeout(function () { if (node.parentNode) node.parentNode.removeChild(node); }, 6000);
+  }
+
+  /* asyncJobNotice renders the 202 "accepted as a background job" outcome. A
+   * 202 means the work is still running: it must never show a count or the
+   * word "complete". The Location header names the job endpoint that will
+   * carry the result. */
+  function asyncJobNotice(location) {
+    var body = [
+      h("h2", { text: "Accepted as a background job" }),
+      h("p", { text: "This operation is running in the background; its result is not ready yet." })
+    ];
+    if (location) {
+      body.push(h("p", null, [link("View job status", location)]));
+    }
+    return h("div", { class: "notice job-accepted", role: "status" }, body);
+  }
+
+  /* noticeToast shows a non-expiring notice in the toast root. A 202 carries
+   * a link a plain text toast cannot, and it must stay reachable while the
+   * background job runs. */
+  function noticeToast(node) {
+    var root = document.getElementById("toast-root");
+    if (!root) return;
+    root.appendChild(node);
   }
 
   function errorDetail(data) {
@@ -1758,6 +1783,14 @@
       confirmBtn.disabled = true;
       api(API + "/definitions", { method: "POST", raw: lastText }).then(function (r) {
         confirmBtn.disabled = false;
+        if (r.status === 202) {
+          /* Accepted as a background job: the merge has not completed, so never
+           * show an outcome table or "Import complete". */
+          preview.replaceChildren(asyncJobNotice(r.location));
+          confirmWrap.hidden = true;
+          invalidateAll();
+          return;
+        }
         if (r.status >= 400) { preview.replaceChildren(errorState(r.data)); return; }
         preview.replaceChildren(renderDefinitionsOutcome(r.data, false));
         confirmWrap.hidden = true;
@@ -2016,6 +2049,14 @@
       guard: function () { return ack.checked; },
       onConfirm: function () {
         return api(queuePath("/", queue.name) + "/contents", { method: "DELETE" }).then(function (r) {
+          if (r.status === 202) {
+            /* Accepted as a background job: no count is known yet, so never
+             * claim "Purged N messages". */
+            noticeToast(asyncJobNotice(r.location));
+            invalidateAll();
+            navigate("/queues/" + encodeURIComponent(queue.name));
+            return false;
+          }
           if (r.status >= 400) { toast("Purge failed: " + errorDetail(r.data), "error"); return false; }
           toast("Purged " + (r.purged || "0") + " messages from " + queue.name, "ok");
           invalidateAll();
