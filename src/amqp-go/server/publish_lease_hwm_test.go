@@ -36,11 +36,11 @@ func readDeliveryTag(t *testing.T, r *rawAMQP) uint64 {
 // SUBSEQUENT producer-only reads. The lease is retained through broker+server
 // completion (two-party join), then used == 0.
 func TestLease_TransientHWMStoredWithGate(t *testing.T) {
-	srv, addr, created, released, _ := leaseServer(t, 1<<20, func(cfg *config.AMQPConfig) {
+	srv, _, created, released, _ := leaseServer(t, 1<<20, func(cfg *config.AMQPConfig) {
 		cfg.Engine.MaxQueueBacklog = 1
 	}, nil)
 
-	p := dialRaw(t, addr)
+	p := dialRawPipe(t, srv)
 	p.handshake("guest", "guest", 4, 0)
 	p.openChannel(1)
 	p.declareQueue(1, "sl22-q")
@@ -52,7 +52,7 @@ func TestLease_TransientHWMStoredWithGate(t *testing.T) {
 
 	// Producer-only confirm-mode publish AT HWM: stored + confirmed PROMPTLY
 	// (no consumer drains anything).
-	pub := dialRaw(t, addr)
+	pub := dialRawPipe(t, srv)
 	pub.handshake("guest", "guest", 4, 0)
 	pub.openChannel(1)
 	leaseConfirmSelect(t, pub, 1)
@@ -78,7 +78,7 @@ func TestLease_TransientHWMStoredWithGate(t *testing.T) {
 
 	// A MIXED connection (consumer + publisher) at HWM: its publish stores
 	// and confirms, its ACKs flow, it is never 506-closed nor depth-parked.
-	m := dialRaw(t, addr)
+	m := dialRawPipe(t, srv)
 	m.handshake("guest", "guest", 4, 0)
 	m.openChannel(1)
 	leaseConfirmSelect(t, m, 1)
@@ -110,11 +110,11 @@ func TestLease_TransientHWMStoredWithGate(t *testing.T) {
 // for the publish and the consumer's own acks both flow, in order, with no
 // wait and no close.
 func TestLease_TransientHWMMixedConnAckSchedule(t *testing.T) {
-	srv, addr, _, _, _ := leaseServer(t, 1<<20, func(cfg *config.AMQPConfig) {
+	srv, _, _, _, _ := leaseServer(t, 1<<20, func(cfg *config.AMQPConfig) {
 		cfg.Engine.MaxQueueBacklog = 2
 	}, nil)
 
-	p := dialRaw(t, addr)
+	p := dialRawPipe(t, srv)
 	p.handshake("guest", "guest", 4, 0)
 	p.openChannel(1)
 	p.declareQueue(1, "sl22m-q")
@@ -126,7 +126,7 @@ func TestLease_TransientHWMMixedConnAckSchedule(t *testing.T) {
 	}, 30*time.Second, time.Millisecond)
 
 	// Mixed connection: consumer + confirm-mode publisher on channel 1.
-	m := dialRaw(t, addr)
+	m := dialRawPipe(t, srv)
 	m.handshake("guest", "guest", 4, 0)
 	m.openChannel(1)
 	leaseConfirmSelect(t, m, 1)
@@ -161,9 +161,9 @@ func TestLease_TransientHWMMixedConnAckSchedule(t *testing.T) {
 // waits; immediate grants are never counted.
 func TestLease_WaitMetricsRecorded(t *testing.T) {
 	release := gateWALWrite(t)
-	srv, addr, _, _, probe := leaseServer(t, 1<<20, nil, nil)
+	srv, _, _, _, probe := leaseServer(t, 1<<20, nil, nil)
 
-	r := dialRaw(t, addr)
+	r := dialRawPipe(t, srv)
 	r.handshake("guest", "guest", 4, 0)
 	r.openChannel(1)
 	r.declareQueue(1, "slpw-q")

@@ -16,12 +16,12 @@ import (
 // used drops to 0 while the commit is STILL parked. A second connection
 // progresses normally throughout (the group-commit WAL is untouched).
 func TestLease_TxCommitParkDrainsQueuedLeases(t *testing.T) {
-	srv, addr, created, released, _ := leaseServer(t, 1<<20, func(cfg *config.AMQPConfig) {
+	srv, _, created, released, _ := leaseServer(t, 1<<20, func(cfg *config.AMQPConfig) {
 		cfg.Engine.MaxQueueBacklog = 1
 	}, nil)
 
 	// Fill the tx target queue to HWM=1 with a transient publish.
-	p := dialRaw(t, addr)
+	p := dialRawPipe(t, srv)
 	p.handshake("guest", "guest", 4, 0)
 	p.openChannel(1)
 	p.declareQueue(1, "sltx-q")
@@ -39,7 +39,7 @@ func TestLease_TxCommitParkDrainsQueuedLeases(t *testing.T) {
 	createdBase := created.Load()
 	releasedBase := released.Load()
 
-	a := dialRaw(t, addr)
+	a := dialRawPipe(t, srv)
 	a.handshake("guest", "guest", 4, 0)
 	a.openChannel(1)
 	a.send(1, 90, 10, []byte{}) // tx.select
@@ -70,7 +70,7 @@ func TestLease_TxCommitParkDrainsQueuedLeases(t *testing.T) {
 
 	// Another connection progresses normally throughout (the group-commit WAL
 	// is not touched by the capacity-parked commit).
-	b := dialRaw(t, addr)
+	b := dialRawPipe(t, srv)
 	b.handshake("guest", "guest", 4, 0)
 	b.openChannel(1)
 	b.declareQueue(1, "sltx-q2")
@@ -79,7 +79,7 @@ func TestLease_TxCommitParkDrainsQueuedLeases(t *testing.T) {
 	leaseWaitAck(t, b, 1, 1)
 
 	// Unpark the commit by draining the queue with a consumer.
-	c := dialRaw(t, addr)
+	c := dialRawPipe(t, srv)
 	c.handshake("guest", "guest", 4, 0)
 	c.openChannel(1)
 	c.consume(1, "sltx-q", "c1")
