@@ -422,7 +422,8 @@ Per-repetition throughput and RSS figures were collected with the same `cmd/perf
 | `connection.open` / `open-ok` | Yes | Yes |
 | `connection.close` / `close-ok` | Yes | Yes |
 | `connection.blocked` / `unblocked` | Yes (memory/disk alarms) | Yes |
-| `connection.secure` / `secure-ok` | No | Yes |
+| `connection.secure` / `secure-ok` (method — multi-step SASL) | No | Yes |
+| connection `secure`/`ssl` property (`/api/connections`) | Yes | Yes |
 | `channel.open` / `open-ok` | Yes | Yes |
 | `channel.close` / `close-ok` | Yes | Yes |
 | `channel.flow` / `flow-ok` | Yes | Yes |
@@ -517,7 +518,9 @@ The following RabbitMQ features are not implemented:
 - Priority queues (`x-max-priority`)
 - Lazy queues (`x-queue-mode`)
 - Consumer priorities (`x-priority`)
-- `connection.secure` / `secure-ok` (multi-step challenge-response auth)
+- `connection.secure` / `secure-ok` (multi-step challenge-response auth; the
+  `secure`/`ssl` connection properties are reported on `/api/connections`, but the
+  multi-step method itself is not implemented)
 - SASL EXTERNAL
 - Global prefetch (`basic.qos` with `global=true`) — accepted but applied per-consumer, not enforced globally
 - Prefetch size (`basic.qos` with `prefetch_size > 0`) — rejected with a `540 not implemented` channel error rather than silently ignored
