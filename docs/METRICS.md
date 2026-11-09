@@ -52,11 +52,15 @@ The **Metrics tab** (`/metrics`) in the management UI renders that payload as a 
 vital-stats panel, a grouped and searchable family browser, and a raw-text view. A tile
 has three outcomes: a family the endpoint never emitted renders an em-dash with "not
 emitted by this broker" (never a fabricated `0`); a family present with a zero value
-renders `0`; and a family present whose label matcher selects none of its series renders
-`0` (a sum over an empty set is a defined zero). Only the absent-family case carries the
-"not emitted by this broker" title — a filtered tile never fabricates it. A malformed
-matcher, or one that drops the whole excluded domain, degrades the tile to unknown with a
-title naming the bad pattern. See [MANAGEMENT.md](MANAGEMENT.md#metrics-tab).
+renders `0`; and a family present whose **filtered sum** (`sum(<family>{<label>…})`)
+selects none of its series renders `0` (a sum over an empty set is a defined zero). Any
+other selector form — a bare metric name with a matcher, or `max(...)` with a matcher —
+still renders the em-dash, because no aggregate value is defined there; the "not emitted
+by this broker" title is tied to having no truthful value for that selector, which includes
+a filtered non-`sum` selector that matches no series. The static gate rejects a pattern
+that drops the whole excluded domain; at runtime only a malformed pattern degrades the tile
+to unknown with a title naming the bad pattern. See
+[MANAGEMENT.md](MANAGEMENT.md#metrics-tab).
 
 ## Metric reference
 

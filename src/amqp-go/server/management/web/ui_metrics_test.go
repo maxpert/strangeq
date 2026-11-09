@@ -851,6 +851,42 @@ func TestUI_MetricsFilteredSumAbsentFamilyStaysUnknown(t *testing.T) {
 	}
 }
 
+// TestUI_MetricsFilteredNonSumStaysUnknown (review LOW) pins the other half of
+// the empty-match rule: the present-0 shortcut is gated on a filtered SUM
+// (sel.agg === "sum" && sel.filter), so it applies to `sum(<family>{<label>…})`
+// only. The shipped shutdown_incomplete tile is a bare metric name plus a
+// matcher — a family present whose matcher selects none of its series has no
+// aggregate value defined, so the tile stays an em-dash with an unknown
+// severity and the "not emitted by this broker" title. This is the case the
+// docs previously described as a fabricated-0; the runtime is what it is, and
+// this test keeps the prose tied to it.
+func TestUI_MetricsFilteredNonSumStaysUnknown(t *testing.T) {
+	stub := newStub()
+	stub.set(func(s *stubAPI) {
+		s.metricsText = metricFixture(
+			"# HELP amqp_shutdown_total Shutdowns",
+			"# TYPE amqp_shutdown_total counter",
+			`amqp_shutdown_total{result="clean"} 1`,
+		)
+	})
+	srv := appServer(t, stub)
+	ctx, cancel := newTab(t)
+	defer cancel()
+
+	openMetrics(t, ctx, srv.URL, true, "")
+
+	// The family IS present, but the tile is a bare name + matcher, not a sum.
+	if got := tileText(t, ctx, "shutdown_incomplete"); got != "\u2014" {
+		t.Fatalf("shutdown_incomplete = %q, want an em-dash (a non-sum selector has no defined aggregate over an empty set)", got)
+	}
+	if got := tileSeverity(t, ctx, "shutdown_incomplete"); got != "unknown" {
+		t.Fatalf("shutdown_incomplete severity = %q, want unknown", got)
+	}
+	if got := evalStr(t, ctx, `document.getElementById('metrics-tile-shutdown_incomplete').title`); got != "not emitted by this broker" {
+		t.Fatalf("shutdown_incomplete title = %q, want %q", got, "not emitted by this broker")
+	}
+}
+
 // TestUI_MetricsHostileTextIsInert (B3 LOW #5 / SEC-030): a HELP line and a
 // label value carrying markup render as inert text — no element from the
 // payload is created and no event handler runs.
