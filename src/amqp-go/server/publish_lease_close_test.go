@@ -158,8 +158,7 @@ func TestLease_ProcessorStallCloses506(t *testing.T) {
 	// The processor is wedged with msg2's method frame queued behind it: the
 	// stall guard cancels the wait and closes with 506 (frame observed or
 	// socket closed — the best-effort close write races teardown).
-	a.c.SetReadDeadline(time.Now().Add(30 * time.Second))
-	f, err := protocol.ReadFrameOptimizedWithLimit(a.r, 131072+8)
+	f, err := a.readFrameMaybe()
 	if err == nil {
 		require.Equal(t, byte(protocol.FrameMethod), f.Type)
 		require.Equal(t, uint16(10), uint16(f.Payload[0])<<8|uint16(f.Payload[1]))

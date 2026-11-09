@@ -50,11 +50,8 @@ func TestLease_ReleasedAtTheWriteNotAtTheFsync(t *testing.T) {
 
 	// The confirm is still outstanding (the durability barrier is intact):
 	// nothing may reach the wire before the fdatasync.
-	require.NoError(t, r.c.SetReadDeadline(time.Now().Add(200*time.Millisecond)))
-	one := make([]byte, 1)
-	_, rerr := r.r.Read(one)
-	require.Error(t, rerr, "the publisher confirm must not be sent before the fdatasync")
-	require.NoError(t, r.c.SetReadDeadline(time.Time{}))
+	// A negative assertion: nothing may reach the wire before the fdatasync.
+	r.expectSilence(200 * time.Millisecond)
 
 	// Release durability: the confirm arrives.
 	release()

@@ -32,7 +32,7 @@ func TestWSB_PreAuth_BadVersion_GetsSupportedHeader(t *testing.T) {
 	require.NoError(t, err)
 
 	buf := make([]byte, 8)
-	require.NoError(t, c.SetReadDeadline(time.Now().Add(2*time.Second)))
+	require.NoError(t, c.SetReadDeadline(time.Now().Add(wsbFrameDeadline)))
 	_, err = io.ReadFull(c, buf)
 	require.NoError(t, err)
 	assert.Equal(t, []byte("AMQP\x00\x00\x09\x01"), buf, "server must reply with the supported header")
@@ -50,7 +50,7 @@ func TestWSB_PreAuth_GarbageHeader_GetsSupportedHeader(t *testing.T) {
 	require.NoError(t, err)
 
 	buf := make([]byte, 8)
-	require.NoError(t, c.SetReadDeadline(time.Now().Add(2*time.Second)))
+	require.NoError(t, c.SetReadDeadline(time.Now().Add(wsbFrameDeadline)))
 	_, err = io.ReadFull(c, buf)
 	require.NoError(t, err)
 	assert.Equal(t, []byte("AMQP\x00\x00\x09\x01"), buf)
@@ -67,7 +67,7 @@ func TestWSB_PreAuth_ShortHeaderTimesOut(t *testing.T) {
 	_, err := c.Write([]byte("AMQP"))
 	require.NoError(t, err)
 
-	require.NoError(t, c.SetReadDeadline(time.Now().Add(2*time.Second)))
+	require.NoError(t, c.SetReadDeadline(time.Now().Add(wsbFrameDeadline)))
 	_, err = c.Read(make([]byte, 1))
 	assert.Error(t, err, "short header must be closed by the header deadline")
 
@@ -130,7 +130,7 @@ func TestWSB_PreAuth_PendingLimitRefusesExcess(t *testing.T) {
 	}, 2*time.Second, 10*time.Millisecond)
 
 	fifth := dialSilentSocket(t, addr)
-	require.NoError(t, fifth.SetReadDeadline(time.Now().Add(1*time.Second)))
+	require.NoError(t, fifth.SetReadDeadline(time.Now().Add(wsbFrameDeadline)))
 	_, err := fifth.Read(make([]byte, 1))
 	assert.Error(t, err, "the 5th pending socket must be refused")
 
@@ -173,7 +173,7 @@ func TestWSB_PreAuth_SlotHeldUntilOpenOK(t *testing.T) {
 
 	// Slot held: a second socket is refused.
 	second := dialSilentSocket(t, addr)
-	require.NoError(t, second.SetReadDeadline(time.Now().Add(1*time.Second)))
+	require.NoError(t, second.SetReadDeadline(time.Now().Add(wsbFrameDeadline)))
 	_, err := second.Read(make([]byte, 1))
 	assert.Error(t, err, "second socket must be refused while the slot is held")
 

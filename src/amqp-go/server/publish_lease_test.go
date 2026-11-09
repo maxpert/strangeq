@@ -179,14 +179,13 @@ func leaseConfirmSelect(t *testing.T, r *rawAMQP, ch uint16) {
 	r.expectMethodCh(ch, 85, 11) // confirm.select-ok
 }
 
-// leaseWaitAck reads frames until a basic.ack on ch covers tag want (30 s bound).
+// leaseWaitAck reads frames until a basic.ack on ch covers tag want. The wait
+// is content-driven: it carries the rawAMQP stall cap (socket) or no cap (pipe).
 func leaseWaitAck(t *testing.T, r *rawAMQP, ch uint16, want uint64) {
 	t.Helper()
-	deadline := time.Now().Add(30 * time.Second)
 	var maxTag uint64
 	for maxTag < want {
-		require.NoError(t, r.c.SetReadDeadline(deadline))
-		f, err := protocol.ReadFrameOptimizedWithLimit(r.r, 131072+8)
+		f, err := r.readFrameMaybe()
 		require.NoError(t, err, "waiting for basic.ack covering tag %d (max seen %d)", want, maxTag)
 		if f.Type == protocol.FrameMethod && f.Channel == ch && len(f.Payload) >= 4 &&
 			f.Payload[0] == 0 && f.Payload[1] == 60 && f.Payload[2] == 0 && f.Payload[3] == 80 {
@@ -202,7 +201,6 @@ func leaseWaitAck(t *testing.T, r *rawAMQP, ch uint16, want uint64) {
 // covers its wanted tag (acks for other channels are tracked, not discarded).
 func leaseWaitAcks(t *testing.T, r *rawAMQP, wants map[uint16]uint64) {
 	t.Helper()
-	deadline := time.Now().Add(30 * time.Second)
 	got := make(map[uint16]uint64)
 	for {
 		done := true
@@ -214,8 +212,7 @@ func leaseWaitAcks(t *testing.T, r *rawAMQP, wants map[uint16]uint64) {
 		if done {
 			return
 		}
-		require.NoError(t, r.c.SetReadDeadline(deadline))
-		f, err := protocol.ReadFrameOptimizedWithLimit(r.r, 131072+8)
+		f, err := r.readFrameMaybe()
 		require.NoError(t, err, "waiting for acks %v (got %v)", wants, got)
 		if f.Type == protocol.FrameMethod && len(f.Payload) >= 4 &&
 			f.Payload[0] == 0 && f.Payload[1] == 60 && f.Payload[2] == 0 && f.Payload[3] == 80 {
@@ -1254,8 +1251,7 @@ func TestLease_NestedHeaderOverBudgetCloses(t *testing.T) {
 	leaseSendHeader(t, x, 2, 600<<10, true, "")
 
 	// Either the 506 frame is observed or the socket closes.
-	x.c.SetReadDeadline(time.Now().Add(30 * time.Second))
-	f, err := protocol.ReadFrameOptimizedWithLimit(x.r, 131072+8)
+	f, err := x.readFrameMaybe()
 	if err == nil {
 		require.Equal(t, byte(protocol.FrameMethod), f.Type)
 		cls := uint16(f.Payload[0])<<8 | uint16(f.Payload[1])
@@ -1432,8 +1428,7 @@ func TestLease_MultiChannel20And1000Connections(t *testing.T) {
 				if done {
 					break
 				}
-				r.c.SetReadDeadline(time.Now().Add(30 * time.Second))
-				f, err := protocol.ReadFrameOptimizedWithLimit(r.r, 131072+8)
+				f, err := r.readFrameMaybe()
 				if err != nil {
 					closedEarly = true // socket closed (possibly without a frame)
 					break
