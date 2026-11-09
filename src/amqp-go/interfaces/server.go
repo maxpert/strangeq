@@ -2,7 +2,6 @@ package interfaces
 
 import (
 	"errors"
-	"net"
 	"regexp"
 	"sync"
 	"time"
@@ -30,21 +29,6 @@ type Logger interface {
 type LogField struct {
 	Key   string
 	Value interface{}
-}
-
-// ConnectionHandler defines the interface for custom connection handling
-type ConnectionHandler interface {
-	// HandleConnection processes a new client connection
-	HandleConnection(conn net.Conn) error
-
-	// OnConnect is called when a connection is established
-	OnConnect(connectionID string) error
-
-	// OnDisconnect is called when a connection is closed
-	OnDisconnect(connectionID string) error
-
-	// ValidateConnection performs connection validation
-	ValidateConnection(connectionID string) error
 }
 
 // Authenticator defines the interface for authentication mechanisms

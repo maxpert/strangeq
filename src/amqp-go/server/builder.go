@@ -100,12 +100,6 @@ func (b *ServerBuilder) WithPort(port int) *ServerBuilder {
 	return b
 }
 
-// WithLogger sets a custom logger implementation
-func (b *ServerBuilder) WithLogger(logger interfaces.Logger) *ServerBuilder {
-	b.logger = logger
-	return b
-}
-
 // WithZapLogger creates a logger using zap with the specified level
 func (b *ServerBuilder) WithZapLogger(level string) *ServerBuilder {
 	var zapConfig zap.Config
@@ -166,13 +160,6 @@ func (b *ServerBuilder) WithFileAuthentication(userFile string) *ServerBuilder {
 	return b
 }
 
-// WithConnectionHandler accepts a custom connection handler for API
-// compatibility. The builder has no consumer for it, so it has no effect on
-// the built server.
-func (b *ServerBuilder) WithConnectionHandler(handler interfaces.ConnectionHandler) *ServerBuilder {
-	return b
-}
-
 // WithTLS enables TLS with the specified certificate and key files
 func (b *ServerBuilder) WithTLS(certFile, keyFile string) *ServerBuilder {
 	b.config.Security.TLSEnabled = true
@@ -194,14 +181,6 @@ func (b *ServerBuilder) WithTLSMutualAuth(caFile string) *ServerBuilder {
 // WithMaxConnections sets the maximum number of concurrent connections
 func (b *ServerBuilder) WithMaxConnections(max int) *ServerBuilder {
 	b.config.Network.MaxConnections = max
-	return b
-}
-
-// WithProtocolLimits sets AMQP protocol limits
-func (b *ServerBuilder) WithProtocolLimits(maxChannels, maxFrameSize int, maxMessageSize int64) *ServerBuilder {
-	b.config.Server.MaxChannelsPerConnection = maxChannels
-	b.config.Server.MaxFrameSize = maxFrameSize
-	b.config.Server.MaxMessageSize = maxMessageSize
 	return b
 }
 
