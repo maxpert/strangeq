@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.14.1] - 2026-11-09
+
 ### Changed
 - Metrics-tab correctness, from a post-release review of the metric surface (see
   [docs/METRICS.md](docs/METRICS.md)):
