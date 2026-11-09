@@ -36,7 +36,11 @@
 - The headless-browser test harness used a fixed 30 s per-tab deadline that flaked
   under host CPU contention, and applied it only *after* tab creation. The bound
   is now 90 s clamped to the go-test budget, covers tab setup as well, and names
-  the test, the stage and the bound on timeout.
+  the test, the stage and the bound on timeout. A setup that exceeds the bound
+  now fails instead of turning the suite green with every UI test skipped, and a
+  timed-out setup no longer leaks the browser's page target (which previously
+  left ~50% of attempts holding a renderer — the contention that caused the
+  timeouts in the first place).
 
 ## [0.14.0] - 2026-11-08
 
