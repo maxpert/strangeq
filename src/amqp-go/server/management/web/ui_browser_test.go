@@ -185,10 +185,26 @@ func tabFailure(ctx context.Context, t *testing.T, err error) string {
 	return " [" + strings.Join(parts, "; ") + "]"
 }
 
+// setupIsFatal classifies a tab-setup error. A deadline that fired while the
+// tab was being created is not "the browser is unavailable": the package
+// browser was up (TestMain proved it) and the tab simply exceeded its bound.
+// Treating that as a skip would turn a wedged browser into a green suite with
+// the whole UI pass skipped, so it must fail the test loudly with the bound
+// named. Everything else — the genuine unavailability decided in TestMain, a
+// cancelled parent, an allocator refusal — keeps the historical skip.
+func setupIsFatal(err error) bool {
+	return errors.Is(err, context.DeadlineExceeded)
+}
+
 // newTab opens a fresh tab that shares the package browser. The tab-creation
 // step runs on the same budget-aware bound as every later tab operation (see
 // browserDeadlineBudget), so neither setup nor a later action can hang, and a
 // slow host is attributed to the tab, not the go-test binary.
+//
+// A setup that blows the bound FAILS the test (setupIsFatal); only a genuine
+// unavailability — browserErr from TestMain, or a non-deadline setup error —
+// skips. Either way the browserTab attached by boundedTab makes the bound
+// available for the message.
 func newTab(t *testing.T) (context.Context, context.CancelFunc) {
 	t.Helper()
 	if browserErr != nil {
@@ -197,8 +213,12 @@ func newTab(t *testing.T) (context.Context, context.CancelFunc) {
 	ctx, cancel, err := boundedTab(t, browserCtx)
 	if err != nil {
 		cancel()
-		// boundedTab always attaches browserTab before the setup Do, so the
-		// bound is available for the skip message.
+		// Consult the context too: a hang cut by the bound can surface either
+		// as a deadline error through chromedp's wrap or as the context's own
+		// Err(), and both are the same "exceeded the bound" outcome.
+		if setupIsFatal(err) || setupIsFatal(ctx.Err()) {
+			t.Fatalf("headless browser tab setup exceeded %s%s", tabFrom(ctx).bound, tabFailure(ctx, t, err))
+		}
 		t.Skipf("headless browser tab unavailable after %s: %v%s", tabFrom(ctx).bound, err, tabFailure(ctx, t, err))
 	}
 	return ctx, cancel
@@ -489,6 +509,46 @@ func TestUI_BrowserTabSetupIsBounded(t *testing.T) {
 			t.Fatal("newTab returned an unbounded tab context")
 		}
 	})
+}
+
+// TestUI_BrowserTabSetupOutcome pins the newTab classification that decides
+// whether a setup error fails the test or skips it. A deadline that fires
+// during setup is fatal (a wedged-but-present browser must not go green with
+// the UI suite skipped); a cancelled parent or a generic allocator error keeps
+// skipping. setupIsFatal is consulted with both the chromedp error and the
+// context's own Err(), so the timeout must be recognised through chromedp's
+// wrapping — the "expired bound cuts the setup Do" case above proves the 1ns
+// bound produces a context.DeadlineExceeded that errors.Is sees through the
+// wrap.
+func TestUI_BrowserTabSetupOutcome(t *testing.T) {
+	cases := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{name: "deadline exceeded is fatal", err: context.DeadlineExceeded, want: true},
+		{name: "wrapped deadline exceeded is fatal", err: fmt.Errorf("chromedp: %w", context.DeadlineExceeded), want: true},
+		{name: "cancelled is a skip", err: context.Canceled, want: false},
+		{name: "generic allocator error is a skip", err: errors.New("exec: chrome: no such file or directory"), want: false},
+		{name: "nil is a skip", err: nil, want: false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := setupIsFatal(tc.err); got != tc.want {
+				t.Fatalf("setupIsFatal(%v) = %v, want %v", tc.err, got, tc.want)
+			}
+		})
+	}
+
+	// The 1ns bound from the sibling test produces exactly the context state
+	// newTab consults: ctx.Err() == DeadlineExceeded. Classifying that state
+	// must be fatal, so the expired-bound setup cannot degrade to a skip.
+	spent, cancel := context.WithTimeout(context.Background(), time.Nanosecond)
+	defer cancel()
+	<-spent.Done()
+	if !setupIsFatal(spent.Err()) {
+		t.Fatalf("setupIsFatal(ctx.Err()=%v) = false, want true: a spent bound must fail the test", spent.Err())
+	}
 }
 
 // TestUI_BrowserTabFailureDiagnosis proves a timed-out tab stage produces a
