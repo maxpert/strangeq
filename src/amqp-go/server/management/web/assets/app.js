@@ -195,6 +195,26 @@
     return h("span", { text: v ? (trueText || "true") : (falseText || "false") });
   }
 
+  /* secureCell renders a connection's TLS transport state for the connections
+   * list. The badge carries a text label ("SSL") so the state is never conveyed
+   * by colour alone; a non-TLS connection shows the page's em-dash convention,
+   * and an absent field is reported as unknown rather than assumed insecure. */
+  function secureCell(r) {
+    if (r.secure === true) {
+      return h("span", { class: "badge ssl-badge", title: "TLS transport", text: "SSL" });
+    }
+    if (r.secure === false) return dash("not TLS");
+    return dash("unknown");
+  }
+
+  /* authMechanismCell renders the SASL mechanism that authenticated the
+   * connection. It is truthful only when a mechanism actually authenticated, so
+   * an empty/absent value renders the em-dash convention — never a guess. */
+  function authMechanismCell(v) {
+    if (isNull(v) || v === "") return dash("no SASL mechanism");
+    return h("span", { text: String(v) });
+  }
+
   function link(text, href) {
     return h("a", { href: href, text: text });
   }
@@ -1270,6 +1290,7 @@
       { key: "vhost", label: "Vhost", render: function (r) { return h("span", { text: val(r.vhost) }); } },
       { key: "state", label: "State", render: function (r) { return stateCell(r.state); } },
       { key: "channels", label: "Channels", render: function (r) { return num(r.channels); } },
+      { key: "secure", label: "Secure", render: function (r) { return secureCell(r); } },
       { key: "peer", label: "Peer", render: function (r) { return h("span", { text: val(r.peer_host) + ":" + val(r.peer_port) }); } },
       { key: "connected_at", label: "Connected at", render: function (r) { return fmtTime(r.connected_at); } },
       { key: "last_activity", label: "Last activity", render: function (r) { return fmtTime(r.last_activity); } },
@@ -1368,6 +1389,8 @@
       h("dt", { text: "user" }), h("dd", { text: val(conn.user) }),
       h("dt", { text: "vhost" }), h("dd", { text: val(conn.vhost) }),
       h("dt", { text: "state" }), h("dd", null, [stateCell(conn.state)]),
+      h("dt", { text: "SSL" }), h("dd", null, [boolCell(conn.secure, "Yes", "No")]),
+      h("dt", { text: "auth_mechanism" }), h("dd", null, [authMechanismCell(conn.auth_mechanism)]),
       h("dt", { text: "protocol" }), h("dd", { text: val(conn.protocol) }),
       h("dt", { text: "peer" }), h("dd", { text: val(conn.peer_host) + ":" + val(conn.peer_port) }),
       h("dt", { text: "connected_at" }), h("dd", null, [fmtTime(conn.connected_at)]),
