@@ -1900,7 +1900,8 @@
         ["DIV-metrics-1", "two /metrics: on the telemetry listener /metrics is the unauthenticated Prometheus text; on the management listener /metrics is the SPA deep link. Different origins, different content"],
         ["DIV-metrics-2", "/api/metrics is a StrangeQ extension with no RabbitMQ counterpart; the JSON {text} wrapper is ours"],
         ["DIV-metrics-3", "a management Metrics-tab refresh increments promhttp_metric_handler_requests_total because ScrapeText uses the shared instrumented handler"],
-        ["DIV-metrics-4", "the raw /metrics link is absent when metricsUrl is unset (telemetry disabled or a wildcard bind); the in-SPA matrix is same-origin and still works"]
+        ["DIV-metrics-4", "the raw /metrics link is absent when metricsUrl is unset (telemetry disabled or a wildcard bind); the in-SPA matrix is same-origin and still works"],
+        ["DIV-secure", "connection secure/ssl are derived from the transport (a *tls.Conn accepted socket), never from the SASL mechanism; auth_mechanism names the mechanism that authenticated and is empty when auth is disabled; SASL EXTERNAL is not accepted, so a non-TLS connection can never report secure=true"]
       ];
       container.replaceChildren(h("div", { class: "screen screen-about" }, [
         h("div", { class: "page-head" }, [h("h1", { text: "About / Capabilities" })]),
