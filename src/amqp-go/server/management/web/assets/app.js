@@ -35,6 +35,13 @@
    * config value (javascript:, data:, vbscript:, an off-origin
    * scheme-relative URL) is rejected so it can never be promoted into a link. */
   var METRICS_URL = /^https?:[/][/]/i.test(CONFIG.metricsUrl || '') ? CONFIG.metricsUrl : '';
+  /* DURABILITY scopes the WAL full-flush alarm to the crash model the metric's
+   * contract is written for. Under durability: flush every confirm is a full
+   * drive-cache flush, so amqp_wal_full_flush_total{site="group_commit"} is
+   * expected to climb and must not raise the alarm. barrier (the default, and
+   * the fallback for an absent or unknown value) keeps the strict alarm, so a
+   * stale shell can only over-alarm, never silently suppress. */
+  var DURABILITY = CONFIG.durability === "flush" ? "flush" : "barrier";
   /* METRICS_API is the same-origin, auth-gated data source for the Metrics
    * screen: the management listener's JSON {text} wrapper around the process
    * registry scrape. connect-src 'self' covers it, so the CSP is untouched.
@@ -2712,7 +2719,13 @@
           state = ev.value === 1 ? "bad" : "ok";
           text = ev.value === 1 ? "set" : "none";
         } else {
-          state = (t.sev && ev.value > 0) ? t.sev : "ok";
+          /* The WAL full-flush alarm is written for barrier mode, where a
+           * traffic-path full flush must stay 0. Under durability: flush every
+           * confirm is a full drive-cache flush, so the count is expected to
+           * climb and is rendered without an alarm. */
+          var sev = t.sev;
+          if (t.id === "wal_full_flush" && DURABILITY === "flush") sev = null;
+          state = (sev && ev.value > 0) ? sev : "ok";
           text = renderTile(t.render, ev.value);
         }
       }

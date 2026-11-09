@@ -92,6 +92,12 @@ type Options struct {
 	// <meta name="sq-config"> element so the SPA can render the /metrics link
 	// without an inline <script> (the CSP is script-src 'self').
 	MetricsURL string
+	// Durability is the effective crash model ("barrier", "flush" or "none"),
+	// injected alongside MetricsURL so the SPA can scope the WAL full-flush
+	// alarm to the mode its metric contract is written for. Either option alone
+	// is enough to inject the meta; an empty Options still serves the embedded
+	// bytes verbatim.
+	Durability string
 }
 
 // Handler returns the http.Handler that serves the embedded SPA.
@@ -116,10 +122,17 @@ func (h *spaHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 // shellForOptions renders index.html with the injected config, or the embedded
 // bytes verbatim when nothing is configured.
 func shellForOptions(opts Options) []byte {
-	if opts.MetricsURL == "" {
+	if opts.MetricsURL == "" && opts.Durability == "" {
 		return embedded.index.body
 	}
-	cfg, err := json.Marshal(map[string]string{"metricsUrl": opts.MetricsURL})
+	fields := map[string]string{}
+	if opts.MetricsURL != "" {
+		fields["metricsUrl"] = opts.MetricsURL
+	}
+	if opts.Durability != "" {
+		fields["durability"] = opts.Durability
+	}
+	cfg, err := json.Marshal(fields)
 	if err != nil {
 		return embedded.index.body
 	}

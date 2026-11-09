@@ -755,6 +755,39 @@ func TestUI_MetricsInvalidPatternStaysUnknown(t *testing.T) {
 	}
 }
 
+// TestUI_MetricsWalFullFlushDurabilityFlush (review MEDIUM): under
+// durability: flush every confirm is a full drive-cache flush, so the
+// group_commit site is expected to climb and must not alarm. The number still
+// renders (nothing is hidden); only the alarm is scoped to barrier mode. The
+// barrier default keeps the strict alarm — TestUI_MetricsSeverityClassification
+// pins that direction.
+func TestUI_MetricsWalFullFlushDurabilityFlush(t *testing.T) {
+	stub := newStub()
+	stub.set(func(s *stubAPI) {
+		s.metricsText = metricFixture(
+			"# HELP amqp_wal_full_flush_total WAL full flushes",
+			"# TYPE amqp_wal_full_flush_total counter",
+			`amqp_wal_full_flush_total{site="group_commit"} 5`,
+		)
+	})
+	srv := appServer(t, stub)
+	ctx, cancel := newTab(t)
+	defer cancel()
+
+	openMetrics(t, ctx, srv.URL, true, `window.__SQ_CONFIG__ = { durability: "flush" };`)
+
+	if got := tileText(t, ctx, "wal_full_flush"); got != "5" {
+		t.Fatalf("flush-mode wal_full_flush = %q, want 5 (the count must still render)", got)
+	}
+	if got := tileSeverity(t, ctx, "wal_full_flush"); got != "ok" {
+		t.Fatalf("flush-mode wal_full_flush severity = %q, want ok (a flush-mode confirm is expected)", got)
+	}
+	notice := evalStr(t, ctx, `document.getElementById('metrics-notice').textContent`)
+	if strings.Contains(notice, "WAL full flushes") {
+		t.Fatalf("flush mode still alarms on WAL full flushes: %q", notice)
+	}
+}
+
 // TestUI_MetricsHostileTextIsInert (B3 LOW #5 / SEC-030): a HELP line and a
 // label value carrying markup render as inert text — no element from the
 // payload is created and no event handler runs.
