@@ -49,9 +49,14 @@ CSP. It is auth-gated like every other `/api/*` route and answers:
 - `503` on a scrape failure (with `Retry-After`).
 
 The **Metrics tab** (`/metrics`) in the management UI renders that payload as a 45-tile
-vital-stats panel, a grouped and searchable family browser, and a raw-text view. A family
-that is absent renders an em-dash with "not emitted by this broker" — never a fabricated
-`0`. See [MANAGEMENT.md](MANAGEMENT.md#metrics-tab).
+vital-stats panel, a grouped and searchable family browser, and a raw-text view. A tile
+has three outcomes: a family the endpoint never emitted renders an em-dash with "not
+emitted by this broker" (never a fabricated `0`); a family present with a zero value
+renders `0`; and a family present whose label matcher selects none of its series renders
+`0` (a sum over an empty set is a defined zero). Only the absent-family case carries the
+"not emitted by this broker" title — a filtered tile never fabricates it. A malformed
+matcher, or one that drops the whole excluded domain, degrades the tile to unknown with a
+title naming the bad pattern. See [MANAGEMENT.md](MANAGEMENT.md#metrics-tab).
 
 ## Metric reference
 

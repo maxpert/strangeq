@@ -409,9 +409,18 @@ with data). It is gated by the same capability and resource gates as the API.
 The `/metrics` screen renders the broker's Prometheus matrix from the same-origin,
 auth-gated `GET /api/metrics`:
 
-- a **45-tile vital-stats panel** grouped into Throughput, Topology and Health, where an
-  absent family renders an em-dash with "not emitted by this broker" (never a fabricated
-  `0`), and a present zero renders `0`;
+- a **45-tile vital-stats panel** grouped into Throughput, Topology and Health, with three
+  tile outcomes: a family the endpoint never emitted renders an em-dash with "not emitted
+  by this broker" (never a fabricated `0`); a family present with a zero value renders `0`;
+  and a family present whose label matcher selects none of its series renders `0` (a sum
+  over an empty set is a defined zero, so a traffic-path-only counter reads `0` when only
+  pre-initialized off-path sites are present). The "not emitted by this broker" title
+  applies **only** to the absent-family case — a filtered tile never fabricates that claim.
+  A tile whose matcher is malformed or selects the whole excluded domain degrades to an
+  em-dash with an unknown severity naming the bad pattern, never a fabricated `0`.
+  The WAL full-flush alarm is scoped to `barrier` durability: under `durability: flush`
+  every confirm is a full drive-cache flush, so the `group_commit` count still renders but
+  raises no alarm;
 - a **grouped, searchable family browser** over every scraped family;
 - a **raw text** view (`?view=raw`) of the exposition;
 - rates derived from **two samples**, with a pause/backoff control.
