@@ -1,9 +1,5 @@
 package config
 
-import (
-	"time"
-)
-
 // ConfigBuilder provides a fluent API for building configuration
 type ConfigBuilder struct {
 	config *AMQPConfig
@@ -57,24 +53,6 @@ func (b *ConfigBuilder) WithStoragePath(path string) *ConfigBuilder {
 // Any other value is rejected by Validate/Build.
 func (b *ConfigBuilder) WithDurability(durability string) *ConfigBuilder {
 	b.config.Storage.Durability = durability
-	return b
-}
-
-// WithCacheSize sets the storage cache size in megabytes
-func (b *ConfigBuilder) WithCacheSize(sizeMB int64) *ConfigBuilder {
-	b.config.Storage.CacheMB = sizeMB
-	return b
-}
-
-// WithMaxFiles sets the maximum number of open file handles
-func (b *ConfigBuilder) WithMaxFiles(maxFiles int) *ConfigBuilder {
-	b.config.Storage.MaxFiles = maxFiles
-	return b
-}
-
-// WithRetention sets the segment retention period
-func (b *ConfigBuilder) WithRetention(retention time.Duration) *ConfigBuilder {
-	b.config.Storage.RetentionMS = retention.Milliseconds()
 	return b
 }
 

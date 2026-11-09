@@ -46,11 +46,8 @@ func DefaultConfig() *AMQPConfig {
 			// of the group-commit fence, or durability: flush for the full
 			// F_FULLFSYNC drive-cache flush (power-loss safe). Emitted by
 			// --generate-config so the no-config path is unambiguous.
-			Durability:  interfaces.DurabilityBarrier,
-			CRCCheck:    boolPtr(true),
-			CacheMB:     64,       // 64 MB metadata cache
-			MaxFiles:    100,      // Max open file handles
-			RetentionMS: 86400000, // 24 hours
+			Durability: interfaces.DurabilityBarrier,
+			CRCCheck:   boolPtr(true),
 		},
 		Security: interfaces.SecurityConfig{
 			TLSEnabled:             false,

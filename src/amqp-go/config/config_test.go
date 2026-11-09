@@ -270,9 +270,6 @@ network:
 storage:
   path: ./test-data
   durability: none
-  cachemb: 64
-  maxfiles: 100
-  retentionms: 86400000
   checkpointintervalms: 5000
 server:
   loglevel: debug
@@ -403,9 +400,6 @@ network:
   tcpkeepaliveintervalms: 30000
 storage:
   path: ./test-data
-` + extra + `  cachemb: 64
-  maxfiles: 100
-  retentionms: 86400000
   checkpointintervalms: 5000
 server:
   loglevel: debug
@@ -444,9 +438,6 @@ network:
   tcpkeepaliveintervalms: 30000
 storage:
   path: ./test-data
-  cachemb: 64
-  maxfiles: 100
-  retentionms: 86400000
   checkpointintervalms: 5000
 server:
   loglevel: debug

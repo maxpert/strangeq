@@ -146,14 +146,6 @@ type StorageConfig struct {
 	// Message settings
 	MessageTTL int64 // Message TTL in seconds (0 = no TTL)
 
-	// Performance settings
-	CacheMB  int64 // Metadata cache size in megabytes
-	MaxFiles int   // Maximum open file handles
-
-	// RetentionMS is how long to keep old segments before compaction (milliseconds)
-	// Example: 86400000 = 24 hours
-	RetentionMS int64
-
 	// UnsafeRecovery (--unsafe-recovery) lets the broker START on a data
 	// directory whose recovery could not be completed safely, DISCARDING
 	// whatever could not be interpreted. Zero value (false) is the safe
