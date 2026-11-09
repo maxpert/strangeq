@@ -136,6 +136,46 @@ func TestUI_S10_BindingsList(t *testing.T) {
 	}
 }
 
+// TestUI_S10_BindingsCreateWaitsForCapability pins the fix for the flake that
+// turned CI red on the v0.14.3 push: TestUI_S10_BindingsCreate failed at 90.01s
+// on ui_s10_test.go:154 step 4/4 (WaitVisible #binding-source).
+//
+// Cause, at the source: boot() fires loadVersion() WITHOUT awaiting it and then
+// calls render() (app.js:3247-3256), so the bindings screen renders before
+// state.capabilities lands. bindingsWriteState() therefore returns "unknown" for
+// the first render and #create-binding-btn is rendered DISABLED
+// (app.js:1601-1606) while still being visible. chromedp's WaitVisible accepts a
+// disabled button, and the click handler opens with `if (!createBtn.disabled)
+// return;` — so a click landing inside that window is silently swallowed, the
+// dialog never opens, and the test sits on WaitVisible(#binding-source) until the
+// tab budget expires.
+//
+// capsDelay forces that window instead of hoping to hit it, and WaitEnabled is the
+// explicit synchronisation on the exact precondition the handler checks.
+func TestUI_S10_BindingsCreateWaitsForCapability(t *testing.T) {
+	stub := newStub()
+	stub.set(func(s *stubAPI) {
+		s.caps["bindings"] = true
+		s.capsDelay = 600 * time.Millisecond // the screen renders long before this
+	})
+	srv := appServer(t, stub)
+	ctx, cancel := newTab(t)
+	defer cancel()
+
+	mustDo(t, ctx, chromedp.Navigate(srv.URL+"/bindings"))
+	mustDo(t, ctx, chromedp.WaitVisible(chromedp.CSS("#create-binding-btn")))
+	// Pin the window this test exists for: visible, but not yet clickable.
+	if !evalBool(t, ctx, `document.getElementById('create-binding-btn').disabled`) {
+		t.Fatal("precondition: the button must render disabled while the capability is unknown")
+	}
+	// Only then is it clickable, and the dialog must open.
+	mustDo(t, ctx,
+		chromedp.WaitEnabled(chromedp.CSS("#create-binding-btn")),
+		chromedp.Click(chromedp.CSS("#create-binding-btn")),
+		chromedp.WaitVisible(chromedp.CSS("#binding-source")),
+	)
+}
+
 // TestUI_S10_BindingsCreate proves the create dialog POSTs the canonical path
 // with the routing key AND the x-* arguments, and carries the CSRF token.
 func TestUI_S10_BindingsCreate(t *testing.T) {
@@ -154,6 +194,7 @@ func TestUI_S10_BindingsCreate(t *testing.T) {
 	mustDo(t, ctx,
 		chromedp.Navigate(srv.URL+"/bindings"),
 		chromedp.WaitVisible(chromedp.CSS("#create-binding-btn")),
+		chromedp.WaitEnabled(chromedp.CSS("#create-binding-btn")),
 		chromedp.Click(chromedp.CSS("#create-binding-btn")),
 		chromedp.WaitVisible(chromedp.CSS("#binding-source")),
 	)
@@ -202,6 +243,7 @@ func TestUI_S10_BindingsCreateExchangeDestination(t *testing.T) {
 	mustDo(t, ctx,
 		chromedp.Navigate(srv.URL+"/bindings"),
 		chromedp.WaitVisible(chromedp.CSS("#create-binding-btn")),
+		chromedp.WaitEnabled(chromedp.CSS("#create-binding-btn")),
 		chromedp.Click(chromedp.CSS("#create-binding-btn")),
 		chromedp.WaitVisible(chromedp.CSS("#binding-source")),
 	)
@@ -587,6 +629,7 @@ func TestUI_S10_HostileValuesInert(t *testing.T) {
 		mustDo(t, ctx,
 			chromedp.Navigate(srv.URL+"/bindings"),
 			chromedp.WaitVisible(chromedp.CSS("#create-binding-btn")),
+			chromedp.WaitEnabled(chromedp.CSS("#create-binding-btn")),
 			chromedp.Click(chromedp.CSS("#create-binding-btn")),
 			chromedp.WaitVisible(chromedp.CSS("#binding-source")),
 		)

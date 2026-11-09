@@ -11,6 +11,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 )
 
 // stubAPI is a minimal, self-contained stand-in for the spec-01 management API.
@@ -32,6 +33,7 @@ type stubAPI struct {
 	bindings501 bool
 	users403    bool
 	caps        map[string]any
+	capsDelay   time.Duration // delays GET /api/strangeq/version (capabilities)
 	queues      []map[string]any
 	overview    map[string]any
 
@@ -417,7 +419,20 @@ func (s *stubAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			}
 			s.mu.Lock()
 			caps := s.caps
+			delay := s.capsDelay
 			s.mu.Unlock()
+			// capsDelay widens the window in which a screen has already rendered
+			// while the capabilities are still unknown. That window is exactly what
+			// puts a capability-gated button into its disabled state (app.js
+			// bindingsWriteState/closeConnectionState return "unknown" until
+			// state.capabilities lands), so a test that clicks such a button must
+			// wait for it to be ENABLED, not merely visible — a click on a disabled
+			// button is swallowed by the button's own guard and the dialog never
+			// opens. This knob lets a test force that window deterministically
+			// instead of hoping to hit it.
+			if delay > 0 {
+				time.Sleep(delay)
+			}
 			writeRead(w, r, map[string]any{
 				"product": "StrangeQ", "version": "0.4.0", "commit": "abc123",
 				"build_date": "2026-11-08", "go_version": "go1.27", "api_compatibility": "rabbitmq-4.4-management-subset",
