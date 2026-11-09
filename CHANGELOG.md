@@ -56,6 +56,28 @@ them must migrate.
   `amqp_messages_redelivered_total` (and the management "Redelivered" health
   tile) stayed at zero. The collector is now resolved once, before broker
   construction, and wired to the concrete broker before it is wrapped.
+- Management SPA capability gates: a gated control (Create binding, Close
+  connection, delete binding) could stay permanently disabled when the
+  capabilities response arrived after the screen had already rendered —
+  `boot()` fired `loadVersion()` without awaiting it and nothing re-applied
+  the capability map to the rendered controls. A targeted re-render of the
+  `[data-cap]` controls now runs when capabilities arrive or change.
+- `AckCursor.OnPublish` was a load-then-store, so a concurrent lower-tag store
+  could clobber the delivery-tag frontier `Head()` that the queue reaper reads
+  as `t >= qs.Head()`. The frontier is now an atomic max (CAS loop); final
+  frontier regressed as far as 9,900 with 10,000 tags published.
+
+### Changed
+
+- Raw-AMQP test harness: positive frame waits now wait on frame content over a
+  synchronous `net.Pipe` (the same `handleConnection` path as a socket) instead
+  of per-frame wall-clock caps; the only read bound is an env-tunable stall
+  guard (`SQ_WSB_FRAME_DEADLINE`, default 10 s) so a slow CI box can no longer
+  fail a test for being slow.
+- README performance table re-measured on the 0.15.0 build (default `barrier`
+  mode; 3-4 repetitions; paired where possible): StrangeQ stays ahead of
+  RabbitMQ 4.4 Classic on every workload with 12-79% less peak memory;
+  margins +47% / +85% / tie / +21% / +210% across the five workloads.
 
 ## [0.14.3] - 2026-11-09
 
