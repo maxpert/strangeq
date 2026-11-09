@@ -23,9 +23,16 @@ import (
 /* ------------------------------------------------------------------ setup -- */
 
 // Per-tab deadline policy. A UI test opens one fresh tab from the package
-// browser; every tab operation is bounded so no test can hang, but the bound is
-// derived from the go-test budget instead of a hard-coded 30 s so a slow host
-// cannot turn "the tab needed longer" into a bare "context deadline exceeded".
+// browser; every I/O step on that tab is bounded so no test can hang. The
+// bound covers the tab-creation (setup) Do as well as every later action run
+// on the tab (see boundedTab). It is derived from the go-test budget instead of
+// a hard-coded 30 s so a slow host cannot turn "the tab needed longer" into a
+// bare "context deadline exceeded".
+//
+// The one step outside the per-tab bound is the package-level browser start in
+// TestMain: it runs before any *testing.T exists, so there is no go-test budget
+// to derive the bound from, and it is governed only by the test binary's own
+// -timeout. Every step a test performs after TestMain is inside the bound.
 const (
 	// defaultBrowserDeadline is the generous per-tab budget used when the
 	// go-test budget is unknown or larger than this.
@@ -97,7 +104,9 @@ var (
 // a timeout can name the test, the stage and the bound.
 type browserTabKey struct{}
 
-// browserTab is the diagnostic state attached to a tab's context.
+// browserTab is the diagnostic state attached to a tab's context before the
+// setup Do runs, so a timeout during tab creation is diagnosed with the default
+// "tab setup" stage rather than an empty one.
 type browserTab struct {
 	bound   time.Duration
 	started time.Time
@@ -176,23 +185,43 @@ func tabFailure(ctx context.Context, t *testing.T, err error) string {
 	return " [" + strings.Join(parts, "; ") + "]"
 }
 
-// newTab opens a fresh tab that shares the package browser. Every test gets a
-// tab deadline derived from its go-test budget (see browserDeadlineBudget), so
-// no test can hang and a slow host is attributed to the tab, not the binary.
+// newTab opens a fresh tab that shares the package browser. The tab-creation
+// step runs on the same budget-aware bound as every later tab operation (see
+// browserDeadlineBudget), so neither setup nor a later action can hang, and a
+// slow host is attributed to the tab, not the go-test binary.
 func newTab(t *testing.T) (context.Context, context.CancelFunc) {
 	t.Helper()
 	if browserErr != nil {
 		t.Skipf("headless browser unavailable: %v", browserErr)
 	}
-	tabCtx, cancelTab := chromedp.NewContext(browserCtx)
-	if err := chromedp.Do(tabCtx); err != nil {
-		cancelTab()
-		t.Skipf("headless browser tab unavailable: %v", err)
+	ctx, cancel, err := boundedTab(t, browserCtx)
+	if err != nil {
+		cancel()
+		// boundedTab always attaches browserTab before the setup Do, so the
+		// bound is available for the skip message.
+		t.Skipf("headless browser tab unavailable after %s: %v%s", tabFrom(ctx).bound, err, tabFailure(ctx, t, err))
 	}
+	return ctx, cancel
+}
+
+// boundedTab derives the bounded per-tab context from parent and runs the
+// tab-creation step *inside* that bound, so a hung setup fails within the tab
+// budget with a diagnosis instead of running to the go-test timeout. It returns
+// the context even on failure (so the caller can render tabFailure) and never
+// skips; newTab owns the skip semantics. The tab itself stays owned by the
+// chromedp context derived from parent, so the returned cancel closes it.
+func boundedTab(t *testing.T, parent context.Context) (context.Context, context.CancelFunc, error) {
+	t.Helper()
+	tabCtx, cancelTab := chromedp.NewContext(parent)
 	bound := browserDeadline(t)
 	ctx, cancelTimeout := context.WithTimeout(tabCtx, bound)
 	ctx = context.WithValue(ctx, browserTabKey{}, &browserTab{bound: bound, started: time.Now()})
-	return ctx, func() { cancelTimeout(); cancelTab() }
+	if err := chromedp.Do(ctx); err != nil {
+		cancelTimeout()
+		cancelTab()
+		return ctx, func() {}, err
+	}
+	return ctx, func() { cancelTimeout(); cancelTab() }, nil
 }
 
 func chromeExecPath() string {
@@ -389,6 +418,77 @@ func TestUI_BrowserTabDeadlineIsBudgetAware(t *testing.T) {
 	if got > time.Until(budget)-browserDeadlineMargin+time.Second {
 		t.Fatalf("tab bound %s outlives the go-test budget %s", got.Round(time.Millisecond), time.Until(budget).Round(time.Millisecond))
 	}
+}
+
+// TestUI_BrowserTabSetupIsBounded proves the tab *setup* step (the first Run
+// that creates the tab) is inside the same budget-aware bound as every later
+// action: an already-expired bound cuts setup instead of letting it run on an
+// unbounded context, a cancelled parent returns at once with a diagnosis naming
+// the bound, and newTab still hands back a context that carries a deadline.
+func TestUI_BrowserTabSetupIsBounded(t *testing.T) {
+	if browserErr != nil {
+		t.Skipf("headless browser unavailable: %v", browserErr)
+	}
+
+	// A parent that is already done: setup must return promptly rather than
+	// wait on the browser, and the failure must name the bound so a hang is
+	// diagnosable.
+	t.Run("cancelled parent returns within the bound", func(t *testing.T) {
+		t.Setenv("SQ_BROWSER_DEADLINE", "")
+		cancelled, cancelParent := context.WithCancel(context.Background())
+		cancelParent()
+
+		bound := browserDeadline(t)
+		start := time.Now()
+		ctx, cancel, err := boundedTab(t, cancelled)
+		elapsed := time.Since(start)
+		defer cancel()
+
+		if err == nil {
+			t.Fatal("tab setup on a cancelled parent must fail")
+		}
+		if elapsed >= bound {
+			t.Fatalf("tab setup ran %s, past the %s per-tab bound", elapsed, bound)
+		}
+		if msg := tabFailure(ctx, t, err); !strings.Contains(msg, "tab bound "+bound.String()) {
+			t.Fatalf("setup failure diagnosis omits the bound %s: %q", bound, msg)
+		}
+	})
+
+	// An already-expired bound must cut the real tab-creation Do. This is the
+	// assertion that fails if setup runs on an unbounded context (the pre-fix
+	// ordering): chromedp then creates the tab successfully and returns no
+	// error even though the bound is long gone.
+	t.Run("expired bound cuts the setup Do", func(t *testing.T) {
+		t.Setenv("SQ_BROWSER_DEADLINE", "1ns")
+		start := time.Now()
+		ctx, cancel, err := boundedTab(t, browserCtx)
+		defer cancel()
+
+		if err == nil {
+			t.Fatal("tab setup with an already-expired bound must fail, not create a tab")
+		}
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("tab setup error = %v, want context.DeadlineExceeded", err)
+		}
+		if elapsed := time.Since(start); elapsed > time.Minute {
+			t.Fatalf("tab setup ran %s despite the expired 1ns bound", elapsed)
+		}
+		if msg := tabFailure(ctx, t, err); !strings.Contains(msg, "tab deadline exceeded") {
+			t.Fatalf("setup deadline diagnosis omits the remedy: %q", msg)
+		}
+	})
+
+	// The harness contract itself is unchanged: newTab still returns a context
+	// that carries the bound.
+	t.Run("newTab context carries the bound", func(t *testing.T) {
+		t.Setenv("SQ_BROWSER_DEADLINE", "")
+		ctx, cancel := newTab(t)
+		defer cancel()
+		if _, ok := ctx.Deadline(); !ok {
+			t.Fatal("newTab returned an unbounded tab context")
+		}
+	})
 }
 
 // TestUI_BrowserTabFailureDiagnosis proves a timed-out tab stage produces a
