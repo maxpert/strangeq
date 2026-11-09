@@ -2574,7 +2574,17 @@
     out.name = fm[1];
     if (fm[2] !== undefined && fm[2] !== null && fm[2] !== "") {
       var lm = fm[2].match(/^\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*(=~|!~|!=|=)\s*"((?:[^"\\]|\\.)*)"\s*$/);
-      if (lm) out.filter = { label: lm[1], op: lm[2], value: unescapeLabel(lm[3]) };
+      if (lm) {
+        out.filter = { label: lm[1], op: lm[2], value: unescapeLabel(lm[3]) };
+        if (out.filter.op === "=~" || out.filter.op === "!~") {
+          /* A Prometheus regex matcher is fully anchored. Compile it once here
+           * so a malformed pattern is a parse-time fact (filter.invalid), not a
+           * per-sample false that silently selects nothing and would render a
+           * fabricated present zero. */
+          try { out.filter.re = new RegExp("^(?:" + out.filter.value + ")$"); }
+          catch (e) { out.filter.invalid = true; }
+        }
+      }
     }
     return out;
   }
@@ -2587,26 +2597,33 @@
     return null;
   }
 
-  /* labelMatches applies one label matcher to a sample's value. A Prometheus
-   * regex matcher is fully anchored: it matches the whole label value, never a
-   * substring, so site!~"close" excludes exactly "close" and not
-   * "segment_close". A malformed pattern matches nothing so it can never be
-   * silently read as a pass. */
+  /* labelMatches applies one label matcher to a sample's value, tri-state: true
+   * selects the sample, false does not, and undefined means the matcher itself
+   * is unusable (a malformed regex). A Prometheus regex matcher is fully
+   * anchored: it matches the whole label value, never a substring, so
+   * site!~"close" excludes exactly "close" and not "segment_close". An invalid
+   * pattern returns undefined so the tile degrades to unknown instead of
+   * selecting nothing and being read as a present zero. */
   function labelMatches(filter, v) {
     if (filter.op === "=") return v === filter.value;
     if (filter.op === "!=") return v !== filter.value;
-    var re;
-    try { re = new RegExp("^(?:" + filter.value + ")$"); }
-    catch (e) { return false; }
-    var hit = re.test(v === undefined || v === null ? "" : v);
+    if (filter.invalid) return undefined;
+    var hit = filter.re.test(v === undefined || v === null ? "" : v);
     return filter.op === "!~" ? !hit : hit;
   }
 
+  /* matchingSamples returns the selected samples, or null when any sample's
+   * matcher is unusable (undefined), so the caller can tell "selected nothing"
+   * from "could not evaluate". */
   function matchingSamples(fam, filter) {
     var out = [];
     for (var i = 0; i < fam.samples.length; i++) {
       var smp = fam.samples[i];
-      if (filter && !labelMatches(filter, smp.labels[filter.label])) continue;
+      if (filter) {
+        var m = labelMatches(filter, smp.labels[filter.label]);
+        if (m === undefined) return null;
+        if (!m) continue;
+      }
       out.push(smp);
     }
     return out;
@@ -2645,6 +2662,12 @@
     var fam = familyByName(model, sel.name);
     if (!fam) return { found: false };
     var matches = matchingSamples(fam, sel.filter);
+    if (matches === null) {
+      /* The matcher itself is unusable (a malformed regex): the family is
+       * present but no truthful value can be computed, so the tile stays
+       * unknown — never a fabricated present zero. */
+      return { found: false, invalid: true, pattern: sel.filter.value };
+    }
     if (!matches.length) {
       /* The family IS emitted; the filter selects none of its series. Summed
        * over an empty set the aggregate is a defined zero, so a filtered sum
@@ -2679,7 +2702,12 @@
       var ev = evalTile(model, t.sel, { prev: prev, curr: curr });
       var state = "unknown";
       var text = DASH;
-      if (ev.found) {
+      var title = "";
+      if (ev.invalid) {
+        /* An unusable selector pattern is unknown, never a fabricated value:
+         * the tile keeps the em-dash and names the offending pattern. */
+        title = 'invalid selector pattern "' + ev.pattern + '": the tile is unknown, never a fabricated value';
+      } else if (ev.found) {
         if (t.render === "alarm") {
           state = ev.value === 1 ? "bad" : "ok";
           text = ev.value === 1 ? "set" : "none";
@@ -2688,7 +2716,7 @@
           text = renderTile(t.render, ev.value);
         }
       }
-      out.push({ id: t.id, label: t.label, group: t.group, state: state, text: text });
+      out.push({ id: t.id, label: t.label, group: t.group, state: state, text: text, title: title });
     }
     return out;
   }
@@ -2809,7 +2837,7 @@
       var value = card.querySelector(".card-value");
       if (value) {
         value.textContent = t.text;
-        value.title = (t.state === "unknown") ? "not emitted by this broker" : "";
+        value.title = (t.state === "unknown") ? (t.title || "not emitted by this broker") : "";
       }
       var sev = card.querySelector(".card-sev");
       if (sev) sev.textContent = t.state === "unknown" ? DASH : t.state;
@@ -3202,7 +3230,9 @@
     refreshNow: refreshNow,
     navigate: navigate,
     render: render,
-    parseProm: parseProm
+    parseProm: parseProm,
+    evalTile: evalTile,
+    VITALS: VITALS
   };
 
   if (document.readyState === "loading") {

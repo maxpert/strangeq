@@ -696,6 +696,65 @@ func TestUI_MetricsRawEndpointGated(t *testing.T) {
 	})
 }
 
+// TestUI_MetricsInvalidPatternStaysUnknown (review MEDIUM): a malformed or
+// match-everything regex must degrade the tile to unknown, never fabricate a
+// present zero. evalTile reports invalid:true and the rendered tile keeps the
+// em-dash, severity unknown, with a title naming the offending pattern.
+func TestUI_MetricsInvalidPatternStaysUnknown(t *testing.T) {
+	stub := newStub()
+	stub.set(func(s *stubAPI) {
+		s.metricsText = metricFixture(
+			"# HELP amqp_wal_full_flush_total WAL full flushes",
+			"# TYPE amqp_wal_full_flush_total counter",
+			`amqp_wal_full_flush_total{site="group_commit"} 5`,
+		)
+	})
+	srv := appServer(t, stub)
+	ctx, cancel := newTab(t)
+	defer cancel()
+
+	openMetrics(t, ctx, srv.URL, true, "")
+
+	// evalTile is the pure seam: a malformed pattern is a parse-time fact.
+	got := mustRun(t, ctx, chromedp.Evaluate[string](`(function(){
+	  var ev = window.SQ.evalTile(window.SQ.state.metrics.model, 'sum(amqp_wal_full_flush_total{site!~"boot["})', {prev:{}, curr:{}});
+	  return JSON.stringify({found: ev.found, invalid: !!ev.invalid, pattern: ev.pattern || ''});
+	})()`))
+	if !strings.Contains(got, `"found":false`) || !strings.Contains(got, `"invalid":true`) || !strings.Contains(got, "boot[") {
+		t.Fatalf("evalTile on a malformed pattern = %s, want found:false, invalid:true, pattern boot[", got)
+	}
+
+	// Swap the shipped selector for the malformed one, then force a fresh
+	// scrape (a changed body defeats the 304) so the real tile re-renders.
+	mustRun(t, ctx, chromedp.Evaluate[string](`(function(){
+	  for (var i=0;i<window.SQ.VITALS.length;i++){
+	    if (window.SQ.VITALS[i].id === 'wal_full_flush') {
+	      window.SQ.VITALS[i].sel = 'sum(amqp_wal_full_flush_total{site!~"boot["})';
+	      break;
+	    }
+	  }
+	  return 'ok';
+	})()`))
+	stub.set(func(s *stubAPI) {
+		s.metricsText = metricFixture(
+			"# HELP amqp_wal_full_flush_total WAL full flushes",
+			"# TYPE amqp_wal_full_flush_total counter",
+			`amqp_wal_full_flush_total{site="group_commit"} 6`,
+		)
+	})
+	mustRun(t, ctx, refreshAwait(`(async function(){ await window.SQ.refreshNow(); return 'ok'; })()`))
+
+	if got := tileText(t, ctx, "wal_full_flush"); got != "\u2014" {
+		t.Fatalf("invalid-pattern tile = %q, want an em-dash (never a fabricated 0)", got)
+	}
+	if got := tileSeverity(t, ctx, "wal_full_flush"); got != "unknown" {
+		t.Fatalf("invalid-pattern severity = %q, want unknown", got)
+	}
+	if got := evalStr(t, ctx, `document.getElementById('metrics-tile-wal_full_flush').title`); !strings.Contains(got, "boot[") {
+		t.Fatalf("invalid-pattern title = %q, want it to name the pattern", got)
+	}
+}
+
 // TestUI_MetricsHostileTextIsInert (B3 LOW #5 / SEC-030): a HELP line and a
 // label value carrying markup render as inert text — no element from the
 // payload is created and no event handler runs.
