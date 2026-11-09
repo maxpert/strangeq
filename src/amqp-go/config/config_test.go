@@ -400,7 +400,7 @@ network:
   tcpkeepaliveintervalms: 30000
 storage:
   path: ./test-data
-  checkpointintervalms: 5000
+` + extra + `  checkpointintervalms: 5000
 server:
   loglevel: debug
   maxchannelsperconnection: 2047
