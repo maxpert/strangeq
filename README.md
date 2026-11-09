@@ -423,7 +423,6 @@ Per-repetition throughput and RSS figures were collected with the same `cmd/perf
 | `connection.close` / `close-ok` | Yes | Yes |
 | `connection.blocked` / `unblocked` | Yes (memory/disk alarms) | Yes |
 | `connection.secure` / `secure-ok` (method — multi-step SASL) | No | Yes |
-| connection `secure`/`ssl` property (`/api/connections`) | Yes | Yes |
 | `channel.open` / `open-ok` | Yes | Yes |
 | `channel.close` / `close-ok` | Yes | Yes |
 | `channel.flow` / `flow-ok` | Yes | Yes |
@@ -626,6 +625,16 @@ Two optional HTTP surfaces can be enabled independently of the broker listener:
 The management UI includes a **Metrics tab** that renders the same Prometheus matrix the
 telemetry listener exposes (a 45-tile vital-stats panel, a searchable family browser, and a
 raw view) from a same-origin, auth-gated `GET /api/metrics`.
+
+### Management REST API compatibility
+
+| Feature | StrangeQ | RabbitMQ |
+|---------|----------|----------|
+| Connection `secure`/`ssl` property (`/api/connections`) | Yes | Yes |
+
+`GET /api/connections` also reports `auth_mechanism`, the SASL mechanism that authenticated
+the connection. Both fields describe transport/identity state, not protocol-method support:
+`secure`/`ssl` are derived from the transport (a `*tls.Conn`), never from the SASL mechanism.
 
 ## Monitoring
 
