@@ -319,15 +319,6 @@ func (c *Connection) DrainPendingConfirmNacks() []PendingConfirmNack {
 	return drained
 }
 
-// HasPendingConfirmNacks reports whether any confirm nack is awaiting the
-// flusher. Lock-free-ish peek used to keep the flusher's fast path cheap.
-func (c *Connection) HasPendingConfirmNacks() bool {
-	c.pendingNackMu.Lock()
-	n := len(c.pendingNacks)
-	c.pendingNackMu.Unlock()
-	return n > 0
-}
-
 // Channel represents an AMQP channel
 type Channel struct {
 	ID         uint16

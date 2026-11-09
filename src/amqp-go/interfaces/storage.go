@@ -213,27 +213,6 @@ type TransactionAction struct {
 	Data      map[string]interface{} `json:"data"` // Operation-specific data
 }
 
-// StorageStats represents storage statistics
-type StorageStats struct {
-	TotalMessages int   `json:"total_messages"`
-	TotalSize     int64 `json:"total_size"`
-	LSMSize       int64 `json:"lsm_size"`
-	ValueLogSize  int64 `json:"value_log_size"`
-	PendingWrites int   `json:"pending_writes"`
-	ExchangeCount int   `json:"exchange_count"`
-	QueueCount    int   `json:"queue_count"`
-	BindingCount  int   `json:"binding_count"`
-	ConsumerCount int   `json:"consumer_count"`
-}
-
-// MetadataStats represents metadata storage statistics
-type MetadataStats struct {
-	ExchangeCount int `json:"exchange_count"`
-	QueueCount    int `json:"queue_count"`
-	BindingCount  int `json:"binding_count"`
-	ConsumerCount int `json:"consumer_count"`
-}
-
 // Storage error types
 var (
 	ErrMessageNotFound      = errors.New("message not found")
@@ -245,8 +224,6 @@ var (
 	ErrTransactionExists    = errors.New("transaction already exists")
 	ErrTransactionNotActive = errors.New("transaction is not active")
 	ErrPendingAckNotFound   = errors.New("pending acknowledgment not found")
-	ErrCorruptedStorage     = errors.New("storage corruption detected")
-	ErrRecoveryInProgress   = errors.New("recovery operation in progress")
 )
 
 // AcknowledgmentStore interface for handling message acknowledgment persistence

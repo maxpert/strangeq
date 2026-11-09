@@ -116,7 +116,7 @@ func (lm *LifecycleManager) setState(state LifecycleState) {
 }
 
 // markRunning records that the server is actually serving (listener bound).
-// Server.Start / StartWithQuitChannel call it right after binding; before this
+// Server.Start calls it right after binding; before this
 // existed, the state only ever reached StateRunning as the server was on its
 // way DOWN (after Start returned), so Health() never reported "healthy".
 func (lm *LifecycleManager) markRunning() {
@@ -275,7 +275,7 @@ func (lm *LifecycleManager) Shutdown() error {
 func (lm *LifecycleManager) forceShutdown() error {
 	// Stop the server — cancels metrics collector and closes the listener.
 	// Guard against double-close: Server.Stop may have already been called
-	// (e.g. via StartWithQuitChannel), and the listener may already be closed.
+	// and the listener may already be closed.
 	if err := lm.server.Stop(); err != nil {
 		// Ignore "already closed" errors from redundant close calls
 		if !isListenerClosedErr(err) {

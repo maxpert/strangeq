@@ -11,11 +11,8 @@ import (
 
 // Method IDs for connection class
 const (
-	ConnectionStart    = 10
 	ConnectionStartOK  = 11
-	ConnectionSecure   = 20
 	ConnectionSecureOK = 21
-	ConnectionTune     = 30
 	ConnectionTuneOK   = 31
 	ConnectionOpen     = 40
 	ConnectionOpenOK   = 41
@@ -31,7 +28,6 @@ const (
 // Method IDs for channel class
 const (
 	ChannelOpen    = 10
-	ChannelOpenOK  = 11
 	ChannelFlow    = 20
 	ChannelFlowOK  = 21
 	ChannelClose   = 40
@@ -40,50 +36,39 @@ const (
 
 // Method IDs for exchange class
 const (
-	ExchangeDeclare   = 10 // 40.10 - class ID 40, method ID 10
-	ExchangeDeclareOK = 11 // 40.11 - class ID 40, method ID 11
-	ExchangeDelete    = 20 // 40.20 - class ID 40, method ID 20
-	ExchangeDeleteOK  = 21 // 40.21 - class ID 40, method ID 21
-	ExchangeBind      = 30 // 40.30 - class ID 40, method ID 30
-	ExchangeBindOK    = 31 // 40.31 - class ID 40, method ID 31
-	ExchangeUnbind    = 40 // 40.40 - class ID 40, method ID 40
-	ExchangeUnbindOK  = 51 // 40.51 - class ID 40, method ID 51
+	ExchangeDeclare  = 10 // 40.10 - class ID 40, method ID 10
+	ExchangeDelete   = 20 // 40.20 - class ID 40, method ID 20
+	ExchangeBind     = 30 // 40.30 - class ID 40, method ID 30
+	ExchangeBindOK   = 31 // 40.31 - class ID 40, method ID 31
+	ExchangeUnbind   = 40 // 40.40 - class ID 40, method ID 40
+	ExchangeUnbindOK = 51 // 40.51 - class ID 40, method ID 51
 )
 
 // Method IDs for queue class
 const (
-	QueueDeclare   = 10 // 50.10 - class ID 50, method ID 10
-	QueueDeclareOK = 11 // 50.11 - class ID 50, method ID 11
-	QueueBind      = 20 // 50.20 - class ID 50, method ID 20
-	QueueBindOK    = 21 // 50.21 - class ID 50, method ID 21
-	QueuePurge     = 30 // 50.30 - class ID 50, method ID 30
-	QueuePurgeOK   = 31 // 50.31 - class ID 50, method ID 31
-	QueueDelete    = 40 // 50.40 - class ID 50, method ID 40
-	QueueDeleteOK  = 41 // 50.41 - class ID 50, method ID 41
-	QueueUnbind    = 50 // 50.50 - class ID 50, method ID 50
-	QueueUnbindOK  = 51 // 50.51 - class ID 50, method ID 51
+	QueueDeclare  = 10 // 50.10 - class ID 50, method ID 10
+	QueueBind     = 20 // 50.20 - class ID 50, method ID 20
+	QueueBindOK   = 21 // 50.21 - class ID 50, method ID 21
+	QueuePurge    = 30 // 50.30 - class ID 50, method ID 30
+	QueuePurgeOK  = 31 // 50.31 - class ID 50, method ID 31
+	QueueDelete   = 40 // 50.40 - class ID 50, method ID 40
+	QueueDeleteOK = 41 // 50.41 - class ID 50, method ID 41
+	QueueUnbind   = 50 // 50.50 - class ID 50, method ID 50
+	QueueUnbindOK = 51 // 50.51 - class ID 50, method ID 51
 )
 
 // Method IDs for basic class
 const (
-	BasicQos          = 10  // 60.10 - class ID 60, method ID 10
-	BasicQosOK        = 11  // 60.11 - class ID 60, method ID 11
-	BasicConsume      = 20  // 60.20 - class ID 60, method ID 20
-	BasicConsumeOK    = 21  // 60.21 - class ID 60, method ID 21
-	BasicCancel       = 30  // 60.30 - class ID 60, method ID 30
-	BasicCancelOK     = 31  // 60.31 - class ID 60, method ID 31
-	BasicPublish      = 40  // 60.40 - class ID 60, method ID 40
-	BasicReturn       = 50  // 60.50 - class ID 60, method ID 50
-	BasicDeliver      = 60  // 60.60 - class ID 60, method ID 60
-	BasicGet          = 70  // 60.70 - class ID 60, method ID 70
-	BasicGetOK        = 71  // 60.71 - class ID 60, method ID 71
-	BasicGetEmpty     = 72  // 60.72 - class ID 60, method ID 72
-	BasicAck          = 80  // 60.80 - class ID 60, method ID 80
-	BasicReject       = 90  // 60.90 - class ID 60, method ID 90
-	BasicRecoverAsync = 100 // 60.100 - class ID 60, method ID 100
-	BasicRecover      = 110 // 60.110 - class ID 60, method ID 110
-	BasicRecoverOK    = 111 // 60.111 - class ID 60, method ID 111
-	BasicNack         = 120 // 60.120 - class ID 60, method ID 120
+	BasicQos      = 10  // 60.10 - class ID 60, method ID 10
+	BasicConsume  = 20  // 60.20 - class ID 60, method ID 20
+	BasicCancel   = 30  // 60.30 - class ID 60, method ID 30
+	BasicCancelOK = 31  // 60.31 - class ID 60, method ID 31
+	BasicPublish  = 40  // 60.40 - class ID 60, method ID 40
+	BasicGet      = 70  // 60.70 - class ID 60, method ID 70
+	BasicAck      = 80  // 60.80 - class ID 60, method ID 80
+	BasicReject   = 90  // 60.90 - class ID 60, method ID 90
+	BasicRecover  = 110 // 60.110 - class ID 60, method ID 110
+	BasicNack     = 120 // 60.120 - class ID 60, method ID 120
 )
 
 // Method IDs for tx class
@@ -96,15 +81,9 @@ const (
 	TxRollbackOK = 31 // 90.31 - class ID 90, method ID 31
 )
 
-// Class ID for confirm class
-const (
-	ConfirmClass = 85
-)
-
 // Method IDs for confirm class
 const (
-	ConfirmSelect   = 10 // 85.10 - class ID 85, method ID 10
-	ConfirmSelectOK = 11 // 85.11 - class ID 85, method ID 11
+	ConfirmSelect = 10 // 85.10 - class ID 85, method ID 10
 )
 
 // ConnectionStartMethod represents the connection.start method
@@ -2781,19 +2760,6 @@ func EncodeMethodFrameForChannel(channelID uint16, classID, methodID uint16, met
 	}
 }
 
-// EncodeHeaderFrameForChannel encodes a content header into a header frame for a specific channel
-func EncodeHeaderFrameForChannel(channelID uint16, classID uint16, headerData []byte) *Frame {
-	// A content header frame contains: class ID (2 bytes) + weight (2 bytes) + body size (8 bytes) +
-	// property flags (2 bytes) + properties (variable length based on property flags)
-
-	return &Frame{
-		Type:    FrameHeader,
-		Channel: channelID,
-		Size:    uint32(len(headerData)),
-		Payload: headerData,
-	}
-}
-
 // EncodeContentHeaderFrameForChannel properly encodes a content header frame for a specific channel
 func EncodeContentHeaderFrameForChannel(channelID uint16, classID, weight uint16, bodySize uint64, propertyFlags uint16, properties []byte) *Frame {
 	// A content header frame contains:
@@ -2869,45 +2835,4 @@ type ConfirmSelectOKMethod struct {
 // Serialize encodes the ConfirmSelectOKMethod into a byte slice
 func (m *ConfirmSelectOKMethod) Serialize() ([]byte, error) {
 	return []byte{}, nil
-}
-
-// FragmentBodyIntoFrames fragments a message body into multiple body frames
-// respecting the AMQP maxFrameSize constraint. Each frame payload must be
-// <= (maxFrameSize - 8) bytes to account for frame header overhead.
-//
-// AMQP 0.9.1 Specification:
-// - Large message bodies MUST be split into multiple body frames
-// - Each body frame MUST NOT exceed the negotiated max-frame-size
-// - Frame overhead is 8 bytes: 1 (type) + 2 (channel) + 4 (size) + 1 (end marker)
-//
-// For a 16MB message with 128KB maxFrameSize, this creates ~122 body frames.
-// Returns empty slice for zero-length bodies (method + header frames only).
-func FragmentBodyIntoFrames(channelID uint16, body []byte, maxFrameSize uint32) []*Frame {
-	if len(body) == 0 {
-		return nil // No body frames for empty bodies
-	}
-
-	// Calculate max payload size per frame (frame size - 8 byte overhead)
-	maxBodyPerFrame := int(maxFrameSize) - 8
-	if maxBodyPerFrame <= 0 {
-		// Should never happen with valid maxFrameSize, but handle defensively
-		maxBodyPerFrame = 4096 // Minimum safe frame size
-	}
-
-	// Pre-allocate slice with expected capacity
-	numFrames := (len(body) + maxBodyPerFrame - 1) / maxBodyPerFrame
-	frames := make([]*Frame, 0, numFrames)
-
-	// Fragment body into chunks
-	for offset := 0; offset < len(body); offset += maxBodyPerFrame {
-		end := offset + maxBodyPerFrame
-		if end > len(body) {
-			end = len(body)
-		}
-
-		chunk := body[offset:end]
-		frames = append(frames, EncodeBodyFrameForChannel(channelID, chunk))
-	}
-
-	return frames
 }

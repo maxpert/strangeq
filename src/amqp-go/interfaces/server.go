@@ -173,7 +173,6 @@ type ResourceType string
 const (
 	ResourceExchange ResourceType = "exchange"
 	ResourceQueue    ResourceType = "queue"
-	ResourceVHost    ResourceType = "vhost"
 )
 
 // Operation represents an authorization check request.

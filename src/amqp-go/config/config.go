@@ -221,7 +221,7 @@ func DefaultConfig() *AMQPConfig {
 	}
 }
 
-// AMQPConfig implements the Config interface
+// AMQPConfig is the concrete server configuration.
 type AMQPConfig struct {
 	Network        interfaces.NetworkConfig       `json:"network"`
 	Storage        interfaces.StorageConfig       `json:"storage"`
@@ -239,11 +239,6 @@ const (
 	ManagementAuthenticationBasic   = "basic"
 	ManagementAuthenticationNone    = "none"
 )
-
-// GetManagement returns the management (control-plane) configuration.
-func (c *AMQPConfig) GetManagement() interfaces.ManagementConfig {
-	return c.Management
-}
 
 // GetNetwork returns network configuration
 func (c *AMQPConfig) GetNetwork() interfaces.NetworkConfig {
@@ -314,11 +309,6 @@ func (c *AMQPConfig) GetEngine() interfaces.EngineConfig {
 	e.Durability = c.Durability()
 	e.UnsafeRecovery = c.Storage.UnsafeRecovery
 	return e
-}
-
-// GetResourceAlarms returns the resource-alarm configuration (SQ-12).
-func (c *AMQPConfig) GetResourceAlarms() interfaces.ResourceAlarmConfig {
-	return c.ResourceAlarms
 }
 
 // Validate validates the configuration

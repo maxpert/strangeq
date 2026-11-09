@@ -1,32 +1,5 @@
 package interfaces
 
-// Config defines the interface for server configuration
-type Config interface {
-	// GetNetwork returns network configuration
-	GetNetwork() NetworkConfig
-
-	// GetStorage returns storage configuration
-	GetStorage() StorageConfig
-
-	// GetSecurity returns security configuration
-	GetSecurity() SecurityConfig
-
-	// GetServer returns server information configuration
-	GetServer() ServerConfig
-
-	// GetEngine returns engine tuning configuration
-	GetEngine() EngineConfig
-
-	// Validate validates the configuration
-	Validate() error
-
-	// Load loads configuration from a source
-	Load(source string) error
-
-	// Save saves configuration to a destination
-	Save(destination string) error
-}
-
 // NetworkConfig holds network-related configuration
 type NetworkConfig struct {
 	// Address to bind the server to
