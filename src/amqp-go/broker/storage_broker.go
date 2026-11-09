@@ -14,9 +14,6 @@ import (
 	"github.com/maxpert/amqp-go/storage"
 )
 
-// ErrConsumerChannelFull is returned when a consumer channel is full and cannot accept more messages
-var ErrConsumerChannelFull = errors.New("consumer channel full")
-
 // ErrNoRoute is returned when a message published with mandatory=true
 // cannot be routed to any queue.
 var ErrNoRoute = errors.New("no route to destination queue")

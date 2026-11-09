@@ -653,8 +653,8 @@ func (c *hotCache) Put(queue string, m *protocol.Message, backed bool) bool {
 	return false
 }
 
-// PutBestEffort admits m if the byte budgets have room for it WITHOUT
-// EVICTING anything.
+// PutBestEffortEntry admits m if the byte budgets have room for it WITHOUT
+// EVICTING anything, and returns the ENTRY it admitted.
 //
 // It is the admission used by the two RAM-holder entry points:
 //
@@ -685,12 +685,6 @@ func (c *hotCache) Put(queue string, m *protocol.Message, backed bool) bool {
 // The membership probes and the upgrades are the same as Put's: an already
 // admitted message is upgraded (never re-charged), and the identity probe is
 // the reverse index, so a mutated DeliveryTag cannot admit a second entry.
-func (c *hotCache) PutBestEffort(queue string, m *protocol.Message, backed bool, durable bool) bool {
-	entry, ok := c.PutBestEffortEntry(queue, m, backed, durable)
-	return ok && entry != nil
-}
-
-// PutBestEffortEntry is PutBestEffort plus the ENTRY it admitted.
 //
 // IT RETURNS THE ENTRY SO THE CALLER CAN MARK IT DURABLE LATER WITHOUT
 // TAKING THE QUEUE'S LOCK AGAIN (see MarkDurableEntry). The publish path

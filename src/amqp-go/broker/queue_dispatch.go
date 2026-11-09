@@ -215,12 +215,9 @@ func (qs *QueueState) TagBand() (minTag, maxTag uint64) {
 	return qs.ordinalBase, qs.ordinalBase | SeqMask
 }
 
-func (qs *QueueState) SetParkTimeout(d time.Duration) {
-	qs.parkTimeout = d
-}
-
 // SetCapacityFallback overrides WaitForCapacity's safety-net wake interval.
-// Set it before the QueueState is used concurrently, like SetParkTimeout.
+// Set it before the QueueState is used concurrently.
+//
 // The compact millisecond representation preserves QueueState's dispatch-plane
 // layout while keeping this override per queue. Production leaves the
 // constructor's 10ms default unchanged; tests can move the fallback out of

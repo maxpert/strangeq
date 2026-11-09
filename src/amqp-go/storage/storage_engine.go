@@ -442,15 +442,6 @@ func (ds *StorageEngine) HotCacheResidentBytes(queue string) int64 {
 	return ds.hot.residentBytes(queue)
 }
 
-// HotCacheQueueByteBudget reports the effective per-queue hot-cache byte budget.
-// Diagnostic only.
-func (ds *StorageEngine) HotCacheQueueByteBudget() int64 {
-	if ds.hot == nil {
-		return 0
-	}
-	return ds.hot.queueBytes
-}
-
 // WALBookkeepingStats exposes the WAL tier's in-memory bookkeeping for the
 // telemetry scrape (WS-MEMORY-CUT §8). Diagnostic only; never gated. Returns
 // zeroes when the WAL tier is not built.
