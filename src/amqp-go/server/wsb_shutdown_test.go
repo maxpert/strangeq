@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"encoding/binary"
 	"errors"
 	"os"
 	"runtime"
@@ -11,6 +12,7 @@ import (
 	"time"
 
 	"github.com/maxpert/amqp-go/config"
+	"github.com/maxpert/amqp-go/protocol"
 	"github.com/maxpert/amqp-go/storage"
 	amqp "github.com/rabbitmq/amqp091-go"
 	"github.com/stretchr/testify/assert"
@@ -170,6 +172,80 @@ func TestWSB_Shutdown_Idempotent(t *testing.T) {
 	assert.Equal(t, results[0], results[1], "concurrent Shutdowns must return the same value")
 	assert.Equal(t, results[0], third, "repeated Shutdown must return the same value")
 	assert.NoError(t, results[0])
+}
+
+// TestWSB_Shutdown_PreOpenConnectionCompletingItsHandshakeStillSees320 pins the
+// fix for the connection.open-ok / rt.handshakeDone window. The broker writes
+// open-ok inside processConnectionOpen and publishes rt.handshakeDone only after
+// that returns, while the client's Dial returns the instant it READS open-ok. A
+// Shutdown landing in that window used to close the socket with no close frame
+// at all, so the peer saw the socket die instead of the promised
+// CONNECTION_FORCED — that is how CI broke TestShutdownWSB (expected 320, actual
+// 501 FRAME_ERROR with Server=false).
+//
+// The client here is deliberately held mid-handshake — start-ok sent, tune
+// consumed, no tune-ok yet — while Shutdown starts, and only then completes it.
+func TestWSB_Shutdown_PreOpenConnectionCompletingItsHandshakeStillSees320(t *testing.T) {
+	srv, addr := startWSBServer(t, nil, nil)
+
+	r := dialRaw(t, addr)
+	r.sendHeader()
+	r.expectMethod(10, 10) // connection.start
+	resp := append([]byte{0}, []byte("guest")...)
+	resp = append(resp, 0)
+	resp = append(resp, []byte("guest")...)
+	r.startOK("PLAIN", resp)
+	r.expectMethod(10, 30) // connection.tune — pre-open from the server's view
+
+	ctx, cancel := wsbCtx(5 * time.Second)
+	defer cancel()
+	shutdownDone := make(chan error, 1)
+	go func() { shutdownDone <- srv.Shutdown(ctx) }()
+
+	// The pre-open socket must NOT be torn down the moment Shutdown starts:
+	// step 2 gives it shutdownHandshakeGrace so the handshake can still land.
+	// Silence here is the assertion that the old immediate raw close is gone.
+	r.expectSilence(shutdownHandshakeGrace / 2)
+
+	// Finish the handshake after Shutdown began.
+	tuneOK := make([]byte, 8)
+	binary.BigEndian.PutUint32(tuneOK[2:6], 131072)
+	r.send(0, 10, 31, tuneOK)
+	open := &protocol.ConnectionOpenMethod{VirtualHost: "/", Reserved1: "", Reserved2: 0}
+	data, err := open.Serialize()
+	require.NoError(t, err)
+	r.send(0, 10, 40, data)
+	r.expectMethod(10, 41) // connection.open-ok
+
+	// The promise: a close FRAME (320), not a dead socket.
+	r.expectConnectionClose(320)
+	r.send(0, 10, 51, []byte{}) // connection.close-ok
+	r.expectEOF()
+	require.NoError(t, <-shutdownDone)
+}
+
+// TestWSB_Shutdown_PreOpenConnectionIsClosedRawAfterTheGrace: a connection that
+// never completes its handshake is still closed raw — no close frame is
+// protocol-legal before connection.open — but only after the grace, so the
+// shutdown never abandons a peer that is still mid-handshake and stays bounded.
+func TestWSB_Shutdown_PreOpenConnectionIsClosedRawAfterTheGrace(t *testing.T) {
+	srv, addr := startWSBServer(t, nil, nil)
+
+	r := dialRaw(t, addr)
+	r.sendHeader()
+	r.expectMethod(10, 10) // connection.start; never answered, so it never opens
+
+	ctx, cancel := wsbCtx(5 * time.Second)
+	defer cancel()
+	start := time.Now()
+	require.NoError(t, srv.Shutdown(ctx))
+	elapsed := time.Since(start)
+
+	assert.GreaterOrEqual(t, elapsed, shutdownHandshakeGrace,
+		"a pre-open socket must get the handshake grace before the raw close")
+	assert.Less(t, elapsed, shutdownHandshakeGrace+2*time.Second,
+		"the grace must stay bounded")
+	r.expectEOF()
 }
 
 // TestWSB_Shutdown_ForceClosesNonCooperativeClient: with a client that never

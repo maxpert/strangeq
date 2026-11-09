@@ -22,6 +22,30 @@ const shutdownForceJoinTimeout = 5 * time.Second
 // client can never delay broker teardown.
 const managementShutdownTimeout = 5 * time.Second
 
+// shutdownHandshakePoll, and shutdownHandshakeGrace with it, shape Shutdown's
+// still-handshaking branch.
+//
+// A connection can be past connection.open-ok on the wire while handshakeDone is
+// still unset: the broker writes open-ok inside processConnectionOpen
+// (connection_handlers.go) and publishes the flag only after that returns
+// (server.go), while the client's Dial returns the instant it READS open-ok. A
+// Shutdown landing in that window used to close the socket with no close frame
+// at all, so the peer saw the socket die (amqp091-go synthesizes
+// Error{Code: FrameError, Server:false}) instead of the promised
+// connection.close 320 CONNECTION_FORCED — the exact failure CI reported on
+// TestShutdownWSB (expected 320, actual 501, Server=false).
+//
+// The still-handshaking branch therefore waits this long for handshakeDone to
+// settle (the handshake needs one round trip once the frames are on the wire)
+// and takes the graceful path when it does. If the grace expires the connection
+// never reached connection.open, where a close frame is not protocol-legal, so
+// it is closed raw exactly as before. Half a second is far wider than the
+// in-flight handshake it covers and far narrower than any shutdown budget.
+const (
+	shutdownHandshakePoll  = 2 * time.Millisecond
+	shutdownHandshakeGrace = 500 * time.Millisecond
+)
+
 // ErrShutdownIncomplete is returned (wrapping the context error) when
 // connection goroutines outlived the shutdown context AND the force-join
 // grace; storage is left open in that case.
@@ -51,6 +75,36 @@ func (s *Server) Shutdown(ctx context.Context) error {
 		s.shutdownErr = s.shutdown(ctx)
 	})
 	return s.shutdownErr
+}
+
+// forceConnectionClose handles the one shutdown case that cannot be decided in
+// the caller: a connection with a runtime whose handshake has not settled yet.
+//
+// It exists because of the connection.open-ok / handshakeDone window described at
+// the constants above. The caller has already dealt with the two decidable cases
+// (no runtime at all, handshake already done), so this only has to give the
+// in-flight handshake its grace and then pick the close that is actually legal:
+// the graceful CONNECTION_FORCED the moment connection.open lands, or the raw
+// socket close if the peer never gets there.
+//
+// Every close site's cause telemetry is once-guarded (recordConnectionClose /
+// recordCloseCause), so exactly one cause is ever recorded for this connection.
+func (s *Server) forceConnectionClose(c *protocol.Connection, r *connRuntime) {
+	deadline := time.Now().Add(shutdownHandshakeGrace)
+	for time.Now().Before(deadline) {
+		if r.handshakeDone.Load() {
+			// The peer's own Dial is already past open-ok, so a close frame is
+			// protocol-legal and it is the promised one.
+			s.failConnection(r, amqperrors.ConnectionForced,
+				"CONNECTION_FORCED - broker shutdown", 0, 0)
+			return
+		}
+		time.Sleep(shutdownHandshakePoll)
+	}
+	// Never reached connection.open: a close frame is not protocol-legal there,
+	// so this stays the raw close (with its own cause record).
+	s.recordConnectionClose(c, ConnectionCloseForcedShutdown)
+	_ = c.Conn.Close()
 }
 
 func (s *Server) shutdown(ctx context.Context) (err error) {
@@ -112,16 +166,24 @@ func (s *Server) shutdown(ctx context.Context) (err error) {
 		if s.MetricsCollector != nil {
 			s.MetricsCollector.RecordShutdownConnectionForced()
 		}
-		if rt, ok := s.runtimes.Load(c); ok && rt.(*connRuntime).handshakeDone.Load() {
+		rt, ok := s.runtimes.Load(c)
+		switch {
+		case !ok:
+			// No runtime: nothing on this socket can speak AMQP (unit tests
+			// build bare connections). Recorded and closed synchronously, so the
+			// cause is visible the moment Shutdown returns.
+			s.recordConnectionClose(c, ConnectionCloseForcedShutdown)
+			_ = c.Conn.Close()
+		case rt.(*connRuntime).handshakeDone.Load():
 			// failConnection records the forced_shutdown cause once (the code
 			// is CONNECTION_FORCED), so this branch must NOT record it again.
 			go s.failConnection(rt.(*connRuntime), amqperrors.ConnectionForced,
 				"CONNECTION_FORCED - broker shutdown", 0, 0)
-		} else {
-			// Still handshaking (or no runtime): just close the socket. There
-			// is no failConnection to record the cause, so record it here.
-			s.recordConnectionClose(c, ConnectionCloseForcedShutdown)
-			_ = c.Conn.Close()
+		default:
+			// Mid-handshake: the peer may already be past connection.open-ok on
+			// the wire while handshakeDone is still unset, so this one gets the
+			// bounded grace before the raw close. See forceConnectionClose.
+			go s.forceConnectionClose(c, rt.(*connRuntime))
 		}
 	}
 
