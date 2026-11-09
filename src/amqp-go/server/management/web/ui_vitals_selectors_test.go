@@ -11,6 +11,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/maxpert/amqp-go/storage"
 	"github.com/stretchr/testify/require"
 )
 
@@ -53,14 +54,29 @@ var (
 // labelDomains is the enumerable label-literal domain for every family the
 // VITALS selectors filter on. Each entry mirrors the Go const block that closes
 // the domain: metrics/management.go (status_class is strconv.Itoa(statusCode)
-// -> "2".."5") and server/recovery_metrics.go (RecoveryOutcome* and
-// ShutdownResult*). Only families with a closed enum are listed; a selector on
-// any other family is checked for the metric name alone.
+// -> "2".."5"), server/recovery_metrics.go (RecoveryOutcome* and
+// ShutdownResult*), and storage/syncpolicy.go (the amqp_wal_full_flush_total
+// site labels, taken from storage.WALFullFlushSites so the pinned set cannot
+// drift from the producer). Only families with a closed enum are listed; a
+// selector on any other family is checked for the metric name alone.
 var labelDomains = map[string]map[string]bool{
 	"amqp_recovery_faults_total":        {"benign": true, "degraded": true, "fatal": true},
 	"amqp_shutdown_total":               {"clean": true, "forced": true, "incomplete": true},
 	"amqp_management_requests_total":    {"2": true, "3": true, "4": true, "5": true},
 	"amqp_management_ui_requests_total": {"2": true, "3": true, "4": true, "5": true},
+	"amqp_wal_full_flush_total":         walFullFlushSiteDomain(),
+}
+
+// walFullFlushSiteDomain builds the site-label domain for
+// amqp_wal_full_flush_total from the producer's own list, so a new site label
+// cannot silently fall outside the gate.
+func walFullFlushSiteDomain() map[string]bool {
+	sites := storage.WALFullFlushSites()
+	dom := make(map[string]bool, len(sites))
+	for _, s := range sites {
+		dom[s] = true
+	}
+	return dom
 }
 
 // parseVitalSelectors extracts and parses every entry of the VITALS table in
@@ -94,9 +110,9 @@ func parseVitalSelectors(t *testing.T, js string) []vitalSelector {
 }
 
 // vitalSelectorProblems returns one problem string per selector whose metric
-// name is absent from the inventory golden, or whose label literal is outside
-// that family's enumerable domain. Domains that are not enumerable are checked
-// for the metric name only.
+// name is absent from the inventory golden, or whose label matcher cannot select
+// a real value of that family's enumerable domain. Domains that are not
+// enumerable are checked for the metric name only.
 func vitalSelectorProblems(sels []vitalSelector, golden map[string]bool, domains map[string]map[string]bool) []string {
 	var probs []string
 	for _, s := range sels {
@@ -114,8 +130,7 @@ func vitalSelectorProblems(sels []vitalSelector, golden map[string]bool, domains
 			continue
 		}
 		if s.op == "=~" || s.op == "!~" {
-			// A regex matcher's value is a pattern over the domain, not a
-			// domain literal; it is checked for the metric name only.
+			probs = append(probs, regexMatcherProblems(s, dom)...)
 			continue
 		}
 		if !dom[s.value] {
@@ -125,6 +140,72 @@ func vitalSelectorProblems(sels []vitalSelector, golden map[string]bool, domains
 		}
 	}
 	return probs
+}
+
+// regexMatcherProblems checks a regex label matcher against a closed domain:
+//
+//	(a) the pattern must compile under Go's RE2 (the same engine the broker
+//	    exposes), so a malformed pattern fails here, not on a dashboard;
+//	(b) a pure "|"-alternation of literals must name only domain values, which
+//	    catches a misspelled site such as "boot_tai";
+//	(c) the matcher must select at least one domain value, and a "!~" must also
+//	    keep at least one, so it cannot silently drop the whole domain (".*").
+func regexMatcherProblems(s vitalSelector, dom map[string]bool) []string {
+	var probs []string
+	re, err := regexp.Compile("^(?:" + s.value + ")$")
+	if err != nil {
+		return append(probs, fmt.Sprintf(
+			"VITALS %q selects %q, but %q is not a valid RE2 pattern: %v",
+			s.id, s.sel, s.value, err))
+	}
+	if lits, ok := alternationLiterals(s.value); ok {
+		for _, lit := range lits {
+			if !dom[lit] {
+				probs = append(probs, fmt.Sprintf(
+					"VITALS %q selects %q, but alternative %q is not a legal %s value (legal: %s)",
+					s.id, s.sel, lit, s.name, strings.Join(sortedKeys(dom), ", ")))
+			}
+		}
+	}
+	matched := 0
+	for v := range dom {
+		if re.MatchString(v) {
+			matched++
+		}
+	}
+	if matched == 0 {
+		probs = append(probs, fmt.Sprintf(
+			"VITALS %q selects %q, but the pattern %q matches no %s value (legal: %s)",
+			s.id, s.sel, s.value, s.name, strings.Join(sortedKeys(dom), ", ")))
+	}
+	if s.op == "!~" && matched == len(dom) {
+		probs = append(probs, fmt.Sprintf(
+			"VITALS %q selects %q, but %q drops the entire %s domain (legal: %s)",
+			s.id, s.sel, s.value, s.name, strings.Join(sortedKeys(dom), ", ")))
+	}
+	return probs
+}
+
+// alternationLiterals reports whether pattern is a pure "|"-separated list of
+// literal strings (no other regex metacharacter) and returns its alternatives.
+func alternationLiterals(pattern string) ([]string, bool) {
+	if pattern == "" {
+		return nil, false
+	}
+	for i := 0; i < len(pattern); i++ {
+		switch pattern[i] {
+		case '|':
+		case '.', '*', '+', '?', '(', ')', '[', ']', '{', '}', '\\', '^', '$':
+			return nil, false
+		}
+	}
+	parts := strings.Split(pattern, "|")
+	for _, p := range parts {
+		if p == "" {
+			return nil, false
+		}
+	}
+	return parts, true
 }
 
 func sortedKeys(m map[string]bool) []string {
@@ -328,6 +409,85 @@ func TestUI_VitalsSelectorsMatchInventory(t *testing.T) {
 	for _, p := range vitalSelectorProblems(sels, golden, labelDomains) {
 		t.Error(p)
 	}
+}
+
+// TestUI_VitalsSelectorProblems_Regex pins the regex half of the static gate: a
+// malformed pattern, a misspelled literal alternative, and a pattern that drops
+// the whole domain must all be reported, while the shipped selector passes.
+func TestUI_VitalsSelectorProblems_Regex(t *testing.T) {
+	const family = "amqp_wal_full_flush_total"
+	golden := map[string]bool{family: true}
+	mk := func(id, op, value string) vitalSelector {
+		return vitalSelector{
+			id:    id,
+			sel:   family + `{site` + op + `"` + value + `"}`,
+			name:  family,
+			label: "site",
+			op:    op,
+			value: value,
+		}
+	}
+	cases := []struct {
+		name    string
+		sel     vitalSelector
+		wantAny []string
+		want    int
+	}{
+		{"malformed pattern", mk("bad", "!~", "boot["), []string{"not a valid RE2 pattern"}, 1},
+		{"misspelled alternative", mk("typo", "!~", "boot_tai|boot_mkdir|close"), []string{"boot_tai"}, 1},
+		{"drops the whole domain", mk("all", "!~", ".*"), []string{"drops the entire"}, 1},
+		{"shipped selector", mk("ok", "!~", "boot_tail|boot_mkdir|close"), nil, 0},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			probs := vitalSelectorProblems([]vitalSelector{tc.sel}, golden, labelDomains)
+			if len(probs) != tc.want {
+				t.Fatalf("problems = %v, want %d", probs, tc.want)
+			}
+			for _, want := range tc.wantAny {
+				if !strings.Contains(strings.Join(probs, "\n"), want) {
+					t.Errorf("problems %v do not mention %q", probs, want)
+				}
+			}
+		})
+	}
+}
+
+// TestUI_VitalsSelectorWalFullFlushExclusion pins the shipped wal_full_flush
+// selector's exclusion set to exactly the three off-traffic-path sites, so a
+// change to the site labels or the pattern cannot silently widen or narrow the
+// alarm. The domain comes from storage.WALFullFlushSites, the producer's list.
+func TestUI_VitalsSelectorWalFullFlushExclusion(t *testing.T) {
+	js := string(readAsset(t, "app.js"))
+	sels := parseVitalSelectors(t, js)
+	var wal *vitalSelector
+	for i := range sels {
+		if sels[i].id == "wal_full_flush" {
+			wal = &sels[i]
+			break
+		}
+	}
+	require.NotNil(t, wal, "app.js VITALS has no wal_full_flush tile")
+	require.Equal(t, "!~", wal.op, "wal_full_flush must exclude sites with an anchored !~ matcher")
+
+	dom := labelDomains["amqp_wal_full_flush_total"]
+	require.NotEmpty(t, dom, "amqp_wal_full_flush_total has no pinned site domain")
+	for _, site := range storage.WALFullFlushSites() {
+		if !dom[site] {
+			t.Errorf("producer site %q is not in the pinned domain", site)
+		}
+	}
+
+	re := regexp.MustCompile("^(?:" + wal.value + ")$")
+	var dropped []string
+	for site := range dom {
+		if re.MatchString(site) {
+			dropped = append(dropped, site)
+		}
+	}
+	sort.Strings(dropped)
+	require.Equal(t, []string{"boot_mkdir", "boot_tail", "close"}, dropped,
+		"the wal_full_flush exclusion must be exactly the off-traffic-path boot/close sites")
 }
 
 // TestUI_VitalsSelectorGateCatchesBadLabel pins the gate itself: the exact bug

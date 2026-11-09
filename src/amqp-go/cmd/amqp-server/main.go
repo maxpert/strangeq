@@ -361,7 +361,7 @@ func main() {
 			Commit:        commit,
 			BuildDate:     date,
 			GoVersion:     runtime.Version(),
-			UIHandler:     web.HandlerWithOptions(web.Options{MetricsURL: metricsURL}),
+			UIHandler:     web.HandlerWithOptions(web.Options{MetricsURL: metricsURL, Durability: cfg.Durability()}),
 			// Same-origin source for the SPA's Metrics screen (spec mgmt-07):
 			// nil when telemetry is disabled, so GET /api/metrics answers 501.
 			MetricsScrape: metricsScrapeFunc(telemetryServer),

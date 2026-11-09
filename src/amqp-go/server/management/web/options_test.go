@@ -136,6 +136,49 @@ func TestHandlerWithOptions_AttributeIsHTMLEscaped(t *testing.T) {
 	}
 }
 
+// TestHandlerWithOptions_InjectsDurabilityMeta proves the crash model reaches
+// the SPA through the same CSP-safe <meta> element, both when it is set together
+// with MetricsURL and when it is the only option (a durability-only option must
+// not be silently dropped by the empty-MetricsURL fast path).
+func TestHandlerWithOptions_InjectsDurabilityMeta(t *testing.T) {
+	cases := []struct {
+		name    string
+		opts    Options
+		wantURL string
+		wantDur string
+	}{
+		{"durability with metrics url", Options{MetricsURL: "http://127.0.0.1:9999/metrics", Durability: "flush"}, "http://127.0.0.1:9999/metrics", "flush"},
+		{"durability alone", Options{Durability: "barrier"}, "", "barrier"},
+		{"none durability alone", Options{Durability: "none"}, "", "none"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			rec := do(HandlerWithOptions(tc.opts), http.MethodGet, "/", nil)
+			body := rec.Body.Bytes()
+			if bytes.Equal(body, readAsset(t, "index.html")) {
+				t.Fatal("a configured handler served the unmodified shell")
+			}
+			matches := sqConfigMetaRe.FindAllSubmatch(body, -1)
+			if len(matches) != 1 {
+				t.Fatalf("expected exactly one sq-config meta, got %d; body=%s", len(matches), body)
+			}
+			var cfg struct {
+				MetricsURL string `json:"metricsUrl"`
+				Durability string `json:"durability"`
+			}
+			if err := json.Unmarshal([]byte(html.UnescapeString(string(matches[0][1]))), &cfg); err != nil {
+				t.Fatalf("meta content is not JSON after entity decoding: %v (%q)", err, matches[0][1])
+			}
+			if cfg.Durability != tc.wantDur {
+				t.Errorf("injected durability = %q, want %q", cfg.Durability, tc.wantDur)
+			}
+			if cfg.MetricsURL != tc.wantURL {
+				t.Errorf("injected metricsUrl = %q, want %q", cfg.MetricsURL, tc.wantURL)
+			}
+		})
+	}
+}
+
 // TestHandlerWithOptions_AssetsUnaffected proves the static assets keep their
 // content-hash ETag and 304 handling when options are set.
 func TestHandlerWithOptions_AssetsUnaffected(t *testing.T) {
