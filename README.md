@@ -301,6 +301,22 @@ Key engine tuning parameters:
 - `walcleanupcheckintervalms` — WAL reclaim sweep interval (code default and shipped sample: 1000 ms)
 - `consumermaxbatchsize` — Max messages to deliver per consumer per poll (default 100)
 
+### Removed configuration keys
+
+Three storage keys were removed in `0.15.0` and are now reported as unknown keys
+at load: `storage.cachemb`, `storage.maxfiles` and `storage.retentionms`. They
+were parsed but read by no engine path, so dropping them changes no behaviour —
+a config that still carries them starts normally and logs one warning per key.
+Remove them to silence the warning.
+
+Separately, the retired engine depth keys — `engine.ringbuffersize`,
+`engine.spillthresholdpercent`, `engine.depthhighwmoverride` and
+`engine.depthhighwm` — are **rejected** at boot rather than ignored, because
+silently dropping them would change the per-queue publisher backpressure depth.
+Replace them with `engine.maxqueuebacklog`; the mapping is
+`ringbuffersize × spillthresholdpercent / 100`. See `CHANGELOG.md` for the full
+`0.15.0` breaking-change list.
+
 ## Performance
 
 Throughput is measured as **end-to-end delivered messages per second (msg/s)**: every published message is delivered and acknowledged, and `lost=0`. Both brokers are driven by the same client ([`cmd/perftest`](src/amqp-go/cmd/perftest), built on [amqp091-go](https://github.com/rabbitmq/amqp091-go)) with identical flags. Shipped release is `v0.13.0`. The `none` and `barrier` StrangeQ columns are from the release benchmark matrix (5 stall-free repetitions per cell, profiling-free harness, zero invalid cells); the `flush` rows are separate full-flush reference measurements — see **Repetitions** below.
