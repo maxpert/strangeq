@@ -23,6 +23,26 @@ import (
 	"golang.org/x/crypto/bcrypt"
 )
 
+// wsbFrameDeadline bounds a single raw-AMQP socket read in these WSB tests.
+//
+// Under a full `-race -count=1 ./...` CI run the broker can legitimately
+// answer later than 2 s (raced scheduling on contended cores), and the old
+// hard 2 s bound turned a healthy run red with a read i/o timeout
+// (TestLease_TransientHWMMixedConnAckSchedule). This is the same arrangement
+// as the browser suite's SQ_BROWSER_DEADLINE: an env override with a wider
+// default, so a stall fails LATER and never weaker.
+//
+// Only positive-wait reads use this bound; expectSilence keeps its own
+// explicit duration, because it exists to assert that nothing arrives.
+var wsbFrameDeadline = func() time.Duration {
+	if v := os.Getenv("SQ_WSB_FRAME_DEADLINE"); v != "" {
+		if d, err := time.ParseDuration(v); err == nil && d > 0 {
+			return d
+		}
+	}
+	return 10 * time.Second
+}()
+
 // startWSBServer builds a real Server with storage in t.TempDir(), Address
 // 127.0.0.1:0, LogLevel "silent". It applies mutate(cfg) before Build and
 // tweak(srv) after, starts it (go srv.Start(); poll srv.IsListening() ≤2s,
@@ -158,7 +178,7 @@ func (r *rawAMQP) sendFrame(f *protocol.Frame) {
 
 func (r *rawAMQP) readFrame() *protocol.Frame {
 	r.t.Helper()
-	require.NoError(r.t, r.c.SetReadDeadline(time.Now().Add(2*time.Second)))
+	require.NoError(r.t, r.c.SetReadDeadline(time.Now().Add(wsbFrameDeadline)))
 	f, err := protocol.ReadFrameOptimizedWithLimit(r.r, 131072+8)
 	require.NoError(r.t, err)
 	return f
@@ -221,7 +241,7 @@ func (r *rawAMQP) expectChannelClose(ch, code uint16) {
 
 func (r *rawAMQP) expectEOF() {
 	r.t.Helper()
-	require.NoError(r.t, r.c.SetReadDeadline(time.Now().Add(2*time.Second)))
+	require.NoError(r.t, r.c.SetReadDeadline(time.Now().Add(wsbFrameDeadline)))
 	_, err := r.r.ReadByte()
 	require.Error(r.t, err, "expected EOF/reset")
 	require.True(r.t,
