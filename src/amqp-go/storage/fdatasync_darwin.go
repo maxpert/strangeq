@@ -109,7 +109,8 @@ func fullFsyncFD(fd uintptr, site string) error {
 	}
 }
 
-// barrierSyncFileSite is barrierSyncFile with a site label for the full-flush
+// barrierSyncFileSite issues the crash_model: barrier confirm primitive with a
+// site label for the full-flush
 // counter: if the device rejects F_BARRIERFSYNC the fallback issues a real
 // F_FULLFSYNC, which is counted under this site.
 func barrierSyncFileSite(f *os.File, site string) error {

@@ -6,10 +6,11 @@ import (
 	"path/filepath"
 )
 
-// atomicWriteFileWithPolicy is atomicWriteFile with an explicit crash-model
-// sync policy: under barrier mode the temp-file fsync and the directory sync
-// use the fence (this is a declare/topology path that CAN fire while the broker
-// is serving traffic), under force_flush the full drive-cache flush. The atomic
+// atomicWriteFileWithPolicy writes data to path atomically with an explicit
+// crash-model sync policy: under barrier mode the temp-file fsync and the
+// directory sync use the fence (this is a declare/topology path that CAN fire
+// while the broker is serving traffic), under force_flush the full drive-cache
+// flush. The atomic
 // temp+rename shape is unchanged.
 func atomicWriteFileWithPolicy(path string, data []byte, perm os.FileMode, pol syncPolicy) error {
 	dir := filepath.Dir(path)

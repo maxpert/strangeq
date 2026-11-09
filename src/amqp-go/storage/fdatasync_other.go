@@ -18,7 +18,8 @@ func fdatasyncFileSite(f *os.File, _ string) error {
 	return f.Sync()
 }
 
-// barrierSyncFileSite is barrierSyncFile; the site is ignored here.
+// barrierSyncFileSite issues the crash_model: barrier confirm primitive; the
+// site is ignored here.
 func barrierSyncFileSite(f *os.File, _ string) error {
 	return f.Sync()
 }
