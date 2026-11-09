@@ -85,3 +85,6 @@ issues.md
 
 # Git worktrees (local only)
 .worktrees/
+
+# OpenCode project-local config (local only)
+.opencode/
