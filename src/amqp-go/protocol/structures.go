@@ -49,10 +49,20 @@ type Connection struct {
 	// already pulled into the buffer. SetReadDeadline stays on the raw Conn —
 	// bufio.Reader delegates the underlying deadline transparently (SQ-1).
 	Reader   io.Reader
-	Channels sync.Map    // map[uint16]*Channel - concurrent-safe map
-	Vhost    string      // Virtual host for this connection
-	Username string      // Authenticated username
-	User     interface{} // Authenticated *interfaces.User (interface{} to avoid import cycle; set once during handshake, immutable thereafter)
+	Channels sync.Map // map[uint16]*Channel - concurrent-safe map
+	Vhost    string   // Virtual host for this connection
+	Username string   // Authenticated username
+	// AuthMechanism is the SASL mechanism that actually AUTHENTICATED this
+	// connection (for example "PLAIN"). It is set ONLY when a mechanism
+	// validated the connection: it stays empty when authentication is disabled
+	// (no SASL verification happens, so reporting the offered mechanism would
+	// imply a validation that never occurred), when the handshake has not
+	// reached start-ok yet, and on every refused attempt. Written under
+	// Server.Mutex next to Username because the connection is published into
+	// Server.Connections before the handshake completes and the management read
+	// path reads it under Server.Mutex.RLock.
+	AuthMechanism string
+	User          interface{} // Authenticated *interfaces.User (interface{} to avoid import cycle; set once during handshake, immutable thereafter)
 	// ClientProperties holds the properties/capabilities the client advertised
 	// in connection.start-ok, captured during the handshake and immutable
 	// thereafter. nil until start-ok is parsed. SQ-12 gates

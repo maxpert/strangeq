@@ -1,6 +1,7 @@
 package management
 
 import (
+	"crypto/tls"
 	"net"
 	"net/http"
 	"runtime"
@@ -81,6 +82,20 @@ type connectionInfo struct {
 	RecvOct        any    `json:"recv_oct"`
 	SendOct        any    `json:"send_oct"`
 	ChannelsDetail any    `json:"channels_detail"`
+	// Secure reports whether the connection's transport is TLS. RabbitMQ's
+	// `secure` flag is derived from the transport, NOT from the SASL mechanism:
+	// a validated PLAIN mechanism over a plaintext socket is not secure. `SSL`
+	// is the legacy alias RabbitMQ also emits; the two are kept equal here.
+	// SASL EXTERNAL (which would make a non-TLS connection secure by
+	// certificate) is a documented divergence: this broker never accepts it, so
+	// no `|| external` term exists — if EXTERNAL is ever accepted, its OR
+	// belongs in this derivation.
+	Secure bool `json:"secure"`
+	SSL    bool `json:"ssl"`
+	// AuthMechanism is the SASL mechanism that authenticated the connection, or
+	// "" when authentication is disabled or the connection has not yet
+	// negotiated (see protocol.Connection.AuthMechanism).
+	AuthMechanism string `json:"auth_mechanism"`
 }
 
 // connectionsSnapshot reads Server.Connections under Server.Mutex.RLock (a
@@ -97,18 +112,26 @@ func (s *Server) connectionsSnapshot() []connectionInfo {
 	out := make([]connectionInfo, 0, len(srv.Connections))
 	for id, conn := range srv.Connections {
 		info := connectionInfo{
-			Name:     id,
-			Node:     s.nodeName,
-			VHost:    conn.Vhost,
-			User:     conn.Username,
-			Protocol: "AMQP 0-9-1",
-			State:    connectionState(conn, alarm),
+			Name:          id,
+			Node:          s.nodeName,
+			VHost:         conn.Vhost,
+			User:          conn.Username,
+			Protocol:      "AMQP 0-9-1",
+			State:         connectionState(conn, alarm),
+			AuthMechanism: conn.AuthMechanism,
 		}
 		conn.Channels.Range(func(_, _ any) bool {
 			info.Channels++
 			return true
 		})
 		if conn.Conn != nil {
+			// The transport decides `secure`: a *tls.Conn is TLS, anything else
+			// (including the non-TCP conns tests inject) is conservatively not.
+			// No ConnectionState() read and no cipher/cert exposure here.
+			if _, ok := conn.Conn.(*tls.Conn); ok {
+				info.Secure = true
+				info.SSL = true
+			}
 			if host, port, err := net.SplitHostPort(conn.Conn.RemoteAddr().String()); err == nil {
 				info.PeerHost = host
 				if p, perr := strconv.Atoi(port); perr == nil {

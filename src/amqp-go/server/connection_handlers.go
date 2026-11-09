@@ -343,6 +343,7 @@ func (s *Server) handleConnectionStartOK(conn *protocol.Connection, payload []by
 		s.Mutex.Lock()
 		conn.Username = user.Username
 		conn.User = user
+		conn.AuthMechanism = mechanism.Name()
 		s.Mutex.Unlock()
 		s.Log.Info("User authenticated successfully",
 			zap.String("connection_id", conn.ID),
@@ -351,6 +352,7 @@ func (s *Server) handleConnectionStartOK(conn *protocol.Connection, payload []by
 	} else {
 		s.Mutex.Lock()
 		conn.Username = "authenticated"
+		conn.AuthMechanism = mechanism.Name()
 		s.Mutex.Unlock()
 		s.Log.Info("Authentication successful",
 			zap.String("connection_id", conn.ID),
