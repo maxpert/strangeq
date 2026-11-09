@@ -3,7 +3,6 @@ package management
 import (
 	"encoding/json"
 	"os"
-	"strings"
 	"sync"
 
 	"github.com/maxpert/amqp-go/interfaces"
@@ -185,5 +184,3 @@ func (u *userSource) names() map[string]struct{} {
 	}
 	return out
 }
-
-var _ = strings.TrimSpace

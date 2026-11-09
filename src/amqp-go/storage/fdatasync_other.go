@@ -18,13 +18,6 @@ func fdatasyncFileSite(f *os.File, _ string) error {
 	return f.Sync()
 }
 
-// barrierSyncFile mirrors fdatasyncFile on the platforms that are neither Linux
-// nor macOS: os.File.Sync. There is no cheaper ordered primitive here, so
-// crash_model has no effect on these platforms.
-func barrierSyncFile(f *os.File) error {
-	return f.Sync()
-}
-
 // barrierSyncFileSite is barrierSyncFile; the site is ignored here.
 func barrierSyncFileSite(f *os.File, _ string) error {
 	return f.Sync()

@@ -50,13 +50,6 @@ func (w *responseRecorder) statusCode() int {
 	return w.status
 }
 
-// ensureHeader lets a handler set a header before the status is written.
-func (w *responseRecorder) ensureHeader(k, v string) {
-	if !w.written {
-		w.Header().Set(k, v)
-	}
-}
-
 // serveHTTP is the single entry point: routing, authentication, the two gates,
 // CSRF, metrics, and panic isolation all live here.
 func (s *Server) serveHTTP(w http.ResponseWriter, r *http.Request) {
@@ -470,9 +463,6 @@ func (s *Server) writeAPIError(w http.ResponseWriter, r *http.Request, e *apiErr
 		_, _ = w.Write(body)
 	}
 }
-
-// etag for a body already encoded.
-func etagBody(body []byte) string { return etagFor(body) }
 
 // readBodyLimited reads the request body up to limit bytes, returning 413 when
 // it is exceeded (SEC-065).

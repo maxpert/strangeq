@@ -5,7 +5,6 @@ import (
 	"net/http"
 	"runtime"
 	"strconv"
-	"strings"
 	"time"
 
 	"github.com/maxpert/amqp-go/broker"
@@ -369,9 +368,3 @@ func (s *Server) goVersion() string {
 // managementAPIVersion is the management-surface version advertised in the
 // overview (RabbitMQ-management-compatible product generation).
 const managementAPIVersion = "0.4.0"
-
-func isVHostAccepted(vhost string) bool {
-	return vhost == "/" || vhost == "%2F" || vhost == "%2f"
-}
-
-var _ = strings.TrimSpace

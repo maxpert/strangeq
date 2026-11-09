@@ -22,16 +22,6 @@ func fdatasyncFileSite(f *os.File, _ string) error {
 	return fdatasyncFile(f)
 }
 
-// barrierSyncFile is the crash_model: barrier confirm primitive on Linux. Linux
-// has no cheaper ordered primitive than fdatasync(2): on a volatile-cache
-// device fdatasync already flushes the drive cache itself, so F_BARRIERFSYNC's
-// "fsync plus an ordering barrier WITHOUT the cache flush" has no Linux
-// analogue. The fence therefore IS fdatasyncFile, and crash_model has NO
-// effect on Linux.
-func barrierSyncFile(f *os.File) error {
-	return fdatasyncFile(f)
-}
-
 // barrierSyncFileSite is barrierSyncFile; the site is ignored on Linux.
 func barrierSyncFileSite(f *os.File, _ string) error {
 	return fdatasyncFile(f)

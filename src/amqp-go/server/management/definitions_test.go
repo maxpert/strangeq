@@ -36,7 +36,6 @@ type definitionsImportRequest struct {
 // --- result helpers ---------------------------------------------------------
 
 func appliedNames(res defsImportResponse) []string { return resultNames(res.Applied) }
-func skippedNames(res defsImportResponse) []string { return resultNames(res.Skipped) }
 func failedNames(res defsImportResponse) []string  { return resultNames(res.Failed) }
 
 func resultNames(items []defsResult) []string {
