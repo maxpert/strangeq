@@ -136,9 +136,9 @@ func TestHotCacheQueueAdmissionIsQueueLocal(t *testing.T) {
 			t.Fatalf("globalUsed = %d, want %d: the global budget was not exceeded, "+
 				"so no cross-queue eviction was warranted", cache.globalUsed, 3*charge)
 		}
-		if cache.queueUsed["qa"] != 2*charge || cache.queueUsed["qb"] != charge {
+		if cache.residentBytes("qa") != 2*charge || cache.residentBytes("qb") != charge {
 			t.Fatalf("per-queue accounting = qa %d qb %d, want %d/%d",
-				cache.queueUsed["qa"], cache.queueUsed["qb"], 2*charge, charge)
+				cache.residentBytes("qa"), cache.residentBytes("qb"), 2*charge, charge)
 		}
 	})
 }
@@ -168,9 +168,9 @@ func TestHotCacheEntryIdentityIsOwnedByEntry(t *testing.T) {
 			t.Fatalf("Count(q) = %d after deleting by the admitted tag, want 0 "+
 				"(the entry stayed in the queue map under its original key)", got)
 		}
-		if cache.queueUsed["q"] != 0 || cache.globalUsed != 0 {
+		if cache.residentBytes("q") != 0 || cache.globalUsed != 0 {
 			t.Fatalf("byte accounting after delete = queue %d global %d, want 0/0",
-				cache.queueUsed["q"], cache.globalUsed)
+				cache.residentBytes("q"), cache.globalUsed)
 		}
 
 		// The byte accounting really returned to zero: the budget binds again
@@ -454,7 +454,7 @@ func TestHotCacheMutatedRePutDoesNotDuplicateEntry(t *testing.T) {
 		t.Fatalf("Count(%q) = %d after a mutated re-Put, want 1: the same message "+
 			"was admitted twice, so the queue's ready set is double-counted", queue, got)
 	}
-	if got := cache.queueUsed[queue]; got != charge {
+	if got := cache.residentBytes(queue); got != charge {
 		t.Fatalf("per-queue byte accounting = %d, want %d: the same message was "+
 			"charged twice", got, charge)
 	}

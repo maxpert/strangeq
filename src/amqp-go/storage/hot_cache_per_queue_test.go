@@ -29,12 +29,12 @@ func perQueueTestMessage(tag uint64) *protocol.Message {
 // The global counter is the sum of every queue's resident bytes, so a leak
 // or a double count shows up here as a mismatch.
 //
-// It reads the mirror map without its lock, so it may only be called when no
-// other goroutine is running.
+// It reads the mirror without any cache-wide lock, so it may only be called
+// when no other goroutine is running.
 func hotCacheAssertMirrorConsistent(t *testing.T, cache *hotCache) {
 	t.Helper()
 	var sum int64
-	for _, used := range cache.queueUsed {
+	for _, used := range hotCacheMirror(cache) {
 		sum += used
 	}
 	if got := atomic.LoadInt64(&cache.globalUsed); got != sum {
@@ -228,7 +228,7 @@ func TestHotCacheGlobalBudgetIsNeverExceeded(t *testing.T) {
 	if got := atomic.LoadInt64(&cache.globalUsed); got != 0 {
 		t.Fatalf("the global byte accounting = %d after everything was removed, want 0", got)
 	}
-	remaining := len(cache.queueUsed)
+	remaining := len(hotCacheMirror(cache))
 	if remaining != 0 {
 		t.Fatalf("the mirror still holds %d queues after everything was removed", remaining)
 	}
@@ -339,7 +339,7 @@ func TestHotCacheAccountingIsExactAfterTheCacheIsEmptied(t *testing.T) {
 	if got := atomic.LoadInt64(&cache.globalUsed); got != 0 {
 		t.Fatalf("the global byte accounting = %d after the cache was emptied, want 0", got)
 	}
-	remaining := len(cache.queueUsed)
+	remaining := len(hotCacheMirror(cache))
 	if remaining != 0 {
 		t.Fatalf("the mirror still holds %d queues after the cache was emptied", remaining)
 	}
