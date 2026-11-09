@@ -1331,12 +1331,8 @@
   /* rowCloseButton is the S2 per-row close control; it is disabled, with a
    * tooltip, when the broker reports the capability is unsupported or unknown. */
   function rowCloseButton(conn) {
-    var btn = h("button", { type: "button", class: "danger row-action", text: "Close" });
-    var st = closeConnectionState();
-    if (st !== "on") {
-      btn.disabled = true;
-      btn.title = closeConnectionDisabledReason(st);
-    }
+    var btn = h("button", { type: "button", class: "danger row-action", dataset: { cap: "close_connection" }, text: "Close" });
+    applyCapabilityGate(btn);
     btn.addEventListener("click", function (ev) {
       ev.stopPropagation();
       if (btn.disabled) return;
@@ -1361,12 +1357,8 @@
 
   function buildConnectionDetail(conn, route) {
     var name = String(conn.name);
-    var closeBtn = h("button", { type: "button", id: "close-connection-btn", class: "danger", text: "Close" });
-    var closeState = closeConnectionState();
-    if (closeState !== "on") {
-      closeBtn.disabled = true;
-      closeBtn.title = closeConnectionDisabledReason(closeState);
-    }
+    var closeBtn = h("button", { type: "button", id: "close-connection-btn", class: "danger", dataset: { cap: "close_connection" }, text: "Close" });
+    applyCapabilityGate(closeBtn);
     closeBtn.addEventListener("click", function () {
       if (closeBtn.disabled) return;
       openCloseConnection(conn);
@@ -1597,12 +1589,8 @@
 
   function buildBindings(data, route, vhost) {
     var items = itemsOf(data);
-    var createBtn = h("button", { type: "button", id: "create-binding-btn", text: "Create binding" });
-    var st = bindingsWriteState();
-    if (st !== "on") {
-      createBtn.disabled = true;
-      createBtn.title = bindingsDisabledReason(st);
-    }
+    var createBtn = h("button", { type: "button", id: "create-binding-btn", dataset: { cap: "bindings" }, text: "Create binding" });
+    applyCapabilityGate(createBtn);
     createBtn.addEventListener("click", function () { if (!createBtn.disabled) openCreateBinding(route, vhost, null); });
     return h("div", { class: "screen screen-bindings" }, [
       h("div", { class: "page-head" }, [h("h1", { text: "Bindings" }), h("span", { class: "spacer" }), createBtn]),
@@ -3175,14 +3163,59 @@
     return loadVersion();
   }
 
+  /* CAPABILITY_GATES maps a capability-gated control's data-cap attribute to
+   * its three-state gate and the text explaining why the control is disabled. */
+  var CAPABILITY_GATES = {
+    bindings: { state: bindingsWriteState, reason: bindingsDisabledReason },
+    close_connection: { state: closeConnectionState, reason: closeConnectionDisabledReason }
+  };
+
+  /* applyCapabilityGate sets one already-built control's enabled/disabled state
+   * (and its disabled tooltip) from the current capability map. It is the single
+   * code path used both when a control is built and when capabilities arrive
+   * later. */
+  function applyCapabilityGate(btn) {
+    if (!btn) return;
+    var gate = CAPABILITY_GATES[btn.dataset.cap];
+    if (!gate) return;
+    var st = gate.state();
+    if (st === "on") { btn.disabled = false; btn.removeAttribute("title"); }
+    else { btn.disabled = true; btn.title = gate.reason(st); }
+  }
+
+  /* refreshCapabilityControls re-applies the capability gates to the controls
+   * that are already rendered. boot() renders the screen before loadVersion()
+   * settles, so a gated control can be painted disabled while its capability is
+   * still unknown, and a refresh tick does NOT recover it (loadList() skips the
+   * rebuild on a 304). This is deliberately a targeted re-render of only the
+   * gated controls: a full render() would re-run the screen's data load, which
+   * double-scrapes /metrics and resets its rate samples, and would discard any
+   * in-progress input. */
+  function refreshCapabilityControls() {
+    Array.prototype.forEach.call(document.querySelectorAll("[data-cap]"), applyCapabilityGate);
+  }
+
+  /* capabilitiesEqual compares two capability maps so a re-fetch that reports
+   * the same set does not re-apply the gates (no needless DOM churn). */
+  function capabilitiesEqual(a, b) {
+    return JSON.stringify(a || {}) === JSON.stringify(b || {});
+  }
+
   function loadVersion() {
     return api(API + "/strangeq/version").then(function (r) {
       if (r.status < 400 && r.data) {
+        var before = state.capabilities;
         state.version = r.data;
         state.capabilities = r.data.capabilities || {};
         state.capabilitiesLoaded = true;
         var el = document.getElementById("app-version");
         if (el) el.textContent = r.data.version || "";
+        /* Deliver late-arriving (or changed) capabilities to the already-rendered
+         * UI: the first paint happened while the capability map was still empty,
+         * so any gated control is currently disabled. */
+        if (state.authed && !capabilitiesEqual(before, state.capabilities)) {
+          refreshCapabilityControls();
+        }
       }
     }).catch(function () { state.capabilitiesLoaded = false; /* version is best-effort */ });
   }
@@ -3265,6 +3298,7 @@
     api: api,
     esc: esc,
     refreshNow: refreshNow,
+    refreshCapabilities: loadVersion,
     navigate: navigate,
     render: render,
     parseProm: parseProm,
