@@ -35,7 +35,6 @@ type QueueState struct {
 
 	tail                   atomic.Uint64
 	head                   atomic.Uint64
-	minAckCursor           atomic.Uint64
 	waiting                atomic.Int64
 	inflight               atomic.Int64
 	wake                   chan struct{}
@@ -167,8 +166,8 @@ func (qs *QueueState) SetMaxQueueBacklog(wm uint64) {
 // (the broker's getOrCreateQueueState cold path does this under its creation
 // mutex, before the QueueState is published to other goroutines).
 //
-// CRITICAL: this also seeds tail, head, and minAckCursor to ordinalBase. These
-// atomic.Uint64 cursors zero-value to 0, but this queue's tags all live at
+// CRITICAL: this also seeds tail and head to ordinalBase. These atomic.Uint64
+// cursors zero-value to 0, but this queue's tags all live at
 // ordinal<<OrdinalShift and up — if the cursors were left at 0, Claim would
 // see tail=0 < head=ordinalBase+1 and gap-crawl the ENTIRE unused tag range
 // below this queue's ordinal (up to ~8.8e13 tags for a mid-range ordinal)
@@ -180,7 +179,6 @@ func (qs *QueueState) SetOrdinal(ordinal uint64) {
 	qs.ordinalBase = PackTag(ordinal, 0)
 	qs.tail.Store(qs.ordinalBase)
 	qs.head.Store(qs.ordinalBase)
-	qs.minAckCursor.Store(qs.ordinalBase)
 }
 
 // Ordinal returns this queue's composite-tag ordinal (broker/tag_packing.go),
@@ -665,9 +663,7 @@ func (qs *QueueState) ClaimInflight(tag uint64) {
 // Like Claim it does NOT touch `waiting` or `inflight`: the caller inspects the
 // tag first, then either GapSkipAdvance()s a gap tag (a tag never stored / already
 // acked, which was never counted as ready) or completes the eviction of a real
-// message via ClaimInflight()+AckAdvance(). Going through inflight for real
-// evictions keeps AckAdvance from mis-jumping minAckCursor while live deliveries
-// are outstanding (a concurrent real ack keeps `remaining` non-zero).
+// message via ClaimInflight()+AckAdvance().
 func (qs *QueueState) PopOldestReady() (uint64, bool) {
 	if t, _, ok := qs.tryPopRequeue(); ok {
 		return t, true
@@ -702,12 +698,6 @@ func (qs *QueueState) AckAdvance(tag uint64) {
 				break
 			}
 		}
-		remaining = 0
-	}
-	if remaining == 0 && qs.requeueCount.Load() <= 0 {
-		qs.minAckCursor.Store(qs.head.Load())
-	} else if tag == qs.minAckCursor.Load() {
-		qs.minAckCursor.CompareAndSwap(tag, tag+1)
 	}
 	qs.NotifyNewMessage()
 }
@@ -717,9 +707,7 @@ func (qs *QueueState) AckAdvance(tag uint64) {
 // never touches the inflight counter (a reaped message was never delivered) and
 // is invoked ONLY by the winner of the ring Delete (deleteIfPresent==true), so
 // across {reaper drop, consumer head-check} at most one caller decrements depth
-// per tag. minAckCursor is intentionally left to the storage-synced ack path;
-// it is not read for any depth/backpressure decision (Depth uses waiting +
-// inflight). waiting is clamped at zero defensively.
+// per tag. waiting is clamped at zero defensively.
 func (qs *QueueState) ReapDrop() {
 	if qs.waiting.Add(-1) < 0 {
 		for {
@@ -752,11 +740,6 @@ func (qs *QueueState) LastActivityMilli() int64 {
 }
 
 func (qs *QueueState) GapSkipAdvance(tag uint64) {
-	if qs.inflight.Load() == 0 && qs.requeueCount.Load() <= 0 {
-		qs.minAckCursor.Store(qs.head.Load())
-	} else if tag == qs.minAckCursor.Load() {
-		qs.minAckCursor.CompareAndSwap(tag, tag+1)
-	}
 	qs.NotifyNewMessage()
 }
 
@@ -765,7 +748,6 @@ func (qs *QueueState) Recover(minTag, maxTag, count uint64) {
 	if maxTag < minTag {
 		maxTag = minTag
 	}
-	qs.minAckCursor.Store(minTag)
 	qs.inflight.Store(0)
 	// Store `waiting` BEFORE `head`: head is the visibility gate the SQ-9 reaper
 	// scans against (it walks tail→head), so publishing the recovered depth first
@@ -865,18 +847,6 @@ func (qs *QueueState) AtHighWaterMark() bool {
 		return false
 	}
 	return qs.Depth() >= wm
-}
-
-func (qs *QueueState) SetMinAckCursor(val uint64) {
-	for {
-		cur := qs.minAckCursor.Load()
-		if val <= cur {
-			return
-		}
-		if qs.minAckCursor.CompareAndSwap(cur, val) {
-			return
-		}
-	}
 }
 
 func (qs *QueueState) Close() {

@@ -489,7 +489,6 @@ func BenchmarkPublishConsumeAck_Roundtrip(b *testing.B) {
 		broker.storage.DeliverToConsumer("bench-rt", "bench-rt-consumer", tag)
 		broker.storage.DeleteMessage("bench-rt", tag)
 		broker.storage.AckFromConsumer("bench-rt", "bench-rt-consumer", tag)
-		qs.SetMinAckCursor(broker.storage.GetMinAckCursor("bench-rt"))
 		qs.AckAdvance(tag)
 	}
 }

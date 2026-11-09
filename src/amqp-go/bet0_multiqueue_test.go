@@ -1386,11 +1386,11 @@ func bet0ServerWithConfig(t *testing.T, dir string, tweak func(*config.AMQPConfi
 //
 // If the dispatch tag carries a per-queue component in its high bits, a queue's
 // tags no longer start near zero — queue number N mints its first tag at some
-// base far above 0. QueueState.tail/head/minAckCursor are atomic.Uint64 whose
+// base far above 0. QueueState.tail/head are atomic.Uint64 whose
 // zero value is 0, so if the fresh-queue path leaves them at 0 while head is set
 // from the first minted tag, Claim's one-integer-at-a-time walk has to cross the
 // entire base before it can deliver anything — a hang strictly worse than the P0
-// this loop is fixing. (Recovery sets all three cursors from recovered tags, so
+// this loop is fixing. (Recovery sets both cursors from recovered tags, so
 // it is the FRESH queue path that is exposed.)
 //
 // Several queues are declared in sequence on one broker so that they take

@@ -32,10 +32,9 @@ func TestQueueStateLayoutUnchanged(t *testing.T) {
 		{"nextSeq", unsafe.Offsetof(qs.nextSeq), 8},
 		{"tail", unsafe.Offsetof(qs.tail), 16},
 		{"head", unsafe.Offsetof(qs.head), 24},
-		{"minAckCursor", unsafe.Offsetof(qs.minAckCursor), 32},
-		{"waiting", unsafe.Offsetof(qs.waiting), 40},
-		{"inflight", unsafe.Offsetof(qs.inflight), 48},
-		{"closed", unsafe.Offsetof(qs.closed), 144},
+		{"waiting", unsafe.Offsetof(qs.waiting), 32},
+		{"inflight", unsafe.Offsetof(qs.inflight), 40},
+		{"closed", unsafe.Offsetof(qs.closed), 136},
 	} {
 		if tc.got != tc.want {
 			t.Errorf("QueueState.%s offset = %d, want %d — a field was inserted or reordered "+
@@ -52,7 +51,12 @@ func TestQueueStateLayoutUnchanged(t *testing.T) {
 	// pinned hot-field offset above unchanged and only grows the size again
 	// (288 → 296). Neither append reordered a hot field; the offset pins above
 	// are therefore still the load-bearing assertion, and only the size moved.
-	const wantSize = 296
+	//
+	// The hot-path work stream REMOVED the dead minAckCursor field (nothing
+	// read it: Depth() is waiting+inflight). That shifts every field after it
+	// down by one uint64 — waiting 40 → 32, inflight 48 → 40, closed 144 → 136
+	// — and shrinks the struct 296 → 288. Re-derived here.
+	const wantSize = 288
 	if got := unsafe.Sizeof(qs); got != wantSize {
 		t.Errorf("unsafe.Sizeof(QueueState) = %d, want %d — the Task 2 maxBacklogSeen "+
 			"field is appended at the END of the struct; hot-field offsets are unchanged, "+

@@ -1087,9 +1087,9 @@ func (b *StorageBroker) createQueueStateLocked(queueName string) *QueueState {
 	}
 
 	// Create new queue state with a backpressure high-water mark derived from
-	// the ring-buffer spill threshold. The depth gate (head - minAckCursor)
+	// the configured per-queue backlog. The depth gate (waiting + inflight)
 	// coordinates broker-level publisher backpressure with storage-level
-	// spilling: once unacked depth reaches the spill threshold, publishers
+	// spilling: once unacked depth reaches the high-water mark, publishers
 	// block in WaitForCapacity until consumers ack and drain.
 	//
 	// The record read above is handed straight to resolveQueueOrdinal: it is
@@ -1134,7 +1134,7 @@ func (b *StorageBroker) GetQueuePolicy(queueName string) *QueuePolicy {
 // computeMaxQueueBacklog returns the per-queue publisher backpressure depth
 // high-water mark in messages: that is the configured EngineConfig.MaxQueueBacklog,
 // or interfaces.DefaultMaxQueueBacklog (52428) when it is unset (0). This depth
-// (head - minAckCursor) is where publishers block or spill; it is a secondary
+// (waiting + inflight) is where publishers block or spill; it is a secondary
 // gate -- the hot-cache BYTE budget usually binds first (see publisherGate).
 func (b *StorageBroker) computeMaxQueueBacklog() uint64 {
 	if b.engineConfig.MaxQueueBacklog > 0 {
@@ -1424,25 +1424,21 @@ func (b *StorageBroker) dropExpiredOnGet(qs *QueueState, queueName string, msg *
 
 // ackDelivered performs the storage and queue bookkeeping to acknowledge a
 // single already-delivered message: delete it from storage, clear any pending
-// ack, notify the ack cursor, sync the min-ack cursor for ring-overwrite safety
-// and backpressure, and advance the queue depth frontier (inflight−1). The
-// caller is responsible for the deliveryIndex LoadAndDelete guard and for
-// releasing the prefetch gate (no-ack deliveries hold no gate credit). Shared
-// by the manual single-message ack path and the no-ack implicit-ack path so the
-// two stay in lockstep.
+// ack, notify the ack cursor, and advance the queue depth frontier
+// (inflight−1). The caller is responsible for the deliveryIndex LoadAndDelete
+// guard and for releasing the prefetch gate (no-ack deliveries hold no gate
+// credit). Shared by the manual single-message ack path and the no-ack
+// implicit-ack path so the two stay in lockstep.
 func (b *StorageBroker) ackDelivered(queueState *QueueState, queueName, consumerID string, deliveryTag uint64) {
 	b.finishAck(queueState, queueName, consumerID, deliveryTag)
-	queueState.SetMinAckCursor(b.storage.GetMinAckCursor(queueName))
 }
 
 // finishAck performs the per-tag storage and queue bookkeeping to positively
 // acknowledge one already-settled delivery: delete the message, clear its
 // pending ack, notify the AckCursor, and advance the queue depth frontier. It
 // does NOT release the prefetch gate (the
-// settle() winner already did) and does NOT sync the min-ack cursor — callers
-// sync it once (per-ack for single ack via ackDelivered, once-after-the-loop for
-// multi-ack) to keep the O(consumers) recompute off the per-tag path. The tag
-// must already have been claimed via settle().
+// settle() winner already did). The tag must already have been claimed via
+// settle().
 func (b *StorageBroker) finishAck(queueState *QueueState, queueName, consumerID string, deliveryTag uint64) {
 	b.storage.DeleteMessage(queueName, deliveryTag)
 	b.storage.DeletePendingAck(queueName, deliveryTag)
@@ -1455,9 +1451,8 @@ func (b *StorageBroker) finishAck(queueState *QueueState, queueName, consumerID 
 // basic.recover requeue-all share it): remove it from the AckCursor unacked
 // set, clear its pending ack, then either
 // requeue it for redelivery or discard it and advance the depth frontier. Like
-// finishAck it does NOT release the prefetch gate (settle() owns that) and does
-// NOT sync the min-ack cursor. The tag must already have been claimed via
-// settle().
+// finishAck it does NOT release the prefetch gate (settle() owns that). The tag
+// must already have been claimed via settle().
 func (b *StorageBroker) finishNack(queueState *QueueState, queueName, consumerID string, deliveryTag uint64, requeue bool) {
 	b.storage.NackFromConsumer(queueName, consumerID, deliveryTag)
 	b.storage.DeletePendingAck(queueName, deliveryTag)
@@ -2872,10 +2867,8 @@ drainComplete:
 	}
 
 	// 8. Unregister from AckCursor — safe now: all in-flight messages have
-	//    been requeued, so minAckCursor recomputation won't skip them. If
-	//    this were done before the requeue, minAckCursor would jump forward
-	//    past the consumer's unacked tags, making the queue appear emptier
-	//    than it actually is and potentially failing to apply backpressure.
+	//    been requeued, so the consumer's unacked set is empty and removing the
+	//    entry cannot strand a tag.
 	b.storage.UnregisterConsumerCursor(state.queueName, consumerID)
 
 	mu := b.getQueueConsumersMutex(state.queueName)
@@ -4620,7 +4613,6 @@ func (b *StorageBroker) AcknowledgeMessage(consumerID string, deliveryTag uint64
 			}
 			b.finishAck(queueState, state.queueName, consumerID, tag)
 		}
-		queueState.SetMinAckCursor(b.storage.GetMinAckCursor(state.queueName))
 	} else {
 		// Acknowledge single message. Settle funnels the LoadAndDelete guard
 		// (against duplicate ACK or concurrent UnregisterConsumer cleanup) and
@@ -4629,9 +4621,8 @@ func (b *StorageBroker) AcknowledgeMessage(consumerID string, deliveryTag uint64
 		if _, won := b.settle(deliveryTag); !won {
 			return nil
 		}
-		// Delete the message, clear its pending ack, notify the AckCursor,
-		// sync the min-ack cursor for backpressure, and advance the depth
-		// frontier (may jump minAckCursor to head if the queue drained).
+		// Delete the message, clear its pending ack, notify the AckCursor, and
+		// advance the depth frontier.
 		b.ackDelivered(queueState, state.queueName, state.consumer.ID, deliveryTag)
 	}
 
@@ -4698,7 +4689,6 @@ func (b *StorageBroker) NacknowledgeMessage(consumerID string, deliveryTag uint6
 			// goroutine (a real latency cliff). One Policy() load is hoisted.
 			b.discardNackedBatch(queueState, state.queueName, consumerID, tags, deliveryTag)
 		}
-		queueState.SetMinAckCursor(b.storage.GetMinAckCursor(state.queueName))
 	} else {
 		// Nacknowledge single message. Settle funnels the LoadAndDelete guard
 		// (against duplicate nack or concurrent UnregisterConsumer cleanup) and
@@ -4991,7 +4981,6 @@ func (b *StorageBroker) purgeIncarnation(name string, qs *QueueState) (int, erro
 			purged++
 		}
 	}
-	qs.SetMinAckCursor(b.storage.GetMinAckCursor(name))
 	qs.WakeAll()
 	return purged, nil
 }
@@ -5051,7 +5040,6 @@ func (b *StorageBroker) AcknowledgeGetDelivery(deliveryTag uint64) error {
 	b.storage.DeleteMessage(queueName, deliveryTag)
 	b.storage.DeletePendingAck(queueName, deliveryTag)
 	queueState.AckAdvance(deliveryTag)
-	queueState.SetMinAckCursor(b.storage.GetMinAckCursor(queueName))
 
 	return nil
 }
@@ -5121,8 +5109,6 @@ func (b *StorageBroker) RequeueAllForConsumer(consumerID string) error {
 		}
 		b.finishNack(queueState, state.queueName, consumerID, tag, true)
 	}
-
-	queueState.SetMinAckCursor(b.storage.GetMinAckCursor(state.queueName))
 
 	return nil
 }

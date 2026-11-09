@@ -44,7 +44,6 @@ func TestA1Integration_PublishConsumeAck(t *testing.T) {
 			broker.storage.DeliverToConsumer("test-ack", "test-consumer", tag)
 			broker.storage.DeleteMessage("test-ack", tag)
 			broker.storage.AckFromConsumer("test-ack", "test-consumer", tag)
-			queueState.SetMinAckCursor(broker.storage.GetMinAckCursor("test-ack"))
 			queueState.AckAdvance(tag)
 			break
 		}
@@ -199,7 +198,6 @@ func TestA1Integration_BackpressureBlocksPublisher(t *testing.T) {
 	broker.storage.DeliverToConsumer("test-bp", "bp-consumer", tag3)
 
 	broker.storage.AckFromConsumer("test-bp", "bp-consumer", tag1)
-	qs.SetMinAckCursor(broker.storage.GetMinAckCursor("test-bp"))
 	qs.AckAdvance(tag1)
 
 	select {

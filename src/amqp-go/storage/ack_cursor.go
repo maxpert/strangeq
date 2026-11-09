@@ -5,25 +5,38 @@ import (
 	"sync/atomic"
 )
 
-const noLowest = ^uint64(0)
-
+// consumerAckState is one consumer's unacked delivery-tag set. The set is the
+// only state the ack machinery needs: multi-ack (basic.ack multiple=true),
+// basic.nack, and consumer-cancel requeue-all all enumerate it through
+// GetUnackedTags, and the prefetch gate reads its size through GetUnackedCount.
 type consumerAckState struct {
-	unacked       sync.Map // tag -> struct{}
-	lowestUnacked atomic.Uint64
+	unacked sync.Map // tag -> struct{}
 }
 
+// AckCursor tracks the delivery tags a queue has published and the per-consumer
+// sets of tags that have been delivered but not yet settled.
+//
+// It deliberately keeps NO running "minimum unacked tag" cursor. That cursor
+// (a lowestUnacked atomic per consumer plus a dirty-flag-triggered O(consumers)
+// recompute) was maintained on every deliver and every ack and then read by the
+// broker's ack path — but nothing ever consumed the value for a decision:
+//
+//   - the storage cursor was only mirrored into QueueState.minAckCursor, which
+//     is written but never read (Depth() is waiting+inflight; see
+//     QueueState.ReapDrop's doc in broker/queue_dispatch.go);
+//   - the per-consumer scan it required (a full sync.Map.Range over the
+//     consumer's unacked set on every in-order ack) was 83% of a CPU profile of
+//     the ack path.
+//
+// The value is now computed ON DEMAND by MinAckCursor (see its doc); nothing on
+// the deliver/ack path calls it.
 type AckCursor struct {
-	minAckCursor atomic.Uint64
-	head         atomic.Uint64
-	consumers    sync.Map // consumerTag -> *consumerAckState
-	dirty        atomic.Bool
+	head      atomic.Uint64
+	consumers sync.Map // consumerTag -> *consumerAckState
 }
 
 func NewAckCursor() *AckCursor {
-	ac := &AckCursor{}
-	ac.minAckCursor.Store(0)
-	ac.head.Store(0)
-	return ac
+	return &AckCursor{}
 }
 
 func (ac *AckCursor) OnPublish(tag uint64) {
@@ -33,19 +46,15 @@ func (ac *AckCursor) OnPublish(tag uint64) {
 }
 
 func (ac *AckCursor) OnDeliver(tag uint64, consumerTag string) {
-	v, _ := ac.consumers.LoadOrStore(consumerTag, newConsumerAckState())
-	c := v.(*consumerAckState)
-	c.unacked.Store(tag, struct{}{})
-	for {
-		cur := c.lowestUnacked.Load()
-		if cur != noLowest && tag >= cur {
-			break
-		}
-		if c.lowestUnacked.CompareAndSwap(cur, tag) {
-			break
-		}
+	v, ok := ac.consumers.Load(consumerTag)
+	if !ok {
+		// Slow path only: a delivery to a consumer that was never registered
+		// (the broker always registers first). LoadOrStore must NOT be on the
+		// fast path: it evaluates newConsumerAckState() unconditionally, which
+		// allocated a throwaway state on EVERY delivery.
+		v, _ = ac.consumers.LoadOrStore(consumerTag, &consumerAckState{})
 	}
-	ac.dirty.Store(true)
+	v.(*consumerAckState).unacked.Store(tag, struct{}{})
 }
 
 func (ac *AckCursor) OnAck(tag uint64, consumerTag string) bool {
@@ -53,15 +62,8 @@ func (ac *AckCursor) OnAck(tag uint64, consumerTag string) bool {
 	if !ok {
 		return false
 	}
-	c := v.(*consumerAckState)
-	if _, ok := c.unacked.LoadAndDelete(tag); !ok {
-		return false
-	}
-	if c.lowestUnacked.Load() == tag {
-		c.lowestUnacked.Store(scanLowest(&c.unacked))
-	}
-	ac.dirty.Store(true)
-	return true
+	_, ok = v.(*consumerAckState).unacked.LoadAndDelete(tag)
+	return ok
 }
 
 func (ac *AckCursor) OnNack(tag uint64, consumerTag string) bool {
@@ -69,34 +71,38 @@ func (ac *AckCursor) OnNack(tag uint64, consumerTag string) bool {
 }
 
 func (ac *AckCursor) OnConsumerRegister(consumerTag string) {
-	ac.consumers.LoadOrStore(consumerTag, newConsumerAckState())
-	ac.dirty.Store(true)
-}
-
-func newConsumerAckState() *consumerAckState {
-	c := &consumerAckState{}
-	c.lowestUnacked.Store(noLowest)
-	return c
+	ac.consumers.LoadOrStore(consumerTag, &consumerAckState{})
 }
 
 func (ac *AckCursor) OnConsumerUnregister(consumerTag string) {
 	ac.consumers.Delete(consumerTag)
-	ac.dirty.Store(true)
 }
 
+// MinAckCursor returns the lowest delivery tag still unacked by any registered
+// consumer, or the highest published tag when no consumer holds an unacked
+// message.
+//
+// This is an ON-DEMAND scan of every consumer's unacked set, and it exists
+// solely to satisfy the interfaces.Storage contract (StorageEngine.GetMinAckCursor).
+// It has NO production caller: the broker no longer maintains or reads a
+// running min-ack cursor, because no depth/backpressure decision consumes it
+// (Depth() is waiting+inflight). Do not call it from the delivery or ack hot
+// path — it is O(consumers × window).
 func (ac *AckCursor) MinAckCursor() uint64 {
-	if ac.dirty.CompareAndSwap(true, false) {
-		ac.recomputeMin()
-	}
-	return ac.minAckCursor.Load()
-}
-
-func (ac *AckCursor) IsSafeToOverwrite(oldTag, newTag uint64, ringSize int) bool {
-	mask := uint64(ringSize - 1)
-	if oldTag&mask != newTag&mask {
+	lowest := ^uint64(0)
+	ac.consumers.Range(func(_, v any) bool {
+		v.(*consumerAckState).unacked.Range(func(k, _ any) bool {
+			if t := k.(uint64); t < lowest {
+				lowest = t
+			}
+			return true
+		})
 		return true
+	})
+	if lowest == ^uint64(0) {
+		return ac.head.Load()
 	}
-	return oldTag < ac.MinAckCursor()
+	return lowest
 }
 
 func (ac *AckCursor) Head() uint64 {
@@ -138,32 +144,4 @@ func (ac *AckCursor) GetUnackedCount(consumerTag string) int {
 		return true
 	})
 	return count
-}
-
-func (ac *AckCursor) recomputeMin() {
-	lowest := noLowest
-	ac.consumers.Range(func(_, v any) bool {
-		l := v.(*consumerAckState).lowestUnacked.Load()
-		if l < lowest {
-			lowest = l
-		}
-		return true
-	})
-	if lowest == noLowest {
-		ac.minAckCursor.Store(ac.head.Load())
-	} else {
-		ac.minAckCursor.Store(lowest)
-	}
-}
-
-func scanLowest(m *sync.Map) uint64 {
-	min := noLowest
-	m.Range(func(k, _ any) bool {
-		t := k.(uint64)
-		if t < min {
-			min = t
-		}
-		return true
-	})
-	return min
 }

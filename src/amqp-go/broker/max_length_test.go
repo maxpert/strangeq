@@ -419,10 +419,9 @@ func TestTx_DropHeadEvictsOldestAfterCommit(t *testing.T) {
 // manual-ack basic.get delivery is held unacked across an eviction; afterwards
 // (a) the authoritative storage ack cursor still protects the unacked tag, (b)
 // the queue depth still accounts for the inflight delivery, and (c) the delivery
-// is intact and acks cleanly. (qs.minAckCursor is only a broker-side backpressure
-// mirror — AtHighWaterMark gates on Depth() = waiting+inflight — and legitimately
-// advances for basic.get deliveries, which are tracked via the storage cursor and
-// SetMinAckCursor resync; it is therefore not the overwrite-safety gate here.)
+// is intact and acks cleanly. (There is no broker-side min-ack mirror: the depth
+// gate is Depth() = waiting+inflight, and the storage ack cursor is the only
+// overwrite-safety signal.)
 func TestDropHead_EvictionPreservesInflightDelivery(t *testing.T) {
 	b, cleanup := createTestBroker(t)
 	defer cleanup()
@@ -444,11 +443,14 @@ func TestDropHead_EvictionPreservesInflightDelivery(t *testing.T) {
 	require.NoError(t, publishBody(b, "q", "m3"))
 	require.Equal(t, int64(2), qs.WaitingCount())
 
-	// Ring-overwrite safety (authoritative cursor): the storage ack cursor, which
-	// is derived from outstanding pending-acks and gates slot reuse, must not have
-	// advanced past the still-unacked inflight m0.
-	require.LessOrEqual(t, b.storage.GetMinAckCursor("q"), m0tag,
-		"eviction must not let the storage ack cursor pass an outstanding inflight delivery")
+	// Ring-overwrite safety (authoritative record): the eviction must not have
+	// settled or dropped the still-unacked inflight m0. Its pending-ack entry —
+	// the storage-tier record a settle claims, and the only signal that keeps a
+	// basic.get delivery protected (basic.get deliveries are NOT tracked by the
+	// AckCursor's per-consumer unacked set) — must still be present.
+	if _, err := b.storage.GetPendingAck("q", m0tag); err != nil {
+		t.Errorf("eviction dropped the inflight delivery's pending ack: %v", err)
+	}
 
 	// Depth still counts the inflight m0 (waiting=2 ready + inflight=1).
 	require.Equal(t, uint64(3), qs.Depth(), "eviction must not drop the inflight delivery from depth accounting")
