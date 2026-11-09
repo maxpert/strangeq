@@ -39,9 +39,23 @@ func NewAckCursor() *AckCursor {
 	return &AckCursor{}
 }
 
+// OnPublish advances the published-tag frontier to tag.
+//
+// The frontier is a max() driven by CONCURRENT writers, so the compare must be
+// atomic: a load-then-store here lets a lower-tag store that passed its check
+// before a higher-tag store landed run after it and LOSE the high-water mark
+// (observed in CI as Head() reading 9,900 with 10,000 tags published, which
+// also feeds the queue reaper's `t >= qs.Head()` frontier). The CAS loop is the
+// atomic max and takes at most a few iterations in the common ascending case.
 func (ac *AckCursor) OnPublish(tag uint64) {
-	if tag > ac.head.Load() {
-		ac.head.Store(tag)
+	for {
+		cur := ac.head.Load()
+		if tag <= cur {
+			return
+		}
+		if ac.head.CompareAndSwap(cur, tag) {
+			return
+		}
 	}
 }
 
