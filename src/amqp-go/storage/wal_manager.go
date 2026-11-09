@@ -326,6 +326,15 @@ type WALManager struct {
 	cfg       WALConfig
 }
 
+// walActiveRead is the immutable (file number, read handle) pair the active-file
+// snapshot publishes (N1). It is stored only under fileMutex and only by the two
+// places that install the active file's read handle (rollFile, openNextFile);
+// see QueueWAL.activeRead for the full lifetime argument.
+type walActiveRead struct {
+	num uint64
+	f   *os.File
+}
+
 // QueueWAL manages a SHARED Write-Ahead Log with lock-free write path
 // Note: Despite the name, this now serves ALL queues (naming kept for compatibility)
 type QueueWAL struct {
@@ -374,6 +383,57 @@ type QueueWAL struct {
 	fileMutex               sync.Mutex
 	currentFileOffsets      *roaring64.Bitmap
 	currentFileOffsetsMutex sync.Mutex
+
+	// activeRead is the LOCK-FREE snapshot of the ACTIVE file's read handle
+	// (N1). readMessage loads it to serve a record whose index entry names the
+	// active file WITHOUT taking fileMutex — which the committer holds from
+	// commitBatch's Lock to its Unlock, across the write, the hot-cache
+	// admissions, the fdatasync and the indexing. Before this, every cold read
+	// of a record in the active file queued behind whichever fsync was in
+	// flight.
+	//
+	// FIELD PLACEMENT: it is declared BELOW the pinned group-commit hot group
+	// (currentFile..currentFileOffsets), so the baseline offsets the layout test
+	// locks are unchanged. It therefore lands on the line the committer locks
+	// (fileMutex@192, currentFileOffsetsMutex@208) — but the snapshot itself is
+	// WRITTEN only on a roll while the reader merely LOADS it, so the only
+	// interaction is that a per-batch lock invalidates the readers' shared copy
+	// (~once per batch, against ~1e6 loads/s). Neither the Committing benchmark
+	// nor a padded variant moved measurably, so it is NOT padded: a structural
+	// layout change without a measured benefit is exactly what the layout test
+	// warns against.
+	//
+	// FD LIFETIME — WHY A SNAPSHOT HOLDER CAN NEVER USE A CLOSED DESCRIPTOR.
+	// The pair is IMMUTABLE once stored: (num, f) are published together and
+	// never mutated, so a single atomic load is at least as consistent as the
+	// old fileMutex-guarded read of currentReadFile. It is stored ONLY under
+	// fileMutex, by the two sites that install the active file's read handle
+	// (rollFile, openNextFile), and cleared under fileMutex by close() BEFORE
+	// that same close() closes currentReadFile. So the handle it names has
+	// exactly the lifetime the reader used to depend on:
+	//
+	//   - A ROLL DOES NOT CLOSE IT. rollFile moves the outgoing read handle into
+	//     oldFileCache (still open) and only then republishes the snapshot for
+	//     the new file.
+	//   - IT IS CLOSED ONLY by closeOldFileHandle (the reclaim of a file whose
+	//     every record is acknowledged, or withOldFileHandle's retry) and by
+	//     close() at shutdown. The reclaim never selects the ACTIVE file (it
+	//     skips fileNum == qw.fileNum.Load()), and readMessage uses the snapshot
+	//     only when ar.num == location.pos.segmentID with the record's file
+	//     number already confirmed equal to the active file's — i.e. only for
+	//     the file the committer is writing, which no reclaim closes.
+	//
+	// The residual window is the one the OLD code already had between
+	// fileMutex.Unlock() and parseMessageAt: close() (shutdown) or a roll+reclaim
+	// race can close the handle under the read. That is SAFE by the platform
+	// guarantee asserted in TestClosedOldFileHandle_ReadAtYieldsTypedErrClosed:
+	// os.File.ReadAt -> poll.FD.Pread takes an incref that fails once Close has
+	// marked the descriptor closed, so the read returns a TYPED os.ErrClosed and
+	// can never reach a recycled descriptor. readMessage turns that ErrClosed
+	// into a fall-through to the authoritative locked path — the same degrade
+	// withOldFileHandle already performs — so a transient close is never
+	// reported as a read fault.
+	activeRead atomic.Pointer[walActiveRead]
 
 	// currentFileHasSharedBody (ITER5 §2) records that the active file carries at
 	// least one BodyBlock record. It is set under fileMutex by commitBatch when a
@@ -4283,6 +4343,9 @@ func (qw *QueueWAL) rollFile() error {
 	qw.fileNum.Store(num)
 	qw.currentFile = w
 	qw.currentReadFile = r
+	// N1: publish the new active-file read snapshot under fileMutex, atomically
+	// with the handle install above. The old handle stays open in oldFileCache.
+	qw.activeRead.Store(&walActiveRead{num: num, f: r})
 	qw.fileOffset.Store(size)
 	qw.currentInv = newSegmentInventory(size)
 	// A roll installs a NEW file, so its directory-entry durability replaces
@@ -4698,6 +4761,10 @@ func (qw *QueueWAL) openNextFile() error {
 	qw.fileNum.Store(num)
 	qw.currentFile = w
 	qw.currentReadFile = r
+	// N1: publish the boot file's active-read snapshot (boot only; no goroutine
+	// is running yet, but the store keeps the invariant "snapshot set wherever
+	// currentReadFile is set").
+	qw.activeRead.Store(&walActiveRead{num: num, f: r})
 	qw.fileOffset.Store(size)
 	qw.currentInv = newSegmentInventory(size)
 	qw.currentFileDirEntryDurable = dirEntryDurable
@@ -4999,6 +5066,22 @@ func (qw *QueueWAL) readMessage(queueName string, offset uint64) (*protocol.Mess
 		}
 		if location.pos.segmentID == qw.fileNum.Load() {
 			sh.mu.RUnlock()
+			// N1: serve the ACTIVE file from the lock-free snapshot, so a cold
+			// read no longer queues behind the committer's fileMutex (held
+			// across write -> fsync -> index). The snapshot is validated against
+			// the file number the gate just confirmed is active, so a superseded
+			// snapshot simply fails the match and falls through to the
+			// authoritative locked path below. No new lock is taken here and no
+			// durability step is moved.
+			if ar := qw.activeRead.Load(); ar != nil && ar.f != nil && ar.num == location.pos.segmentID {
+				msg, err := qw.parseMessageAt(ar.f, queueName, location.pos.position, offset)
+				if !errors.Is(err, os.ErrClosed) {
+					return msg, err
+				}
+				// The active handle was closed under us (the close() window).
+				// Fall through to the locked path, which re-reads the handle
+				// under fileMutex and returns the authoritative answer.
+			}
 			qw.fileMutex.Lock()
 			if location.pos.segmentID != qw.fileNum.Load() {
 				// It rolled between the atomic check and fileMutex. Retry through
@@ -5324,6 +5407,10 @@ func (qw *QueueWAL) close() {
 
 	qw.fileMutex.Lock()
 	qw.fileClosed = true
+	// N1: retire the active-read snapshot BEFORE closing the handle it names, so
+	// a reader either observes a still-open handle or nil (and takes the locked
+	// path). Stored under fileMutex, serialized with the roll publishes.
+	qw.activeRead.Store(nil)
 	defer qw.fileMutex.Unlock()
 
 	if qw.currentFile != nil {
