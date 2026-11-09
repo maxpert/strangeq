@@ -2,6 +2,61 @@
 
 ## [Unreleased]
 
+## [0.15.0] - 2026-11-09
+
+### Breaking changes
+
+Backward compatibility is deliberately abandoned for this minor release. The
+following exported symbols and configuration keys were unused inside this module
+and have been **removed**, not deprecated. Out-of-tree embedders that referenced
+them must migrate.
+
+**Removed exported symbols**
+
+- `interfaces`: `Config`, `Transactional`, `ConnectionHandler`, `ResourceVHost`,
+  `StorageStats`, `MetadataStats`, `ErrCorruptedStorage`, `ErrRecoveryInProgress`.
+- `config`: `(*AMQPConfig).GetManagement`, `(*AMQPConfig).GetResourceAlarms`.
+- `config.ConfigBuilder` setters: `WithHeartbeat`, `WithTCPKeepAlive`,
+  `WithBufferSizes`, `WithCRCCheck`, `WithTLSCA`, `WithAuthentication`,
+  `WithFileAuthentication`, `WithAuthorization`, `WithVirtualHost`,
+  `WithAccessControl`, `WithAuthFailureLimit`, `WithTelemetry`, `WithDaemonize`,
+  `WithProtocolLimits`, `WithCacheSize`, `WithMaxFiles`, `WithRetention`.
+  (`ConfigBuilder`, `NewConfigBuilder`, `FromConfig`, `Build`, `BuildUnsafe` and
+  the still-used setters remain.)
+- `protocol` AMQP method-ID constants: `ConnectionStart`, `ConnectionSecure`,
+  `ConnectionTune`, `ChannelOpenOK`, `ExchangeDeclareOK`, `ExchangeDeleteOK`,
+  `QueueDeclareOK`, `BasicQosOK`, `BasicConsumeOK`, `BasicReturn`, `BasicDeliver`,
+  `BasicGetOK`, `BasicGetEmpty`, `BasicRecoverAsync`, `BasicRecoverOK`,
+  `ConfirmClass`, `ConfirmSelectOK`. (`BasicGet` is still used and remains, as do
+  the tx-class and other routed constants.)
+- `protocol`: `(*Frame).MarshalBinaryPooled`,
+  `(*Connection).HasPendingConfirmNacks`, `EncodeHeaderFrameForChannel`,
+  `FragmentBodyIntoFrames`, `NewTxSelectFrame`, `NewTxCommitFrame`,
+  `NewTxRollbackFrame`, `ParseTransactionMethod`. (The `NewTx*OKFrame`
+  constructors remain, and the legacy frame codecs are untouched.)
+- `server`: const `AMQPServer`; `(*Server).StartWithQuitChannel`;
+  `(*ServerBuilder).WithLogger`, `(*ServerBuilder).WithProtocolLimits`,
+  `(*ServerBuilder).WithConnectionHandler`; constants `RecoveryOutcomeBenign` and
+  `RecoveryOutcomeFatal` (`RecoveryOutcomeDegraded` remains).
+- `errors`: `ContentTooLarge`, `NoRoute`, `NoConsumers`. (The broker's separate
+  `broker.ErrNoRoute` sentinel is unaffected.)
+
+**Removed configuration keys**
+
+- `storage.cachemb`, `storage.maxfiles`, `storage.retentionms`. These keys were
+  accepted and reflection-loaded but read by no engine path. They no longer bind
+  to a field and are reported as unknown keys at load.
+
+### Fixed
+
+- The production redelivery metric was permanently dark:
+  `server/builder.go` resolved the metrics collector only *after* wrapping the
+  concrete `*broker.StorageBroker` in `NewStorageBrokerAdapter`, so
+  `StorageBroker.SetMetricsCollector` was never called in the standard build and
+  `amqp_messages_redelivered_total` (and the management "Redelivered" health
+  tile) stayed at zero. The collector is now resolved once, before broker
+  construction, and wired to the concrete broker before it is wrapped.
+
 ## [0.14.3] - 2026-11-09
 
 ### Fixed
