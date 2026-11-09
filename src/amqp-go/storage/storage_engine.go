@@ -839,10 +839,10 @@ func (ds *StorageEngine) DeleteMessage(queueName string, deliveryTag uint64) err
 	mu.Lock()
 	defer mu.Unlock()
 
-	// GetResident, not Get: a settlement must find an entry that is
-	// resident even when it is not yet durable.
-	msg, backed, foundHot := ds.hot.GetResident(queueName, deliveryTag)
-	ds.hot.Delete(queueName, deliveryTag)
+	// TakeResident, not Get: a settlement must find an entry that is resident
+	// even when it is not yet durable. It probes and removes in ONE critical
+	// section and does NOT promote the doomed entry in the LRU.
+	msg, backed, foundHot := ds.hot.TakeResident(queueName, deliveryTag)
 	if !foundHot || msg.DeliveryMode == 2 || backed {
 		ds.ackColdTiers(queueName, deliveryTag)
 	}

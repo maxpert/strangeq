@@ -848,6 +848,44 @@ func (c *hotCache) GetResident(queue string, tag uint64) (m *protocol.Message, b
 	return entry.message, entry.backed, true
 }
 
+// TakeResident atomically probes AND removes the entry admitted under tag,
+// returning it whether or not it is durable, in ONE critical section and
+// WITHOUT promoting the entry in the LRU.
+//
+// It exists for the settlement path (StorageEngine.DeleteMessage). That path
+// used to call GetResident and then Delete: two critical sections, and the
+// probe promoted an entry that was about to be removed (a global seq.Add, an
+// LRU MoveToFront, and sometimes a walk to refresh the oldest-backed stamp —
+// all wasted on a doomed entry). TakeResident does the probe and the removal
+// under one lock and skips the promotion.
+//
+// IT IS EXACTLY EQUIVALENT to GetResident-then-Delete for a caller that
+// discards Delete's unique-winner result: same predicate (present or not),
+// same returned (message, backed) pair, the same removal, and the same mirror
+// update (noteQueueUsed). A caller that NEEDS Delete's winner result must keep
+// the two-step form (see StorageEngine.DeleteMessageIfPresentDetailed),
+// because making the pair atomic would let it win a race the two-step form can
+// legitimately lose.
+func (c *hotCache) TakeResident(queue string, tag uint64) (m *protocol.Message, backed, ok bool) {
+	q := c.queueStateIfPresent(queue)
+	if q == nil {
+		return nil, false, false
+	}
+
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	hotCacheQueueLockFire(q.name)
+
+	entry, ok := q.entries[tag]
+	if !ok {
+		return nil, false, false
+	}
+	m, backed = entry.message, entry.backed
+	c.removeLocked(q, entry)
+	c.noteQueueUsed(queue, q.used)
+	return m, backed, true
+}
+
 // Delete removes an entry while holding the queue's lock, making exactly one
 // concurrent caller the winner for a present queue/tag pair.
 func (c *hotCache) Delete(queue string, tag uint64) bool {
