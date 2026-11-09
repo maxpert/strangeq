@@ -82,8 +82,9 @@ storage:
 
   # Durability of a confirmed message — the single option that names the crash
   # class a publisher confirm is guaranteed to survive (macOS; on Linux and every
-  # non-darwin platform all three values use fdatasync, so the choice is inert
-  # there and any value is power-loss safe).
+  # non-darwin platform barrier and flush both fdatasync per confirmed message —
+  # power-loss safe — so barrier vs flush is inert there, but none issues no
+  # group-commit barrier at all and is NOT power-loss safe).
   #
   #   none    = no WAL group-commit barrier (the retired fsync: false). A
   #             confirmed message survives the broker staying up but NOT a

@@ -114,9 +114,10 @@ const (
 
 // Accepted values of StorageConfig.Durability — the single user-facing
 // durability option. Each names the crash class a confirmed message is
-// guaranteed to survive on darwin; on Linux and every non-darwin platform all
-// three use fdatasync (which already flushes the drive cache), so the choice is
-// inert there and any value is power-loss safe.
+// guaranteed to survive on darwin; on Linux and every non-darwin platform
+// barrier and flush both fdatasync per confirmed message (which already flushes
+// the drive cache), so barrier vs flush is inert there, but none issues no
+// group-commit barrier at all and is NOT power-loss safe.
 const (
 	// DurabilityNone issues no WAL group-commit barrier (the retired
 	// fsync: false): a confirmed message survives the broker staying up but
