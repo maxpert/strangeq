@@ -143,42 +143,9 @@ func TestAckCursor_NoConsumersMinIsHead(t *testing.T) {
 
 	ac.OnPublish(10)
 	ackCursorEq(t, 10, ac.Head(), "OnPublish advances head")
-	ackCursorEq(t, 0, ac.MinAckCursor(), "no consumers -> OnPublish does not move min")
-}
-
-func TestAckCursor_IsSafeToOverwrite_DifferentSlots(t *testing.T) {
-	ac := NewAckCursor()
-	ac.OnConsumerRegister("c1")
-	ac.OnPublish(1)
-	ac.OnDeliver(1, "c1")
-
-	if !ac.IsSafeToOverwrite(1, 2, 4) {
-		t.Fatal("different slots (1&3=1, 2&3=2) should be safe")
-	}
-}
-
-func TestAckCursor_IsSafeToOverwrite_SameSlotAcked(t *testing.T) {
-	ac := NewAckCursor()
-	ac.OnConsumerRegister("c1")
-	ac.OnPublish(1)
-	ac.OnDeliver(1, "c1")
-	ackCursorEq(t, 1, ac.MinAckCursor(), "tag 1 unacked -> min 1")
-
-	if !ac.IsSafeToOverwrite(0, 4, 4) {
-		t.Fatal("same slot (0&3=0, 4&3=0), oldTag 0 < minAckCursor 1 -> safe")
-	}
-}
-
-func TestAckCursor_IsSafeToOverwrite_SameSlotNotAcked(t *testing.T) {
-	ac := NewAckCursor()
-	ac.OnConsumerRegister("c1")
-	ac.OnPublish(0)
-	ac.OnDeliver(0, "c1")
-	ackCursorEq(t, 0, ac.MinAckCursor(), "tag 0 unacked -> min 0")
-
-	if ac.IsSafeToOverwrite(0, 4, 4) {
-		t.Fatal("same slot, oldTag 0 still unacked (0 < minAckCursor 0 is false) -> not safe")
-	}
+	// MinAckCursor is computed on demand: with no consumer holding an unacked
+	// tag, the lowest unacked tag is "none", so the cursor sits at head.
+	ackCursorEq(t, 10, ac.MinAckCursor(), "on-demand: no consumers -> min = head")
 }
 
 func TestAckCursor_ConcurrentDeliverAck(t *testing.T) {

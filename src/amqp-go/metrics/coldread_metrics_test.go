@@ -36,6 +36,35 @@ func TestColdReadAndPublisherParkMetrics(t *testing.T) {
 	require.Equal(t, 1234.0, testutil.ToFloat64(c.QueueDepthHighWater.WithLabelValues("q", "/")))
 }
 
+// TestResolveHotCacheDeliveryMetrics_SeriesIdentical pins the delivery-path
+// resolution cache (storage's optional hotCacheDeliveryMetricsResolver
+// capability): the resolved closures must increment EXACTLY the same series the
+// three RecordHotCacheDelivery* methods do for the same queue, so a collector
+// that opts into the resolver cannot change what is exported.
+func TestResolveHotCacheDeliveryMetrics_SeriesIdentical(t *testing.T) {
+	c := NewCollector("resolve_" + sanitize(t.Name()))
+
+	hit, coldRead, addPreads := c.ResolveHotCacheDeliveryMetrics("q")
+	require.NotNil(t, hit)
+	require.NotNil(t, coldRead)
+	require.NotNil(t, addPreads)
+
+	hit()
+	hit()
+	coldRead()
+	addPreads(2)
+	addPreads(0)  // ignored, exactly like RecordHotCacheDeliveryPread
+	addPreads(-1) // ignored
+
+	require.Equal(t, 2.0, testutil.ToFloat64(c.HotCacheDeliveryHits.WithLabelValues("q")))
+	require.Equal(t, 1.0, testutil.ToFloat64(c.HotCacheDeliveryColdReads.WithLabelValues("q")))
+	require.Equal(t, 2.0, testutil.ToFloat64(c.HotCacheDeliveryPreads.WithLabelValues("q")))
+
+	// The fallback methods hit the SAME series: one family, no duplicate.
+	c.RecordHotCacheDeliveryHit("q")
+	require.Equal(t, 3.0, testutil.ToFloat64(c.HotCacheDeliveryHits.WithLabelValues("q")))
+}
+
 func TestQueuePoller_PublishesDepthHighWater(t *testing.T) {
 	c := NewCollector("hw_" + sanitize(t.Name()))
 	p := &queuePoller{collector: c}

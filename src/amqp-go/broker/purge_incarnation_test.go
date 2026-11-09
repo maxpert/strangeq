@@ -59,7 +59,6 @@ func TestPurgeIncarnationAppliesOnlyToTheHandedIncarnation(t *testing.T) {
 	// Snapshot qB's cursors and tags BEFORE the mismatched call.
 	preTail := qsB.tail.Load()
 	preHead := qsB.head.Load()
-	preMinAck := qsB.minAckCursor.Load()
 	preWaiting := qsB.waiting.Load()
 	preInflight := qsB.inflight.Load()
 	minB, _ := qsB.TagBand()
@@ -86,9 +85,6 @@ func TestPurgeIncarnationAppliesOnlyToTheHandedIncarnation(t *testing.T) {
 	}
 	if got := qsB.head.Load(); got != preHead {
 		t.Errorf("qB.head changed: %d -> %d, want unchanged", preHead, got)
-	}
-	if got := qsB.minAckCursor.Load(); got != preMinAck {
-		t.Errorf("qB.minAckCursor changed: %d -> %d, want unchanged", preMinAck, got)
 	}
 	if got := qsB.waiting.Load(); got != preWaiting {
 		t.Errorf("qB.waiting changed: %d -> %d, want unchanged", preWaiting, got)

@@ -38,12 +38,7 @@ func hotCacheAssertAccountingIsExact(t *testing.T, cache *hotCache) {
 			got, sum)
 	}
 
-	cache.queueUsedMu.Lock()
-	mirror := make(map[string]int64, len(cache.queueUsed))
-	for name, used := range cache.queueUsed {
-		mirror[name] = used
-	}
-	cache.queueUsedMu.Unlock()
+	mirror := hotCacheMirror(cache)
 
 	for name, used := range perQueue {
 		got, ok := mirror[name]

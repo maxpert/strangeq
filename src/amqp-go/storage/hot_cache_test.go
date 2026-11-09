@@ -136,9 +136,9 @@ func TestHotCacheQueueAdmissionIsQueueLocal(t *testing.T) {
 			t.Fatalf("globalUsed = %d, want %d: the global budget was not exceeded, "+
 				"so no cross-queue eviction was warranted", cache.globalUsed, 3*charge)
 		}
-		if cache.queueUsed["qa"] != 2*charge || cache.queueUsed["qb"] != charge {
+		if cache.residentBytes("qa") != 2*charge || cache.residentBytes("qb") != charge {
 			t.Fatalf("per-queue accounting = qa %d qb %d, want %d/%d",
-				cache.queueUsed["qa"], cache.queueUsed["qb"], 2*charge, charge)
+				cache.residentBytes("qa"), cache.residentBytes("qb"), 2*charge, charge)
 		}
 	})
 }
@@ -168,9 +168,9 @@ func TestHotCacheEntryIdentityIsOwnedByEntry(t *testing.T) {
 			t.Fatalf("Count(q) = %d after deleting by the admitted tag, want 0 "+
 				"(the entry stayed in the queue map under its original key)", got)
 		}
-		if cache.queueUsed["q"] != 0 || cache.globalUsed != 0 {
+		if cache.residentBytes("q") != 0 || cache.globalUsed != 0 {
 			t.Fatalf("byte accounting after delete = queue %d global %d, want 0/0",
-				cache.queueUsed["q"], cache.globalUsed)
+				cache.residentBytes("q"), cache.globalUsed)
 		}
 
 		// The byte accounting really returned to zero: the budget binds again
@@ -326,6 +326,74 @@ func TestHotCacheDeleteUniqueWinner(t *testing.T) {
 	}
 }
 
+// TestHotCacheTakeResidentSettlesAndMirrors pins the settlement contract of
+// TakeResident: it finds a resident entry (durable or not), returns its
+// message and backed flag, removes it (exactly once), and publishes the queue's
+// zeroed resident bytes into the mirror — the same observable outcome as the
+// GetResident-then-Delete pair it replaces in StorageEngine.DeleteMessage.
+func TestHotCacheTakeResidentSettlesAndMirrors(t *testing.T) {
+	cache := newHotCache(64<<20, 256<<20)
+	msg := hotCacheTestMessage(7)
+	if !cache.Put("q", msg, true) {
+		t.Fatal("Put failed")
+	}
+
+	got, backed, ok := cache.TakeResident("q", 7)
+	if !ok || !backed || got != msg {
+		t.Fatalf("TakeResident = (%p, backed=%v, ok=%v), want (%p, true, true)", got, backed, ok, msg)
+	}
+	if _, _, ok := cache.TakeResident("q", 7); ok {
+		t.Fatal("TakeResident won twice for the same tag")
+	}
+	if _, _, ok := cache.Get("q", 7); ok {
+		t.Fatal("a taken entry is still visible to Get")
+	}
+	if got := cache.Count("q"); got != 0 {
+		t.Fatalf("Count = %d, want 0 after TakeResident", got)
+	}
+	if got := cache.residentBytes("q"); got != 0 {
+		t.Fatalf("mirror residentBytes = %d, want 0 after TakeResident", got)
+	}
+
+	// A never-admitted queue and an unknown tag both report absent, exactly as
+	// GetResident-then-Delete did.
+	if _, _, ok := cache.TakeResident("absent-queue", 1); ok {
+		t.Fatal("TakeResident on a missing queue must report absent")
+	}
+	if _, _, ok := cache.TakeResident("q", 99); ok {
+		t.Fatal("TakeResident on a missing tag must report absent")
+	}
+}
+
+// TestHotCacheTakeResidentSkipsLruPromotion is the falsifiable form of N3's
+// second half: the settlement must not touch the LRU of the entry it is about
+// to delete. The recency stamp (hotCache.seq) is bumped by every promotion, so
+// the test proves GetResident DOES promote and TakeResident does NOT.
+func TestHotCacheTakeResidentSkipsLruPromotion(t *testing.T) {
+	cache := newHotCache(64<<20, 256<<20)
+	for tag := uint64(1); tag <= 3; tag++ {
+		if !cache.Put("q", hotCacheTestMessage(tag), true) {
+			t.Fatalf("Put(%d) failed", tag)
+		}
+	}
+
+	before := cache.seq.Load()
+	if _, _, ok := cache.GetResident("q", 2); !ok {
+		t.Fatal("GetResident(2) failed")
+	}
+	if cache.seq.Load() == before {
+		t.Fatal("premise: GetResident must promote the probed entry (advance the recency stamp)")
+	}
+
+	before = cache.seq.Load()
+	if _, _, ok := cache.TakeResident("q", 2); !ok {
+		t.Fatal("TakeResident(2) failed")
+	}
+	if got := cache.seq.Load(); got != before {
+		t.Fatalf("TakeResident promoted the doomed entry: recency stamp %d -> %d", before, got)
+	}
+}
+
 func TestHotCacheZeroBodyEntriesBounded(t *testing.T) {
 	message := hotCacheTestMessage(1)
 	charge := cacheCharge("q", message)
@@ -386,7 +454,7 @@ func TestHotCacheMutatedRePutDoesNotDuplicateEntry(t *testing.T) {
 		t.Fatalf("Count(%q) = %d after a mutated re-Put, want 1: the same message "+
 			"was admitted twice, so the queue's ready set is double-counted", queue, got)
 	}
-	if got := cache.queueUsed[queue]; got != charge {
+	if got := cache.residentBytes(queue); got != charge {
 		t.Fatalf("per-queue byte accounting = %d, want %d: the same message was "+
 			"charged twice", got, charge)
 	}

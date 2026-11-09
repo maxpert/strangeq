@@ -250,7 +250,7 @@ func deleteRangeWithoutEpoch(c *hotCache, queue string, minTag, maxTag uint64) i
 		removed++
 	}
 	if removed > 0 {
-		c.noteQueueUsed(queue, q.used)
+		c.noteQueueUsed(q, q.used)
 	}
 	return removed
 }

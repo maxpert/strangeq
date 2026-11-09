@@ -990,6 +990,30 @@ func (c *Collector) RecordHotCacheDeliveryPread(queue string, n int) {
 	c.HotCacheDeliveryPreads.WithLabelValues(queue).Add(float64(n))
 }
 
+// ResolveHotCacheDeliveryMetrics resolves a queue's delivery-classification
+// series ONCE and returns the closures the storage engine calls on the hot
+// path (storage's optional hotCacheDeliveryMetricsResolver capability).
+//
+// This is what removes the per-message cost from the delivery hot path:
+// WithLabelValues hashes the label set and takes the vector's internal RWMutex
+// read lock, so calling it once per delivered message cost 26 ns serially and
+// 117-124 ns/op with 8 goroutines delivering at once — the contention is the
+// vector's metricMap reader count, not the per-label counter.
+//
+// The series produced are IDENTICAL to RecordHotCacheDeliveryHit /
+// ...ColdRead / ...Pread for the same queue; this is only a resolution cache.
+func (c *Collector) ResolveHotCacheDeliveryMetrics(queue string) (hit, coldRead func(), addPreads func(int)) {
+	hitCounter := c.HotCacheDeliveryHits.WithLabelValues(queue)
+	coldCounter := c.HotCacheDeliveryColdReads.WithLabelValues(queue)
+	preadCounter := c.HotCacheDeliveryPreads.WithLabelValues(queue)
+	return hitCounter.Inc, coldCounter.Inc, func(n int) {
+		if n <= 0 {
+			return
+		}
+		preadCounter.Add(float64(n))
+	}
+}
+
 // RecordPublisherPark observes one completed queue-depth reader park.
 func (c *Collector) RecordPublisherPark(seconds float64) {
 	c.PublisherParksTotal.Inc()

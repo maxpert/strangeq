@@ -50,6 +50,17 @@ const hotCachePutAttempts = 8
 // a cache with a very large number of queues.
 const hotCacheFreeRounds = 64
 
+// hotCacheLineSize is the cache line size the padding below is sized for.
+//
+// 128 bytes, not the more common 64: the target machine is darwin/arm64
+// (hw.cachelinesize = 128) and Go sizes internal/cpu.CacheLinePadSize to 128
+// there. On a 64-byte-line platform the extra padding only wastes a few dozen
+// bytes of a struct that is allocated once per broker, which costs nothing.
+const hotCacheLineSize = 128
+
+// hotCachePad fills a hot line after an 8-byte field.
+type hotCachePad = [hotCacheLineSize - 8]byte
+
 // hotCache is a byte-bounded collection of PER-QUEUE caches.
 //
 // ONE LOCK PER QUEUE. The cache used to have ONE mutex for the whole
@@ -61,6 +72,16 @@ const hotCacheFreeRounds = 64
 // entries and its byte accounting, so two queues never serialise on each
 // other.
 //
+// FALSE SHARING: THE GLOBAL COUNTERS GET THEIR OWN LINES. globalUsed is
+// compare-and-swapped on every admission and added on every removal, seq is
+// incremented on EVERY cache access, and the queues sync.Map header is read on
+// every lookup — all from every queue's goroutines at once. Without padding
+// those three share one cache line, so unrelated queues invalidate each
+// other's line on every operation; the padding below keeps the two
+// read-modify-written counters alone on their own lines. (The previous
+// layout put globalUsed at 0, seq at 32 and the sync.Map header at 40, so all
+// three sat in the first 128-byte line.)
+//
 // TWO budgets, TWO victim pools. The per-queue budget is satisfied out of
 // THAT queue's backed entries and the global budget out of the queues'
 // entries as a whole; they are never satisfied out of the same pool, so a
@@ -71,10 +92,10 @@ const hotCacheFreeRounds = 64
 // compare-and-swap, so the total resident bytes never exceed the budget, not
 // even while several queues fill up at the same time.
 //
-// THE LOCK ORDER IS: a queue's lock, and then (never the other way round)
-// the mirror lock. The global eviction sweep takes ONE queue's lock at a
-// time and never holds two, so there is no lock cycle. The admitting queue
-// RELEASES its own lock before it goes and frees space elsewhere.
+// THE LOCK ORDER IS: a queue's lock, and nothing else -- there is no second
+// cache-wide lock any more. The global eviction sweep takes ONE queue's lock
+// at a time and never holds two, so there is no lock cycle. The admitting
+// queue RELEASES its own lock before it goes and frees space elsewhere.
 type hotCache struct {
 	// globalUsed is the sum of every queue's resident bytes: the GLOBAL
 	// budget's accounting. It is accessed with the atomic operations below
@@ -82,6 +103,16 @@ type hotCache struct {
 	// and it is the FIRST field of the struct so that it is 64-BIT ALIGNED,
 	// which those operations require.
 	globalUsed int64
+	_          hotCachePad
+
+	// seq hands out the recency stamps that order the queues against EACH
+	// OTHER. Every access to an entry stamps it with the next value, so the
+	// stamps are totally ordered and comparable across queues. The
+	// cross-queue eviction picks the queue whose oldest backed entry has
+	// the SMALLEST stamp, which is exactly the globally least recently used
+	// backed entry the single global LRU used to select.
+	seq atomic.Uint64
+	_   hotCachePad
 
 	queueBytes  int64
 	globalBytes int64
@@ -96,14 +127,6 @@ type hotCache struct {
 	// OFF and the charging is byte-identical to before.
 	exemptPendingDurable bool
 
-	// seq hands out the recency stamps that order the queues against EACH
-	// OTHER. Every access to an entry stamps it with the next value, so the
-	// stamps are totally ordered and comparable across queues. The
-	// cross-queue eviction picks the queue whose oldest backed entry has
-	// the SMALLEST stamp, which is exactly the globally least recently used
-	// backed entry the single global LRU used to select.
-	seq atomic.Uint64
-
 	// queues maps a queue name to that queue's state.
 	//
 	// It is a sync.Map because EVERY operation looks the queue up and the
@@ -112,25 +135,18 @@ type hotCache struct {
 	// sync.RWMutex would put a shared atomic on the read path -- exactly
 	// the contention shape the WAL index shards were split to remove.)
 	queues sync.Map // string -> *hotCacheQueue
-
-	// queueUsed mirrors every queue's resident byte count.
-	//
-	// The AUTHORITATIVE per-queue accounting lives in the queue's own state
-	// (hotCacheQueue.used, under the queue's own lock); this map is the
-	// observable projection of it, maintained under its own lock so that
-	// the mirror can never be read half-updated. It is written on every
-	// admission and every removal, so it never drifts from the
-	// authoritative value.
-	queueUsedMu sync.Mutex
-	queueUsed   map[string]int64
 }
 
 // hotCacheQueue is ONE QUEUE's slice of the cache: its own lock, its own
 // LRU list, its own entries, its own reverse index and its own byte
 // accounting.
 //
-// EVERYTHING IN HERE IS TOUCHED ONLY UNDER mu. The cross-queue operation
-// (the global eviction) takes ONE queue's lock at a time and never holds
+// EVERYTHING MUTABLE IN HERE IS TOUCHED ONLY UNDER mu, with exactly two
+// deliberate exceptions that are atomics read WITHOUT the lock:
+// pendingDurable (read by the pace gate and written by the WAL committer's
+// lock-free durability point) and usedMirror (read by the pace gate and the
+// management surface, written under mu). The cross-queue operation (the
+// global eviction) takes ONE queue's lock at a time and never holds
 // two, so there is no lock cycle.
 type hotCacheQueue struct {
 	cache *hotCache
@@ -167,6 +183,21 @@ type hotCacheQueue struct {
 	// used is this queue's resident byte count. It is the AUTHORITATIVE
 	// per-queue accounting and it is guarded by mu.
 	used int64
+
+	// usedMirror is the OBSERVABLE projection of `used`: the value the pace
+	// gate and the management surface read. It is an atomic written under mu
+	// together with `used` (via noteQueueUsed), so it never drifts from the
+	// authoritative value, and it is read WITHOUT mu -- which is the point:
+	// the read runs on the publisher's reader path (paceEffectiveResident) and
+	// the whole cache shares this path across queues.
+	//
+	// It replaces a cache-wide mutex-guarded map. That map put EVERY queue's
+	// admission and removal behind ONE mutex: the queue lock is already held at
+	// each write site, so taking a second, cache-wide lock stretched every
+	// queue's critical section and serialised unrelated queues. An atomic store
+	// under the queue's own lock gives the same "never read half-updated"
+	// guarantee (the store is a single instruction) with no shared lock.
+	usedMirror atomic.Int64
 
 	// pendingDurable is the sum of the charges of this queue's entries that
 	// were admitted NOT-YET-DURABLE (see hotCacheEntry.pendingDurable) and have
@@ -304,7 +335,6 @@ func newHotCacheWithExemption(queueBytes, globalBytes int64, exemptPendingDurabl
 		queueBytes:           queueBytes,
 		globalBytes:          globalBytes,
 		exemptPendingDurable: exemptPendingDurable,
-		queueUsed:            make(map[string]int64),
 	}
 }
 
@@ -340,14 +370,17 @@ func (c *hotCache) queueStateIfPresent(queue string) *hotCacheQueue {
 	return nil
 }
 
-// residentBytes returns the queue's resident byte count from the mirror map
-// (the observable projection of hotCacheQueue.used; see noteQueueUsed). A queue
-// that has never been admitted into reports 0.
+// residentBytes returns the queue's resident byte count from the mirror (the
+// observable projection of hotCacheQueue.used; see noteQueueUsed). A queue that
+// has never been admitted into reports 0. It takes no lock: the mirror is an
+// atomic on the queue's own state, so this is the lock-free read the pace gate
+// and the management surface need.
 func (c *hotCache) residentBytes(queue string) int64 {
-	c.queueUsedMu.Lock()
-	used := c.queueUsed[queue]
-	c.queueUsedMu.Unlock()
-	return used
+	q := c.queueStateIfPresent(queue)
+	if q == nil {
+		return 0
+	}
+	return q.usedMirror.Load()
 }
 
 // pendingDurableExemptLocked is the number of bytes the pacing/admission budget
@@ -382,12 +415,12 @@ func (c *hotCache) pendingDurableExemptLocked(q *hotCacheQueue) int64 {
 // stale pair can only move the gate by one admission, which the gate re-reads
 // on the next call.
 func (c *hotCache) paceEffectiveResident(queue string) int64 {
-	used := c.residentBytes(queue)
-	if !c.exemptPendingDurable {
-		return used
-	}
 	q := c.queueStateIfPresent(queue)
 	if q == nil {
+		return 0
+	}
+	used := q.usedMirror.Load()
+	if !c.exemptPendingDurable {
 		return used
 	}
 	p := q.pendingDurable.Load()
@@ -568,7 +601,7 @@ func (c *hotCache) Put(queue string, m *protocol.Message, backed bool) bool {
 		// as before.
 		for q.used-c.pendingDurableExemptLocked(q)+charge > c.queueBytes {
 			if !q.evictOldestBackedLocked() {
-				c.noteQueueUsed(queue, q.used)
+				c.noteQueueUsed(q, q.used)
 				q.mu.Unlock()
 				return false
 			}
@@ -586,7 +619,7 @@ func (c *hotCache) Put(queue string, m *protocol.Message, backed bool) bool {
 			//
 			// The mirror is published BEFORE the lock is released, so it is
 			// exact on every exit path of the admission.
-			c.noteQueueUsed(queue, q.used)
+			c.noteQueueUsed(q, q.used)
 			q.mu.Unlock()
 			if !c.freeGlobalSpace(q, charge) {
 				return false
@@ -613,15 +646,15 @@ func (c *hotCache) Put(queue string, m *protocol.Message, backed bool) bool {
 			// is its oldest backed entry.
 			q.oldestBacked.Store(int64(entry.lastUsed))
 		}
-		c.noteQueueUsed(queue, q.used)
+		c.noteQueueUsed(q, q.used)
 		q.mu.Unlock()
 		return true
 	}
 	return false
 }
 
-// PutBestEffort admits m if the byte budgets have room for it WITHOUT
-// EVICTING anything.
+// PutBestEffortEntry admits m if the byte budgets have room for it WITHOUT
+// EVICTING anything, and returns the ENTRY it admitted.
 //
 // It is the admission used by the two RAM-holder entry points:
 //
@@ -652,12 +685,6 @@ func (c *hotCache) Put(queue string, m *protocol.Message, backed bool) bool {
 // The membership probes and the upgrades are the same as Put's: an already
 // admitted message is upgraded (never re-charged), and the identity probe is
 // the reverse index, so a mutated DeliveryTag cannot admit a second entry.
-func (c *hotCache) PutBestEffort(queue string, m *protocol.Message, backed bool, durable bool) bool {
-	entry, ok := c.PutBestEffortEntry(queue, m, backed, durable)
-	return ok && entry != nil
-}
-
-// PutBestEffortEntry is PutBestEffort plus the ENTRY it admitted.
 //
 // IT RETURNS THE ENTRY SO THE CALLER CAN MARK IT DURABLE LATER WITHOUT
 // TAKING THE QUEUE'S LOCK AGAIN (see MarkDurableEntry). The publish path
@@ -766,7 +793,7 @@ func (c *hotCache) putBestEffortLocked(q *hotCacheQueue, queue string, m *protoc
 	if backed && q.oldestBacked.Load() == 0 {
 		q.oldestBacked.Store(int64(entry.lastUsed))
 	}
-	c.noteQueueUsed(queue, q.used)
+	c.noteQueueUsed(q, q.used)
 	return entry
 }
 
@@ -848,6 +875,44 @@ func (c *hotCache) GetResident(queue string, tag uint64) (m *protocol.Message, b
 	return entry.message, entry.backed, true
 }
 
+// TakeResident atomically probes AND removes the entry admitted under tag,
+// returning it whether or not it is durable, in ONE critical section and
+// WITHOUT promoting the entry in the LRU.
+//
+// It exists for the settlement path (StorageEngine.DeleteMessage). That path
+// used to call GetResident and then Delete: two critical sections, and the
+// probe promoted an entry that was about to be removed (a global seq.Add, an
+// LRU MoveToFront, and sometimes a walk to refresh the oldest-backed stamp —
+// all wasted on a doomed entry). TakeResident does the probe and the removal
+// under one lock and skips the promotion.
+//
+// IT IS EXACTLY EQUIVALENT to GetResident-then-Delete for a caller that
+// discards Delete's unique-winner result: same predicate (present or not),
+// same returned (message, backed) pair, the same removal, and the same mirror
+// update (noteQueueUsed). A caller that NEEDS Delete's winner result must keep
+// the two-step form (see StorageEngine.DeleteMessageIfPresentDetailed),
+// because making the pair atomic would let it win a race the two-step form can
+// legitimately lose.
+func (c *hotCache) TakeResident(queue string, tag uint64) (m *protocol.Message, backed, ok bool) {
+	q := c.queueStateIfPresent(queue)
+	if q == nil {
+		return nil, false, false
+	}
+
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	hotCacheQueueLockFire(q.name)
+
+	entry, ok := q.entries[tag]
+	if !ok {
+		return nil, false, false
+	}
+	m, backed = entry.message, entry.backed
+	c.removeLocked(q, entry)
+	c.noteQueueUsed(q, q.used)
+	return m, backed, true
+}
+
 // Delete removes an entry while holding the queue's lock, making exactly one
 // concurrent caller the winner for a present queue/tag pair.
 func (c *hotCache) Delete(queue string, tag uint64) bool {
@@ -865,7 +930,7 @@ func (c *hotCache) Delete(queue string, tag uint64) bool {
 		return false
 	}
 	c.removeLocked(q, entry)
-	c.noteQueueUsed(queue, q.used)
+	c.noteQueueUsed(q, q.used)
 	return true
 }
 
@@ -957,7 +1022,7 @@ func (c *hotCache) DeleteRange(queue string, minTag, maxTag uint64) int {
 		removed++
 	}
 	if removed > 0 {
-		c.noteQueueUsed(queue, q.used)
+		c.noteQueueUsed(q, q.used)
 	}
 	return removed
 }
@@ -1068,7 +1133,7 @@ func (c *hotCache) freeGlobalSpace(admitting *hotCacheQueue, charge int64) bool 
 				break
 			}
 		}
-		c.noteQueueUsed(victim.name, victim.used)
+		c.noteQueueUsed(victim, victim.used)
 		victim.mu.Unlock()
 	}
 
@@ -1089,7 +1154,7 @@ func (c *hotCache) freeGlobalSpace(admitting *hotCacheQueue, charge int64) bool 
 				break
 			}
 		}
-		c.noteQueueUsed(admitting.name, admitting.used)
+		c.noteQueueUsed(admitting, admitting.used)
 		admitting.mu.Unlock()
 	}
 	return c.globalRoom(charge)
@@ -1197,21 +1262,17 @@ func (q *hotCacheQueue) refreshOldestBackedLocked() {
 	q.oldestBacked.Store(int64(stamp))
 }
 
-// noteQueueUsed publishes the queue's resident byte count into the mirror
-// map.
+// noteQueueUsed publishes the queue's resident byte count into the mirror.
 //
-// The mirror is the observable projection of the queue's own accounting, so
-// it is written from under the queue's lock (the queue's lock is always
-// taken BEFORE the mirror lock) and it is written on every change, so it
-// never drifts from the authoritative value.
-func (c *hotCache) noteQueueUsed(queue string, used int64) {
-	c.queueUsedMu.Lock()
-	if used == 0 {
-		delete(c.queueUsed, queue)
-	} else {
-		c.queueUsed[queue] = used
-	}
-	c.queueUsedMu.Unlock()
+// The mirror is the observable projection of the queue's own accounting, so it
+// is written from under the queue's lock (the caller holds it) and it is
+// written on every change, so it never drifts from the authoritative value.
+// The store itself is a single atomic: there is no second lock, so publishing
+// the mirror never stretches the queue's critical section beyond the mutation
+// that produced it -- which matters because every one of the nine call sites
+// already holds the queue's lock.
+func (c *hotCache) noteQueueUsed(q *hotCacheQueue, used int64) {
+	q.usedMirror.Store(used)
 }
 
 func cacheCharge(queue string, m *protocol.Message) int64 {
