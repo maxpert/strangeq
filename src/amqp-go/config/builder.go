@@ -44,26 +44,6 @@ func (b *ConfigBuilder) WithMaxConnections(max int) *ConfigBuilder {
 	return b
 }
 
-// WithHeartbeat sets the heartbeat interval
-func (b *ConfigBuilder) WithHeartbeat(interval time.Duration) *ConfigBuilder {
-	b.config.Network.HeartbeatIntervalMS = interval.Milliseconds()
-	return b
-}
-
-// WithTCPKeepAlive enables/disables TCP keep-alive
-func (b *ConfigBuilder) WithTCPKeepAlive(enabled bool, interval time.Duration) *ConfigBuilder {
-	b.config.Network.TCPKeepAlive = enabled
-	b.config.Network.TCPKeepAliveIntervalMS = interval.Milliseconds()
-	return b
-}
-
-// WithBufferSizes sets read and write buffer sizes
-func (b *ConfigBuilder) WithBufferSizes(readSize, writeSize int) *ConfigBuilder {
-	b.config.Network.ReadBufferSize = readSize
-	b.config.Network.WriteBufferSize = writeSize
-	return b
-}
-
 // Storage Configuration
 
 // WithStoragePath sets the data directory path
@@ -77,14 +57,6 @@ func (b *ConfigBuilder) WithStoragePath(path string) *ConfigBuilder {
 // Any other value is rejected by Validate/Build.
 func (b *ConfigBuilder) WithDurability(durability string) *ConfigBuilder {
 	b.config.Storage.Durability = durability
-	return b
-}
-
-// WithCRCCheck enables/disables CRC32 integrity checks for WAL/segment records.
-// It sets the tri-state flag to an explicit value (never nil), so building via
-// the fluent API always expresses a concrete integrity choice.
-func (b *ConfigBuilder) WithCRCCheck(enabled bool) *ConfigBuilder {
-	b.config.Storage.CRCCheck = &enabled
 	return b
 }
 
@@ -116,65 +88,6 @@ func (b *ConfigBuilder) WithTLS(certFile, keyFile string) *ConfigBuilder {
 	return b
 }
 
-// WithTLSCA sets the TLS CA file
-func (b *ConfigBuilder) WithTLSCA(caFile string) *ConfigBuilder {
-	b.config.Security.TLSCAFile = caFile
-	return b
-}
-
-// WithAuthentication enables authentication with the specified backend
-func (b *ConfigBuilder) WithAuthentication(backend string, options map[string]interface{}) *ConfigBuilder {
-	b.config.Security.AuthenticationEnabled = true
-	b.config.Security.AuthenticationBackend = backend
-	b.config.Security.AuthenticationConfig = options
-	return b
-}
-
-// WithFileAuthentication enables file-based authentication
-func (b *ConfigBuilder) WithFileAuthentication(userFile string) *ConfigBuilder {
-	return b.WithAuthentication("file", map[string]interface{}{
-		"user_file": userFile,
-	})
-}
-
-// WithAuthorization enables authorization
-func (b *ConfigBuilder) WithAuthorization(enabled bool) *ConfigBuilder {
-	b.config.Security.AuthorizationEnabled = enabled
-	return b
-}
-
-// WithVirtualHost sets the default virtual host
-func (b *ConfigBuilder) WithVirtualHost(vhost string) *ConfigBuilder {
-	b.config.Security.DefaultVHost = vhost
-	return b
-}
-
-// WithAccessControl sets allowed and blocked users/hosts
-func (b *ConfigBuilder) WithAccessControl(allowedUsers, blockedUsers, allowedHosts, blockedHosts []string) *ConfigBuilder {
-	b.config.Security.AllowedUsers = allowedUsers
-	b.config.Security.BlockedUsers = blockedUsers
-	b.config.Security.AllowedHosts = allowedHosts
-	b.config.Security.BlockedHosts = blockedHosts
-	return b
-}
-
-// WithAuthFailureLimit configures the per-peer failed-authentication limiter.
-// limit 0 disables it; window is the refill window.
-func (b *ConfigBuilder) WithAuthFailureLimit(limit int, window time.Duration) *ConfigBuilder {
-	b.config.Security.AuthFailureLimit = limit
-	b.config.Security.AuthFailureWindowMS = window.Milliseconds()
-	return b
-}
-
-// WithTelemetry configures the telemetry HTTP endpoint.
-func (b *ConfigBuilder) WithTelemetry(enabled bool, address string, port int, pprof bool) *ConfigBuilder {
-	b.config.Telemetry.Enabled = enabled
-	b.config.Telemetry.Address = address
-	b.config.Telemetry.Port = port
-	b.config.Telemetry.PprofEnabled = pprof
-	return b
-}
-
 // Server Configuration
 
 // WithServerInfo sets server identification information
@@ -191,21 +104,6 @@ func (b *ConfigBuilder) WithServerInfo(name, version, product, platform, copyrig
 func (b *ConfigBuilder) WithLogging(level, logFile string) *ConfigBuilder {
 	b.config.Server.LogLevel = level
 	b.config.Server.LogFile = logFile
-	return b
-}
-
-// WithDaemonize enables/disables daemon mode
-func (b *ConfigBuilder) WithDaemonize(enabled bool, pidFile string) *ConfigBuilder {
-	b.config.Server.Daemonize = enabled
-	b.config.Server.PidFile = pidFile
-	return b
-}
-
-// WithProtocolLimits sets AMQP protocol limits
-func (b *ConfigBuilder) WithProtocolLimits(maxChannels int, maxFrameSize int, maxMessageSize int64) *ConfigBuilder {
-	b.config.Server.MaxChannelsPerConnection = maxChannels
-	b.config.Server.MaxFrameSize = maxFrameSize
-	b.config.Server.MaxMessageSize = maxMessageSize
 	return b
 }
 
