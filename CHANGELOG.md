@@ -2,6 +2,40 @@
 
 ## [Unreleased]
 
+### Changed
+- Metrics-tab correctness, from a post-release review of the metric surface (see
+  [docs/METRICS.md](docs/METRICS.md)):
+  - Five families the broker actually emits no longer fall into the `Other`
+    catch-all (which is now reserved for genuinely unknown families):
+    `amqp_consumer_register_errors_total`, `amqp_deliveries_dropped_total`,
+    `amqp_deliveries_requeued_total`, `amqp_delivery_send_errors_total`,
+    `amqp_publish_refused_total`. A test now fails if any emitted family lands in
+    `Other`.
+  - The `Unroutable` tile is `warn`, not `bad`: a mandatory publish with no
+    matching binding is a normal caller outcome.
+  - The `WAL full flushes` tile is `bad` only in `barrier` durability mode, and
+    only for traffic-path flush sites. Under `storage.durability: flush` a full
+    flush per confirm is the configured behaviour, so it is informational there
+    (the durability mode is now passed to the UI; an absent or unrecognised mode
+    falls back to the strict `barrier` reading).
+- The tile outcome rule has three documented cases: the family is absent ⇒ `—`
+  with `not emitted by this broker`; the family is present ⇒ the number; the
+  family is present but a **filtered** selector matches no series ⇒ `0`. A
+  malformed `=~`/`!~` pattern is never read as `0` — it degrades the tile to `—`
+  and names the offending pattern.
+
+### Fixed
+- `config.sample.yaml` and `interfaces/config.go` claimed all three
+  `storage.durability` values use fdatasync on Linux, "so any value is power-loss
+  safe". Only `barrier` and `flush` do; `none` issues no group-commit barrier and
+  is not power-loss safe.
+- The headless-browser test harness used a fixed 30 s per-tab deadline that flaked
+  under host CPU contention, and applied it only *after* tab creation. The bound
+  is now 90 s clamped to the go-test budget, covers tab setup as well, and names
+  the test, the stage and the bound on timeout.
+
+## [0.14.0] - 2026-11-08
+
 ### Added
 - Management **control plane**: an optional RabbitMQ-4.4-management-subset REST API and an
   embedded single-binary web UI (assets `go:embed`-ed; no separate folder, build step, or
@@ -27,7 +61,32 @@
   a golden inventory test and documented in [docs/METRICS.md](docs/METRICS.md).
 - `--management`, `--management-address`, and `--management-port` flags.
 
+### Changed
+- `amqp_wal_settle_drained_total` is renamed `amqp_wal_settle_drained`: it is a
+  gauge, not a counter, so the `_total` suffix was wrong. Update any dashboard or
+  alert referring to the old name.
+
 ### Fixed
+- `amqp_message_delivery_duration_seconds` was never observed — its only producer
+  sat on a code path no delivery took. Both batched delivery writers now time the
+  batch write.
+- `amqp_channels_total` leaked on connection teardown while channels were still
+  open; the teardown path now records each channel close.
+- A batched `basic.ack`/`basic.nack` with `multiple=true` counted a single settled
+  delivery instead of every delivery it settled.
+- `amqp_consumers_total` stayed stale when a channel was closed without the
+  connection being closed.
+- Deleting a queue did not reclaim its segment or hot-cache per-queue series, so
+  the metric surface grew without bound.
+- Exclusive-queue teardown did not increment `amqp_queues_deleted_total`.
+- Messages published through the management API were not counted in
+  `amqp_messages_published_total`.
+- The bundled Grafana dashboard queried `amqp_messages_dropped_total`, a family the
+  broker never writes; the panel now uses `amqp_deliveries_dropped_total` and
+  `amqp_publish_refused_total`. New repo gates parse every dashboard expression
+  against the metric inventory, and every VITALS tile selector too.
+- The `Management 5xx` tile selected `status_class="5xx"`, a label value that can
+  never occur (the class is the bare digit), so the tile was permanently `—`.
 - The AMQP handshake wrote `conn.Username`/`conn.Vhost` after the connection was published
   into the registry and outside `Server.Mutex`, racing the management read path (which
   reads them under `Mutex.RLock`). The handshake assignments now hold `Server.Mutex`, and
