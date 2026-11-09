@@ -279,9 +279,9 @@ func leaseBody(n int) []byte { return make([]byte, n) }
 // BEFORE its body is read and before a confirm tag is minted.
 func TestLease_ReservedAtHeaderBeforeBodyAndTag(t *testing.T) {
 	release := gateWALWrite(t)
-	srv, addr, _, _, _ := leaseServer(t, 1<<20, nil, nil)
+	srv, _, _, _, _ := leaseServer(t, 1<<20, nil, nil)
 
-	r := dialRaw(t, addr)
+	r := dialRawPipe(t, srv)
 	r.handshake("guest", "guest", 16, 0)
 	r.openChannel(1)
 	r.declareQueue(1, "sl1-q")
@@ -346,6 +346,10 @@ func TestLease_ReservedAtHeaderBeforeBodyAndTag(t *testing.T) {
 
 // SL-2: ten producers, 200 publishes each; used <= G at every step; all 2000
 // confirmed; used == 0 at the end.
+// SOCKET-REQUIRED: every producer publishes 200 messages before it reads a
+// single confirm. On a synchronous net.Pipe the broker's small ack writes block
+// until the client reads, so the broker's write deadline fires and it closes
+// the pipe. TCP absorbs those acks in the kernel send buffer. Stays on dialRaw.
 func TestLease_TenProducersBoundedByG(t *testing.T) {
 	const G = int64(1 << 20)
 	srv, addr, _, _, probe := leaseServer(t, G, nil, nil)
@@ -583,9 +587,9 @@ func TestLease_1000Connections(t *testing.T) {
 // unchanged.
 func TestLease_OversizedProgress(t *testing.T) {
 	release := gateWALWrite(t)
-	srv, addr, _, _, probe := leaseServer(t, 1<<20, nil, nil)
+	srv, _, _, _, probe := leaseServer(t, 1<<20, nil, nil)
 
-	r := dialRaw(t, addr)
+	r := dialRawPipe(t, srv)
 	r.handshake("guest", "guest", 4, 0)
 	r.openChannel(1)
 	r.declareQueue(1, "sl5-q")
@@ -617,7 +621,7 @@ func TestLease_OversizedProgress(t *testing.T) {
 func startPipeServerConnection(t *testing.T, srv *Server) (*rawAMQP, <-chan struct{}) {
 	t.Helper()
 	clientConn, serverConn := net.Pipe()
-	r := &rawAMQP{t: t, c: clientConn, r: nil}
+	r := &rawAMQP{t: t, c: clientConn, r: nil, pipe: true}
 	r.r = newBufioReader(clientConn)
 	done := make(chan struct{})
 	go func() {
@@ -799,9 +803,9 @@ func TestLease_TxPublishReleasedAtBuffer(t *testing.T) {
 // SL-9: a malformed header (payload < 12 bytes) pairs a nil lease; the
 // processor produces the existing malformed outcome; no leak.
 func TestLease_MalformedHeaderNilLease(t *testing.T) {
-	srv, addr, created, released, _ := leaseServer(t, 0, nil, nil)
+	srv, _, created, released, _ := leaseServer(t, 0, nil, nil)
 
-	r := dialRaw(t, addr)
+	r := dialRawPipe(t, srv)
 	r.handshake("guest", "guest", 4, 0)
 	r.openChannel(1)
 	r.declareQueue(1, "sl9-q")
@@ -825,8 +829,8 @@ func TestLease_MalformedHeaderNilLease(t *testing.T) {
 // SL-10: the channel-max and closing-gate discards release the header lease.
 func TestLease_DiscardGatesRelease(t *testing.T) {
 	t.Run("channel-max gate", func(t *testing.T) {
-		srv, addr, created, released, _ := leaseServer(t, 0, nil, nil)
-		r := dialRaw(t, addr)
+		srv, _, created, released, _ := leaseServer(t, 0, nil, nil)
+		r := dialRawPipe(t, srv)
 		r.handshake("guest", "guest", 1, 0) // channel_max = 1
 		r.openChannel(1)
 		r.declareQueue(1, "sl10-q")
@@ -847,8 +851,8 @@ func TestLease_DiscardGatesRelease(t *testing.T) {
 	})
 
 	t.Run("closing gate", func(t *testing.T) {
-		srv, addr, created, released, _ := leaseServer(t, 0, nil, nil)
-		r := dialRaw(t, addr)
+		srv, _, created, released, _ := leaseServer(t, 0, nil, nil)
+		r := dialRawPipe(t, srv)
 		r.handshake("guest", "guest", 4, 0)
 		r.openChannel(1)
 		r.declareQueue(1, "sl10-q")
@@ -873,6 +877,11 @@ func TestLease_DiscardGatesRelease(t *testing.T) {
 
 // SL-11: on a mixed consumer+producer connection, acks are processed after
 // the grant and the connection stays open.
+// SOCKET-REQUIRED: this test sends a basic.ack while the broker reader is
+// parked in a lease Reserve and expects the Write to COMPLETE and the ack to be
+// read only after the grant. That needs kernel send buffering; on a synchronous
+// net.Pipe the Write blocks until the (parked) reader resumes, so the test
+// deadlocks. It stays on dialRaw.
 func TestLease_MixedConnAcksAfterGrant(t *testing.T) {
 	release := gateWALWrite(t)
 	srv, addr, _, _, _ := leaseServer(t, 1<<20, nil, nil)
@@ -1063,9 +1072,9 @@ func TestLease_DeadlineAfterWait(t *testing.T) {
 // SL-13: a seeded mix of publish outcomes leaves created == released and
 // used == 0.
 func TestLease_NoLeakPerLease(t *testing.T) {
-	srv, addr, created, released, probe := leaseServer(t, 1<<20, nil, nil)
+	srv, _, created, released, probe := leaseServer(t, 1<<20, nil, nil)
 
-	r := dialRaw(t, addr)
+	r := dialRawPipe(t, srv)
 	r.handshake("guest", "guest", 8, 0)
 	r.openChannel(1)
 	r.declareQueue(1, "sl13-q")
@@ -1129,9 +1138,9 @@ func TestLease_NoLeakPerLease(t *testing.T) {
 // succeeds; interleaved bodies both confirm.
 func TestLease_InterleavedChannelsWithinBudget(t *testing.T) {
 	release := gateWALWrite(t)
-	srv, addr, _, _, _ := leaseServer(t, 1<<20, nil, nil)
+	srv, _, _, _, _ := leaseServer(t, 1<<20, nil, nil)
 
-	r := dialRaw(t, addr)
+	r := dialRawPipe(t, srv)
 	r.handshake("guest", "guest", 8, 0)
 	r.openChannel(1)
 	r.openChannel(2)
@@ -1173,7 +1182,7 @@ func TestLease_InterleavedChannelsWithinBudget(t *testing.T) {
 // count, not on the global `created` counter, which X's teardown moves.
 func TestLease_NestedHeaderOverBudgetCloses(t *testing.T) {
 	release := gateWALWrite(t)
-	srv, addr, created, released, probe := leaseServer(t, 1<<20, nil, nil)
+	srv, _, created, released, probe := leaseServer(t, 1<<20, nil, nil)
 
 	// PER-CONNECTION grant accounting. The limiter reports every grant it
 	// makes as "grant:<connID>" through the step hook, so the invariant this
@@ -1203,7 +1212,7 @@ func TestLease_NestedHeaderOverBudgetCloses(t *testing.T) {
 
 	// X: ch1 publishes 600 KiB (lease ≈ 615272) but only sends part of the
 	// body — the leased body stays owed.
-	x := dialRaw(t, addr)
+	x := dialRawPipe(t, srv)
 	x.handshake("guest", "guest", 8, 0)
 	x.openChannel(1)
 	x.declareQueue(1, "sl15-q")
@@ -1231,7 +1240,7 @@ func TestLease_NestedHeaderOverBudgetCloses(t *testing.T) {
 
 	// Y: a full 600 KiB durable publish — its header's blocking Reserve queues
 	// (used + lease > G), and its body stays unread.
-	y := dialRaw(t, addr)
+	y := dialRawPipe(t, srv)
 	y.handshake("guest", "guest", 4, 0)
 	y.openChannel(1)
 	leaseConfirmSelect(t, y, 1)
