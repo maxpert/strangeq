@@ -278,6 +278,18 @@ with `Allow`), **429** (rate limited), and **503** (shutting down / broker unava
 | DELETE | `/api/connections/{name}` | Force-close one connection (graceful `connection.close 320`). `204`, `404`, `403`. |
 | DELETE | `/api/connections/username/{user}` | Close every connection of a user. `204`, `403`. |
 
+A connection object also carries RabbitMQ's transport/mechanism fields:
+
+- `secure` (bool) and its legacy alias `ssl` (bool) — **derived from the transport**:
+  `true` when the accepted socket is a `*tls.Conn` (i.e. `security.tls.enabled` wrapped the
+  listener), `false` otherwise. `secure` and `ssl` are always equal. A validated `PLAIN`
+  mechanism does **not** set them; `SASL EXTERNAL` is not accepted, so a non-TLS connection
+  can never report `secure=true`. Neither flag claims TLS is configured when it is not.
+- `auth_mechanism` (string) — the SASL mechanism that **actually authenticated** the
+  connection (for example `"PLAIN"`). It is `""` when authentication is disabled (no SASL
+  verification happens) or when the handshake has not completed `connection.start-ok`, and
+  it is never set on a refused attempt.
+
 ### Channels (read-only)
 
 | Method | Path | Purpose |
@@ -389,8 +401,8 @@ with data). It is gated by the same capability and resource gates as the API.
 | Screen | Route | Contents |
 |--------|-------|----------|
 | S1 Overview | `/` | Health dot, alarm banner, unsafe-recovery banner, connection/channel/queue/consumer/exchange totals, queues-with-messages, and a Top-queues-by-ready table. Auto-refreshes every 2 s while visible. |
-| S2 Connections list | `/connections` | Filter/sort, per-row Close. |
-| S3 Connection detail | `/connections/{name}` | Connection fields and its channels. |
+| S2 Connections list | `/connections` | Filter/sort, a per-row `SSL` badge for TLS connections, per-row Close. |
+| S3 Connection detail | `/connections/{name}` | Connection fields (including `SSL` Yes/No and `auth_mechanism`) and its channels. |
 | S4 Channels | `/channels`, `/channels/{id}` | Read-only list and detail; the UI states there is no close-channel operation. |
 | S5 Consumers | `/consumers` | Consumer list. |
 | S6 Exchanges list | `/exchanges` | List, filter by type, declare. |
@@ -456,6 +468,11 @@ deliberate and surfaced honestly rather than faked:
 - **Two `/metrics`** — on the telemetry listener `/metrics` is the unauthenticated
   Prometheus text; on the management listener `/metrics` is the SPA deep link. Different
   origins, different content.
+- **Connection `secure`/`ssl` and `auth_mechanism`** — `secure`/`ssl` come from the
+  transport (a `*tls.Conn` accepted socket), never from the SASL mechanism; `PLAIN` over a
+  plaintext socket is not secure. `auth_mechanism` names the mechanism that authenticated
+  and is empty when authentication is disabled or not yet negotiated. `SASL EXTERNAL` is
+  not accepted, so a non-TLS connection can never report `secure=true`.
 
 The S14 About screen lists these divergences at runtime, and the resolved-capability list
 from `GET /api/strangeq/version` reports which optional broker seams are present.

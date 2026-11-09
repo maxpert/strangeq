@@ -227,6 +227,7 @@ table.data-table { border-collapse: collapse; width: 100%; background: var(--pan
 }
 .badge.warn { background: var(--warn-bg); color: var(--warn); }
 .badge.system { background: #e7eefb; color: var(--accent); }
+.badge.ssl-badge { background: var(--ok-bg); color: var(--ok); }
 
 .notice {
   border: 1px solid var(--warn);

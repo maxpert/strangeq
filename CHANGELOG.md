@@ -2,6 +2,23 @@
 
 ## [Unreleased]
 
+### Added
+- RabbitMQ-compatible transport/mechanism reporting on management
+  `/api/connections` objects:
+  - `secure` (and its legacy alias `ssl`) — `true` only when the accepted socket
+    is a `*tls.Conn` (the TLS listener), derived from the transport, never from
+    the SASL mechanism. A validated `PLAIN` mechanism over a plaintext socket is
+    **not** secure, and since `SASL EXTERNAL` is not accepted a non-TLS
+    connection can never report `secure=true`. These flags only report; TLS
+    support is unchanged.
+  - `auth_mechanism` — the SASL mechanism that actually authenticated the
+    connection (e.g. `"PLAIN"`), recorded only on a successful authentication.
+    It is empty when authentication is disabled (no SASL verification occurs) or
+    before the handshake completes, and is never set on a refused attempt.
+  - The connections screen shows a text-labelled `SSL` badge on secure rows
+    (state is not conveyed by colour alone) and the detail page adds `SSL`
+    Yes/No plus the `auth_mechanism` (em-dash when empty).
+
 ## [0.14.1] - 2026-11-09
 
 ### Changed

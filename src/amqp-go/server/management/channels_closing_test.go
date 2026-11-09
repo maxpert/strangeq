@@ -59,6 +59,13 @@ func (r *b2RawConn) readMethod() (ch, class, method uint16, payload []byte) {
 
 func (r *b2RawConn) handshake() {
 	r.t.Helper()
+	r.handshakeAs("guest", "guest")
+}
+
+// handshakeAs runs the same happy-path handshake with explicit SASL PLAIN
+// credentials, so a test can authenticate against an auth-enabled server.
+func (r *b2RawConn) handshakeAs(user, pass string) {
+	r.t.Helper()
 	if _, err := r.c.Write([]byte("AMQP\x00\x00\x09\x01")); err != nil {
 		r.t.Fatalf("write protocol header: %v", err)
 	}
@@ -69,7 +76,7 @@ func (r *b2RawConn) handshake() {
 	startOK := &protocol.ConnectionStartOKMethod{
 		ClientProperties: map[string]interface{}{},
 		Mechanism:        "PLAIN",
-		Response:         []byte("\x00guest\x00guest"),
+		Response:         []byte("\x00" + user + "\x00" + pass),
 		Locale:           "en_US",
 	}
 	data, err := startOK.Serialize()

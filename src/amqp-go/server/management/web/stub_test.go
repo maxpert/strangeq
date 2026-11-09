@@ -39,9 +39,12 @@ type stubAPI struct {
 	// observe server-side reversal (sort_reverse=true).
 	exchangeItems   []map[string]any
 	connectionItems []map[string]any
-	channelItems    []map[string]any
-	consumerItems   []map[string]any
-	userItems       []map[string]any
+	// connectionDetail overrides the single-connection GET body (secure/ssl and
+	// auth_mechanism included) so the detail screen can be exercised.
+	connectionDetail map[string]any
+	channelItems     []map[string]any
+	consumerItems    []map[string]any
+	userItems        []map[string]any
 
 	// bindingItems is the aggregate binding set; nil installs one default row.
 	bindingItems []map[string]any
@@ -1008,7 +1011,13 @@ func (s *stubAPI) handleConnections(w http.ResponseWriter, r *http.Request, segs
 	if len(segs) == 3 {
 		switch r.Method {
 		case http.MethodGet:
-			writeRead(w, r, map[string]any{"name": segs[2], "user": "guest", "vhost": "/", "state": "running", "channels": 1, "protocol": "AMQP 0-9-1", "peer_host": "127.0.0.1", "peer_port": 5000, "connected_at": "2026-11-08T00:00:00Z", "last_activity": "2026-11-08T00:00:01Z"})
+			s.mu.Lock()
+			detail := s.connectionDetail
+			s.mu.Unlock()
+			if detail == nil {
+				detail = map[string]any{"name": segs[2], "user": "guest", "vhost": "/", "state": "running", "channels": 1, "protocol": "AMQP 0-9-1", "peer_host": "127.0.0.1", "peer_port": 5000, "connected_at": "2026-11-08T00:00:00Z", "last_activity": "2026-11-08T00:00:01Z"}
+			}
+			writeRead(w, r, detail)
 			return
 		case http.MethodDelete:
 			s.mu.Lock()

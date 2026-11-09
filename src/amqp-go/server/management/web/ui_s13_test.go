@@ -158,3 +158,17 @@ func TestUI_S13_DefinitionsImportErrors(t *testing.T) {
 		})
 	}
 }
+
+// TestUI_About_DivergenceSecureRow proves the S14 About screen's runtime
+// divergence table carries the connection secure/ssl + auth_mechanism row that
+// docs/MANAGEMENT.md documents. The docs claim the About screen lists these
+// divergences at runtime, so the row must actually be in the divergences array.
+func TestUI_About_DivergenceSecureRow(t *testing.T) {
+	js := string(readAsset(t, "app.js"))
+	if !strings.Contains(js, `["DIV-secure",`) {
+		t.Error("app.js divergence table lacks a DIV-secure row")
+	}
+	if !strings.Contains(js, "secure/ssl are derived from the transport") {
+		t.Error("the DIV-secure row must state that secure/ssl come from the transport")
+	}
+}

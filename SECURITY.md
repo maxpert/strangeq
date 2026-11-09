@@ -83,7 +83,11 @@ server:
 ## Known Limitations
 
 1. **Rate limiting**: Basic per-IPv4/per-IPv6-/64 failed-authentication limiting only (`security.authfailurelimit`); there is no general request-rate limiting
-2. **SASL EXTERNAL**: Not supported (certificate-based auth via mTLS is supported)
+2. **SASL EXTERNAL**: Not supported (certificate-based auth via mTLS is supported). The
+   management `/api/connections` `secure`/`ssl` flags are derived from the **transport**
+   only: a validated `PLAIN` mechanism over a plaintext socket is not treated as making a
+   connection secure, and because EXTERNAL is never accepted, a non-TLS connection can
+   never report `secure=true`.
 3. **Audit logging**: Not implemented
 
 ## Security Checklist
