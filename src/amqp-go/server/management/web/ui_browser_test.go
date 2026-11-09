@@ -17,6 +17,7 @@ import (
 
 	"github.com/chromedp/cdproto/cdp"
 	"github.com/chromedp/cdproto/page"
+	"github.com/chromedp/cdproto/target"
 	"github.com/chromedp/chromedp"
 )
 
@@ -232,16 +233,62 @@ func newTab(t *testing.T) (context.Context, context.CancelFunc) {
 // chromedp context derived from parent, so the returned cancel closes it.
 func boundedTab(t *testing.T, parent context.Context) (context.Context, context.CancelFunc, error) {
 	t.Helper()
+	return boundedTabWithin(t, parent, browserDeadline(t))
+}
+
+// boundedTabWithin is boundedTab with the per-tab bound supplied by the caller
+// instead of read from SQ_BROWSER_DEADLINE / the go-test budget, so a test can
+// drive the setup-timeout path deterministically without mutating process-global
+// state. On the setup-failure path it also reaps any page target the timed-out
+// Do created without attaching (see reapUnattachedPageTargets).
+func boundedTabWithin(t *testing.T, parent context.Context, bound time.Duration) (context.Context, context.CancelFunc, error) {
+	t.Helper()
 	tabCtx, cancelTab := chromedp.NewContext(parent)
-	bound := browserDeadline(t)
 	ctx, cancelTimeout := context.WithTimeout(tabCtx, bound)
 	ctx = context.WithValue(ctx, browserTabKey{}, &browserTab{bound: bound, started: time.Now()})
 	if err := chromedp.Do(ctx); err != nil {
 		cancelTimeout()
 		cancelTab()
+		// A timed-out first Run can create the target in the browser without ever
+		// attaching it (Context.Target stays nil), so cancelTab() has no handle to
+		// close it. Reap the browser's unattached page targets before returning.
+		reapUnattachedPageTargets(parent)
 		return ctx, func() {}, err
 	}
 	return ctx, func() { cancelTimeout(); cancelTab() }, nil
+}
+
+// reapUnattachedPageTargets best-effort closes every page target of ctx's
+// browser that has no attached client. It exists for the tab-setup failure path:
+// a first chromedp.Do cut by the tab bound can leave the page target open in the
+// browser without ever attaching it, so Context.Target stays nil and the
+// cancelTab() handle is gone — nothing else can close it, and every orphan holds
+// a renderer. At that moment the only live page target without a client is the
+// orphan this setup just created: every live harness tab (browserCtx's, newTab's)
+// reports Attached=true.
+//
+// It is deliberately best-effort: a concurrent close can race to
+// "No target with given id found (-32602)", which is ignored, and a ctx with no
+// browser (a parent that was cancelled before it ever ran) is a no-op.
+//
+// NOTE: if this package ever adopts t.Parallel, the Attached rule must become a
+// snapshot-diff — record the page-target IDs before the Do and close only the
+// IDs that appeared — because a live tab could momentarily be unattached.
+func reapUnattachedPageTargets(ctx context.Context) {
+	if chromedp.FromContext(ctx) == nil {
+		return
+	}
+	infos, err := chromedp.Targets(ctx)
+	if err != nil {
+		return
+	}
+	for _, in := range infos {
+		if in.Type != "page" || in.Attached {
+			continue
+		}
+		_, _ = chromedp.CallBrowser[target.CloseTargetParams, cdp.Empty](
+			ctx, target.CloseTarget, target.CloseTargetParams{TargetID: in.TargetID})
+	}
 }
 
 func chromeExecPath() string {
@@ -574,6 +621,119 @@ func TestUI_BrowserTabFailureDiagnosis(t *testing.T) {
 		if !strings.Contains(msg, want) {
 			t.Errorf("diagnosis %q does not contain %q", msg, want)
 		}
+	}
+}
+
+// listPageTargetIDs returns the sorted IDs of ctx's browser's page targets.
+// Non-page targets (workers, iframes, the browser's own devtools target) are
+// excluded: the tab setup only ever creates a page.
+func listPageTargetIDs(ctx context.Context) ([]string, error) {
+	infos, err := chromedp.Targets(ctx)
+	if err != nil {
+		return nil, err
+	}
+	ids := make([]string, 0, len(infos))
+	for _, in := range infos {
+		if in.Type == "page" {
+			ids = append(ids, string(in.TargetID))
+		}
+	}
+	slices.Sort(ids)
+	return ids, nil
+}
+
+// waitForTargetIDs polls the page-target IDs until they equal want (success) or
+// have been unchanged for settle (the browser has settled on a different set),
+// bounded by timeout. List errors are skipped, not fatal: a transient fetch
+// failure must not fail the leak assertion. The final sample is returned so the
+// caller can name exactly which targets leaked.
+func waitForTargetIDs(ctx context.Context, want []string, timeout, settle time.Duration) ([]string, bool) {
+	deadline := time.Now().Add(timeout)
+	var cur, prev []string
+	lastChange := time.Now()
+	for {
+		ids, err := listPageTargetIDs(ctx)
+		if err == nil {
+			cur = ids
+			if slices.Equal(cur, want) {
+				return cur, true
+			}
+			if !slices.Equal(cur, prev) {
+				prev = cur
+				lastChange = time.Now()
+			} else if time.Since(lastChange) >= settle {
+				return cur, false
+			}
+		}
+		if !time.Now().Before(deadline) {
+			return cur, false
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+// timedOutSetup runs one tab setup with a 1ns bound and reports whether the
+// resulting chromedp context has no Target — the state that makes cancelTab()
+// unable to close a target the timed-out Do may have created in the browser.
+func timedOutSetup(t *testing.T, parent context.Context) (nilTarget bool) {
+	t.Helper()
+	ctx, cancel, err := boundedTabWithin(t, parent, time.Nanosecond)
+	defer cancel()
+	if err == nil {
+		t.Fatalf("tab setup with a 1ns bound must fail, not create an attached tab")
+	}
+	h := chromedp.FromContext(ctx)
+	return h == nil || h.Target == nil
+}
+
+// TestUI_BrowserTabSetupDoesNotLeakTabs pins the tab-setup failure path: a first
+// chromedp.Do cut by the tab bound can create the page target in the browser
+// without ever attaching it, so Context.Target stays nil and cancelTab() has no
+// handle to close it. boundedTab must reap the browser's unattached page targets
+// on that path, or each timed-out setup can orphan a renderer. Roughly half of
+// timed-out setups leak, so 12 attempts leave an orphan with p ~ 0.9998 pre-fix
+// and none with the fix.
+func TestUI_BrowserTabSetupDoesNotLeakTabs(t *testing.T) {
+	if browserErr != nil {
+		t.Skipf("headless browser unavailable: %v", browserErr)
+	}
+
+	// One healthy observer tab keeps a live attached page target in the
+	// snapshot, so the assertion also proves the reap never closes a real tab.
+	observer, cancelObserver := newTab(t)
+	defer cancelObserver()
+	mustDo(t, observer, chromedp.Navigate("about:blank"))
+
+	want, err := listPageTargetIDs(browserCtx)
+	if err != nil {
+		t.Fatalf("list page targets before the setups: %v", err)
+	}
+
+	const attempts = 12
+	nilTargets := 0
+	for i := 0; i < attempts; i++ {
+		if timedOutSetup(t, browserCtx) {
+			nilTargets++
+		}
+	}
+
+	got, ok := waitForTargetIDs(browserCtx, want, 3*time.Second, 200*time.Millisecond)
+	if !ok {
+		var leaked, missing []string
+		for _, id := range got {
+			if !slices.Contains(want, id) {
+				leaked = append(leaked, id)
+			}
+		}
+		for _, id := range want {
+			if !slices.Contains(got, id) {
+				missing = append(missing, id)
+			}
+		}
+		t.Fatalf("%d timed-out tab setups changed the page-target set "+
+			"(handles.Target was nil on %d/%d attempts)\n"+
+			"  snapshot: %v\n  after:    %v\n  leaked:   %v\n  missing:  %v",
+			attempts, nilTargets, attempts, want, got, leaked, missing)
 	}
 }
 
