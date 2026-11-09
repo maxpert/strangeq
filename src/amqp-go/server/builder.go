@@ -232,6 +232,17 @@ func (b *ServerBuilder) Build() (*Server, error) {
 		ls.SetLogger(logger)
 	}
 
+	// Resolve the metrics collector ONCE, before the broker is constructed (F9).
+	// It used to be resolved only AFTER the broker was wrapped, so the concrete
+	// StorageBroker never received it: amqp_messages_redelivered_total and the
+	// management "Redelivered" health tile stayed permanently zero in the
+	// standard build. It is handed to StorageBroker.SetMetricsCollector in the
+	// broker branch below, before NewStorageBrokerAdapter hides the concrete type.
+	metricsCollector := b.metrics
+	if metricsCollector == nil {
+		metricsCollector = &NoOpMetricsCollector{}
+	}
+
 	// Create broker if not provided.
 	//
 	// ordinalGating carries any boot-gating fault raised HERE forward to the
@@ -249,6 +260,11 @@ func (b *ServerBuilder) Build() (*Server, error) {
 		// Phase 6G: Pass engine config for tunable parameters
 		storageBroker := broker.NewStorageBroker(storageImpl, b.config.GetEngine())
 		storageBroker.SetLogger(logger)
+		// F9: the concrete StorageBroker is the only holder of the redelivery
+		// counter's sink, and the adapter below hides it. Wire the collector
+		// HERE, before NewStorageBrokerAdapter, or RecordMessageRedelivered is
+		// never called in production.
+		storageBroker.SetMetricsCollector(metricsCollector)
 		// WS-D §15: wire the MaxQueues/MaxExchanges topology limits.
 		storageBroker.SetTopologyLimits(b.config.GetServer().MaxQueues, b.config.GetServer().MaxExchanges)
 		// initOrdinalAllocator establishes the delivery-tag ordinal high-water
@@ -300,12 +316,6 @@ func (b *ServerBuilder) Build() (*Server, error) {
 	// Set the broker as the transaction executor
 	executor := transaction.NewUnifiedBrokerExecutor(unifiedBroker)
 	transactionManager.SetExecutor(executor)
-
-	// Use provided metrics collector or default to NoOp
-	metricsCollector := b.metrics
-	if metricsCollector == nil {
-		metricsCollector = &NoOpMetricsCollector{}
-	}
 
 	// Wire authentication: if WithAuthenticator was called, it implies auth is on.
 	var authenticator interfaces.Authenticator
