@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.14.2] - 2026-11-09
+
 ### Added
 - RabbitMQ-compatible transport/mechanism reporting on management
   `/api/connections` objects:
