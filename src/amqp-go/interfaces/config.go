@@ -1,32 +1,5 @@
 package interfaces
 
-// Config defines the interface for server configuration
-type Config interface {
-	// GetNetwork returns network configuration
-	GetNetwork() NetworkConfig
-
-	// GetStorage returns storage configuration
-	GetStorage() StorageConfig
-
-	// GetSecurity returns security configuration
-	GetSecurity() SecurityConfig
-
-	// GetServer returns server information configuration
-	GetServer() ServerConfig
-
-	// GetEngine returns engine tuning configuration
-	GetEngine() EngineConfig
-
-	// Validate validates the configuration
-	Validate() error
-
-	// Load loads configuration from a source
-	Load(source string) error
-
-	// Save saves configuration to a destination
-	Save(destination string) error
-}
-
 // NetworkConfig holds network-related configuration
 type NetworkConfig struct {
 	// Address to bind the server to
@@ -172,14 +145,6 @@ type StorageConfig struct {
 
 	// Message settings
 	MessageTTL int64 // Message TTL in seconds (0 = no TTL)
-
-	// Performance settings
-	CacheMB  int64 // Metadata cache size in megabytes
-	MaxFiles int   // Maximum open file handles
-
-	// RetentionMS is how long to keep old segments before compaction (milliseconds)
-	// Example: 86400000 = 24 hours
-	RetentionMS int64
 
 	// UnsafeRecovery (--unsafe-recovery) lets the broker START on a data
 	// directory whose recovery could not be completed safely, DISCARDING

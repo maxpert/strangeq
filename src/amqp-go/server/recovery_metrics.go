@@ -30,9 +30,7 @@ const (
 
 // Recovery outcomes (spec 06 §3.2), matching interfaces.RecoveryOutcome.String().
 const (
-	RecoveryOutcomeBenign   = "benign"
 	RecoveryOutcomeDegraded = "degraded"
-	RecoveryOutcomeFatal    = "fatal"
 )
 
 // Publish-refusal reasons (spec 06 §3.4). Unroutable is deliberately absent:

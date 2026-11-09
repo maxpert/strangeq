@@ -42,11 +42,6 @@ const (
 	ResourceLocked     = 405
 	PreconditionFailed = 406
 
-	// Channel errors
-	ContentTooLarge = 311
-	NoRoute         = 312
-	NoConsumers     = 313
-
 	// Frame errors
 	FrameError       = 501
 	SyntaxError      = 502

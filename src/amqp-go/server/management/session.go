@@ -5,7 +5,6 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"net/http"
-	"sort"
 	"sync"
 	"time"
 )
@@ -224,5 +223,3 @@ func randomHex(n int) (string, error) {
 	}
 	return hex.EncodeToString(buf), nil
 }
-
-var _ = sort.Strings

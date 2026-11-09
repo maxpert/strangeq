@@ -109,16 +109,6 @@ storage:
   # Message TTL in seconds (0 = no expiration)
   messagettl: 0
 
-  # Metadata cache size in megabytes
-  cachemb: 64
-
-  # Maximum number of open file handles
-  maxfiles: 100
-
-  # Retention period for old segments (milliseconds)
-  # Example: 86400000 = 24 hours
-  retentionms: 86400000
-
 # ============================================================================
 # Security Configuration
 # ============================================================================

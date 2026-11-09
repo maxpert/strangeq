@@ -456,5 +456,3 @@ func capsFromList(list []string) map[string]bool {
 	}
 	return out
 }
-
-var _ = strings.TrimSpace

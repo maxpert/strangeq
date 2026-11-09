@@ -32,7 +32,6 @@ const (
 	errInternal         = "internal_error"
 	errNotImplemented   = "not_implemented"
 	errUnavailable      = "unavailable"
-	errTimeout          = "timeout"
 )
 
 // errorEnvelope is the wire shape of every error response.
@@ -126,17 +125,6 @@ func sanitizeField(v string, max int) string {
 		}
 	}
 	return b.String()
-}
-
-// encodeJSONBody renders v compactly with HTML escaping disabled. Used by the
-// error path, which has no ETag/projection concerns.
-func encodeJSONBody(v any) []byte {
-	b, err := marshalCompact(v)
-	if err != nil {
-		// The error envelope is a plain struct of strings; marshal cannot fail.
-		return []byte(`{"error":"internal_error","reason":"response encoding failed"}`)
-	}
-	return b
 }
 
 // marshalCompact is the single JSON encoder for the management surface

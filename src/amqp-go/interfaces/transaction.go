@@ -105,12 +105,3 @@ type TransactionStats struct {
 	ChannelTransactions map[uint16]TransactionState        `json:"channel_transactions"`
 	OperationCounts     map[TransactionOperationType]int64 `json:"operation_counts"`
 }
-
-// Transactional interface marks broker implementations that support transactions
-type Transactional interface {
-	// GetTransactionManager returns the transaction manager for this broker
-	GetTransactionManager() TransactionManager
-
-	// GetTransactionStats returns current transaction statistics
-	GetTransactionStats() *TransactionStats
-}

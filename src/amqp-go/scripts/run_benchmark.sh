@@ -75,9 +75,6 @@ network:
 storage:
   path: $STORAGE_PATH
   durability: barrier
-  cachemb: 64
-  maxfiles: 100
-  retentionms: 86400000
 server:
   loglevel: info
   maxchannelsperconnection: 2047

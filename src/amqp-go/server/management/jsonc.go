@@ -4,10 +4,8 @@ import (
 	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
-	"encoding/json"
 	"fmt"
 	"reflect"
-	"strconv"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -357,10 +355,6 @@ func fieldTableJSON(v any) any {
 	}
 }
 
-// intToString renders an int64 as an unsigned decimal; the JSON encoder would
-// do it, but header values need a plain string.
-func intToString(n int64) string { return strconv.FormatInt(n, 10) }
-
 // canonicalFieldTableJSON renders an AMQP field table as the exact canonical
 // JSON the management surface emits (FR-CONV-046: byte-sorted keys, compact,
 // no HTML escaping; FR-CONV-047: value mapping). It is the single hash input
@@ -392,5 +386,3 @@ func propertiesKey(routingKey string, arguments map[string]any) string {
 	sum := sha256.Sum256(canonicalFieldTableJSON(arguments))
 	return routingKey + "~" + hex.EncodeToString(sum[:])
 }
-
-var _ = json.Marshal

@@ -109,20 +109,8 @@ func fullFsyncFD(fd uintptr, site string) error {
 	}
 }
 
-// barrierSyncFile is the crash_model: barrier confirm primitive on macOS:
-// fcntl(F_BARRIERFSYNC), issued through the same preemptible x/sys path as
-// fdatasyncFile. It makes f's dirty pages and metadata durable at the drive
-// (the fsync part) and then issues an ORDERING BARRIER instead of a drive
-// write-cache flush. A process kill and an OS crash therefore cannot lose
-// barrier-confirmed data; a sudden power loss can lose confirmed data still in
-// the drive's volatile cache, so what survives is a prefix of the log in
-// barrier order on drives that honour barriers. Only the two confirm sites use
-// this; every other durability site keeps the full F_FULLFSYNC (fdatasyncFile).
-func barrierSyncFile(f *os.File) error {
-	return barrierSyncFileSite(f, "")
-}
-
-// barrierSyncFileSite is barrierSyncFile with a site label for the full-flush
+// barrierSyncFileSite issues the crash_model: barrier confirm primitive with a
+// site label for the full-flush
 // counter: if the device rejects F_BARRIERFSYNC the fallback issues a real
 // F_FULLFSYNC, which is counted under this site.
 func barrierSyncFileSite(f *os.File, site string) error {

@@ -120,25 +120,11 @@ func DeserializeTxRollbackOKMethod(data []byte) (*TxRollbackOKMethod, error) {
 
 // Transaction method frame constructors
 
-// NewTxSelectFrame creates a tx.select method frame
-func NewTxSelectFrame(channelID uint16) *Frame {
-	method := &TxSelectMethod{}
-	methodData := method.Serialize()
-	return EncodeMethodFrameForChannel(channelID, 90, TxSelect, methodData)
-}
-
 // NewTxSelectOKFrame creates a tx.select-ok method frame
 func NewTxSelectOKFrame(channelID uint16) *Frame {
 	method := &TxSelectOKMethod{}
 	methodData := method.Serialize()
 	return EncodeMethodFrameForChannel(channelID, 90, TxSelectOK, methodData)
-}
-
-// NewTxCommitFrame creates a tx.commit method frame
-func NewTxCommitFrame(channelID uint16) *Frame {
-	method := &TxCommitMethod{}
-	methodData := method.Serialize()
-	return EncodeMethodFrameForChannel(channelID, 90, TxCommit, methodData)
 }
 
 // NewTxCommitOKFrame creates a tx.commit-ok method frame
@@ -148,38 +134,9 @@ func NewTxCommitOKFrame(channelID uint16) *Frame {
 	return EncodeMethodFrameForChannel(channelID, 90, TxCommitOK, methodData)
 }
 
-// NewTxRollbackFrame creates a tx.rollback method frame
-func NewTxRollbackFrame(channelID uint16) *Frame {
-	method := &TxRollbackMethod{}
-	methodData := method.Serialize()
-	return EncodeMethodFrameForChannel(channelID, 90, TxRollback, methodData)
-}
-
 // NewTxRollbackOKFrame creates a tx.rollback-ok method frame
 func NewTxRollbackOKFrame(channelID uint16) *Frame {
 	method := &TxRollbackOKMethod{}
 	methodData := method.Serialize()
 	return EncodeMethodFrameForChannel(channelID, 90, TxRollbackOK, methodData)
-}
-
-// Transaction method parsing helper
-
-// ParseTransactionMethod parses transaction class methods based on method ID
-func ParseTransactionMethod(methodID uint16, data []byte) (interface{}, error) {
-	switch methodID {
-	case TxSelect:
-		return DeserializeTxSelectMethod(data)
-	case TxSelectOK:
-		return DeserializeTxSelectOKMethod(data)
-	case TxCommit:
-		return DeserializeTxCommitMethod(data)
-	case TxCommitOK:
-		return DeserializeTxCommitOKMethod(data)
-	case TxRollback:
-		return DeserializeTxRollbackMethod(data)
-	case TxRollbackOK:
-		return DeserializeTxRollbackOKMethod(data)
-	default:
-		return nil, fmt.Errorf("unknown transaction method ID: %d", methodID)
-	}
 }

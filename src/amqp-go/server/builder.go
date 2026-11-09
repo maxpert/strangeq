@@ -100,12 +100,6 @@ func (b *ServerBuilder) WithPort(port int) *ServerBuilder {
 	return b
 }
 
-// WithLogger sets a custom logger implementation
-func (b *ServerBuilder) WithLogger(logger interfaces.Logger) *ServerBuilder {
-	b.logger = logger
-	return b
-}
-
 // WithZapLogger creates a logger using zap with the specified level
 func (b *ServerBuilder) WithZapLogger(level string) *ServerBuilder {
 	var zapConfig zap.Config
@@ -166,13 +160,6 @@ func (b *ServerBuilder) WithFileAuthentication(userFile string) *ServerBuilder {
 	return b
 }
 
-// WithConnectionHandler accepts a custom connection handler for API
-// compatibility. The builder has no consumer for it, so it has no effect on
-// the built server.
-func (b *ServerBuilder) WithConnectionHandler(handler interfaces.ConnectionHandler) *ServerBuilder {
-	return b
-}
-
 // WithTLS enables TLS with the specified certificate and key files
 func (b *ServerBuilder) WithTLS(certFile, keyFile string) *ServerBuilder {
 	b.config.Security.TLSEnabled = true
@@ -194,14 +181,6 @@ func (b *ServerBuilder) WithTLSMutualAuth(caFile string) *ServerBuilder {
 // WithMaxConnections sets the maximum number of concurrent connections
 func (b *ServerBuilder) WithMaxConnections(max int) *ServerBuilder {
 	b.config.Network.MaxConnections = max
-	return b
-}
-
-// WithProtocolLimits sets AMQP protocol limits
-func (b *ServerBuilder) WithProtocolLimits(maxChannels, maxFrameSize int, maxMessageSize int64) *ServerBuilder {
-	b.config.Server.MaxChannelsPerConnection = maxChannels
-	b.config.Server.MaxFrameSize = maxFrameSize
-	b.config.Server.MaxMessageSize = maxMessageSize
 	return b
 }
 
@@ -253,6 +232,17 @@ func (b *ServerBuilder) Build() (*Server, error) {
 		ls.SetLogger(logger)
 	}
 
+	// Resolve the metrics collector ONCE, before the broker is constructed (F9).
+	// It used to be resolved only AFTER the broker was wrapped, so the concrete
+	// StorageBroker never received it: amqp_messages_redelivered_total and the
+	// management "Redelivered" health tile stayed permanently zero in the
+	// standard build. It is handed to StorageBroker.SetMetricsCollector in the
+	// broker branch below, before NewStorageBrokerAdapter hides the concrete type.
+	metricsCollector := b.metrics
+	if metricsCollector == nil {
+		metricsCollector = &NoOpMetricsCollector{}
+	}
+
 	// Create broker if not provided.
 	//
 	// ordinalGating carries any boot-gating fault raised HERE forward to the
@@ -270,6 +260,11 @@ func (b *ServerBuilder) Build() (*Server, error) {
 		// Phase 6G: Pass engine config for tunable parameters
 		storageBroker := broker.NewStorageBroker(storageImpl, b.config.GetEngine())
 		storageBroker.SetLogger(logger)
+		// F9: the concrete StorageBroker is the only holder of the redelivery
+		// counter's sink, and the adapter below hides it. Wire the collector
+		// HERE, before NewStorageBrokerAdapter, or RecordMessageRedelivered is
+		// never called in production.
+		storageBroker.SetMetricsCollector(metricsCollector)
 		// WS-D §15: wire the MaxQueues/MaxExchanges topology limits.
 		storageBroker.SetTopologyLimits(b.config.GetServer().MaxQueues, b.config.GetServer().MaxExchanges)
 		// initOrdinalAllocator establishes the delivery-tag ordinal high-water
@@ -321,12 +316,6 @@ func (b *ServerBuilder) Build() (*Server, error) {
 	// Set the broker as the transaction executor
 	executor := transaction.NewUnifiedBrokerExecutor(unifiedBroker)
 	transactionManager.SetExecutor(executor)
-
-	// Use provided metrics collector or default to NoOp
-	metricsCollector := b.metrics
-	if metricsCollector == nil {
-		metricsCollector = &NoOpMetricsCollector{}
-	}
 
 	// Wire authentication: if WithAuthenticator was called, it implies auth is on.
 	var authenticator interfaces.Authenticator

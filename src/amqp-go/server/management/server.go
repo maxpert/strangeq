@@ -425,6 +425,3 @@ func (s *Server) uptimeSeconds() int64 {
 	}
 	return int64(d.Seconds())
 }
-
-var _ = sync.Mutex{}
-var _ = atomic.Int64{}

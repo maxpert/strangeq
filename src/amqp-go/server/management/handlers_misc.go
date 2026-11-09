@@ -279,14 +279,6 @@ func (s *Server) hNotImplemented(subsystem string) func(http.ResponseWriter, *ht
 	}
 }
 
-// hNotImplementedAggregate serves 501 naming BOB-4 (aggregate bindings).
-func (s *Server) hNotImplementedAggregate(kind string) func(http.ResponseWriter, *http.Request) {
-	return func(w http.ResponseWriter, r *http.Request) {
-		s.writeAPIError(w, r, apiErr(http.StatusNotImplemented, errNotImplemented,
-			kind+" is not implemented (BOB-4: aggregate binding listing is unbuilt)"))
-	}
-}
-
 // hNotImplementedUser serves 501 naming BOB-6 (runtime user CRUD).
 func (s *Server) hNotImplementedUser(kind string) func(http.ResponseWriter, *http.Request) {
 	return func(w http.ResponseWriter, r *http.Request) {
