@@ -198,7 +198,9 @@ func TestWSB_OversizedAckFrame_ClosesConnection(t *testing.T) {
 	}
 	assert.True(t, conn.Closed.Load())
 
-	clientConn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	// Wait for the broker's close: a timeout ASSERTION, not a positive-wait cap,
+	// so it uses the shared env-overridable stall bound (guards a stall).
+	clientConn.SetReadDeadline(time.Now().Add(wsbFrameDeadline))
 	_, err := clientConn.Read(make([]byte, 1))
 	assert.Error(t, err, "client side must see EOF")
 }
