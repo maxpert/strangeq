@@ -2,6 +2,23 @@
 
 ## [Unreleased]
 
+## [0.14.3] - 2026-11-09
+
+### Fixed
+- `Server.Shutdown` could close a connection's socket with **no `connection.close`
+  frame at all**. The broker writes `connection.open-ok` inside
+  `processConnectionOpen` and marks the handshake complete only after that
+  returns, while a client's `Dial` returns the instant it *reads* `open-ok`. A
+  shutdown landing in that window treated the connection as still-handshaking and
+  just closed the socket, so the peer saw the connection die instead of the
+  promised `connection.close` **320 CONNECTION_FORCED** (the client library
+  reports `501 FRAME_ERROR` with `Server=false` for that case — which is how this
+  was found). A connection in that state is now given a bounded 500 ms grace to
+  finish the handshake and receives the 320 close the moment `connection.open`
+  lands; one that never reaches `connection.open` is still closed with the socket,
+  because a close frame is not protocol-legal before `connection.open`. The
+  shutdown stays bounded in both cases.
+
 ## [0.14.2] - 2026-11-09
 
 ### Added
