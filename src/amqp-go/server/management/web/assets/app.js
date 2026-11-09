@@ -2534,7 +2534,7 @@
     { id: "unsafe_artifacts", label: "Unsafe-recovery discards", group: "Health", sel: "amqp_unsafe_recovery_discarded_artifacts", render: "count", sev: "bad" },
     { id: "recovery_faults", label: "Recovery faults", group: "Health", sel: "sum(amqp_recovery_faults_total{outcome!=\"benign\"})", render: "count", sev: "bad" },
     { id: "recovery_discarded", label: "Recovery discards", group: "Health", sel: "sum(amqp_recovery_discarded_records_total)", render: "count", sev: "bad" },
-    { id: "unroutable", label: "Unroutable", group: "Health", sel: "amqp_messages_unroutable_total", render: "count", sev: "bad" },
+    { id: "unroutable", label: "Unroutable", group: "Health", sel: "amqp_messages_unroutable_total", render: "count", sev: "warn" },
     { id: "refused", label: "Publish refused", group: "Health", sel: "sum(amqp_publish_refused_total)", render: "count", sev: "bad" },
     { id: "dropped", label: "Deliveries dropped", group: "Health", sel: "sum(amqp_deliveries_dropped_total)", render: "count", sev: "bad" },
     { id: "redelivered", label: "Redelivered", group: "Health", sel: "amqp_messages_redelivered_total", render: "count", sev: "warn" },
@@ -2544,7 +2544,7 @@
     { id: "auth_failures", label: "Auth failures", group: "Health", sel: "sum(amqp_auth_failures_total)", render: "count", sev: "warn" },
     { id: "wal_write_errors", label: "WAL write errors", group: "Health", sel: "amqp_wal_write_errors_total", render: "count", sev: "bad" },
     { id: "wal_fsync_errors", label: "WAL fsync errors", group: "Health", sel: "amqp_wal_fsync_errors_total", render: "count", sev: "bad" },
-    { id: "wal_full_flush", label: "WAL full flushes", group: "Health", sel: "sum(amqp_wal_full_flush_total)", render: "count", sev: null },
+    { id: "wal_full_flush", label: "WAL full flushes", group: "Health", sel: "sum(amqp_wal_full_flush_total{site!~\"boot_tail|boot_mkdir|close\"})", render: "count", sev: "bad" },
     { id: "wal_files", label: "WAL files", group: "Health", sel: "amqp_wal_files", render: "count", sev: null },
     { id: "segment_read_errors", label: "Segment read errors", group: "Health", sel: "amqp_segment_read_errors_total", render: "count", sev: "bad" },
     { id: "segment_fsync_errors", label: "Segment fsync errors", group: "Health", sel: "amqp_segment_fsync_errors_total", render: "count", sev: "bad" },
@@ -2573,7 +2573,7 @@
     if (!fm) return null;
     out.name = fm[1];
     if (fm[2] !== undefined && fm[2] !== null && fm[2] !== "") {
-      var lm = fm[2].match(/^\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*(!=|=)\s*"((?:[^"\\]|\\.)*)"\s*$/);
+      var lm = fm[2].match(/^\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*(=~|!~|!=|=)\s*"((?:[^"\\]|\\.)*)"\s*$/);
       if (lm) out.filter = { label: lm[1], op: lm[2], value: unescapeLabel(lm[3]) };
     }
     return out;
@@ -2587,15 +2587,26 @@
     return null;
   }
 
+  /* labelMatches applies one label matcher to a sample's value. A Prometheus
+   * regex matcher is fully anchored: it matches the whole label value, never a
+   * substring, so site!~"close" excludes exactly "close" and not
+   * "segment_close". A malformed pattern matches nothing so it can never be
+   * silently read as a pass. */
+  function labelMatches(filter, v) {
+    if (filter.op === "=") return v === filter.value;
+    if (filter.op === "!=") return v !== filter.value;
+    var re;
+    try { re = new RegExp("^(?:" + filter.value + ")$"); }
+    catch (e) { return false; }
+    var hit = re.test(v === undefined || v === null ? "" : v);
+    return filter.op === "!~" ? !hit : hit;
+  }
+
   function matchingSamples(fam, filter) {
     var out = [];
     for (var i = 0; i < fam.samples.length; i++) {
       var smp = fam.samples[i];
-      if (filter) {
-        var v = smp.labels[filter.label];
-        if (filter.op === "=") { if (v !== filter.value) continue; }
-        else if (v === filter.value) continue;
-      }
+      if (filter && !labelMatches(filter, smp.labels[filter.label])) continue;
       out.push(smp);
     }
     return out;
@@ -2634,7 +2645,16 @@
     var fam = familyByName(model, sel.name);
     if (!fam) return { found: false };
     var matches = matchingSamples(fam, sel.filter);
-    if (!matches.length) return { found: false };
+    if (!matches.length) {
+      /* The family IS emitted; the filter selects none of its series. Summed
+       * over an empty set the aggregate is a defined zero, so a filtered sum
+       * renders a present 0 (ok) rather than an unknown dash — which is what
+       * keeps a traffic-path-only counter truthful when the broker
+       * pre-initializes the excluded sites. Any other selector, and an absent
+       * family, stays unknown. */
+      if (sel.agg === "sum" && sel.filter) return { found: true, value: 0 };
+      return { found: false };
+    }
     var acc = 0;
     for (var i = 0; i < matches.length; i++) {
       if (!isFinite(matches[i].value)) return { found: false };

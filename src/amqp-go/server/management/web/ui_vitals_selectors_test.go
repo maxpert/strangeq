@@ -35,8 +35,10 @@ var (
 	vitalWrapRe = regexp.MustCompile(`^(rate|sum|max)\((.*)\)$`)
 	// vitalHeadRe splits "name" or "name{...}".
 	vitalHeadRe = regexp.MustCompile(`^([a-zA-Z_:][a-zA-Z0-9_:]*)(?:\{(.*)\})?$`)
-	// vitalLabelRe matches the single label matcher app.js supports.
-	vitalLabelRe = regexp.MustCompile(`^([a-zA-Z_][a-zA-Z0-9_]*)\s*(!=|=)\s*"((?:[^"\\]|\\.)*)"$`)
+	// vitalLabelRe matches the single label matcher app.js supports: "=" and
+	// "!=" value matchers plus the anchored Prometheus regex matchers "=~" and
+	// "!~".
+	vitalLabelRe = regexp.MustCompile(`^([a-zA-Z_][a-zA-Z0-9_]*)\s*(!=|=~|!~|=)\s*"((?:[^"\\]|\\.)*)"$`)
 	// inventoryNameRe pulls the amqp_* family names out of a golden list.
 	inventoryNameRe = regexp.MustCompile(`"(amqp_[a-zA-Z0-9_]+)"`)
 	// inventoryListRe bounds each `[]string{ ... }` block in the inventory
@@ -109,6 +111,11 @@ func vitalSelectorProblems(sels []vitalSelector, golden map[string]bool, domains
 		}
 		dom, ok := domains[s.name]
 		if !ok {
+			continue
+		}
+		if s.op == "=~" || s.op == "!~" {
+			// A regex matcher's value is a pattern over the domain, not a
+			// domain literal; it is checked for the metric name only.
 			continue
 		}
 		if !dom[s.value] {

@@ -191,8 +191,13 @@ func TestUI_MetricsBadTileHighlights(t *testing.T) {
 	}
 }
 
-// TestUI_MetricsSeverityClassification (spec test 24 / R6): redelivered is warn
-// (noise-grade) while unroutable is bad, and the banner counts bad only.
+// TestUI_MetricsSeverityClassification (spec test 24 / R6 + audit LOW 14):
+// redelivered is warn (noise-grade) and unroutable is warn too — a mandatory
+// publish with no matching binding is a normal caller outcome, not a broker
+// fault — so the banner counts bad only. A WAL full flush alarms only when it
+// fires on the traffic path: in barrier mode the boot/close sites are allowed
+// to fire legitimately, and the anchored site exclusion keeps them out of the
+// bad count.
 func TestUI_MetricsSeverityClassification(t *testing.T) {
 	stub := newStub()
 	stub.set(func(s *stubAPI) {
@@ -203,6 +208,12 @@ func TestUI_MetricsSeverityClassification(t *testing.T) {
 			"# HELP amqp_messages_unroutable_total Unroutable messages",
 			"# TYPE amqp_messages_unroutable_total counter",
 			"amqp_messages_unroutable_total 2",
+			"# HELP amqp_wal_full_flush_total WAL full flushes",
+			"# TYPE amqp_wal_full_flush_total counter",
+			`amqp_wal_full_flush_total{site="group_commit"} 1`,
+			`amqp_wal_full_flush_total{site="boot_tail"} 1`,
+			`amqp_wal_full_flush_total{site="boot_mkdir"} 1`,
+			`amqp_wal_full_flush_total{site="close"} 1`,
 		)
 	})
 	srv := appServer(t, stub)
@@ -214,16 +225,76 @@ func TestUI_MetricsSeverityClassification(t *testing.T) {
 	if got := tileSeverity(t, ctx, "redelivered"); got != "warn" {
 		t.Fatalf("redelivered severity = %q, want warn", got)
 	}
-	if got := tileSeverity(t, ctx, "unroutable"); got != "bad" {
-		t.Fatalf("unroutable severity = %q, want bad", got)
+	if got := tileSeverity(t, ctx, "unroutable"); got != "warn" {
+		t.Fatalf("unroutable severity = %q, want warn (a no-route mandatory publish is a caller outcome)", got)
+	}
+	// Only the traffic-path full flush counts: group_commit is 1 and the boot
+	// and close sites are excluded, so the tile reads 1, not 4.
+	if got := tileText(t, ctx, "wal_full_flush"); got != "1" {
+		t.Fatalf("wal_full_flush = %q, want 1 (only the traffic-path site)", got)
+	}
+	if got := tileSeverity(t, ctx, "wal_full_flush"); got != "bad" {
+		t.Fatalf("wal_full_flush severity = %q, want bad", got)
 	}
 	notice := evalStr(t, ctx, `document.getElementById('metrics-notice').textContent`)
 	if !regexp.MustCompile(`1 vital signal`).MatchString(notice) {
 		t.Fatalf("banner must count exactly 1 bad signal: %q", notice)
 	}
-	if !strings.Contains(notice, "Unroutable") {
+	if !strings.Contains(notice, "WAL full flushes") {
 		t.Fatalf("banner does not name the bad tile: %q", notice)
 	}
+	if strings.Contains(notice, "Unroutable") {
+		t.Fatalf("a warn tile must not be named in the bad banner: %q", notice)
+	}
+
+	// A full flush at a boot/close site is legitimate off the traffic path: the
+	// tile renders a present zero (ok), never bad and never an unknown dash.
+	for _, site := range []string{"boot_tail", "boot_mkdir", "close"} {
+		t.Run(site, func(t *testing.T) {
+			s2 := newStub()
+			s2.set(func(s *stubAPI) {
+				s.metricsText = metricFixture(
+					"# HELP amqp_wal_full_flush_total WAL full flushes",
+					"# TYPE amqp_wal_full_flush_total counter",
+					`amqp_wal_full_flush_total{site="`+site+`"} 1`,
+				)
+			})
+			srv2 := appServer(t, s2)
+			ctx2, cancel2 := newTab(t)
+			defer cancel2()
+			openMetrics(t, ctx2, srv2.URL, true, "")
+			if got := tileText(t, ctx2, "wal_full_flush"); got != "0" {
+				t.Fatalf("a %s flush must not count as a traffic-path flush: tile = %q, want 0", site, got)
+			}
+			if got := tileSeverity(t, ctx2, "wal_full_flush"); got != "ok" {
+				t.Fatalf("a %s flush is legitimate: severity = %q, want ok", site, got)
+			}
+		})
+	}
+
+	// The site matcher is anchored (Prometheus regex semantics): segment_close
+	// is a traffic-path flush, so the bare "close" in the exclusion must NOT
+	// swallow it.
+	t.Run("segment_close is on the traffic path", func(t *testing.T) {
+		s3 := newStub()
+		s3.set(func(s *stubAPI) {
+			s.metricsText = metricFixture(
+				"# HELP amqp_wal_full_flush_total WAL full flushes",
+				"# TYPE amqp_wal_full_flush_total counter",
+				`amqp_wal_full_flush_total{site="segment_close"} 1`,
+			)
+		})
+		srv3 := appServer(t, s3)
+		ctx3, cancel3 := newTab(t)
+		defer cancel3()
+		openMetrics(t, ctx3, srv3.URL, true, "")
+		if got := tileText(t, ctx3, "wal_full_flush"); got != "1" {
+			t.Fatalf("segment_close must not be excluded by the anchored site matcher: tile = %q, want 1", got)
+		}
+		if got := tileSeverity(t, ctx3, "wal_full_flush"); got != "bad" {
+			t.Fatalf("a segment_close full flush is a traffic-path flush: severity = %q, want bad", got)
+		}
+	})
 }
 
 /* ------------------------------------------------------------- rates ------- */
