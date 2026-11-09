@@ -23,17 +23,17 @@ import (
 	"golang.org/x/crypto/bcrypt"
 )
 
-// wsbFrameDeadline bounds a single raw-AMQP socket read in these WSB tests.
+// wsbFrameDeadline is the ONE coarse, env-overridable stall cap left on a
+// socket-backed rawAMQP read in these WSB tests (SQ_WSB_FRAME_DEADLINE).
 //
-// Under a full `-race -count=1 ./...` CI run the broker can legitimately
-// answer later than 2 s (raced scheduling on contended cores), and the old
-// hard 2 s bound turned a healthy run red with a read i/o timeout
-// (TestLease_TransientHWMMixedConnAckSchedule). This is the same arrangement
-// as the browser suite's SQ_BROWSER_DEADLINE: an env override with a wider
-// default, so a stall fails LATER and never weaker.
+// It guards against a broker that never answers — a STALL, not slowness — so a
+// healthy broker on a loaded, contended CI box can never trip it. A positive
+// wait on a socket is intrinsically wall-clock-shaped, which is why it needs a
+// cap at all; a positive wait on a synchronous net.Pipe (dialRawPipe) is not —
+// it is driven by the frame content the broker writes, so it arms no cap.
 //
-// Only positive-wait reads use this bound; expectSilence keeps its own
-// explicit duration, because it exists to assert that nothing arrives.
+// Only expectSilence keeps its own explicit duration, because a NEGATIVE
+// assertion ("nothing arrives") is intrinsically time-shaped.
 var wsbFrameDeadline = func() time.Duration {
 	if v := os.Getenv("SQ_WSB_FRAME_DEADLINE"); v != "" {
 		if d, err := time.ParseDuration(v); err == nil && d > 0 {
@@ -149,6 +149,9 @@ type rawAMQP struct {
 	t *testing.T
 	c net.Conn
 	r *bufio.Reader
+	// pipe is true when c is one end of a synchronous net.Pipe: a positive read
+	// then carries no wall-clock cap (see armStallCap).
+	pipe bool
 }
 
 func dialRaw(t *testing.T, addr string) *rawAMQP {
@@ -157,6 +160,28 @@ func dialRaw(t *testing.T, addr string) *rawAMQP {
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = c.Close() })
 	return &rawAMQP{t: t, c: c, r: bufio.NewReader(c)}
+}
+
+// dialRawPipe wires a rawAMQP client to srv over a synchronous in-memory
+// net.Pipe, through the SAME handleConnection path a real accepted socket takes
+// (pre-auth handshake slot, srv.Connections registration, readFrames). Because
+// net.Pipe is unbuffered, every Write round-trips through the broker goroutine
+// before the matching Read returns: a positive wait is driven by frame CONTENT,
+// never by a wall-clock deadline.
+//
+// Use it when the assertions are about BROKER behaviour; keep dialRaw when they
+// are about KERNEL socket semantics (close/reset detection, EOF, half-close,
+// listener binding, error propagation through a real fd).
+func dialRawPipe(t *testing.T, srv *Server) *rawAMQP {
+	t.Helper()
+	clientConn, serverConn := net.Pipe()
+	// Mirror dispatchAccepted: take a pre-auth slot, then let handleConnection
+	// own the goroutine (it releases the slot and calls connWG.Done).
+	require.True(t, srv.tryAcquireHandshakeSlot(), "dialRawPipe: pending-handshake slot")
+	srv.connWG.Add(1)
+	go srv.handleConnection(serverConn)
+	t.Cleanup(func() { _ = clientConn.Close() })
+	return &rawAMQP{t: t, c: clientConn, r: bufio.NewReader(clientConn), pipe: true}
 }
 
 func (r *rawAMQP) sendHeader() {
@@ -176,12 +201,38 @@ func (r *rawAMQP) sendFrame(f *protocol.Frame) {
 	require.NoError(r.t, protocol.WriteFrame(r.c, f))
 }
 
+// armStallCap arms the ONE coarse, env-overridable stall cap
+// (SQ_WSB_FRAME_DEADLINE) on a socket-backed rawAMQP. It guards against a broker
+// that never answers — a STALL, not slowness — so a healthy broker on a loaded
+// box can never trip it. A pipe-backed client arms nothing: a synchronous
+// round-trip is bounded by the frame content, not by the wall clock.
+//
+// This is the ONLY SetReadDeadline site for a rawAMQP positive wait; readFrame,
+// readFrameMaybe and expectEOF all route through it.
+func (r *rawAMQP) armStallCap() {
+	r.t.Helper()
+	if r.pipe {
+		return
+	}
+	require.NoError(r.t, r.c.SetReadDeadline(time.Now().Add(wsbFrameDeadline)))
+}
+
 func (r *rawAMQP) readFrame() *protocol.Frame {
 	r.t.Helper()
-	require.NoError(r.t, r.c.SetReadDeadline(time.Now().Add(wsbFrameDeadline)))
+	r.armStallCap()
 	f, err := protocol.ReadFrameOptimizedWithLimit(r.r, 131072+8)
 	require.NoError(r.t, err)
 	return f
+}
+
+// readFrameMaybe reads one frame and returns the read error instead of failing,
+// so a caller can treat "the connection closed" as an outcome: a server close
+// may be observed either as a 506 frame OR as a closed socket. It carries the
+// same single stall cap as readFrame.
+func (r *rawAMQP) readFrameMaybe() (*protocol.Frame, error) {
+	r.t.Helper()
+	r.armStallCap()
+	return protocol.ReadFrameOptimizedWithLimit(r.r, 131072+8)
 }
 
 // expectMethod reads frames (skipping heartbeats) until a method frame arrives
@@ -241,7 +292,7 @@ func (r *rawAMQP) expectChannelClose(ch, code uint16) {
 
 func (r *rawAMQP) expectEOF() {
 	r.t.Helper()
-	require.NoError(r.t, r.c.SetReadDeadline(time.Now().Add(wsbFrameDeadline)))
+	r.armStallCap()
 	_, err := r.r.ReadByte()
 	require.Error(r.t, err, "expected EOF/reset")
 	require.True(r.t,
@@ -249,7 +300,11 @@ func (r *rawAMQP) expectEOF() {
 		"expected EOF/reset, got %v", err)
 }
 
-// expectSilence asserts that no frame arrives within d.
+// expectSilence asserts that no frame arrives within d. The duration is
+// explicit and local: a NEGATIVE assertion is intrinsically time-shaped, so it
+// keeps its own bound instead of the positive-wait stall cap. The deadline is
+// cleared afterwards so a later positive wait on a pipe-backed client (which
+// arms no cap of its own) cannot inherit a spent one.
 func (r *rawAMQP) expectSilence(d time.Duration) {
 	r.t.Helper()
 	require.NoError(r.t, r.c.SetReadDeadline(time.Now().Add(d)))
@@ -257,6 +312,7 @@ func (r *rawAMQP) expectSilence(d time.Duration) {
 	require.Error(r.t, err, "expected read timeout (silence)")
 	var ne net.Error
 	require.True(r.t, errors.As(err, &ne) && ne.Timeout(), "expected read timeout, got %v", err)
+	_ = r.c.SetReadDeadline(time.Time{})
 }
 
 func (r *rawAMQP) startOK(mech string, resp []byte) {
