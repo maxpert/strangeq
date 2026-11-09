@@ -18,11 +18,15 @@
     flush per confirm is the configured behaviour, so it is informational there
     (the durability mode is now passed to the UI; an absent or unrecognised mode
     falls back to the strict `barrier` reading).
-- The tile outcome rule has three documented cases: the family is absent ⇒ `—`
+- The tile outcome rule has four documented cases: the family is absent ⇒ `—`
   with `not emitted by this broker`; the family is present ⇒ the number; the
-  family is present but a **filtered** selector matches no series ⇒ `0`. A
+  family is present and a **filtered sum** (`sum(<family>{<label>…})`) matches no
+  series ⇒ `0`; and the family is present but any other selector form — a bare
+  name with a matcher, or `max(…)` with a matcher — matches no series ⇒ `—`
+  (no aggregate value is defined there, so that title applies to it too). A
   malformed `=~`/`!~` pattern is never read as `0` — it degrades the tile to `—`
-  and names the offending pattern.
+  and names the offending pattern; a *valid* pattern that drops the whole
+  excluded domain is rejected by the static gate, not at runtime.
 
 ### Fixed
 - `config.sample.yaml` and `interfaces/config.go` claimed all three
