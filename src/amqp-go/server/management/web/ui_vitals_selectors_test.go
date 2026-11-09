@@ -24,6 +24,7 @@ type vitalSelector struct {
 	label string // "" when the selector has no label filter
 	op    string // "=" or "!=" ("" when absent)
 	value string // "" when the selector has no label filter
+	agg   string // aggregate wrapper: "rate", "sum", "max", or "" for a bare selector
 }
 
 var (
@@ -94,6 +95,7 @@ func parseVitalSelectors(t *testing.T, js string) []vitalSelector {
 		s := vitalSelector{id: e[1], sel: strings.ReplaceAll(e[2], `\"`, `"`)}
 		body := s.sel
 		if m := vitalWrapRe.FindStringSubmatch(body); m != nil {
+			s.agg = m[1]
 			body = strings.TrimSpace(m[2])
 		}
 		head := vitalHeadRe.FindStringSubmatch(body)
@@ -110,8 +112,9 @@ func parseVitalSelectors(t *testing.T, js string) []vitalSelector {
 }
 
 // vitalSelectorProblems returns one problem string per selector whose metric
-// name is absent from the inventory golden, or whose label matcher cannot select
-// a real value of that family's enumerable domain. Domains that are not
+// name is absent from the inventory golden, whose label matcher cannot select a
+// real value of that family's enumerable domain, or that filters a rate()
+// (which the runtime evaluates over the whole family). Domains that are not
 // enumerable are checked for the metric name only.
 func vitalSelectorProblems(sels []vitalSelector, golden map[string]bool, domains map[string]map[string]bool) []string {
 	var probs []string
@@ -123,6 +126,18 @@ func vitalSelectorProblems(sels []vitalSelector, golden map[string]bool, domains
 			continue
 		}
 		if s.label == "" {
+			continue
+		}
+		/* A filtered rate() has never been defined: evalTile returns from its
+		 * rate() branch before consulting sel.filter, and buildSamples
+		 * aggregates by family name alone, so a well-formed filtered rate would
+		 * be silently evaluated over the whole family. The static gate is the
+		 * layer that owns this rule; the runtime filter.invalid path is left
+		 * untouched for direct evalTile callers. */
+		if s.agg == "rate" {
+			probs = append(probs, fmt.Sprintf(
+				"VITALS %q selects %q, but a filtered rate is unsupported: rate() is evaluated over the whole family, so remove the label matcher",
+				s.id, s.sel))
 			continue
 		}
 		dom, ok := domains[s.name]
@@ -450,6 +465,34 @@ func TestUI_VitalsSelectorProblems_Regex(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// TestUI_VitalsSelectorProblems_RejectsFilteredRate pins the layer that owns the
+// rule: a filtered rate() has never been defined, because evalTile returns from
+// its rate() branch before consulting the selector's label filter, and
+// buildSamples aggregates a family by name alone. A well-formed filtered rate
+// would therefore be silently evaluated over the whole family instead of the
+// selected series; the static gate must reject it rather than accept a selector
+// the runtime ignores. The shipped table uses no filtered rate, so the gate must
+// stay green for the real VITALS list.
+func TestUI_VitalsSelectorProblems_RejectsFilteredRate(t *testing.T) {
+	js := "var VITALS = [\n" +
+		`    { id: "wal_rate", label: "WAL flushes/s", group: "Health", sel: "rate(amqp_wal_full_flush_total{site!~\"boot_tail|boot_mkdir|close\"})", render: "rate", sev: null }` + "\n" +
+		"  ];"
+	sels := parseVitalSelectors(t, js)
+	require.Len(t, sels, 1)
+	probs := vitalSelectorProblems(sels, map[string]bool{"amqp_wal_full_flush_total": true}, labelDomains)
+	require.Len(t, probs, 1, "a filtered rate must be exactly one problem, not a silent whole-family evaluation")
+	if !strings.Contains(probs[0], "filtered rate") || !strings.Contains(strings.ToLower(probs[0]), "unsupported") {
+		t.Fatalf("the gate did not name the filtered rate as unsupported: %s", probs[0])
+	}
+
+	// The shipped VITALS table must stay green: no real tile uses a filtered
+	// rate, so this gate cannot reject the selectors that actually ship.
+	golden := loadInventoryGolden(t)
+	for _, p := range vitalSelectorProblems(parseVitalSelectors(t, string(readAsset(t, "app.js"))), golden, labelDomains) {
+		t.Errorf("shipped VITALS selector reported a problem: %s", p)
 	}
 }
 
