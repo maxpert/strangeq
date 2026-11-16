@@ -2,8 +2,8 @@ package broker
 
 // SQ-9 (W4) per-queue background reaper.
 //
-// One goroutine per queue that has a queue-level x-message-ttl and/or x-expires
-// policy (started at declare/recovery, stopped when the queue's stopCh closes).
+// One goroutine per queue with x-message-ttl, x-expires or reliable expiry
+// retries (started at declare/recovery, stopped when the queue's stopCh closes).
 // It does two jobs, both off a single per-queue timer whose period tracks the
 // nearest deadline:
 //
@@ -22,7 +22,10 @@ package broker
 //     consumers, no basic.get, no redeclare — all of which reset the idle clock
 //     via QueueState.MarkActivity).
 //
-// LINEARIZATION (reaper vs consumer Claim, for undelivered messages).
+// Reliable expiry first takes ownership through the tail cursor or requeue
+// ring. The best-effort path arbitrates at storage removal as described below.
+//
+// LINEARIZATION (best-effort reaper vs consumer Claim).
 // The reaper removes a ready message with the ring's Delete-returns-bool
 // (storage.AtomicRing.Delete via DeleteMessageIfPresent) and decrements depth
 // (ReapDrop) ONLY when it wins that CAS. The delivery head-check does the same.
@@ -76,12 +79,11 @@ const (
 )
 
 // maybeStartReaper starts the per-queue reaper goroutine once, if the queue's
-// policy needs it (queue-level TTL or x-expires). Called from declare/recovery
-// after the policy is attached. Cheap and idempotent: a queue without either
-// policy never spawns a goroutine (unset-feature zero cost).
+// policy needs it (queue-level TTL, x-expires, or reliable TTL retries). Called
+// from declare/recovery after the policy is attached.
 func (b *StorageBroker) maybeStartReaper(name string, qs *QueueState) {
 	p := qs.Policy()
-	if p == nil || !(p.HasMessageTTL || p.HasQueueExpires) {
+	if p == nil || !(p.HasMessageTTL || p.HasQueueExpires || p.ReliableDeadLetter) {
 		return
 	}
 	if !qs.StartReaperOnce() {
@@ -126,6 +128,10 @@ func (b *StorageBroker) reapSweep(name string, qs *QueueState) time.Duration {
 	}
 	now := b.ttlNowMillis()
 	next := reaperMaxInterval
+	retryFailed := false
+	if p.ReliableDeadLetter {
+		retryFailed = b.reapExpiryRetries(name, qs, p, now)
+	}
 
 	if p.HasQueueExpires {
 		expiresMs := p.QueueExpires.Milliseconds()
@@ -159,7 +165,13 @@ func (b *StorageBroker) reapSweep(name string, qs *QueueState) time.Duration {
 		}
 	}
 
-	if p.HasMessageTTL {
+	if retryFailed {
+		next = min(next, deadLetterRetryInterval)
+	} else if p.HasMessageTTL && p.ReliableDeadLetter {
+		if !b.queueHasConsumers(name) {
+			next = min(next, b.reapReliableTTLHead(name, qs, p, now))
+		}
+	} else if p.HasMessageTTL {
 		// Poll at least as finely as the queue TTL so freshly published messages
 		// expire promptly.
 		if ttl := p.MessageTTL; ttl > 0 && ttl < next {
@@ -178,6 +190,67 @@ func (b *StorageBroker) reapSweep(name string, qs *QueueState) time.Duration {
 
 	if next < reaperMinInterval {
 		next = reaperMinInterval
+	}
+	return next
+}
+
+// reapExpiryRetries owns marked entries through the same ring lock as a
+// consumer or get. A registered consumer may be waiting for credit, so these
+// claims remain eligible while a consumer is registered.
+func (b *StorageBroker) reapExpiryRetries(name string, qs *QueueState, p *QueuePolicy, now int64) (retryFailed bool) {
+	for _, entry := range qs.takeReadRetries(reaperBatchSize) {
+		msg, err := b.storage.GetMessage(name, entry.tag)
+		if isAbsentMessage(err) {
+			continue
+		}
+		if err != nil || msg == nil {
+			qs.putBackReady(entry)
+			retryFailed = true
+			continue
+		}
+		if !entry.retryExpiry && !messageExpired(msg, p, now) {
+			_, entry.retryRead = messageDeadlineMillis(msg, p)
+			qs.putBackReady(entry)
+			continue
+		}
+		if b.expireReliableReady(qs, name, msg, entry.tag, p) != nil {
+			retryFailed = true
+		}
+	}
+	return retryFailed
+}
+
+// reapReliableTTLHead reads the current tail once and claims an expired tag
+// before staging it. Storage failures leave the tail in place for a retry.
+func (b *StorageBroker) reapReliableTTLHead(name string, qs *QueueState, p *QueuePolicy, now int64) time.Duration {
+	next := reaperMaxInterval
+	if p.MessageTTL > 0 {
+		next = min(next, p.MessageTTL)
+	}
+	for i := 0; i < reaperBatchSize && !b.queueHasConsumers(name); i++ {
+		tag := qs.Tail()
+		if tag >= qs.Head() {
+			break
+		}
+		msg, err := b.storage.GetMessage(name, tag)
+		if isAbsentMessage(err) {
+			qs.tail.CompareAndSwap(tag, tag+1)
+			continue
+		}
+		if err != nil || msg == nil {
+			b.logDeadLetterRetry("could not read the expiring queue head; will retry", name, "", err)
+			return deadLetterRetryInterval
+		}
+		deadline, ok := messageDeadlineMillis(msg, p)
+		if !ok {
+			break
+		}
+		if deadline > now {
+			return min(next, time.Duration(deadline-now)*time.Millisecond)
+		}
+		if qs.tail.CompareAndSwap(tag, tag+1) && b.expireReliableReady(qs, name, msg, tag, p) != nil {
+			return deadLetterRetryInterval
+		}
 	}
 	return next
 }

@@ -1308,11 +1308,11 @@ func (s *Server) handleBasicAck(conn *protocol.Connection, channelID uint16, pay
 				return s.unknownDeliveryTag(conn, channelID, wireTag, protocol.BasicAck)
 			}
 		}
-		settled := s.cumulativeSettle(channel, wireTag, settleAck, false)
+		settled, err := s.cumulativeSettle(channel, wireTag, settleAck, false)
 		if s.MetricsCollector != nil {
 			s.MetricsCollector.RecordMessagesAcknowledged(settled)
 		}
-		return nil
+		return err
 	}
 
 	msgID, consumerID, isGet, known := s.resolveDeliveryTag(channel, wireTag)
@@ -1422,11 +1422,11 @@ func (s *Server) handleBasicNack(conn *protocol.Connection, channelID uint16, pa
 				return s.unknownDeliveryTag(conn, channelID, wireTag, protocol.BasicNack)
 			}
 		}
-		settled := s.cumulativeSettle(channel, wireTag, settleNack, requeue)
+		settled, err := s.cumulativeSettle(channel, wireTag, settleNack, requeue)
 		if s.MetricsCollector != nil {
 			s.MetricsCollector.RecordMessagesRejected(settled)
 		}
-		return nil
+		return err
 	}
 
 	msgID, consumerID, isGet, known := s.resolveDeliveryTag(channel, wireTag)
@@ -1473,7 +1473,7 @@ const (
 // It returns the number of deliveries actually settled, so the caller can
 // count one acknowledgement/rejection per settled delivery instead of one per
 // cumulative method (finding 5).
-func (s *Server) cumulativeSettle(channel *protocol.Channel, wireTag uint64, kind settleKind, requeue bool) int {
+func (s *Server) cumulativeSettle(channel *protocol.Channel, wireTag uint64, kind settleKind, requeue bool) (int, error) {
 	// Spec: delivery-tag 0 with multiple=true means "every outstanding delivery
 	// on the channel". Wire tags are 1-based, so 0 would otherwise match nothing
 	// and ack-all / nack-all would silently no-op.
@@ -1483,35 +1483,47 @@ func (s *Server) cumulativeSettle(channel *protocol.Channel, wireTag uint64, kin
 	if channel == nil {
 		ctag, ok := s.Broker.GetConsumerForDelivery(wireTag)
 		if !ok {
-			return 0
+			return 0, nil
 		}
 		switch {
 		case ctag == "" && kind == settleAck:
 			s.Broker.AcknowledgeGetDelivery(wireTag)
 		case ctag == "":
-			s.Broker.NackGetDelivery(wireTag, requeue)
+			if err := s.Broker.NackGetDelivery(wireTag, requeue); err != nil {
+				return 0, err
+			}
 		case kind == settleAck:
 			s.Broker.AcknowledgeMessage(ctag, wireTag, true)
 		default:
-			s.Broker.NacknowledgeMessage(ctag, wireTag, true, requeue)
+			if err := s.Broker.NacknowledgeMessage(ctag, wireTag, true, requeue); err != nil {
+				return 0, err
+			}
 		}
-		return 1
+		return 1, nil
 	}
 
 	refs := channel.TakeWireTagsUpTo(wireTag)
+	var firstErr error
+	settled := 0
 	for _, ref := range refs {
+		var err error
 		switch {
 		case ref.IsGet && kind == settleAck:
 			s.Broker.AcknowledgeGetDelivery(ref.MsgID)
 		case ref.IsGet:
-			s.Broker.NackGetDelivery(ref.MsgID, requeue)
+			err = s.Broker.NackGetDelivery(ref.MsgID, requeue)
 		case kind == settleAck:
 			s.Broker.AcknowledgeMessage(ref.ConsumerID, ref.MsgID, false)
 		default:
-			s.Broker.NacknowledgeMessage(ref.ConsumerID, ref.MsgID, false, requeue)
+			err = s.Broker.NacknowledgeMessage(ref.ConsumerID, ref.MsgID, false, requeue)
+		}
+		if err == nil {
+			settled++
+		} else if firstErr == nil {
+			firstErr = err
 		}
 	}
-	return len(refs)
+	return settled, firstErr
 }
 
 func (s *Server) handleBasicRecover(conn *protocol.Connection, channelID uint16, payload []byte) error {

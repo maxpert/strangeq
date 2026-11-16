@@ -1,6 +1,7 @@
 package broker
 
 import (
+	"errors"
 	"time"
 
 	"github.com/maxpert/amqp-go/interfaces"
@@ -246,6 +247,9 @@ func (b *StorageBroker) deadLetter(policy *QueuePolicy, srcQueueName string, msg
 	if policy == nil || !policy.HasDeadLetterExchange {
 		return nil
 	}
+	if policy.ReliableDeadLetter {
+		return b.stageDeadLetter(srcQueueName, makeDeadLetter(policy, srcQueueName, msg, reason))
+	}
 
 	// Resolve the DLX. An absent or otherwise unreadable DLX is a silent drop
 	// (RabbitMQ drops the message; the caller still deletes the source).
@@ -254,34 +258,7 @@ func (b *StorageBroker) deadLetter(policy *QueuePolicy, srcQueueName string, msg
 		return nil
 	}
 
-	// Routing key: the configured x-dead-letter-routing-key when set, else the
-	// message's CURRENT routing key (RabbitMQ preserves the original RK).
-	routingKey := msg.RoutingKey
-	if policy.HasDeadLetterRoutingKey {
-		routingKey = policy.DeadLetterRoutingKey
-	}
-
-	// Clone the message (deep-copy Headers, reset DeliveryTag) and annotate
-	// x-death on the CLONE — never the live pointer. The original routing key
-	// is captured for the x-death routing-keys field BEFORE any rewrite.
-	clone := cloneForDeadLetter(msg)
-
-	originalExpiration := ""
-	if reason == DeadLetterExpired {
-		// Strip Expiration only for expired deaths, recording the original so a
-		// consumer can see the TTL that fired. Rejected/maxlen preserve it.
-		originalExpiration = clone.Expiration
-		clone.Expiration = ""
-	}
-
-	clone.Headers = annotateXDeath(clone.Headers, xDeathEvent{
-		queue:              srcQueueName,
-		reason:             reason,
-		exchange:           msg.Exchange,
-		routingKeys:        []string{msg.RoutingKey},
-		deathTime:          time.Now(),
-		originalExpiration: originalExpiration,
-	})
+	clone := makeDeadLetter(policy, srcQueueName, msg, reason)
 
 	// Re-enter routing ONLY through routeMessage (never a second router). The
 	// scratch is pooled and owned by this goroutine until releaseRouteScratch;
@@ -292,7 +269,7 @@ func (b *StorageBroker) deadLetter(policy *QueuePolicy, srcQueueName string, msg
 	// which this path never calls).
 	rs := acquireRouteScratch()
 	defer releaseRouteScratch(rs)
-	if err := b.routeMessage(exchange, routingKey, clone, rs); err != nil {
+	if err := b.routeMessage(exchange, clone.RoutingKey, clone, rs); err != nil {
 		return nil
 	}
 	if len(rs.queues) == 0 {
@@ -312,150 +289,105 @@ func (b *StorageBroker) deadLetter(policy *QueuePolicy, srcQueueName string, msg
 		cyclic = xDeathQueueSet(clone.Headers)
 	}
 
-	// RabbitMQ rewrites the dead-lettered message's exchange to the DLX and its
-	// routing key to the resolved key (dead-letter-routing-key when set, else the
-	// original). A DLQ consumer must see the rewritten values. This runs AFTER
-	// annotateXDeath (which recorded the ORIGINAL exchange + routing key from msg,
-	// not the clone) and AFTER routeMessage (which routed on the resolved key
-	// argument, not clone.RoutingKey), so on a chained A→B→C dead-letter each
-	// x-death entry records that hop's own exchange (the intermediate DLX), not
-	// the original exchange forever.
-	clone.Exchange = policy.DeadLetterExchange
-	clone.RoutingKey = routingKey
-
 	b.republishToTargets(srcQueueName, rs.queues, clone, cyclic)
 	return nil
 }
 
-// republishToTargets enqueues the dead-letter clone into each (non-cyclic)
-// target queue using a NON-BLOCKING enqueue path — the frozen seam requirement
-// so all three Wave 2 consumers (SQ-9 TTL, SQ-10 reject/nack, SQ-11 max-length)
-// inherit it. Unlike the publish hot path (PublishMessage), it MUST NOT call
-// QueueState.WaitForCapacity: a consumer-less dead-letter queue sitting at its
-// high-water mark would otherwise stall basic.reject/nack on the connection's
-// frame goroutine.
-//
-// TARGET-OVERFLOW ENFORCEMENT (Bug#3): each target queue's own x-max-length /
-// x-overflow policy is honored, matching RabbitMQ (which applies the target's
-// overflow policy to a dead-lettered message, so the target never overshoots its
-// configured cap). Per target, its policy is loaded ONCE and applied without ever
-// blocking:
-//   - x-overflow=reject-publish AND the target is AT-OR-OVER its limit
-//     (maxLenRejectsPublish): the dead-letter is DROPPED for this target — a
-//     system dead-letter cannot be nacked back to a publisher, so dropping is the
-//     RabbitMQ-equivalent — and surfaced via recordDeadLetterOverflow. The
-//     at-or-over check + the matching enqueue run under the target's maxLenMu
-//     (mirroring PublishMessage) so concurrent republishes cannot both admit past
-//     the cap.
-//   - otherwise the message is stored + published + byte-accounted, then a
-//     drop-head target with a limit is trimmed (dropHeadTrim) so it stays AT its
-//     cap. dropHeadTrim runs AFTER enqueue with NO lock held: it recursively
-//     dead-letters the evicted head (reason=maxlen) through this same seam, and
-//     holding a lock across that recursion could deadlock. Cycle detection keeps
-//     the recursion finite (the evicted head cannot loop back into a queue already
-//     in its x-death set).
-//
-// The AtHighWaterMark check remains as the physical-ring backstop (never block; a
-// ring at its depth high-water mark drops rather than stalls the frame goroutine).
-// For a policy-limited target the ring HWM is far above x-max-length, so the
-// x-max-length semantics above are what give RabbitMQ parity.
-//
-// The per-target copy mirrors the PublishMessage fanout invariant: the first
-// successfully-enqueued target reuses the clone directly; subsequent targets
-// deep-copy Headers so queue copies never share a map pointer.
-func (b *StorageBroker) republishToTargets(srcQueueName string, targets []string, clone *protocol.Message, cyclic map[string]struct{}) {
+func makeDeadLetter(policy *QueuePolicy, source string, msg *protocol.Message, reason DeadLetterReason) *protocol.Message {
+	clone := cloneForDeadLetter(msg)
+	originalExpiration := ""
+	if reason == DeadLetterExpired {
+		originalExpiration = clone.Expiration
+		clone.Expiration = ""
+	}
+	clone.Headers = annotateXDeath(clone.Headers, xDeathEvent{
+		queue:              source,
+		reason:             reason,
+		exchange:           msg.Exchange,
+		routingKeys:        []string{msg.RoutingKey},
+		deathTime:          time.Now(),
+		originalExpiration: originalExpiration,
+	})
+	clone.Exchange = policy.DeadLetterExchange
+	if policy.HasDeadLetterRoutingKey {
+		clone.RoutingKey = policy.DeadLetterRoutingKey
+	}
+	return clone
+}
+
+var (
+	errDeadLetterTargetGone = errors.New("dead-letter target is gone")
+	errDeadLetterTargetFull = errors.New("dead-letter target is at its depth limit")
+	errDeadLetterOverflow   = errors.New("dead-letter target rejected the transfer under its overflow policy")
+)
+
+// republishToTargets is the best-effort path. Target capacity and persistence
+// failures are terminal for this path.
+func (b *StorageBroker) republishToTargets(source string, targets []string, clone *protocol.Message, cyclic map[string]struct{}) {
 	first := true
 	for _, target := range targets {
-		if cyclic != nil {
-			if _, isCyclic := cyclic[target]; isCyclic {
-				continue // per-target cycle drop (expired/maxlen only)
-			}
+		if _, skip := cyclic[target]; skip {
+			continue
 		}
-
 		qs := b.getOrCreateQueueState(target)
-
-		select {
-		case <-qs.StopCh():
-			// Target queue was deleted out from under us — drop the dead-letter
-			// rather than publishing into a state that will never be recovered.
-			b.recordDeadLetterTargetGone(srcQueueName, target)
-			continue
-		default:
-		}
-
-		// Physical-ring backstop: never block (no WaitForCapacity) and never
-		// overshoot the ring high-water mark.
-		if qs.AtHighWaterMark() {
-			continue
-		}
-
-		// Single policy load per target, used by every branch below.
 		p := qs.Policy()
+		copy := clone
+		if !first {
+			copy = cloneForDeadLetter(clone)
+		}
+		switch err := b.republishToTarget(qs, p, target, copy); err {
+		case nil:
+			first = false
+			b.trimDeadLetterTarget(qs, p, target)
+		case errDeadLetterTargetGone:
+			b.recordDeadLetterTargetGone(source, target)
+		case errDeadLetterTargetFull:
+			// The physical-ring backstop has always dropped silently.
+		case errDeadLetterOverflow:
+			b.recordDeadLetterOverflow(source, target)
+		default:
+			b.recordDeadLetterDrop(source, target, err)
+		}
+	}
+}
 
-		// x-overflow=reject-publish: refuse the dead-letter when the target is
-		// AT-OR-OVER its limit. admitRejectPublish makes the check+reserve atomic
-		// w.r.t. other admitters (normal publishers and concurrent republishes),
-		// so two dead-letters cannot both observe count==limit-1 and both push
-		// past the cap — and an admitted dead-letter behind a gated completion is
-		// still counted (§7).
-		rejectPublish := p != nil && p.Overflow == OverflowRejectPublish &&
-			(p.HasMaxLength || p.HasMaxLengthBytes)
-		var msgID uint64
-		if rejectPublish {
-			id, ok := admitRejectPublish(qs, p, len(clone.Body))
-			if !ok {
-				b.recordDeadLetterOverflow(srcQueueName, target)
-				continue
-			}
-			msgID = id
-		} else {
-			msgID = qs.FrontierReserve()
-		}
+// republishToTarget shares the nonblocking capacity, admission and visibility
+// rules between best-effort and reliable dead-lettering. It returns success for
+// a persistent message only after StoreMessage's WAL completion.
+func (b *StorageBroker) republishToTarget(qs *QueueState, p *QueuePolicy, target string, storeMsg *protocol.Message) error {
+	select {
+	case <-qs.StopCh():
+		return errDeadLetterTargetGone
+	default:
+	}
+	if qs.AtHighWaterMark() {
+		return errDeadLetterTargetFull
+	}
 
-		var storeMsg *protocol.Message
-		if first {
-			clone.DeliveryTag = msgID
-			storeMsg = clone
-		} else {
-			c := *clone
-			c.DeliveryTag = msgID
-			if clone.Headers != nil {
-				h := make(map[string]interface{}, len(clone.Headers))
-				for k, v := range clone.Headers {
-					h[k] = v
-				}
-				c.Headers = h
-			}
-			storeMsg = &c
+	rejectPublish := p != nil && p.Overflow == OverflowRejectPublish && (p.HasMaxLength || p.HasMaxLengthBytes)
+	if rejectPublish {
+		tag, ok := admitRejectPublish(qs, p, len(storeMsg.Body))
+		if !ok {
+			return errDeadLetterOverflow
 		}
+		storeMsg.DeliveryTag = tag
+	} else {
+		storeMsg.DeliveryTag = qs.FrontierReserve()
+	}
+	if err := b.storage.StoreMessage(target, storeMsg); err != nil {
+		qs.FrontierComplete(storeMsg.DeliveryTag, false)
+		return err
+	}
+	if !rejectPublish {
+		addReadyBytesOnEnqueue(qs, p, len(storeMsg.Body))
+	}
+	qs.FrontierComplete(storeMsg.DeliveryTag, true)
+	return nil
+}
 
-		// At-least-once: StoreMessage (durable persistence for a persistent
-		// message) happens here, BEFORE the caller removes the source. A store
-		// failure is a genuine message LOSS (the caller still deletes the source),
-		// so it is made observable — logged and counted via the optional metrics
-		// hook — rather than dropped silently. Behavior is unchanged: drop and
-		// continue.
-		if err := b.storage.StoreMessage(target, storeMsg); err != nil {
-			// FrontierComplete(false) pops the tag and releases its reservation.
-			qs.FrontierComplete(msgID, false)
-			b.recordDeadLetterDrop(srcQueueName, target, err)
-			continue
-		}
-		qs.FrontierComplete(msgID, true)
-		// SQ-11: keep the DLX target's ready-bytes counter consistent when the
-		// target itself enforces x-max-length-bytes. A RESERVED copy's bytes
-		// were transferred by the frontier pop (§7) — skip the add here.
-		if !rejectPublish {
-			addReadyBytesOnEnqueue(qs, p, len(storeMsg.Body))
-		}
-
-		// drop-head with a limit: trim AFTER enqueue (lock-free) so the target
-		// stays AT its cap, evicting the globally-oldest ready message. dropHeadTrim
-		// dead-letters each eviction through this same seam; no lock is held here.
-		if p != nil && p.Overflow == OverflowDropHead && (p.HasMaxLength || p.HasMaxLengthBytes) {
-			b.dropHeadTrim(qs, target, p)
-		}
-		first = false
+func (b *StorageBroker) trimDeadLetterTarget(qs *QueueState, p *QueuePolicy, target string) {
+	if p != nil && p.Overflow == OverflowDropHead && (p.HasMaxLength || p.HasMaxLengthBytes) {
+		b.dropHeadTrim(qs, target, p)
 	}
 }
 

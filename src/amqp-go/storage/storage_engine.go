@@ -656,9 +656,6 @@ func (ds *StorageEngine) GetMessage(queueName string, deliveryTag uint64) (*prot
 	}
 
 	msg, err := ds.readColdMessageCounted(queue, deliveryTag, false)
-	if err != nil {
-		return nil, err
-	}
 
 	// The acknowledgement re-check: the tag may have been acknowledged
 	// between the tier read and now. It asks the WAL whether the tag was
@@ -666,7 +663,7 @@ func (ds *StorageEngine) GetMessage(queueName string, deliveryTag uint64) (*prot
 	if ds.wal != nil && ds.wal.IsAcknowledged(queueName, deliveryTag) {
 		return nil, interfaces.ErrMessageNotFound
 	}
-	return msg, nil
+	return msg, err
 }
 
 // GetMessageForDelivery reads a message for a CONSUMER DELIVERY and admits
@@ -735,6 +732,9 @@ func (ds *StorageEngine) GetMessageForDelivery(queueName string, deliveryTag uin
 	ds.recordHotCacheDeliveryColdRead(captured)
 	msg, err := ds.readColdMessageCounted(captured, deliveryTag, true)
 	if err != nil {
+		if ds.wal != nil && ds.wal.IsAcknowledged(queueName, deliveryTag) {
+			return nil, interfaces.ErrMessageNotFound
+		}
 		return nil, err
 	}
 
@@ -881,10 +881,10 @@ func (ds *StorageEngine) putBestEffortIfCurrent(queueName string, captured *Queu
 // delivered message with reads no consumer asked for.
 func (ds *StorageEngine) readColdMessageCounted(queue *QueueHot, deliveryTag uint64, countPreads bool) (*protocol.Message, error) {
 	queueName := queue.name
-	var msg *protocol.Message
+	var walErr, segmentErr error
 	if ds.wal != nil {
-		if m, err := ds.wal.Read(queueName, deliveryTag); err == nil {
-			msg = m
+		msg, err := ds.wal.Read(queueName, deliveryTag)
+		if err == nil {
 			if countPreads {
 				// The WAL delivery parse issues one positional read for the
 				// record header and one for its payload (parseMessageAt); a
@@ -894,17 +894,25 @@ func (ds *StorageEngine) readColdMessageCounted(queue *QueueHot, deliveryTag uin
 				// through the WAL.
 				ds.recordHotCacheDeliveryPread(queue, 2)
 			}
+			return msg, nil
+		}
+		if !errors.Is(err, interfaces.ErrMessageNotFound) {
+			walErr = fmt.Errorf("read queue %q tag %d from WAL: %w", queueName, deliveryTag, err)
 		}
 	}
-	if msg == nil && ds.segments != nil {
-		if m, err := ds.segments.Read(queueName, deliveryTag); err == nil {
-			msg = m
+	if ds.segments != nil {
+		msg, err := ds.segments.Read(queueName, deliveryTag)
+		if err == nil {
+			return msg, nil
+		}
+		if !errors.Is(err, interfaces.ErrMessageNotFound) {
+			segmentErr = fmt.Errorf("read queue %q tag %d from segments: %w", queueName, deliveryTag, err)
 		}
 	}
-	if msg == nil {
-		return nil, interfaces.ErrMessageNotFound
+	if walErr != nil || segmentErr != nil {
+		return nil, errors.Join(walErr, segmentErr)
 	}
-	return msg, nil
+	return nil, interfaces.ErrMessageNotFound
 }
 
 // DeleteMessage removes a message from the hot cache and acknowledges it in

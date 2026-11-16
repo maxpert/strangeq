@@ -56,6 +56,8 @@ type MessageStore interface {
 	//
 	// A DELIVERY uses GetMessageForDelivery instead: the write-through
 	// admission is attributable to a consumer delivery, not to a probe.
+	// ErrMessageNotFound identifies an absent or settled tag. An unreadable
+	// tag that could still be present returns its underlying read failure.
 	GetMessage(queueName string, deliveryTag uint64) (*protocol.Message, error)
 
 	// GetMessageForDelivery retrieves a specific message by delivery tag for
@@ -70,6 +72,7 @@ type MessageStore interface {
 	// It is atomic with the queue's RANGE REMOVALS too (the range purge and
 	// the queue deletion): a tag settled by either is never admitted, never
 	// served from the hot cache and never counted by it.
+	// Absence and read failures have the same meaning as for GetMessage.
 	GetMessageForDelivery(queueName string, deliveryTag uint64) (*protocol.Message, error)
 
 	// DeleteMessage removes a message from storage after acknowledgment

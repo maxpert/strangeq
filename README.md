@@ -448,6 +448,7 @@ Run on the same kind of storage you intend to deploy against: the default
 | `x-expires` (queue TTL) | Yes | Idle queue auto-deletes after N ms with no consumers/get/redeclare |
 | `x-dead-letter-exchange` | Yes | Rejected / expired / evicted messages re-routed through the normal router |
 | `x-dead-letter-routing-key` | Yes | Overrides the routing key on dead-letter (else the original key is kept) |
+| `x-dead-letter-strategy` | Yes | `at-most-once` by default. `at-least-once` retains a durable pending transfer until the routed queues accept it. |
 | `x-death` / `x-first-death-*` headers | Yes | Full array-of-tables with `count`/`reason`/`queue`/`time`/`exchange`/`routing-keys` aggregation |
 | `x-max-length` | Yes | Cap on ready message count |
 | `x-max-length-bytes` | Yes | Cap on ready message bytes |
@@ -456,6 +457,10 @@ Run on the same kind of storage you intend to deploy against: the default
 | `x-max-priority` (priority queues) | No | See Not Yet Supported |
 
 Dead-letter `reason` values match RabbitMQ: `rejected` (nack/reject with requeue=false), `expired` (TTL), `maxlen` (drop-head eviction). Cycle detection matches RabbitMQ too — a `rejected` loop is not broken (it cycles), while `expired`/`maxlen` are dropped on a queue-name match.
+
+To opt in to at-least-once dead-lettering, declare a durable source queue with `x-dead-letter-strategy: at-least-once`, `x-overflow: reject-publish`, and `x-dead-letter-exchange`. Keep storage WAL sync enabled and use durable destination queues. StrangeQ writes a pending copy to the data directory before removing the source, then writes a persistent message to each routed destination. The pending copy survives a broker restart on the same data directory. A destination's TTL starts when StrangeQ attempts to enqueue the transfer. On the source, background expiry for this mode works from the ready queue head.
+
+If the exchange is missing or there is no route, StrangeQ waits for a route. Once the first route resolves, it keeps that set of destination names and retries destinations that are full, unavailable, unbound, or fail to store the message. Each destination must be reachable through the exchange when StrangeQ retries it. A destination that already accepted the message stays complete across retries. A crash between destination persistence and recording that completion can deliver a duplicate. Normal recovery can also replay the original persistent source message. Pending copies use disk space until their transfers finish.
 
 ### Behavioral Divergences from RabbitMQ
 
