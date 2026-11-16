@@ -380,6 +380,17 @@ func (n *Node) group(id uint64) *clusterraft.Group {
 	defer n.groupsMu.RUnlock()
 	return n.groups[id]
 }
+
+// LocalQueueShardStatus returns the local Raft status and preferred leader for queue.
+func (n *Node) LocalQueueShardStatus(queue string) (clusterraft.Status, uint64, bool) {
+	id := groupFor(queue, n.cfg.Shards)
+	group := n.group(id)
+	if group == nil {
+		return clusterraft.Status{}, 0, false
+	}
+	return group.Status(), rank(n.view(), id)[0], true
+}
+
 func (n *Node) view() view { return *n.current.Load() }
 func (n *Node) install(v view) {
 	if v.Epoch <= n.view().Epoch || !n.catalog.valid(v) {

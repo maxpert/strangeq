@@ -20,41 +20,8 @@ import (
 
 func TestClusterAMQPScaleOneToSevenAndRestart(t *testing.T) {
 	const brokers = 7
-	sockets := make([]net.Listener, 2*brokers)
-	addresses := make([]string, len(sockets))
-	for i := range sockets {
-		s, err := net.Listen("tcp", "127.0.0.1:0")
-		require.NoError(t, err)
-		sockets[i] = s
-		t.Cleanup(func() { _ = s.Close() })
-		addresses[i] = s.Addr().String()
-	}
-	for _, s := range sockets {
-		require.NoError(t, s.Close())
-	}
-
-	token := make([]byte, 32)
-	_, err := rand.Read(token)
-	require.NoError(t, err)
-	tokenFile := filepath.Join(t.TempDir(), "peer-token")
-	require.NoError(t, os.WriteFile(tokenFile, []byte(base64.RawURLEncoding.EncodeToString(token)), 0600))
-	seeds := []string{"1@" + addresses[0]}
-	nodes := make([]testClusterBroker, brokers)
-	for i := range nodes {
-		cfg := config.DefaultConfig()
-		cfg.Storage.Path = t.TempDir()
-		cfg.Network.Address = addresses[i+brokers]
-		cfg.Cluster = config.ClusterConfig{
-			ID: "amqp-network", NodeID: uint64(i + 1), PeerAddress: addresses[i], Seeds: seeds, Shards: 3,
-			TokenFile: tokenFile, AllowLoopbackPlaintext: true,
-		}
-		if i > 1 {
-			cfg.Cluster.Discovery = []string{addresses[1]}
-		}
-		nodes[i].config = cfg
-		t.Cleanup(func() { nodes[i].close(t) })
-	}
-	_, err = openCluster(nodes[0].config, true)
+	nodes := newTestCluster(t, brokers, 1, 3)
+	_, err := openCluster(nodes[0].config, true)
 	require.NoError(t, err)
 	nodes[0].start(t, false)
 	const queue = "integration-cross-node"
@@ -127,6 +94,48 @@ func TestClusterAMQPScaleOneToSevenAndRestart(t *testing.T) {
 		nodes[i].close(t)
 	}
 	assertClusterPublishRejected(t, survivor, minority, queue)
+}
+
+func newTestCluster(t *testing.T, brokers, originalVoters int, shards uint64) []testClusterBroker {
+	t.Helper()
+	sockets := make([]net.Listener, 2*brokers)
+	addresses := make([]string, len(sockets))
+	for i := range sockets {
+		s, err := net.Listen("tcp", "127.0.0.1:0")
+		require.NoError(t, err)
+		sockets[i] = s
+		t.Cleanup(func() { _ = s.Close() })
+		addresses[i] = s.Addr().String()
+	}
+	for _, s := range sockets {
+		require.NoError(t, s.Close())
+	}
+
+	token := make([]byte, 32)
+	_, err := rand.Read(token)
+	require.NoError(t, err)
+	tokenFile := filepath.Join(t.TempDir(), "peer-token")
+	require.NoError(t, os.WriteFile(tokenFile, []byte(base64.RawURLEncoding.EncodeToString(token)), 0600))
+	seeds := make([]string, originalVoters)
+	for i := range seeds {
+		seeds[i] = fmt.Sprintf("%d@%s", i+1, addresses[i])
+	}
+	nodes := make([]testClusterBroker, brokers)
+	for i := range nodes {
+		cfg := config.DefaultConfig()
+		cfg.Storage.Path = t.TempDir()
+		cfg.Network.Address = addresses[i+brokers]
+		cfg.Cluster = config.ClusterConfig{
+			ID: "amqp-network", NodeID: uint64(i + 1), PeerAddress: addresses[i], Seeds: seeds, Shards: shards,
+			TokenFile: tokenFile, AllowLoopbackPlaintext: true,
+		}
+		if originalVoters == 1 && i > 1 {
+			cfg.Cluster.Discovery = []string{addresses[1]}
+		}
+		nodes[i].config = cfg
+		t.Cleanup(func() { nodes[i].close(t) })
+	}
+	return nodes
 }
 
 func waitClusterBroker(t *testing.T, broker *testClusterBroker) {
