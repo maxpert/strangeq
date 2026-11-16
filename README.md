@@ -519,8 +519,8 @@ replica of that queue. Each queue belongs to a stable Raft shard. Adding brokers
 moves replicas and shard leadership while keeping that queue's order and data.
 Queue shards and the membership catalog grow toward three replicas.
 
-See [Cluster setup and limits](docs/CLUSTERING.md) for bootstrap, discovery, and
-client retry behavior.
+See [Cluster setup and configuration](docs/CLUSTERING.md) for a two-broker
+walkthrough, peer TLS, configuration options, and quorum behavior.
 
 ## Production Deployment
 

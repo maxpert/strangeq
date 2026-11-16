@@ -14,7 +14,7 @@ umask 077
 openssl rand -base64 32 | tr '+/' '-_' | tr -d '=\n' > peer.token
 ```
 
-Use a configuration like this for a local test.
+Save this local test configuration as `node-1.yaml`.
 
 ```yaml
 network:
@@ -46,10 +46,30 @@ Keep peer clocks synchronized for request authentication and delivery leases.
 
 Keep the cluster ID, original `seeds`, shard count, and token the same. Set a new
 positive `node_id`, a reachable `peer_address`, and its own storage directory.
-Start with the ordinary command and let it enroll. If the original seed is
-unavailable after the catalog has three voters, set `cluster.discovery` to the
-peer addresses of reachable enrolled brokers. The immutable `seeds` still
-identify the original configuration.
+For a second broker on the same machine, save this as `node-2.yaml`.
+
+```yaml
+network:
+  address: "127.0.0.1:5673"
+storage:
+  path: "./node-2-data"
+cluster:
+  id: "example"
+  node_id: 2
+  peer_address: "127.0.0.1:7662"
+  seeds: ["1@127.0.0.1:7661"]
+  token_file: "./peer.token"
+  allow_loopback_plaintext: true
+```
+
+Start it with `amqp-server --config node-2.yaml`. The broker enrolls on startup.
+You can declare a queue and publish with confirms on port 5672, then consume
+and acknowledge using the same queue name on port 5673. The receiving broker
+routes each operation to the owning shard.
+
+If the original seed is unavailable after the catalog has three voters, set
+`cluster.discovery` to the peer addresses of reachable enrolled brokers. The
+immutable `seeds` still identify the original configuration.
 
 The membership catalog retains its first three voters after it reaches three.
 Online enrollment does not replace those voters. Shards place replicas and
@@ -58,6 +78,38 @@ learner before voting. As placement converges, retired stores are removed after
 persisting a replica tombstone. Never use initialization to replace a lost
 original voter disk. Replacement needs a new node identity, and recovery of a
 lost catalog quorum is a separate operator operation.
+
+## Configuration reference
+
+| Key under `cluster` | Default | Purpose |
+|---|---|---|
+| `id` | Empty | Enables cluster mode and identifies the cluster. Use the same ID on every broker. |
+| `node_id` | Required | Unique positive node ID. Keep it stable across restarts with the same data directory. |
+| `peer_address` | Required | Advertised peer `host:port`. Every peer must be able to reach it. |
+| `peer_listen` | `peer_address` | Local bind address for peer traffic. |
+| `seeds` | Required | One to three original voters as `node_id@host:port`. Copy the same list to every broker. |
+| `discovery` | Empty | Additional peer `host:port` addresses for discovering enrolled brokers. |
+| `shards` | `32` | Fixed data shard count from 1 to 1024. Use the same count on every broker. |
+| `token_file` | Required | File containing the shared 32-byte token encoded as unpadded base64url. |
+| `peer_cert_file`, `peer_key_file` | Empty | PEM certificate and private key for peer TLS. Set both for multi-host deployments. |
+| `peer_ca_file` | System trust roots | PEM trust roots for a private CA. |
+| `allow_loopback_plaintext` | `false` | Allows peer traffic without TLS on numeric loopback addresses for local tests. |
+
+Cluster state lives under `storage.path/cluster`. Relative paths resolve from
+the working directory. Configure AMQP client authentication and encryption
+separately from peer TLS. See [TLS](TLS.md) and [Authorization](AUTHORIZATION.md).
+
+## Readiness and quorum
+
+With [telemetry](METRICS.md) enabled, `/health` includes the broker's cluster
+enrollment status. A ready broker can still encounter a shard without quorum.
+Use an AMQP publish with confirms to verify that a particular queue can accept
+writes. If enrollment stalls, check reachability on the advertised peer port,
+the original seed list, the shared token, and the peer certificate and CA.
+
+Restart a broker with its existing configuration and persistent directory. If
+a shard loses quorum, restore access to enough of its existing voters before
+expecting new commits.
 
 ## Behavior and limits
 
