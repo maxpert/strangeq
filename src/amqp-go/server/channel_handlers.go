@@ -227,18 +227,26 @@ func (s *Server) teardownChannel(conn *protocol.Connection, channelID uint16) {
 		protocol.PutPendingMessage(pm)
 	}
 
-	// Unregister consumers from broker (stops poll goroutines)
-	for _, consumerID := range consumerIDs {
-		err := s.Broker.UnregisterConsumer(consumerID)
-		if err != nil {
-			s.Log.Warn("Failed to unregister consumer on channel close",
-				zap.String("consumer_id", consumerID),
-				zap.Uint16("channel_id", channelID),
-				zap.Error(err))
-		} else {
-			s.Log.Debug("Unregistered consumer on channel close",
-				zap.String("consumer_id", consumerID),
-				zap.Uint16("channel_id", channelID))
+	distributed, clustered := s.Broker.(*ClusterBroker)
+	if clustered {
+		if err := distributed.unregisterConsumers(consumerIDs); err != nil {
+			s.Log.Warn("Failed to release cluster consumers on channel close",
+				zap.Uint16("channel_id", channelID), zap.Error(err))
+		}
+	} else {
+		// Unregister consumers from broker (stops poll goroutines)
+		for _, consumerID := range consumerIDs {
+			err := s.Broker.UnregisterConsumer(consumerID)
+			if err != nil {
+				s.Log.Warn("Failed to unregister consumer on channel close",
+					zap.String("consumer_id", consumerID),
+					zap.Uint16("channel_id", channelID),
+					zap.Error(err))
+			} else {
+				s.Log.Debug("Unregistered consumer on channel close",
+					zap.String("consumer_id", consumerID),
+					zap.Uint16("channel_id", channelID))
+			}
 		}
 	}
 	// A channel-only close unregisters consumers without touching the
@@ -246,6 +254,10 @@ func (s *Server) teardownChannel(conn *protocol.Connection, channelID uint16) {
 	// gauge kept counting a consumer that no longer existed (finding 6).
 	if len(consumerIDs) > 0 {
 		s.updateConsumersTotal()
+	}
+
+	if clustered {
+		distributed.requeueGetChannelDeliveries(conn.ID, channelID)
 	}
 
 	// Remove channel from connection

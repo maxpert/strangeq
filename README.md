@@ -470,7 +470,7 @@ StrangeQ is wire-compatible, but a few observable behaviors intentionally differ
 
 The following RabbitMQ features are not implemented:
 
-- Clustering and high availability
+- Clustered versions of exclusive, auto-delete, and policy-managed queues
 - Priority queues (`x-max-priority`)
 - Lazy queues (`x-queue-mode`)
 - Consumer priorities (`x-priority`)
@@ -510,6 +510,17 @@ The following RabbitMQ features are not implemented:
 5. Restore pending acknowledgments
 
 Recovery is incremental (recovery time is not measured in this document).
+
+### Distributed Queues
+
+Optional cluster mode can start with one broker and add peers online. Any AMQP
+listener can publish to and consume from a queue, including brokers that hold no
+replica of that queue. Each queue belongs to a stable Raft shard. Adding brokers
+moves replicas and shard leadership while keeping that queue's order and data.
+Queue shards and the membership catalog grow toward three replicas.
+
+See [Cluster setup and limits](docs/CLUSTERING.md) for bootstrap, discovery, and
+client retry behavior.
 
 ## Production Deployment
 

@@ -2357,7 +2357,7 @@ func (b *StorageBroker) BindQueue(queueName, exchangeName, routingKey string, ar
 	// Headers-exchange bindings validate x-match at bind time (R9
 	// validate_binding), BEFORE anything is stored.
 	if bindEx.Kind == "headers" {
-		if verr := validateHeadersBinding(arguments); verr != nil {
+		if verr := ValidateHeadersBinding(arguments); verr != nil {
 			return verr
 		}
 	}
@@ -2526,7 +2526,7 @@ func (b *StorageBroker) BindExchange(destination, source, routingKey string, arg
 	// Headers-SOURCE e2e bindings validate x-match at bind time (R9), before
 	// anything is stored.
 	if srcExchange.Kind == "headers" {
-		if verr := validateHeadersBinding(arguments); verr != nil {
+		if verr := ValidateHeadersBinding(arguments); verr != nil {
 			return verr
 		}
 	}
@@ -4369,6 +4369,11 @@ func (b *StorageBroker) collectTargetQueues(exchange *protocol.Exchange, routing
 // match_any([]) = false — a nil/empty binding therefore matches every
 // message. x-match itself is validated at bind time (validateHeadersBinding).
 func (b *StorageBroker) matchHeaders(bindingArgs map[string]interface{}, messageHeaders map[string]interface{}) bool {
+	return MatchHeaders(bindingArgs, messageHeaders)
+}
+
+// MatchHeaders applies AMQP headers binding semantics.
+func MatchHeaders(bindingArgs map[string]interface{}, messageHeaders map[string]interface{}) bool {
 	mode, _ := bindingArgs["x-match"].(string) // validated at bind time
 	withX := mode == "all-with-x" || mode == "any-with-x"
 	any := mode == "any" || mode == "any-with-x"
@@ -4393,10 +4398,10 @@ func (b *StorageBroker) matchHeaders(bindingArgs map[string]interface{}, message
 	return !any // match_all([]) = true, match_any([]) = false
 }
 
-// validateHeadersBinding implements RabbitMQ's validate_binding for a headers
+// ValidateHeadersBinding implements RabbitMQ's validate_binding for a headers
 // exchange (R9): x-match must be absent or a longstr naming one of the four
 // modes; anything else is binding_invalid (406).
-func validateHeadersBinding(args map[string]interface{}) error {
+func ValidateHeadersBinding(args map[string]interface{}) error {
 	v, present := args["x-match"]
 	if !present {
 		return nil

@@ -148,6 +148,10 @@ func (s *Server) processConnectionOpen(conn *protocol.Connection, payload []byte
 	if vhost == "" {
 		vhost = "/"
 	}
+	if _, clustered := s.Broker.(*ClusterBroker); clustered && vhost != "/" {
+		return s.connectionError(conn, amqperrors.InvalidPath,
+			"clustered brokers serve the default virtual host /", 10, 40)
+	}
 
 	// AMQP 0.9.1 spec, connection.open "security" rule (SHOULD):
 	//   "The server SHOULD verify that the client has permission to access

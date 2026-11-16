@@ -540,6 +540,8 @@ func (s *Server) cleanupConnection(connection *protocol.Connection) {
 	}
 
 	// Clean up on connection close - iterate all channels and cancel consumers
+	distributed, clustered := s.Broker.(*ClusterBroker)
+	var distributedConsumers []string
 	connection.Channels.Range(func(key, value interface{}) bool {
 		channel := value.(*protocol.Channel)
 		channel.Mutex.Lock()
@@ -575,7 +577,9 @@ func (s *Server) cleanupConnection(connection *protocol.Connection) {
 		}
 
 		// Unregister from broker (stops poll goroutines)
-		if s.Broker != nil {
+		if clustered {
+			distributedConsumers = append(distributedConsumers, consumerIDs...)
+		} else if s.Broker != nil {
 			for _, consumerID := range consumerIDs {
 				err := s.Broker.UnregisterConsumer(consumerID)
 				if err != nil {
@@ -593,6 +597,13 @@ func (s *Server) cleanupConnection(connection *protocol.Connection) {
 
 		return true // continue iteration
 	})
+
+	if clustered {
+		if err := distributed.unregisterConsumers(distributedConsumers); err != nil {
+			s.Log.Warn("Failed to release cluster consumers on connection close",
+				zap.String("connection_id", connection.ID), zap.Error(err))
+		}
+	}
 
 	// Requeue this connection's orphaned basic.get deliveries (no_ack=false,
 	// unacked) — scoped to the closing connection (WS-B §10).

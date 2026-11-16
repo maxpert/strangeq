@@ -190,6 +190,10 @@ func (b *ServerBuilder) Build() (*Server, error) {
 	if err := b.config.Validate(); err != nil {
 		return nil, fmt.Errorf("invalid configuration: %w", err)
 	}
+	clusterBroker, clusterMode := b.broker.(*ClusterBroker)
+	if (b.config.Cluster.Enabled() || clusterMode) && clusterBroker == nil {
+		return nil, errors.New("cluster configuration requires a distributed broker")
+	}
 
 	// Memory limits are handled at the storage engine/queue level via HWM and capacity settings
 
@@ -205,7 +209,11 @@ func (b *ServerBuilder) Build() (*Server, error) {
 
 	// Phase 1: Use the in-memory storage engine
 	var storageImpl interfaces.Storage
-	if b.storage != nil {
+	if clusterMode {
+		if b.storage != nil {
+			return nil, errors.New("local storage cannot be attached to a distributed broker")
+		}
+	} else if b.storage != nil {
 		storageImpl = b.storage
 	} else {
 		// Create a new storage engine with the engine config
@@ -368,7 +376,7 @@ func (b *ServerBuilder) Build() (*Server, error) {
 		// WS-B (§11.4): retain the storage/broker handles so Shutdown can close
 		// exactly what the builder created (and nothing injected by the caller).
 		storage:     storageImpl,
-		ownsStorage: b.storage == nil,
+		ownsStorage: b.storage == nil && !clusterMode,
 		ownsBroker:  b.broker == nil,
 		// SQ-12: resolve resource-alarm thresholds + samplers. nil when alarms
 		// are disabled, in which case the monitor is never spawned (zero-cost).
@@ -445,6 +453,11 @@ func (b *ServerBuilder) Build() (*Server, error) {
 	// built lazily on the first publish — building it here wires the metrics
 	// and the budget gauge at startup).
 	_ = server.publishLimiter()
+
+	if clusterMode {
+		clusterBroker.cancelConsumers = server.notifyConsumersCancelled
+		return server, nil
+	}
 
 	// Always perform recovery (storage is always persistent)
 	recoveryManager := NewRecoveryManager(storageImpl, unifiedBroker, logger.(*ZapLoggerAdapter).logger)

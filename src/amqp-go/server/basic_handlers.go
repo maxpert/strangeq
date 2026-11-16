@@ -825,7 +825,12 @@ func (s *Server) handleBasicConsume(conn *protocol.Connection, channelID uint16,
 	conn.ConsumersDirty.Store(true)
 
 	// Register the consumer with the broker under its internal identity.
-	err = s.Broker.RegisterConsumer(consumeMethod.Queue, consumer.ID, consumer)
+	distributed, clustered := s.Broker.(*ClusterBroker)
+	if clustered {
+		err = distributed.registerConsumer(consumeMethod.Queue, consumer.ID, consumer)
+	} else {
+		err = s.Broker.RegisterConsumer(consumeMethod.Queue, consumer.ID, consumer)
+	}
 	if err != nil {
 		// Registration failed: release the tag so the channel does not hold a
 		// consumer the broker never accepted (which would make the tag
@@ -850,6 +855,11 @@ func (s *Server) handleBasicConsume(conn *protocol.Connection, channelID uint16,
 			zap.Error(err),
 			zap.String("consumer_tag", consumer.Tag),
 			zap.String("queue", consumeMethod.Queue))
+		if clustered {
+			if _, _, ok := brokerErrorReply(err); ok {
+				return s.closeChannelWithBrokerError(conn, channelID, err, 60, 20)
+			}
+		}
 		return err
 	}
 
@@ -863,6 +873,9 @@ func (s *Server) handleBasicConsume(conn *protocol.Connection, channelID uint16,
 		return err
 	}
 
+	if clustered {
+		distributed.startConsumer(consumer.ID)
+	}
 	s.updateConsumersTotal()
 
 	s.Log.Debug("Consumer registered",
@@ -982,7 +995,14 @@ func (s *Server) handleBasicGet(conn *protocol.Connection, channelID uint16, pay
 		return s.authzChannelError(conn, channelID, err, 60, 70)
 	}
 
-	message, deliveryTag, messageCount, err := s.Broker.GetMessageForGetOwned(queueName, getMethod.NoAck, conn.ID)
+	var message *protocol.Message
+	var deliveryTag uint64
+	var messageCount uint32
+	if distributed, ok := s.Broker.(*ClusterBroker); ok {
+		message, deliveryTag, messageCount, err = distributed.getMessageForChannel(queueName, getMethod.NoAck, conn.ID, channelID)
+	} else {
+		message, deliveryTag, messageCount, err = s.Broker.GetMessageForGetOwned(queueName, getMethod.NoAck, conn.ID)
+	}
 	if err != nil {
 		s.Log.Error("Failed to get message for basic.get",
 			zap.Error(err),

@@ -80,3 +80,6 @@ func topicMatch(pattern, key string) bool {
 func (b *StorageBroker) matchTopicPattern(pattern, routingKey string) bool {
 	return topicMatch(pattern, routingKey)
 }
+
+// MatchTopicPattern reports whether a routing key matches an AMQP topic binding.
+func MatchTopicPattern(pattern, routingKey string) bool { return topicMatch(pattern, routingKey) }

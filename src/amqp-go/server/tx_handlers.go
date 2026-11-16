@@ -41,6 +41,10 @@ func (s *Server) handleTxSelect(conn *protocol.Connection, channelID uint16, pay
 		return s.malformed(conn, err, 90, 10)
 	}
 
+	if _, clusterMode := s.Broker.(*ClusterBroker); clusterMode {
+		return s.connectionError(conn, amqperrors.NotImplemented, "NOT_IMPLEMENTED - transactions are unavailable in cluster mode", 90, 10)
+	}
+
 	// Check if channel is in confirm mode — can't be in both
 	if val, ok := conn.Channels.Load(channelID); ok {
 		ch := val.(*protocol.Channel)

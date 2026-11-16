@@ -112,13 +112,13 @@ func (s *Server) handleQueueDeclare(conn *protocol.Connection, channelID uint16,
 	}
 
 	// Call the broker to declare the queue
-	queue, err := s.Broker.DeclareQueue(
-		queueName,
-		declareMethod.Durable,
-		declareMethod.AutoDelete,
-		declareMethod.Exclusive,
-		declareMethod.Arguments,
-	)
+	var queue *protocol.Queue
+	var msgCount, consumerCount uint32
+	if distributed, ok := s.Broker.(*ClusterBroker); ok {
+		queue, msgCount, consumerCount, err = distributed.DeclareQueueWithCounts(queueName, declareMethod.Durable, declareMethod.AutoDelete, declareMethod.Exclusive, declareMethod.Arguments)
+	} else {
+		queue, err = s.Broker.DeclareQueue(queueName, declareMethod.Durable, declareMethod.AutoDelete, declareMethod.Exclusive, declareMethod.Arguments)
+	}
 
 	if err != nil {
 		// WS-D: every known broker semantic error (invalid-argument 406,
@@ -164,8 +164,6 @@ func (s *Server) handleQueueDeclare(conn *protocol.Connection, channelID uint16,
 	// on every declare, passive or not. The protocol.Queue.MessageCount runtime
 	// counter is never maintained, so query the broker's ready count; fall back
 	// to 0 for a non-storage broker.
-	msgCount := uint32(0)
-	consumerCount := uint32(0)
 	if sb, ok := s.Broker.(*StorageBrokerAdapter); ok {
 		msgCount = sb.broker.GetQueueReadyCount(queue.Name)
 		consumerCount = uint32(sb.broker.GetQueueConsumerCount(queue.Name))
@@ -199,9 +197,12 @@ func (s *Server) handleQueueDeclarePassive(conn *protocol.Connection, channelID 
 	// falls back to the management view.
 	var queue *protocol.Queue
 	var err error
+	var msgCount, consumerCount uint32
 	sb, ok := s.Broker.(*StorageBrokerAdapter)
 	if ok {
 		queue, err = sb.broker.QueueDeclarePassive(name)
+	} else if distributed, ok := s.Broker.(*ClusterBroker); ok {
+		queue, msgCount, consumerCount, err = distributed.QueueDeclarePassiveWithCounts(name)
 	} else {
 		queue = s.Broker.GetQueues()[name]
 		if queue == nil {
@@ -237,8 +238,6 @@ func (s *Server) handleQueueDeclarePassive(conn *protocol.Connection, channelID 
 	}
 
 	// 7. Declare-ok carries the REAL ready/consumer counts (read-only getters).
-	msgCount := uint32(0)
-	consumerCount := uint32(0)
 	if ok {
 		msgCount = sb.broker.GetQueueReadyCount(queue.Name)
 		consumerCount = uint32(sb.broker.GetQueueConsumerCount(queue.Name))

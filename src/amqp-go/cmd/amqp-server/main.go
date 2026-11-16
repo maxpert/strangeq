@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -61,10 +62,11 @@ func versionString() string {
 // applyFlagOverrides are registered on the FlagSet and read back by name
 // through flag.Visit, so they need no field here.
 type cliOptions struct {
-	configFile     *string
-	showVersion    *bool
-	generateConfig *string
-	healthcheck    *bool
+	configFile        *string
+	showVersion       *bool
+	generateConfig    *string
+	healthcheck       *bool
+	initializeCluster *bool
 }
 
 // newFlagSet defines the final CLI surface. Flag defaults are documentation
@@ -85,6 +87,7 @@ func newFlagSet() (*flag.FlagSet, *cliOptions) {
 	fs.Bool("management", false, "Enable the management (control-plane) HTTP API (default from config: management.enabled)")
 	fs.String("management-address", "", "Management API bind address (default from config: 127.0.0.1)")
 	fs.Int("management-port", 0, "Management API port (default from config: 15672)")
+	o.initializeCluster = fs.Bool("initialize-cluster", false, "Initialize fresh data on an original cluster voter")
 	o.healthcheck = fs.Bool("healthcheck", false, "Probe the local /health endpoint and exit 0 (ready) or 1 (not ready)")
 
 	fs.Bool("tls", false, "Enable TLS (amqps)")
@@ -223,11 +226,19 @@ func main() {
 		fmt.Println("*** --unsafe-recovery IS SET: this broker may have discarded unrecoverable data at boot. See the log lines above. ***")
 	}
 
+	if *opts.initializeCluster {
+		if _, err := openCluster(cfg, true); err != nil {
+			log.Fatalf("Failed to initialize cluster voter: %v", err)
+		}
+		fmt.Println("Cluster voter storage initialized")
+		return
+	}
+
 	// Daemon stages. Stage 0 waits for READY; stage 1 detaches and forks; the
 	// final process resolves paths (above) before finalizeDaemon chdirs.
 	switch os.Getenv(daemonEnv) {
 	case "":
-		if cfg.Server.Daemonize {
+		if cfg.Server.Daemonize && !*opts.initializeCluster {
 			if err := startDaemon(cfg.Server.LogFile); err != nil {
 				log.Fatalf("Failed to daemonize: %v", err)
 			}
@@ -254,12 +265,22 @@ func main() {
 		collector.SetBuildInfo(version, commit, runtime.Version())
 	}
 
+	clusterNode, err := openCluster(cfg, false)
+	if err != nil {
+		log.Fatalf("Failed to start cluster peer: %v", err)
+	}
 	serverBuilder := server.NewServerBuilder().WithConfig(cfg)
+	if clusterNode != nil {
+		serverBuilder.WithUnifiedBroker(server.NewClusterBroker(clusterNode))
+	}
 	if collector != nil {
 		serverBuilder = serverBuilder.WithMetrics(collector)
 	}
 	amqpServer, err := serverBuilder.Build()
 	if err != nil {
+		if clusterNode != nil {
+			_ = clusterNode.Close()
+		}
 		log.Fatalf("Failed to create server: %v", err)
 	}
 
@@ -287,8 +308,15 @@ func main() {
 			Address:     cfg.Telemetry.Address,
 			Port:        cfg.Telemetry.Port,
 			EnablePprof: cfg.Telemetry.PprofEnabled,
-			Ready:       readyFunc(amqpServer.IsListening, serverHealth(amqpServer), &shuttingDown),
-			Annotate:    func() string { return alarmAnnotation(amqpServer.AlarmState()) },
+			Ready: readyFunc(amqpServer.IsListening, func() error {
+				if clusterNode != nil {
+					if err := clusterNode.Ready(); err != nil {
+						return err
+					}
+				}
+				return serverHealth(amqpServer)()
+			}, &shuttingDown),
+			Annotate: func() string { return alarmAnnotation(amqpServer.AlarmState()) },
 		})
 		if err := telemetryServer.Listen(); err != nil {
 			log.Fatalf("telemetry: %v", err)
@@ -451,6 +479,9 @@ func main() {
 	shutdownCtx, cancelShutdown := context.WithTimeout(context.Background(), 30*time.Second)
 	shutdownErr := shutdownServer(amqpServer, shutdownCtx)
 	cancelShutdown()
+	if clusterNode != nil {
+		shutdownErr = errors.Join(shutdownErr, clusterNode.Close())
+	}
 
 	if stopPoller != nil {
 		stopPoller()

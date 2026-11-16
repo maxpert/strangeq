@@ -38,6 +38,7 @@ var knownEnvSections = []string{
 	"engine",
 	"telemetry",
 	"management",
+	"cluster",
 }
 
 // normalizeSection strips underscores from a section name.

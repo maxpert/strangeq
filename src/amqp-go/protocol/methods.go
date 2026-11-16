@@ -3,7 +3,9 @@ package protocol
 import (
 	"encoding/binary"
 	"fmt"
+	"maps"
 	"math"
+	"slices"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -725,6 +727,15 @@ func encodeLongString(s string) []byte {
 }
 
 func EncodeFieldTable(table map[string]interface{}) ([]byte, error) {
+	return encodeFieldTableWithOrder(table, false)
+}
+
+// EncodeCanonicalFieldTable preserves AMQP types and sorts keys recursively.
+func EncodeCanonicalFieldTable(table map[string]interface{}) ([]byte, error) {
+	return encodeFieldTableWithOrder(table, true)
+}
+
+func encodeFieldTableWithOrder(table map[string]interface{}, ordered bool) ([]byte, error) {
 	var result []byte
 
 	// First, encode the table to binary format
@@ -732,7 +743,7 @@ func EncodeFieldTable(table map[string]interface{}) ([]byte, error) {
 	// In a real implementation, we'd properly serialize the map
 
 	// Calculate the total length of the table first
-	tableBytes, err := serializeFieldTable(table)
+	tableBytes, err := serializeFieldTable(table, ordered)
 	if err != nil {
 		return nil, err
 	}
@@ -750,7 +761,7 @@ type Decimal struct {
 	Value int32
 }
 
-func writeFieldValue(value interface{}) ([]byte, error) {
+func writeFieldValue(value interface{}, ordered bool) ([]byte, error) {
 	switch v := value.(type) {
 	case bool:
 		var b byte
@@ -801,7 +812,7 @@ func writeFieldValue(value interface{}) ([]byte, error) {
 	case []interface{}:
 		var elements []byte
 		for _, elem := range v {
-			elemBytes, err := writeFieldValue(elem)
+			elemBytes, err := writeFieldValue(elem, ordered)
 			if err != nil {
 				return nil, err
 			}
@@ -818,7 +829,7 @@ func writeFieldValue(value interface{}) ([]byte, error) {
 		binary.BigEndian.PutUint64(buf[1:9], uint64(v.Unix()))
 		return buf, nil
 	case map[string]interface{}:
-		tblBytes, err := serializeFieldTable(v)
+		tblBytes, err := serializeFieldTable(v, ordered)
 		if err != nil {
 			return nil, err
 		}
@@ -851,14 +862,27 @@ func writeFieldValue(value interface{}) ([]byte, error) {
 	}
 }
 
-func serializeFieldTable(table map[string]interface{}) ([]byte, error) {
+func serializeFieldTable(table map[string]interface{}, ordered bool) ([]byte, error) {
+	if ordered {
+		var output []byte
+		for _, key := range slices.Sorted(maps.Keys(table)) {
+			data, err := writeFieldValue(table[key], true)
+			if err != nil {
+				return nil, err
+			}
+			output = append(output, encodeShortString(key)...)
+			output = append(output, data...)
+		}
+		return output, nil
+	}
+
 	var result []byte
 
 	for key, value := range table {
 		keyBytes := encodeShortString(key)
 		result = append(result, keyBytes...)
 
-		valueBytes, err := writeFieldValue(value)
+		valueBytes, err := writeFieldValue(value, ordered)
 		if err != nil {
 			return nil, err
 		}

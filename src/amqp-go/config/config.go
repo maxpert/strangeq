@@ -228,6 +228,7 @@ type AMQPConfig struct {
 	ResourceAlarms interfaces.ResourceAlarmConfig `json:"resource_alarms"`
 	Telemetry      interfaces.TelemetryConfig     `json:"telemetry"`
 	Management     interfaces.ManagementConfig    `json:"management"`
+	Cluster        ClusterConfig                  `json:"cluster,omitzero"`
 }
 
 // Management authentication modes (spec mgmt-01 §5.1).
@@ -310,6 +311,9 @@ func (c *AMQPConfig) GetEngine() interfaces.EngineConfig {
 
 // Validate validates the configuration
 func (c *AMQPConfig) Validate() error {
+	if err := c.validateCluster(); err != nil {
+		return err
+	}
 	// Validate network configuration
 	if c.Network.Port <= 0 || c.Network.Port > 65535 {
 		return fmt.Errorf("invalid network port: %d", c.Network.Port)
@@ -630,6 +634,10 @@ func (c *AMQPConfig) ResolvePaths(base string) {
 		return filepath.Join(base, path)
 	}
 	c.Storage.Path = resolve(c.Storage.Path)
+	c.Cluster.TokenFile = resolve(c.Cluster.TokenFile)
+	c.Cluster.PeerCertFile = resolve(c.Cluster.PeerCertFile)
+	c.Cluster.PeerKeyFile = resolve(c.Cluster.PeerKeyFile)
+	c.Cluster.PeerCAFile = resolve(c.Cluster.PeerCAFile)
 	c.Server.LogFile = resolve(c.Server.LogFile)
 	c.Server.PidFile = resolve(c.Server.PidFile)
 	c.Security.AuthenticationFilePath = resolve(c.Security.AuthenticationFilePath)
