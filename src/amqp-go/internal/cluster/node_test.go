@@ -16,7 +16,26 @@ import (
 
 	"github.com/maxpert/amqp-go/internal/clusterraft"
 	"github.com/stretchr/testify/require"
+	"go.etcd.io/raft/v3"
 )
+
+func TestOpenRejectsReservedRaftIDBeforeEnrollment(t *testing.T) {
+	cfg := Config{
+		ClusterID: "reserved-peer-id", Directory: t.TempDir(), Shards: 1,
+		Peer: Peer{raft.LocalAppendThread, "127.0.0.1:30002"}, Listen: "127.0.0.1:0",
+		Seeds: []Peer{{1, "127.0.0.1:30001"}}, AllowInsecure: true,
+		Token:      base64.RawURLEncoding.EncodeToString(make([]byte, 32)),
+		NewMachine: func(uint64) clusterraft.Machine { return &testMachine{} },
+	}
+	node, err := Open(cfg)
+	if node != nil {
+		t.Cleanup(func() { require.NoError(t, node.Close()) })
+	}
+	require.ErrorContains(t, err, "valid peer")
+	files, err := os.ReadDir(cfg.Directory)
+	require.NoError(t, err)
+	require.Empty(t, files)
+}
 
 func TestFourNodeRebalanceAndReplicaIdentityFence(t *testing.T) {
 	token := make([]byte, 32)
@@ -196,6 +215,13 @@ func TestOneVoterGrowsToSevenViaSurvivingPeer(t *testing.T) {
 		return true
 	}, 28*time.Second, 50*time.Millisecond)
 	submitEventually(t, nodes[6], queue, "seven", `["one","seven"]`)
+	// The only original seed is offline, while two subsequently enrolled
+	// catalog voters still serve requests. A blank replacement directory must
+	// not let that original voter reinitialize under the same identity.
+	replacement := configs[0]
+	replacement.Directory = t.TempDir()
+	replacement.Discovery = []string{addrs[1]}
+	require.ErrorContains(t, Initialize(replacement), "cluster is running")
 	start(0)
 
 	require.Eventually(t, func() bool {

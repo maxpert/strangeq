@@ -179,7 +179,7 @@ func (b *ClusterBroker) claim(ctx context.Context, s *clusterSession, noAck bool
 		return nil, 0, clusterCount(res.Queue.Ready), nil
 	}
 	if err != nil {
-		return nil, 0, 0, clusterQueueError(s.queue, err)
+		return nil, 0, 0, err
 	}
 	delivery := res.Result.Delivery
 	message, err := decodeClusterMessage(delivery.Body)
@@ -241,11 +241,22 @@ func (b *ClusterBroker) GetMessageForGetOwned(queue string, noAck bool, connecti
 func (b *ClusterBroker) getMessageForChannel(queue string, noAck bool, connection string, channel uint16) (*protocol.Message, uint64, uint32, error) {
 	ctx, cancel := clusterContext()
 	defer cancel()
-	session, err := b.getSession(ctx, clusterGetKey{Connection: connection, Queue: queue, Channel: channel})
+	key := clusterGetKey{Connection: connection, Queue: queue, Channel: channel}
+	session, err := b.getSession(ctx, key)
 	if err != nil {
 		return nil, 0, 0, err
 	}
-	return b.claim(ctx, session, noAck, "")
+	message, tag, ready, err := b.claim(ctx, session, noAck, "")
+	if errors.Is(err, clusterqueue.ErrQueueIncarnation) {
+		// The failed claim made no change, and run canceled the old session.
+		// Reopen once against the current queue to handle delete/redeclare.
+		session, err = b.getSession(ctx, key)
+		if err != nil {
+			return nil, 0, 0, err
+		}
+		message, tag, ready, err = b.claim(ctx, session, noAck, "")
+	}
+	return message, tag, ready, clusterQueueError(queue, err)
 }
 
 func (b *ClusterBroker) RequeueGetDeliveries(connection string) {
@@ -310,21 +321,53 @@ func (b *ClusterBroker) settle(consumer string, tag uint64, multiple bool, kind 
 	ctx, cancel := clusterContext()
 	defer cancel()
 	for _, tag := range tags {
-		b.mu.Lock()
-		entry, ok := b.deliveries[tag]
-		b.mu.Unlock()
-		if !ok || entry.Consumer != consumer {
-			return clusterqueue.ErrUnknownAttempt
-		}
-		if _, err := entry.Session.run(ctx, kind, entry.Attempt); err != nil {
+		if err := b.settleAttempt(ctx, consumer, tag, kind); err != nil {
 			return err
 		}
-		b.mu.Lock()
-		delete(b.deliveries, tag)
-		b.mu.Unlock()
 	}
 	return nil
 }
+
+func (b *ClusterBroker) settleAttempt(ctx context.Context, consumer string, tag uint64, kind clusterqueue.QueueCommandKind) error {
+	b.mu.Lock()
+	entry, ok := b.deliveries[tag]
+	b.mu.Unlock()
+	if !ok || entry.Consumer != consumer {
+		return clusterqueue.ErrUnknownAttempt
+	}
+	if _, err := entry.Session.run(ctx, kind, entry.Attempt); err != nil {
+		return err
+	}
+	b.mu.Lock()
+	delete(b.deliveries, tag)
+	b.mu.Unlock()
+	return nil
+}
+
+func (b *ClusterBroker) settleWireTags(channel *protocol.Channel, upto uint64, kind settleKind, requeue bool) (int, error) {
+	command := clusterqueue.AckMessage
+	if kind == settleNack {
+		command = clusterqueue.DropMessage
+		if requeue {
+			command = clusterqueue.RequeueMessage
+		}
+	}
+
+	tags, refs := channel.TakeWireTagEntriesUpTo(upto)
+	ctx, cancel := clusterContext()
+	defer cancel()
+	for i, ref := range refs {
+		if err := b.settleAttempt(ctx, ref.ConsumerID, ref.MsgID, command); err != nil {
+			for j := i; j < len(refs); j++ {
+				unsettled := refs[j]
+				channel.TrackDelivery(tags[j], unsettled.MsgID, unsettled.ConsumerID, unsettled.IsGet)
+			}
+			return i, fmt.Errorf("cluster cumulative settlement at delivery tag %d: %w", tags[i], err)
+		}
+	}
+	return len(refs), nil
+}
+
 func (b *ClusterBroker) AcknowledgeMessage(c string, t uint64, m bool) error {
 	return b.settle(c, t, m, clusterqueue.AckMessage)
 }

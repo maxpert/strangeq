@@ -92,7 +92,7 @@ func open(cfg Config, initialize bool) (*Node, error) {
 	if cfg.Shards == 0 {
 		cfg.Shards = defaultShards
 	}
-	if cfg.Peer.ID == 0 || !validAddress(cfg.Peer.Address) || cfg.Listen == "" || cfg.Directory == "" || cfg.NewMachine == nil {
+	if !clusterraft.ValidMemberID(cfg.Peer.ID) || !validAddress(cfg.Peer.Address) || cfg.Listen == "" || cfg.Directory == "" || cfg.NewMachine == nil {
 		return nil, errors.New("cluster requires a valid peer, listener, storage directory and machine")
 	}
 	c, err := newCatalog(cfg.ClusterID, cfg.Shards, cfg.Seeds)
@@ -168,12 +168,19 @@ func (n *Node) prepareIdentity(seed, initialize bool) error {
 			return errors.New("original voter is missing persistent identity")
 		}
 		if seed {
+			addresses := make([]string, 0, len(n.catalog.initial.Nodes)+len(n.cfg.Discovery))
 			for _, other := range n.catalog.initial.Nodes {
-				if other.ID == n.cfg.Peer.ID {
+				addresses = append(addresses, other.Address)
+			}
+			addresses = append(addresses, n.cfg.Discovery...)
+			seen := map[string]bool{n.cfg.Peer.Address: true}
+			for _, address := range addresses {
+				if seen[address] {
 					continue
 				}
+				seen[address] = true
 				ctx, cancel := context.WithTimeout(n.ctx, 500*time.Millisecond)
-				_, err := n.client.Membership(ctx, other.Address, nil)
+				_, err := n.client.Membership(ctx, address, nil)
 				cancel()
 				if err == nil {
 					return errors.New("cannot initialize an original voter while the cluster is running")

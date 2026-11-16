@@ -1,25 +1,60 @@
 package clusterqueue
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
+
+	"github.com/fxamacker/cbor/v2"
 )
 
 // Reserve wire space for the Raft envelope and protocol-specific shard state.
 const maxSnapshotBytes = 112 << 20
+const snapshotVersion byte = 2
+const legacySnapshotVersion = 1
 
-type snapshot struct {
+var snapshotEncoding = func() cbor.UserBufferEncMode {
+	mode, err := cbor.CoreDetEncOptions().UserBufferEncMode()
+	if err != nil {
+		panic(err)
+	}
+	return mode
+}()
+
+var snapshotDecoding = func() cbor.DecMode {
+	mode, err := (cbor.DecOptions{
+		DupMapKey:        cbor.DupMapKeyEnforcedAPF,
+		IndefLength:      cbor.IndefLengthForbidden,
+		TagsMd:           cbor.TagsForbidden,
+		MaxArrayElements: maxMessages,
+		MaxMapPairs:      maxMessages,
+	}).DecMode()
+	if err != nil {
+		panic(err)
+	}
+	return mode
+}()
+
+type legacySnapshot struct {
 	Version uint16
 	State   *machineState
 }
 
 func (m *Machine) Snapshot() ([]byte, error) {
-	data, err := json.Marshal(snapshot{Version: snapshotVersion, State: &m.state})
-	if err == nil && len(data) > maxSnapshotBytes {
+	// CBOR stores payloads and arguments as raw bytes and needs no string
+	// escaping. At capacity, the 48 MiB payload budget plus 4096 queues
+	// (name, arguments, and fields), 8192 sessions, and 131072 message
+	// records fit under the snapshot cap, including in-flight map keys.
+	var out bytes.Buffer
+	_ = out.WriteByte(snapshotVersion)
+	if err := snapshotEncoding.MarshalToBuffer(&m.state, &out); err != nil {
+		return nil, err
+	}
+	if out.Len() > maxSnapshotBytes {
 		return nil, errors.New("queue snapshot exceeds peer size limit")
 	}
-	return data, err
+	return out.Bytes(), nil
 }
 
 // Restore validates the snapshot and reconstructs the resource counters before
@@ -28,17 +63,28 @@ func (m *Machine) Restore(data []byte) error {
 	if len(data) > maxSnapshotBytes {
 		return errors.New("queue snapshot exceeds peer size limit")
 	}
-	var s snapshot
-	if err := json.Unmarshal(data, &s); err != nil {
-		return fmt.Errorf("invalid queue snapshot: %w", err)
+	var state *machineState
+	switch {
+	case len(data) > 0 && data[0] == snapshotVersion:
+		if err := snapshotDecoding.Unmarshal(data[1:], &state); err != nil {
+			return fmt.Errorf("invalid queue snapshot: %w", err)
+		}
+	case len(data) > 0 && data[0] == '{':
+		var legacy legacySnapshot
+		if err := json.Unmarshal(data, &legacy); err != nil {
+			return fmt.Errorf("invalid queue snapshot: %w", err)
+		}
+		if legacy.Version == legacySnapshotVersion {
+			state = legacy.State
+		}
 	}
-	if s.Version != snapshotVersion || s.State == nil {
+	if state == nil {
 		return errors.New("unsupported queue snapshot")
 	}
-	if err := s.State.validate(); err != nil {
+	if err := state.validate(); err != nil {
 		return err
 	}
-	m.state = *s.State
+	m.state = *state
 	return nil
 }
 

@@ -1416,7 +1416,7 @@ func (s *Server) readFrames(rt *connRuntime, done chan struct{}) {
 			return
 		}
 
-		// Divert basic.ack/nack/reject straight to the ACK processor,
+		// On standalone brokers, divert basic.ack/nack/reject to the ACK processor,
 		// bypassing FrameQueue and the (potentially publish-blocked)
 		// processFrames goroutine. A basic.publish that hits queue
 		// backpressure blocks processFrames in QueueState.WaitForCapacity;
@@ -1435,13 +1435,18 @@ func (s *Server) readFrames(rt *connRuntime, done chan struct{}) {
 			if !s.admitOversizedAckFrame(conn, frame) {
 				return
 			}
-			select {
-			case conn.AckQueue <- frame:
-			case <-conn.Done:
-				protocol.PutFrame(frame)
-				return
+			// Cluster publishes have bounded RPCs and no queue-depth wait.
+			// Keep settlements in FrameQueue so later channel methods cannot
+			// overtake a committed ack, nack, or reject.
+			if _, clustered := s.Broker.(*ClusterBroker); !clustered {
+				select {
+				case conn.AckQueue <- frame:
+				case <-conn.Done:
+					protocol.PutFrame(frame)
+					return
+				}
+				continue
 			}
-			continue
 		}
 
 		// WS-I Phase B: header-time lease. A content-header frame reserves its
@@ -1625,6 +1630,9 @@ func (s *Server) processFrame(conn *protocol.Connection, frame *protocol.Frame) 
 	switch frame.Type {
 	case protocol.FrameMethod:
 		if isAckFrame(frame) {
+			if _, clustered := s.Broker.(*ClusterBroker); clustered {
+				return true, s.processAckFrame(conn, frame)
+			}
 			select {
 			case conn.AckQueue <- frame:
 				return false, nil

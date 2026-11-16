@@ -61,32 +61,73 @@ func checkIdentity(value []byte, config Config) bool {
 }
 
 func createStore(cfg Config) (*bbolt.DB, error) {
+	path := filepath.Join(cfg.Dir, dbName)
+	db, err := openStore(cfg, path)
+	if !errors.Is(err, os.ErrNotExist) {
+		return db, err
+	}
 	if err := os.MkdirAll(cfg.Dir, 0700); err != nil {
 		return nil, err
 	}
-	existing, err := Exists(cfg.Dir)
+	if err := provisionStore(cfg, path); err != nil {
+		return nil, err
+	}
+	return openStore(cfg, path)
+}
+
+func openStore(cfg Config, path string) (*bbolt.DB, error) {
+	options := &bbolt.Options{
+		Timeout: time.Second,
+		OpenFile: func(path string, flags int, mode os.FileMode) (*os.File, error) {
+			return os.OpenFile(path, flags&^os.O_CREATE, mode)
+		},
+	}
+	db, err := bbolt.Open(path, 0600, options)
 	if err != nil {
 		return nil, err
 	}
-	db, err := bbolt.Open(filepath.Join(cfg.Dir, dbName), 0600, &bbolt.Options{Timeout: time.Second})
-	if err != nil {
-		return nil, err
-	}
-	cleanup := func(err error) (*bbolt.DB, error) { _ = db.Close(); return nil, err }
-	var created bool
-	err = db.Update(func(tx *bbolt.Tx) error {
+	err = db.View(func(tx *bbolt.Tx) error {
 		state := tx.Bucket(stateBucket)
-		if state != nil {
-			if !checkIdentity(state.Get(keyIdentity), cfg) || tx.Bucket(logBucket) == nil {
-				return errors.New("raft store identity or format mismatch")
-			}
-			return nil
-		}
-		if existing {
+		if state == nil {
 			return errors.New("existing raft store is missing its persistent identity")
 		}
-		var err error
-		state, err = tx.CreateBucket(stateBucket)
+		if !checkIdentity(state.Get(keyIdentity), cfg) || tx.Bucket(logBucket) == nil {
+			return errors.New("raft store identity or format mismatch")
+		}
+		return nil
+	})
+	// A prior process may have stopped just after linking the final path.
+	// Sync both directory entries while holding the store lock before use.
+	for _, dir := range []string{cfg.Dir, filepath.Dir(cfg.Dir)} {
+		if err == nil {
+			err = syncDirectory(dir)
+		}
+	}
+	if err != nil {
+		_ = db.Close()
+		return nil, err
+	}
+	return db, nil
+}
+
+// Publish the initialized store atomically. A crash before publication leaves
+// raft.db absent. openStore locks and syncs the published entry before use.
+func provisionStore(cfg Config, path string) error {
+	stage, err := os.CreateTemp(cfg.Dir, ".raft-store-*")
+	if err != nil {
+		return err
+	}
+	defer os.Remove(stage.Name())
+	if err := stage.Close(); err != nil {
+		return err
+	}
+	db, err := bbolt.Open(stage.Name(), 0600, nil)
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+	err = db.Update(func(tx *bbolt.Tx) error {
+		state, err := tx.CreateBucket(stateBucket)
 		if err != nil {
 			return err
 		}
@@ -101,11 +142,9 @@ func createStore(cfg Config) (*bbolt.DB, error) {
 		if err := state.Put(keyIdentity, id); err != nil {
 			return err
 		}
-		created = true
 		if len(cfg.Peers) == 0 {
 			return nil
 		}
-
 		data, err := cfg.Machine.Snapshot()
 		if err != nil {
 			return err
@@ -120,16 +159,16 @@ func createStore(cfg Config) (*bbolt.DB, error) {
 		return putMessage(state, keyHard, &pb.HardState{Term: new(uint64(1)), Commit: new(uint64(1))})
 	})
 	if err != nil {
-		return cleanup(err)
+		return err
 	}
-	if created {
-		for _, dir := range []string{cfg.Dir, filepath.Dir(cfg.Dir)} {
-			if err := syncDirectory(dir); err != nil {
-				return cleanup(err)
-			}
-		}
+	// Both paths are in the same directory. A link publishes without
+	// replacing an existing store opened by a concurrent provisioner.
+	if err := os.Link(stage.Name(), path); errors.Is(err, os.ErrExist) {
+		return nil
+	} else if err != nil {
+		return err
 	}
-	return db, nil
+	return os.Remove(stage.Name())
 }
 
 func syncDirectory(path string) error {

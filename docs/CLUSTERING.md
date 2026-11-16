@@ -79,6 +79,12 @@ persisting a replica tombstone. Never use initialization to replace a lost
 original voter disk. Replacement needs a new node identity, and recovery of a
 lost catalog quorum is a separate operator operation.
 
+When initializing a seed with a fresh directory, StrangeQ probes the other
+original seeds and configured discovery addresses for a running cluster. A
+reachable enrolled peer with the same cluster credentials blocks initialization.
+Unreachable peers leave the probe inconclusive. Use initialization only for a
+known-new cluster and preserve the durable identity of an existing voter.
+
 ## Configuration reference
 
 | Key under `cluster` | Default | Purpose |
@@ -111,6 +117,20 @@ Restart a broker with its existing configuration and persistent directory. If
 a shard loses quorum, restore access to enough of its existing voters before
 expecting new commits.
 
+## Queue placement and metadata
+
+Every broker hashes the queue name to the same shard ID. The replicated
+catalog records broker identities, addresses, and each shard's committed
+replica membership. Brokers keep a routing view in
+`storage.path/cluster/catalog-cache`. Each shard elects its own leader, and
+brokers update their leader hints as they route requests.
+
+StrangeQ embeds the [etcd Raft library](https://github.com/etcd-io/raft).
+StrangeQ persists each group's log, term, vote, and snapshots in a local
+bbolt `raft.db`. That includes a separate database for the catalog on its
+replicas. On each Raft update, the broker saves the batch before sending
+replication acknowledgments or reporting a committed queue operation.
+
 ## Behavior and limits
 
 - One voter commits to its local durable store. With two voters, both must
@@ -127,6 +147,9 @@ expecting new commits.
   messages, and sessions. Snapshots prune committed log prefixes and the disk
   store reuses their pages. A database file can retain its physical high-water
   size until offline compaction.
+- Run the same StrangeQ build on every broker. The current build reads legacy
+  JSON queue snapshots and writes CBOR queue snapshots. Earlier builds cannot
+  install or reopen the new snapshots.
 - Cluster mode supports ordinary queue declarations, publish, get, consume,
   ack, nack, requeue, and exchange routing in the default virtual host.
   A publish routed to several queues commits separately on each destination

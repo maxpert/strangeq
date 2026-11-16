@@ -1,12 +1,49 @@
 package clusterraft
 
 import (
+	"errors"
+	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/stretchr/testify/require"
+	"go.etcd.io/bbolt"
 	"go.etcd.io/raft/v3"
 	pb "go.etcd.io/raft/v3/raftpb"
 )
+
+type failedInitialSnapshot struct{ testMachine }
+
+func (*failedInitialSnapshot) Snapshot() ([]byte, error) {
+	return nil, errors.New("initial snapshot failed")
+}
+
+func TestStoreCreationCanRetryAfterInitialSnapshotFailure(t *testing.T) {
+	dir := t.TempDir()
+	config := Config{ID: 1, GroupID: 3, Dir: dir, Peers: []uint64{1}, Machine: &failedInitialSnapshot{}}
+	_, err := createStore(config)
+	require.ErrorContains(t, err, "initial snapshot failed")
+	exists, err := Exists(dir)
+	require.NoError(t, err)
+	require.False(t, exists)
+	files, err := os.ReadDir(dir)
+	require.NoError(t, err)
+	require.Empty(t, files)
+
+	config.Machine = &testMachine{}
+	db, err := createStore(config)
+	require.NoError(t, err)
+	require.NoError(t, db.Close())
+}
+
+func TestStoreCreationRefusesExistingStoreWithoutIdentity(t *testing.T) {
+	config := Config{ID: 1, GroupID: 3, Dir: t.TempDir(), Peers: []uint64{1}, Machine: &testMachine{}}
+	db, err := bbolt.Open(filepath.Join(config.Dir, dbName), 0600, nil)
+	require.NoError(t, err)
+	require.NoError(t, db.Close())
+	_, err = createStore(config)
+	require.ErrorContains(t, err, "missing its persistent identity")
+}
 
 func TestStoreReplacesUncommittedSuffixAndPrunesCheckpointPrefix(t *testing.T) {
 	config := Config{ID: 1, GroupID: 3, Dir: t.TempDir(), Peers: []uint64{1, 2, 3}, Machine: &testMachine{}}

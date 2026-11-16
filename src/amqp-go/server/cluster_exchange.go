@@ -17,17 +17,18 @@ import (
 )
 
 const (
-	exchangePrefix      byte = 0xff
-	exchangeDeclare          = "declare"
-	exchangeDescribe         = "describe"
-	exchangeDelete           = "delete"
-	exchangeBind             = "bind"
-	exchangeUnbind           = "unbind"
-	exchangePrune            = "prune"
-	exchangeList             = "list"
-	maxExchangeSnapshot      = 8 << 20
-	maxClusterExchanges      = 2048
-	maxExchangeBindings      = 4096
+	exchangePrefix          byte = 0xff
+	exchangeDeclare              = "declare"
+	exchangeDescribe             = "describe"
+	exchangeDelete               = "delete"
+	exchangeBind                 = "bind"
+	exchangeUnbind               = "unbind"
+	exchangePrune                = "prune"
+	exchangeList                 = "list"
+	maxExchangeSnapshot          = 8 << 20
+	exchangeSnapshotFraming      = 2
+	maxClusterExchanges          = 2048
+	maxExchangeBindings          = 4096
 )
 
 type clusterTarget struct {
@@ -190,7 +191,7 @@ func (m *ClusterMachine) applyExchange(request clusterExchangeCommand) clusterEx
 		return clusterExchangeReply{Code: "invalid"}
 	}
 	used := m.exchangeBytes + exchangeRecordSize(old) - exchangeRecordSize(prior)
-	if used > maxExchangeSnapshot || prior.Name == "" && len(m.exchanges) >= maxClusterExchanges {
+	if used > maxExchangeSnapshot-exchangeSnapshotFraming || prior.Name == "" && len(m.exchanges) >= maxClusterExchanges {
 		return clusterExchangeReply{Code: "limit"}
 	}
 	if m.exchanges == nil {
@@ -201,16 +202,15 @@ func (m *ClusterMachine) applyExchange(request clusterExchangeCommand) clusterEx
 	return clusterExchangeReply{}
 }
 
-// The estimate includes the maximum JSON expansion of names and wire field tables.
+// An exchange appears both as a map key and as a record in the snapshot.
+// Include the colon and reserve a comma for every record.
 func exchangeRecordSize(ex clusterExchange) int {
 	if ex.Name == "" {
 		return 0
 	}
-	size := 128 + 6*len(ex.Name) + 2*len(ex.Arguments)
-	for _, binding := range ex.Bindings {
-		size += 128 + 6*(len(binding.Target.Queue)+len(binding.Key)) + 2*len(binding.Arguments)
-	}
-	return size
+	key, _ := json.Marshal(ex.Name)
+	record, _ := json.Marshal(ex)
+	return len(key) + 1 + len(record) + 1
 }
 
 func (m *ClusterMachine) Snapshot() ([]byte, error) {
@@ -252,9 +252,6 @@ func (m *ClusterMachine) Restore(data []byte) error {
 			return errors.New("invalid exchange in snapshot")
 		}
 		restored.exchangeBytes += exchangeRecordSize(exchange)
-	}
-	if restored.exchangeBytes > maxExchangeSnapshot {
-		return errors.New("AMQP topology exceeds its limit")
 	}
 	if err := restored.queues.Restore(data[5+length:]); err != nil {
 		return err

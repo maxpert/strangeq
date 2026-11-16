@@ -103,6 +103,7 @@ func TestClusterNamedExchangeFromAnyBroker(t *testing.T) {
 	require.NoError(t, reader.Cancel(consumer, false))
 	redelivery := getClusterMessage(t, first, queue, "second", true)
 	require.NoError(t, redelivery.Ack(false))
+	waitClusterQueueDepth(t, &nodes[0], queue, 0, 0)
 	snapshot, err = first.QueueInspect(queue)
 	require.NoError(t, err)
 	require.Zero(t, snapshot.Messages)

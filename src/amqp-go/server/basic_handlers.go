@@ -1328,11 +1328,11 @@ func (s *Server) handleBasicAck(conn *protocol.Connection, channelID uint16, pay
 				return s.unknownDeliveryTag(conn, channelID, wireTag, protocol.BasicAck)
 			}
 		}
-		settled := s.cumulativeSettle(channel, wireTag, settleAck, false)
+		settled, err := s.cumulativeSettle(channel, wireTag, settleAck, false)
 		if s.MetricsCollector != nil {
 			s.MetricsCollector.RecordMessagesAcknowledged(settled)
 		}
-		return nil
+		return err
 	}
 
 	msgID, consumerID, isGet, known := s.resolveDeliveryTag(channel, wireTag)
@@ -1442,11 +1442,11 @@ func (s *Server) handleBasicNack(conn *protocol.Connection, channelID uint16, pa
 				return s.unknownDeliveryTag(conn, channelID, wireTag, protocol.BasicNack)
 			}
 		}
-		settled := s.cumulativeSettle(channel, wireTag, settleNack, requeue)
+		settled, err := s.cumulativeSettle(channel, wireTag, settleNack, requeue)
 		if s.MetricsCollector != nil {
 			s.MetricsCollector.RecordMessagesRejected(settled)
 		}
-		return nil
+		return err
 	}
 
 	msgID, consumerID, isGet, known := s.resolveDeliveryTag(channel, wireTag)
@@ -1490,10 +1490,9 @@ const (
 // over-settled. When channel is nil (legacy tests) it falls back to routing the
 // wire tag (== msgID) to the owning consumer's broker multi-ack.
 //
-// It returns the number of deliveries actually settled, so the caller can
-// count one acknowledgement/rejection per settled delivery instead of one per
-// cumulative method (finding 5).
-func (s *Server) cumulativeSettle(channel *protocol.Channel, wireTag uint64, kind settleKind, requeue bool) int {
+// It returns the number of settled deliveries for metrics. Clustered settlements
+// surface the first failure because quorum may be lost partway through a batch.
+func (s *Server) cumulativeSettle(channel *protocol.Channel, wireTag uint64, kind settleKind, requeue bool) (int, error) {
 	// Spec: delivery-tag 0 with multiple=true means "every outstanding delivery
 	// on the channel". Wire tags are 1-based, so 0 would otherwise match nothing
 	// and ack-all / nack-all would silently no-op.
@@ -1503,7 +1502,7 @@ func (s *Server) cumulativeSettle(channel *protocol.Channel, wireTag uint64, kin
 	if channel == nil {
 		ctag, ok := s.Broker.GetConsumerForDelivery(wireTag)
 		if !ok {
-			return 0
+			return 0, nil
 		}
 		switch {
 		case ctag == "" && kind == settleAck:
@@ -1515,9 +1514,12 @@ func (s *Server) cumulativeSettle(channel *protocol.Channel, wireTag uint64, kin
 		default:
 			s.Broker.NacknowledgeMessage(ctag, wireTag, true, requeue)
 		}
-		return 1
+		return 1, nil
 	}
 
+	if distributed, ok := s.Broker.(*ClusterBroker); ok {
+		return distributed.settleWireTags(channel, wireTag, kind, requeue)
+	}
 	refs := channel.TakeWireTagsUpTo(wireTag)
 	for _, ref := range refs {
 		switch {
@@ -1531,7 +1533,7 @@ func (s *Server) cumulativeSettle(channel *protocol.Channel, wireTag uint64, kin
 			s.Broker.NacknowledgeMessage(ref.ConsumerID, ref.MsgID, false, requeue)
 		}
 	}
-	return len(refs)
+	return len(refs), nil
 }
 
 func (s *Server) handleBasicRecover(conn *protocol.Connection, channelID uint16, payload []byte) error {
@@ -1554,6 +1556,13 @@ func (s *Server) handleBasicRecover(conn *protocol.Connection, channelID uint16,
 		return s.connectionError(conn, amqperrors.ChannelErrorCode, "CHANNEL_ERROR - expected 'channel.open'", 60, 110)
 	}
 	channel := value.(*protocol.Channel)
+
+	if distributed, ok := s.Broker.(*ClusterBroker); ok {
+		if _, err := distributed.settleWireTags(channel, math.MaxUint64, settleNack, true); err != nil {
+			return err
+		}
+		return s.sendBasicRecoverOK(conn, channelID)
+	}
 
 	// basic.recover is scoped to this channel's consumers, addressed by their
 	// broker-internal identities (the broker's ledger is keyed by identity;

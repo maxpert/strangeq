@@ -13,8 +13,10 @@ import (
 
 	"github.com/maxpert/amqp-go/config"
 	"github.com/maxpert/amqp-go/internal/cluster"
+	"github.com/maxpert/amqp-go/internal/clusterqueue"
 	"github.com/maxpert/amqp-go/server"
 	amqp "github.com/rabbitmq/amqp091-go"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
@@ -31,8 +33,7 @@ func TestClusterAMQPScaleOneToSevenAndRestart(t *testing.T) {
 	publishClusterConfirm(t, write, queue, "before-join")
 	single := getClusterMessage(t, write, queue, "before-join", false)
 	require.NoError(t, single.Ack(false))
-	_, err = write.QueueInspect(queue)
-	require.NoError(t, err)
+	waitClusterQueueDepth(t, &nodes[0], queue, 0, 0)
 	for _, body := range []string{"one", "two", "restart"} {
 		publishClusterConfirm(t, write, queue, body)
 	}
@@ -50,15 +51,15 @@ func TestClusterAMQPScaleOneToSevenAndRestart(t *testing.T) {
 	require.Equal(t, "text/plain", delivery.ContentType)
 	require.Equal(t, "message-one", delivery.MessageId)
 	require.NoError(t, delivery.Nack(false, true))
+	waitClusterQueueDepth(t, &nodes[brokers-1], queue, brokers+2, 0)
 
 	other := openClusterChannel(t, publisher)
 	delivery = getClusterMessage(t, other, queue, "two", false)
 	require.NoError(t, delivery.Ack(false))
-	// The synchronous Get following Ack on the same channel fences settlement.
+	waitClusterQueueDepth(t, &nodes[0], queue, brokers+1, 0)
 	delivery = getClusterMessage(t, other, queue, "restart", false)
 	require.NoError(t, delivery.Nack(false, true))
-	_, err = other.QueueInspect(queue)
-	require.NoError(t, err)
+	waitClusterQueueDepth(t, &nodes[0], queue, brokers+1, 0)
 
 	for i := range nodes {
 		nodes[i].close(t)
@@ -72,13 +73,13 @@ func TestClusterAMQPScaleOneToSevenAndRestart(t *testing.T) {
 		read = openClusterChannel(t, recovered)
 		msg := getClusterMessage(t, read, queue, fmt.Sprintf("node-%d", i+1), false)
 		require.NoError(t, msg.Ack(false))
-		_, err := read.QueueInspect(queue)
-		require.NoError(t, err)
+		waitClusterQueueDepth(t, &nodes[i], queue, uint64(brokers+1-i), 0)
 	}
 	for _, body := range []string{"one", "restart"} {
 		msg := getClusterMessage(t, read, queue, body, true)
 		require.NoError(t, msg.Ack(false))
 	}
+	waitClusterQueueDepth(t, &nodes[brokers-1], queue, 0, 0)
 	_, ok, err := read.Get(queue, false)
 	require.NoError(t, err)
 	require.False(t, ok)
@@ -233,6 +234,24 @@ func waitQueue(t *testing.T, broker *testClusterBroker, queue string, passive bo
 	}, 15*time.Second, 60*time.Millisecond)
 	t.Cleanup(func() { _ = connection.Close() })
 	return connection
+}
+
+// Observe committed settlement directly before recording checkpoints or stopping a broker.
+func waitClusterQueueDepth(t *testing.T, broker *testClusterBroker, queue string, ready, unacked uint64) {
+	t.Helper()
+	request, err := clusterqueue.EncodeCommand(clusterqueue.QueueCommand{Kind: clusterqueue.DescribeQueue, Queue: queue})
+	require.NoError(t, err)
+	require.EventuallyWithT(t, func(c *assert.CollectT) {
+		ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+		defer cancel()
+		raw, err := broker.node.Submit(ctx, queue, request)
+		require.NoError(c, err)
+		response, err := clusterqueue.DecodeResponse(raw)
+		require.NoError(c, err)
+		require.NoError(c, response.Err())
+		require.Equal(c, ready, response.Queue.Ready, "ready messages")
+		require.Equal(c, unacked, response.Queue.Unacknowledged, "unacknowledged messages")
+	}, 5*time.Second, 20*time.Millisecond, "replicated settlement must finish")
 }
 
 func publishClusterConfirm(t *testing.T, c *amqp.Channel, queue, body string) {

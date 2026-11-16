@@ -17,7 +17,6 @@ const (
 	maxMessageBytes   = (24 << 20) - 4096
 	maxArgumentsBytes = 4096
 	maxExpiryBatch    = 128
-	snapshotVersion   = 1
 )
 
 type Machine struct {

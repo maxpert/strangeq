@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"errors"
+	"net"
 	"sync"
 	"testing"
 	"time"
@@ -13,6 +14,7 @@ import (
 	"github.com/maxpert/amqp-go/protocol"
 	amqp "github.com/rabbitmq/amqp091-go"
 	"github.com/stretchr/testify/require"
+	"go.uber.org/zap"
 )
 
 type localClusterMachine struct {
@@ -217,7 +219,7 @@ func (p *lostClusterReplies) Submit(ctx context.Context, queue string, command [
 	if err != nil {
 		return nil, err
 	}
-	if envelope.Kind != clusterqueue.OpenQueueSession && envelope.Kind != clusterqueue.ClaimMessage {
+	if envelope.Kind != clusterqueue.OpenQueueSession && envelope.Kind != clusterqueue.ClaimMessage && envelope.Kind != clusterqueue.AckMessage {
 		return reply, nil
 	}
 	if p.first[envelope.Kind] == nil {
@@ -266,4 +268,211 @@ func TestClusterBuilderRejectsStandaloneFallback(t *testing.T) {
 		_ = srv.Shutdown(ctx)
 	}
 	require.ErrorContains(t, err, "requires a distributed broker")
+}
+
+type clusterSubmitFunc func(context.Context, string, []byte) ([]byte, error)
+
+func (f clusterSubmitFunc) Submit(ctx context.Context, queue string, request []byte) ([]byte, error) {
+	return f(ctx, queue, request)
+}
+
+func TestClusterCumulativeSettlementReportsPartialFailure(t *testing.T) {
+	for _, nack := range []bool{false, true} {
+		name := "ack"
+		kind := clusterqueue.AckMessage
+		if nack {
+			name = "nack"
+			kind = clusterqueue.RequeueMessage
+		}
+		t.Run(name, func(t *testing.T) {
+			state := &localClusterMachine{}
+			var failedAttempt clusterqueue.AttemptID
+			submitter := clusterSubmitFunc(func(ctx context.Context, queue string, request []byte) ([]byte, error) {
+				command, err := clusterqueue.DecodeCommand(request)
+				if err != nil {
+					return nil, err
+				}
+				if command.Kind == kind && command.Attempt == failedAttempt {
+					command.Attempt = 0
+					request, err = clusterqueue.EncodeCommand(command)
+					if err != nil {
+						return nil, err
+					}
+				}
+				return state.Submit(ctx, queue, request)
+			})
+			b := NewClusterBroker(submitter)
+			_, err := b.DeclareQueue("jobs", true, false, false, nil)
+			require.NoError(t, err)
+			client, transport := net.Pipe()
+			t.Cleanup(func() { _ = client.Close(); _ = transport.Close() })
+			conn := protocol.NewConnection(transport)
+			ch := protocol.NewChannel(1, conn)
+			conn.Channels.Store(ch.ID, ch)
+			t.Cleanup(func() { b.RequeueGetDeliveries(conn.ID) })
+			for i, body := range []string{"first", "second", "third"} {
+				require.NoError(t, b.PublishMessage("", "jobs", &protocol.Message{Body: []byte(body)}))
+				_, tag, _, err := b.getMessageForChannel("jobs", false, conn.ID, ch.ID)
+				require.NoError(t, err)
+				ch.TrackDelivery(uint64(i+1), tag, "", true)
+				if i == 1 {
+					failedAttempt = b.deliveries[tag].Attempt
+				}
+			}
+
+			srv := &Server{Broker: b, Log: zap.NewNop()}
+			if nack {
+				err = srv.handleBasicNack(conn, ch.ID, makeNackPayload(3, true, true))
+			} else {
+				err = srv.handleBasicAck(conn, ch.ID, makeAckPayload(3, true))
+			}
+			require.ErrorIs(t, err, clusterqueue.ErrUnknownAttempt)
+			_, tracked := ch.ResolveWireTag(1)
+			require.False(t, tracked, "completed settlements leave the wire ledger")
+			for _, tag := range []uint64{2, 3} {
+				_, tracked := ch.ResolveWireTag(tag)
+				require.True(t, tracked, "failed and unattempted settlements remain outstanding")
+			}
+			info, err := b.describe(context.Background(), "jobs")
+			require.NoError(t, err)
+			require.Equal(t, uint64(2), info.Unacknowledged)
+			if nack {
+				require.Equal(t, uint64(1), info.Ready)
+			} else {
+				require.Zero(t, info.Ready)
+			}
+		})
+	}
+}
+
+func TestClusterBasicRecoverRequeuesGetsOnItsChannel(t *testing.T) {
+	b := NewClusterBroker(&localClusterMachine{})
+	_, err := b.DeclareQueue("jobs", true, false, false, nil)
+	require.NoError(t, err)
+	client, transport := net.Pipe()
+	t.Cleanup(func() { _ = client.Close(); _ = transport.Close() })
+	go drainAckConn(client)
+	conn := protocol.NewConnection(transport)
+	t.Cleanup(func() { b.RequeueGetDeliveries(conn.ID) })
+	for i, body := range []string{"first", "second"} {
+		ch := protocol.NewChannel(uint16(i+1), conn)
+		conn.Channels.Store(ch.ID, ch)
+		require.NoError(t, b.PublishMessage("", "jobs", &protocol.Message{Body: []byte(body)}))
+		_, tag, _, err := b.getMessageForChannel("jobs", false, conn.ID, ch.ID)
+		require.NoError(t, err)
+		ch.TrackDelivery(1, tag, "", true)
+	}
+
+	srv := &Server{Broker: b, Log: zap.NewNop()}
+	payload, err := (&protocol.BasicRecoverMethod{Requeue: true}).Serialize()
+	require.NoError(t, err)
+	require.NoError(t, srv.handleBasicRecover(conn, 1, payload))
+	info, err := b.describe(context.Background(), "jobs")
+	require.NoError(t, err)
+	require.Equal(t, uint64(1), info.Ready)
+	require.Equal(t, uint64(1), info.Unacknowledged)
+	firstChannel := srv.wireChannel(conn, 1)
+	_, tracked := firstChannel.ResolveWireTag(1)
+	require.False(t, tracked)
+	secondChannel := srv.wireChannel(conn, 2)
+	_, tracked = secondChannel.ResolveWireTag(1)
+	require.True(t, tracked)
+	message, _, _, err := b.getMessageForChannel("jobs", true, conn.ID, firstChannel.ID)
+	require.NoError(t, err)
+	require.NotNil(t, message)
+	require.Equal(t, "first", string(message.Body))
+	require.True(t, message.Redelivered)
+}
+
+func TestClusterGetRefreshesSessionAfterQueueRecreation(t *testing.T) {
+	state := &localClusterMachine{}
+	getter, writer := NewClusterBroker(state), NewClusterBroker(state)
+	t.Cleanup(func() { getter.RequeueGetDeliveries("reader") })
+	const queue = "jobs"
+	_, err := writer.DeclareQueue(queue, true, false, false, nil)
+	require.NoError(t, err)
+	require.NoError(t, writer.PublishMessage("", queue, &protocol.Message{Body: []byte("old")}))
+	oldMessage, oldTag, _, err := getter.getMessageForChannel(queue, false, "reader", 1)
+	require.NoError(t, err)
+	require.NotNil(t, oldMessage)
+	require.Equal(t, "old", string(oldMessage.Body))
+
+	_, err = writer.DeleteQueue(queue, false, false)
+	require.NoError(t, err)
+	_, err = writer.DeclareQueue(queue, true, false, false, nil)
+	require.NoError(t, err)
+	require.NoError(t, writer.PublishMessage("", queue, &protocol.Message{Body: []byte("new")}))
+	newMessage, newTag, _, err := getter.getMessageForChannel(queue, false, "reader", 1)
+	require.NoError(t, err)
+	require.NotNil(t, newMessage)
+	require.Equal(t, "new", string(newMessage.Body))
+	require.NotEqual(t, oldTag, newTag)
+	require.ErrorIs(t, getter.AcknowledgeGetDelivery(oldTag), clusterqueue.ErrUnknownAttempt)
+	info, err := writer.describe(context.Background(), queue)
+	require.NoError(t, err)
+	require.Equal(t, uint64(1), info.Unacknowledged)
+	require.NoError(t, getter.AcknowledgeGetDelivery(newTag))
+}
+
+func TestClusterSettlementStaysInFrameOrder(t *testing.T) {
+	b := NewClusterBroker(&localClusterMachine{})
+	_, err := b.DeclareQueue("jobs", true, false, false, nil)
+	require.NoError(t, err)
+	require.NoError(t, b.PublishMessage("", "jobs", &protocol.Message{Body: []byte("settle before close")}))
+	client, transport := net.Pipe()
+	conn := protocol.NewConnection(transport)
+	ch := protocol.NewChannel(1, conn)
+	conn.Channels.Store(ch.ID, ch)
+	_, tag, _, err := b.getMessageForChannel("jobs", false, conn.ID, ch.ID)
+	require.NoError(t, err)
+	ch.TrackDelivery(1, tag, "", true)
+	t.Cleanup(func() { b.RequeueGetDeliveries(conn.ID) })
+
+	srv := &Server{Broker: b, Log: zap.NewNop(), Config: config.DefaultConfig()}
+	readerDone := make(chan struct{})
+	go srv.readFrames(srv.runtimeFor(conn), readerDone)
+	t.Cleanup(func() {
+		_ = client.Close()
+		_ = transport.Close()
+		<-readerDone
+	})
+	ack := encodeAckFrame(t, ch.ID, 1, false)
+	ackBytes, err := ack.MarshalBinary()
+	require.NoError(t, err)
+	closeFrame := protocol.EncodeMethodFrameForChannel(ch.ID, 20, protocol.ChannelClose, nil)
+	closeBytes, err := closeFrame.MarshalBinary()
+	require.NoError(t, err)
+	require.NoError(t, client.SetWriteDeadline(time.Now().Add(time.Second)))
+	_, err = client.Write(append(ackBytes, closeBytes...))
+	require.NoError(t, err)
+
+	takeFrame := func() *protocol.Frame {
+		select {
+		case frame := <-conn.FrameQueue:
+			require.NotNil(t, frame)
+			return frame
+		case <-time.After(time.Second):
+			t.Fatal("missing method frame")
+			return nil
+		}
+	}
+	frame := takeFrame()
+	classID, methodID, ok := methodIDs(frame)
+	require.True(t, ok)
+	require.Equal(t, uint16(60), classID)
+	require.Equal(t, uint16(protocol.BasicAck), methodID)
+	pooled, err := srv.processFrame(conn, frame)
+	require.NoError(t, err)
+	require.True(t, pooled, "processFrame must settle inline")
+	protocol.PutFrame(frame)
+	frame = takeFrame()
+	classID, methodID, ok = methodIDs(frame)
+	require.True(t, ok)
+	require.Equal(t, uint16(20), classID)
+	require.Equal(t, uint16(protocol.ChannelClose), methodID)
+	protocol.PutFrame(frame)
+	info, err := b.describe(context.Background(), "jobs")
+	require.NoError(t, err)
+	require.Zero(t, info.Ready)
+	require.Zero(t, info.Unacknowledged)
 }
