@@ -13,7 +13,7 @@ type journalSegmentCheckpointResult struct {
 
 func (w *journalSegmentOutput) reserveFrame(size int64) error {
 	q := w.store.quota
-	if !w.maintenance {
+	if w.index == nil {
 		return q.reserve(size)
 	}
 	// Each stream can stage a replacement index independently.
@@ -34,11 +34,11 @@ func (w *journalSegmentOutput) reserveFrame(size int64) error {
 }
 
 // The writer alone selects checkpoints and retires files. Index construction
-// reads the sealed prefix on a worker, while the writer may append and rotate.
-// It doesn't remove any files while this worker still needs the old manifest.
+// writes a metadata image captured at the last rotation. The worker needs
+// only the immutable references built by successful appends.
 func (w *journalSegmentOutput) maintain(wait bool) error {
 	s := w.store
-	if !w.maintenance || w.dirty {
+	if w.index == nil || w.dirty {
 		return nil
 	}
 	if w.checkpointBuild != nil {
@@ -62,16 +62,28 @@ func (w *journalSegmentOutput) maintain(wait bool) error {
 			return err
 		}
 	}
-	last := s.manifest.extents[len(s.manifest.extents)-1]
-	if last.base <= s.manifest.checkpoint.end {
+	sealed := w.sealedIndex
+	if sealed == nil {
 		return nil
+	}
+	w.sealedIndex = nil
+	manifest := s.manifest
+	cutoff, err := manifest.cutoff(sealed.sequence, sealed.end)
+	if err != nil {
+		return err
 	}
 	ready := make(chan journalSegmentCheckpointResult, 1)
 	w.checkpointBuild = ready
 	go func() {
-		reader := &journalSegmentReader{store: s}
-		staged, err := reader.stageCheckpoint(last.firstSequence-1, last.base)
-		ready <- journalSegmentCheckpointResult{staged: staged, err: err}
+		covered := manifest.extents[:cutoff]
+		ref, err := s.writeCheckpoint(sealed.sequence, sealed.end, sealed.groups, covered)
+		result := journalSegmentCheckpointResult{err: err}
+		if err == nil {
+			result.staged = stagedJournalSegmentCheckpoint{
+				store: s, previous: manifest.checkpoint, ref: ref, owners: journalCheckpointOwners(covered, sealed.groups),
+			}
+		}
+		ready <- result
 	}()
 	if wait {
 		return w.finishCheckpoint(<-ready)

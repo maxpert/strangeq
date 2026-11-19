@@ -34,6 +34,7 @@ type journalCompletion struct {
 
 type journalRequest struct {
 	record       journalRecord
+	delta        *journalGroupDelta
 	staging      journalScratchLoan
 	syncRequired bool
 	charge       int
@@ -109,7 +110,7 @@ func newJournalWriterWithBudget(file journalFile, end int64, nextSequence uint64
 // append job that Raft has already accepted and cannot cancel or drop. Each
 // group has one ordered append job, so encoding outside the lock cannot
 // reorder two requests for the same group.
-func (w *journalWriter) enqueueEncoded(group uint64, size int, syncRequired bool, encode func([]byte) error) (<-chan journalCompletion, error) {
+func (w *journalWriter) enqueueEncoded(group uint64, size int, syncRequired bool, delta *journalGroupDelta, encode func([]byte) error) (<-chan journalCompletion, error) {
 	if group == 0 || size < 0 || size > maxJournalFrameBytes-journalRecordHeaderSize ||
 		size > w.limits.pendingBytes-journalRecordHeaderSize {
 		return nil, errJournalTooLarge
@@ -152,7 +153,7 @@ func (w *journalWriter) enqueueEncoded(group uint64, size int, syncRequired bool
 	result := make(chan journalCompletion, 1)
 	w.queue = append(w.queue, journalRequest{
 		record: journalRecord{group: group, body: body}, syncRequired: syncRequired,
-		staging: staging, charge: charge, result: result,
+		delta: delta, staging: staging, charge: charge, result: result,
 	})
 	w.ready.Signal()
 	return result, nil
@@ -295,7 +296,22 @@ func (w *journalWriter) writeBatch(batch []journalRequest) error {
 		w.dirty = !synced
 	}
 	if syncRequired {
-		return w.sync()
+		if err := w.sync(); err != nil {
+			return err
+		}
+	}
+	for _, request := range batch {
+		if request.delta == nil {
+			continue
+		}
+		for i := range request.delta.entries {
+			request.delta.entries[i].offset += request.record.location.offset
+		}
+		if segment, ok := w.file.(*journalSegmentOutput); ok && segment.index != nil {
+			if err := segment.index.append(request.record.group, *request.delta); err != nil {
+				return err
+			}
+		}
 	}
 	return nil
 }

@@ -177,7 +177,7 @@ func (n *journalGroupNode) persist(group uint64, op journalGroupOp) (journalGrou
 		return journalGroupDelta{}, err
 	}
 	var delta journalGroupDelta
-	result, err := n.writer.enqueueEncoded(group, size, true, func(body []byte) error {
+	result, err := n.writer.enqueueEncoded(group, size, true, &delta, func(body []byte) error {
 		var encodeErr error
 		delta, encodeErr = op.encode(body)
 		return encodeErr
@@ -188,9 +188,6 @@ func (n *journalGroupNode) persist(group uint64, op journalGroupOp) (journalGrou
 	completion := <-result
 	if completion.err != nil {
 		return journalGroupDelta{}, completion.err
-	}
-	for i := range delta.entries {
-		delta.entries[i].offset += completion.location.offset
 	}
 	return delta, nil
 }
@@ -257,18 +254,22 @@ func (n *journalGroupNode) replayBatch(batch []journalRecord) error {
 		if err != nil {
 			return err
 		}
-		if delta.kind == journalGroupCreate {
-			if err := n.replayCreate(record.group, delta); err != nil {
-				return err
-			}
-			continue
+		if err := n.replayDelta(record.group, delta); err != nil {
+			return err
 		}
-		if n.groups[record.group] == nil || len(delta.identity) != 0 {
-			return fmt.Errorf("%w: unexpected operation for group %d", errJournalCorrupt, record.group)
-		}
-		if err := n.groups[record.group].replay(delta); err != nil {
-			return fmt.Errorf("%w: group %d: %v", errJournalCorrupt, record.group, err)
-		}
+	}
+	return nil
+}
+
+func (n *journalGroupNode) replayDelta(group uint64, delta journalGroupDelta) error {
+	if delta.kind == journalGroupCreate {
+		return n.replayCreate(group, delta)
+	}
+	if n.groups[group] == nil || len(delta.identity) != 0 {
+		return fmt.Errorf("%w: unexpected operation for group %d", errJournalCorrupt, group)
+	}
+	if err := n.groups[group].replay(delta); err != nil {
+		return fmt.Errorf("%w: group %d: %v", errJournalCorrupt, group, err)
 	}
 	return nil
 }

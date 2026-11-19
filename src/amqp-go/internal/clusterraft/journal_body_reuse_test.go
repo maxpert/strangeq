@@ -24,7 +24,7 @@ func TestJournalWriterReusesEncodedBodiesAfterCompletion(t *testing.T) {
 	for i := range cap(bodies) {
 		body := bytes.Repeat([]byte{byte(i)}, 512<<10)
 		bodies = append(bodies, body)
-		result, err := writer.enqueueEncoded(1, len(body), true, func(dst []byte) error {
+		result, err := writer.enqueueEncoded(1, len(body), true, nil, func(dst []byte) error {
 			staging[fmt.Sprintf("%p", &dst[0])] = true
 			copy(dst, body)
 			return nil
@@ -33,7 +33,7 @@ func TestJournalWriterReusesEncodedBodiesAfterCompletion(t *testing.T) {
 		require.NoError(t, awaitJournalCompletion(t, result).err)
 	}
 	rejected := errors.New("intentional encoder rejection")
-	_, err = writer.enqueueEncoded(1, 64<<10, true, func([]byte) error { return rejected })
+	_, err = writer.enqueueEncoded(1, 64<<10, true, nil, func([]byte) error { return rejected })
 	require.ErrorIs(t, err, rejected)
 	require.NoError(t, writer.close())
 

@@ -42,7 +42,7 @@ func TestJournalSharedBudgetRetainsSingleMaximumAdmission(t *testing.T) {
 	budget, writers, files := openSharedBudgetWriters(t, limits)
 	size := limits.pendingBytes - journalRecordHeaderSize
 	for index, writer := range writers {
-		pending, err := writer.enqueueEncoded(uint64(index+1), size, true, func(body []byte) error {
+		pending, err := writer.enqueueEncoded(uint64(index+1), size, true, nil, func(body []byte) error {
 			clear(body)
 			return nil
 		})
@@ -73,7 +73,7 @@ func TestJournalSharedBudgetFailureWakesPeerWithoutReleasingPeerReservations(t *
 	}
 	queued := make(chan admitted, 1)
 	go func() {
-		result, err := writers[1].enqueueEncoded(3, 9, true, func(body []byte) error {
+		result, err := writers[1].enqueueEncoded(3, 9, true, nil, func(body []byte) error {
 			copy(body, "123456789")
 			return nil
 		})
@@ -117,7 +117,7 @@ func TestJournalSharedBudgetFailedWriterKeepsInProgressEncodingCharged(t *testin
 	defer close(release)
 	encoded := make(chan error, 1)
 	go func() {
-		_, err := writers[0].enqueueEncoded(3, 13, true, func(body []byte) error {
+		_, err := writers[0].enqueueEncoded(3, 13, true, nil, func(body []byte) error {
 			close(encoding)
 			<-release
 			clear(body)

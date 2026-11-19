@@ -2,7 +2,11 @@ package clusterraft
 
 import (
 	"bytes"
+	"encoding/json"
+	"os"
 	"path/filepath"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -143,4 +147,94 @@ func TestSegmentedJournalIdleShardCheckpointsWhenSharedLogAdvances(t *testing.T)
 		defer idle.mu.Unlock()
 		return idle.snapshotIndex == applied
 	}, 2*time.Second, 10*time.Millisecond, "the idle shard must checkpoint without receiving more writes")
+}
+
+func TestSegmentedJournalCheckpointUsesStableAppendMetadataAcrossRotations(t *testing.T) {
+	const extent = 256 << 10
+	dir := t.TempDir()
+	started, release := make(chan struct{}), make(chan struct{})
+	var startOnce, releaseOnce sync.Once
+	unblock := func() { releaseOnce.Do(func() { close(release) }) }
+	defer unblock()
+	node, err := openSegmentedGroupNode(dir, true, false, extent, 8<<20, nil, journalSegmentHooks{
+		syncFile: func(file *os.File) error {
+			if strings.HasPrefix(filepath.Base(file.Name()), journalCheckpointPrefix) {
+				startOnce.Do(func() {
+					close(started)
+					<-release
+				})
+			}
+			return syncJournalFile(file)
+		},
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = node.close() })
+	cfg := Config{ID: 1, GroupID: 11, Dir: dir, Peers: []uint64{1}, Machine: &testMachine{}, TickInterval: -1}
+	group := openTestJournalGroup(t, node, cfg)
+	require.NoError(t, group.Campaign(t.Context()))
+
+	var expected []string
+	appendBodies := func(count int) {
+		t.Helper()
+		for range count {
+			body := bytes.Repeat([]byte{'a' + byte(len(expected))}, 64<<10)
+			_, err := group.Propose(t.Context(), body)
+			require.NoError(t, err)
+			expected = append(expected, string(body))
+		}
+	}
+	appendBodies(6)
+	select {
+	case <-started:
+	case <-time.After(3 * time.Second):
+		t.Fatal("checkpoint worker did not reach the index sync")
+	}
+	before, err := loadJournalSegmentManifest(dir)
+	require.NoError(t, err)
+	require.Empty(t, before.checkpoint.name, "the staged index has no authority before its sync")
+	appendBodies(8)
+	after, err := loadJournalSegmentManifest(dir)
+	require.NoError(t, err)
+	require.GreaterOrEqual(t, len(after.extents), len(before.extents)+2, "writer must roll while the index worker is held")
+	unblock()
+	require.NoError(t, group.Close())
+	require.NoError(t, node.close())
+	after, err = loadJournalSegmentManifest(dir)
+	require.NoError(t, err)
+	require.True(t, after.checkpoint.valid())
+
+	reopened, err := openSegmentedGroupNode(dir, false, false, extent, 8<<20, nil, journalSegmentHooks{})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = reopened.close() })
+	cfg.Machine = &testMachine{}
+	restored := openTestJournalGroup(t, reopened, cfg)
+	snapshot, err := restored.MachineSnapshot(t.Context())
+	require.NoError(t, err)
+	var values []string
+	require.NoError(t, json.Unmarshal(snapshot, &values))
+	require.Equal(t, expected, values)
+}
+
+func TestSegmentedJournalCanIndexRecoveredSealBeforeAnyNewAppend(t *testing.T) {
+	dir, first, _, _ := seedRetainedCheckpointFixture(t)
+	extent := int64(len(first))
+	before, err := loadJournalSegmentManifest(dir)
+	require.NoError(t, err)
+	require.Empty(t, before.checkpoint.name)
+	require.Len(t, before.extents, 2)
+
+	node, err := openSegmentedGroupNode(dir, false, false, extent, 4096, nil, journalSegmentHooks{})
+	require.NoError(t, err)
+	require.NoError(t, node.close())
+	after, err := loadJournalSegmentManifest(dir)
+	require.NoError(t, err)
+	require.Equal(t, extent, after.checkpoint.end)
+	require.Equal(t, uint64(1), after.checkpoint.sequence)
+	require.Len(t, after.extents, 1, "the recovered sealed extent has no live entry references")
+
+	reopened, err := openSegmentedGroupNode(dir, false, false, extent, 4096, nil, journalSegmentHooks{})
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, reopened.close()) })
+	require.Contains(t, reopened.groups, uint64(11), "group from the sealed index")
+	require.Contains(t, reopened.groups, uint64(22), "group from the active replay tail")
 }

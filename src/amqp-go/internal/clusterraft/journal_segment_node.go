@@ -13,6 +13,10 @@ func openSegmentedGroupNode(dir string, create, rangeSync bool, extentBytes, ret
 		replySlots:  make(chan struct{}, journalReplySlots),
 		syncFile:    syncJournalFile, syncDir: syncDirectory,
 	}
+	var restoredSeal *journalSealedIndex
+	hooks.recoveredSeal = func(sequence uint64, end int64) {
+		restoredSeal = &journalSealedIndex{sequence: sequence, end: end, groups: cloneJournalGroups(node.groups)}
+	}
 	hooks.restoreCheckpoint = func(_ uint64, _ int64, groups map[uint64]*journalGroupState) error {
 		node.groups = groups
 		return nil
@@ -31,7 +35,11 @@ func openSegmentedGroupNode(dir string, create, rangeSync bool, extentBytes, ret
 		return nil, err
 	}
 	output.rangeSync = rangeSync
-	output.maintenance = true
+	output.index, err = newJournalAppendIndex(node.groups)
+	if err != nil {
+		return nil, err
+	}
+	output.sealedIndex = restoredSeal
 	limits := journalGroupWriterLimits()
 	limits.maxFileBytes = 0
 	limits.batchBytes = min(limits.batchBytes, int(extentBytes)-journalFrameHeaderSize-journalFrameTrailerSize)

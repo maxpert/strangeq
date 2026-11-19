@@ -28,6 +28,7 @@ type journalSegmentHooks struct {
 	writeAt           func(*os.File, []byte, int64) (int, error)
 	publishManifest   func(install func() error) error
 	restoreCheckpoint func(uint64, int64, map[uint64]*journalGroupState) error
+	recoveredSeal     func(uint64, int64)
 }
 
 type journalSegmentStorage struct {
@@ -51,20 +52,20 @@ type journalSegmentStorage struct {
 	writerClosed         bool
 	closed               bool
 
-	readSlots    chan struct{}
-	reads        sync.WaitGroup
-	checkpointMu sync.Mutex
-	closeOnce    sync.Once
-	closeErr     error
+	readSlots chan struct{}
+	reads     sync.WaitGroup
+	closeOnce sync.Once
+	closeErr  error
 }
 
 // journalSegmentOutput is used by a single journalWriter. Closing it does not
 // release node ownership or invalidate the reader.
 type journalSegmentOutput struct {
 	rangeSync       bool
-	maintenance     bool
 	lastMaintain    int64
 	checkpointBuild <-chan journalSegmentCheckpointResult
+	index           *journalAppendIndex
+	sealedIndex     *journalSealedIndex
 	store           *journalSegmentStorage
 	file            *os.File
 	nextSequence    uint64
@@ -183,6 +184,10 @@ func openJournalSegmentsWithQuota(dir string, create bool, extentBytes, retained
 		_ = active.Close()
 		return nil, nil, journalScan{}, fmt.Errorf("%w: recovered journal exceeds retained byte capacity", errJournalTooLarge)
 	}
+	// These callbacks only stage startup recovery. Drop their captured groups
+	// before the writer takes over.
+	store.hooks.restoreCheckpoint = nil
+	store.hooks.recoveredSeal = nil
 	store.manifest, store.end = manifest, state.end
 	store.advanceCheckpointFloor(manifest.extents[len(manifest.extents)-1].base, manifest.extentBytes)
 	store.durableEnd = state.end
@@ -256,6 +261,9 @@ func (s *journalSegmentStorage) replay(manifest journalSegmentManifest, start in
 		}
 		if state.nextSequence != manifest.extents[i+1].firstSequence {
 			return nil, journalScan{}, fmt.Errorf("%w: frame sequence changed across sealed extent %d", errJournalCorrupt, extent.id)
+		}
+		if s.hooks.recoveredSeal != nil && i == len(manifest.extents)-2 {
+			s.hooks.recoveredSeal(state.nextSequence-1, state.end)
 		}
 	}
 	return nil, journalScan{}, fmt.Errorf("%w: missing active journal extent", errJournalCorrupt)
@@ -353,6 +361,11 @@ func (w *journalSegmentOutput) rotate(offset int64) error {
 	s.manifest = manifest
 	s.mu.Unlock()
 	s.advanceCheckpointFloor(offset, manifest.extentBytes)
+	if w.index != nil {
+		w.sealedIndex = &journalSealedIndex{
+			sequence: w.nextSequence - 1, end: offset, groups: cloneJournalGroups(w.index.shadow.groups),
+		}
+	}
 	return old.Close()
 }
 
@@ -470,7 +483,7 @@ func (w *journalSegmentOutput) Close() error {
 		return nil
 	}
 	var maintenanceErr error
-	if w.maintenance && w.failed == nil && !w.dirty {
+	if w.index != nil && w.failed == nil && !w.dirty {
 		maintenanceErr = w.maintain(true)
 	}
 	if w.checkpointBuild != nil {
@@ -492,18 +505,6 @@ func (w *journalSegmentOutput) Close() error {
 
 func (r *journalSegmentReader) ReadAt(data []byte, offset int64) (int, error) {
 	return r.readAt(data, offset, (*os.File).ReadAt)
-}
-
-func (s *journalSegmentStorage) pinRead() (journalSegmentManifest, int64, bool) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	if s.closed {
-		return journalSegmentManifest{}, 0, false
-	}
-	// Rotation publishes a new immutable extent list. Keep ownership while
-	// reading from this view, and release the map lock before any disk I/O.
-	s.reads.Add(1)
-	return s.manifest, s.end, true
 }
 
 func (r *journalSegmentReader) readAt(data []byte, offset int64, diskRead func(*os.File, []byte, int64) (int, error)) (int, error) {
