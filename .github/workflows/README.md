@@ -1,34 +1,36 @@
-# GitHub Actions Workflows
+# GitHub Actions workflows
 
-## Workflows
+| Workflow | Triggers | Checks or outputs |
+|---|---|---|
+| [Build and Test](build.yml) | Pushes and pull requests to `main` or `develop` | Go 1.27.3 tests with race detection and coverage, formatting, vet, binary/version verification, systemd smoke test, and shell syntax checks |
+| [Release Build](release.yml) | `v*` tag pushes, release creation/publication, or manual dispatch | macOS (`amd64`, `arm64`) and Linux (`amd64`, `arm64`, `386`) archives and SHA256 checksums |
+| [CodeQL](codeql.yml) | Pushes and pull requests to `main`, plus Mondays at 00:00 UTC | Go security and quality analysis |
 
-### Release Build (`release.yml`)
-Triggers on a `v*` tag push, GitHub release creation/publishing, or manual dispatch. Builds binaries for macOS (arm64, amd64) and Linux (amd64, arm64, 386), generates SHA256 checksums, and uploads them to the release (creating it if the tag has none).
+Release and tag events upload assets to the GitHub release, creating the release
+if needed. Manual dispatch accepts a version label and builds downloadable
+workflow artifacts; it does not create a release or upload release assets.
 
-### Build and Test (`build.yml`)
-Triggers on push/PR to main and develop. Runs tests with race detection, generates coverage, runs gofmt and go vet checks, and verifies the binary builds.
+[Dependabot](../dependabot.yml) checks Go modules and GitHub Actions weekly on
+Mondays. It is configured separately from the workflows.
 
-### CodeQL Analysis (`codeql.yml`)
-Triggers on push/PR to main and weekly. Runs security and quality analysis.
+## Local checks
 
-### Dependabot (`.github/dependabot.yml`, not a workflow)
-Weekly checks for Go module and GitHub Actions updates.
+From the repository root:
 
-## Local Testing
-
-```bash
+```sh
 cd src/amqp-go
-go test -race ./...
+go test -race -timeout 25m ./...
 go build ./cmd/amqp-server
 ```
 
+See [Contributing](../../CONTRIBUTING.md) for formatting, package checks, and
+development setup. The workflows pin Go 1.27.3.
+
 ## Troubleshooting
 
-### Release workflow not triggering
-1. Check if release was created (not just a tag)
-2. Verify workflow file is in main branch
-3. Check Actions tab for errors
+For build failures, inspect the failing job's log and reproduce its command from
+`src/amqp-go`. The full race-enabled test suite can take several minutes.
 
-### Build failures
-1. Check Go version (requires 1.27.3+)
-2. Run locally: `go test ./... && go build ./cmd/amqp-server`
+For missing release assets, confirm the run used a `v*` tag push or a release
+event, then inspect both the build jobs and the Create Release Assets job in
+Actions. A manual run leaves its packages under the run's artifacts.

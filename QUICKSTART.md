@@ -1,5 +1,10 @@
 # Quick Start
 
+The examples below use a local broker with authentication disabled. Stop the
+broker with Ctrl-C when finished. For a network-facing deployment, configure
+[TLS](docs/TLS.md) and [authentication and authorization](docs/AUTHORIZATION.md)
+before allowing remote clients.
+
 ## Installation
 
 ### Pre-built Binary
@@ -14,6 +19,8 @@ amqp-server --version
 ```
 
 ### From Source
+
+Install the Go version declared in [go.mod](src/amqp-go/go.mod) or later.
 
 ```bash
 git clone https://github.com/maxpert/strangeq.git
@@ -38,10 +45,11 @@ amqp-server --generate-config config.yaml
 # Run with config file
 amqp-server --config config.yaml
 
-# With TLS
+# With TLS on the same default port (5672); create certificates first
+# See docs/TLS.md for a complete setup on the standard TLS port, 5671.
 amqp-server --tls --tls-cert cert.pem --tls-key key.pem
 
-# With telemetry (Prometheus metrics and /health); pprof needs --enable-pprof
+# With telemetry (Prometheus metrics and /health); pprof is off by default
 amqp-server --config config.yaml --enable-telemetry
 ```
 
@@ -55,9 +63,11 @@ defaults → file → environment → explicitly set flags.
 AMQP_NETWORK_PORT=15672 amqp-server --config config.yaml
 AMQP_NETWORK_ADDRESS=0.0.0.0:5672 amqp-server
 AMQP_STORAGE_PATH=/var/lib/amqp amqp-server
-AMQP_SECURITY_AUTHENTICATION_ENABLED=true amqp-server
 AMQP_SERVER_LOGLEVEL=debug amqp-server
 ```
+
+Enabling `security.authenticationenabled` also requires a readable auth file.
+see [the authorization guide](docs/AUTHORIZATION.md#auth-file-format).
 
 ## Test Connection
 
@@ -75,7 +85,7 @@ connection = pika.BlockingConnection(
 )
 channel = connection.channel()
 
-channel.queue_declare(queue='hello')
+channel.queue_declare(queue='hello', durable=False)
 
 channel.basic_publish(
     exchange='',
@@ -98,11 +108,12 @@ const amqp = require('amqplib');
 
 async function main() {
     const connection = await amqp.connect('amqp://localhost');
-    const channel = await connection.createChannel();
+    const channel = await connection.createConfirmChannel();
 
-    await channel.assertQueue('hello');
+    await channel.assertQueue('hello', { durable: false });
 
     channel.sendToQueue('hello', Buffer.from('Hello World!'));
+    await channel.waitForConfirms();
     console.log(" [x] Sent 'Hello World!'");
 
     await connection.close();
@@ -112,6 +123,14 @@ main().catch(console.error);
 ```
 
 ### Go
+
+In a new directory, initialize a module and install the client, then save the
+example as `main.go` and run `go run .`:
+
+```bash
+go mod init example.com/strangeq-hello
+go get github.com/rabbitmq/amqp091-go
+```
 
 ```go
 package main
@@ -155,7 +174,9 @@ See [CLIENT_EXAMPLES.md](CLIENT_EXAMPLES.md) for consumers, exchanges, and advan
 
 ## Configuration
 
-See `src/amqp-go/config.sample.yaml` for all options with documented defaults.
+See [config.sample.yaml](src/amqp-go/config.sample.yaml) for the configuration
+reference. Paths such as `storage.path` are relative to the working directory
+where you start the broker, not the config file location.
 
 ```yaml
 network:
@@ -172,13 +193,10 @@ Omitted keys keep their defaults, so a short file is valid.
 
 ## Production Deployment
 
-```bash
-sudo cp deployment/systemd/amqp-server.service /etc/systemd/system/
-sudo systemctl daemon-reload
-sudo systemctl enable amqp-server
-sudo systemctl start amqp-server
-sudo systemctl status amqp-server
-```
+Follow the [systemd guide](deployment/systemd/README.md) to create the service
+account, install configuration and credentials, and start the service. Copying
+the unit alone is insufficient. The shipped systemd config enables password
+authentication but requires you to add TLS before using it on an untrusted network.
 
 ## Troubleshooting
 
@@ -186,10 +204,13 @@ sudo systemctl status amqp-server
 
 ```bash
 sudo lsof -i :5672
-amqp-server --config config.yaml  # change network.port
+AMQP_NETWORK_PORT=5673 amqp-server --config config.yaml
 ```
 
 ### Connection Refused
 
-- Check server is running: `ps aux | grep amqp-server`
-- Check logs: `amqp-server --config config.yaml` (set `server.loglevel: debug`)
+- Check that the broker is running and listening on the host and port used by the client.
+- Inspect the terminal or service journal for startup errors. To increase detail,
+  set `server.loglevel: debug` and restart the broker.
+- Match the client URL scheme to the listener: `amqp://` for plaintext and
+  `amqps://` for TLS.

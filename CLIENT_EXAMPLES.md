@@ -1,6 +1,21 @@
 # Client Examples
 
-Complete examples for connecting to StrangeQ from various programming languages.
+Examples for Python, Node.js, and Go using the default local broker at
+`localhost:5672`, with authentication disabled. The `guest` credentials used by
+client defaults are not a configured production account. For authenticated
+deployments, supply your own credentials and use [TLS](docs/TLS.md).
+
+Run a consumer before publishing to a fanout or topic exchange: messages sent
+before its temporary queue is bound have no destination. The basic examples
+share a durable `task_queue`. All three languages can use the same queue.
+Fanout and topic examples use non-durable exchanges and temporary queues.
+
+Basic publishers wait for broker confirms. A confirm is a broker acknowledgement,
+not proof that a consumer processed the message. Persistent messages, durable
+queues, and the configured [storage durability](src/amqp-go/config.sample.yaml)
+determine restart behavior. The routing and RPC examples illustrate the API.
+production applications also need reconnect handling, bounded work, and explicit
+error handling. RPC examples allow one outstanding call per client.
 
 ## Table of Contents
 
@@ -32,6 +47,9 @@ def publish_message():
 
     # Declare queue
     channel.queue_declare(queue='task_queue', durable=True)
+
+    # Ask the broker to confirm accepted publishes.
+    channel.confirm_delivery()
 
     # Publish message
     message = "Hello from Python!"
@@ -91,6 +109,10 @@ if __name__ == '__main__':
 
 ### Publish/Subscribe with Fanout Exchange
 
+These functions are separate publisher and subscriber entry points. Save the
+block in a file and call `receive_logs()` for a subscriber or `publish_logs()`
+for a publisher. Use separate processes.
+
 ```python
 import pika
 
@@ -143,7 +165,6 @@ def receive_logs():
 
 ```python
 import pika
-import sys
 
 # Publisher
 def publish_to_topic(routing_key, message):
@@ -202,8 +223,14 @@ def consume_from_topic(binding_keys):
 
 ### RPC Pattern
 
+Start `start_rpc_server()` in one process. In another, create a
+`FibonacciRpcClient`, call `client.call(10)`, and call `client.close()` in a
+`finally` block. Use small nonnegative inputs. Recursive Fibonacci is a teaching
+example with exponential work. A timeout does not cancel work on the server.
+
 ```python
 import pika
+import time
 import uuid
 
 # RPC Client
@@ -230,7 +257,7 @@ class FibonacciRpcClient:
         if self.corr_id == props.correlation_id:
             self.response = body
 
-    def call(self, n):
+    def call(self, n, timeout=10):
         self.response = None
         self.corr_id = str(uuid.uuid4())
         self.channel.basic_publish(
@@ -243,10 +270,16 @@ class FibonacciRpcClient:
             body=str(n)
         )
 
+        deadline = time.monotonic() + timeout
         while self.response is None:
-            self.connection.process_data_events()
+            if time.monotonic() >= deadline:
+                raise TimeoutError("RPC response timed out")
+            self.connection.process_data_events(time_limit=0.1)
 
         return int(self.response)
+
+    def close(self):
+        self.connection.close()
 
 # RPC Server
 def fib(n):
@@ -287,6 +320,10 @@ def start_rpc_server():
 
 ## Node.js (amqplib)
 
+The basic examples invoke their entry point. Fanout, topic, and RPC blocks define
+functions. Add a call to the desired function and handle its promise rejection.
+Run publishers and consumers in separate processes.
+
 ### Installation
 
 ```bash
@@ -301,7 +338,7 @@ const amqp = require('amqplib');
 async function publishMessage() {
     try {
         const connection = await amqp.connect('amqp://localhost');
-        const channel = await connection.createChannel();
+        const channel = await connection.createConfirmChannel();
 
         const queue = 'task_queue';
         const message = 'Hello from Node.js!';
@@ -314,11 +351,9 @@ async function publishMessage() {
             persistent: true
         });
 
+        await channel.waitForConfirms();
         console.log(` [x] Sent '${message}'`);
-
-        setTimeout(() => {
-            connection.close();
-        }, 500);
+        await connection.close();
     } catch (error) {
         console.error(error);
     }
@@ -344,11 +379,12 @@ async function consumeMessages() {
         });
 
         // Fair dispatch
-        channel.prefetch(1);
+        await channel.prefetch(1);
 
         console.log(' [*] Waiting for messages. To exit press CTRL+C');
 
-        channel.consume(queue, (msg) => {
+        await channel.consume(queue, (msg) => {
+            if (msg === null) return; // consumer cancelled
             const content = msg.content.toString();
             console.log(` [x] Received '${content}'`);
 
@@ -374,7 +410,7 @@ const amqp = require('amqplib');
 // Publisher
 async function publishLogs() {
     const connection = await amqp.connect('amqp://localhost');
-    const channel = await connection.createChannel();
+    const channel = await connection.createConfirmChannel();
 
     const exchange = 'logs';
     const message = 'Log message from Node.js';
@@ -384,11 +420,9 @@ async function publishLogs() {
     });
 
     channel.publish(exchange, '', Buffer.from(message));
+    await channel.waitForConfirms();
     console.log(` [x] Sent '${message}'`);
-
-    setTimeout(() => {
-        connection.close();
-    }, 500);
+    await connection.close();
 }
 
 // Subscriber
@@ -408,9 +442,10 @@ async function receiveLogs() {
 
     console.log(' [*] Waiting for logs. To exit press CTRL+C');
 
-    channel.bindQueue(q.queue, exchange, '');
+    await channel.bindQueue(q.queue, exchange, '');
 
-    channel.consume(q.queue, (msg) => {
+    await channel.consume(q.queue, (msg) => {
+        if (msg === null) return;
         console.log(` [x] ${msg.content.toString()}`);
     }, {
         noAck: true
@@ -426,7 +461,7 @@ const amqp = require('amqplib');
 // Publisher
 async function publishToTopic(routingKey, message) {
     const connection = await amqp.connect('amqp://localhost');
-    const channel = await connection.createChannel();
+    const channel = await connection.createConfirmChannel();
 
     const exchange = 'topic_logs';
 
@@ -435,11 +470,9 @@ async function publishToTopic(routingKey, message) {
     });
 
     channel.publish(exchange, routingKey, Buffer.from(message));
+    await channel.waitForConfirms();
     console.log(` [x] Sent '${routingKey}':'${message}'`);
-
-    setTimeout(() => {
-        connection.close();
-    }, 500);
+    await connection.close();
 }
 
 // Example: publishToTopic('kern.critical', 'A critical kernel error');
@@ -461,11 +494,12 @@ async function consumeFromTopic(bindingKeys) {
 
     console.log(' [*] Waiting for logs. To exit press CTRL+C');
 
-    bindingKeys.forEach((key) => {
-        channel.bindQueue(q.queue, exchange, key);
-    });
+    for (const key of bindingKeys) {
+        await channel.bindQueue(q.queue, exchange, key);
+    }
 
-    channel.consume(q.queue, (msg) => {
+    await channel.consume(q.queue, (msg) => {
+        if (msg === null) return;
         console.log(` [x] ${msg.fields.routingKey}:${msg.content.toString()}`);
     }, {
         noAck: true
@@ -477,9 +511,15 @@ async function consumeFromTopic(bindingKeys) {
 
 ### RPC Pattern
 
+Use a Node.js version supporting `node:crypto.randomUUID`. Start
+`startRpcServer().catch(console.error)` in one process. In another, create a
+`FibonacciRpcClient`, await `client.connect()`, await `client.call(10)`, then
+await `client.close()` in `finally`. Keep inputs small and nonnegative. A timeout
+does not cancel server work.
+
 ```javascript
 const amqp = require('amqplib');
-const { v4: uuidv4 } = require('uuid');
+const { randomUUID } = require('node:crypto');
 
 // RPC Client
 class FibonacciRpcClient {
@@ -493,15 +533,16 @@ class FibonacciRpcClient {
 
         this.callbackQueue = queue;
 
-        this.channel.consume(this.callbackQueue, (msg) => {
+        await this.channel.consume(this.callbackQueue, (msg) => {
+            if (msg === null) return;
             if (msg.properties.correlationId === this.correlationId) {
                 this.response = msg.content.toString();
             }
         }, { noAck: true });
     }
 
-    async call(n) {
-        this.correlationId = uuidv4();
+    async call(n, timeoutMs = 10000) {
+        this.correlationId = randomUUID();
         this.response = null;
 
         this.channel.sendToQueue('rpc_queue', Buffer.from(n.toString()), {
@@ -510,11 +551,16 @@ class FibonacciRpcClient {
         });
 
         // Wait for response
-        return new Promise((resolve) => {
+        return new Promise((resolve, reject) => {
+            const timeout = setTimeout(() => {
+                clearInterval(interval);
+                reject(new Error('RPC response timed out'));
+            }, timeoutMs);
             const interval = setInterval(() => {
                 if (this.response !== null) {
                     clearInterval(interval);
-                    resolve(parseInt(this.response));
+                    clearTimeout(timeout);
+                    resolve(Number.parseInt(this.response, 10));
                 }
             }, 100);
         });
@@ -540,11 +586,12 @@ async function startRpcServer() {
         durable: false
     });
 
-    channel.prefetch(1);
+    await channel.prefetch(1);
 
     console.log(' [x] Awaiting RPC requests');
 
-    channel.consume('rpc_queue', (msg) => {
+    await channel.consume('rpc_queue', (msg) => {
+        if (msg === null) return;
         const n = parseInt(msg.content.toString());
 
         console.log(` [.] fib(${n})`);
@@ -565,7 +612,12 @@ async function startRpcServer() {
 
 ### Installation
 
+Start a new Go module, then save each example as `main.go` and run `go run .`.
+The fanout and topic blocks define functions. Add a `main` function that calls
+the publisher or consumer you want to run, in separate processes.
+
 ```bash
+go mod init example.com/strangeq-client
 go get github.com/rabbitmq/amqp091-go
 ```
 
@@ -576,6 +628,7 @@ package main
 
 import (
     "log"
+    "time"
     amqp "github.com/rabbitmq/amqp091-go"
 )
 
@@ -604,6 +657,11 @@ func main() {
         log.Fatal(err)
     }
 
+    if err := ch.Confirm(false); err != nil {
+        log.Fatal(err)
+    }
+    confirms := ch.NotifyPublish(make(chan amqp.Confirmation, 1))
+
     body := "Hello from Go!"
     err = ch.Publish(
         "",     // exchange
@@ -620,6 +678,14 @@ func main() {
         log.Fatal(err)
     }
 
+    select {
+    case confirmation, ok := <-confirms:
+        if !ok || !confirmation.Ack {
+            log.Fatal("publish was not confirmed")
+        }
+    case <-time.After(10 * time.Second):
+        log.Fatal("publish confirm timed out")
+    }
     log.Printf(" [x] Sent '%s'", body)
 }
 ```
@@ -681,17 +747,13 @@ func main() {
         log.Fatal(err)
     }
 
-    forever := make(chan bool)
-
-    go func() {
-        for d := range msgs {
-            log.Printf(" [x] Received %s", d.Body)
-            d.Ack(false)
-        }
-    }()
-
     log.Printf(" [*] Waiting for messages. To exit press CTRL+C")
-    <-forever
+    for d := range msgs {
+        log.Printf(" [x] Received %s", d.Body)
+        if err := d.Ack(false); err != nil {
+            log.Fatal(err)
+        }
+    }
 }
 ```
 
@@ -722,7 +784,7 @@ func publishLogs() {
     err = ch.ExchangeDeclare(
         "logs",   // name
         "fanout", // type
-        true,     // durable
+        false,    // durable
         false,    // auto-deleted
         false,    // internal
         false,    // no-wait
@@ -767,7 +829,7 @@ func receiveLogs() {
     err = ch.ExchangeDeclare(
         "logs",
         "fanout",
-        true,
+        false,
         false,
         false,
         false,
@@ -813,16 +875,10 @@ func receiveLogs() {
         log.Fatal(err)
     }
 
-    forever := make(chan bool)
-
-    go func() {
-        for d := range msgs {
-            log.Printf(" [x] %s", d.Body)
-        }
-    }()
-
     log.Printf(" [*] Waiting for logs. To exit press CTRL+C")
-    <-forever
+    for d := range msgs {
+        log.Printf(" [x] %s", d.Body)
+    }
 }
 ```
 
@@ -852,7 +908,7 @@ func publishToTopic(routingKey string, message string) {
     err = ch.ExchangeDeclare(
         "topic_logs",
         "topic",
-        true,
+        false,
         false,
         false,
         false,
@@ -895,7 +951,7 @@ func consumeFromTopic(bindingKeys []string) {
     err = ch.ExchangeDeclare(
         "topic_logs",
         "topic",
-        true,
+        false,
         false,
         false,
         false,
@@ -943,18 +999,32 @@ func consumeFromTopic(bindingKeys []string) {
         log.Fatal(err)
     }
 
-    forever := make(chan bool)
-
-    go func() {
-        for d := range msgs {
-            log.Printf(" [x] %s:%s", d.RoutingKey, d.Body)
-        }
-    }()
-
     log.Printf(" [*] Waiting for logs. To exit press CTRL+C")
-    <-forever
+    for d := range msgs {
+        log.Printf(" [x] %s:%s", d.RoutingKey, d.Body)
+    }
 }
 ```
+
+## Protocol limits
+
+The standalone broker supports a subset of RabbitMQ's AMQP extensions.
+
+- Priority queues, consumer priorities, lazy queues, SASL EXTERNAL, and multi-step
+  SASL challenge-response are unsupported.
+- Global prefetch is accepted but applied per consumer. Nonzero prefetch size is
+  rejected with a connection-level `540 NOT_IMPLEMENTED` error.
+- A full `reject-publish` queue produces a negative publisher confirm when
+  confirms are enabled. Without confirms, a mandatory publish produces
+  `basic.return` and a non-mandatory publish is silently dropped. Transactions
+  enforce the queue limit by dropping refused copies while committing the
+  remaining operations.
+- Zero-TTL messages expire without a publish-time handoff to a waiting consumer.
+  Malformed per-message expiration values are treated as no per-message TTL,
+  although a queue TTL still applies.
+
+See [cluster behavior and limits](docs/CLUSTERING.md#behavior-and-limits) for
+replicated queues and the subset available in cluster mode.
 
 ## Next Steps
 

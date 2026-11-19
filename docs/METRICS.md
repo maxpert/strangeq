@@ -1,13 +1,9 @@
 # Telemetry and Metrics
 
-StrangeQ exposes Prometheus telemetry through an optional HTTP listener, and re-serves the
-same process registry through the management control plane so the two never drift. This
-document lists how telemetry is served, the full emitted `amqp_*` metric reference, and a
-set of ready-to-use alerting queries.
-
-> The management listener itself, its auth model, and the Metrics UI tab are documented in
-> [MANAGEMENT.md](MANAGEMENT.md). The metric *families* are pinned by a golden test
-> (`src/amqp-go/metrics/inventory_test.go`), so a family cannot silently disappear.
+Enable the telemetry listener to scrape Prometheus metrics and check broker readiness.
+It is separate from the [management HTTP API and UI](MANAGEMENT.md) and works in
+standalone and cluster mode. Management can re-serve the same process registry when
+enabled on a standalone broker.
 
 ## Serving telemetry
 
@@ -35,39 +31,47 @@ Environment equivalents are `AMQP_TELEMETRY_ENABLED`, `AMQP_TELEMETRY_ADDRESS`,
 | `/health` | GET | Readiness probe. `200 OK` when ready; `503 NOT READY: <reason>` until recovery completes and the AMQP listener is bound, and during shutdown. During a resource alarm it still returns `200` with `OK (resource alarm active: memory,disk)`. |
 | `/debug/pprof/*` | GET | Go profiling, only when `--enable-pprof`. Heap and goroutine dumps are unauthenticated — keep the listener on loopback or behind a firewall. |
 
-The queue poller refreshes per-queue gauges every 15 s and caps per-queue series at 2000;
-above that cap only the aggregate `amqp_queues_total` is published.
+Check the listener after startup.
+
+```sh
+curl --fail http://127.0.0.1:9419/health
+curl --fail http://127.0.0.1:9419/metrics
+```
+
+In cluster mode, readiness includes enrollment, not proof that every shard has quorum.
+Verify a queue's write availability with an AMQP publish and publisher confirm. See
+[cluster readiness](CLUSTERING.md#readiness-and-quorum).
+
+The queue poller refreshes per-queue gauges every 15 seconds. Once the snapshot exceeds
+2,000 queues it stops updating per-queue gauges and updates only the aggregate
+`amqp_queues_total`. Previously emitted per-queue values may be stale.
 
 ### Management `GET /api/metrics` and the Metrics tab
 
 On the management listener, `GET /api/metrics` returns the same scrape wrapped as JSON
 (`{"text": "..."}`), so the same-origin SPA can render it under the `connect-src 'self'`
-CSP. It is auth-gated like every other `/api/*` route and answers:
+CSP. The route requires authentication and can return these statuses.
 
-- `200` with the exposition;
-- `501` when telemetry is disabled (no process registry);
+- `200` with the exposition.
+- `501` when telemetry is disabled (no process registry).
 - `503` on a scrape failure (with `Retry-After`).
 
-The **Metrics tab** (`/metrics`) in the management UI renders that payload as a 45-tile
-vital-stats panel, a grouped and searchable family browser, and a raw-text view. A tile
-has three outcomes: a family the endpoint never emitted renders an em-dash with "not
-emitted by this broker" (never a fabricated `0`); a family present with a zero value
-renders `0`; and a family present whose **filtered sum** (`sum(<family>{<label>…})`)
-selects none of its series renders `0` (a sum over an empty set is a defined zero). Any
-other selector form — a bare metric name with a matcher, or `max(...)` with a matcher —
-still renders the em-dash, because no aggregate value is defined there; the "not emitted
-by this broker" title is tied to having no truthful value for that selector, which includes
-a filtered non-`sum` selector that matches no series. The static gate rejects a pattern
-that drops the whole excluded domain; at runtime only a malformed pattern degrades the tile
-to unknown with a title naming the bad pattern. See
-[MANAGEMENT.md](MANAGEMENT.md#metrics-tab).
+The [Metrics tab](MANAGEMENT.md#metrics-tab) provides vital-stat tiles, a searchable
+family browser, and raw exposition. Missing values display an em dash. An emitted zero
+displays `0`. Management is unavailable in cluster mode. Scrape the telemetry listener
+directly there.
 
 ## Metric reference
 
-Every emitted family uses the `amqp_` namespace. Types are Prometheus `counter`, `gauge`,
-`histogram`, or `summary`; `gauge (func)` marks a `GaugeFunc` read at scrape time.
-All label domains are **closed enums** unless noted — no queue name, connection id, user
-name, routing key, or exchange name is ever a label on the broker-outage families.
+Every emitted family uses the `amqp_` namespace. Types are Prometheus `counter`,
+`gauge`, `histogram`, or `summary`. `gauge (func)` marks a `GaugeFunc` read at scrape
+time. Label domains are closed enums unless noted. Per-queue families explicitly list
+`queue` or `vhost` labels. Fault families use bounded classifications.
+
+Registration does not imply that every storage backend updates a family. The WAL and
+segment families below describe the standalone storage engine. They do not establish the
+health or durable commit state of a cluster's shared Raft journal. Use broker logs and
+queue-level AMQP checks alongside telemetry.
 
 ### Startup, build, and process
 
@@ -79,7 +83,7 @@ name, routing key, or exchange name is ever a label on the broker-outage familie
 | `amqp_memory_heap_bytes` | gauge | — | Heap memory in use. |
 | `amqp_memory_gc_pause_seconds` | summary | — | GC pause duration (p50/p90/p99). |
 | `amqp_goroutines_total` | gauge | — | Number of active goroutines. |
-| `amqp_file_descriptors_open` | gauge | — | Number of open file descriptors. **Linux only**: read from `/proc/self/fd`, so it is a permanent `0` on Darwin/Windows (the platform caveat is deliberate — `sysctl kern.num_files` reports a system-wide count, not this process's, so it is not a correct substitute). |
+| `amqp_file_descriptors_open` | gauge | — | Open process file descriptors from `/proc/self/fd` on Linux. Always `0` on macOS and Windows. |
 | `amqp_disk_free_bytes` | gauge | — | Free disk space in the data directory. |
 | `amqp_disk_usage_bytes` | gauge | — | Total disk used by server data. |
 | `amqp_unsafe_recovery_discarded_artifacts` | gauge | — | Artifacts discarded at boot because `--unsafe-recovery` was set; `0` on a clean boot. **Non-zero means the broker is serving from data it could not fully recover.** |
@@ -144,7 +148,7 @@ name, routing key, or exchange name is ever a label on the broker-outage familie
 | `amqp_messages_rejected_total` | counter | — | Messages rejected since start. |
 | `amqp_messages_unroutable_total` | counter | — | Unroutable messages since start. |
 | `amqp_messages_inflight` | gauge (func) | — | Messages delivered but not yet settled across every queue. |
-| `amqp_messages_dropped_total` | counter | `queue`, `reason` | **DEPRECATED IN PLACE**: unbounded `queue` label, no production writer. Kept so removing a registered name is not a breaking change. Use `amqp_publish_refused_total` / `amqp_deliveries_dropped_total`. |
+| `amqp_messages_dropped_total` | counter | `queue`, `reason` | Deprecated; no production writer. Use `amqp_publish_refused_total` and `amqp_deliveries_dropped_total`. |
 | `amqp_message_publish_duration_seconds` | histogram | — | Time taken to publish a message. |
 | `amqp_message_delivery_duration_seconds` | histogram | — | Time taken to deliver a message to a consumer. |
 
@@ -226,7 +230,7 @@ name, routing key, or exchange name is ever a label on the broker-outage familie
 
 | Metric | Type | Labels | Meaning |
 |--------|------|--------|---------|
-| `amqp_recovery_faults_total` | counter | `stage`, `outcome` | Classified recovery faults. `stage` ∈ `storage-validation`, `metadata`, `exchange-recovery`, `queue-recovery`, `message-recovery`, `wal-scan`, `pending-acks`, `ordinal-allocator`; `outcome` ∈ `benign`, `degraded`, `fatal`. A non-zero `degraded`/`fatal` means the broker booted on data it could not fully recover. |
+| `amqp_recovery_faults_total` | counter | `stage`, `outcome` | Classified recovery faults. `stage` ∈ `storage-validation`, `metadata`, `exchange-recovery`, `queue-recovery`, `message-recovery`, `wal-scan`, `pending-acks`, `ordinal-allocator`; `outcome` ∈ `benign`, `degraded`, `fatal`. A non-zero `degraded` or `fatal` value records an incomplete recovery; a fatal fault can prevent startup. |
 | `amqp_recovery_discarded_records_total` | counter | `stage` | Recovered records deliberately discarded or quarantined at boot, by stage (same enum). |
 | `amqp_recovery_duration_seconds` | histogram | — | Wall-clock duration of the boot recovery pass. |
 | `amqp_recovery_messages_recovered` | gauge | — | Persistent messages recovered into the running broker at boot. |
@@ -255,7 +259,7 @@ name, routing key, or exchange name is ever a label on the broker-outage familie
 
 ### Management control plane (`amqp_management_*`)
 
-These families are registered **only** when the management surface is enabled; with it
+These families are registered **only** when the management surface is enabled. With it
 disabled, none is registered. Every label is bounded.
 
 | Metric | Type | Labels | Meaning |
@@ -272,7 +276,7 @@ disabled, none is registered. Every label is bounded.
 | `amqp_management_forbidden_lock_acquired_total` | counter | `lock` | Acquisitions of a forbidden hot-path lock; **structurally 0** (see below). |
 | `amqp_management_publish_backpressure_total` | counter | — | HTTP publishes refused `503` by a queue high-water gate. |
 | `amqp_management_jobs` | gauge | `state` | Async job pool by state. `state` ∈ `queued`, `running`, `done`, `failed`. |
-| `amqp_management_audit_dropped_total` | counter | — | Non-destructive audit records dropped (destructive records never drop). |
+| `amqp_management_audit_dropped_total` | counter | — | Audit-hook failures; the production logger hook does not report write failures. |
 | `amqp_management_capability_denied_total` | counter | `capability` | Requests denied by the capability gate, by capability. |
 | `amqp_management_unauthenticated` | gauge | — | `1` when the management surface runs with authentication disabled. |
 | `amqp_management_insecure_bind` | gauge | — | `1` when the management listener is non-loopback without TLS. |
@@ -281,12 +285,14 @@ disabled, none is registered. Every label is bounded.
 
 ## Alerting: "is something wrong?"
 
-The queries below are starting points; tune thresholds and windows to your traffic.
+The queries below are starting points. Tune thresholds and windows to your traffic and
+select the families your backend updates. Standalone WAL/segment alerts do not monitor
+cluster journal durability.
 
 **Degraded boot / data loss.**
 
 ```promql
-# The broker booted on data it could not fully recover.
+# The broker discarded artifacts during unsafe recovery.
 amqp_unsafe_recovery_discarded_artifacts > 0
 
 # Classified recovery faults that are not benign.
@@ -374,27 +380,21 @@ amqp_management_unauthenticated == 1   # auth disabled
 
 ## What is deliberately NOT emitted, and why
 
-- **`amqp_message_age_seconds`** — removed. In the previous tree it was registered but had
-  no production writer (a permanently-zero series); it is now gone rather than left as a
-  dead name.
-- **`amqp_segment_checkpoint_errors_total`** — **not registered.** The segstore-v1 rework
-  removed the WAL→segment checkpoint copy path (`performCheckpoint` is now a no-op), so no
-  surviving code path can ever increment it. Registering it would be exactly the
-  permanently-zero series the design forbids. The segment durability signal lives in
-  `amqp_segment_fsync_errors_total` and `amqp_segment_roll_errors_total`, which do have
-  live sites.
-- **`amqp_management_forbidden_lock_acquired_total`** — registered, but **structurally 0**:
-  no management code path calls it. The real barrier is an AST gate that fails the build if
-  the management-facing source references a forbidden hot-path lock, plus hold-the-lock
-  deadline tests. The family exists only so a future regression has a name to fire.
-- **`amqp_recovery_faults_total{stage="recovery"}`** — the former aggregate-classifier arm
-  is absent: every fault is classified at the site that created it, so that arm could never
-  be minted (a permanently-zero series).
-- **`amqp_messages_dropped_total`** — deprecated in place. It carries an unbounded `queue`
-  label and has no writer; it stays registered only so removing a name is not a breaking
-  change. Use `amqp_publish_refused_total` and `amqp_deliveries_dropped_total`.
-- **`amqp_queue_messages_unacknowledged` / `amqp_queue_messages_total`** — emitted only when
-  the broker reports a known unacked depth. A queue whose depth is unknown emits **no
-  series** rather than a fabricated `0`.
-- **Per-queue series above 2000 queues** — the queue poller stops publishing per-queue
-  gauges and keeps only the aggregate `amqp_queues_total`.
+Some missing or constant values have specific meanings.
+
+- `amqp_message_age_seconds` and `amqp_segment_checkpoint_errors_total` are not
+  registered because their former paths no longer have production writers.
+  For standalone segment durability, use `amqp_segment_fsync_errors_total` and
+  `amqp_segment_roll_errors_total`.
+- `amqp_management_forbidden_lock_acquired_total` is registered but always zero
+  in the current implementation. Static checks and deadline tests guard the
+  management lock boundary. This metric alone does not prove isolation.
+- `amqp_recovery_faults_total{stage="recovery"}` is absent. Faults use the
+  specific stages listed in the recovery table.
+- `amqp_messages_dropped_total` remains registered for compatibility, without
+  a production writer. Use the refusal and delivery-drop counters instead.
+- `amqp_queue_messages_unacknowledged` and `amqp_queue_messages_total` are
+  emitted only when the broker knows the required depths. Missing series do
+  not mean zero.
+- Above 2,000 queues, the queue poller updates only `amqp_queues_total`.
+  Previously emitted per-queue series can retain stale values.

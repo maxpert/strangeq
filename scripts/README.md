@@ -1,6 +1,15 @@
 # StrangeQ Monitoring Scripts
 
-This directory contains scripts to launch the AMQP server with full observability using Prometheus and Grafana.
+This directory contains a local development launcher for the AMQP server,
+Prometheus, Grafana, and a load generator. It is not a production deployment.
+The launcher exposes telemetry on all interfaces, and Docker publishes Grafana
+and Prometheus ports on all interfaces with initial Grafana credentials
+`admin`/`admin`. Restrict access to a trusted development host.
+
+Run commands below from the repository's `scripts` directory unless stated
+otherwise. Requirements: Docker with a running daemon, the `docker-compose`
+command (the scripts do not call `docker compose`), `curl`, `lsof`, and Go matching
+[src/amqp-go/go.mod](../src/amqp-go/go.mod) if the binaries need building.
 
 ## Quick Start
 
@@ -11,10 +20,17 @@ Launch everything (server + monitoring + load test) with one command:
 ```
 
 This will:
+
 1. Start Prometheus and Grafana in Docker containers
 2. Start the AMQP server with telemetry enabled
 3. Run a performance test with 10 producers and 10 consumers
-4. Display real-time progress and provide dashboard links
+4. Tail `/tmp/perftest.log` and print dashboard links
+
+The launcher builds missing `src/amqp-go/bin/amqp-server` and `bin/perftest`
+binaries. It does not rebuild existing ones. Stop it with Ctrl-C to stop the
+broker and load generator it started. Prometheus and Grafana remain running
+until you run `./stop-monitoring.sh`. The broker uses persistent `src/amqp-go/data`
+storage, so runs can reuse earlier data.
 
 ## Custom Configuration
 
@@ -22,13 +38,13 @@ You can override the default settings using environment variables:
 
 ```bash
 # Custom load test configuration
-PUBLISHERS=20 CONSUMERS=20 RATE=2000 DURATION=600s ./launch-with-monitoring.sh
+PUBLISHERS=20 CONSUMERS=20 DURATION=600s ./launch-with-monitoring.sh
 
-# Custom ports
-AMQP_PORT=5673 TELEMETRY_PORT=9420 ./launch-with-monitoring.sh
+# Custom AMQP port: both values are needed by the current script
+AMQP_PORT=5673 AMQP_NETWORK_PORT=5673 ./launch-with-monitoring.sh
 
 # Combine multiple settings
-PUBLISHERS=50 CONSUMERS=50 RATE=5000 DURATION=1800s ./launch-with-monitoring.sh
+PUBLISHERS=50 CONSUMERS=50 DURATION=1800s ./launch-with-monitoring.sh
 ```
 
 ### Available Environment Variables
@@ -39,8 +55,14 @@ PUBLISHERS=50 CONSUMERS=50 RATE=5000 DURATION=1800s ./launch-with-monitoring.sh
 | `CONSUMERS` | 10 | Number of consumer goroutines |
 | `RATE` | 1000 | Displayed only: `perftest` has no rate limit, so this value does not throttle the run |
 | `DURATION` | 300s | Test duration (e.g., 60s, 5m, 1h) |
-| `AMQP_PORT` | 5672 | AMQP server port |
-| `TELEMETRY_PORT` | 9419 | Prometheus metrics port |
+| `AMQP_PORT` | 5672 | Load-generator URL and port precheck; does not set the broker listener |
+| `AMQP_NETWORK_PORT` | 5672 | Broker port override; set it to match a custom `AMQP_PORT` |
+| `TELEMETRY_PORT` | 9419 | Broker telemetry port; Prometheus target remains fixed at 9419 |
+
+If changing `TELEMETRY_PORT`, also update the target in
+[`monitoring/prometheus.yml`](monitoring/prometheus.yml) and restart Prometheus.
+`RATE` does not throttle traffic even though one launcher status line labels it
+as msg/s. The load generator runs without a rate limit.
 
 ## Available Scripts
 
@@ -52,21 +74,25 @@ PUBLISHERS=50 CONSUMERS=50 RATE=5000 DURATION=1800s ./launch-with-monitoring.sh
 ### Start Monitoring Stack Only
 
 ```bash
-cd monitoring
-docker-compose up -d
+docker-compose -f monitoring/docker-compose.yml up -d
 ```
 
 ### Start AMQP Server Manually
 
 ```bash
 cd ../src/amqp-go
-./bin/amqp-server --enable-telemetry
+go build -o bin/amqp-server ./cmd/amqp-server
+# Docker Prometheus reaches this host listener through host.docker.internal.
+./bin/amqp-server --enable-telemetry --telemetry-address 0.0.0.0
 ```
 
 ### Run Performance Test Manually
 
+Open another terminal at the `scripts` directory:
+
 ```bash
 cd ../src/amqp-go
+go build -o bin/perftest ./cmd/perftest
 ./bin/perftest -url amqp://guest:guest@localhost:5672/ \
   -producers 10 -consumers 10 -duration 300s
 ```
@@ -76,6 +102,8 @@ full flag list (`perftest` has no rate-limit flag).
 
 ### Stop Monitoring
 
+From the `scripts` directory:
+
 ```bash
 ./stop-monitoring.sh
 ```
@@ -83,9 +111,9 @@ full flag list (`perftest` has no rate-limit flag).
 ## Accessing Dashboards
 
 ### Grafana Dashboard
-- **URL**: http://localhost:3000
+- **URL**: [Grafana](http://localhost:3000)
 - **Username**: `admin`
-- **Password**: `admin`
+- **Initial password**: `admin` (persisted Grafana data may contain a changed password)
 - **Dashboard**: "AMQP Server - StrangeQ Monitoring" (auto-loaded)
 - **Features**:
   - Auto-refreshes every 5 seconds
@@ -96,7 +124,7 @@ full flag list (`perftest` has no rate-limit flag).
   - Error tracking
 
 ### Prometheus
-- **URL**: http://localhost:9090
+- **URL**: [Prometheus](http://localhost:9090)
 - **Use**: Query and explore metrics
 - **Examples**:
   ```promql
@@ -111,7 +139,7 @@ full flag list (`perftest` has no rate-limit flag).
   ```
 
 ### Raw Metrics Endpoint
-- **URL**: http://localhost:9419/metrics
+- **URL**: [Raw metrics](http://localhost:9419/metrics)
 - **Format**: Prometheus text format
 - **Use**: Direct access to all metrics
 
@@ -160,9 +188,7 @@ tail -f /tmp/amqp-server.log
 tail -f /tmp/perftest.log
 
 # Docker container logs
-cd monitoring
-docker-compose logs -f prometheus
-docker-compose logs -f grafana
+docker-compose -f monitoring/docker-compose.yml logs -f prometheus grafana
 ```
 
 ## Troubleshooting
@@ -178,11 +204,9 @@ lsof -i :9090  # Prometheus
 lsof -i :3000  # Grafana
 lsof -i :9419  # Telemetry
 
-# Kill the process
-kill -9 <PID>
-
-# Or use a different port
-AMQP_PORT=5673 TELEMETRY_PORT=9420 ./launch-with-monitoring.sh
+# Stop a conflicting service using its normal shutdown command, or choose
+# a different AMQP port for both the broker and the load generator.
+AMQP_PORT=5673 AMQP_NETWORK_PORT=5673 ./launch-with-monitoring.sh
 ```
 
 ### Docker Issues
@@ -192,18 +216,24 @@ AMQP_PORT=5673 TELEMETRY_PORT=9420 ./launch-with-monitoring.sh
 docker ps
 
 # Restart Docker containers
-cd monitoring
-docker-compose restart
-
-# Clean restart (removes data volumes)
-docker-compose down -v
-docker-compose up -d
+docker-compose -f monitoring/docker-compose.yml restart
 
 # View container logs
-docker-compose logs -f
+docker-compose -f monitoring/docker-compose.yml logs -f
+
+# Remove stored metrics and Grafana settings only when intentionally resetting:
+# docker-compose -f monitoring/docker-compose.yml down -v
 ```
 
 ### Server Won't Start
+
+The launcher treats any HTTP response as readiness, including `/health` 503,
+and proceeds after its wait loop expires. Check readiness explicitly if clients
+cannot connect:
+
+```bash
+curl --fail http://localhost:9419/health
+```
 
 Check the logs for errors:
 
@@ -220,7 +250,7 @@ Common issues:
 
 1. **Check if server is running with telemetry:**
    ```bash
-   curl http://localhost:9419/metrics
+   curl --fail http://localhost:9419/metrics
    ```
 
 2. **Check Prometheus is scraping:**
@@ -301,11 +331,11 @@ scripts/
 
 1. **First Time Setup**: On first run, Grafana will create volumes for data persistence. Your dashboards and settings will survive container restarts.
 
-2. **Customizing Dashboards**: You can edit dashboards in Grafana UI. To save changes permanently, export the JSON and update `grafana-dashboards/amqp-dashboard.json`.
+2. **Customizing Dashboards**: You can edit dashboards in Grafana UI. To save changes permanently, export the JSON and update `monitoring/grafana-dashboards/amqp-dashboard.json`.
 
 3. **Long-Running Tests**: For tests longer than 15 minutes, adjust the Grafana time range (top-right corner) or use absolute time ranges.
 
-4. **Multiple Servers**: To monitor multiple AMQP servers, edit `prometheus.yml` to add more scrape targets.
+4. **Multiple Servers**: To monitor multiple AMQP servers, edit `monitoring/prometheus.yml` to add more scrape targets.
 
 5. **Alerting**: Set up alerting rules in Prometheus for critical metrics like disk space, error rates, or latency thresholds.
 

@@ -2,23 +2,22 @@
 
 ## Supported Versions
 
-| Version | Supported |
-| ------- | ---------- |
-| 0.1.x   | Yes        |
-| < 0.1   | No         |
+Use the latest published release. This repository does not state a maintenance
+window or backport policy for older releases. Consult the
+[release history](CHANGELOG.md) for available fixes.
 
 ## Reporting a Vulnerability
 
 Please do **not** open a public issue for security problems.
 
-Preferred: use GitHub's private vulnerability reporting —
-https://github.com/maxpert/strangeq/security/advisories/new
-(Repository maintainers: enable it under Settings → Code security → Private vulnerability reporting.)
-
-Alternative: email <!-- MAINTAINER: replace with a real, monitored address before release --> `SECURITY-CONTACT-TBD`.
+Use [GitHub's private vulnerability reporting](https://github.com/maxpert/strangeq/security/advisories/new)
+if it is enabled for this repository. No monitored security email address is
+published here. If private reporting is unavailable, contact a repository
+maintainer privately without disclosing exploit details in a public issue.
 
 Include affected version (`amqp-server --version`), configuration (redact secrets), reproduction steps, and impact.
-We aim to acknowledge within 48 hours. Fixes are released as patch versions and announced via a GitHub Security Advisory.
+We aim to acknowledge reports within 48 hours. Fixes are released as patch
+versions and announced through a GitHub Security Advisory.
 
 ## Security Best Practices
 
@@ -35,9 +34,11 @@ We aim to acknowledge within 48 hours. Fixes are released as patch versions and 
 - Restrict network access using firewalls
 
 ### Configuration Security
-- Store configuration files with restricted permissions (0600)
+- Restrict configuration, auth-file, and private-key access to their owner or
+  the service group (for example, 0600 or root-owned 0640 with group `amqp`)
 - Never commit credentials to version control
-- Use environment variables or secret management for sensitive data
+- Keep password hashes in the protected auth file. Load private keys from
+  protected files or your deployment secret manager
 
 ### Storage Security
 - Protect storage directories with appropriate file permissions
@@ -65,6 +66,8 @@ security:
   tlskeyfile: /etc/amqp/certs/server.key
   authenticationenabled: true
   authenticationfilepath: /etc/amqp/auth.json
+  authorizationenabled: true
+  authmechanisms: [PLAIN]
   allowedhosts: ["10.0.0.0/8", "localhost"]
   blockedusers: []
   authfailurelimit: 5
@@ -80,20 +83,26 @@ server:
   loglevel: warn
 ```
 
+Create `/etc/amqp/auth.json` with bcrypt hashes and per-vhost permissions before
+starting the broker. See [Authorization](docs/AUTHORIZATION.md). The example
+keeps TLS on port 5672, so clients use `amqps://HOST:5672/`. For certificate
+setup and port selection, see [TLS configuration](docs/TLS.md).
+
 ## Known Limitations
 
-1. **Rate limiting**: Basic per-IPv4/per-IPv6-/64 failed-authentication limiting only (`security.authfailurelimit`); there is no general request-rate limiting
-2. **SASL EXTERNAL**: Not supported (certificate-based auth via mTLS is supported). The
-   management `/api/connections` `secure`/`ssl` flags are derived from the **transport**
-   only: a validated `PLAIN` mechanism over a plaintext socket is not treated as making a
-   connection secure, and because EXTERNAL is never accepted, a non-TLS connection can
-   never report `secure=true`.
-3. **Audit logging**: Not implemented
+1. **Rate limiting**: Basic per-IPv4/per-IPv6-/64 failed-authentication limiting only (`security.authfailurelimit`); there is no general AMQP request-rate limiting
+2. **SASL EXTERNAL**: Not supported. Mutual TLS verifies client certificates at
+   the transport layer. It does not map certificate identities to broker users.
+   Enable SASL authentication and authorization separately. Management connection
+   `secure`/`ssl` flags report TLS transport, not user authorization.
+3. **Audit logging**: Standalone management mutations can emit structured audit
+   events through the broker logger. This is not a durable audit trail, and
+   there is no general AMQP operation audit trail.
 
 ## Security Checklist
 
 - [ ] TLS enabled with valid certificates
-- [ ] Authentication enabled (PLAIN with TLS)
+- [ ] Authentication and authorization enabled (PLAIN with TLS)
 - [ ] ANONYMOUS mechanism disabled
 - [ ] Strong passwords used
 - [ ] Configuration files have restricted permissions

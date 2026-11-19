@@ -6,10 +6,9 @@
 
 ### Breaking changes
 
-Backward compatibility is deliberately abandoned for this minor release. The
-following exported symbols and configuration keys were unused inside this module
-and have been **removed**, not deprecated. Out-of-tree embedders that referenced
-them must migrate.
+This minor release removes the following exported symbols and configuration
+keys that were unused inside this module. They are removed rather than
+deprecated. External Go callers that reference them must migrate.
 
 **Removed exported symbols**
 
@@ -309,12 +308,18 @@ them must migrate.
 - Vectored delivery for large messages (writev)
 
 ### Performance
-- See the [Performance section](README.md#performance) for the current measured
-  matrix against RabbitMQ 4.4 Classic, including both durability modes, the
-  validity gates, and the cross-session caveat.
+- See the [benchmark guide](src/amqp-go/benchmark/README.md) for current
+  measurement and reproduction instructions. The figures below record the
+  historical comparison at the time of this entry.
 - Headline (shipped `fsync:on` mode): wins on the 1 KiB workloads and on peak
   RSS; the 64 KiB `fsync:on` rows remain losses against RabbitMQ's
   best-measured configuration (F3 0.81x, F4 0.87x).
 
-[Unreleased]: https://github.com/maxpert/strangeq/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/maxpert/strangeq/compare/v0.15.0...HEAD
+[0.15.0]: https://github.com/maxpert/strangeq/releases/tag/v0.15.0
+[0.14.3]: https://github.com/maxpert/strangeq/releases/tag/v0.14.3
+[0.14.2]: https://github.com/maxpert/strangeq/releases/tag/v0.14.2
+[0.14.1]: https://github.com/maxpert/strangeq/releases/tag/v0.14.1
+[0.14.0]: https://github.com/maxpert/strangeq/releases/tag/v0.14.0
+[0.12.0]: https://github.com/maxpert/strangeq/releases/tag/v0.12.0
 [0.1.0]: https://github.com/maxpert/strangeq/releases/tag/v0.1.0

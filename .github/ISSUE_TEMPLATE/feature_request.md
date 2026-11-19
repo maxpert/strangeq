@@ -1,24 +1,26 @@
 ---
 name: Feature request
-about: Suggest an idea for this project
+about: Suggest an improvement
 title: '[FEATURE] '
 labels: enhancement
 assignees: ''
-
 ---
 
-**Is your feature request related to a problem? Please describe.**
-A clear and concise description of what the problem is. Ex. I'm always frustrated when [...]
+## Problem
 
-**Describe the solution you'd like**
-A clear and concise description of what you want to happen.
+Describe the use case and the limitation you encounter.
 
-**Describe alternatives you've considered**
-A clear and concise description of any alternative solutions or features you've considered.
+## Proposed behavior
 
-**Additional context**
-Add any other context or screenshots about the feature request here.
+Explain the result you want, with a concrete example if possible. Specify whether
+it applies to standalone, local Raft, or multi-node cluster mode.
 
-**AMQP Compliance**
-If this feature relates to AMQP 0.9.1 compliance, please reference the relevant section of the specification.
+## Alternatives
 
+Describe any alternatives or workarounds you considered.
+
+## Compatibility and context
+
+For AMQP 0.9.1 or RabbitMQ compatibility requests, link the relevant specification
+section or documented behavior. Include workload requirements, references, or
+screenshots that help explain the request.

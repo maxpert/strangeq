@@ -1,17 +1,24 @@
 # StrangeQ Performance Benchmarks
 
-`cmd/perftest` drives standalone broker benchmarks. It uses
-[amqp091-go](https://github.com/rabbitmq/amqp091-go). Producers and consumers
-run on separate connections, and consumers use manual acknowledgement with a
-QoS prefetch. For replicated queues, use the [cluster comparison guide](CLUSTER_COMPARISON.md).
+`cmd/perftest` measures one broker endpoint. It uses
+[amqp091-go](https://github.com/rabbitmq/amqp091-go). Producers and consumers run on
+separate connections, and consumers use manual acknowledgement with a QoS prefetch. Use
+this guide for a quick single-endpoint workload. For controlled single-node Classic and
+three-voter quorum comparisons, use the [comparison runner](CLUSTER_COMPARISON.md),
+which records topology, durability, payload profile, and paired evidence.
 
 ## Quick Start
 
 ```bash
 cd src/amqp-go
-go run ./cmd/amqp-server &
+go run ./cmd/amqp-server
+```
 
-# 1 producer / 1 consumer, 1 KB, 20s
+Wait for the broker to listen, then run these commands in a second terminal from
+`src/amqp-go`.
+
+```bash
+# 1 producer / 1 consumer, 1 KiB, 20 seconds
 go run ./cmd/perftest -url amqp://guest:guest@localhost:5672/ \
   -durable -confirm -producers 1 -consumers 1 -size 1024 -duration 20s
 
@@ -40,7 +47,7 @@ go run ./cmd/perftest -url amqp://guest:guest@localhost:5672/ \
 
 ## Output
 
-Real-time per-second, then a summary:
+The command prints per-second rates followed by a summary.
 
 ```
 [Ns]  sent: N/s  recv: N/s  lat p50=… p95=… p99=…
@@ -54,18 +61,34 @@ Consumer latency  p50=…  p75=…  p95=…  p99=…  p99.9=…
 Confirm latency   p50=…  p75=…  p95=…  p99=…  p99.9=…
 ```
 
-`Consumed` is the in-window receive rate (the headline throughput);
-`Delivered` counts the messages drained after the publish window.
+`Consumed` is the in-window receive rate (the headline throughput). `Delivered` counts
+all deliveries, including the drain after the publish window. `Lost` is the published
+count minus deliveries seen by the drain deadline. It can include a backlog still
+waiting at that deadline. It is not proof of durable message loss. Confirm mode fails on
+negative or unresolved confirms, but it does not establish restart or failover safety.
+Check logs and require positive publish and delivery counts before accepting a run.
 
 ## Head-to-head vs RabbitMQ
 
-The [repository benchmark results](../../../README.md#performance) cover
-replicated clusters. The standalone command below runs `cmd/perftest` against
-one RabbitMQ broker.
+The [comparison guide](CLUSTER_COMPARISON.md) separates single-node local-journal and
+replicated-cluster measurements and explains how to reproduce a controlled trial. The
+command below is a quick workload against one RabbitMQ endpoint.
 
 ## Running Against RabbitMQ
 
+Use host port 5673 so the local StrangeQ process can remain on 5672. Run from
+`src/amqp-go`. Wait for RabbitMQ to finish startup before starting the workload.
+
 ```bash
-docker run -d --name rabbitmq-bench --platform linux/arm64 -p 5672:5672 rabbitmq:4.4-management
-go run ./cmd/perftest -url amqp://guest:guest@localhost:5672/ -durable -confirm -producers 10 -consumers 10 -duration 20s
+docker run -d --rm --name rabbitmq-bench -p 127.0.0.1:5673:5672 rabbitmq:4.4.0-management
+go run ./cmd/perftest -url amqp://guest:guest@localhost:5673/ \
+  -durable -confirm -producers 10 -consumers 10 -duration 20s
+docker stop rabbitmq-bench
 ```
+
+For a nonempty `-exchange`, declare the exchange and bind `-queue` to it with the queue
+name as routing key before running. The command declares its queue but does not declare
+exchanges or bindings.
+
+Use an empty benchmark queue for each trial. This command reuses the named queue and
+does not isolate broker storage or collect paired resource evidence.

@@ -1,42 +1,47 @@
 ---
 name: Bug report
-about: Create a report to help us improve
+about: Report a reproducible problem
 title: '[BUG] '
 labels: bug
 assignees: ''
-
 ---
 
-**Describe the bug**
-A clear and concise description of what the bug is.
+## Problem
 
-**To Reproduce**
-Steps to reproduce the behavior:
-1. Configure server with '...'
-2. Send message to '....'
-3. Observe error '....'
+Describe what happened and what you expected.
 
-**Expected behavior**
-A clear and concise description of what you expected to happen.
+## Reproduction
 
-**Environment:**
- - OS: [e.g. Ubuntu 22.04, macOS 14, Windows 11]
- - AMQP-Go Version: [e.g. v0.1.0]
- - Go Version: [e.g. 1.27.3]
-  - Storage: [e.g. persistent (default), in-memory]
+1. Start the broker with ...
+2. Send or consume ...
+3. Observe ...
 
-**Configuration:**
-```json
-{
-  // Paste your configuration here (remove sensitive data)
-}
+Include a minimal client example or exact commands if possible.
+
+## Environment
+
+- StrangeQ version or commit (`amqp-server --version`):
+- OS and architecture (for example, Linux arm64 or macOS arm64):
+- Go version, if built from source:
+- Client library and version:
+- Mode: default standalone, local Raft (`cluster.local`), or multi-node cluster:
+- Storage durability profile and filesystem:
+- For clusters: node count and relevant queue/shard placement:
+
+## Configuration and logs
+
+Include relevant configuration and logs. Remove passwords, tokens, private keys,
+and other sensitive values.
+
+```yaml
+# Minimal broker configuration
 ```
 
-**Logs:**
-```
-Paste relevant log output here
+```text
+Relevant logs
 ```
 
-**Additional context**
-Add any other context about the problem here.
+## Additional context
 
+Include workload details, restart/failure steps, or screenshots if relevant.
+Report vulnerabilities privately using [SECURITY.md](../../SECURITY.md).

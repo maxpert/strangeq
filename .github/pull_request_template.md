@@ -1,55 +1,38 @@
 ## Description
-<!-- Provide a brief description of the changes in this PR -->
 
-## Type of Change
-<!-- Mark the relevant option with an "x" -->
-- [ ] Bug fix (non-breaking change which fixes an issue)
-- [ ] New feature (non-breaking change which adds functionality)
-- [ ] Breaking change (fix or feature that would cause existing functionality to not work as expected)
-- [ ] Documentation update
+<!-- Describe the problem and resulting behavior. Include a before/after example when useful. -->
+
+## Type of change
+
+- [ ] Bug fix
+- [ ] Feature
+- [ ] Breaking change
 - [ ] Performance improvement
-- [ ] Code refactoring
+- [ ] Refactoring
+- [ ] Documentation
 
-## Related Issues
-<!-- Link to related issues using #issue_number -->
-Closes #
+## Related issues
 
-## Changes Made
-<!-- List the specific changes made in this PR -->
-- 
-- 
-- 
+<!-- Link related issues; use "Closes #123" only when this PR resolves the issue. -->
 
-## Testing
-<!-- Describe the tests you ran and their results -->
-- [ ] All existing tests pass
-- [ ] Added new tests for changes
-- [ ] Tested manually with the following scenarios:
-  - 
-  - 
+## Validation
 
-## Performance Impact
-<!-- If applicable, describe any performance implications -->
-- [ ] No performance impact
-- [ ] Performance improvement (provide benchmark results)
-- [ ] Performance regression (explain why acceptable)
+<!-- List the checks you ran and their results, including relevant manual scenarios. State any checks not run. -->
+
+## Performance and compatibility
+
+<!-- If applicable, describe workload/topology, durability settings, benchmark evidence, client behavior, or storage/upgrade implications. Otherwise remove this section. -->
 
 ## Documentation
-<!-- Check all that apply -->
-- [ ] Updated README.md
-- [ ] Updated code comments
-- [ ] Updated examples
-- [ ] No documentation needed
+
+<!-- Link updated guides or examples, or explain why documentation changes are unnecessary. -->
 
 ## Checklist
-- [ ] My code follows the project's style guidelines
-- [ ] I have performed a self-review of my own code
-- [ ] I have commented my code, particularly in hard-to-understand areas
-- [ ] My changes generate no new warnings or errors
-- [ ] I have added tests that prove my fix is effective or that my feature works
-- [ ] New and existing unit tests pass locally with my changes
-- [ ] Any dependent changes have been merged and published
 
-## Screenshots (if applicable)
-<!-- Add screenshots to help explain your changes -->
+- [ ] Reviewed the changes for scope and correctness
+- [ ] Added or updated relevant tests, or explained why none are needed
+- [ ] Documented changes in behavior or configuration
 
+## Screenshots
+
+<!-- For UI changes, include screenshots if helpful. Otherwise remove this section. -->

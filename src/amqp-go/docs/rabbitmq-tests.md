@@ -4,7 +4,9 @@ This document describes the RabbitMQ interoperability tests for the AMQP 0.9.1 p
 
 ## Overview
 
-The RabbitMQ interoperability tests (`rabbitmq_interop_test.go`) validate that our AMQP protocol implementation correctly interacts with a real RabbitMQ server. These tests verify:
+The [RabbitMQ interoperability tests](../protocol/rabbitmq_interop_test.go)
+exercise low-level AMQP frame serialization and parsing against a real RabbitMQ
+server. They do not start StrangeQ or establish full broker conformance. They cover
 
 - Protocol header exchange
 - Connection handshake (Start, StartOK, Tune, TuneOK, Open, OpenOK)
@@ -14,7 +16,7 @@ The RabbitMQ interoperability tests (`rabbitmq_interop_test.go`) validate that o
 - Message publishing (Basic.Publish with content headers and body)
 - Message consumption (Basic.Get)
 - Heartbeat frames
-- Multiple concurrent channels
+- Multiple channels on one connection
 
 ## Prerequisites
 
@@ -26,22 +28,36 @@ To run these tests, you need:
 
 ## Quick Start with Docker
 
-The easiest way to run these tests is using Docker. Run the `go test`
-commands from the Go module root (`src/amqp-go`); the interop tests live in the
-`protocol` package:
+Run these commands from the Go module root (`src/amqp-go`). Choose host ports
+that do not conflict with a local StrangeQ or RabbitMQ instance. The Docker
+example binds only to loopback and creates an explicit test user.
 
 ```bash
 # Start RabbitMQ with management interface
 docker run -d --name rabbitmq-test \
-  -p 5672:5672 \
-  -p 15672:15672 \
+  -p 127.0.0.1:5672:5672 \
+  -p 127.0.0.1:15672:15672 \
+  -e RABBITMQ_DEFAULT_USER=interop \
+  -e RABBITMQ_DEFAULT_PASS=local-test-only \
   rabbitmq:4-management
 
-# Wait for RabbitMQ to be ready (about 10 seconds)
-sleep 10
+# Wait up to two minutes for the broker, failing if it never becomes ready.
+ready=false
+for attempt in $(seq 1 60); do
+  if docker exec rabbitmq-test rabbitmq-diagnostics -q check_running; then
+    ready=true
+    break
+  fi
+  sleep 2
+done
+if [ "$ready" != true ]; then
+  docker logs rabbitmq-test
+  exit 1
+fi
 
-# Run the tests
-go test -v -run TestRabbitMQ ./protocol/
+# Disable test-result caching so this run actually contacts RabbitMQ.
+RABBITMQ_USER=interop RABBITMQ_PASS=local-test-only \
+  go test -count=1 -v -run TestRabbitMQ ./protocol/
 
 # Stop and remove the container when done
 docker stop rabbitmq-test
@@ -69,7 +85,7 @@ RABBITMQ_HOST=rabbitmq.example.com \
 RABBITMQ_PORT=5672 \
 RABBITMQ_USER=testuser \
 RABBITMQ_PASS=testpass \
-go test -v -run TestRabbitMQ ./protocol/
+go test -count=1 -v -run TestRabbitMQ ./protocol/
 ```
 
 ### Skipping Tests
@@ -78,17 +94,22 @@ If you don't have RabbitMQ available or want to skip these tests:
 
 ```bash
 # Skip RabbitMQ interop tests
-SKIP_RABBITMQ_TESTS=1 go test -v ./protocol/
+SKIP_RABBITMQ_TESTS=1 go test -count=1 -v ./protocol/
 ```
 
-The tests will also automatically skip if they cannot connect to RabbitMQ.
+The tests also skip when TCP connection establishment fails. A green `go test`
+exit status therefore does not prove these checks ran. Inspect verbose output
+for `SKIP`, especially in CI. The tests use plaintext TCP, so use an isolated
+test network rather than production credentials. For the separate broker
+conformance suite and its `AMQP_URL` setting, see
+[Contributing](../../../CONTRIBUTING.md#amqp-compliance).
 
 ## Test Coverage
 
 The test suite includes the following tests:
 
 ### 1. TestRabbitMQ_ProtocolHeader
-Tests the initial protocol header exchange (`AMQP\0\0\9\1`).
+Tests the initial protocol header bytes (`41 4d 51 50 00 00 09 01` in hexadecimal).
 
 ### 2. TestRabbitMQ_ConnectionHandshake
 Tests the complete connection handshake:
@@ -120,7 +141,10 @@ Tests publishing a message:
 - Opens a channel
 - Declares a queue
 - Publishes a message with content header and body frames
-- Verifies message is accepted
+- Checks that the frames can be written without an immediate socket error
+
+This test does not request a publisher confirm or read a server acknowledgement.
+`TestRabbitMQ_BasicGet` provides the message round-trip check.
 
 ### 7. TestRabbitMQ_BasicGet
 Tests retrieving a message:
@@ -131,10 +155,11 @@ Tests retrieving a message:
 - Verifies message body matches
 
 ### 8. TestRabbitMQ_Heartbeat
-Tests sending heartbeat frames.
+Tests writing a heartbeat frame without an immediate socket error. It does not
+check heartbeat timeout enforcement or server liveness after the write.
 
 ### 9. TestRabbitMQ_MultipleChannels
-Tests opening multiple channels concurrently.
+Opens three channels sequentially on one connection and checks each response.
 
 ## Running Specific Tests
 
@@ -142,10 +167,10 @@ You can run individual tests using the `-run` flag:
 
 ```bash
 # Run only the connection handshake test
-go test -v -run TestRabbitMQ_ConnectionHandshake ./protocol/
+go test -count=1 -v -run TestRabbitMQ_ConnectionHandshake ./protocol/
 
 # Run only publishing and consumption tests
-go test -v -run "TestRabbitMQ_(BasicPublish|BasicGet)" ./protocol/
+go test -count=1 -v -run "TestRabbitMQ_(BasicPublish|BasicGet)" ./protocol/
 ```
 
 ## Debugging
@@ -154,7 +179,7 @@ go test -v -run "TestRabbitMQ_(BasicPublish|BasicGet)" ./protocol/
 
 ```bash
 # Run tests with verbose output
-go test -v -run TestRabbitMQ ./protocol/
+go test -count=1 -v -run TestRabbitMQ ./protocol/
 ```
 
 ### Check RabbitMQ Logs
@@ -179,27 +204,41 @@ If using the management plugin, you can monitor connections and channels:
 
 ```
 http://localhost:15672
-Username: guest
-Password: guest
+Username: interop
+Password: local-test-only
 ```
 
 ## CI/CD Integration
 
-For automated testing in CI/CD pipelines:
+In CI, check RabbitMQ readiness before starting `go test`, use `-count=1`, and
+inspect output for skipped tests. This example is a step list for a workflow
+with checkout and Go setup already configured.
 
 ```yaml
-# Example GitHub Actions workflow
 - name: Start RabbitMQ
   run: |
-    docker run -d --name rabbitmq-test -p 5672:5672 rabbitmq:4-management
-    sleep 10
+    docker run -d --name rabbitmq-test -p 127.0.0.1:5672:5672 \
+      -e RABBITMQ_DEFAULT_USER=interop \
+      -e RABBITMQ_DEFAULT_PASS=local-test-only rabbitmq:4-management
+    for attempt in $(seq 1 60); do
+      if docker exec rabbitmq-test rabbitmq-diagnostics -q check_running; then
+        exit 0
+      fi
+      sleep 2
+    done
+    docker logs rabbitmq-test
+    exit 1
 
 - name: Run RabbitMQ interop tests
-  run: go test -v -run TestRabbitMQ
-  working-directory: ./src/amqp-go/protocol
+  run: go test -count=1 -v -run TestRabbitMQ ./protocol/
+  working-directory: ./src/amqp-go
+  env:
+    RABBITMQ_USER: interop
+    RABBITMQ_PASS: local-test-only
 
 - name: Stop RabbitMQ
-  run: docker stop rabbitmq-test
+  if: always()
+  run: docker rm -f rabbitmq-test
 ```
 
 ## Troubleshooting
@@ -221,7 +260,8 @@ If you see authentication errors:
 ### Timeout Errors
 
 If tests timeout:
-1. Increase the test timeout: `go test -timeout 30s -run TestRabbitMQ ./protocol/`
+1. Set an overall test timeout with `go test -count=1 -timeout 2m -run TestRabbitMQ ./protocol/`.
+   This does not change the internal five-second dial or ten-second connection deadlines.
 2. Check if RabbitMQ is overloaded or slow to respond
 3. Verify network latency is acceptable
 
@@ -234,4 +274,5 @@ These tests use the low-level protocol package directly, without any high-level 
 - Parse responses by reading frame payloads
 - Handle all AMQP handshake steps explicitly
 
-This approach validates that the protocol implementation is correct at the lowest level and compatible with RabbitMQ's AMQP 0.9.1 implementation.
+These checks cover the listed frame exchanges, not the entire AMQP 0.9.1
+specification. Use the separate conformance suite for broker behavior.

@@ -6,6 +6,16 @@ manage.
 
 ## Installation
 
+These instructions target a Linux host with systemd. Run the file-copy commands
+from this repository's `deployment/systemd` directory. Hash generation requires `htpasswd` (typically `apache2-utils` on
+Debian/Ubuntu or `httpd-tools` on RHEL-family systems).
+
+The shipped config listens on all interfaces with password authentication, but
+without TLS or resource authorization. Before exposing the listener on an
+untrusted network, add [TLS](../../docs/TLS.md), set
+`security.authorizationenabled: true` to enforce the auth-file permissions, and
+restrict network access.
+
 ### 1. Create System User
 
 ```bash
@@ -28,10 +38,11 @@ sudo chmod 750 /etc/amqp
 
 ### 3. Install Binary
 
+Download or build the binary using [Quick Start](../../QUICKSTART.md). Replace
+`/absolute/path/to/amqp-server` below with its actual location.
+
 ```bash
-# Download or build the binary
-sudo cp amqp-server /usr/local/bin/
-sudo chmod 755 /usr/local/bin/amqp-server
+sudo install -o root -g root -m 0755 /absolute/path/to/amqp-server /usr/local/bin/amqp-server
 ```
 
 ### 4. Install Configuration and Auth File
@@ -45,13 +56,14 @@ sudo install -o root -g amqp -m 0640 config.yaml /etc/amqp/config.yaml
 sudo install -o root -g amqp -m 0640 amqp-server.env.example /etc/amqp/amqp-server.env
 
 # Create the auth file referenced by the config. Generate a bcrypt hash:
-HASH=$(htpasswd -bnBC 10 "" 'change-me' | tr -d ':\n')
+# This prompts for the password instead of putting it in shell history.
+HASH=$(htpasswd -nBC 10 admin | cut -d: -f2)
 sudo install -o root -g amqp -m 0640 /dev/null /etc/amqp/auth.json
 sudo tee /etc/amqp/auth.json >/dev/null <<EOF
 {
   "users": [
     {
-      "username": "guest",
+      "username": "admin",
       "password_hash": "$HASH",
       "vhost_permissions": [
         {"vhost": "/", "permission": {"configure": ".*", "write": ".*", "read": ".*"}}
@@ -63,11 +75,17 @@ sudo tee /etc/amqp/auth.json >/dev/null <<EOF
 EOF
 ```
 
-Replace `change-me` before installing. The hash is quoted as a JSON string;
-bcrypt hashes contain no characters that need escaping.
+Choose a strong password at the prompt and verify that `HASH` is nonempty before
+creating the auth file. The hash is inserted as a JSON string. Bcrypt hashes
+contain no characters that need JSON escaping. Do not use the placeholder
+credentials from client examples for this account.
 
-The broker only re-reads `auth.json` on `systemctl reload` (SIGHUP). Other
-settings require a restart.
+The example grants full access to `/`. For application accounts, use only the
+permissions they need. See [Authorization](../../docs/AUTHORIZATION.md).
+
+The broker reads `auth.json` on startup and re-reads it on `systemctl reload`
+(SIGHUP). Existing AMQP connections keep their user snapshot. Reconnect clients
+when changing their permissions. Other settings require a restart.
 
 ### 5. Install Service File
 
@@ -157,11 +175,13 @@ systemctl cat amqp-server
 # Show service dependencies
 systemctl list-dependencies amqp-server
 
-# Show environment variables
-systemctl show-environment
+# Show the optional environment-file path
+systemctl show amqp-server --property=EnvironmentFiles
 
-# Run service in foreground (for debugging)
-sudo -u amqp /usr/local/bin/amqp-server --config /etc/amqp/config.yaml
+# Stop the service before running another broker on the same data directory
+sudo systemctl stop amqp-server
+# Use the same working directory as the unit
+(cd /var/lib/amqp && sudo -u amqp /usr/local/bin/amqp-server --config /etc/amqp/config.yaml)
 ```
 
 ## Log Retention
@@ -178,8 +198,10 @@ EOF
 sudo systemctl restart systemd-journald
 ```
 
-If you configure `server.logfile` instead, the broker does not reopen the file
-on SIGHUP. Use logrotate with `copytruncate`, or use the journal (recommended).
+These journald limits apply to the host journal, not just this service. If you
+configure `server.logfile` instead, choose a path writable under the unit's
+`ReadWritePaths` restriction. SIGHUP does not reopen that file. Use the journal
+for managed retention. A `copytruncate` rotation can lose log lines.
 
 ## Security Hardening
 
@@ -189,80 +211,78 @@ The provided service file includes several security hardening options:
 - `PrivateTmp=true` - Uses private /tmp directory
 - `ProtectSystem=strict` - Makes most of filesystem read-only
 - `ProtectHome=true` - Makes /home inaccessible
-- `ReadWritePaths=...` - Only specified paths are writable
-- `UMask=0027` - Files and directories the service creates are readable only by the service's group
+- `ReadWritePaths=/var/lib/amqp` - Allows service data writes under that path
+- `UMask=0027` - Removes world access and group-write permission from new files
 
 ### Additional Hardening (Optional)
 
-Add these to `[Service]` section for more security:
+Review these optional restrictions against your host and workload before adding
+them through `sudo systemctl edit amqp-server`. Apply changes with
+`sudo systemctl daemon-reload` and a service restart:
 
 ```ini
-# Network
-PrivateNetwork=false
+# Network families used by the broker
+[Service]
 RestrictAddressFamilies=AF_INET AF_INET6
 
 # System calls
 SystemCallFilter=@system-service
 SystemCallErrorNumber=EPERM
 
-# Capabilities
-CapabilityBoundingSet=CAP_NET_BIND_SERVICE
-AmbientCapabilities=CAP_NET_BIND_SERVICE
+# No capabilities are needed for ports 5672 and 5671
+CapabilityBoundingSet=
+AmbientCapabilities=
 ```
 
 ## Firewall Configuration
 
+Permit only the client network that needs access. The examples below use
+`10.0.0.0/8`. Replace it with your client CIDR and use the configured AMQP port
+(5671 if you selected the conventional TLS port). Choose the tool your host uses.
+
 ### UFW (Ubuntu/Debian)
 
 ```bash
-sudo ufw allow 5672/tcp comment 'AMQP-Go'
+sudo ufw allow from 10.0.0.0/8 to any port 5672 proto tcp comment 'StrangeQ'
 ```
 
 ### firewalld (RHEL/CentOS)
 
 ```bash
-sudo firewall-cmd --permanent --add-port=5672/tcp
+sudo firewall-cmd --permanent --add-rich-rule='rule family="ipv4" source address="10.0.0.0/8" port port="5672" protocol="tcp" accept'
 sudo firewall-cmd --reload
 ```
 
 ### iptables
 
 ```bash
-sudo iptables -A INPUT -p tcp --dport 5672 -j ACCEPT
-sudo iptables-save > /etc/iptables/rules.v4
+sudo iptables -A INPUT -s 10.0.0.0/8 -p tcp --dport 5672 -j ACCEPT
+# On hosts with iptables-persistent and /etc/iptables installed:
+sudo iptables-save | sudo tee /etc/iptables/rules.v4 >/dev/null
 ```
 
 ## Monitoring
 
 ### Systemd Status
 
-```bash
-# Create status check script
-cat > /usr/local/bin/amqp-status.sh << 'EOF'
-#!/bin/bash
-systemctl is-active --quiet amqp-server
-exit $?
-EOF
-
-chmod +x /usr/local/bin/amqp-status.sh
-
-# Add to crontab for monitoring
-# */5 * * * * /usr/local/bin/amqp-status.sh || mail -s "AMQP Down" admin@example.com
-```
+Use `systemctl is-active --quiet amqp-server` in a host-monitoring check. A zero
+exit status means systemd considers the service active. Use `/health` to check
+broker readiness.
 
 ### Metrics Endpoint
 
 The shipped config binds telemetry to `127.0.0.1:9419` (loopback only), so
 scrape it from the host or proxy it locally. `/health` reports readiness: 503
 while recovery runs, during shutdown, and 503 when the AMQP listener is not
-bound. pprof is disabled unless `--enable-pprof` is passed.
+bound. pprof is disabled by default. It can be enabled by configuration,
+environment, or `--enable-pprof`.
 
 If metrics must be reachable from another host, expose them via nginx (keep
 the broker's telemetry listener on loopback):
 
 ```nginx
 location /metrics {
-    proxy_pass http://localhost:9419/metrics;
+    proxy_pass http://127.0.0.1:9419/metrics;
     allow 10.0.0.0/8;
     deny all;
 }
@@ -280,8 +300,9 @@ sudo journalctl -u amqp-server -n 50
 /usr/local/bin/amqp-server --version
 /usr/local/bin/amqp-server -h
 
-# Check that the config loads (start in the foreground; Ctrl-C to stop)
-sudo -u amqp /usr/local/bin/amqp-server --config /etc/amqp/config.yaml
+# Check that the config loads (stop the service first; Ctrl-C to stop)
+sudo systemctl stop amqp-server
+(cd /var/lib/amqp && sudo -u amqp /usr/local/bin/amqp-server --config /etc/amqp/config.yaml)
 
 # Check file permissions
 ls -la /etc/amqp/
@@ -303,8 +324,7 @@ sudo chown root:amqp /etc/amqp/config.yaml /etc/amqp/auth.json
 sudo lsof -i :5672
 sudo netstat -tlnp | grep 5672
 
-# Grant bind capability (if needed for port <1024)
-sudo setcap 'cap_net_bind_service=+ep' /usr/local/bin/amqp-server
+# Ports 5672 and 5671 do not require a bind capability.
 ```
 
 ## Uninstallation

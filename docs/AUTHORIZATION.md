@@ -9,8 +9,8 @@ Each user has a set of **virtual host permissions**, one per vhost. Each vhost p
 | Permission | Operations |
 |---|---|
 | **configure** | Creating or destroying resources (declare/delete exchange/queue) |
-| **write** | Injecting messages into a resource (publish, bind queue to exchange) |
-| **read** | Retrieving messages from a resource (consume, get, bind exchange) |
+| **write** | Publishing to exchanges, purging queues, binding destinations |
+| **read** | Consuming/getting from queues, binding sources |
 
 Each regex pattern is matched against the resource name. Patterns are **unanchored** (Go regexp default) — use `^...$` to restrict matches. An empty pattern denies all operations for that action.
 
@@ -43,7 +43,15 @@ Server-generated queue names use the `amq.gen.` prefix and are exempt from this 
 
 ## Auth File Format
 
-Authorization is configured via the auth file (JSON). Each user has `vhost_permissions` with a permission triple per vhost:
+Authorization is configured via the auth file (JSON). Each user has
+`vhost_permissions` with a permission triple per vhost. Replace every
+`password_hash` placeholder below with a real bcrypt hash before use. The
+placeholders cannot authenticate. The [systemd guide](../deployment/systemd/README.md#4-install-configuration-and-auth-file)
+shows an interactive hash-generation command. Administrator tags grant management
+capabilities. AMQP resource access still uses the permission triple.
+
+The producer and consumer below cannot declare queues or exchanges. Provision
+those resources with a separate account before connecting these clients.
 
 ```json
 {
@@ -126,13 +134,14 @@ Enable authorization in the config file (canonical concatenated keys):
 ```yaml
 security:
   authenticationenabled: true
+  authenticationfilepath: /etc/amqp/auth.json
   authorizationenabled: true
   authmechanisms:
     - PLAIN
 ```
 
 Snake_case spellings (`authentication_enabled`, `authorization_enabled`,
-`auth_mechanisms`) are also accepted since v0.1.0; both bind to the same
+`auth_mechanisms`) are also accepted. Both bind to the same
 fields. Unknown keys are reported at startup rather than silently ignored.
 
 Environment variables apply with or without `--config`:
@@ -142,6 +151,11 @@ AMQP_SECURITY_AUTHENTICATION_ENABLED=true \
 AMQP_SECURITY_AUTHORIZATION_ENABLED=true \
   amqp-server --config config.yaml
 ```
+
+The file backend reads the auth file on startup. SIGHUP (or `systemctl reload
+amqp-server` for the shipped unit) reloads users for new AMQP connections.
+existing AMQP connections keep their authenticated user snapshot. Reconnect those
+clients when changing their permissions. Configuration changes require a restart.
 
 ## Connection access control
 
@@ -174,7 +188,7 @@ security:
 ### Failed-authentication limiting
 
 After `security.authfailurelimit` failures in a window, further attempts from
-that peer are refused before any bcrypt work:
+that peer are refused before password verification:
 
 ```yaml
 security:
