@@ -42,7 +42,8 @@ type journalSegmentStorage struct {
 	manifest             journalSegmentManifest
 	checkpointOwners     map[uint64]bool
 	end                  int64
-	durableEnd           int64
+	durableEnd           int64 // Physically fenced prefix; used for recovery authority.
+	completedEnd         int64 // Complete checked frames available for process reads.
 	recoveryErr          error
 	retainedSourceOwners uint64
 	retainedSources      map[journalRetirementRange]uint64
@@ -185,6 +186,7 @@ func openJournalSegmentsWithQuota(dir string, create bool, extentBytes, retained
 	store.manifest, store.end = manifest, state.end
 	store.advanceCheckpointFloor(manifest.extents[len(manifest.extents)-1].base, manifest.extentBytes)
 	store.durableEnd = state.end
+	store.completedEnd = state.end
 	if hooks.sharedQuota != nil {
 		if err = hooks.sharedQuota.reserve(quota.used); err != nil {
 			_ = active.Close()
@@ -429,6 +431,7 @@ func (w *journalSegmentOutput) writeFrame(frame []byte, offset int64, syncRange 
 	s.end += size
 	if synced {
 		s.durableEnd = s.end
+		s.completedEnd = s.end
 	}
 	s.mu.Unlock()
 	return n, synced, nil
@@ -467,6 +470,7 @@ func (w *journalSegmentOutput) Sync() error {
 		w.dirty = false
 		w.store.mu.Lock()
 		w.store.durableEnd = w.store.end
+		w.store.completedEnd = w.store.end
 		w.store.mu.Unlock()
 	}
 	return nil

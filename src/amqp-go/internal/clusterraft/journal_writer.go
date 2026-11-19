@@ -8,12 +8,18 @@ import (
 	"math"
 	"slices"
 	"sync"
+	"sync/atomic"
 )
 
 var (
 	errJournalBusy   = errors.New("raft journal admission full")
 	errJournalClosed = errors.New("raft journal closed")
 )
+
+// A pair shares this one-way latch. Nil always means full durability.
+type journalDurability struct{ strict atomic.Bool }
+
+func (d *journalDurability) processAllowed() bool { return d != nil && !d.strict.Load() }
 
 type journalFile interface {
 	io.WriterAt
@@ -33,21 +39,23 @@ type journalCompletion struct {
 }
 
 type journalRequest struct {
-	record       journalRecord
-	delta        *journalGroupDelta
-	staging      journalScratchLoan
-	syncRequired bool
-	charge       int
-	result       chan journalCompletion
+	record          journalRecord
+	delta           *journalGroupDelta
+	staging         journalScratchLoan
+	syncRequired    bool
+	processEligible bool
+	charge          int
+	result          chan journalCompletion
 }
 
 type journalWriter struct {
-	file    journalFile
-	limits  journalLimits
-	budget  *journalBudget
-	staging journalScratchPool
-	done    chan struct{}
-	failed  chan struct{}
+	durability *journalDurability
+	file       journalFile
+	limits     journalLimits
+	budget     *journalBudget
+	staging    journalScratchPool
+	done       chan struct{}
+	failed     chan struct{}
 
 	localMu          sync.Mutex
 	mu               *sync.Mutex
@@ -107,6 +115,10 @@ func newJournalWriterWithBudget(file journalFile, end int64, nextSequence uint64
 // group has one ordered append job, so encoding outside the lock cannot
 // reorder two requests for the same group.
 func (w *journalWriter) enqueueEncoded(group uint64, size int, syncRequired bool, delta *journalGroupDelta, encode func([]byte) error) (<-chan journalCompletion, error) {
+	return w.enqueueEncodedMode(group, size, syncRequired, false, delta, encode)
+}
+
+func (w *journalWriter) enqueueEncodedMode(group uint64, size int, syncRequired, processEligible bool, delta *journalGroupDelta, encode func([]byte) error) (<-chan journalCompletion, error) {
 	if group == 0 || size < 0 || size > maxJournalFrameBytes-journalRecordHeaderSize ||
 		size > w.limits.pendingBytes-journalRecordHeaderSize {
 		return nil, errJournalTooLarge
@@ -148,7 +160,7 @@ func (w *journalWriter) enqueueEncoded(group uint64, size int, syncRequired bool
 	}
 	result := make(chan journalCompletion, 1)
 	w.queue = append(w.queue, journalRequest{
-		record: journalRecord{group: group, body: body}, syncRequired: syncRequired,
+		record: journalRecord{group: group, body: body}, syncRequired: syncRequired, processEligible: processEligible,
 		delta: delta, staging: staging, charge: charge, result: result,
 	})
 	w.ready.Signal()
@@ -248,7 +260,8 @@ func (w *journalWriter) writeBatch(batch []journalRequest) error {
 		if len(request.record.body) != 0 {
 			records = append(records, request.record)
 		}
-		syncRequired = syncRequired || request.syncRequired
+		// Eligibility is rechecked at execution, after any activation latch.
+		syncRequired = syncRequired || request.syncRequired || (request.processEligible && !w.durability.processAllowed())
 	}
 	if len(records) != 0 {
 		frame, locations, err := encodeJournalFrame(w.frameBuffer, w.nextSequence, records)
@@ -308,6 +321,13 @@ func (w *journalWriter) writeBatch(batch []journalRequest) error {
 				return err
 			}
 		}
+	}
+	// Publish process-readable bytes only after frame checking and append-index
+	// publication both succeeded. Strict reads retain their sync-first boundary.
+	if segment, ok := w.file.(*journalSegmentOutput); ok {
+		segment.store.mu.Lock()
+		segment.store.completedEnd = segment.store.end
+		segment.store.mu.Unlock()
 	}
 	return nil
 }
@@ -372,4 +392,17 @@ func (w *journalWriter) close() error {
 	w.mu.Unlock()
 	<-w.done
 	return w.err // The writer publishes its final error before closing done.
+}
+
+// requireFullDurability closes the fast path before ordering a strict fence.
+// Admission waits rather than allowing a full queue to bypass activation.
+func (w *journalWriter) requireFullDurability() error {
+	if w.durability != nil {
+		w.durability.strict.Store(true)
+	}
+	result, err := w.enqueueEncoded(1, 0, true, nil, func([]byte) error { return nil })
+	if err != nil {
+		return err
+	}
+	return (<-result).err
 }

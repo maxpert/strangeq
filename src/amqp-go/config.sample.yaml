@@ -89,6 +89,10 @@ storage:
   #   none    = no WAL group-commit barrier (the retired fsync: false). A
   #             confirmed message survives the broker staying up but NOT a
   #             process kill. Transactions always fsync.
+  #   process = cluster.local only: process-kill recovery while the kernel
+  #             stays alive, without an OS-crash or power-loss guarantee.
+  #             Peer activation permanently upgrades the same journal to full
+  #             durability, including failed activation attempts.
   #   barrier = fcntl(F_BARRIERFSYNC) (the default): the batch is handed to the
   #             drive under an ordering barrier. Confirmed messages survive
   #             kill -9 and an OS crash; a sudden power loss can lose the most

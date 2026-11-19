@@ -117,6 +117,9 @@ AMQP_STORAGE_PATH=/var/lib/amqp amqp-server --config config.yaml
 
 Use the [sample configuration](src/amqp-go/config.sample.yaml) for the available
 settings, including storage durability, resource alarms, and connection limits.
+The [local cluster guide](docs/CLUSTERING.md#pilot-start-locally-then-activate-peers)
+also documents explicit `storage.durability: process`, which recovers process
+kills while the kernel stays alive and upgrades permanently when peers activate.
 Run `amqp-server --help` for command-line options.
 
 ### Management and telemetry

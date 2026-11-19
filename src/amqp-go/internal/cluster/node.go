@@ -48,6 +48,7 @@ type Config struct {
 	Listen, Directory, Token                string
 	Shards                                  uint64
 	AllowInsecure                           bool
+	ProcessDurability                       bool
 	ExperimentalRaftRangeSync               bool
 	ExperimentalAckAndClaim                 bool
 	ExperimentalAssignments                 bool
@@ -110,6 +111,9 @@ func Initialize(cfg Config) error {
 func Open(cfg Config) (*Node, error) { return open(cfg, false) }
 
 func open(cfg Config, initialize bool) (*Node, error) {
+	if cfg.ProcessDurability && !cfg.local {
+		return nil, errors.New("process durability requires a local node")
+	}
 	if cfg.Shards == 0 {
 		cfg.Shards = defaultShards
 	}
@@ -453,6 +457,7 @@ func (n *Node) openGroup(id uint64, peers []uint64) error {
 	g, err := n.journal.OpenGroup(clusterraft.Config{
 		ID: n.cfg.Peer.ID, GroupID: id, Dir: n.store(id), Peers: peers, Machine: machine, MaxEntryBytes: maxEntryBytes,
 		DeferJournalCommit:           id != catalogID,
+		ProcessDurability:            id != catalogID && n.cfg.ProcessDurability,
 		BackgroundJournalCheckpoints: id != catalogID,
 		AssignmentReplicaBodies:      n.assignmentReplicaSlots != nil && id != catalogID,
 		GatherProposal:               gatherProposal,

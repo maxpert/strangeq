@@ -59,6 +59,9 @@ type Config struct {
 	// DeferJournalCommit allows independent commit progress to wait for a
 	// later durability fence. Only use it for journal-backed data shards.
 	DeferJournalCommit bool
+	// ProcessDurability permits kernel-write completion for this data group when
+	// its journal owner is in isolated process mode. Catalog groups leave it off.
+	ProcessDurability bool
 	// BackgroundJournalCheckpoints stages routine snapshots outside the Group
 	// lock. Only use it for journal-backed data shards.
 	BackgroundJournalCheckpoints bool

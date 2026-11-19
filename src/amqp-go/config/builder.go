@@ -49,7 +49,8 @@ func (b *ConfigBuilder) WithStoragePath(path string) *ConfigBuilder {
 }
 
 // WithDurability sets the single durability option: interfaces.DurabilityNone,
-// interfaces.DurabilityBarrier (the default), or interfaces.DurabilityFlush.
+// interfaces.DurabilityProcess (cluster.local only), interfaces.DurabilityBarrier
+// (the default), or interfaces.DurabilityFlush.
 // Any other value is rejected by Validate/Build.
 func (b *ConfigBuilder) WithDurability(durability string) *ConfigBuilder {
 	b.config.Storage.Durability = durability

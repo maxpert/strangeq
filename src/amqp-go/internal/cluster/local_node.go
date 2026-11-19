@@ -83,6 +83,15 @@ func OpenLocal(cfg Config) (*Node, error) {
 	} else {
 		return nil, err
 	}
+	// Decide before opening storage or replaying groups: even an unreadable or
+	// invalid activation intent must never reopen this lineage in process mode.
+	intent, intentErr := os.ReadFile(filepath.Join(cfg.Directory, peerActivationFile))
+	if intentErr != nil && !errors.Is(intentErr, os.ErrNotExist) {
+		return nil, intentErr
+	}
+	if activation.Peer.Address != "" || intentErr == nil {
+		cfg.ProcessDurability = false
+	}
 	cfg.Seeds = []Peer{{ID: cfg.Peer.ID}}
 	cfg.Listen, cfg.Token, cfg.TLS = "", "", nil
 	cfg.Discovery = nil
@@ -90,7 +99,6 @@ func OpenLocal(cfg Config) (*Node, error) {
 	if err != nil {
 		return nil, err
 	}
-	intent, intentErr := os.ReadFile(n.path(peerActivationFile))
 	if intentErr == nil {
 		var want peerActivation
 		if json.Unmarshal(intent, &want) != nil || want.Peer.ID != cfg.Peer.ID || !validAddress(want.Peer.Address) || want.Listen == "" {
@@ -216,6 +224,11 @@ func (n *Node) ActivatePeers(options Config) error {
 		}
 	} else {
 		return err
+	}
+	// The intent is durable before the one-way policy upgrade. A failed
+	// upgrade, bind or endpoint commit cannot restore relaxed journal writes.
+	if err := n.journal.RequireFullDurability(); err != nil {
+		return fmt.Errorf("activate peer durability: %w", err)
 	}
 	if err := server.Start(); err != nil {
 		return fmt.Errorf("activate peer listener: %w", err)

@@ -28,6 +28,20 @@ Save as `local.yaml` and run `amqp-server --config local.yaml` directly, without
 values and the data directory. There is no peer socket while peer settings are
 absent. Publishes use the same durable journal/commit/apply path with one voter.
 
+The default `storage.durability: barrier` keeps the existing durable journal
+fences. The local profile also permits explicit `storage.durability: process`:
+confirmed publications and required settlements survive a broker process kill
+while the OS kernel remains alive. This policy does not promise recovery after
+an OS crash, host reset or power loss. It is rejected for standalone and
+addressed cluster profiles. `none` does not provide this process-kill guarantee.
+
+Process mode applies only before peer activation. Activation durably records
+its intent and upgrades the same journal to full durability before opening a
+peer listener or committing the advertised endpoint. This upgrade is one-way,
+including failed activation attempts. Startup with peer settings or an existing
+activation intent opens strictly before recovery; retaining `durability: process`
+in the local configuration cannot downgrade an activated journal.
+
 To activate peers in this running process, generate a shared token using the
 credential command below. Keep `local: true` and the same shard/format settings.
 Add these loopback-only test settings to the existing `cluster` section:

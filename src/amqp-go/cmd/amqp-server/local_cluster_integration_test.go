@@ -11,14 +11,23 @@ import (
 	"time"
 
 	"github.com/maxpert/amqp-go/config"
+	"github.com/maxpert/amqp-go/interfaces"
 	amqp "github.com/rabbitmq/amqp091-go"
 	"github.com/stretchr/testify/require"
 )
 
 func TestLocalAMQPPromotesWithoutReplacingGatewayAndSurvivesSeedLoss(t *testing.T) {
+	for _, mode := range []string{interfaces.DurabilityBarrier, interfaces.DurabilityProcess} {
+		t.Run(mode, func(t *testing.T) { checkLocalAMQPPromotion(t, mode) })
+	}
+}
+
+func checkLocalAMQPPromotion(t *testing.T, mode string) {
+	t.Helper()
 	nodes := newTestCluster(t, 3, 1, 2)
 	transport := nodes[0].config.Cluster
 	nodes[0].config.Cluster = config.ClusterConfig{Local: true, Shards: 2}
+	nodes[0].config.Storage.Durability = mode
 	nodes[0].start(t, false)
 	const queue = "local-promoted-bytes"
 	connection := waitQueue(t, &nodes[0], queue, false)

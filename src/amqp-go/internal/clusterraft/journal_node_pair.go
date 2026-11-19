@@ -24,10 +24,23 @@ type NodeJournalPair struct {
 // before returning. create has the same provisioning-only meaning as it does
 // for OpenNodeJournal. There is deliberately no single-stream fallback.
 func OpenNodeJournalPairWithRangeSync(root string, create bool, peer uint64) (*NodeJournalPair, error) {
+	return OpenNodeJournalPairWithOptions(root, create, peer, JournalOptions{RangeSync: true})
+}
+
+func OpenNodeJournalPairWithOptions(root string, create bool, peer uint64, options JournalOptions) (*NodeJournalPair, error) {
+	var durability *journalDurability
+	if options.ProcessDurability {
+		durability = &journalDurability{}
+	}
+
 	quota := &journalSegmentQuota{limit: journalGroupMaxFileBytes, streams: 2}
 	return openJournalPair(root, peer, func(dir string, _ int, budget *journalBudget) (*journalGroupNode, error) {
-		return openSegmentedGroupNode(dir, create, true, journalServingExtentBytes, journalGroupMaxFileBytes, budget,
+		store, err := openSegmentedGroupNode(dir, create, options.RangeSync, journalServingExtentBytes, journalGroupMaxFileBytes, budget,
 			journalSegmentHooks{sharedQuota: quota})
+		if err == nil {
+			store.writer.durability = durability
+		}
+		return store, err
 	})
 }
 
@@ -131,4 +144,24 @@ func (n *NodeJournalPair) Close() error {
 		n.closeErr = errors.Join(n.closeErr, stream.Close())
 	}
 	return n.closeErr
+}
+
+// RequireFullDurability closes both fast paths atomically before fencing either
+// stream. It attempts every fence even if an earlier stream has failed.
+func (n *NodeJournalPair) RequireFullDurability() error {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	if n.closed {
+		return errJournalClosed
+	}
+	for _, stream := range n.streams {
+		if stream.store.writer.durability != nil {
+			stream.store.writer.durability.strict.Store(true)
+		}
+	}
+	var err error
+	for _, stream := range n.streams {
+		err = errors.Join(err, stream.RequireFullDurability())
+	}
+	return err
 }

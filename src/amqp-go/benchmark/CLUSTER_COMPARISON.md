@@ -76,7 +76,7 @@ include the active trials and idle-policy lane counts used for these figures.
 
 Use Python 3.11 or later, Java, and a release build of `amqp-server`. Obtain and verify the official [RabbitMQ 4.4.0 generic UNIX archive](https://github.com/rabbitmq/rabbitmq-server/releases/tag/v4.4.0), [Erlang/OTP 28.5.0.8](https://github.com/erlang/otp/releases/tag/OTP-28.5.0.8), and [RabbitMQ PerfTest 2.25.0 shaded JAR](https://github.com/rabbitmq/rabbitmq-perf-test/releases/tag/v2.25.0). The three paths below point to locally extracted or installed copies. The script checks the versions reported by the client and running RabbitMQ nodes. It does not fetch or install packages.
 
-On Linux, build the StrangeQ binary and run both brokers, the client, and the RSS sampler inside the same host, dedicated VM, or unprivileged container. Use the same local scratch filesystem for both brokers. Avoid comparing a native broker against a broker in a VM. Record the filesystem, cache and flush behavior, CPU limits, and memory limits alongside the results. The script uses the binaries' shipping durability settings.
+On Linux, build the StrangeQ binary and run both brokers, the client, and the RSS sampler inside the same host, dedicated VM, or unprivileged container. Use the same local scratch filesystem for both brokers. Avoid comparing a native broker against a broker in a VM. Record the filesystem, cache and flush behavior, CPU limits, and memory limits alongside the results. RabbitMQ uses its shipping durability settings. StrangeQ uses the explicit `--strangeq-durability` profile, defaulting to the unchanged shipping `barrier` setting.
 
 ```sh
 python3 scripts/cluster_compare.py \
@@ -89,6 +89,25 @@ python3 scripts/cluster_compare.py \
 ```
 
 Add `--topology singleton` to this command for the configured [local-journal pilot](../../../docs/CLUSTERING.md#pilot-start-locally-then-activate-peers). It writes `cluster: {local: true}` with the requested `--strangeq-shards`, starts once without an initialization command, and supplies no peer endpoint or credential. RabbitMQ starts one node with Classic as the explicit default; the client omits its quorum-queue declaration flag. This measures the local journal, not the legacy standalone engine.
+
+`--strangeq-durability {barrier,flush,process}` writes the selected value to `storage.durability` and records it in `environment.json` and each timed result. `barrier` preserves the default synchronous journal behavior; `flush` requests the full drive-cache flush profile where the platform distinguishes it. Both use synchronous durability on Linux. `process` is allowed only with `--topology singleton`: eligible local-journal confirms follow completed kernel writes without a per-confirm disk fence. It protects against broker-process crashes while the OS remains running; it does not promise survival of an OS crash or power loss. Required structural fences remain enabled. Peer activation permanently upgrades the local journal to full durability. Keep `process` results separate from full-durability comparisons with RabbitMQ Classic.
+
+For a raw 64 KiB high-entropy singleton A/B on a native ARM64 Linux host, build and verify native ARM64 binaries, then run the following once with `process` and once with `barrier`, saving distinct evidence directories. Leave every other setting and the scratch device unchanged. The 65,536-byte fixture is reused for both brokers; journal compression, range sync, dual stream, assignments, and replica bodies are all off in this profile. Each invocation still contains its own three order-alternating StrangeQ/RabbitMQ pairs.
+
+```sh
+python3 scripts/cluster_compare.py \
+  --strangeq-bin /path/to/native-arm64/amqp-server \
+  --rabbitmq-home /path/to/rabbitmq_server-4.4.0 \
+  --erlang-bin /path/to/native-arm64/otp-28.5.0.8/bin \
+  --perftest-jar /path/to/perf-test-2.25.0.jar \
+  --scratch /path/on/test-volume \
+  --output /path/to/benchmark-evidence/process-raw64k \
+  --topology singleton --strangeq-shards 32 \
+  --strangeq-durability process --payload-profile high-entropy \
+  --case 65536-10x10-10q --duration 24 --warmup 4 --repeats 3
+```
+
+This is a saturation profile with ten producers, ten consumers, ten queues, confirm window 64 and prefetch 100. A separate matched-load run must add the same `--rate-per-producer` to both durability invocations and check achieved confirm and delivery rates. `environment.json` records host architecture (`machine`), the exact payload digest, binary hashes and selected settings; verify the binaries' architectures separately because the host architecture alone does not prove native execution.
 
 The prerequisites and topology can be checked without publishers using `--validate-only --case 1024-1x1-1q --repeats 1` in either mode. A measured run defaults to three interleaved repeats of all three workloads. Trials run serially and alternate which broker starts the pair. Use `--case` for a targeted run. Each trial uses fresh data directories and loopback application listeners; `quorum3` also configures peer listeners and a cluster credential. RabbitMQ has a private EPMD process in both modes. The script stops its own processes and removes temporary trial data on exit. Logs and measurements remain under `--output`.
 
@@ -103,6 +122,17 @@ Optional settings remain explicit and default off: `--strangeq-range-sync`, `--s
 ## Read the results
 
 `summary.json` reports the median and range for sent publishes/s, confirmed publishes/s, deliveries/s, highest combined broker RSS, and both p99 latencies. Throughput averages complete one-second samples after the configured warmup. Compare actual send rates when interpreting capped runs. PerfTest's p99 covers its full timed run. The existing `peak_cluster_rss_bytes` field is the peak simultaneous sum of three broker PIDs in `quorum3` or the single broker PID in `singleton`, excluding client and EPMD. `environment.json` and each timed result record topology, process count and RSS scope. Each run keeps its raw PerfTest log, RSS samples, command and before/after placement checks.
+
+Every timed Linux trial, for both brokers and every durability profile, also retains `storage-samples.json`: a baseline before client start, roughly one sample per second, and a final sample after client exit. It reads small kernel counter files without launching another sampler process. The counters have distinct scopes:
+
+| Counter | Meaning |
+| --- | --- |
+| `peak_cluster_rss_bytes` / `rss-samples.json` | Broker-process resident memory, excluding the client and EPMD. This is not a measurement of filesystem page cache. |
+| `scratch_device_written_bytes_delta` | End-minus-start Linux scratch backing block-device written sectors, converted with 512 bytes per sector. Includes unrelated I/O to that device; does not prove drive-cache flush or stable-media persistence. Raw samples also retain cumulative read/write bytes and the result records the read-byte delta. |
+| `host_cache_dirty_bytes` / `peak_host_cache_dirty_bytes` | Host-wide `/proc/meminfo` Dirty pages awaiting writeback, in bytes. |
+| `host_cache_writeback_bytes` / `peak_host_cache_writeback_bytes` | Host-wide `/proc/meminfo` Writeback pages currently being written, in bytes. |
+
+Dirty and Writeback are separate counters and exclude clean page cache; neither is attributable to an individual broker PID. The device identity and scope are recorded in the file's context. Filesystems without a `/sys/dev/block` entry, including some container filesystems, retain Dirty/Writeback evidence and an explicit reason for unavailable device counters. The result's cache peaks and I/O deltas cover the full client lifetime, including warmup, and omit any background writeback after client exit. Storage and RSS samples survive rejected-workload parsing so the paired evidence remains inspectable. Use a quiet dedicated host and inspect the raw cache trajectory when comparing `process` against `barrier`; short runs may end with deferred kernel writes and do not establish sustained storage throughput.
 
 In `quorum3`, RabbitMQ checks retain queue durability/type, three online members, actual leader distribution and pinned versions. StrangeQ retains three enrolled catalog voters and three committed voters with local storage for every workload shard; evidence records preferred leaders. In `singleton`, RabbitMQ must report one pinned-version node and unique durable Classic queues in `running` state, using the documented [queue inspection fields](https://www.rabbitmq.com/docs/man/rabbitmqctl.8#list_queues). StrangeQ must have a private `Local:true` persistent identity, its generated lineage and sole blank-address seed matching the catalog, no peer-activation intent, sole-voter committed membership reports with positive configuration indexes, and open journal groups for catalog/workload shards. Those reports are a persisted observation rather than a live Raft-status query; the unactivated local lifecycle provides no peer membership ingress. The server exposes no external per-shard live leader/membership query in this harness.
 

@@ -92,6 +92,12 @@ const (
 // the drive cache), so barrier vs flush is inert there, but none issues no
 // group-commit barrier at all and is NOT power-loss safe.
 const (
+	// DurabilityProcess confirms after journal writes reach the kernel. Only
+	// cluster.local permits it: process kills are recoverable while the kernel
+	// stays alive; OS crashes and power loss are outside its guarantee. Peer
+	// activation permanently upgrades the journal to full durability.
+	DurabilityProcess = "process"
+
 	// DurabilityNone issues no WAL group-commit barrier (the retired
 	// fsync: false): a confirmed message survives the broker staying up but
 	// not a process kill. Transactions (WriteTxAtomic) always fsync.
@@ -116,10 +122,12 @@ type StorageConfig struct {
 	Path string
 
 	// Durability is the single user-facing durability option. It is one of
-	// DurabilityNone, DurabilityBarrier (the default when the key is absent or
-	// ""), or DurabilityFlush:
+	// DurabilityNone, DurabilityProcess (cluster.local only), DurabilityBarrier
+	// (the default when the key is absent or ""), or DurabilityFlush:
 	//
 	//   none    - no WAL group-commit barrier (the retired fsync: false).
+	//   process - local journal writes survive a process kill while the kernel
+	//             remains alive; no OS-crash or power-loss guarantee.
 	//   barrier - fcntl(F_BARRIERFSYNC) on macOS: a confirmed message survives
 	//             a process kill and an OS crash; a power loss may still lose
 	//             the drive-cache tail (the retired fsync: true + barrier).
@@ -128,7 +136,7 @@ type StorageConfig struct {
 	//
 	// GetEngine maps this onto the internal EngineConfig transport
 	// (WALSyncDisabled / CrashModel); nothing under the storage engine reads
-	// this field directly. Any value other than the three above is rejected by
+	// this field directly. Any value other than those above is rejected by
 	// Validate. Transactions (WriteTxAtomic) always fdatasync regardless.
 	Durability string
 

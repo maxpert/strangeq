@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/maxpert/amqp-go/config"
+	"github.com/maxpert/amqp-go/interfaces"
 	"github.com/maxpert/amqp-go/internal/cluster"
 	"github.com/maxpert/amqp-go/internal/clusterqueue"
 	"github.com/maxpert/amqp-go/internal/clusterraft"
@@ -88,6 +89,7 @@ func clusterOptions(cfg *config.AMQPConfig) (cluster.Config, error) {
 		Discovery: c.Discovery,
 		Listen:    listen, Directory: filepath.Join(cfg.Storage.Path, "cluster"), Token: strings.TrimSpace(string(token)),
 		Shards: c.Shards, AllowInsecure: c.AllowLoopbackPlaintext, TLS: tlsConfig,
+		ProcessDurability:                       cfg.Durability() == interfaces.DurabilityProcess,
 		ExperimentalRaftRangeSync:               c.ExperimentalRaftRangeSync,
 		ExperimentalAckAndClaim:                 c.ExperimentalAckAndClaim,
 		ExperimentalAssignments:                 c.ExperimentalAssignments,

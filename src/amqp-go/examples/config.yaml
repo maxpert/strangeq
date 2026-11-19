@@ -23,7 +23,7 @@ network:
 
 storage:
   path: ./data
-  # Durability of a confirmed message: none | barrier (default) | flush.
+  # Durability of a confirmed message: none | process (cluster.local only) | barrier (default) | flush.
   # barrier fences the group-commit batch to the drive (OS-crash safe);
   # flush adds the full drive-cache flush (power-loss safe); none skips the
   # group-commit barrier. Transactions always fsync regardless.

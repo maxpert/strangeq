@@ -273,7 +273,7 @@ def launch_strangeq(args, stack, scratch, output, env):
             cluster_config["shards"] = args.strangeq_shards
         write_json(config, {
             "network": {"address": f"{LOOPBACK}:{amqp_port}"},
-            "storage": {"path": str(path)},
+            "storage": {"path": str(path), "durability": args.strangeq_durability},
             "telemetry": {"enabled": True, "address": LOOPBACK, "port": health_port},
             "cluster": cluster_config,
         })
@@ -587,9 +587,47 @@ def read_rss(brokers):
     return [values[pid] for pid in pids]
 
 
+def linux_storage_context(scratch, *, sys_devices=Path("/sys/dev/block")):
+    device = scratch.stat().st_dev
+    number = f"{os.major(device)}:{os.minor(device)}"
+    stat = sys_devices / number / "stat"
+    return {
+        "scratch_device_major_minor": number,
+        "scratch_device_stat_path": str(stat) if stat.is_file() else None,
+        "scratch_device_scope": "whole scratch backing block device; includes unrelated host I/O",
+        "scratch_device_unavailable_reason": None if stat.is_file() else "no Linux block-device stat for scratch filesystem",
+        "host_cache_scope": "host-wide /proc/meminfo Dirty and Writeback; excludes clean page cache; not broker RSS",
+        "sampling_interval_seconds": 1,
+    }
+
+
+def read_linux_storage(context, *, meminfo=Path("/proc/meminfo")):
+    values = {}
+    for line in meminfo.read_text(encoding="ascii").splitlines():
+        key, _, value = line.partition(":")
+        if key in ("Dirty", "Writeback"):
+            fields = value.split()
+            if len(fields) != 2 or fields[1] != "kB":
+                raise BenchmarkError(f"unexpected Linux {key} memory counter")
+            values[f"host_cache_{key.lower()}_bytes"] = int(fields[0]) * 1024
+    if len(values) != 2:
+        raise BenchmarkError("Linux memory evidence requires both Dirty and Writeback counters")
+    if context["scratch_device_stat_path"] is not None:
+        fields = Path(context["scratch_device_stat_path"]).read_text(encoding="ascii").split()
+        if len(fields) < 7:
+            raise BenchmarkError("incomplete Linux scratch-device stat")
+        # Linux block stat sectors are always 512 bytes, independent of the
+        # device's logical/physical sector size. These are device-wide counters.
+        values["scratch_device_read_bytes"] = int(fields[2]) * 512
+        values["scratch_device_written_bytes"] = int(fields[6]) * 512
+    return values
+
+
 def measure(args, stack, scratch, output, env, brokers, command):
     log = output / "perftest.log"
     start = time.monotonic()
+    storage_context = linux_storage_context(scratch) if platform.system() == "Linux" else None
+    storage_samples = [(0, read_linux_storage(storage_context))] if storage_context else []
     client = spawn(stack, command, scratch, env, log)
     samples = []
     deadline = start + args.duration + 50
@@ -598,16 +636,35 @@ def measure(args, stack, scratch, output, env, brokers, command):
         if now >= deadline:
             raise BenchmarkError(f"PerfTest exceeded its wall-clock limit; see {log}")
         samples.append((now - start, read_rss(brokers)))
+        if storage_context and now - start >= storage_samples[-1][0] + 1:
+            storage_samples.append((now - start, read_linux_storage(storage_context)))
         try:
             client.wait(timeout=0.25)
         except subprocess.TimeoutExpired:
             pass
     write_json(output / "rss-samples.json", samples)
+    if storage_context:
+        storage_samples.append((time.monotonic() - start, read_linux_storage(storage_context)))
+        write_json(output / "storage-samples.json", {"context": storage_context, "samples": storage_samples})
     if client.returncode:
         raise BenchmarkError(f"PerfTest exited {client.returncode}; see {log}")
     metrics = parse_perf_test(log.read_text(encoding="utf-8", errors="replace"), args.duration, args.warmup)
-    return dict(metrics, peak_cluster_rss_bytes=peak_rss(samples, TOPOLOGIES[args.topology]),
+    storage_metrics = {}
+    if storage_context:
+        storage_metrics = {
+            "peak_host_cache_dirty_bytes": max(row["host_cache_dirty_bytes"] for _, row in storage_samples),
+            "peak_host_cache_writeback_bytes": max(row["host_cache_writeback_bytes"] for _, row in storage_samples),
+            "storage_samples": len(storage_samples), "storage_context": storage_context,
+        }
+        for counter in ("scratch_device_read_bytes", "scratch_device_written_bytes"):
+            if counter in storage_samples[0][1]:
+                delta = storage_samples[-1][1][counter] - storage_samples[0][1][counter]
+                if delta < 0:
+                    raise BenchmarkError(f"Linux {counter} decreased during the timed trial")
+                storage_metrics[f"{counter}_delta"] = delta
+    return dict(metrics, **storage_metrics, peak_cluster_rss_bytes=peak_rss(samples, TOPOLOGIES[args.topology]),
                 rss_samples=len(samples), topology=args.topology, broker_processes=len(brokers),
+                strangeq_durability=args.strangeq_durability,
                 rss_scope=f"simultaneous sum of {len(brokers)} broker processes; excludes client and EPMD")
 
 
@@ -728,6 +785,8 @@ def arguments():
     parser.add_argument("--payload-profile", choices=("perftest", "high-entropy"), default="perftest",
                         help="perftest: built-in time/sequence bodies; high-entropy: one reused deterministic binary per case")
     parser.add_argument("--strangeq-bin", type=Path, required=True)
+    parser.add_argument("--strangeq-durability", choices=("barrier", "flush", "process"), default="barrier",
+                        help="storage durability profile; process requires singleton and protects process crashes only")
     parser.add_argument("--strangeq-range-sync", action="store_true", help="enable full synchronous journal range writes where supported")
     parser.add_argument("--strangeq-dual-stream", action="store_true", help="use two journal streams on fresh StrangeQ brokers")
     parser.add_argument("--strangeq-ack-and-claim", action="store_true", help="enable combined ACK and refill on every fresh StrangeQ journal replica")
@@ -754,6 +813,8 @@ def arguments():
     parser.add_argument("--validate-only", action="store_true", help="verify topology without starting any publishers")
     parser.add_argument("--darwin-diagnostic", action="store_true", help="allow native macOS diagnostic runs with possibly different flush primitives")
     args = parser.parse_args()
+    if args.strangeq_durability == "process" and args.topology != "singleton":
+        parser.error("strangeq-durability process requires --topology singleton")
     if args.warmup < 0 or args.duration < args.warmup + 4:
         parser.error("the measured window must contain at least four complete seconds")
     if args.strangeq_shards is not None and not 1 <= args.strangeq_shards <= 1024:
@@ -812,7 +873,8 @@ def main():
     if system == "Darwin":
         otp["erlang_efile_sync_static"] = darwin_erlang_flush(args, output, env)
     write_json(output / "environment.json", {
-        "platform": platform.platform(), "cpu_count": os.cpu_count(), "scratch": str(args.scratch), "locale": locale,
+        "platform": platform.platform(), "machine": platform.machine(), "cpu_count": os.cpu_count(),
+        "scratch": str(args.scratch), "locale": locale,
         "benchmark_mode": "same-host Linux" if system == "Linux" else "Darwin diagnostic only",
         "payload_profile": args.payload_profile, "payloads": args.payloads,
         "topology": args.topology, "broker_processes_per_engine": TOPOLOGIES[args.topology],
@@ -821,6 +883,7 @@ def main():
         "rss_scope": f"simultaneous sum of {TOPOLOGIES[args.topology]} broker processes per engine; excludes client and EPMD",
         "strangeq_sha256": file_digest(args.strangeq_bin), "strangeq_binary": str(args.strangeq_bin),
         "strangeq_storage": "segmented_journal",
+        "strangeq_durability": args.strangeq_durability,
         "strangeq_range_sync": args.strangeq_range_sync,
         "strangeq_dual_stream": args.strangeq_dual_stream,
         "strangeq_ack_and_claim": args.strangeq_ack_and_claim,

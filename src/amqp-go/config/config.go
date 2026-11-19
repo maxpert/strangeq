@@ -263,7 +263,7 @@ func (c *AMQPConfig) GetServer() interfaces.ServerConfig {
 // default, so every zero-value path stays on the ordered barrier.
 func (c *AMQPConfig) Durability() string {
 	switch c.Storage.Durability {
-	case interfaces.DurabilityNone, interfaces.DurabilityBarrier, interfaces.DurabilityFlush:
+	case interfaces.DurabilityNone, interfaces.DurabilityProcess, interfaces.DurabilityBarrier, interfaces.DurabilityFlush:
 		return c.Storage.Durability
 	default:
 		return interfaces.DurabilityBarrier
@@ -284,6 +284,7 @@ func (c *AMQPConfig) CRCEnabled() bool {
 // integrity-checked:
 //
 //	none    -> WALSyncDisabled=true,  CrashModel=""  (skip the group-commit fence)
+//	process -> local Raft journal policy; legacy engine stays fenced
 //	barrier -> WALSyncDisabled=false, CrashModel=""  (empty == fence; the default)
 //	flush   -> WALSyncDisabled=false, CrashModel="force_flush"
 //
@@ -339,14 +340,18 @@ func (c *AMQPConfig) Validate() error {
 	}
 
 	// The single durability option. "" is accepted for zero-value Load callers
-	// and normalizes to the barrier default; anything else outside the three
+	// and normalizes to the barrier default; anything else outside the four
 	// documented values FAILS at boot rather than silently selecting a
 	// durability level nobody asked for.
 	switch c.Storage.Durability {
 	case "", interfaces.DurabilityNone, interfaces.DurabilityBarrier, interfaces.DurabilityFlush:
+	case interfaces.DurabilityProcess:
+		if !c.Cluster.Local {
+			return fmt.Errorf("storage.durability process requires cluster.local: true")
+		}
 	default:
-		return fmt.Errorf("invalid storage.durability %q: allowed values are %q, %q, and %q (omit for the default %q)",
-			c.Storage.Durability, interfaces.DurabilityNone, interfaces.DurabilityBarrier, interfaces.DurabilityFlush, interfaces.DurabilityBarrier)
+		return fmt.Errorf("invalid storage.durability %q: allowed values are %q, %q, %q, and %q (omit for the default %q)",
+			c.Storage.Durability, interfaces.DurabilityNone, interfaces.DurabilityProcess, interfaces.DurabilityBarrier, interfaces.DurabilityFlush, interfaces.DurabilityBarrier)
 	}
 
 	// Validate security configuration

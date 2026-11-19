@@ -44,7 +44,10 @@ class PairedWorkloadTests(unittest.TestCase):
     def test_high_entropy_metadata_records_selected_fixture_for_both_engines(self):
         self.check_rejected_pair("singleton", payload_profile="high-entropy")
 
-    def check_rejected_pair(self, topology, payload_profile="perftest"):
+    def test_process_metadata_retains_paired_rejection_evidence(self):
+        self.check_rejected_pair("singleton", payload_profile="high-entropy", durability="process")
+
+    def check_rejected_pair(self, topology, payload_profile="perftest", durability="barrier"):
         with tempfile.TemporaryDirectory() as scratch:
             root = Path(scratch)
             jar = root / "perftest.jar"
@@ -57,6 +60,7 @@ class PairedWorkloadTests(unittest.TestCase):
                 "--case", "1024-1x1-1q", "--duration", "6", "--warmup", "2", "--repeats", "1",
                 "--topology", topology,
                 "--payload-profile", payload_profile,
+                "--strangeq-durability", durability,
             ]
             observed = []
 
@@ -83,6 +87,7 @@ class PairedWorkloadTests(unittest.TestCase):
             evidence = next(report.iterdir())
             environment = json.loads((evidence / "environment.json").read_text())
             self.assertEqual(environment["strangeq_storage"], "segmented_journal")
+            self.assertEqual(environment["strangeq_durability"], durability)
             self.assertEqual(environment["payload_profile"], payload_profile)
             self.assertEqual(set(environment["payloads"]), {"1024-1x1-1q"})
             payload = environment["payloads"]["1024-1x1-1q"]
@@ -133,6 +138,26 @@ class JournalDefaultTests(unittest.TestCase):
 
     def test_ack_and_claim_does_not_require_a_backend_selector(self):
         self.assertTrue(self.arguments(Path("/fixture"), "--strangeq-ack-and-claim").strangeq_ack_and_claim)
+
+    def test_durability_defaults_to_barrier_and_selected_profile_reaches_storage(self):
+        self.assertEqual(self.arguments(Path("/fixture")).strangeq_durability, "barrier")
+        for durability in ("barrier", "flush", "process"):
+            with self.subTest(durability=durability), tempfile.TemporaryDirectory() as scratch:
+                root = Path(scratch)
+                args = self.arguments(root, "--topology", "singleton", "--strangeq-durability", durability)
+                with mock.patch.multiple(cluster_compare, spawn=mock.DEFAULT, wait_until_ready=mock.DEFAULT,
+                                         free_ports=mock.DEFAULT) as fakes:
+                    fakes["free_ports"].return_value = [16000, 16001]
+                    cluster_compare.launch_strangeq(args, mock.Mock(), root, root, {})
+                config = json.loads((root / "node-1.yaml").read_text())
+                self.assertEqual(config["storage"], {"path": str(root / "node-1"), "durability": durability})
+                self.assertNotIn("durability", config["cluster"])
+
+    def test_process_profile_is_rejected_for_quorum_before_launch(self):
+        with mock.patch("sys.stderr", new_callable=io.StringIO) as error, self.assertRaises(SystemExit) as raised:
+            self.arguments(Path("/fixture"), "--strangeq-durability", "process")
+        self.assertEqual(raised.exception.code, 2)
+        self.assertIn("requires --topology singleton", error.getvalue())
 
     def test_payload_profile_defaults_preserve_perftest_bodies_without_files(self):
         with tempfile.TemporaryDirectory() as scratch:
@@ -238,6 +263,72 @@ class JournalDefaultTests(unittest.TestCase):
                     self.assertRaises(SystemExit) as raised:
                 self.arguments(Path("/fixture"), *options)
             self.assertEqual(raised.exception.code, 2)
+
+
+class LinuxStorageEvidenceTests(unittest.TestCase):
+    def test_device_sector_bytes_and_host_cache_are_distinct(self):
+        with tempfile.TemporaryDirectory() as scratch:
+            root = Path(scratch)
+            device = root.stat().st_dev
+            number = f"{cluster_compare.os.major(device)}:{cluster_compare.os.minor(device)}"
+            sys_devices = root / "sys-devices"
+            stat = sys_devices / number / "stat"
+            stat.parent.mkdir(parents=True)
+            stat.write_text("1 2 13 4 5 6 17 8 9 10 11\n")
+            meminfo = root / "meminfo"
+            meminfo.write_text("MemFree: 999 kB\nDirty: 23 kB\nWriteback: 7 kB\nCached: 1000 kB\n")
+            context = cluster_compare.linux_storage_context(root, sys_devices=sys_devices)
+            self.assertEqual(context["scratch_device_major_minor"], number)
+            self.assertEqual(cluster_compare.read_linux_storage(context, meminfo=meminfo), {
+                "host_cache_dirty_bytes": 23 * 1024,
+                "host_cache_writeback_bytes": 7 * 1024,
+                "scratch_device_read_bytes": 13 * 512,
+                "scratch_device_written_bytes": 17 * 512,
+            })
+            stat.unlink()
+            context = cluster_compare.linux_storage_context(root, sys_devices=sys_devices)
+            self.assertIn("no Linux block-device stat", context["scratch_device_unavailable_reason"])
+            self.assertEqual(cluster_compare.read_linux_storage(context, meminfo=meminfo), {
+                "host_cache_dirty_bytes": 23 * 1024, "host_cache_writeback_bytes": 7 * 1024,
+            })
+            meminfo.write_text("Dirty: 23 kB\n")
+            with self.assertRaisesRegex(BenchmarkError, "both Dirty and Writeback"):
+                cluster_compare.read_linux_storage(context, meminfo=meminfo)
+
+    def test_measure_retains_storage_samples_even_when_workload_is_rejected(self):
+        for rejected in (False, True):
+            with self.subTest(rejected=rejected), tempfile.TemporaryDirectory() as scratch:
+                root = Path(scratch)
+                (root / "perftest.log").write_text(perf_output(nacks=int(rejected)))
+                args = mock.Mock(duration=6, warmup=2, topology="singleton", strangeq_durability="process")
+                client = mock.Mock(returncode=0)
+                client.poll.side_effect = [None, 0]
+                initial = {"host_cache_dirty_bytes": 100, "host_cache_writeback_bytes": 20,
+                           "scratch_device_read_bytes": 1000, "scratch_device_written_bytes": 2000}
+                final = {"host_cache_dirty_bytes": 200, "host_cache_writeback_bytes": 10,
+                         "scratch_device_read_bytes": 1500, "scratch_device_written_bytes": 3500}
+                with (
+                    mock.patch("cluster_compare.platform.system", return_value="Linux"),
+                    mock.patch("cluster_compare.linux_storage_context", return_value={"fixture": True}),
+                    mock.patch("cluster_compare.read_linux_storage", side_effect=[initial, final]),
+                    mock.patch("cluster_compare.time.monotonic", side_effect=[10, 10.1, 10.4]),
+                    mock.patch("cluster_compare.read_rss", return_value=[55]),
+                    mock.patch("cluster_compare.spawn", return_value=client),
+                ):
+                    if rejected:
+                        with self.assertRaises(cluster_compare.RejectedWorkload):
+                            cluster_compare.measure(args, mock.Mock(), root, root, {}, [mock.Mock()], [])
+                    else:
+                        result = cluster_compare.measure(args, mock.Mock(), root, root, {}, [mock.Mock()], [])
+                        self.assertEqual(result["peak_cluster_rss_bytes"], 55)
+                        self.assertEqual(result["peak_host_cache_dirty_bytes"], 200)
+                        self.assertEqual(result["peak_host_cache_writeback_bytes"], 20)
+                        self.assertEqual(result["scratch_device_written_bytes_delta"], 1500)
+                        self.assertEqual(result["scratch_device_read_bytes_delta"], 500)
+                        self.assertEqual(result["strangeq_durability"], "process")
+                evidence = json.loads((root / "storage-samples.json").read_text())
+                self.assertEqual(evidence["context"], {"fixture": True})
+                self.assertEqual([row for _, row in evidence["samples"]], [initial, final])
 
 
 class PerfTestOutputTests(unittest.TestCase):

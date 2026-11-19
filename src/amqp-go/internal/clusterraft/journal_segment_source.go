@@ -63,7 +63,7 @@ func (source *journalRetainedSource) ReadAt(data []byte, offset int64) (int, err
 	count := int(min(int64(len(data)), size-offset))
 	s := lease.owner
 	s.mu.RLock()
-	manifest, end := s.manifest, s.durableEnd
+	manifest, end := s.manifest, s.completedEnd
 	s.mu.RUnlock()
 	n, err := s.readAtView(manifest, end, data[:count], lease.span.start+offset, (*os.File).ReadAt)
 	if err == nil && count < len(data) {
@@ -91,8 +91,8 @@ func (s *journalSegmentStorage) retainSource(span journalRetirementRange, parent
 		return nil, fmt.Errorf("%w: retained journal source ownership limit", errJournalTooLarge)
 	}
 	// Retain also works before the first checkpoint. Its range must already
-	// lie in the synced append prefix and wholly inside one selected extent.
-	if span.group == 0 || span.start < 0 || span.end <= span.start || span.end > s.durableEnd ||
+	// lie in the completed checked-frame prefix and wholly inside one selected extent.
+	if span.group == 0 || span.start < 0 || span.end <= span.start || span.end > s.completedEnd ||
 		len(s.manifest.extents) == 0 {
 		return nil, fmt.Errorf("%w: invalid retained command range", errJournalCorrupt)
 	}
@@ -101,7 +101,7 @@ func (s *journalSegmentStorage) retainSource(span journalRetirementRange, parent
 	if at < 0 {
 		return nil, fmt.Errorf("%w: retained command precedes selected history", errJournalCorrupt)
 	}
-	end := s.durableEnd
+	end := s.completedEnd
 	if extent := extents[at]; extent.sealedBytes != 0 {
 		end = extent.base + extent.sealedBytes
 	}

@@ -27,6 +27,7 @@ type nodeJournalOwner interface {
 	GroupIDs() []uint64
 	HasGroup(uint64) bool
 	Failure() error
+	RequireFullDurability() error
 	Close() error
 }
 
@@ -172,15 +173,12 @@ func (n *Node) prepareJournal() error {
 			}
 		}
 	}
-	openJournal := clusterraft.OpenNodeJournal
-	if n.cfg.ExperimentalRaftRangeSync {
-		openJournal = clusterraft.OpenNodeJournalWithRangeSync
-	}
+	opts := clusterraft.JournalOptions{RangeSync: n.cfg.ExperimentalRaftRangeSync, ProcessDurability: n.cfg.ProcessDurability}
 	var owner nodeJournalOwner
 	if n.cfg.ExperimentalRaftJournalDualStream {
-		owner, err = clusterraft.OpenNodeJournalPairWithRangeSync(n.cfg.Directory, !established, n.cfg.Peer.ID)
+		owner, err = clusterraft.OpenNodeJournalPairWithOptions(n.cfg.Directory, !established, n.cfg.Peer.ID, opts)
 	} else {
-		owner, err = openJournal(n.path(journalDirectory), !established)
+		owner, err = clusterraft.OpenNodeJournalWithOptions(n.path(journalDirectory), !established, opts)
 	}
 	if err != nil {
 		if established && errors.Is(err, os.ErrNotExist) {

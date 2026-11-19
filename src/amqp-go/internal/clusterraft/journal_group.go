@@ -66,7 +66,8 @@ type journalGroupStore struct {
 	closeOwner bool
 	// Pending commit is protected by the Group mutex. It can cover only
 	// entries already durable in the local journal.
-	pendingCommit uint64
+	pendingCommit     uint64
+	processDurability bool
 	// The per-group worker owns staged until it hands off completion. A
 	// stopped Group can skip publication, but close runs after its worker
 	// exits and must then preserve the durable delta for the next owner.
@@ -138,7 +139,7 @@ func (n *journalGroupNode) openStore(config Config) (*journalGroupStore, *pb.Sna
 		return nil, nil, err
 	}
 	n.owners[config.GroupID] = true
-	return &journalGroupStore{node: n, group: config.GroupID, state: state}, snapshot, nil
+	return &journalGroupStore{node: n, group: config.GroupID, state: state, processDurability: config.ProcessDurability}, snapshot, nil
 }
 
 func (n *journalGroupNode) provisionGroup(config Config) error {
@@ -171,12 +172,16 @@ func (n *journalGroupNode) provisionGroup(config Config) error {
 }
 
 func (n *journalGroupNode) persist(group uint64, op journalGroupOp) (journalGroupDelta, error) {
+	return n.persistMode(group, op, false)
+}
+
+func (n *journalGroupNode) persistMode(group uint64, op journalGroupOp, processEligible bool) (journalGroupDelta, error) {
 	size, err := op.size()
 	if err != nil {
 		return journalGroupDelta{}, err
 	}
 	var delta journalGroupDelta
-	result, err := n.writer.enqueueEncoded(group, size, true, &delta, func(body []byte) error {
+	result, err := n.writer.enqueueEncodedMode(group, size, !processEligible, processEligible, &delta, func(body []byte) error {
 		var encodeErr error
 		delta, encodeErr = op.encode(body)
 		return encodeErr
@@ -499,6 +504,11 @@ func (s *journalGroupStore) pendingHardState() *pb.HardState {
 }
 
 func (s *journalGroupStore) deferCommit(write readyWrite) bool {
+	// Process recovery needs explicit commit frames: unlike a device-loss model,
+	// an intact kernel-written log must recover the latest completed commit.
+	if s.node.writer.durability.processAllowed() {
+		return false
+	}
 	ready := write.ready
 	persisted := s.state.hard
 	if ready.MustSync || len(ready.Entries) != 0 || !raft.IsEmptySnap(ready.Snapshot) ||
@@ -538,9 +548,9 @@ func (s *journalGroupStore) persistReady(write readyWrite) (journalGroupDelta, e
 			return journalGroupDelta{}, err
 		}
 	}
-	delta, err := s.node.persist(s.group, journalGroupOp{
+	delta, err := s.node.persistMode(s.group, journalGroupOp{
 		kind: journalGroupReady, hard: ready.HardState, snapshot: snapshot, entries: ready.Entries,
-	})
+	}, s.processReadyEligible(write))
 	if err != nil {
 		return journalGroupDelta{}, err
 	}
@@ -642,3 +652,26 @@ func (s *journalGroupStore) close() error {
 func (s *journalGroupStore) failureSignal() <-chan struct{} { return s.node.writer.failed }
 
 func (s *journalGroupStore) failureCause() error { return s.node.writer.failure() }
+
+// Only append-only ordinary data in a stable one-voter configuration may use
+// process completion. Raft MustSync does not distinguish normal entries from
+// term/vote changes, so compare the validated hard-state transition directly.
+func (s *journalGroupStore) processReadyEligible(write readyWrite) bool {
+	if !s.processDurability || !s.node.writer.durability.processAllowed() || write.replacesLog ||
+		!raft.IsEmptySnap(write.ready.Snapshot) ||
+		write.hard.GetTerm() != s.state.hard.GetTerm() || write.hard.GetVote() != s.state.hard.GetVote() {
+		return false
+	}
+	conf := s.state.snapshot.metadata.GetConfState()
+	if len(conf.GetVoters()) != 1 || len(conf.GetVotersOutgoing()) != 0 ||
+		len(conf.GetLearners()) != 0 || len(conf.GetLearnersNext()) != 0 || conf.GetAutoLeave() ||
+		len(s.state.identity) < 16 || conf.GetVoters()[0] != binary.BigEndian.Uint64(s.state.identity[8:16]) {
+		return false
+	}
+	for _, entry := range write.ready.Entries {
+		if entry.GetType() != pb.EntryNormal {
+			return false
+		}
+	}
+	return true
+}

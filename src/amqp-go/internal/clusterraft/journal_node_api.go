@@ -23,10 +23,32 @@ func OpenNodeJournalWithRangeSync(dir string, create bool) (*NodeJournal, error)
 	return openNodeJournal(dir, create, true)
 }
 
+// JournalOptions selects append completion; zero values preserve full durability.
+// ProcessDurability is for an isolated one-voter owner. Its caller must invoke
+// RequireFullDurability before activating transport or admitting another member.
+type JournalOptions struct {
+	RangeSync         bool
+	ProcessDurability bool
+}
+
+func OpenNodeJournalWithOptions(dir string, create bool, options JournalOptions) (*NodeJournal, error) {
+	return openNodeJournalOptions(dir, create, options, nil)
+}
+
 func openNodeJournal(dir string, create, rangeSync bool) (*NodeJournal, error) {
-	store, err := openSegmentedGroupNode(dir, create, rangeSync, journalServingExtentBytes, journalGroupMaxFileBytes, nil, journalSegmentHooks{})
+	return OpenNodeJournalWithOptions(dir, create, JournalOptions{RangeSync: rangeSync})
+}
+
+func openNodeJournalOptions(dir string, create bool, options JournalOptions, durability *journalDurability) (*NodeJournal, error) {
+	store, err := openSegmentedGroupNode(dir, create, options.RangeSync, journalServingExtentBytes, journalGroupMaxFileBytes, nil, journalSegmentHooks{})
 	if err != nil {
 		return nil, err
+	}
+	if options.ProcessDurability {
+		if durability == nil {
+			durability = &journalDurability{}
+		}
+		store.writer.durability = durability
 	}
 	return &NodeJournal{store: store}, nil
 }
@@ -56,3 +78,7 @@ func (n *NodeJournal) Failure() error { return n.store.writer.failure() }
 
 // Close releases node ownership after all Group handles are closed.
 func (n *NodeJournal) Close() error { return n.store.close() }
+
+// RequireFullDurability permanently disables process completion and waits for
+// every previously admitted append to cross the physical durability fence.
+func (n *NodeJournal) RequireFullDurability() error { return n.store.writer.requireFullDurability() }
