@@ -43,6 +43,9 @@ type Server struct {
 	StartTime          time.Time
 	metricsCancel      context.CancelFunc
 
+	clusterDeadLetterCancel context.CancelFunc
+	clusterDeadLetterDone   chan struct{}
+
 	messagesPublished atomic.Int64
 	messagesDelivered atomic.Int64
 	bytesReceived     atomic.Int64
@@ -316,7 +319,21 @@ func (s *Server) Start() error {
 	}
 
 	s.Mutex.Lock()
+	if s.ShuttingDown {
+		s.Mutex.Unlock()
+		return listener.Close()
+	}
 	s.Listener = listener
+	if cluster, ok := s.Broker.(*ClusterBroker); ok {
+		ctx, cancel := context.WithCancel(context.Background())
+		s.clusterDeadLetterCancel = cancel
+		done := make(chan struct{})
+		s.clusterDeadLetterDone = done
+		go func() {
+			defer close(done)
+			cluster.runClusterDeadLetters(ctx)
+		}()
+	}
 	s.Mutex.Unlock()
 
 	// The server is actually serving now — the lifecycle only used to reach
@@ -1942,6 +1959,7 @@ func (s *Server) Stop() error {
 	cancel := s.metricsCancel
 	alarmCancel := s.alarmCancel
 	nagCancel := s.unsafeRecoveryCancel
+	deadLetterCancel, deadLetterDone := s.clusterDeadLetterCancel, s.clusterDeadLetterDone
 	s.Mutex.Unlock()
 
 	if cancel != nil {
@@ -1952,6 +1970,10 @@ func (s *Server) Stop() error {
 	}
 	if nagCancel != nil {
 		nagCancel()
+	}
+	if deadLetterCancel != nil {
+		deadLetterCancel()
+		<-deadLetterDone
 	}
 
 	if ln != nil {

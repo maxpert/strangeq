@@ -200,14 +200,16 @@ operation.
   messages, and sessions. In bbolt, snapshots prune committed log prefixes and
   free pages for reuse. A bbolt file can retain its high-water size until offline
   compaction.
-- Run the same StrangeQ build on every broker. The current build reads legacy
-  JSON queue snapshots and writes CBOR queue snapshots. Earlier builds cannot
-  install or reopen the new snapshots.
+- Run the same StrangeQ build on every broker. Upgrade the cluster together.
+  Opening a cluster store updates its Raft storage mode so older builds cannot
+  replay settlements with different dead-letter semantics.
 - Cluster mode supports ordinary queue declarations, publish, get, consume,
   ack, nack, requeue, and exchange routing in the default virtual host.
   A publish routed to several queues commits separately on each destination
   shard, so an error can leave a partial fanout.
-- Cluster mode rejects transactions, exclusive or auto-delete queues, queue
-  policies, named virtual hosts, and the management HTTP API. Use a separate
+- Durable replicated queues support [at-least-once dead-lettering](DEAD_LETTERING.md#replicated-queues)
+  for non-requeued consumer rejections.
+- Cluster mode rejects transactions, exclusive or auto-delete queues, other
+  queue policies, named virtual hosts, and the management HTTP API. Use a separate
   empty storage directory for a new cluster. Existing standalone stores are not
   imported.

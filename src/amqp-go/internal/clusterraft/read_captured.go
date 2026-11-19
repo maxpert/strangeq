@@ -59,3 +59,11 @@ func (g *Group) ReadCaptured(ctx context.Context, capture func(Machine) (func() 
 	}
 	return body, nil
 }
+
+// HasLocalWork evaluates a cheap, read-only scheduling predicate. Results are
+// advisory and carry no quorum guarantee.
+func (g *Group) HasLocalWork(pending func(Machine) bool) bool {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.stopped() == nil && g.node.BasicStatus().Lead == g.cfg.ID && pending(g.cfg.Machine)
+}

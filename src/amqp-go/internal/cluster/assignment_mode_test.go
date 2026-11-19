@@ -84,7 +84,7 @@ func TestAssignmentsRequireFreshJournalAndMatchingPeerMode(t *testing.T) {
 
 	peer, err := clusterwire.NewClient(clusterwire.Config{
 		Listen: fresh.Listen, ClusterID: fresh.ClusterID, Token: fresh.Token, AllowInsecure: true,
-		ProtocolVersion: ackAndClaimPeerProtocol,
+		ProtocolVersion: deadLetterPeerProtocolOffset + ackAndClaimPeerProtocol,
 	})
 	require.NoError(t, err)
 	t.Cleanup(peer.Close)
@@ -120,7 +120,7 @@ func TestSmallBodyCompressionFencesLegacyStorageAndPeers(t *testing.T) {
 
 	peer, err := clusterwire.NewClient(clusterwire.Config{
 		Listen: small.Listen, ClusterID: small.ClusterID, Token: small.Token, AllowInsecure: true,
-		ProtocolVersion: compressedBodyPeerProtocol,
+		ProtocolVersion: deadLetterPeerProtocolOffset + compressedBodyPeerProtocol,
 	})
 	require.NoError(t, err)
 	t.Cleanup(peer.Close)

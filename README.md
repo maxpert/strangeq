@@ -208,9 +208,10 @@ It implements a subset of RabbitMQ's extensions and management API.
 - Zero-TTL messages expire without a publish-time handoff to a waiting consumer.
   Malformed per-message expiration values are treated as no TTL.
 - Cluster mode supports ordinary queues, exchange routing, publish, get, consume,
-  acknowledgments, and requeue in the default vhost. It rejects transactions,
-  exclusive and auto-delete queues, queue policies, named vhosts, and the
-  management HTTP API. Existing standalone stores are not imported.
+  acknowledgments, and requeue in the default vhost. Durable replicated queues
+  support [at-least-once dead-lettering](docs/DEAD_LETTERING.md#replicated-queues).
+  Transactions, exclusive and auto-delete queues, other queue policies, named
+  vhosts, and the management HTTP API are unavailable in cluster mode.
 - A cluster publish routed to multiple queues commits separately on each
   destination shard; an error can leave a partial fanout. Retrying a publish
   after an unknown outcome can produce duplicates.

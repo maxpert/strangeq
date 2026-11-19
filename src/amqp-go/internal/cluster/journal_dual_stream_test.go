@@ -38,7 +38,7 @@ func TestDualJournalNodeUsesFreshStableParityStorage(t *testing.T) {
 	require.NoDirExists(t, filepath.Join(cfg.Directory, "raft-journal"))
 	mode, err := os.ReadFile(filepath.Join(cfg.Directory, "raft-storage-mode-v1"))
 	require.NoError(t, err)
-	require.Equal(t, "segmented-journal-two-stream-parity-v1", string(mode))
+	require.Equal(t, "segmented-journal-two-stream-parity-v1"+deadLetterStorageModeSuffix, string(mode))
 
 	assertInventory := func() {
 		t.Helper()

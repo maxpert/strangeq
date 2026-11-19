@@ -61,6 +61,9 @@ func (m messageState) releaseJournalSource() {
 
 // ReleaseJournalSources runs after captured readers have been joined.
 func (m *Machine) ReleaseJournalSources() {
+	for _, entry := range m.state.DeadLetters {
+		entry.Message.releaseJournalSource()
+	}
 	for _, queue := range m.state.Queues {
 		for _, message := range queue.Ready {
 			message.releaseJournalSource()
@@ -162,6 +165,12 @@ func (s *machineState) loadJournalBodies() error {
 			}
 		}
 	}
+	for id, entry := range s.DeadLetters {
+		if err := load(&entry.Message); err != nil {
+			return err
+		}
+		s.DeadLetters[id] = entry
+	}
 	if len(scratch) != 0 {
 		return errors.New("journal queue body accounting mismatch")
 	}
@@ -169,6 +178,12 @@ func (s *machineState) loadJournalBodies() error {
 }
 
 func (s *machineState) clearJournalBodies() {
+	for id, entry := range s.DeadLetters {
+		if entry.Message.cold != nil {
+			entry.Message.Body = nil
+			s.DeadLetters[id] = entry
+		}
+	}
 	for _, queue := range s.Queues {
 		for i := range queue.Ready {
 			if queue.Ready[i].cold != nil {

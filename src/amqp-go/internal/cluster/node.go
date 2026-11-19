@@ -33,6 +33,7 @@ const (
 	assignmentPeerProtocol          = 3
 	compressedBodyPeerProtocol      = 4
 	smallCompressedBodyPeerProtocol = 5
+	deadLetterPeerProtocolOffset    = 8
 )
 
 var ErrUnavailable = errors.New("shard leader unavailable")
@@ -156,6 +157,8 @@ func open(cfg Config, initialize bool) (*Node, error) {
 	if cfg.ExperimentalJournalSmallBodyCompression {
 		wcfg.ProtocolVersion = smallCompressedBodyPeerProtocol
 	}
+	// Any quorum member must implement the same durable settlement semantics.
+	wcfg.ProtocolVersion += deadLetterPeerProtocolOffset
 	client, err := clusterwire.NewClient(wcfg)
 	if err != nil {
 		return nil, err
@@ -290,6 +293,9 @@ func (n *Node) prepareIdentity(seed, initialize bool) error {
 		prior.Shards != want.Shards || !slices.Equal(prior.Seeds, want.Seeds) ||
 		(seed && prior.Nonce != "") || (!seed && !validNonce(prior.Nonce)) {
 		return errors.New("persistent cluster identity does not match configuration")
+	}
+	if err := n.ensureStorageModeEpoch(mode); err != nil {
+		return err
 	}
 	n.nonce = prior.Nonce
 	return nil

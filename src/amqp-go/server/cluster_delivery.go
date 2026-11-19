@@ -98,7 +98,11 @@ func (b *ClusterBroker) openSession(ctx context.Context, queue string, consumer 
 }
 
 func (s *clusterSession) command(kind clusterqueue.QueueCommandKind) clusterqueue.QueueCommand {
-	return clusterqueue.QueueCommand{Kind: kind, Queue: s.queue, Incarnation: s.incarnation, Session: s.id, Owner: s.owner}
+	command := clusterqueue.QueueCommand{Kind: kind, Queue: s.queue, Incarnation: s.incarnation, Session: s.id, Owner: s.owner}
+	if kind == clusterqueue.DropMessage {
+		command.RejectedAt = time.Now().UnixNano()
+	}
+	return command
 }
 
 func (s *clusterSession) run(ctx context.Context, kind clusterqueue.QueueCommandKind, attempt clusterqueue.AttemptID) (clusterqueue.QueueResponse, error) {

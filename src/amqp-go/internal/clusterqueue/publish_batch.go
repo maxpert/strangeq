@@ -40,6 +40,16 @@ func EncodePublishCommand(queue string, incarnation QueueID, record PublishRecor
 	return encodeCommand(command, record.Prefix)
 }
 
+// EncodeDeadLetterPublish requires a durable destination. A nonzero move ID
+// also completes that destination on a pending transfer in the same shard.
+func EncodeDeadLetterPublish(queue string, incarnation QueueID, move uint64, record PublishRecord) ([]byte, error) {
+	command := QueueCommand{
+		Kind: PublishDeadLetter, Queue: queue, Incarnation: incarnation, DeadLetterMove: move,
+		Body: record.Body, packedVersion: record.packedVersion(),
+	}
+	return encodeCommand(command, record.Prefix)
+}
+
 // EncodePublishBatch builds one ordered queue command. Each message is
 // preceded by its 32-bit big-endian length in the raw frame body.
 func EncodePublishBatch(queue string, incarnation QueueID, bodies [][]byte) ([]byte, error) {

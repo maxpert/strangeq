@@ -248,7 +248,7 @@ func (b *StorageBroker) deadLetter(policy *QueuePolicy, srcQueueName string, msg
 		return nil
 	}
 	if policy.ReliableDeadLetter {
-		return b.stageDeadLetter(srcQueueName, makeDeadLetter(policy, srcQueueName, msg, reason))
+		return b.stageDeadLetter(srcQueueName, MakeDeadLetter(policy, srcQueueName, msg, reason, time.Now()))
 	}
 
 	// Resolve the DLX. An absent or otherwise unreadable DLX is a silent drop
@@ -258,7 +258,7 @@ func (b *StorageBroker) deadLetter(policy *QueuePolicy, srcQueueName string, msg
 		return nil
 	}
 
-	clone := makeDeadLetter(policy, srcQueueName, msg, reason)
+	clone := MakeDeadLetter(policy, srcQueueName, msg, reason, time.Now())
 
 	// Re-enter routing ONLY through routeMessage (never a second router). The
 	// scratch is pooled and owned by this goroutine until releaseRouteScratch;
@@ -293,7 +293,8 @@ func (b *StorageBroker) deadLetter(policy *QueuePolicy, srcQueueName string, msg
 	return nil
 }
 
-func makeDeadLetter(policy *QueuePolicy, source string, msg *protocol.Message, reason DeadLetterReason) *protocol.Message {
+// MakeDeadLetter rewrites the routing fields and records the given death event.
+func MakeDeadLetter(policy *QueuePolicy, source string, msg *protocol.Message, reason DeadLetterReason, deathTime time.Time) *protocol.Message {
 	clone := cloneForDeadLetter(msg)
 	originalExpiration := ""
 	if reason == DeadLetterExpired {
@@ -305,7 +306,7 @@ func makeDeadLetter(policy *QueuePolicy, source string, msg *protocol.Message, r
 		reason:             reason,
 		exchange:           msg.Exchange,
 		routingKeys:        []string{msg.RoutingKey},
-		deathTime:          time.Now(),
+		deathTime:          deathTime,
 		originalExpiration: originalExpiration,
 	})
 	clone.Exchange = policy.DeadLetterExchange

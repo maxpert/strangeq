@@ -19,8 +19,8 @@ func validAckAndClaimCommand(c QueueCommand) bool {
 
 func (m *Machine) ackAndClaim(c QueueCommand, q *queueState, sess *sessionState) outcome {
 	for i, attempt := range c.Attempts {
-		if !m.settle(q, sess, AckMessage, attempt) {
-			return outcome{Settled: uint64(i), Code: errorsToCode[ErrUnknownAttempt], Ready: uint64(len(q.Ready))}
+		if err := m.settle(q, sess, AckMessage, attempt, 0); err != nil {
+			return outcome{Settled: uint64(i), Code: errorsToCode[err], Ready: uint64(len(q.Ready))}
 		}
 	}
 	last := q.claimBatch(c, sess)

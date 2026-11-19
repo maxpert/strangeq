@@ -39,6 +39,8 @@ const (
 	// requested ACKs succeed. Both outcomes share one session sequence.
 	AckAndClaim
 	SetAssignmentCredit
+	UpdateDeadLetter
+	PublishDeadLetter
 )
 
 const MaxSettlementBatch = 64
@@ -48,6 +50,7 @@ type QueueSpec struct {
 	AutoDelete bool
 	Exclusive  bool
 	Arguments  []byte
+	DeadLetter *DeadLetterPolicy `json:",omitempty" cbor:",omitempty"`
 }
 
 // Sequence orders the commands in a session. A caller resolves an uncertain
@@ -80,7 +83,10 @@ type QueueCommand struct {
 	logicalSize   int
 
 	// AssignmentAfter requests an optional page of newly assigned flights.
-	AssignmentAfter *AttemptID `json:",omitempty"`
+	AssignmentAfter *AttemptID        `json:",omitempty"`
+	RejectedAt      int64             `json:",omitempty"`
+	DeadLetter      *DeadLetterUpdate `json:",omitempty"`
+	DeadLetterMove  uint64            `json:",omitempty"`
 }
 
 type QueueInfo struct {
@@ -108,14 +114,16 @@ type Result struct {
 }
 
 type QueueResponse struct {
-	storageErr    error
-	Queue         QueueInfo   `json:",omitzero"`
-	Result        Result      `json:",omitzero"`
-	Count         uint64      `json:",omitempty"`
-	Queues        []QueueInfo `json:",omitempty"`
-	Code          string      `json:",omitempty"`
-	DeliveryBatch bool        `json:",omitempty"`
-	Deliveries    []Delivery  `json:"-"`
+	storageErr        error
+	DeadLetter        *DeadLetterTransfer `json:",omitempty"`
+	DeadLetterThrough uint64              `json:",omitempty"`
+	Queue             QueueInfo           `json:",omitzero"`
+	Result            Result              `json:",omitzero"`
+	Count             uint64              `json:",omitempty"`
+	Queues            []QueueInfo         `json:",omitempty"`
+	Code              string              `json:",omitempty"`
+	DeliveryBatch     bool                `json:",omitempty"`
+	Deliveries        []Delivery          `json:"-"`
 	// AckClaim distinguishes a combined result, including partial settlement
 	// and empty refill. Count still counts deliveries; Settled counts ACKs.
 	AckClaim  bool   `json:",omitempty"`
@@ -304,7 +312,7 @@ func DecodeCommand(data []byte) (QueueCommand, error) {
 	}
 	if err == nil && c.packedVersion != 0 {
 		switch c.Kind {
-		case PublishMessage:
+		case PublishMessage, PublishDeadLetter:
 			if !c.allowsPackedEnvelope(c.Body) {
 				return QueueCommand{}, ErrInvalidCommand
 			}
@@ -359,7 +367,29 @@ func InvalidCommandReply() []byte {
 }
 
 func validCommandPayload(c QueueCommand) bool {
-	if c.Kind < DeclareQueue || c.Kind > SetAssignmentCredit {
+	if c.Kind < DeclareQueue || c.Kind > PublishDeadLetter {
+		return false
+	}
+	if c.Kind == PublishDeadLetter {
+		return validQueueName(c.Queue) && len(c.Body) <= maxMessageBytes &&
+			!c.AutoAssign && !c.Consumer && c.Session == 0 && c.Sequence == 0 && c.Owner == "" &&
+			c.Attempt == 0 && c.Settlement == 0 && len(c.Attempts) == 0 &&
+			c.ClaimLimit == 0 && c.ClaimBytes == 0 && c.Prefetch == 0 && c.Deadline == 0 &&
+			c.AssignmentAfter == nil && c.RejectedAt == 0 && !c.IfEmpty && !c.IfUnused &&
+			c.DeadLetter == nil && c.QueueSpec.DeadLetter == nil && !c.QueueSpec.Durable &&
+			!c.QueueSpec.AutoDelete && !c.QueueSpec.Exclusive && len(c.QueueSpec.Arguments) == 0
+	}
+	if c.DeadLetterMove != 0 {
+		return false
+	}
+	if c.Kind == UpdateDeadLetter {
+		d := c.DeadLetter
+		return d != nil && d.ID != 0 && len(c.Body) == 0 &&
+			(len(d.Plan) == 0) != (d.Completed == "") &&
+			validDeadLetterNames(d.Plan) && (d.Completed == "" || validQueueName(d.Completed))
+	}
+	if c.DeadLetter != nil || c.QueueSpec.DeadLetter != nil && c.Kind != DeclareQueue ||
+		c.RejectedAt < 0 || c.RejectedAt != 0 && c.Kind != DropMessage && (c.Kind != SettleBatch || c.Settlement != DropMessage) {
 		return false
 	}
 	if c.AutoAssign && (c.Kind != OpenQueueSession || !c.Consumer || c.Prefetch == 0 ||
@@ -435,7 +465,7 @@ func DecodeResponse(data []byte) (QueueResponse, error) {
 	if r.DeliveryBatch {
 		return decodeClaimBatchResponse(r, body)
 	}
-	if len(body) > 0 && r.Result.Delivery.Attempt == 0 {
+	if len(body) > 0 && r.Result.Delivery.Attempt == 0 && r.DeadLetter == nil {
 		return QueueResponse{}, ErrInvalidCommand
 	}
 	r.Result.Delivery.Body = body

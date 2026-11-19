@@ -29,16 +29,23 @@ type Machine struct {
 func NewAssignmentMachine() Machine { return Machine{assignments: true} }
 
 type machineState struct {
-	LastQueue      QueueID
-	Queues         map[string]*queueState
-	bodies         uint64
-	coldBytes      uint64
-	packingSavings uint64
-	messages       uint64
-	sessions       uint64
+	LastQueue           QueueID
+	Queues              map[string]*queueState
+	LastDeadLetter      uint64                       `json:",omitempty" cbor:",omitempty"`
+	DeadLetters         map[uint64]pendingDeadLetter `json:",omitempty" cbor:",omitempty"`
+	deadLetterIDs       []uint64
+	deadLetterPlanBytes uint64
+	deadLetterCopyBytes uint64
+	deadLetterCopySlots uint64
+	bodies              uint64
+	coldBytes           uint64
+	packingSavings      uint64
+	messages            uint64
+	sessions            uint64
 }
 
 type queueState struct {
+	name                string
 	ID                  QueueID
 	Spec                QueueSpec
 	LastSession         SessionID
@@ -67,11 +74,13 @@ type sessionState struct {
 }
 
 type messageState struct {
-	ID          MessageID
-	Body        []byte `json:",omitempty"`
-	Redelivered bool   `json:",omitempty"`
-	LogicalSize int    `json:",omitempty" cbor:",omitempty"`
-	cold        *journalBody
+	ID                 MessageID
+	Body               []byte `json:",omitempty"`
+	Redelivered        bool   `json:",omitempty"`
+	DeadLetterCopyUsed bool   `json:",omitempty" cbor:",omitempty"`
+	DeadLetterReserve  uint16 `json:",omitempty" cbor:",omitempty"`
+	LogicalSize        int    `json:",omitempty" cbor:",omitempty"`
+	cold               *journalBody
 }
 
 type commandKey struct {
@@ -182,6 +191,8 @@ func validQueueName(name string) bool {
 
 func (m *Machine) apply(c QueueCommand, wantReply bool, origin journalBodyOrigin) QueueResponse {
 	switch c.Kind {
+	case UpdateDeadLetter:
+		return m.updateDeadLetter(*c.DeadLetter)
 	case ExpireSessions:
 		if c.Deadline <= 0 {
 			return failure(ErrInvalidCommand)
@@ -193,7 +204,7 @@ func (m *Machine) apply(c QueueCommand, wantReply bool, origin journalBodyOrigin
 		}
 		return m.list()
 	case DeclareQueue, DescribeQueue, DeleteQueue, PurgeQueue, OpenQueueSession, RenewQueueSession,
-		ReleaseQueueSession, PublishMessage, ClaimMessage, AckMessage, RequeueMessage, DropMessage, SettleBatch,
+		ReleaseQueueSession, PublishMessage, PublishDeadLetter, ClaimMessage, AckMessage, RequeueMessage, DropMessage, SettleBatch,
 		PublishBatch, ClaimBatch, AckAndClaim, SetAssignmentCredit:
 	default:
 		return failure(ErrInvalidCommand)
@@ -212,7 +223,7 @@ func (m *Machine) apply(c QueueCommand, wantReply bool, origin journalBodyOrigin
 	if c.Kind == DescribeQueue {
 		return QueueResponse{Queue: q.info(c.Queue)}
 	}
-	usesCurrentQueue := (c.Kind == PublishMessage || c.Kind == PublishBatch) && c.Incarnation == 0 && c.Session == 0
+	usesCurrentQueue := (c.Kind == PublishMessage || c.Kind == PublishBatch || c.Kind == PublishDeadLetter) && c.Incarnation == 0 && c.Session == 0
 	if c.Incarnation != q.ID && !usesCurrentQueue {
 		return failure(ErrQueueIncarnation)
 	}
@@ -228,6 +239,8 @@ func (m *Machine) apply(c QueueCommand, wantReply bool, origin journalBodyOrigin
 		return m.updateLease(c, q)
 	case PublishBatch:
 		return m.publishBatch(q, c.Body, origin, c.packedVersion != 0)
+	case PublishDeadLetter:
+		return m.publishDeadLetter(c, q, origin)
 	case PublishMessage:
 		if len(c.Body) > maxMessageBytes {
 			return failure(ErrCapacity)
@@ -247,10 +260,13 @@ func (m *Machine) declare(c QueueCommand, q *queueState) QueueResponse {
 	if len(spec.Arguments) > maxArgumentsBytes {
 		return failure(ErrCapacity)
 	}
+	if spec.DeadLetter != nil && (!spec.Durable || !spec.DeadLetter.valid()) {
+		return failure(ErrInvalidCommand)
+	}
 	if q != nil {
 		old := q.Spec
 		if old.Durable != spec.Durable || old.Exclusive != spec.Exclusive || old.AutoDelete != spec.AutoDelete ||
-			!bytes.Equal(old.Arguments, spec.Arguments) {
+			!bytes.Equal(old.Arguments, spec.Arguments) || !sameDeadLetterPolicy(old.DeadLetter, spec.DeadLetter) {
 			return failure(ErrQueueMismatch)
 		}
 		return QueueResponse{Queue: q.info(c.Queue)}
@@ -262,7 +278,7 @@ func (m *Machine) declare(c QueueCommand, q *queueState) QueueResponse {
 		return failure(ErrIDsExhausted)
 	}
 	m.state.LastQueue++
-	q = &queueState{ID: m.state.LastQueue, Spec: spec}
+	q = &queueState{name: c.Queue, ID: m.state.LastQueue, Spec: spec}
 	if m.state.Queues == nil {
 		m.state.Queues = make(map[string]*queueState)
 	}
@@ -455,8 +471,22 @@ func (m *Machine) expire(cutoff int64) uint64 {
 }
 
 func (m *Machine) publish(q *queueState, body []byte, origin journalBodyOrigin, logical int) QueueResponse {
-	size := uint64(max(logical, len(body)))
-	if m.state.bodies+size > maxBodyBytes || m.state.messages >= maxMessages {
+	return m.publishWithCredit(q, body, origin, logical, deadLetterPublishCredit{})
+}
+
+func (m *Machine) publishWithCredit(q *queueState, body []byte, origin journalBodyOrigin, logical int, credit deadLetterPublishCredit) QueueResponse {
+	reserve := q.Spec.DeadLetter.reserve(q.name)
+	envelopeSize := max(logical, len(body))
+	if reserve != 0 && envelopeSize > maxMessageBytes-int(reserve) {
+		return failure(ErrCapacity)
+	}
+	size := uint64(envelopeSize) + uint64(reserve)
+	copyBytes, copySlots := deadLetterCopyCredit(size, reserve != 0)
+	usedBytes := m.state.bodies + m.state.deadLetterCopyBytes
+	usedSlots := m.state.messages + m.state.deadLetterCopySlots
+	if (usedBytes+size+copyBytes > maxBodyBytes+credit.bodyBytes+credit.copyBytes ||
+		usedSlots+1+copySlots > maxMessages+credit.bodySlots+credit.copySlots) &&
+		!m.state.canMoveWithCredit(usedBytes, usedSlots, size, credit) {
 		return failure(ErrCapacity)
 	}
 	if q.LastMessage == math.MaxUint64 {
@@ -467,6 +497,7 @@ func (m *Machine) publish(q *queueState, body []byte, origin journalBodyOrigin, 
 		return QueueResponse{storageErr: err}
 	}
 	q.LastMessage++
+	message.DeadLetterReserve = reserve
 	if logical > len(body) {
 		message.LogicalSize = logical
 		m.state.packingSavings += uint64(logical - len(body))
@@ -476,6 +507,8 @@ func (m *Machine) publish(q *queueState, body []byte, origin journalBodyOrigin, 
 		m.state.coldBytes += uint64(len(body))
 	}
 	m.state.bodies += size
+	m.state.deadLetterCopyBytes += copyBytes
+	m.state.deadLetterCopySlots += copySlots
 	m.state.messages++
 	q.assignReady()
 	return QueueResponse{Result: Result{MessageID: q.LastMessage}}
@@ -483,7 +516,8 @@ func (m *Machine) publish(q *queueState, body []byte, origin journalBodyOrigin, 
 
 func (m *Machine) removeBody(message messageState) {
 	size := uint64(message.logicalBodySize())
-	m.state.bodies -= size
+	m.state.bodies -= size + uint64(message.DeadLetterReserve)
+	m.releaseDeadLetterCopyCredit(message)
 	m.state.packingSavings -= size - uint64(message.bodySize())
 	if message.cold != nil {
 		m.state.coldBytes -= uint64(message.bodySize())
@@ -610,14 +644,14 @@ func (m *Machine) applyOperation(c QueueCommand, q *queueState, sess *sessionSta
 	case AckAndClaim:
 		return m.ackAndClaim(c, q, sess)
 	case AckMessage, RequeueMessage, DropMessage:
-		if !m.settle(q, sess, c.Kind, c.Attempt) {
-			return outcome{Code: errorsToCode[ErrUnknownAttempt]}
+		if err := m.settle(q, sess, c.Kind, c.Attempt, c.RejectedAt); err != nil {
+			return outcome{Code: errorsToCode[err]}
 		}
 		return outcome{}
 	case SettleBatch:
 		for i, attempt := range c.Attempts {
-			if !m.settle(q, sess, c.Settlement, attempt) {
-				return outcome{Settled: uint64(i), Code: errorsToCode[ErrUnknownAttempt]}
+			if err := m.settle(q, sess, c.Settlement, attempt, c.RejectedAt); err != nil {
+				return outcome{Settled: uint64(i), Code: errorsToCode[err]}
 			}
 		}
 		return outcome{Settled: uint64(len(c.Attempts))}
@@ -626,10 +660,19 @@ func (m *Machine) applyOperation(c QueueCommand, q *queueState, sess *sessionSta
 	}
 }
 
-func (m *Machine) settle(q *queueState, sess *sessionState, kind QueueCommandKind, attempt AttemptID) bool {
+func (m *Machine) settle(q *queueState, sess *sessionState, kind QueueCommandKind, attempt AttemptID, rejectedAt int64) error {
 	old, ok := sess.Flights[attempt]
 	if !ok {
-		return false
+		return ErrUnknownAttempt
+	}
+	deadLetter := kind == DropMessage && q.Spec.DeadLetter != nil
+	if deadLetter {
+		if rejectedAt <= 0 {
+			return ErrInvalidCommand
+		}
+		if m.state.LastDeadLetter == math.MaxUint64 {
+			return ErrIDsExhausted
+		}
 	}
 	delete(sess.Flights, attempt)
 	if len(sess.Flights) == 0 {
@@ -638,10 +681,12 @@ func (m *Machine) settle(q *queueState, sess *sessionState, kind QueueCommandKin
 	q.unacked--
 	if kind == RequeueMessage {
 		q.requeue(old)
+	} else if deadLetter {
+		m.stageDeadLetter(q, old, rejectedAt)
 	} else {
 		m.removeBody(old)
 	}
-	return true
+	return nil
 }
 
 func (q *queueState) claim(sess *sessionState) outcome {

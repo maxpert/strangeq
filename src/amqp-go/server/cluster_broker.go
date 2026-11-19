@@ -192,8 +192,9 @@ func (b *ClusterBroker) DeclareQueueWithCounts(name string, durable, autoDelete,
 	if err != nil {
 		return nil, 0, 0, err
 	}
-	if policy != nil {
-		return nil, 0, 0, fmt.Errorf("%w: queue policies are unavailable in cluster mode", broker.ErrInvalidQueueArgument)
+	deadLetter, err := b.clusterDeadLetterPolicy(policy, durable)
+	if err != nil {
+		return nil, 0, 0, err
 	}
 	encoded, err := protocol.EncodeCanonicalFieldTable(args)
 	if err != nil {
@@ -201,7 +202,7 @@ func (b *ClusterBroker) DeclareQueueWithCounts(name string, durable, autoDelete,
 	}
 	ctx, cancel := clusterContext()
 	defer cancel()
-	reply, err := b.queue(ctx, clusterqueue.QueueCommand{Kind: clusterqueue.DeclareQueue, Queue: name, QueueSpec: clusterqueue.QueueSpec{Durable: durable, Arguments: encoded}})
+	reply, err := b.queue(ctx, clusterqueue.QueueCommand{Kind: clusterqueue.DeclareQueue, Queue: name, QueueSpec: clusterqueue.QueueSpec{Durable: durable, Arguments: encoded, DeadLetter: deadLetter}})
 	if err != nil {
 		return nil, 0, 0, clusterQueueError(name, err)
 	}

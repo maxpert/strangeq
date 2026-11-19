@@ -19,6 +19,7 @@ const (
 	clusterProvisionTemp         = ".cluster-provision-"
 	journalDirectory             = "raft-journal"
 	journalProvisionedFile       = "journal-provisioned-v1"
+	deadLetterStorageModeSuffix  = "-dead-letter-v1"
 )
 
 type nodeJournalOwner interface {
@@ -72,6 +73,7 @@ func (n *Node) storageIdentity() (name, mode string, err error) {
 			return "", "", fmt.Errorf("cluster storage mode %s conflicts with persistent %s", mode, other)
 		}
 	}
+	mode += deadLetterStorageModeSuffix
 	if err := n.checkStorageModeClaim(mode); err != nil {
 		return "", "", err
 	}
@@ -86,10 +88,30 @@ func (n *Node) checkStorageModeClaim(mode string) error {
 	if err != nil {
 		return err
 	}
-	if string(prior) != mode {
+	if string(prior) != mode && string(prior) != strings.TrimSuffix(mode, deadLetterStorageModeSuffix) {
 		return fmt.Errorf("cluster storage mode %s conflicts with persistent mode %q", mode, prior)
 	}
 	return nil
+}
+
+// Install the new epoch before opening any Raft group. An older binary
+// rejects this mode before it can replay settlement with old semantics.
+func (n *Node) ensureStorageModeEpoch(mode string) error {
+	path := n.path(clusterStorageModeFile)
+	prior, err := os.ReadFile(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return n.claimStorageMode(mode)
+	}
+	if err != nil {
+		return err
+	}
+	if string(prior) == mode {
+		return nil
+	}
+	if string(prior) != strings.TrimSuffix(mode, deadLetterStorageModeSuffix) {
+		return fmt.Errorf("cluster storage mode %s conflicts with persistent mode %q", mode, prior)
+	}
+	return durableFile(path, []byte(mode))
 }
 
 func (n *Node) claimStorageMode(mode string) error {
@@ -99,7 +121,7 @@ func (n *Node) claimStorageMode(mode string) error {
 	}
 	// Two initializers may both find the directory empty. Only the first
 	// link publishes the mode. A matching retry may finish provisioning it.
-	if err := n.checkStorageModeClaim(mode); err != nil {
+	if err := n.ensureStorageModeEpoch(mode); err != nil {
 		return err
 	}
 	return syncStorageDirectory(n.cfg.Directory)

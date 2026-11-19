@@ -56,6 +56,7 @@ type legacySnapshot struct {
 func (m *Machine) CloneForSnapshot() Machine {
 	captured := *m
 	captured.state.Queues = maps.Clone(m.state.Queues)
+	captured.state.DeadLetters = maps.Clone(m.state.DeadLetters)
 	for name, original := range captured.state.Queues {
 		queue := *original
 		queue.Ready = slices.Clone(original.Ready)
@@ -120,7 +121,7 @@ func (m *Machine) EstimatedSnapshotBytes() uint64 {
 
 func (s *machineState) snapshotBaseBytes() uint64 {
 	return 64 + s.bodies - s.packingSavings + s.messages*snapshotMessageFraming + s.sessions*snapshotSessionFraming +
-		uint64(len(s.Queues))*snapshotQueueFraming
+		uint64(len(s.Queues))*snapshotQueueFraming + s.deadLetterPlanBytes
 }
 
 // snapshotCapacity estimates encoded bytes and the encoder's temporary space
@@ -193,11 +194,15 @@ func (s *machineState) validate(assignments bool) error {
 			return errors.New("invalid queue in snapshot")
 		}
 		ids[q.ID] = true
+		q.name = name
+		if q.Spec.DeadLetter != nil && (!q.Spec.Durable || !q.Spec.DeadLetter.valid()) {
+			return errors.New("invalid dead-letter policy in snapshot")
+		}
 		if err := s.validateQueue(q, assignments); err != nil {
 			return fmt.Errorf("snapshot queue %q: %w", name, err)
 		}
 	}
-	return nil
+	return s.validateDeadLetters()
 }
 
 func (s *machineState) validateQueue(q *queueState, assignments bool) error {
@@ -259,8 +264,16 @@ func (s *machineState) validateQueue(q *queueState, assignments bool) error {
 }
 
 func (s *machineState) validateMessage(q *queueState, seen map[MessageID]bool, message messageState) error {
-	if message.ID == 0 || message.ID > q.LastMessage || seen[message.ID] || message.bodySize() > maxMessageBytes {
+	if message.ID == 0 || message.ID > q.LastMessage || seen[message.ID] || message.DeadLetterReserve != q.Spec.DeadLetter.reserve(q.name) || message.DeadLetterCopyUsed {
 		return errors.New("invalid message in snapshot")
+	}
+	seen[message.ID] = true
+	return s.accountSnapshotMessage(message)
+}
+
+func (s *machineState) accountSnapshotMessage(message messageState) error {
+	if message.bodySize() > maxMessageBytes {
+		return errors.New("invalid message size in snapshot")
 	}
 	if message.LogicalSize != 0 {
 		logical, err := clusterpayload.ValidateEnvelope(message.Body)
@@ -270,11 +283,13 @@ func (s *machineState) validateMessage(q *queueState, seen map[MessageID]bool, m
 		s.packingSavings += uint64(logical - len(message.Body))
 	}
 	s.messages++
-	s.bodies += uint64(message.logicalBodySize())
-	if s.messages > maxMessages || s.bodies > maxBodyBytes {
+	s.bodies += uint64(message.logicalBodySize()) + uint64(message.DeadLetterReserve)
+	copyBytes, copySlots := message.deadLetterCopyCredit()
+	s.deadLetterCopyBytes += copyBytes
+	s.deadLetterCopySlots += copySlots
+	if s.messages > maxMessages || s.bodies > maxBodyBytes+maxDeadLetterReserve {
 		return ErrCapacity
 	}
-	seen[message.ID] = true
 	return nil
 }
 
@@ -314,7 +329,7 @@ func validateOutcome(q *queueState, sess *sessionState) error {
 		if sess.LastKey.Attempt != 0 || last.Attempt != 0 || last.Message != 0 || last.Settled > MaxSettlementBatch {
 			return errors.New("invalid batch settlement result in snapshot")
 		}
-		if last.Code == "" && last.Settled >= 2 || last.Code == errorsToCode[ErrUnknownAttempt] && last.Settled < MaxSettlementBatch {
+		if last.Code == "" && last.Settled >= 2 || validBatchSettlementError(last.Code) && last.Settled < MaxSettlementBatch {
 			return nil
 		}
 		return errors.New("invalid batch settlement result in snapshot")
