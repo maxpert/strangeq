@@ -37,6 +37,10 @@ class BenchmarkError(RuntimeError):
     pass
 
 
+class PendingMembershipReport(BenchmarkError):
+    """Valid singleton topology whose asynchronous committed reports are not ready."""
+
+
 class RejectedWorkload(BenchmarkError):
     pass
 
@@ -406,18 +410,38 @@ def verify_strangeq_singleton(context, case, *, ack_and_claim=False, assignments
             or any(not isinstance(row, dict) or type(row.get("Group")) is not int for row in rows)
             or {row["Group"] for row in rows} != {CATALOG_GROUP, *range(1, shards + 1)}
             or any(row.get("Voters") != [node] or row.get("Learners") for row in rows)
-            or type(view["Catalog"].get("Index")) is not int or view["Catalog"]["Index"] <= 0):
+            or type(view["Catalog"].get("Index")) is not int or view["Catalog"]["Index"] < 0):
         raise BenchmarkError("local StrangeQ lacks sole catalog-committed voters")
     table = {row["Group"]: row for row in rows}
+    pending = [] if view["Catalog"]["Index"] > 0 else ["catalog"]
     placements = {}
     for name in case.queue_names:
         group = int.from_bytes(hashlib.sha256(name.encode()).digest()[:8], "big") % shards + 1
-        if type(table[group].get("Index")) is not int or table[group]["Index"] <= 0:
+        if type(table[group].get("Index")) is not int or table[group]["Index"] < 0:
             raise BenchmarkError(f"{name} lacks a committed local membership report")
         verify_journal_group(cluster, group)
+        if table[group]["Index"] == 0:
+            pending.append(name)
         placements[name] = {"shard": group, "preferred_leader": node, "voters": [node],
                             "cluster_id": identity["Cluster"], "local": True}
+    # Validate every workload group before classifying a zero report index as
+    # transient: a later conflicting/retired/missing group must fail immediately.
+    if pending:
+        raise PendingMembershipReport(f"committed local membership reports pending for {', '.join(pending)}")
     return placements
+
+
+def wait_for_strangeq_placement(context, case, *, timeout=10, **options):
+    """Wait only before timing for valid singleton membership reports to commit."""
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            return verify_strangeq_placement(context, case, **options)
+        except PendingMembershipReport as error:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise BenchmarkError(f"membership readiness timed out after {timeout}s: {error}") from error
+            time.sleep(min(0.05, remaining))
 
 
 def launch_rabbitmq(args, stack, scratch, output, env):
@@ -582,7 +606,7 @@ def trial(args, case, rabbitmq, output, env):
         if rabbitmq:
             before = verify_rabbit_placement(args, case, placement_context, scratch, output, "before")
         else:
-            before = verify_strangeq_placement(
+            before = wait_for_strangeq_placement(
                 placement_context, case, ack_and_claim=args.strangeq_ack_and_claim,
                 assignments=args.strangeq_assignments, body_compression=args.strangeq_journal_body_compression,
                 dual_stream=args.strangeq_dual_stream,

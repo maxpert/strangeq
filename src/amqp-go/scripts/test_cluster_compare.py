@@ -366,6 +366,84 @@ class PlacementTests(unittest.TestCase):
             with self.assertRaisesRegex(BenchmarkError, "segmented journal"):
                 verify_strangeq_placement(context, case, topology="singleton")
 
+    def test_initial_readiness_waits_for_committed_catalog_and_workload_reports(self):
+        case = CASES["1024-1x1-1q"]
+        with tempfile.TemporaryDirectory() as scratch:
+            context, ready = self.make_strangeq_cluster(Path(scratch), local=True)
+            pending = copy.deepcopy(ready)
+            pending["Catalog"]["Index"] = pending["Placements"][0]["Index"] = 0
+            cache = context[0][0] / "cluster/catalog-cache"
+            cache.write_text(json.dumps(pending))
+            with self.assertRaises(cluster_compare.PendingMembershipReport):
+                verify_strangeq_placement(context, case, topology="singleton")
+            with mock.patch("cluster_compare.time.sleep", side_effect=lambda _: cache.write_text(json.dumps(ready))) as sleep:
+                placement = cluster_compare.wait_for_strangeq_placement(context, case, topology="singleton")
+            sleep.assert_called_once()
+            self.assertEqual(placement[case.queue_names[0]]["voters"], [ready["Nodes"][0]["ID"]])
+
+    def test_initial_readiness_timeout_and_hard_failures_never_relax_validation(self):
+        case = CASES["1024-1x1-1q"]
+        with tempfile.TemporaryDirectory() as scratch:
+            context, pending = self.make_strangeq_cluster(Path(scratch), local=True)
+            pending["Catalog"]["Index"] = pending["Placements"][0]["Index"] = 0
+            cluster = context[0][0] / "cluster"
+            cache = cluster / "catalog-cache"
+            cache.write_text(json.dumps(pending))
+            with mock.patch("cluster_compare.time.monotonic", side_effect=[0, 0, 10]), \
+                    mock.patch("cluster_compare.time.sleep") as sleep, \
+                    self.assertRaisesRegex(BenchmarkError, "readiness timed out after 10s"):
+                cluster_compare.wait_for_strangeq_placement(context, case, topology="singleton")
+            sleep.assert_called_once()
+            for mutate in (
+                lambda v: v["Placements"][0].update(Voters=[1, 2, 3]),
+                lambda v: v["Placements"].append(v["Placements"][0]),
+                lambda v: v["Placements"][0].update(Index=-1),
+                lambda v: v["Placements"][0].pop("Index"),
+            ):
+                invalid = copy.deepcopy(pending)
+                mutate(invalid)
+                cache.write_text(json.dumps(invalid))
+                with self.subTest(view=invalid), mock.patch("cluster_compare.time.sleep") as sleep, \
+                        self.assertRaises(BenchmarkError) as error:
+                    cluster_compare.wait_for_strangeq_placement(context, case, topology="singleton")
+                self.assertNotIsInstance(error.exception, cluster_compare.PendingMembershipReport)
+                sleep.assert_not_called()
+            cache.write_text(json.dumps(pending))
+            for name, contents in (("opened-1", b"\x00"), ("raft-storage-mode-v1", b"bolt"),
+                                   ("journal-identity-v1.json", b"{}")):
+                path = cluster / name
+                previous = path.read_bytes()
+                path.write_bytes(contents)
+                with self.subTest(name=name), mock.patch("cluster_compare.time.sleep") as sleep, \
+                        self.assertRaises(BenchmarkError):
+                    cluster_compare.wait_for_strangeq_placement(context, case, topology="singleton")
+                sleep.assert_not_called()
+                path.write_bytes(previous)
+
+    def test_post_timing_membership_report_failure_is_not_polled(self):
+        case = CASES["1024-1x1-1q"]
+        with tempfile.TemporaryDirectory() as scratch:
+            root = Path(scratch)
+            context, pending = self.make_strangeq_cluster(root, local=True)
+            pending["Placements"][0]["Index"] = 0
+            args = mock.Mock(scratch=root, topology="singleton", validate_only=False, strangeq_shards=1,
+                             strangeq_ack_and_claim=False, strangeq_assignments=False,
+                             strangeq_journal_body_compression=False, strangeq_dual_stream=False,
+                             strangeq_journal_small_body_compression=False)
+
+            def finish_measurement(*_):
+                (context[0][0] / "cluster/catalog-cache").write_text(json.dumps(pending))
+                return {}
+
+            with mock.patch("cluster_compare.launch_strangeq", return_value=([mock.Mock()], [16000], context)), \
+                    mock.patch("cluster_compare.perftest_args", return_value=[]), \
+                    mock.patch("cluster_compare.run_logged", return_value="test stopped (Reached time limit)"), \
+                    mock.patch("cluster_compare.measure", side_effect=finish_measurement), \
+                    mock.patch("cluster_compare.time.sleep") as sleep, \
+                    self.assertRaises(cluster_compare.PendingMembershipReport):
+                cluster_compare.trial(args, case, False, root / "trial", {})
+            sleep.assert_not_called()
+
     def test_seeded_catalog_accepts_null_nonces_only_for_the_three_provisioned_voters(self):
         case = CASES["1024-1x1-1q"]
         with tempfile.TemporaryDirectory() as scratch:
