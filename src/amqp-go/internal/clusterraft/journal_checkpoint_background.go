@@ -57,8 +57,8 @@ func (g *Group) checkpointDue() bool {
 }
 
 func (g *Group) maintainCheckpoint(synchronous bool) error {
-	store, journal := g.store.(*journalGroupStore)
-	background := journal && g.cfg.BackgroundJournalCheckpoints && !synchronous
+	store := g.store
+	background := g.cfg.BackgroundJournalCheckpoints && !synchronous
 	if g.configIndex > g.snapshotIndex {
 		return g.checkpoint()
 	}
@@ -161,7 +161,7 @@ func (g *Group) discardObsoleteRoutineCheckpoint() {
 }
 
 func (g *Group) releaseRoutineCheckpoint(discard bool) {
-	store := g.store.(*journalGroupStore)
+	store := g.store
 	work := g.routineCheckpoint
 	g.routineCheckpoint = nil
 	if discard {

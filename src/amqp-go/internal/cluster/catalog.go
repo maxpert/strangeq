@@ -39,9 +39,10 @@ type view struct {
 }
 
 type catalogCommand struct {
-	Join   *Peer
-	Nonce  string
-	Report *placement
+	Join         *Peer
+	Nonce        string
+	Report       *placement
+	ActivateSeed *Peer `json:",omitempty"`
 }
 
 type catalogReply struct {
@@ -88,12 +89,16 @@ func compareID(a, b uint64) int {
 func comparePeer(a, b Peer) int           { return compareID(a.ID, b.ID) }
 func (c *catalog) view() view             { return *c.current.Load() }
 func contains(a []uint64, id uint64) bool { return slices.Contains(a, id) }
-func address(v view, id uint64) string {
+func lookupPeer(v view, id uint64) (Peer, bool) {
 	i, ok := slices.BinarySearchFunc(v.Nodes, id, func(p Peer, id uint64) int { return compareID(p.ID, id) })
 	if !ok {
-		return ""
+		return Peer{}, false
 	}
-	return v.Nodes[i].Address
+	return v.Nodes[i], true
+}
+func address(v view, id uint64) string {
+	peer, _ := lookupPeer(v, id)
+	return peer.Address
 }
 func equalMembers(a, b []uint64) bool {
 	return len(a) == len(b) && slices.Equal(a, b)
@@ -107,7 +112,8 @@ func checkPeers(peers []Peer) error {
 	addresses := make(map[string]bool, len(peers))
 	var prior uint64
 	for _, peer := range peers {
-		if !clusterraft.ValidMemberID(peer.ID) || peer.ID <= prior || !validAddress(peer.Address) || addresses[peer.Address] {
+		localOnly := len(peers) == 1 && peer.Address == ""
+		if !clusterraft.ValidMemberID(peer.ID) || peer.ID <= prior || (!localOnly && !validAddress(peer.Address)) || addresses[peer.Address] {
 			return errors.New("peer IDs and advertised addresses must be valid and unique")
 		}
 		prior, addresses[peer.Address] = peer.ID, true
@@ -161,20 +167,36 @@ func (c *catalog) Apply(raw []byte) []byte {
 	v := c.view()
 	reply := catalogReply{View: v}
 	var cmd catalogCommand
-	if json.Unmarshal(raw, &cmd) != nil || (cmd.Join != nil && cmd.Report != nil) {
+	if json.Unmarshal(raw, &cmd) != nil {
 		reply.Error = "invalid catalog command"
 		return encode(reply)
 	}
 	changed := false
 	switch {
-	case cmd.Join != nil:
-		p := *cmd.Join
-		known := address(v, p.ID)
+	case cmd.ActivateSeed != nil && cmd.Join == nil && cmd.Report == nil && cmd.Nonce == "":
+		p := *cmd.ActivateSeed
+		current, known := lookupPeer(v, p.ID)
 		switch {
+		case len(c.initial.Nodes) != 1 || p.ID != c.initial.Nodes[0].ID || !known || !validAddress(p.Address):
+			reply.Error = "activation requires the sole original voter and a valid peer address"
+		case current.Address == p.Address:
+			// A retry can arrive after the first replicas have already joined.
+		case current.Address != "" || len(v.Nodes) != 1:
+			reply.Error = "seed peer address already established"
+		default:
+			v.Nodes = []Peer{p}
+			changed = true
+		}
+	case cmd.Join != nil && cmd.ActivateSeed == nil && cmd.Report == nil:
+		p := *cmd.Join
+		known, enrolled := lookupPeer(v, p.ID)
+		switch {
+		case len(v.Nodes) == 1 && v.Nodes[0].Address == "":
+			reply.Error = "activate the seed peer address before enrollment"
 		case !validNonce(cmd.Nonce):
 			reply.Error = "invalid enrollment identity"
-		case known == p.Address && v.Nonces[p.ID] == cmd.Nonce:
-		case known != "":
+		case enrolled && known.Address == p.Address && v.Nonces[p.ID] == cmd.Nonce:
+		case enrolled:
 			reply.Error = "node identity already enrolled"
 		default:
 			nodes := append(slices.Clone(v.Nodes), p)
@@ -194,7 +216,7 @@ func (c *catalog) Apply(raw []byte) []byte {
 			}
 			changed = true
 		}
-	case cmd.Report != nil:
+	case cmd.Report != nil && cmd.Join == nil && cmd.ActivateSeed == nil && cmd.Nonce == "":
 		p := *cmd.Report
 		if !checkPlacement(v, p) {
 			reply.Error = "invalid committed placement"
@@ -212,6 +234,8 @@ func (c *catalog) Apply(raw []byte) []byte {
 			}
 			changed = true
 		}
+	default:
+		reply.Error = "invalid catalog command"
 	}
 	if changed {
 		v.Epoch++
@@ -228,7 +252,7 @@ func checkPlacement(v view, p placement) bool {
 	for _, list := range [][]uint64{p.Voters, p.Learners} {
 		var prior uint64
 		for _, id := range list {
-			if id <= prior || address(v, id) == "" {
+			if _, known := lookupPeer(v, id); id <= prior || !known {
 				return false
 			}
 			prior = id
@@ -273,13 +297,19 @@ func (c *catalog) valid(v view) bool {
 		len(v.Placements) != int(v.Shards) || checkPeers(v.Nodes) != nil {
 		return false
 	}
+	if len(v.Nonces) != len(v.Nodes)-len(c.initial.Nodes) {
+		return false
+	}
 	for _, p := range c.initial.Nodes {
-		if address(v, p.ID) != p.Address || v.Nonces[p.ID] != "" {
+		peer, known := lookupPeer(v, p.ID)
+		// A singleton's endpoint is established by the replicated activation.
+		// A joiner's discovery address need not be its authoritative endpoint.
+		if !known || (len(c.initial.Nodes) > 1 && peer.Address != p.Address) || v.Nonces[p.ID] != "" {
 			return false
 		}
 	}
 	for _, p := range v.Nodes {
-		if address(c.initial, p.ID) == "" && !validNonce(v.Nonces[p.ID]) {
+		if _, original := lookupPeer(c.initial, p.ID); !original && !validNonce(v.Nonces[p.ID]) {
 			return false
 		}
 	}
@@ -289,7 +319,7 @@ func (c *catalog) valid(v view) bool {
 	}
 	targets := make(map[uint64]bool, len(v.CatalogTarget))
 	for _, id := range v.CatalogTarget {
-		if address(v, id) == "" || targets[id] {
+		if _, known := lookupPeer(v, id); !known || targets[id] {
 			return false
 		}
 		targets[id] = true

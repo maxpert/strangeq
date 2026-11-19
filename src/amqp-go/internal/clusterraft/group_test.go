@@ -2,7 +2,6 @@ package clusterraft
 
 import (
 	"context"
-	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"path/filepath"
@@ -11,7 +10,6 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/require"
-	"go.etcd.io/bbolt"
 	"go.etcd.io/raft/v3/raftpb"
 )
 
@@ -23,8 +21,6 @@ func (m *testMachine) Apply(entry []byte) []byte {
 }
 func (m *testMachine) Snapshot() ([]byte, error) { return json.Marshal(m.entries) }
 func (m *testMachine) Restore(data []byte) error { return json.Unmarshal(data, &m.entries) }
-
-func testBoltDB(group *Group) *bbolt.DB { return group.store.(*boltGroupStore).db }
 
 type testCluster struct {
 	t      *testing.T
@@ -331,7 +327,7 @@ func TestReplicaStorageFailureDoesNotAcknowledgeAppend(t *testing.T) {
 	leader, failed := cluster.groups[1], cluster.groups[2]
 	require.NoError(t, leader.Campaign(ctx))
 	cluster.drain()
-	require.NoError(t, testBoltDB(failed).Close())
+	testJournalDiskFor(failed).fail.Store(true)
 
 	reply := make(chan error, 1)
 	go func() {
@@ -355,7 +351,7 @@ func TestReplicaStorageFailureDoesNotAcknowledgeAppend(t *testing.T) {
 		}
 	}
 	require.NoError(t, failed.Step(ctx, toFailed), "the transport can accept a message before its write fails")
-	require.ErrorIs(t, waitTestLocalWrites(ctx, failed), bbolt.ErrDatabaseNotOpen)
+	require.ErrorIs(t, waitTestLocalWrites(ctx, failed), errTestJournalWrite)
 	require.Equal(t, uint64(0), failed.Leader())
 	select {
 	case sent := <-cluster.out:
@@ -412,12 +408,8 @@ func TestStableReadFailureStopsRaftGroupWithoutConfirming(t *testing.T) {
 	index := appendMessage.GetEntries()[0].GetIndex()
 	require.NoError(t, waitTestLocalWrites(ctx, leader))
 	require.Less(t, leader.Status().Commit, index)
-	require.NoError(t, testBoltDB(leader).Update(func(tx *bbolt.Tx) error {
-		entries := tx.Bucket(logBucket)
-		key := binary.BigEndian.AppendUint64(nil, index)
-		require.NotEmpty(t, entries.Get(key), "leader must already have persisted this append")
-		return entries.Put(key, []byte{0})
-	}))
+	corruptTestJournalEntry(t, leader, index)
+
 	require.NoError(t, follower.Step(ctx, appendMessage))
 	for {
 		select {
@@ -454,11 +446,18 @@ func newTestCluster(t *testing.T) *testCluster {
 }
 func (c *testCluster) open(id uint64, peers []uint64) *Group {
 	c.t.Helper()
-	group, err := Open(Config{
+	disk := &testJournalDisk{}
+	node, err := openSegmentedGroupNode(filepath.Join(c.dir, string(rune('a'+id))), true, false, journalServingExtentBytes, journalGroupMaxFileBytes, nil, journalSegmentHooks{writeAt: disk.writeAt})
+	require.NoError(c.t, err)
+	group, err := node.openGroup(Config{
 		ID: id, GroupID: 1, Dir: filepath.Join(c.dir, string(rune('a'+id))), Peers: peers, Machine: &testMachine{},
 		TickInterval: -1, Send: func(msg *raftpb.Message) error { c.out <- msg; return nil },
 	})
 	require.NoError(c.t, err)
+	group.store.closeOwner = true
+	disk.node = node
+	testJournalDisks.Store(group, disk)
+	c.t.Cleanup(func() { testJournalDisks.Delete(group) })
 	c.groups[id] = group
 	return group
 }

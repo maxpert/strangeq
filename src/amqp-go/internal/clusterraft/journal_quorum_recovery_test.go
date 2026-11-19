@@ -85,7 +85,7 @@ func TestJournalDeferredCommitQuorumCrashRecoversConfirmedCommandBeforeRead(t *t
 	func() {
 		leader.mu.Lock()
 		defer leader.mu.Unlock()
-		store := leader.store.(*journalGroupStore)
+		store := leader.store
 		require.Equal(t, previous, store.state.hard.GetCommit(), "the crash boundary must precede commit-floor persistence")
 		require.Equal(t, confirmed, store.pendingCommit, "the acknowledged commit must still be deferred")
 	}()

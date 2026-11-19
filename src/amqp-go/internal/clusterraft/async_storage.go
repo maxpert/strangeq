@@ -49,8 +49,8 @@ func (g *Group) flush(syncWrites bool) error {
 			if err != nil {
 				return fmt.Errorf("plan raft append: %w", err)
 			}
-			if journal, ok := g.store.(*journalGroupStore); ok && g.cfg.DeferJournalCommit &&
-				!syncWrites && len(job.append.GetResponses()) == 0 && journal.deferCommit(write) {
+			if g.cfg.DeferJournalCommit &&
+				!syncWrites && len(job.append.GetResponses()) == 0 && g.store.deferCommit(write) {
 				// The journal already holds the entries this update commits.
 				job.append = nil
 			} else {
@@ -135,8 +135,8 @@ func (g *Group) finishReady(job *appendJob, delta journalGroupDelta, syncWrites 
 				return err
 			}
 		}
-		if journal, ok := g.store.(*journalGroupStore); ok && job.write.replacesLog {
-			g.logBytes, g.appliedLogBytes = journal.remainingLogBytes(g.applied)
+		if job.write.replacesLog {
+			g.logBytes, g.appliedLogBytes = g.store.remainingLogBytes(g.applied)
 		} else {
 			for _, entry := range job.append.GetEntries() {
 				g.logBytes += uint64(proto.Size(entry))
@@ -203,7 +203,7 @@ func (g *Group) send(message *pb.Message) {
 // ordinary heartbeats. Empty appends used for probing or recovering inflights
 // must still receive their ordinary append responses.
 func (g *Group) matchedCommitHeartbeat(message *pb.Message) *pb.Message {
-	if !g.cfg.DeferJournalCommit || !g.journalInput || message.GetType() != pb.MsgApp ||
+	if !g.cfg.DeferJournalCommit || message.GetType() != pb.MsgApp ||
 		message.GetFrom() != g.cfg.ID || message.GetTo() == g.cfg.ID ||
 		len(message.GetEntries()) != 0 || len(message.GetContext()) != 0 || !raft.IsEmptySnap(message.GetSnapshot()) ||
 		message.GetCommit() == 0 || message.GetCommit() > message.GetIndex() {

@@ -36,6 +36,10 @@ func TestClusterExchangeDescribeFollowsBindWithoutRaftWrite(t *testing.T) {
 		}
 		return true
 	}, 8*time.Second, 25*time.Millisecond, "the preferred leader must be established at all voters")
+	// Catalog reports share these extents with the data shard. Wait for both
+	// groups' actual configurations to be durably reported at every node so
+	// background placement reconciliation has no outstanding write to make.
+	waitExchangeReadPlacementReports(t, nodes, directories)
 	leader := nodes[preferred-1]
 	follower := nodes[preferred%uint64(len(nodes))]
 	require.NotSame(t, leader, follower)
@@ -43,15 +47,15 @@ func TestClusterExchangeDescribeFollowsBindWithoutRaftWrite(t *testing.T) {
 	queue, err := writer.DeclareQueue(queueName, true, false, false, nil)
 	require.NoError(t, err)
 	require.NoError(t, writer.DeclareExchange(exchangeName, "direct", true, false, false, nil))
+	journalDirectory := filepath.Join(directories[preferred-1], "raft-journal")
+	beforeBind := exchangeReadExtentDigests(t, journalDirectory)
 	require.NoError(t, writer.BindQueue(queueName, exchangeName, bindingKey, nil))
+	before := exchangeReadExtentDigests(t, journalDirectory)
+	require.NotEqual(t, beforeBind, before, "a real binding write must change the monitored journal extents")
 	prior, _, ok := leader.LocalQueueShardStatus(shardKey)
 	require.True(t, ok)
 	require.Equal(t, preferred, prior.Leader)
 	require.Equal(t, prior.Commit, prior.Applied, "completed bind must be locally applied")
-	path := filepath.Join(directories[preferred-1], "1", "raft.db")
-	before, err := os.ReadFile(path)
-	require.NoError(t, err)
-	require.NotEmpty(t, before)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
 	defer cancel()
@@ -64,9 +68,66 @@ func TestClusterExchangeDescribeFollowsBindWithoutRaftWrite(t *testing.T) {
 	require.Equal(t, preferred, after.Leader)
 	require.Equal(t, prior.Commit, after.Commit, "routing a named exchange must not append a describe proposal")
 	require.Equal(t, prior.Applied, after.Applied)
-	disk, err := os.ReadFile(path)
+	require.Equal(t, before, exchangeReadExtentDigests(t, journalDirectory), "routing a named exchange must leave the active journal extents unchanged")
+}
+
+func exchangeReadExtentDigests(t *testing.T, directory string) map[string][sha256.Size]byte {
+	t.Helper()
+	paths, err := filepath.Glob(filepath.Join(directory, "extent-*.raft-journal"))
 	require.NoError(t, err)
-	require.Equal(t, sha256.Sum256(before), sha256.Sum256(disk), "routing a named exchange must leave its persisted Raft store unchanged")
+	require.NotEmpty(t, paths, "the monitored node must have active segmented journal extents")
+	digests := make(map[string][sha256.Size]byte, len(paths))
+	for _, path := range paths {
+		data, err := os.ReadFile(path)
+		require.NoError(t, err)
+		require.NotEmpty(t, data, "the monitored journal extent must contain actual Raft records")
+		digests[filepath.Base(path)] = sha256.Sum256(data)
+	}
+	return digests
+}
+
+func waitExchangeReadPlacementReports(t *testing.T, nodes []*cluster.Node, directories []string) {
+	t.Helper()
+	type placement struct{ Group, Index uint64 }
+	type catalogView struct {
+		Epoch      uint64
+		Catalog    placement
+		Placements []placement
+	}
+	require.Eventually(t, func() bool {
+		var epoch uint64
+		var reference map[uint64]clusterraft.Status
+		for i, node := range nodes {
+			raw, err := os.ReadFile(filepath.Join(directories[i], "catalog-cache"))
+			var view catalogView
+			if err != nil || json.Unmarshal(raw, &view) != nil || view.Epoch == 0 || len(view.Placements) != 1 {
+				return false
+			}
+			statuses := node.LocalGroupStatuses()
+			if len(statuses) != 2 {
+				return false
+			}
+			for _, placement := range append(view.Placements, view.Catalog) {
+				status, ok := statuses[placement.Group]
+				if !ok || placement.Index == 0 || placement.Index != status.ConfigIndex || status.Leader == 0 ||
+					len(status.Voters) != len(nodes) || len(status.Learners) != 0 || status.Commit != status.Applied {
+					return false
+				}
+				if reference != nil {
+					other := reference[placement.Group]
+					if status.Leader != other.Leader || status.Commit != other.Commit {
+						return false
+					}
+				}
+			}
+			if reference == nil {
+				reference, epoch = statuses, view.Epoch
+			} else if view.Epoch != epoch {
+				return false
+			}
+		}
+		return true
+	}, 8*time.Second, 25*time.Millisecond, "all catalog and data placement reports must be committed, applied, and cached before observing the shared journal")
 }
 
 func TestClusterMachineQueryAcceptsOnlyExchangeDescribe(t *testing.T) {

@@ -3,14 +3,12 @@ package clusterraft
 import (
 	"bytes"
 	"context"
-	"encoding/binary"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/require"
-	"go.etcd.io/bbolt"
 	pb "go.etcd.io/raft/v3/raftpb"
 	"google.golang.org/protobuf/proto"
 )
@@ -51,7 +49,7 @@ func TestAsyncRaftReplicatesWhileLeaderWriteIsBlocked(t *testing.T) {
 		if index := target.Load(); index != 0 && message.GetType() == pb.MsgAppResp &&
 			message.GetTo() == 1 && message.GetIndex() >= index && !message.GetReject() {
 			firstAck.Do(func() {
-				data, err := readAsyncTestEntry(testBoltDB(follower), index)
+				data, err := readAsyncTestEntry(testJournalDiskFor(follower), index)
 				followerAck <- diskObservation{first: data, err: err}
 			})
 		}
@@ -66,22 +64,22 @@ func TestAsyncRaftReplicatesWhileLeaderWriteIsBlocked(t *testing.T) {
 		if bytes.Equal(data, command) {
 			firstApply.Do(func() {
 				index := target.Load()
-				leaderData, err := readAsyncTestEntry(testBoltDB(leader), index)
+				leaderData, err := readAsyncTestEntry(testJournalDiskFor(leader), index)
 				if err != nil {
 					leaderApply <- diskObservation{err: err}
 					return
 				}
-				followerData, err := readAsyncTestEntry(testBoltDB(follower), index)
+				followerData, err := readAsyncTestEntry(testJournalDiskFor(follower), index)
 				leaderApply <- diskObservation{first: leaderData, second: followerData, err: err}
 			})
 		}
 	}}
 	leader.mu.Unlock()
 
-	// bbolt grants a single write transaction. These remain uncommitted and
-	// prevent either broker's real persistence path from opening its writer.
-	releaseLeader := holdAsyncTestWrite(t, testBoltDB(leader))
-	releaseFollower := holdAsyncTestWrite(t, testBoltDB(follower))
+	// Block both nodes at their real segmented extent write boundary before
+	// either append can reach the journal durability fence.
+	releaseLeader, leaderEntered := holdAsyncTestWrite(t, testJournalDiskFor(leader))
+	releaseFollower, followerEntered := holdAsyncTestWrite(t, testJournalDiskFor(follower))
 	result := make(chan response, 1)
 	started := make(chan struct{})
 	go func() {
@@ -113,11 +111,16 @@ func TestAsyncRaftReplicatesWhileLeaderWriteIsBlocked(t *testing.T) {
 	target.Store(index)
 	want, err := proto.Marshal(proposal)
 	require.NoError(t, err)
-	data, err := readAsyncTestEntry(testBoltDB(leader), index)
+	awaitAsyncTestWrite(t, ctx, leaderEntered)
+	data, err := readAsyncTestEntry(testJournalDiskFor(leader), index)
 	require.NoError(t, err)
 	require.Empty(t, data, "leader's append must still be blocked when replication leaves")
 
 	stepAsyncTestGroup(t, ctx, follower, msg)
+	awaitAsyncTestWrite(t, ctx, followerEntered)
+	data, err = readAsyncTestEntry(testJournalDiskFor(follower), index)
+	require.NoError(t, err)
+	require.Empty(t, data, "follower's real extent write must be blocked before releasing its durability fence")
 	select {
 	case reply := <-result:
 		t.Fatalf("peer receipt completed an undurable proposal: %+v", reply)
@@ -185,7 +188,7 @@ func TestAsyncRaftCloseReleasesProposalBeforeJoiningBlockedWriter(t *testing.T) 
 		return err
 	}))
 
-	release := holdAsyncTestWrite(t, testBoltDB(leader))
+	release, entered := holdAsyncTestWrite(t, testJournalDiskFor(leader))
 	awaiting := make(chan error, 1)
 	go func() {
 		_, err := leader.Propose(ctx, []byte("pending during Close"))
@@ -204,6 +207,7 @@ func TestAsyncRaftCloseReleasesProposalBeforeJoiningBlockedWriter(t *testing.T) 
 			t.Fatal("blocked writer must leave a pending proposal before Close")
 		}
 	}
+	awaitAsyncTestWrite(t, ctx, entered)
 	closed := make(chan error, 1)
 	go func() { closed <- leader.Close() }()
 	select {
@@ -240,10 +244,11 @@ func TestAsyncRaftExclusiveWaitReservesAdmissionUntilCanceled(t *testing.T) {
 	require.NoError(t, leader.Campaign(ctx))
 	require.Equal(t, uint64(1), leader.Leader())
 
-	_ = holdAsyncTestWrite(t, testBoltDB(leader))
+	_, entered := holdAsyncTestWrite(t, testJournalDiskFor(leader))
 	// Submit a no-op through the normal RawNode admission path. Synchronous
 	// campaign is finished, and the new append cannot finish under the lease.
 	require.NoError(t, leader.change(ctx, func() error { return leader.node.Propose(nil) }))
+	awaitAsyncTestWrite(t, ctx, entered)
 	leader.mu.Lock()
 	appendJob := leader.appending
 	leader.mu.Unlock()
@@ -308,25 +313,46 @@ func stepAsyncTestGroup(t *testing.T, ctx context.Context, group *Group, message
 	}
 }
 
-func holdAsyncTestWrite(t *testing.T, db *bbolt.DB) func() {
+func holdAsyncTestWrite(t *testing.T, disk *testJournalDisk) (func(), <-chan struct{}) {
 	t.Helper()
-	tx, err := db.Begin(true)
-	require.NoError(t, err)
-	release := func() {
-		if tx != nil {
-			err := tx.Rollback()
-			tx = nil
-			require.NoError(t, err)
-		}
-	}
+	gate := &testJournalWriteGate{entered: make(chan struct{}), released: make(chan struct{})}
+	disk.gate.Store(gate)
+	var once sync.Once
+	release := func() { once.Do(func() { disk.gate.Store(nil); close(gate.released) }) }
 	t.Cleanup(release)
-	return release
+	return release, gate.entered
 }
 
-func readAsyncTestEntry(db *bbolt.DB, index uint64) ([]byte, error) {
+func awaitAsyncTestWrite(t *testing.T, ctx context.Context, entered <-chan struct{}) {
+	t.Helper()
+	select {
+	case <-entered:
+	case <-ctx.Done():
+		t.Fatal("storage worker did not enter the held extent write")
+	}
+}
+
+func readAsyncTestEntry(disk *testJournalDisk, index uint64) ([]byte, error) {
+	reader := disk.node.reader.(*journalSegmentReader)
+	reader.store.mu.RLock()
+	end := reader.store.durableEnd
+	reader.store.mu.RUnlock()
 	var data []byte
-	err := db.View(func(tx *bbolt.Tx) error {
-		data = bytes.Clone(tx.Bucket(logBucket).Get(binary.BigEndian.AppendUint64(nil, index)))
+	_, err := scanJournal(reader, end, end, 1, func(records []journalRecord) error {
+		for _, record := range records {
+			delta, err := decodeJournalGroupOp(record)
+			if err != nil {
+				return err
+			}
+			for _, ref := range delta.entries {
+				if ref.index == index {
+					data = make([]byte, ref.size)
+					if err := readJournalAt(reader, data, ref.offset); err != nil {
+						return err
+					}
+				}
+			}
+		}
 		return nil
 	})
 	return data, err

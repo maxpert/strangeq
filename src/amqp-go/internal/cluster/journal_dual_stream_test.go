@@ -18,7 +18,7 @@ import (
 
 func dualStreamTestConfig(t *testing.T) Config {
 	t.Helper()
-	cfg := journalTestNodeConfig(t, true)
+	cfg := journalTestNodeConfig(t)
 	cfg.ExperimentalRaftRangeSync = true
 	cfg.ExperimentalRaftJournalDualStream = true
 	return cfg

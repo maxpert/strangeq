@@ -10,7 +10,7 @@ type checkpointCostMachine interface {
 // A separate applied-tail ceiling applies even when the routine slot is busy.
 func (g *Group) checkpointPressure() (due, force bool) {
 	machine, costAware := g.cfg.Machine.(checkpointCostMachine)
-	if !g.journalInput || !g.cfg.BackgroundJournalCheckpoints || !costAware {
+	if !g.cfg.BackgroundJournalCheckpoints || !costAware {
 		return g.checkpointDue(), false
 	}
 	baseline := g.cfg.SnapshotBytes
@@ -32,10 +32,10 @@ func scaleCheckpointThreshold(value, multiplier uint64) uint64 {
 // A shard with a small log can keep entire shared extents alive. Ask it to
 // checkpoint when applied entries fall well behind the append frontier.
 func (g *Group) journalCheckpointNeeded() bool {
-	if !g.journalInput || !g.cfg.BackgroundJournalCheckpoints || g.applied <= g.snapshotIndex {
+	if !g.cfg.BackgroundJournalCheckpoints || g.applied <= g.snapshotIndex {
 		return false
 	}
-	store := g.store.(*journalGroupStore)
+	store := g.store
 	reader, ok := store.node.reader.(*journalSegmentReader)
 	return ok && len(store.state.entries) != 0 &&
 		store.state.entries[0].offset < reader.store.checkpointFloor.Load()

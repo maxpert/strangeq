@@ -14,10 +14,9 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func TestExperimentalJournalClusterBootstrapsAndRestartsWithoutBolt(t *testing.T) {
+func TestDefaultJournalClusterBootstrapsAndRestartsWithoutBolt(t *testing.T) {
 	nodes := newTestCluster(t, 3, 3, 2)
 	for i := range nodes {
-		nodes[i].config.Cluster.ExperimentalRaftJournal = true
 		_, err := openCluster(nodes[i].config, true)
 		require.NoError(t, err)
 	}
@@ -76,7 +75,6 @@ func TestExperimentalAckAndClaimPersistsSettlementAndRequeuesRefill(t *testing.T
 	nodes := newTestCluster(t, 3, 3, 2)
 	for i := range nodes {
 		settings := &nodes[i].config.Cluster
-		settings.ExperimentalRaftJournal = true
 		settings.ExperimentalAckAndClaim = true
 		_, err := openCluster(nodes[i].config, true)
 		require.NoError(t, err)

@@ -5,7 +5,65 @@ original voters together. Each node keeps its own persistent directory. The
 application and peer listeners are independent. Clients use the same AMQP port
 and can connect to any enrolled broker.
 
-## Start with one node
+## Pilot: start locally, then activate peers
+
+The local-journal lifecycle is a configured pilot. Ordinary startup without
+`cluster.local: true` or an explicit cluster ID still uses the existing
+standalone engine. Use a fresh directory: this pilot does not migrate legacy
+standalone, bbolt Raft or flat-journal directories.
+
+```yaml
+network:
+  address: "127.0.0.1:5672"
+storage:
+  path: "./local-data"
+cluster:
+  local: true
+  shards: 32
+```
+
+Save as `local.yaml` and run `amqp-server --config local.yaml` directly, without
+`--initialize-cluster`. Startup provisions the local one-voter journal and prints
+`Cluster lineage: <lineage>; node ID: <id>`. Preserve those actual generated
+values and the data directory. There is no peer socket while peer settings are
+absent; publishes use the same durable journal/commit/apply path with one voter.
+
+To activate peers in this running process, generate a shared token using the
+credential command below. Keep `local: true` and the same shard/format settings;
+add these loopback-only test settings to the existing `cluster` section:
+
+```yaml
+  peer_address: "127.0.0.1:7661"
+  token_file: "./peer.token"
+  allow_loopback_plaintext: true
+```
+
+For multiple hosts instead configure `peer_cert_file`, `peer_key_file` and, for
+a private CA, `peer_ca_file`; omit plaintext permission. `peer_listen` optionally
+sets a separate bind address. Send `kill -HUP <broker-pid>` after saving the
+same configuration file. SIGHUP activates authenticated peer transport and
+commits the source's endpoint without replacing its journal or AMQP sessions.
+Only peer settings reload; runtime storage, protocol and identity remain fixed.
+Repeating activation at the same endpoint is idempotent. This is not credential
+or certificate rotation: an already active transport keeps its credentials.
+
+Start each joining broker with a fresh directory and the normal addressed peer
+configuration shown below, substituting the printed source lineage for `id`
+and `"<printed-source-id>@127.0.0.1:7661"` for its sole seed. Choose a unique
+positive `node_id`, use the same shard/format settings and credentials, and start
+normally; never initialize a joiner. Every joining peer retains that same
+original active-seed identity in `seeds`. Keep the original source configured
+with `local: true` permanently, including after activation and restart; do not
+convert its profile to a seeded one. Restart with the same activated endpoint,
+credentials and data directory. There is no separate startup-conversion step.
+
+A second voter needs both nodes for commits. One-node failure tolerance is
+available only after the catalog and each affected shard have three voting
+replicas and learners have caught up. Enrollment alone does not prove that
+convergence. The pilot retains the cluster feature restrictions listed below,
+including the unavailable management HTTP API.
+
+## Provision an addressed seed
 
 Generate a shared peer credential and distribute it to each host as a secret file.
 
@@ -89,20 +147,20 @@ known-new cluster and preserve the durable identity of an existing voter.
 
 | Key under `cluster` | Default | Purpose |
 |---|---|---|
-| `id` | Empty | Enables cluster mode and identifies the cluster. Use the same ID on every broker. |
-| `node_id` | Required | Unique positive node ID. Keep it stable across restarts with the same data directory. |
-| `peer_address` | Required | Advertised peer `host:port`. Every peer must be able to reach it. |
+| `local` | `false` | Configured local-journal pilot: generates persistent one-voter identity on first open. Keep `true` after peer activation. |
+| `id` | Empty | Enables addressed cluster mode and identifies the cluster. Local pilot startup generates this value; joiners use that same lineage. |
+| `node_id` | Required for addressed peers | Unique positive node ID. Generated on first local open; preserve across restarts with the same data directory. |
+| `peer_address` | Required for addressed peers | Advertised peer `host:port`. Omit for unactivated local storage; configure to activate its peer transport. |
 | `peer_listen` | `peer_address` | Local bind address for peer traffic. |
-| `seeds` | Required | One to three original voters as `node_id@host:port`. Copy the same list to every broker. |
+| `seeds` | Required for addressed peers | One to three original voters as `node_id@host:port`. Keep the same original list on joining peers; local pilot source must omit it. |
 | `discovery` | Empty | Additional peer `host:port` addresses for discovering enrolled brokers. |
 | `shards` | `32` | Fixed data shard count from 1 to 1024. Use the same count on every broker. |
-| `token_file` | Required | File containing the shared 32-byte token encoded as unpadded base64url. |
+| `token_file` | Required with peer transport | File containing the shared 32-byte token encoded as unpadded base64url. Omit for unactivated local storage. |
 | `peer_cert_file`, `peer_key_file` | Empty | PEM certificate and private key for peer TLS. Set both for multi-host deployments. |
 | `peer_ca_file` | System trust roots | PEM trust roots for a private CA. |
 | `allow_loopback_plaintext` | `false` | Allows peer traffic without TLS on numeric loopback addresses for local tests. |
-| `experimental_raft_journal` | `false` | Uses a shared segmented Raft journal. Select this when provisioning a fresh cluster storage directory. |
-| `experimental_raft_range_sync` | `false` | Enables Linux synchronous range writes for eligible journal appends. Requires `experimental_raft_journal`; other platforms retain normal sync. |
-| `experimental_raft_journal_dual_stream` | `false` | Uses two journal streams per node. Requires the experimental journal and range sync. Select this during provisioning. |
+| `experimental_raft_range_sync` | `false` | Enables Linux synchronous range writes for eligible journal appends; other platforms retain normal sync. |
+| `experimental_raft_journal_dual_stream` | `false` | Uses two journal streams per node. Requires range sync. Select this during provisioning. |
 | `experimental_ack_and_claim` | `false` | Combines manual acknowledgments and delivery refill in a fresh journal cluster. Enable it on every broker when provisioning. |
 | `experimental_assignments` | `false` | Uses committed consumer assignments in a fresh journal cluster. Enable it on every broker when provisioning. |
 | `experimental_replica_bodies` | `false` | Lets a broker reconstruct eligible remote assignment bodies from its own durable journal. Requires `experimental_assignments`. |
@@ -113,13 +171,15 @@ Cluster state lives under `storage.path/cluster`. Relative paths resolve from
 the working directory. Configure AMQP client authentication and encryption
 separately from peer TLS. See [TLS](TLS.md) and [Authorization](AUTHORIZATION.md).
 
-### Experimental shared journal
+### Shared segmented journal
 
-Set `cluster.experimental_raft_journal: true` on a fresh cluster storage
-directory to try the shared journal. Keep the backend and stream settings on
-subsequent restarts. The selected format is part of the durable node identity.
-StrangeQ rejects flat journal directories and backend mismatches at startup.
-The default cluster backend is bbolt.
+Configured Raft nodes always use the shared segmented journal. There is no
+backend selector: `cluster.experimental_raft_journal` has been removed.
+Provision fresh cluster storage directories for this release; existing bbolt
+Raft stores and flat journals are rejected, not converted. Keep the stream and
+format settings on subsequent restarts because they are part of the durable
+node identity. Ordinary standalone mode continues to use its existing storage
+engine; this release does not migrate standalone data into Raft storage.
 
 Each stream rolls into 256 MiB segments. StrangeQ reclaims a sealed segment
 after a durable checkpoint covers it and all live messages and readers have
@@ -137,9 +197,9 @@ still stop the writer. Other platforms retain normal sync. This option is
 off by default and can change on restart with the same journal; it changes
 neither the disk format nor peer protocol and need not match across brokers.
 
-Set `cluster.experimental_ack_and_claim: true` together with the journal
-setting on every broker in a fresh test cluster to enable combined manual ACK
-and delivery refill. Keep both settings on restart. This mode uses a distinct
+Set `cluster.experimental_ack_and_claim: true` on every broker in a fresh test
+cluster to enable combined manual ACK and delivery refill. Keep the setting
+on restart. This mode uses a distinct
 storage marker and peer protocol identity so earlier brokers cannot open its
 journals or join its Raft groups.
 
@@ -178,20 +238,19 @@ replica membership. Brokers keep a routing view in
 brokers update their leader hints as they route requests.
 
 StrangeQ embeds the [etcd Raft library](https://github.com/etcd-io/raft).
-With its default backend, StrangeQ persists each group's log, term, vote, and
-snapshots in a local bbolt `raft.db`, including a separate database for the
-catalog on its replicas. With either backend, the broker persists Raft updates
-before sending replication acknowledgments or reporting a committed queue
-operation.
+Each configured Raft node persists its groups' logs, term, vote, commit progress
+and recovery checkpoints through the shared segmented journal, including the
+catalog. The broker persists Raft updates before sending replication
+acknowledgments or reporting a committed queue operation.
 
 ## How clustered messages are committed and read
 
-Cluster mode starts its selected Raft storage backend. The normal
+Cluster mode starts its shared segmented Raft journal. The normal
 `amqp-server` startup constructs `ClusterBroker`, and the server builder
 bypasses construction of the standalone storage engine. A clustered publish
 therefore has **no additional write to the standalone queue WAL**.
 
-For an ordinary successful publish to one queue with the experimental journal,
+For an ordinary successful publish to one queue,
 the body is carried by one Raft log entry and appended to the journal once on
 each participating replica. The leader waits for a durable quorum and applies
 the committed command before returning success for the publisher confirm.
@@ -214,10 +273,8 @@ flowchart TD
     E --> W[Consumer / worker]
 ```
 
-The diagram uses the experimental journal for the storage step. The default
-backend instead stores each shard's Raft log, hard state (term, vote and commit
-progress), and snapshots in its own bbolt `raft.db`. Both are cluster storage
-backends with their own persistence. The experimental two-stream journal
+The diagram shows the shared journal used by every configured Raft node.
+The experimental two-stream option
 assigns even group IDs to stream 0 and odd IDs to stream 1. Each group uses one
 stream and writes its payload only to that assigned stream.
 
@@ -232,7 +289,7 @@ to the owning shard leader:
   to registered consumer sessions. The broker reads those assignments through
   a quorum-fenced leader query, or receives a page with an ACK response. Reading
   an assignment page uses the already committed payload bytes.
-- In the journal path, eligible stored bodies of at least 32 KiB stay as
+- Eligible stored bodies of at least 32 KiB stay as
   references into retained journal data. Smaller bodies remain in queue memory.
   Delivery encoders read and checksum the referenced bytes when needed. These
   references retain the source segments until the messages and readers release
@@ -271,9 +328,9 @@ See [replicated dead-lettering](DEAD_LETTERING.md#replicated-queues).
   to spread across more brokers. The supported configuration range is 1–1024
   shards.
 - Each data shard has a 48 MiB live payload budget and bounds on queues,
-  messages, and sessions. In bbolt, snapshots prune committed log prefixes and
-  free pages for reuse. A bbolt file can retain its high-water size until offline
-  compaction.
+  messages, and sessions. Durable checkpoints retire committed log prefixes;
+  sealed segments are reclaimed once no checkpoint, live body or reader needs
+  them, within the shared retained-space budget described above.
 - Run the same StrangeQ build on every broker. Upgrade the cluster together.
   Opening a cluster store updates its Raft storage mode so older builds cannot
   replay settlements with different dead-letter semantics.

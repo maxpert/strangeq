@@ -29,17 +29,31 @@ func TestDeadLetterEpochFencesOlderClusterPeersAndStores(t *testing.T) {
 	stub := &Node{cfg: cfg}
 	_, mode, err := stub.storageIdentity()
 	require.NoError(t, err)
-	olderMode := strings.TrimSuffix(mode, deadLetterStorageModeSuffix) + "-dead-letter-v1"
-	require.NotEqual(t, mode, olderMode)
-	require.NoError(t, durableFile(stub.path(clusterStorageModeFile), []byte(olderMode)))
+	for _, olderMode := range []string{
+		strings.TrimSuffix(mode, deadLetterStorageModeSuffix),
+		strings.TrimSuffix(mode, deadLetterStorageModeSuffix) + "-dead-letter-v1",
+	} {
+		require.NotEqual(t, mode, olderMode)
+		require.NoError(t, durableFile(stub.path(clusterStorageModeFile), []byte(olderMode)))
+		before := journalTestStorageDigest(t, cfg.Directory)
+		node, err := Open(cfg)
+		if node != nil {
+			_ = node.Close()
+		}
+		require.ErrorContains(t, err, "conflicts with persistent mode")
+		require.ErrorContains(t, Initialize(cfg), "conflicts with persistent mode")
+		require.Equal(t, before, journalTestStorageDigest(t, cfg.Directory), "rejecting an older epoch must not upgrade its marker or change its authority")
+	}
 
+	// Restore the exact current marker so the peer-version check exercises a
+	// running current-format node rather than storage compatibility handling.
+	require.NoError(t, durableFile(stub.path(clusterStorageModeFile), []byte(mode)))
 	node, err := Open(cfg)
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, node.Close()) })
 	raw, err := os.ReadFile(stub.path(clusterStorageModeFile))
 	require.NoError(t, err)
 	require.Equal(t, mode, string(raw))
-	require.ErrorContains(t, stub.checkStorageModeClaim(olderMode), "conflicts with persistent mode")
 
 	wireConfig := clusterwire.Config{ClusterID: cfg.ClusterID, Token: cfg.Token, AllowInsecure: true, ProtocolVersion: 8}
 	older, err := clusterwire.NewClient(wireConfig)

@@ -5,7 +5,7 @@ import (
 )
 
 // NodeJournal owns the single append writer and reader shared by the catalog
-// and data groups on an experimental journal-backed node.
+// and data groups on an replicated node.
 type NodeJournal struct {
 	store *journalGroupNode
 }

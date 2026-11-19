@@ -24,12 +24,12 @@ func journalTestPeerAddress(t *testing.T) string {
 	return address
 }
 
-func journalTestNodeConfig(t *testing.T, journal bool) Config {
+func journalTestNodeConfig(t *testing.T) Config {
 	t.Helper()
 	peer := Peer{ID: 1, Address: journalTestPeerAddress(t)}
 	return Config{
 		ClusterID: "journal-node-test", Peer: peer, Seeds: []Peer{peer}, Listen: peer.Address,
-		Directory: t.TempDir(), Shards: 2, AllowInsecure: true, ExperimentalRaftJournal: journal,
+		Directory: t.TempDir(), Shards: 2, AllowInsecure: true,
 		Token:      base64.RawURLEncoding.EncodeToString(make([]byte, 32)),
 		NewMachine: func(uint64) clusterraft.Machine { return &testMachine{} },
 	}
@@ -52,37 +52,45 @@ func journalTestStorageDigest(t *testing.T, root string) map[string][sha256.Size
 	return files
 }
 
-func TestJournalNodeRejectsStorageModeChangesWithoutWriting(t *testing.T) {
-	for _, scenario := range []struct {
-		name           string
-		initialJournal bool
-	}{
-		{"bolt-to-journal", false},
-		{"journal-to-bolt", true},
-	} {
-		t.Run(scenario.name, func(t *testing.T) {
-			cfg := journalTestNodeConfig(t, scenario.initialJournal)
+// The ordinary configured cluster entry point must provision the one node
+// journal without selecting an experimental storage backend.
+func TestDefaultClusterProvisionsSegmentedJournal(t *testing.T) {
+	cfg := journalTestNodeConfig(t)
+	require.NoError(t, Initialize(cfg))
+	require.FileExists(t, filepath.Join(cfg.Directory, journalDirectory, "extent-0000000000000001.raft-journal"))
+	require.NoError(t, filepath.WalkDir(cfg.Directory, func(path string, entry fs.DirEntry, err error) error {
+		if err == nil && !entry.IsDir() {
+			require.NotEqual(t, "raft.db", entry.Name(), "default cluster created a second Raft authority at %s", path)
+		}
+		return err
+	}))
+	node, err := Open(cfg)
+	require.NoError(t, err)
+	require.NoError(t, node.Close())
+}
+
+func TestJournalNodeRejectsLegacyStorageWithoutWriting(t *testing.T) {
+	for _, legacy := range []string{"identity.json", "1/raft.db"} {
+		t.Run(legacy, func(t *testing.T) {
+			cfg := journalTestNodeConfig(t)
 			require.NoError(t, Initialize(cfg))
+			path := filepath.Join(cfg.Directory, legacy)
+			require.NoError(t, os.MkdirAll(filepath.Dir(path), 0700))
+			require.NoError(t, os.WriteFile(path, []byte("legacy authority"), 0600))
 			before := journalTestStorageDigest(t, cfg.Directory)
-			wrong := cfg
-			wrong.ExperimentalRaftJournal = !cfg.ExperimentalRaftJournal
-			node, err := Open(wrong)
+			node, err := Open(cfg)
 			if node != nil {
 				_ = node.Close()
 			}
-			require.ErrorContains(t, err, "storage mode", "configured backend silently reinterpreted an existing store")
-			require.ErrorContains(t, Initialize(wrong), "storage mode", "initialization must not change an existing authority")
+			require.ErrorContains(t, err, "storage mode")
+			require.ErrorContains(t, Initialize(cfg), "storage mode")
 			require.Equal(t, before, journalTestStorageDigest(t, cfg.Directory))
-
-			reopened, err := Open(cfg)
-			require.NoError(t, err)
-			require.NoError(t, reopened.Close())
 		})
 	}
 }
 
 func TestJournalNodeRejectsCompetingOwner(t *testing.T) {
-	cfg := journalTestNodeConfig(t, true)
+	cfg := journalTestNodeConfig(t)
 	require.NoError(t, Initialize(cfg))
 	first, err := Open(cfg)
 	require.NoError(t, err)
@@ -103,7 +111,7 @@ func TestJournalNodeRejectsCompetingOwner(t *testing.T) {
 }
 
 func TestJournalNodeDiscoversGroupWithoutOpenedMarker(t *testing.T) {
-	cfg := journalTestNodeConfig(t, true)
+	cfg := journalTestNodeConfig(t)
 	cfg.Seeds = []Peer{{ID: 7, Address: journalTestPeerAddress(t)}}
 	const shard = 2
 	first, err := Open(cfg)
@@ -131,7 +139,7 @@ func TestJournalNodeDiscoversGroupWithoutOpenedMarker(t *testing.T) {
 }
 
 func TestJournalNodeRefusesMissingEstablishedActiveFile(t *testing.T) {
-	cfg := journalTestNodeConfig(t, true)
+	cfg := journalTestNodeConfig(t)
 	require.NoError(t, Initialize(cfg))
 	active := filepath.Join(cfg.Directory, "raft-journal", "extent-0000000000000001.raft-journal")
 	backup := filepath.Join(t.TempDir(), "test-journal")
@@ -150,4 +158,25 @@ func TestJournalNodeRefusesMissingEstablishedActiveFile(t *testing.T) {
 	reopened, err := Open(cfg)
 	require.NoError(t, err)
 	require.NoError(t, reopened.Close())
+}
+
+func TestOriginalVoterRejectsEmptyReplacementJournal(t *testing.T) {
+	cfg := journalTestNodeConfig(t)
+	require.NoError(t, Initialize(cfg))
+	authority := filepath.Join(cfg.Directory, journalDirectory)
+	require.NoError(t, os.Rename(authority, filepath.Join(t.TempDir(), "original")))
+	replacement, err := clusterraft.OpenNodeJournal(authority, true)
+	require.NoError(t, err)
+	require.NoError(t, replacement.Close())
+	for _, initialize := range []bool{false, true} {
+		node, err := open(cfg, initialize)
+		if node != nil {
+			_ = node.Close()
+		}
+		require.ErrorContains(t, err, "lost its persistent store")
+		inventory, err := clusterraft.OpenNodeJournal(authority, false)
+		require.NoError(t, err)
+		require.Empty(t, inventory.GroupIDs(), "an empty replacement must never bootstrap an original voter")
+		require.NoError(t, inventory.Close())
+	}
 }

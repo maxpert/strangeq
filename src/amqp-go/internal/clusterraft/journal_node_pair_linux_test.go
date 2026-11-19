@@ -70,7 +70,7 @@ func TestNodeJournalPairHeldRangeWriteDoesNotBlockOtherStream(t *testing.T) {
 		})
 		require.NoError(t, err)
 		t.Cleanup(func() { _ = group.Close() })
-		require.Same(t, node.streams[index].store, group.store.(*journalGroupStore).node)
+		require.Same(t, node.streams[index].store, group.store.node)
 		require.NoError(t, group.Campaign(ctx))
 		require.NoError(t, waitTestLocalWrites(ctx, group))
 		groups[index] = group

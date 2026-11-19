@@ -171,14 +171,18 @@ enroll brokers, configure peer TLS, and understand quorum and recovery. See
 for the publish and delivery paths. Cluster mode has a smaller feature set than
 standalone mode; its limits are listed below and in the guide.
 
-The segmented shared journal is **experimental and disabled by default**. Enable
-it only when provisioning fresh cluster stores. Its configuration and restart
-requirements are documented in the [experimental journal guide](docs/CLUSTERING.md#experimental-shared-journal).
+Configured Raft nodes always use the shared segmented journal. Provision fresh
+cluster stores for this release; existing bbolt Raft stores and flat journals
+are not converted. Ordinary standalone storage is unchanged. Journal format,
+optional tuning and restart requirements are documented in the
+[shared journal guide](docs/CLUSTERING.md#shared-segmented-journal).
 
 ## Performance
 
 These same-host benchmarks use three voting replicas per queue on an eight-core
 ARM64 Linux VM. Results describe the measured workloads and storage settings.
+The pinned results below predate the journal becoming the Raft default; replay
+them with the runner and binary from their stated revisions.
 
 ### Active dead-lettering
 

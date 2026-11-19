@@ -269,6 +269,10 @@ func main() {
 	if err != nil {
 		log.Fatalf("Failed to start cluster peer: %v", err)
 	}
+	if clusterNode != nil {
+		lineage, nodeID := clusterNode.Identity()
+		fmt.Printf("Cluster lineage: %s; node ID: %d\n", lineage, nodeID)
+	}
 	serverBuilder := server.NewServerBuilder().WithConfig(cfg)
 	if clusterNode != nil {
 		serverBuilder.WithUnifiedBroker(server.NewClusterBroker(clusterNode))
@@ -417,6 +421,9 @@ func main() {
 	signal.Notify(hupCh, syscall.SIGHUP)
 	go func() {
 		for range hupCh {
+			if err := reloadClusterPeers(clusterNode, cfg, configPath, cwd); err != nil {
+				amqpServer.Log.Error("failed to activate peer transport", zap.Error(err))
+			}
 			reloadAuth(amqpServer)
 			if mgmtServer != nil {
 				if n := mgmtServer.ReloadUsers(); n > 0 {

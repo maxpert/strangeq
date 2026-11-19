@@ -124,7 +124,8 @@ func (n *Node) tryRoute(ctx context.Context, id uint64, data []byte, mode routeM
 		peer := targets[0]
 		targets = targets[1:]
 		addr := address(v, peer)
-		if addr == "" || visited[peer] {
+		client := n.peerClient()
+		if (peer != n.cfg.Peer.ID && (addr == "" || client == nil)) || visited[peer] || peer == 0 {
 			continue
 		}
 		visited[peer] = true
@@ -159,11 +160,11 @@ func (n *Node) tryRoute(ctx context.Context, id uint64, data []byte, mode routeM
 			}
 			switch mode {
 			case routeRead:
-				wire, wireErr = n.client.Read(attempt, addr, frame)
+				wire, wireErr = client.Read(attempt, addr, frame)
 			case routeWait:
-				wire, wireErr = n.client.Wait(attempt, addr, frame)
+				wire, wireErr = client.Wait(attempt, addr, frame)
 			default:
-				wire, wireErr = n.client.CommandForGroup(attempt, addr, id, data)
+				wire, wireErr = client.CommandForGroup(attempt, addr, id, data)
 			}
 		}
 		if cancel != nil {

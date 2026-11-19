@@ -17,7 +17,6 @@ require (
 	github.com/prometheus/client_golang v1.23.2
 	github.com/rabbitmq/amqp091-go v1.10.0
 	github.com/stretchr/testify v1.11.1
-	go.etcd.io/bbolt v1.5.0
 	go.etcd.io/raft/v3 v3.7.0
 	go.uber.org/zap v1.27.0
 	golang.org/x/crypto v0.42.0

@@ -62,7 +62,7 @@ func TestJournalMatchedFollowerReceivesCommitWithoutAnotherAppendFence(t *testin
 	func() {
 		follower.mu.Lock()
 		defer follower.mu.Unlock()
-		store := follower.store.(*journalGroupStore)
+		store := follower.store
 		require.Equal(t, commit-1, store.state.hard.GetCommit())
 		require.Equal(t, commit, store.pendingCommit)
 	}()

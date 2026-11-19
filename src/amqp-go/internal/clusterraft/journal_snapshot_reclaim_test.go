@@ -23,7 +23,7 @@ func requireJournalSnapshot(t *testing.T, group *Group, contents string) string 
 	t.Helper()
 	group.mu.Lock()
 	defer group.mu.Unlock()
-	store := group.store.(*journalGroupStore)
+	store := group.store
 	snapshot, err := store.Snapshot()
 	require.NoError(t, err)
 	_, data, err := decodeSnapshot(snapshot)

@@ -43,7 +43,8 @@ func (g *Group) readCaptured(ctx context.Context,
 		if err != nil {
 			return nil, err
 		}
-		if store, ok := g.store.(*journalGroupStore); ok && size >= captureJournalReplyBytes {
+		if size >= captureJournalReplyBytes {
+			store := g.store
 			slots := store.node.replySlots
 			select {
 			case slots <- struct{}{}:

@@ -3,8 +3,6 @@ package cluster
 import (
 	"context"
 	"encoding/json"
-	"errors"
-	"os"
 	"time"
 
 	"github.com/maxpert/amqp-go/internal/clusterraft"
@@ -75,6 +73,10 @@ func (n *Node) syncCatalog() {
 		}
 	}
 
+	client := n.peerClient()
+	if client == nil {
+		return
+	}
 	v := n.view()
 	addresses := make([]string, 0, len(v.Catalog.Voters)+len(n.cfg.Discovery)+len(n.catalog.initial.Nodes))
 	for _, id := range v.Catalog.Voters {
@@ -86,12 +88,12 @@ func (n *Node) syncCatalog() {
 	}
 	seen := make(map[string]bool, len(addresses))
 	for _, p := range addresses {
-		if p == "" || p == n.cfg.Peer.Address || seen[p] {
+		if p == "" || p == n.peerAddress() || seen[p] {
 			continue
 		}
 		seen[p] = true
 		ctx, cancel := context.WithTimeout(n.ctx, time.Second)
-		raw, err := n.client.Membership(ctx, p, nil)
+		raw, err := client.Membership(ctx, p, nil)
 		cancel()
 		if err != nil {
 			continue
@@ -156,12 +158,9 @@ func (n *Node) removeLocal(group uint64, g *clusterraft.Group) error {
 	n.groupsMu.Lock()
 	delete(n.groups, group)
 	n.groupsMu.Unlock()
-	if n.journal != nil {
-		// The durable retirement marker fences the old group's records.
-		// This prototype retains the shared journal until Node closes.
-		return g.Close()
-	}
-	return errors.Join(g.Close(), os.RemoveAll(n.store(group)))
+	// The durable retirement marker fences the old group's records while
+	// the node retains its shared journal until close.
+	return g.Close()
 }
 
 func (n *Node) reconcile(id uint64, g *clusterraft.Group) {

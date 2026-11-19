@@ -58,11 +58,12 @@ type journalGroupState struct {
 }
 
 type journalGroupStore struct {
-	node     *journalGroupNode
-	group    uint64
-	state    *journalGroupState // Owned by Group under its mutex.
-	once     sync.Once
-	closeErr error
+	node       *journalGroupNode
+	group      uint64
+	state      *journalGroupState // Owned by Group under its mutex.
+	once       sync.Once
+	closeErr   error
+	closeOwner bool
 	// Pending commit is protected by the Group mutex. It can cover only
 	// entries already durable in the local journal.
 	pendingCommit uint64
@@ -89,9 +90,7 @@ func journalGroupWriterLimits() journalLimits {
 }
 
 func (n *journalGroupNode) openGroup(config Config) (*Group, error) {
-	return openGroup(config, func(config Config) (groupStore, *pb.Snapshot, error) {
-		return n.openStore(config)
-	})
+	return n.openValidatedGroup(config)
 }
 
 func (n *journalGroupNode) close() error {
@@ -633,6 +632,9 @@ func (s *journalGroupStore) close() error {
 		s.node.mu.Lock()
 		delete(s.node.owners, s.group)
 		s.node.mu.Unlock()
+		if s.closeOwner {
+			s.closeErr = errors.Join(s.closeErr, s.node.close())
+		}
 	})
 	return s.closeErr
 }

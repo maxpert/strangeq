@@ -105,9 +105,9 @@ func TestFourNodeRebalanceAndReplicaIdentityFence(t *testing.T) {
 
 	require.NoError(t, joiner.Close())
 	disk := configs[3].Directory
-	require.NoError(t, os.RemoveAll(filepath.Join(disk, fmt.Sprint(groupFor(local, 16)))))
+	require.NoError(t, os.RemoveAll(filepath.Join(disk, journalDirectory)))
 	_, err = Open(configs[3])
-	require.ErrorContains(t, err, "persistent store")
+	require.ErrorContains(t, err, "persistent raft journal")
 
 	require.NoError(t, os.RemoveAll(disk))
 	replacement, err := Open(configs[3])

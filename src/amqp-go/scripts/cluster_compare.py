@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Compare three local durable StrangeQ and RabbitMQ brokers with one pinned client."""
+"""Compare local-journal or three-voter StrangeQ with RabbitMQ using one pinned client."""
 
 import argparse
 from collections import Counter
@@ -28,6 +28,7 @@ OTP_VERSION = "28.5.0.8"
 PERF_TEST_VERSION = "2.25.0"
 LOOPBACK = "127.0.0.1"
 VOTERS = {1, 2, 3}
+TOPOLOGIES = {"quorum3": 3, "singleton": 1}
 CATALOG_GROUP = (1 << 64) - 1
 EXCHANGE = "bench-exchange"
 
@@ -103,18 +104,28 @@ def parse_perf_test(output, duration, warmup):
     }
 
 
-def peak_rss(samples):
-    if not samples or any(len(values) != 3 or min(values) <= 0 for _, values in samples):
-        raise BenchmarkError("RSS requires simultaneous samples from all three broker processes")
+def peak_rss(samples, broker_count=3):
+    if not samples or any(len(values) != broker_count or min(values) <= 0 for _, values in samples):
+        raise BenchmarkError(f"RSS requires simultaneous samples from all {broker_count} broker processes")
     return max(sum(values) for _, values in samples)
 
 
-def parse_rabbit_queues(output, case, nodes):
+def parse_rabbit_queues(output, case, nodes, *, topology="quorum3"):
     queues = {}
+    if topology == "singleton" and len(nodes) != 1:
+        raise BenchmarkError("RabbitMQ Classic comparison requires exactly one broker")
     for line in output.splitlines():
         if not line.strip():
             continue
         fields = line.split("\t")
+        if topology == "singleton":
+            if len(fields) != 4:
+                raise BenchmarkError(f"unexpected RabbitMQ Classic queue listing: {line}")
+            name, kind, durable, state = fields
+            if name in queues or kind != "classic" or durable != "true" or state != "running":
+                raise BenchmarkError(f"{name} is not a unique durable running Classic queue")
+            queues[name] = {"leader": next(iter(nodes)), "type": "classic", "durable": True}
+            continue
         if len(fields) != 6:
             raise BenchmarkError(f"unexpected RabbitMQ queue listing: {line}")
         name, kind, durable, leader, members, online = fields
@@ -204,21 +215,24 @@ def wait_until_ready(process, port, log, *, health=False):
 
 
 def launch_strangeq(args, stack, scratch, output, env):
-    ports = free_ports(9)
-    amqp, peers, health = ports[:3], ports[3:6], ports[6:]
-    token = scratch / "peer.token"
-    token.write_text(secrets.token_urlsafe(32), encoding="ascii")
-    seeds = [f"{i}@{LOOPBACK}:{port}" for i, port in enumerate(peers, 1)]
+    local = args.topology == "singleton"
+    count = TOPOLOGIES[args.topology]
+    ports = free_ports(count * (2 if local else 3))
+    amqp = ports[:count]
+    health = ports[count:] if local else ports[2 * count:]
+    peers = [None] if local else ports[count:2 * count]
+    if not local:
+        token = scratch / "peer.token"
+        token.write_text(secrets.token_urlsafe(32), encoding="ascii")
+    seeds = [] if local else [f"{i}@{LOOPBACK}:{port}" for i, port in enumerate(peers, 1)]
     paths, configs = [], []
     for i, (amqp_port, peer_port, health_port) in enumerate(zip(amqp, peers, health), 1):
         path = scratch / f"node-{i}"
         config = scratch / f"node-{i}.yaml"
-        cluster_config = {
+        cluster_config = {"local": True} if local else {
             "id": scratch.name, "node_id": i, "peer_address": f"{LOOPBACK}:{peer_port}",
             "seeds": seeds, "token_file": str(token), "allow_loopback_plaintext": True,
         }
-        if args.strangeq_journal:
-            cluster_config["experimental_raft_journal"] = True
         if args.strangeq_range_sync:
             cluster_config["experimental_raft_range_sync"] = True
         if args.strangeq_dual_stream:
@@ -241,16 +255,17 @@ def launch_strangeq(args, stack, scratch, output, env):
             "telemetry": {"enabled": True, "address": LOOPBACK, "port": health_port},
             "cluster": cluster_config,
         })
-        run_logged([args.strangeq_bin, "--config", config, "--initialize-cluster"], scratch, env,
-                   output / f"init-{i}.log")
+        if not local:
+            run_logged([args.strangeq_bin, "--config", config, "--initialize-cluster"], scratch, env,
+                       output / f"init-{i}.log")
         paths.append(path)
         configs.append(config)
-    logs = [output / f"broker-{i}.log" for i in range(1, 4)]
+    logs = [output / f"broker-{i}.log" for i in range(1, count + 1)]
     brokers = [spawn(stack, [args.strangeq_bin, "--config", config], scratch, env, log)
                for config, log in zip(configs, logs)]
     for broker, port, log in zip(brokers, health, logs):
         wait_until_ready(broker, port, log, health=True)
-    seed_peers = [{"ID": i, "Address": f"{LOOPBACK}:{port}"} for i, port in enumerate(peers, 1)]
+    seed_peers = None if local else [{"ID": i, "Address": f"{LOOPBACK}:{port}"} for i, port in enumerate(peers, 1)]
     return brokers, amqp, (paths, seed_peers)
 
 
@@ -292,18 +307,23 @@ def verify_journal_layout(cluster, ack_and_claim, assignments=False, body_compre
     verify_journal_group(cluster, CATALOG_GROUP)
 
 
-def verify_strangeq_placement(context, case, *, journal=False, ack_and_claim=False, assignments=False,
+def verify_strangeq_placement(context, case, *, ack_and_claim=False, assignments=False,
                               body_compression=False, dual_stream=False, small_body_compression=False,
-                              expected_shards=None):
+                              expected_shards=None, topology="quorum3"):
     paths, seeds = context
+    if topology == "singleton":
+        return verify_strangeq_singleton(
+            context, case, ack_and_claim=ack_and_claim, assignments=assignments,
+            body_compression=body_compression, dual_stream=dual_stream,
+            small_body_compression=small_body_compression, expected_shards=expected_shards,
+        )
     expected_cluster = paths[0].parent.name
     clusters = [path / "cluster" for path in paths]
     views = []
     for cluster, seed in zip(clusters, seeds, strict=True):
-        if journal:
-            verify_journal_layout(cluster, ack_and_claim, assignments, body_compression, dual_stream,
-                                  small_body_compression=small_body_compression)
-        identity_path = cluster / ("journal-identity-v1.json" if journal else "identity.json")
+        verify_journal_layout(cluster, ack_and_claim, assignments, body_compression, dual_stream,
+                              small_body_compression=small_body_compression)
+        identity_path = cluster / "journal-identity-v1.json"
         if small_body_compression:
             if os.path.lexists(identity_path):
                 raise BenchmarkError(f"StrangeQ small-body journal and legacy identities coexist at {cluster}")
@@ -334,11 +354,8 @@ def verify_strangeq_placement(context, case, *, journal=False, ack_and_claim=Fal
         group = int.from_bytes(digest[:8], "big") % shards + 1
         if any(set(table[group]["Voters"]) != VOTERS or table[group]["Learners"] for table in tables):
             raise BenchmarkError(f"{name} lacks three catalog-committed StrangeQ shard voters")
-        if journal:
-            for cluster in clusters:
-                verify_journal_group(cluster, group)
-        elif any(not (cluster / str(group)).is_dir() for cluster in clusters):
-            raise BenchmarkError(f"{name} lacks a local shard store on one or more StrangeQ replicas")
+        for cluster in clusters:
+            verify_journal_group(cluster, group)
         preferred = max(sorted(VOTERS), key=lambda node: hashlib.sha256(
             group.to_bytes(8, "big") + node.to_bytes(8, "big")
         ).digest()[:8])
@@ -346,9 +363,67 @@ def verify_strangeq_placement(context, case, *, journal=False, ack_and_claim=Fal
     return placements
 
 
+def verify_strangeq_singleton(context, case, *, ack_and_claim=False, assignments=False,
+                              body_compression=False, dual_stream=False, small_body_compression=False,
+                              expected_shards=None):
+    paths, seeds = context
+    if len(paths) != 1 or seeds is not None:
+        raise BenchmarkError("local StrangeQ comparison requires exactly one unseeded broker")
+    cluster = paths[0] / "cluster"
+    verify_journal_layout(cluster, ack_and_claim, assignments, body_compression, dual_stream,
+                          small_body_compression=small_body_compression)
+    identity_path = cluster / ("journal-small-body-identity-v1.json" if small_body_compression
+                               else "journal-identity-v1.json")
+    if (not identity_path.is_file() or identity_path.is_symlink()
+            or identity_path.stat().st_mode & 0o077
+            or os.path.lexists(cluster / "peer-activation-v1.json")):
+        raise BenchmarkError("local StrangeQ requires a private identity and no peer activation")
+    other_identity = "journal-identity-v1.json" if small_body_compression else "journal-small-body-identity-v1.json"
+    if os.path.lexists(cluster / other_identity):
+        raise BenchmarkError("local StrangeQ journal identities coexist")
+    identity = json.loads(identity_path.read_text())
+    view = json.loads((cluster / "catalog-cache").read_text())
+    if not isinstance(identity, dict) or not isinstance(view, dict):
+        raise BenchmarkError("local StrangeQ catalog or identity is malformed")
+    peer, shards = identity.get("Peer"), identity.get("Shards")
+    node = peer.get("ID") if isinstance(peer, dict) else None
+    if (identity.get("Local") is not True or type(node) is not int or not 0 < node < (1 << 63)
+            or peer != {"ID": node, "Address": ""}
+            or not isinstance(identity.get("Cluster"), str)
+            or not re.fullmatch(r"[0-9a-f]{32}", identity["Cluster"])
+            or identity.get("Seeds") != [peer] or identity.get("Nonce") != ""
+            or type(shards) is not int or not 1 <= shards <= 1024
+            or view.get("Cluster") != identity["Cluster"] or view.get("Shards") != shards
+            or view.get("Nodes") != [peer] or view.get("Nonces") not in (None, {})
+            or view.get("CatalogTarget") != [node]):
+        raise BenchmarkError("local StrangeQ catalog or identity is not an unactivated singleton")
+    if expected_shards is not None and shards != expected_shards:
+        raise BenchmarkError(f"StrangeQ trial requires {expected_shards} shards but catalog has {shards}")
+    if not isinstance(view.get("Catalog"), dict) or not isinstance(view.get("Placements"), list):
+        raise BenchmarkError("local StrangeQ catalog membership is malformed")
+    rows = [view["Catalog"], *view["Placements"]]
+    if (len(rows) != shards + 1
+            or any(not isinstance(row, dict) or type(row.get("Group")) is not int for row in rows)
+            or {row["Group"] for row in rows} != {CATALOG_GROUP, *range(1, shards + 1)}
+            or any(row.get("Voters") != [node] or row.get("Learners") for row in rows)
+            or type(view["Catalog"].get("Index")) is not int or view["Catalog"]["Index"] <= 0):
+        raise BenchmarkError("local StrangeQ lacks sole catalog-committed voters")
+    table = {row["Group"]: row for row in rows}
+    placements = {}
+    for name in case.queue_names:
+        group = int.from_bytes(hashlib.sha256(name.encode()).digest()[:8], "big") % shards + 1
+        if type(table[group].get("Index")) is not int or table[group]["Index"] <= 0:
+            raise BenchmarkError(f"{name} lacks a committed local membership report")
+        verify_journal_group(cluster, group)
+        placements[name] = {"shard": group, "preferred_leader": node, "voters": [node],
+                            "cluster_id": identity["Cluster"], "local": True}
+    return placements
+
+
 def launch_rabbitmq(args, stack, scratch, output, env):
-    ports = free_ports(7)
-    amqp, distribution, epmd_port = ports[:3], ports[3:6], ports[6]
+    count = TOPOLOGIES[args.topology]
+    ports = free_ports(count * 2 + 1)
+    amqp, distribution, epmd_port = ports[:count], ports[count:2 * count], ports[-1]
     otp_bin = args.erlang_bin
     cookie = secrets.token_hex(24)
     rack = secrets.token_hex(4)
@@ -363,12 +438,14 @@ def launch_rabbitmq(args, stack, scratch, output, env):
         path.mkdir()
         name = f"sqbench{rack}_{i}@{LOOPBACK}"
         config = path / "rabbitmq.conf"
+        queue_config = ("default_queue_type = classic\n" if args.topology == "singleton" else
+                        "quorum_queue.initial_cluster_size = 3\n"
+                        f"quorum_queue.commands_soft_limit = {args.rabbit_window}\n")
         config.write_text(
             f"listeners.tcp.1 = {LOOPBACK}:{amqp_port}\n"
             f"distribution.listener.interface = {LOOPBACK}\n"
             "queue_leader_locator = balanced\n"
-            "quorum_queue.initial_cluster_size = 3\n"
-            f"quorum_queue.commands_soft_limit = {args.rabbit_window}\n",
+            + queue_config,
             encoding="ascii",
         )
         plugins = path / "enabled_plugins"
@@ -415,15 +492,20 @@ def verify_rabbit_placement(args, case, environments, scratch, output, phase):
     nodes = {env["RABBITMQ_NODENAME"] for env in environments}
     seed = environments[0]
     status = rabbit_cmd(args, seed, scratch, output / f"cluster-{phase}.log", "cluster_status")
+    if args.topology == "singleton" and (len(environments) != 1 or len(re.findall(
+            r"^([^\s:]+): RabbitMQ (\S+) on Erlang (\S+)$", status, re.MULTILINE)) != 1):
+        raise BenchmarkError("RabbitMQ Classic comparison requires one reported broker")
     members = {
         match[0] for match in re.findall(r"^([^\s:]+): RabbitMQ (\S+) on Erlang (\S+)$", status, re.MULTILINE)
         if match[1:] == (RABBITMQ_VERSION, OTP_VERSION)
     }
     if nodes != members:
-        raise BenchmarkError("RabbitMQ cluster lacks three nodes reporting the pinned RabbitMQ and OTP versions")
+        raise BenchmarkError(f"RabbitMQ cluster lacks {TOPOLOGIES[args.topology]} nodes reporting the pinned RabbitMQ and OTP versions")
+    fields = ("name", "type", "durable", "state") if args.topology == "singleton" else (
+        "name", "type", "durable", "leader", "members", "online")
     queues = rabbit_cmd(args, seed, scratch, output / f"queues-{phase}.log", "list_queues",
-                        "--no-table-headers", "name", "type", "durable", "leader", "members", "online")
-    placement = parse_rabbit_queues(queues, case, nodes)
+                        "--no-table-headers", *fields)
+    placement = parse_rabbit_queues(queues, case, nodes, topology=args.topology)
     leaders = Counter(value["leader"] for value in placement.values())
     if case.queues > 1 and max(leaders.values()) - min(leaders.get(node, 0) for node in nodes) > 1:
         raise BenchmarkError("RabbitMQ quorum queue leaders are not balanced across the three brokers")
@@ -444,7 +526,7 @@ def perftest_args(args, case, ports, rabbitmq, prepare=False):
     else:
         command.extend(["--queue-pattern", f"{case.name}-%d", "--queue-pattern-from", "1",
                         "--queue-pattern-to", str(case.queues)])
-    if rabbitmq:
+    if rabbitmq and args.topology == "quorum3":
         command.append("--quorum-queue")
     if args.rate_per_producer is not None and not prepare:
         command.extend(["--rate", str(args.rate_per_producer)])
@@ -480,7 +562,9 @@ def measure(args, stack, scratch, output, env, brokers, command):
     if client.returncode:
         raise BenchmarkError(f"PerfTest exited {client.returncode}; see {log}")
     metrics = parse_perf_test(log.read_text(encoding="utf-8", errors="replace"), args.duration, args.warmup)
-    return dict(metrics, peak_cluster_rss_bytes=peak_rss(samples), rss_samples=len(samples))
+    return dict(metrics, peak_cluster_rss_bytes=peak_rss(samples, TOPOLOGIES[args.topology]),
+                rss_samples=len(samples), topology=args.topology, broker_processes=len(brokers),
+                rss_scope=f"simultaneous sum of {len(brokers)} broker processes; excludes client and EPMD")
 
 
 def trial(args, case, rabbitmq, output, env):
@@ -499,11 +583,11 @@ def trial(args, case, rabbitmq, output, env):
             before = verify_rabbit_placement(args, case, placement_context, scratch, output, "before")
         else:
             before = verify_strangeq_placement(
-                placement_context, case, journal=args.strangeq_journal, ack_and_claim=args.strangeq_ack_and_claim,
+                placement_context, case, ack_and_claim=args.strangeq_ack_and_claim,
                 assignments=args.strangeq_assignments, body_compression=args.strangeq_journal_body_compression,
                 dual_stream=args.strangeq_dual_stream,
                 small_body_compression=args.strangeq_journal_small_body_compression,
-                expected_shards=args.strangeq_shards,
+                expected_shards=args.strangeq_shards, topology=args.topology,
             )
         write_json(output / "placement-before.json", before)
         if args.validate_only:
@@ -515,11 +599,11 @@ def trial(args, case, rabbitmq, output, env):
             after = verify_rabbit_placement(args, case, placement_context, scratch, output, "after")
         else:
             after = verify_strangeq_placement(
-                placement_context, case, journal=args.strangeq_journal, ack_and_claim=args.strangeq_ack_and_claim,
+                placement_context, case, ack_and_claim=args.strangeq_ack_and_claim,
                 assignments=args.strangeq_assignments, body_compression=args.strangeq_journal_body_compression,
                 dual_stream=args.strangeq_dual_stream,
                 small_body_compression=args.strangeq_journal_small_body_compression,
-                expected_shards=args.strangeq_shards,
+                expected_shards=args.strangeq_shards, topology=args.topology,
             )
         write_json(output / "placement-after.json", after)
         if before != after:
@@ -595,8 +679,9 @@ def darwin_erlang_flush(args, output, env):
 
 def arguments():
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--topology", choices=TOPOLOGIES, default="quorum3",
+                        help="quorum3: three StrangeQ voters vs RabbitMQ quorum; singleton: local journal vs Classic")
     parser.add_argument("--strangeq-bin", type=Path, required=True)
-    parser.add_argument("--strangeq-journal", action="store_true", help="require experimental node-wide Raft journals on all StrangeQ replicas")
     parser.add_argument("--strangeq-range-sync", action="store_true", help="enable full synchronous journal range writes where supported")
     parser.add_argument("--strangeq-dual-stream", action="store_true", help="use two journal streams on fresh StrangeQ brokers")
     parser.add_argument("--strangeq-ack-and-claim", action="store_true", help="enable combined ACK and refill on every fresh StrangeQ journal replica")
@@ -631,13 +716,9 @@ def arguments():
         parser.error("repeats, window, prefetch and rabbit-window must be positive")
     if args.rate_per_producer is not None and args.rate_per_producer <= 0:
         parser.error("rate-per-producer must be positive")
-    if args.strangeq_ack_and_claim and not args.strangeq_journal:
-        parser.error("strangeq-ack-and-claim requires strangeq-journal")
-    if args.strangeq_range_sync and not args.strangeq_journal:
-        parser.error("strangeq-range-sync requires strangeq-journal")
     if args.strangeq_dual_stream and not args.strangeq_range_sync:
         parser.error("strangeq-dual-stream requires strangeq-range-sync")
-    if args.strangeq_assignments and (not args.strangeq_journal or args.strangeq_ack_and_claim):
+    if args.strangeq_assignments and args.strangeq_ack_and_claim:
         parser.error("strangeq-assignments requires its own journal mode")
     if args.strangeq_replica_bodies and not args.strangeq_assignments:
         parser.error("strangeq-replica-bodies requires strangeq-assignments")
@@ -685,8 +766,12 @@ def main():
     write_json(output / "environment.json", {
         "platform": platform.platform(), "cpu_count": os.cpu_count(), "scratch": str(args.scratch), "locale": locale,
         "benchmark_mode": "same-host Linux" if system == "Linux" else "Darwin diagnostic only",
+        "topology": args.topology, "broker_processes_per_engine": TOPOLOGIES[args.topology],
+        "rabbitmq_queue_type": "classic" if args.topology == "singleton" else "quorum",
+        "strangeq_peer_transport": args.topology != "singleton",
+        "rss_scope": f"simultaneous sum of {TOPOLOGIES[args.topology]} broker processes per engine; excludes client and EPMD",
         "strangeq_sha256": file_digest(args.strangeq_bin), "strangeq_binary": str(args.strangeq_bin),
-        "strangeq_storage": "experimental_raft_journal" if args.strangeq_journal else "bolt",
+        "strangeq_storage": "segmented_journal",
         "strangeq_range_sync": args.strangeq_range_sync,
         "strangeq_dual_stream": args.strangeq_dual_stream,
         "strangeq_ack_and_claim": args.strangeq_ack_and_claim,

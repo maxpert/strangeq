@@ -2,14 +2,12 @@ package clusterraft
 
 import (
 	"bytes"
-	"encoding/binary"
 	"errors"
 	"os"
 	"path/filepath"
 	"testing"
 
 	"github.com/stretchr/testify/require"
-	"go.etcd.io/bbolt"
 	"go.etcd.io/raft/v3"
 	pb "go.etcd.io/raft/v3/raftpb"
 	"google.golang.org/protobuf/proto"
@@ -24,37 +22,34 @@ func (*failedInitialSnapshot) Snapshot() ([]byte, error) {
 func TestStoreCreationCanRetryAfterInitialSnapshotFailure(t *testing.T) {
 	dir := t.TempDir()
 	config := Config{ID: 1, GroupID: 3, Dir: dir, Peers: []uint64{1}, Machine: &failedInitialSnapshot{}}
-	_, err := createStore(config)
+	group, err := Open(config)
+	require.Nil(t, group)
 	require.ErrorContains(t, err, "initial snapshot failed")
-	exists, err := Exists(dir)
-	require.NoError(t, err)
-	require.False(t, exists)
-	files, err := os.ReadDir(dir)
-	require.NoError(t, err)
-	require.Empty(t, files)
-
 	config.Machine = &testMachine{}
-	db, err := createStore(config)
+	group, err = Open(config)
 	require.NoError(t, err)
-	require.NoError(t, db.Close())
+	require.NoError(t, group.Close())
 }
 
-func TestStoreCreationRefusesExistingStoreWithoutIdentity(t *testing.T) {
+func TestStoreCreationRefusesLegacyAuthority(t *testing.T) {
 	config := Config{ID: 1, GroupID: 3, Dir: t.TempDir(), Peers: []uint64{1}, Machine: &testMachine{}}
-	db, err := bbolt.Open(filepath.Join(config.Dir, dbName), 0600, nil)
+	require.NoError(t, os.WriteFile(filepath.Join(config.Dir, "raft.db"), []byte("legacy authority"), 0600))
+	before, err := os.ReadFile(filepath.Join(config.Dir, "raft.db"))
 	require.NoError(t, err)
-	require.NoError(t, db.Close())
-	_, err = createStore(config)
-	require.ErrorContains(t, err, "missing its persistent identity")
+	_, err = Open(config)
+	require.ErrorContains(t, err, "fresh directory")
+	after, err := os.ReadFile(filepath.Join(config.Dir, "raft.db"))
+	require.NoError(t, err)
+	require.Equal(t, before, after)
 }
 
 func TestStoreReplacesUncommittedSuffixAndPrunesCheckpointPrefix(t *testing.T) {
 	config := Config{ID: 1, GroupID: 3, Dir: t.TempDir(), Peers: []uint64{1, 2, 3}, Machine: &testMachine{}}
-	db, err := createStore(config)
+	node, err := OpenNodeJournal(config.Dir, true)
 	require.NoError(t, err)
-	t.Cleanup(func() { require.NoError(t, db.Close()) })
-	store, _, err := loadStore(db)
+	store, _, err := node.store.openStore(config)
 	require.NoError(t, err)
+	t.Cleanup(func() { _ = store.close(); _ = node.Close() })
 
 	entry := func(index, term uint64, body string) *pb.Entry {
 		return &pb.Entry{Index: new(index), Term: new(term), Data: []byte(body)}
@@ -78,7 +73,12 @@ func TestStoreReplacesUncommittedSuffixAndPrunesCheckpointPrefix(t *testing.T) {
 	require.Equal(t, []byte("new 4"), entries[2].GetData())
 
 	require.NoError(t, store.checkpoint(3, &pb.ConfState{Voters: []uint64{1, 2, 3}}, encodeSnapshot(1, []byte("[]"))))
-	store, snapshot, err := loadStore(db)
+	require.NoError(t, store.close())
+	require.NoError(t, node.Close())
+	node, err = OpenNodeJournal(config.Dir, false)
+	require.NoError(t, err)
+	var snapshot *pb.Snapshot
+	store, snapshot, err = node.store.openStore(config)
 	require.NoError(t, err)
 	first, err := store.FirstIndex()
 	require.NoError(t, err)
@@ -89,27 +89,31 @@ func TestStoreReplacesUncommittedSuffixAndPrunesCheckpointPrefix(t *testing.T) {
 	require.Len(t, entries, 1)
 	require.Equal(t, uint64(4), entries[0].GetIndex())
 	require.Equal(t, uint64(3), snapshot.GetMetadata().GetIndex())
-	require.Equal(t, uint64(3), store.hard.GetCommit())
+	require.Equal(t, uint64(3), store.state.hard.GetCommit())
 }
 
-func writeTestReady(t *testing.T, store *diskStorage, ready raft.Ready) {
+func writeTestReady(t *testing.T, store *journalGroupStore, ready raft.Ready) {
 	t.Helper()
 	write, err := store.planReady(ready)
 	require.NoError(t, err)
-	require.NoError(t, saveReady(store.db, write.ready))
-	store.publishReady(write)
+	delta, err := store.persistReady(write)
+	require.NoError(t, err)
+	store.publishReady(write, delta)
 }
 
 func TestGroupReadsStableEntriesFromDiskWithinByteLimit(t *testing.T) {
 	config := Config{ID: 1, GroupID: 3, Dir: t.TempDir(), Peers: []uint64{1}, Machine: &testMachine{}, TickInterval: -1}
-	db, err := createStore(config)
+	node, err := OpenNodeJournal(config.Dir, true)
+	require.NoError(t, err)
+	store, _, err := node.store.openStore(config)
 	require.NoError(t, err)
 	entries := []*pb.Entry{
 		{Index: new(uint64(2)), Term: new(uint64(1)), Data: []byte("first")},
 		{Index: new(uint64(3)), Term: new(uint64(1)), Data: bytes.Repeat([]byte{'x'}, 128)},
 	}
-	require.NoError(t, saveReady(db, raft.Ready{Entries: entries}))
-	require.NoError(t, db.Close())
+	writeTestReady(t, store, raft.Ready{Entries: entries})
+	require.NoError(t, store.close())
+	require.NoError(t, node.Close())
 
 	group, err := Open(config)
 	require.NoError(t, err)
@@ -120,11 +124,7 @@ func TestGroupReadsStableEntriesFromDiskWithinByteLimit(t *testing.T) {
 	require.Len(t, read, 2)
 	require.Equal(t, entries[1].GetData(), read[1].GetData())
 	corrupt := make([]byte, 128)
-	require.NoError(t, testBoltDB(group).Update(func(tx *bbolt.Tx) error {
-		// Zero is an invalid protobuf tag. The next entry is also too large
-		// for the remaining byte budget and must not be decoded on that path.
-		return tx.Bucket(logBucket).Put(binary.BigEndian.AppendUint64(nil, 3), corrupt)
-	}))
+	corruptTestJournalEntry(t, group, 3)
 	read, err = storage.Entries(2, 4, 1)
 	require.NoError(t, err)
 	require.Len(t, read, 1, "Raft requires the first entry even when it exceeds the limit")
@@ -151,9 +151,8 @@ func TestGroupReadsStableSnapshotFromDisk(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, uint64(1), snapshot.GetMetadata().GetIndex())
 	require.NotEmpty(t, snapshot.GetData())
-	require.NoError(t, testBoltDB(group).Update(func(tx *bbolt.Tx) error {
-		return tx.Bucket(stateBucket).Put(keySnapshot, []byte{0})
-	}))
+	ref := group.store.state.snapshot
+	require.NoError(t, os.WriteFile(filepath.Join(config.Dir, ref.name), []byte{0}, 0600))
 	_, err = storage.Snapshot()
 	require.Error(t, err, "Raft storage must read the requested snapshot from disk")
 }

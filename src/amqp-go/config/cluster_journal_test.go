@@ -8,15 +8,14 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func TestExperimentalJournalRequiresClusterMode(t *testing.T) {
+func TestExperimentalRangeSyncRequiresClusterMode(t *testing.T) {
 	cfg := DefaultConfig()
-	require.False(t, cfg.Cluster.ExperimentalRaftJournal)
 	require.False(t, cfg.Cluster.ExperimentalRaftRangeSync)
-	cfg.Cluster.ExperimentalRaftJournal = true
-	require.ErrorContains(t, cfg.Validate(), "cluster.id", "journal selection must not silently apply in standalone mode")
+	cfg.Cluster.ExperimentalRaftRangeSync = true
+	require.ErrorContains(t, cfg.Validate(), "cluster.id")
 }
 
-func TestClusterJournalOptInDecodesFromYAML(t *testing.T) {
+func TestClusterRangeSyncDecodesFromYAML(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "broker.yml")
 	require.NoError(t, os.WriteFile(path, []byte(`
 cluster:
@@ -26,17 +25,14 @@ cluster:
   seeds: ["1@127.0.0.1:24401"]
   token_file: peer.token
   allow_loopback_plaintext: true
-  experimental_raft_journal: true
   experimental_raft_range_sync: true
 `), 0600))
 	cfg, report, err := LoadConfig(path)
 	require.NoError(t, err)
 	require.Empty(t, report.UnknownKeys)
-	require.True(t, cfg.Cluster.ExperimentalRaftJournal)
 	require.True(t, cfg.Cluster.ExperimentalRaftRangeSync)
 	require.NoError(t, cfg.Validate())
-	cfg.Cluster.ExperimentalRaftJournal = false
-	require.ErrorContains(t, cfg.Validate(), "experimental_raft_range_sync requires experimental_raft_journal")
+
 }
 
 func TestExperimentalReplicaBodiesRequireAssignments(t *testing.T) {
@@ -54,7 +50,6 @@ cluster:
   seeds: ["1@127.0.0.1:24401"]
   token_file: peer.token
   allow_loopback_plaintext: true
-  experimental_raft_journal: true
   experimental_assignments: true
   experimental_replica_bodies: true
 `), 0600))
@@ -78,7 +73,6 @@ cluster:
   seeds: ["1@127.0.0.1:24401"]
   token_file: peer.token
   allow_loopback_plaintext: true
-  experimental_raft_journal: true
   experimental_assignments: true
   experimental_journal_small_body_compression: true
 `

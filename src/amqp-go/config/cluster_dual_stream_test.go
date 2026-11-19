@@ -23,7 +23,6 @@ cluster:
   seeds: ["1@127.0.0.1:24401"]
   token_file: peer.token
   allow_loopback_plaintext: true
-  experimental_raft_journal: true
   experimental_raft_range_sync: true
   experimental_raft_journal_dual_stream: true
 `), 0600))
@@ -34,6 +33,5 @@ cluster:
 	require.NoError(t, cfg.Validate())
 	cfg.Cluster.ExperimentalRaftRangeSync = false
 	require.ErrorContains(t, cfg.Validate(), "experimental_raft_journal_dual_stream requires")
-	cfg.Cluster.ExperimentalRaftJournal = false
 	require.ErrorContains(t, cfg.Validate(), "experimental_raft_journal_dual_stream requires")
 }

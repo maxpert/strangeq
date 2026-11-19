@@ -16,7 +16,7 @@ func TestReadIndexNeedsQuorumAndDoesNotPersist(t *testing.T) {
 	ctx, cluster, leader := newReadTestCluster(t)
 	lastBefore, err := leader.store.LastIndex()
 	require.NoError(t, err)
-	statsBefore := testBoltDB(leader).Stats()
+	statsBefore := testJournalEnd(leader)
 	runs := &atomic.Int32{}
 	result := startTestRead(ctx, leader, runs)
 	heartbeat := awaitReadTestHeartbeat(t, ctx, cluster, result)
@@ -37,8 +37,8 @@ func TestReadIndexNeedsQuorumAndDoesNotPersist(t *testing.T) {
 	lastAfter, err := leader.store.LastIndex()
 	require.NoError(t, err)
 	require.Equal(t, lastBefore, lastAfter, "read must not append a command")
-	statsAfter := testBoltDB(leader).Stats()
-	require.Equal(t, statsBefore.TxStats.GetWrite(), statsAfter.TxStats.GetWrite(), "read must not write the Raft store")
+	statsAfter := testJournalEnd(leader)
+	require.Equal(t, statsBefore, statsAfter, "read must not write the Raft store")
 }
 
 func TestReadIndexCancellationBoundsAbandonedFences(t *testing.T) {

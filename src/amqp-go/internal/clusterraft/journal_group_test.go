@@ -60,7 +60,7 @@ func TestJournalGroupRestartsFromCheckpointAndTailWithoutBolt(t *testing.T) {
 	require.JSONEq(t, `["checkpoint body", "tail body"]`, string(snapshot))
 	require.Equal(t, committed, restored.Status().Commit)
 	require.Equal(t, []uint64{1}, restored.Status().Voters)
-	require.NoFileExists(t, filepath.Join(config.Dir, dbName), "journal-backed Group used bbolt")
+	require.NoFileExists(t, filepath.Join(config.Dir, "raft.db"), "journal-backed Group used bbolt")
 	info, err := os.Stat(filepath.Join(dir, journalActiveName))
 	require.NoError(t, err)
 	require.Positive(t, info.Size(), "checkpoint and committed tail must have a physical journal")

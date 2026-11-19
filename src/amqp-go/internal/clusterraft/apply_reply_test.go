@@ -3,6 +3,7 @@ package clusterraft
 import (
 	"bytes"
 	"context"
+	"io"
 	"path/filepath"
 	"testing"
 	"time"
@@ -121,7 +122,7 @@ func (m *replyTestMachine) Apply(data []byte) []byte {
 	return m.Machine.Apply(data)
 }
 
-func (m *replyTestMachine) ApplyCommitted(data []byte, wantReply bool) ([]byte, error) {
+func (m *replyTestMachine) observeCommitted(data []byte, wantReply bool) {
 	if command, err := clusterqueue.DecodeCommand(data); err == nil && command.Kind == clusterqueue.ClaimBatch {
 		if wantReply {
 			m.observed.replies++
@@ -129,16 +130,16 @@ func (m *replyTestMachine) ApplyCommitted(data []byte, wantReply bool) ([]byte, 
 			m.observed.skipped++
 		}
 	}
-	if machine, ok := any(&m.Machine).(interface {
-		ApplyCommitted([]byte, bool) ([]byte, error)
-	}); ok {
-		return machine.ApplyCommitted(data, wantReply)
-	}
-	body := m.Machine.Apply(data)
-	if wantReply {
-		return body, nil
-	}
-	return nil, nil
+}
+
+func (m *replyTestMachine) ApplyCommitted(data []byte, wantReply bool) ([]byte, error) {
+	m.observeCommitted(data, wantReply)
+	return m.Machine.ApplyCommitted(data, wantReply)
+}
+
+func (m *replyTestMachine) ApplyJournaledReply(data []byte, wantReply bool, source io.ReaderAt) ([]byte, func() ([]byte, error), error) {
+	m.observeCommitted(data, wantReply)
+	return m.Machine.ApplyJournaledReply(data, wantReply, source)
 }
 
 func observeReplyTestMachine(group *Group, machine *replyTestMachine) replyObservation {

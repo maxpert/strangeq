@@ -8,6 +8,7 @@ import (
 )
 
 type ClusterConfig struct {
+	Local                                   bool     `json:"local"`
 	ID                                      string   `json:"id"`
 	NodeID                                  uint64   `json:"node_id"`
 	PeerAddress                             string   `json:"peer_address"`
@@ -20,7 +21,6 @@ type ClusterConfig struct {
 	PeerKeyFile                             string   `json:"peer_key_file"`
 	PeerCAFile                              string   `json:"peer_ca_file"`
 	AllowLoopbackPlaintext                  bool     `json:"allow_loopback_plaintext"`
-	ExperimentalRaftJournal                 bool     `json:"experimental_raft_journal"`
 	ExperimentalRaftRangeSync               bool     `json:"experimental_raft_range_sync"`
 	ExperimentalAckAndClaim                 bool     `json:"experimental_ack_and_claim"`
 	ExperimentalAssignments                 bool     `json:"experimental_assignments"`
@@ -30,7 +30,7 @@ type ClusterConfig struct {
 	ExperimentalJournalSmallBodyCompression bool     `json:"experimental_journal_small_body_compression"`
 }
 
-func (c ClusterConfig) Enabled() bool { return c.ID != "" }
+func (c ClusterConfig) Enabled() bool { return c.Local || c.ID != "" }
 
 func (c *AMQPConfig) validateCluster() error {
 	cfg := c.Cluster
@@ -38,27 +38,18 @@ func (c *AMQPConfig) validateCluster() error {
 		if cfg.NodeID != 0 || cfg.PeerAddress != "" || cfg.PeerListen != "" || len(cfg.Seeds) != 0 ||
 			len(cfg.Discovery) != 0 ||
 			cfg.Shards != 0 || cfg.TokenFile != "" || cfg.PeerCertFile != "" || cfg.PeerKeyFile != "" ||
-			cfg.PeerCAFile != "" || cfg.AllowLoopbackPlaintext || cfg.ExperimentalRaftJournal ||
+			cfg.PeerCAFile != "" || cfg.AllowLoopbackPlaintext ||
 			cfg.ExperimentalRaftRangeSync || cfg.ExperimentalRaftJournalDualStream || cfg.ExperimentalAckAndClaim || cfg.ExperimentalAssignments ||
 			cfg.ExperimentalReplicaBodies || cfg.ExperimentalJournalBodyCompression || cfg.ExperimentalJournalSmallBodyCompression {
 			return errors.New("cluster.id is required with cluster options")
 		}
 		return nil
 	}
-	if cfg.NodeID == 0 || cfg.PeerAddress == "" || cfg.TokenFile == "" || cfg.Shards > 1024 {
-		return errors.New("cluster requires node_id, peer_address, token_file, and at most 1024 shards")
+	if cfg.ExperimentalRaftJournalDualStream && !cfg.ExperimentalRaftRangeSync {
+		return errors.New("experimental_raft_journal_dual_stream requires experimental_raft_range_sync")
 	}
-	if cfg.ExperimentalRaftRangeSync && !cfg.ExperimentalRaftJournal {
-		return errors.New("experimental_raft_range_sync requires experimental_raft_journal")
-	}
-	if cfg.ExperimentalRaftJournalDualStream && (!cfg.ExperimentalRaftJournal || !cfg.ExperimentalRaftRangeSync) {
-		return errors.New("experimental_raft_journal_dual_stream requires experimental_raft_journal and experimental_raft_range_sync")
-	}
-	if cfg.ExperimentalAckAndClaim && !cfg.ExperimentalRaftJournal {
-		return errors.New("experimental_ack_and_claim requires experimental_raft_journal")
-	}
-	if cfg.ExperimentalAssignments && (!cfg.ExperimentalRaftJournal || cfg.ExperimentalAckAndClaim) {
-		return errors.New("experimental_assignments requires experimental_raft_journal and its own storage mode")
+	if cfg.ExperimentalAssignments && cfg.ExperimentalAckAndClaim {
+		return errors.New("experimental_assignments requires its own storage mode")
 	}
 	if cfg.ExperimentalReplicaBodies && !cfg.ExperimentalAssignments {
 		return errors.New("experimental_replica_bodies requires experimental_assignments")
@@ -69,11 +60,34 @@ func (c *AMQPConfig) validateCluster() error {
 	if cfg.ExperimentalJournalSmallBodyCompression && !cfg.ExperimentalJournalBodyCompression {
 		return errors.New("experimental_journal_small_body_compression requires experimental_journal_body_compression")
 	}
-	if len(cfg.Seeds) < 1 || len(cfg.Seeds) > 3 {
+	if cfg.Local {
+		if len(cfg.Seeds) != 0 || len(cfg.Discovery) != 0 {
+			return errors.New("local cluster cannot configure seeds or discovery")
+		}
+		if cfg.Shards > 1024 {
+			return errors.New("local cluster permits at most 1024 shards")
+		}
+		if c.Management.Enabled || c.Storage.UnsafeRecovery {
+			return errors.New("management HTTP and unsafe storage recovery are unavailable in cluster mode")
+		}
+		if cfg.PeerAddress == "" {
+			if cfg.PeerListen != "" || cfg.TokenFile != "" || cfg.PeerCertFile != "" || cfg.PeerKeyFile != "" || cfg.PeerCAFile != "" || cfg.AllowLoopbackPlaintext {
+				return errors.New("local peer activation requires peer_address with transport settings")
+			}
+			return nil
+		}
+	}
+	if (!cfg.Local && cfg.NodeID == 0) || cfg.PeerAddress == "" || cfg.TokenFile == "" || cfg.Shards > 1024 {
+		return errors.New("cluster requires node_id, peer_address, token_file, and at most 1024 shards")
+	}
+	if !cfg.Local && (len(cfg.Seeds) < 1 || len(cfg.Seeds) > 3) {
 		return errors.New("cluster requires one to three original voters in seeds")
 	}
 	if c.Management.Enabled || c.Storage.UnsafeRecovery {
 		return errors.New("management HTTP and unsafe storage recovery are unavailable in cluster mode")
+	}
+	if !validAdvertisedAddress(cfg.PeerAddress) {
+		return errors.New("cluster peer_address must be host:port")
 	}
 	if cfg.PeerCertFile == "" || cfg.PeerKeyFile == "" {
 		if !cfg.AllowLoopbackPlaintext || cfg.PeerCertFile != "" || cfg.PeerKeyFile != "" || cfg.PeerCAFile != "" {

@@ -12,7 +12,7 @@ import (
 
 func TestAckAndClaimModeFencesExistingJournalAndIncompatiblePeers(t *testing.T) {
 	t.Run("legacy journal", func(t *testing.T) {
-		legacy := journalTestNodeConfig(t, true)
+		legacy := journalTestNodeConfig(t)
 		require.NoError(t, Initialize(legacy))
 		before := journalTestStorageDigest(t, legacy.Directory)
 		enabled := legacy
@@ -26,7 +26,7 @@ func TestAckAndClaimModeFencesExistingJournalAndIncompatiblePeers(t *testing.T) 
 	})
 
 	t.Run("fresh journal", func(t *testing.T) {
-		legacy := journalTestNodeConfig(t, true)
+		legacy := journalTestNodeConfig(t)
 		enabled := legacy
 		enableAckAndClaimForTest(t, &enabled)
 		require.NoError(t, Initialize(enabled))

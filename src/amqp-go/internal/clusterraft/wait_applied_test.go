@@ -66,7 +66,7 @@ func TestWaitAppliedUsesAppliedConditionWithoutWriting(t *testing.T) {
 	ctx, cluster, leader := newReadTestCluster(t)
 	before, err := leader.store.LastIndex()
 	require.NoError(t, err)
-	beforeStats := testBoltDB(leader).Stats()
+	beforeStats := testJournalEnd(leader)
 	observed, done := startAppliedWaitTest(ctx, leader, "newly applied")
 	expectAppliedWaitObservation(t, ctx, observed, done, false)
 	leader.mu.Lock()
@@ -74,8 +74,8 @@ func TestWaitAppliedUsesAppliedConditionWithoutWriting(t *testing.T) {
 	leader.mu.Unlock()
 	require.NoError(t, err)
 	require.Equal(t, before, index, "parking a readiness wait does not propose a Raft entry")
-	afterStats := testBoltDB(leader).Stats()
-	require.Equal(t, beforeStats.TxStats.GetWrite(), afterStats.TxStats.GetWrite(), "parking does not write the Raft store")
+	afterStats := testJournalEnd(leader)
+	require.Equal(t, beforeStats, afterStats, "parking does not write the Raft store")
 
 	require.NoError(t, cluster.commit(func() error {
 		_, err := leader.Propose(ctx, []byte("newly applied"))
@@ -108,7 +108,7 @@ func TestWaitAppliedCancellationReturnsWithoutWriting(t *testing.T) {
 	ctx, _, leader := newReadTestCluster(t)
 	before, err := leader.store.LastIndex()
 	require.NoError(t, err)
-	beforeStats := testBoltDB(leader).Stats()
+	beforeStats := testJournalEnd(leader)
 	waitCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	observed, done := startAppliedWaitTest(waitCtx, leader, "absent")
@@ -118,8 +118,8 @@ func TestWaitAppliedCancellationReturnsWithoutWriting(t *testing.T) {
 	index, err := leader.store.LastIndex()
 	require.NoError(t, err)
 	require.Equal(t, before, index)
-	afterStats := testBoltDB(leader).Stats()
-	require.Equal(t, beforeStats.TxStats.GetWrite(), afterStats.TxStats.GetWrite())
+	afterStats := testJournalEnd(leader)
+	require.Equal(t, beforeStats, afterStats)
 }
 
 func TestWaitAppliedEndsOnLeaderLoss(t *testing.T) {

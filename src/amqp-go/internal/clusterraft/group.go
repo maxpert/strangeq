@@ -6,6 +6,8 @@ import (
 	"crypto/rand"
 	"errors"
 	"io"
+	"os"
+	"path/filepath"
 	"slices"
 	"sync"
 	"time"
@@ -98,7 +100,7 @@ type configProposal struct {
 type Group struct {
 	mu                                            sync.Mutex
 	cfg                                           Config
-	store                                         groupStore
+	store                                         *journalGroupStore
 	storeFailed                                   <-chan struct{}
 	node                                          *raft.RawNode
 	conf                                          *pb.ConfState
@@ -127,17 +129,36 @@ type Group struct {
 	bufferedOps                                   int
 	bufferedBytes                                 uint64
 	maxBufferedBytes                              uint64
-	journalInput                                  bool
 	exclusiveWaiters                              int
 	closeOnce                                     sync.Once
 	closeErr                                      error
 }
 
+// Open owns one segmented journal for a single group. Multi-group nodes open
+// one NodeJournal and share it across their groups instead.
 func Open(config Config) (*Group, error) {
-	return openGroup(config, openBoltGroupStore)
+	if config.Dir == "" {
+		return nil, errors.New("raft group requires storage")
+	}
+	if _, err := os.Lstat(filepath.Join(config.Dir, "raft.db")); err == nil {
+		return nil, errors.New("legacy raft.db storage requires a fresh directory")
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return nil, err
+	}
+	journal, err := OpenNodeJournal(config.Dir, true)
+	if err != nil {
+		return nil, err
+	}
+	group, err := journal.OpenGroup(config)
+	if err != nil {
+		_ = journal.Close()
+		return nil, err
+	}
+	group.store.closeOwner = true
+	return group, nil
 }
 
-func openGroup(config Config, openStore func(Config) (groupStore, *pb.Snapshot, error)) (_ *Group, err error) {
+func (n *journalGroupNode) openValidatedGroup(config Config) (_ *Group, err error) {
 	if !ValidMemberID(config.ID) || config.GroupID == 0 || config.Dir == "" || config.Machine == nil {
 		return nil, errors.New("raft group requires identity, storage and machine")
 	}
@@ -168,7 +189,7 @@ func openGroup(config Config, openStore func(Config) (groupStore, *pb.Snapshot, 
 	if config.MaxPending < 1 {
 		return nil, errors.New("raft pending limit must be positive")
 	}
-	store, snapshot, err := openStore(config)
+	store, snapshot, err := n.openStore(config)
 	if err != nil {
 		return nil, err
 	}
@@ -180,15 +201,10 @@ func openGroup(config Config, openStore func(Config) (groupStore, *pb.Snapshot, 
 			_ = store.close()
 		}
 	}()
-	_, journalInput := store.(*journalGroupStore)
-	maxBufferedBytes := 4 * config.MaxEntryBytes
-	if journalInput {
-		maxBufferedBytes = min(maxBufferedBytes, journalReadyInputBytes)
-	}
+	maxBufferedBytes := min(4*config.MaxEntryBytes, journalReadyInputBytes)
 	g := &Group{
 		cfg: config, store: store, storeFailed: store.failureSignal(), conf: &pb.ConfState{},
 		pending: make(map[key]chan response), done: make(chan struct{}), maxBufferedBytes: maxBufferedBytes,
-		journalInput: journalInput,
 	}
 	defer g.stopOnStoreReadError(&err)
 	if !raft.IsEmptySnap(snapshot) {
@@ -261,10 +277,8 @@ func (g *Group) apply(entry *pb.Entry) error {
 	}
 	typ := entry.GetType()
 	if typ == pb.EntryConfChange || typ == pb.EntryConfChangeV2 {
-		if journal, ok := g.store.(*journalGroupStore); ok {
-			if err := journal.syncCommit(); err != nil {
-				return err
-			}
+		if err := g.store.syncCommit(); err != nil {
+			return err
 		}
 	}
 	switch typ {
@@ -321,7 +335,8 @@ func (g *Group) applyCommand(entry *pb.Entry) error {
 	var reply []byte
 	var err error
 	machine, journaled := g.cfg.Machine.(journaledMachine)
-	if journal, ok := g.store.(*journalGroupStore); ok && journaled {
+	if journaled {
+		journal := g.store
 		section, sourceErr := journal.commandSource(entry)
 		if sourceErr != nil {
 			return sourceErr
@@ -403,9 +418,7 @@ func (g *Group) checkpointData() ([]byte, error) {
 func (g *Group) recordCheckpoint(index uint64) {
 	g.snapshotIndex = index
 	g.logBytes, g.appliedLogBytes = 0, 0
-	if store, ok := g.store.(*journalGroupStore); ok {
-		g.logBytes, g.appliedLogBytes = store.remainingLogBytes(g.applied)
-	}
+	g.logBytes, g.appliedLogBytes = g.store.remainingLogBytes(g.applied)
 	g.discardObsoleteRoutineCheckpoint()
 }
 
@@ -565,13 +578,9 @@ func (g *Group) Step(ctx context.Context, message *pb.Message) error {
 	if message.GetType() == pb.MsgReadIndex || message.GetType() == pb.MsgReadIndexResp {
 		return errors.New("raft read index must be requested locally on the leader")
 	}
-	inputBytes := uint64(proto.Size(message))
-	if g.journalInput {
-		var err error
-		inputBytes, err = journalPeerInputBytes(message, g.cfg.MaxEntryBytes, inputBytes)
-		if err != nil {
-			return err
-		}
+	inputBytes, err := journalPeerInputBytes(message, g.cfg.MaxEntryBytes, uint64(proto.Size(message)))
+	if err != nil {
+		return err
 	}
 	// A successful snapshot transport receipt still represents a durable
 	// installation (or an already-applied snapshot). Other messages are
@@ -588,12 +597,8 @@ func (g *Group) Propose(ctx context.Context, data []byte) ([]byte, error) {
 	if uint64(len(data)) > g.cfg.MaxEntryBytes-uint64(len(key{})) {
 		return nil, ErrTooLarge
 	}
-	inputBytes := uint64(len(data))
-	if g.journalInput {
-		// Include the proposal key and the maximum protobuf tags and
-		// varints for an ordinary entry's index, term, and lengths.
-		inputBytes += uint64(len(key{})) + 32 + journalEntryInputOverhead
-	}
+	// Include the proposal key and maximum protobuf encoding overhead.
+	inputBytes := uint64(len(data)) + uint64(len(key{})) + 32 + journalEntryInputOverhead
 	var gather time.Duration
 	if g.cfg.GatherProposal != nil {
 		gather = g.cfg.GatherProposal(data)

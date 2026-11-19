@@ -40,6 +40,7 @@ var ErrUnavailable = errors.New("shard leader unavailable")
 var ErrUncertain = errors.New("shard command outcome uncertain")
 
 type Config struct {
+	local                                   bool
 	ClusterID                               string
 	Peer                                    Peer
 	Seeds                                   []Peer
@@ -47,7 +48,6 @@ type Config struct {
 	Listen, Directory, Token                string
 	Shards                                  uint64
 	AllowInsecure                           bool
-	ExperimentalRaftJournal                 bool
 	ExperimentalRaftRangeSync               bool
 	ExperimentalAckAndClaim                 bool
 	ExperimentalAssignments                 bool
@@ -61,6 +61,8 @@ type Config struct {
 }
 
 type Node struct {
+	activationMu           sync.Mutex
+	transport              atomic.Pointer[peerTransport]
 	cfg                    Config
 	nonce                  string
 	catalog                *catalog
@@ -87,6 +89,7 @@ type Node struct {
 }
 
 type identity struct {
+	Local   bool `json:",omitempty"`
 	Peer    Peer
 	Cluster string
 	Shards  uint64
@@ -110,19 +113,13 @@ func open(cfg Config, initialize bool) (*Node, error) {
 	if cfg.Shards == 0 {
 		cfg.Shards = defaultShards
 	}
-	if !clusterraft.ValidMemberID(cfg.Peer.ID) || !validAddress(cfg.Peer.Address) || cfg.Listen == "" || cfg.Directory == "" || cfg.NewMachine == nil {
+	if !clusterraft.ValidMemberID(cfg.Peer.ID) || (!cfg.local && (!validAddress(cfg.Peer.Address) || cfg.Listen == "")) || cfg.Directory == "" || cfg.NewMachine == nil {
 		return nil, errors.New("cluster requires a valid peer, listener, storage directory and machine")
 	}
-	if cfg.ExperimentalRaftRangeSync && !cfg.ExperimentalRaftJournal {
-		return nil, errors.New("cluster range sync requires journal storage")
+	if cfg.ExperimentalRaftJournalDualStream && !cfg.ExperimentalRaftRangeSync {
+		return nil, errors.New("cluster two-stream journal requires range sync")
 	}
-	if cfg.ExperimentalRaftJournalDualStream && (!cfg.ExperimentalRaftJournal || !cfg.ExperimentalRaftRangeSync) {
-		return nil, errors.New("cluster two-stream journal requires journal storage and range sync")
-	}
-	if cfg.ExperimentalAckAndClaim && !cfg.ExperimentalRaftJournal {
-		return nil, errors.New("cluster ACK and claim requires journal storage")
-	}
-	if cfg.ExperimentalAssignments && (!cfg.ExperimentalRaftJournal || cfg.ExperimentalAckAndClaim) {
+	if cfg.ExperimentalAssignments && cfg.ExperimentalAckAndClaim {
 		return nil, errors.New("cluster assignments require a separate journal storage mode")
 	}
 	if cfg.ExperimentalReplicaBodies && !cfg.ExperimentalAssignments {
@@ -138,30 +135,18 @@ func open(cfg Config, initialize bool) (*Node, error) {
 	if err != nil {
 		return nil, err
 	}
-	initialAddr := address(c.initial, cfg.Peer.ID)
-	seed := initialAddr != ""
+	initialPeer, seed := lookupPeer(c.initial, cfg.Peer.ID)
+	initialAddr := initialPeer.Address
 	if (seed && initialAddr != cfg.Peer.Address) || (!seed && initialize) {
 		return nil, errors.New("bootstrap peer identity mismatch")
 	}
-	wcfg := clusterwire.Config{Listen: cfg.Listen, ClusterID: cfg.ClusterID, Token: cfg.Token, TLS: cfg.TLS,
-		AllowInsecure: cfg.AllowInsecure, Timeout: requestTimeout + time.Second, MaxBodyBytes: maxWireBytes}
-	if cfg.ExperimentalAckAndClaim {
-		wcfg.ProtocolVersion = ackAndClaimPeerProtocol
-	}
-	if cfg.ExperimentalAssignments {
-		wcfg.ProtocolVersion = assignmentPeerProtocol
-	}
-	if cfg.ExperimentalJournalBodyCompression {
-		wcfg.ProtocolVersion = compressedBodyPeerProtocol
-	}
-	if cfg.ExperimentalJournalSmallBodyCompression {
-		wcfg.ProtocolVersion = smallCompressedBodyPeerProtocol
-	}
-	// Any quorum member must implement the same durable settlement semantics.
-	wcfg.ProtocolVersion += deadLetterPeerProtocolOffset
-	client, err := clusterwire.NewClient(wcfg)
-	if err != nil {
-		return nil, err
+	wcfg := peerWireConfig(cfg)
+	var client *clusterwire.Client
+	if !cfg.local {
+		client, err = clusterwire.NewClient(wcfg)
+		if err != nil {
+			return nil, err
+		}
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	n := &Node{cfg: cfg, catalog: c, client: client, ctx: ctx, cancel: cancel, groups: map[uint64]*clusterraft.Group{},
@@ -175,13 +160,11 @@ func open(cfg Config, initialize bool) (*Node, error) {
 			_ = n.Close()
 		}
 	}()
-	if err := n.prepareIdentity(seed, initialize); err != nil {
+	if err := n.prepareIdentity(seed, initialize || cfg.local); err != nil {
 		return nil, err
 	}
-	if cfg.ExperimentalRaftJournal {
-		if err := n.prepareJournal(); err != nil {
-			return nil, err
-		}
+	if err := n.prepareJournal(); err != nil {
+		return nil, err
 	}
 	n.current.Store(&c.initial)
 	cache, err := os.ReadFile(n.path("catalog-cache"))
@@ -194,19 +177,21 @@ func open(cfg Config, initialize bool) (*Node, error) {
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return nil, err
 	}
-	if err := n.openExisting(seed, initialize); err != nil {
+	if err := n.openExisting(seed, initialize || cfg.local); err != nil {
 		return nil, err
 	}
 	if initialize {
 		success = true
 		return n, nil
 	}
-	n.wire, err = clusterwire.NewServer(wcfg, n)
-	if err != nil {
-		return nil, err
-	}
-	if err = n.wire.Start(); err != nil {
-		return nil, err
+	if !cfg.local {
+		n.wire, err = clusterwire.NewServer(wcfg, n)
+		if err != nil {
+			return nil, err
+		}
+		if err = n.wire.Start(); err != nil {
+			return nil, err
+		}
 	}
 	n.wg.Add(1)
 	go n.maintain()
@@ -226,13 +211,13 @@ func (n *Node) prepareIdentity(seed, initialize bool) error {
 		return err
 	}
 	p := n.path(name)
-	want := identity{Peer: n.cfg.Peer, Cluster: n.cfg.ClusterID, Shards: n.cfg.Shards, Seeds: n.catalog.initial.Nodes}
+	want := identity{Local: n.cfg.local, Peer: n.cfg.Peer, Cluster: n.cfg.ClusterID, Shards: n.cfg.Shards, Seeds: n.catalog.initial.Nodes}
 	raw, err := os.ReadFile(p)
 	if errors.Is(err, os.ErrNotExist) {
 		if seed && !initialize {
 			return errors.New("original voter is missing persistent identity")
 		}
-		if seed {
+		if seed && !n.cfg.local {
 			addresses := make([]string, 0, len(n.catalog.initial.Nodes)+len(n.cfg.Discovery))
 			for _, other := range n.catalog.initial.Nodes {
 				addresses = append(addresses, other.Address)
@@ -289,7 +274,7 @@ func (n *Node) prepareIdentity(seed, initialize bool) error {
 		return err
 	}
 	var prior identity
-	if json.Unmarshal(raw, &prior) != nil || prior.Peer != want.Peer || prior.Cluster != want.Cluster ||
+	if json.Unmarshal(raw, &prior) != nil || prior.Local != want.Local || prior.Peer != want.Peer || prior.Cluster != want.Cluster ||
 		prior.Shards != want.Shards || !slices.Equal(prior.Seeds, want.Seeds) ||
 		(seed && prior.Nonce != "") || (!seed && !validNonce(prior.Nonce)) {
 		return errors.New("persistent cluster identity does not match configuration")
@@ -412,11 +397,6 @@ func (n *Node) openExisting(seed, initialize bool) error {
 			return err
 		}
 		if retired {
-			if n.journal == nil {
-				if err := os.RemoveAll(n.store(id)); err != nil {
-					return err
-				}
-			}
 			continue
 		}
 		exists, err := n.storeExists(id)
@@ -466,18 +446,14 @@ func (n *Node) openGroup(id uint64, peers []uint64) error {
 	if id != catalogID {
 		machine = n.cfg.NewMachine(id)
 	}
-	storeOpen := clusterraft.Open
 	var gatherProposal func([]byte) time.Duration
-	if n.journal != nil {
-		storeOpen = n.journal.OpenGroup
-		if n.cfg.ExperimentalAssignments && id != catalogID {
-			gatherProposal = gatherSettlement
-		}
+	if n.cfg.ExperimentalAssignments && id != catalogID {
+		gatherProposal = gatherSettlement
 	}
-	g, err := storeOpen(clusterraft.Config{
+	g, err := n.journal.OpenGroup(clusterraft.Config{
 		ID: n.cfg.Peer.ID, GroupID: id, Dir: n.store(id), Peers: peers, Machine: machine, MaxEntryBytes: maxEntryBytes,
-		DeferJournalCommit:           n.journal != nil && id != catalogID,
-		BackgroundJournalCheckpoints: n.journal != nil && id != catalogID,
+		DeferJournalCommit:           id != catalogID,
+		BackgroundJournalCheckpoints: id != catalogID,
 		AssignmentReplicaBodies:      n.assignmentReplicaSlots != nil && id != catalogID,
 		GatherProposal:               gatherProposal,
 		Send:                         func(msg *pb.Message) error { return n.send(id, msg) },
@@ -535,7 +511,8 @@ func (n *Node) install(v view) {
 	}
 }
 func (n *Node) enrolled(v view) bool {
-	return address(v, n.cfg.Peer.ID) == n.cfg.Peer.Address && v.Nonces[n.cfg.Peer.ID] == n.nonce
+	peer, known := lookupPeer(v, n.cfg.Peer.ID)
+	return known && (n.cfg.local || peer.Address == n.cfg.Peer.Address) && v.Nonces[n.cfg.Peer.ID] == n.nonce
 }
 func (n *Node) SupportsAckAndClaim() bool { return n.cfg.ExperimentalAckAndClaim }
 
@@ -560,7 +537,9 @@ func (n *Node) Ready() error {
 }
 func (n *Node) Close() error {
 	n.closeOnce.Do(func() {
+		n.activationMu.Lock()
 		n.cancel()
+		defer n.activationMu.Unlock()
 		// Quiesce admissions that can register workers before waiting on n.wg.
 		n.sendMu.Lock()
 		n.sendMu.Unlock()
@@ -571,6 +550,12 @@ func (n *Node) Close() error {
 			n.closeErr = n.wire.Close(ctx)
 			cancel()
 		}
+		if transport := n.transport.Load(); transport != nil {
+			ctx, cancel := context.WithTimeout(context.Background(), requestTimeout)
+			n.closeErr = errors.Join(n.closeErr, transport.server.Close(ctx))
+			cancel()
+			transport.client.Close()
+		}
 		n.wg.Wait()
 		for _, g := range n.groups {
 			n.closeErr = errors.Join(n.closeErr, g.Close())
@@ -578,7 +563,9 @@ func (n *Node) Close() error {
 		if n.journal != nil {
 			n.closeErr = errors.Join(n.closeErr, n.journal.Close())
 		}
-		n.client.Close()
+		if n.client != nil {
+			n.client.Close()
+		}
 	})
 	return n.closeErr
 }
@@ -591,7 +578,7 @@ type packet struct {
 
 func (n *Node) send(group uint64, msg *pb.Message) error {
 	id := msg.GetTo()
-	if address(n.view(), id) == "" {
+	if address(n.view(), id) == "" || n.peerClient() == nil {
 		return ErrUnavailable
 	}
 	n.sendMu.Lock()
@@ -655,7 +642,10 @@ func (n *Node) sendLoop(peer uint64, queue <-chan packet) {
 			return
 		}
 		ctx, cancel := context.WithTimeout(n.ctx, timeout)
-		err := n.client.Raft(ctx, address(n.view(), peer), p.group, batch)
+		err := error(ErrUnavailable)
+		if client := n.peerClient(); client != nil {
+			err = client.Raft(ctx, address(n.view(), peer), p.group, batch)
+		}
 		cancel()
 		n.sendBytes.Add(-charged)
 		clear(batch)

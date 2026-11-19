@@ -31,10 +31,7 @@ type nodeJournalOwner interface {
 }
 
 func (n *Node) storageIdentity() (name, mode string, err error) {
-	name, mode = boltIdentityFile, "bolt"
-	if n.cfg.ExperimentalRaftJournal {
-		name, mode = journalIdentityFile, "journal"
-	}
+	name, mode = journalIdentityFile, "journal"
 	if n.cfg.ExperimentalAckAndClaim {
 		mode = "journal-ack-and-claim"
 	}
@@ -47,20 +44,16 @@ func (n *Node) storageIdentity() (name, mode string, err error) {
 	if n.cfg.ExperimentalJournalSmallBodyCompression {
 		name, mode = smallBodyJournalIdentityFile, "journal-assignments-small-compressed-bodies"
 	}
-	if n.cfg.ExperimentalRaftJournal {
-		mode = "segmented-" + mode
-	}
+	mode = "segmented-" + mode
 	if n.cfg.ExperimentalRaftJournalDualStream {
 		mode += "-two-stream-parity-v1"
 	}
-	if n.cfg.ExperimentalRaftJournal {
-		// Existing journal identities must carry the segmented storage mode.
-		if exists, err := pathExists(n.path(name)); err != nil {
-			return "", "", err
-		} else if exists {
-			if _, err := os.ReadFile(n.path(clusterStorageModeFile)); err != nil {
-				return "", "", fmt.Errorf("journal lost its persistent storage mode: %w", err)
-			}
+	// Existing journal identities must carry the segmented storage mode.
+	if exists, err := pathExists(n.path(name)); err != nil {
+		return "", "", err
+	} else if exists {
+		if _, err := os.ReadFile(n.path(clusterStorageModeFile)); err != nil {
+			return "", "", fmt.Errorf("journal lost its persistent storage mode: %w", err)
 		}
 	}
 	for _, other := range [...]string{boltIdentityFile, journalIdentityFile, smallBodyJournalIdentityFile} {
@@ -88,22 +81,14 @@ func (n *Node) checkStorageModeClaim(mode string) error {
 	if err != nil {
 		return err
 	}
-	if !matchesStorageModeEpoch(mode, string(prior)) {
+	if mode != string(prior) {
 		return fmt.Errorf("cluster storage mode %s conflicts with persistent mode %q", mode, prior)
 	}
 	return nil
 }
 
-func matchesStorageModeEpoch(mode, prior string) bool {
-	if mode == prior {
-		return true
-	}
-	base, current := strings.CutSuffix(mode, deadLetterStorageModeSuffix)
-	return current && (prior == base || prior == base+"-dead-letter-v1")
-}
-
-// Install the new epoch before opening any Raft group. An older binary
-// rejects this mode before it can replay settlement with old semantics.
+// Verify the exact current epoch before opening any Raft group. Fresh-format
+// releases reject older settlement semantics instead of upgrading a store.
 func (n *Node) ensureStorageModeEpoch(mode string) error {
 	path := n.path(clusterStorageModeFile)
 	prior, err := os.ReadFile(path)
@@ -113,13 +98,10 @@ func (n *Node) ensureStorageModeEpoch(mode string) error {
 	if err != nil {
 		return err
 	}
-	if string(prior) == mode {
-		return nil
-	}
-	if !matchesStorageModeEpoch(mode, string(prior)) {
+	if mode != string(prior) {
 		return fmt.Errorf("cluster storage mode %s conflicts with persistent mode %q", mode, prior)
 	}
-	return durableFile(path, []byte(mode))
+	return nil
 }
 
 func (n *Node) claimStorageMode(mode string) error {
@@ -181,7 +163,7 @@ func (n *Node) prepareJournal() error {
 		// A legacy per-group Bolt file is an incompatible authority even
 		// if its old identity file was removed independently.
 		if _, parseErr := strconv.ParseUint(name, 10, 64); parseErr == nil && entry.IsDir() {
-			exists, err := clusterraft.Exists(n.path(name))
+			exists, err := pathExists(n.path(name + "/raft.db"))
 			if err != nil {
 				return err
 			}
@@ -214,8 +196,5 @@ func (n *Node) prepareJournal() error {
 }
 
 func (n *Node) storeExists(id uint64) (bool, error) {
-	if n.journal != nil {
-		return n.journal.HasGroup(id), nil
-	}
-	return clusterraft.Exists(n.store(id))
+	return n.journal.HasGroup(id), nil
 }

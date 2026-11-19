@@ -1,6 +1,6 @@
 # StrangeQ and RabbitMQ cluster comparison
 
-Run `scripts/cluster_compare.py` from `src/amqp-go` to compare three StrangeQ brokers with three RabbitMQ 4.4.0 brokers running quorum queues. The same RabbitMQ PerfTest 2.25.0 client drives both. The broker processes share one test host and one scratch volume. The results characterize that host and workload.
+Run `scripts/cluster_compare.py` from `src/amqp-go` to compare StrangeQ with RabbitMQ 4.4.0. The default `--topology quorum3` compares three StrangeQ voters with three RabbitMQ brokers running quorum queues. `--topology singleton` compares one local-journal StrangeQ broker with one RabbitMQ broker running durable Classic queues. The same RabbitMQ PerfTest 2.25.0 client drives both engines. The broker processes share one test host and one scratch volume. The results characterize that host and workload; keep the two topologies in separate result sets.
 
 | Payload | Producers | Consumers | Queues |
 | --- | ---: | ---: | ---: |
@@ -8,7 +8,7 @@ Run `scripts/cluster_compare.py` from `src/amqp-go` to compare three StrangeQ br
 | 1 KiB | 10 | 10 | 10 |
 | 64 KiB | 10 | 10 | 10 |
 
-The client uses round-robin connection allocation, a named direct exchange, persistent mandatory publishes, a confirm window of 64 per publisher, and manual acknowledgments with prefetch 100. The RabbitMQ default quorum command window of 32 is explicit. Use `--rabbit-window` to record a separate RabbitMQ tuning trial. Use `--rate-per-producer` to repeat a workload at a fixed offered rate. Accept a matched-load RSS comparison only after checking each broker sustained that load on both its confirm and delivery paths.
+The client uses round-robin connection allocation, a named direct exchange, persistent mandatory publishes, a confirm window of 64 per publisher, and manual acknowledgments with prefetch 100 in both modes. The RabbitMQ quorum command window of 32 is explicit in `quorum3`; it does not apply to Classic. Use `--rabbit-window` to record a separate quorum tuning trial. Use `--rate-per-producer` to repeat any workload in either mode at a fixed offered rate. Accept a matched-load RSS comparison only after checking each broker sustained that load on both its confirm and delivery paths.
 
 ## Recorded ARM64 runs
 
@@ -17,7 +17,7 @@ results below. The [historical README results](../../../README.md#historical-nor
 
 The 1 KiB single-queue case ran for 24 seconds with one publisher and one consumer. The 64 KiB ten-queue case ran for 23 seconds with ten publishers, ten consumers, and an offered rate of 500 messages/s per publisher. The throughput medians exclude the first four seconds of each run. Peak RSS is the highest simultaneous sum across the three broker processes for each run.
 
-StrangeQ used 32 shards, the experimental segmented journal, synchronous range writes, consumer assignments, and both body compression options. The 64 KiB case also used two journal streams per broker. Use `--strangeq-shards 32 --strangeq-journal --strangeq-range-sync --strangeq-assignments --strangeq-journal-body-compression --strangeq-journal-small-body-compression` to select the same broker settings. For the 64 KiB case, add `--strangeq-dual-stream --rate-per-producer 500`.
+StrangeQ used 32 shards, the experimental segmented journal, synchronous range writes, consumer assignments, and both body compression options. The 64 KiB case also used two journal streams per broker. To replay these historical measurements, use both the runner and broker binary from `f02275a`, with that revision's `--strangeq-shards 32 --strangeq-journal --strangeq-range-sync --strangeq-assignments --strangeq-journal-body-compression --strangeq-journal-small-body-compression` settings. For the 64 KiB case, add `--strangeq-dual-stream --rate-per-producer 500`. The current runner requires the unconditional segmented journal and no longer accepts `--strangeq-journal`; a new run of the current code is a separate result set.
 
 ## Replicated dead-lettering runs
 
@@ -43,6 +43,9 @@ synchronous range writes, consumer assignments, and both body compression
 settings. The measurements cover short steady-state windows on this host and
 storage configuration, using one reused payload body. Crash recovery, failover,
 and unique payload bodies require separate measurements.
+Replay this separate reconciliation workload with the recorded `bf52074` binary
+and original reconciliation harness/configuration. The normal-workload runner
+below does not reproduce this DLQ client.
 
 | Pair | StrangeQ confirms/s | StrangeQ DLQ deliveries/s | StrangeQ RSS (MiB) | RabbitMQ confirms/s | RabbitMQ DLQ deliveries/s | RabbitMQ RSS (MiB) |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
@@ -83,11 +86,13 @@ python3 scripts/cluster_compare.py \
   --output /path/to/benchmark-evidence
 ```
 
-The prerequisites and topology can be checked without publishers using `--validate-only --case 1024-1x1-1q --repeats 1`. A measured run defaults to three interleaved repeats of all three workloads. Trials run serially and alternate which broker starts the pair. Use `--case` for a targeted run. Each trial uses newly created loopback listeners, data directories, a cluster credential, and a RabbitMQ-local EPMD process. The script stops its own processes and removes each trial's temporary data on exit. Logs and measurements remain under `--output`.
+Add `--topology singleton` to this command for the configured [local-journal pilot](../../../docs/CLUSTERING.md#pilot-start-locally-then-activate-peers). It writes `cluster: {local: true}` with the requested `--strangeq-shards`, starts once without an initialization command, and supplies no peer endpoint or credential. RabbitMQ starts one node with Classic as the explicit default; the client omits its quorum-queue declaration flag. This measures the local journal, not the legacy standalone engine.
 
-Add `--strangeq-journal` to select the experimental Raft journal on a supporting StrangeQ binary. For a topology smoke check, combine the flag with `--validate-only --case 1024-1x1-1q --repeats 1`. Each StrangeQ broker must have a journal identity, a storage mode and provision marker, a segmented journal manifest and extent files, and open replicas for the catalog and workload shards. The checker rejects per-group Bolt files in this mode. `environment.json` records which StrangeQ storage engine ran. Provision fresh storage for the segmented journal. It rolls into 256 MiB extents and reclaims sealed files once a durable recovery index, live messages, and readers no longer need them. The 8 GiB budget counts retained extent and index bytes per node and is shared across streams. Cumulative appends can exceed that budget as files are reclaimed. Snapshot blobs have a separate 8 GiB budget per stream.
+The prerequisites and topology can be checked without publishers using `--validate-only --case 1024-1x1-1q --repeats 1` in either mode. A measured run defaults to three interleaved repeats of all three workloads. Trials run serially and alternate which broker starts the pair. Use `--case` for a targeted run. Each trial uses fresh data directories and loopback application listeners; `quorum3` also configures peer listeners and a cluster credential. RabbitMQ has a private EPMD process in both modes. The script stops its own processes and removes temporary trial data on exit. Logs and measurements remain under `--output`.
 
-Add `--strangeq-ack-and-claim` with `--strangeq-journal` to measure combined manual ACK and delivery refill. The checker verifies the corresponding storage mode on all three brokers before and after the trial. The mode is recorded in `environment.json`.
+The current runner always requires the segmented Raft journal and emits no backend opt-in setting. Every StrangeQ broker must have a journal identity, a storage mode and provision marker, a segmented journal manifest and extent files, and open replicas for the catalog and workload shards. These checks always run before and after each trial, including `--validate-only`; legacy per-group Bolt files are rejected. `environment.json` records `strangeq_storage: segmented_journal`, the binary hash and every active option below. Provision fresh storage; existing bbolt Raft stores and flat journals are not converted. The journal rolls into 256 MiB extents and reclaims sealed files once a durable recovery index, live messages, and readers no longer need them. The 8 GiB budget counts retained extent and index bytes per node and is shared across streams. Cumulative appends can exceed that budget as files are reclaimed. Snapshot blobs have a separate 8 GiB budget per stream. Ordinary standalone storage is unchanged by this Raft backend transition.
+
+Optional settings remain explicit and default off: `--strangeq-range-sync`, `--strangeq-dual-stream`, `--strangeq-ack-and-claim`, `--strangeq-assignments`, `--strangeq-replica-bodies`, `--strangeq-journal-body-compression`, and `--strangeq-journal-small-body-compression`. Dual stream requires range sync; ACK-and-claim and assignments use separate modes; replica bodies and compression require assignments; small-body compression requires body compression. The checker verifies the selected storage mode on every broker before and after the trial. See [journal configuration and restart requirements](../../../docs/CLUSTERING.md#shared-segmented-journal). `--strangeq-shards` controls fresh-cluster shard count in both topologies.
 
 ## macOS durability comparison
 
@@ -95,9 +100,9 @@ Add `--strangeq-ack-and-claim` with `--strangeq-journal` to measure combined man
 
 ## Read the results
 
-`summary.json` reports the median and range for sent publishes/s, confirmed publishes/s, deliveries/s, highest combined broker RSS, and both p99 latencies. Throughput averages complete one-second samples after the configured warmup. Compare the actual send rates when interpreting capped runs. PerfTest's p99 covers its full timed run. RSS is the maximum of the sums observed in simultaneous three-PID samples from client launch through client exit. It excludes the client and EPMD. Each run keeps its raw PerfTest log, RSS samples, command, and before/after placement checks.
+`summary.json` reports the median and range for sent publishes/s, confirmed publishes/s, deliveries/s, highest combined broker RSS, and both p99 latencies. Throughput averages complete one-second samples after the configured warmup. Compare actual send rates when interpreting capped runs. PerfTest's p99 covers its full timed run. The existing `peak_cluster_rss_bytes` field is the peak simultaneous sum of three broker PIDs in `quorum3` or the single broker PID in `singleton`, excluding client and EPMD. `environment.json` and each timed result record topology, process count and RSS scope. Each run keeps its raw PerfTest log, RSS samples, command and before/after placement checks.
 
-RabbitMQ checks include queue durability and type, three online members, actual leader distribution, and pinned release versions. StrangeQ checks confirm three enrolled catalog voters and three committed voters with local storage for every queue's shard. Its placement evidence records preferred leaders using the catalog's ranking algorithm. The existing server exposes no external per-shard leader query for verifying the actual leaders in this harness.
+In `quorum3`, RabbitMQ checks retain queue durability/type, three online members, actual leader distribution and pinned versions. StrangeQ retains three enrolled catalog voters and three committed voters with local storage for every workload shard; evidence records preferred leaders. In `singleton`, RabbitMQ must report one pinned-version node and unique durable Classic queues in `running` state, using the documented [queue inspection fields](https://www.rabbitmq.com/docs/man/rabbitmqctl.8#list_queues). StrangeQ must have a private `Local:true` persistent identity, its generated lineage and sole blank-address seed matching the catalog, no peer-activation intent, sole-voter committed membership reports with positive configuration indexes, and open journal groups for catalog/workload shards. Those reports are a persisted observation rather than a live Raft-status query; the unactivated local lifecycle provides no peer membership ingress. The server exposes no external per-shard live leader/membership query in this harness.
 
 A measured run requires every interval after warm-up, positive confirms and deliveries, and zero observed negative confirms, returns, or client errors across the log. Missing warm-up intervals are counted in each trial's `result.json`. PerfTest measures rates during a time window. Use separate functional tests for publish-to-delivery reconciliation, durable restart, and failover. Compare peak RSS both at saturation and at matched achieved throughput. Repeat with controlled backlogs separately when assessing queue paging.
 

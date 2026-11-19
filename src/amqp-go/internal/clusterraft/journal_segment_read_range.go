@@ -66,10 +66,7 @@ type journalCaptureQueue struct {
 }
 
 func (g *Group) pinJournalCapture() (func(), error) {
-	store, ok := g.store.(*journalGroupStore)
-	if !ok {
-		return func() {}, nil
-	}
+	store := g.store
 	reader, ok := store.node.reader.(*journalSegmentReader)
 	if !ok {
 		return func() {}, nil

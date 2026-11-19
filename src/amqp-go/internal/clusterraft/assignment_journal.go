@@ -142,10 +142,7 @@ func (g *Group) assignmentJournal() (*journalGroupStore, error) {
 	if !g.cfg.AssignmentReplicaBodies {
 		return nil, raft.ErrUnavailable
 	}
-	store, ok := g.store.(*journalGroupStore)
-	if !ok {
-		return nil, raft.ErrUnavailable
-	}
+	store := g.store
 	if g.terminal != nil {
 		return nil, ErrBusy
 	}

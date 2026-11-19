@@ -13,7 +13,7 @@ import (
 )
 
 func TestLegacyClusterRejectsAssignmentCommandsBeforeProposal(t *testing.T) {
-	config := journalTestNodeConfig(t, true)
+	config := journalTestNodeConfig(t)
 	require.NoError(t, Initialize(config))
 	node, err := Open(config)
 	require.NoError(t, err)
@@ -57,7 +57,7 @@ func TestLegacyClusterRejectsAssignmentCommandsBeforeProposal(t *testing.T) {
 }
 
 func TestAssignmentsRequireFreshJournalAndMatchingPeerMode(t *testing.T) {
-	legacy := journalTestNodeConfig(t, true)
+	legacy := journalTestNodeConfig(t)
 	require.NoError(t, Initialize(legacy))
 	before := journalTestStorageDigest(t, legacy.Directory)
 	incompatible := legacy
@@ -66,7 +66,7 @@ func TestAssignmentsRequireFreshJournalAndMatchingPeerMode(t *testing.T) {
 	require.ErrorContains(t, err, "storage mode")
 	require.Equal(t, before, journalTestStorageDigest(t, legacy.Directory))
 
-	fresh := journalTestNodeConfig(t, true)
+	fresh := journalTestNodeConfig(t)
 	fresh.ExperimentalAssignments = true
 	require.NoError(t, Initialize(fresh))
 	without := fresh
@@ -97,7 +97,7 @@ func TestSmallBodyCompressionFencesLegacyStorageAndPeers(t *testing.T) {
 		cfg.ExperimentalJournalSmallBodyCompression = true
 		return cfg
 	}
-	legacy := journalTestNodeConfig(t, true)
+	legacy := journalTestNodeConfig(t)
 	legacy.ExperimentalAssignments = true
 	legacy.ExperimentalJournalBodyCompression = true
 	require.NoError(t, Initialize(legacy))
@@ -106,7 +106,7 @@ func TestSmallBodyCompressionFencesLegacyStorageAndPeers(t *testing.T) {
 	require.ErrorContains(t, err, "storage mode")
 	require.Equal(t, before, journalTestStorageDigest(t, legacy.Directory))
 
-	fresh := journalTestNodeConfig(t, true)
+	fresh := journalTestNodeConfig(t)
 	fresh.ExperimentalAssignments = true
 	fresh.ExperimentalJournalBodyCompression = true
 	small := enableSmallBodies(fresh)

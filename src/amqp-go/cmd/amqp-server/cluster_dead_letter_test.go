@@ -18,12 +18,12 @@ import (
 )
 
 func TestClusterReliableDeadLetterRecovery(t *testing.T) {
-	for _, journal := range []bool{false, true} {
-		t.Run(fmt.Sprintf("journal=%t", journal), func(t *testing.T) {
+	for _, rangeSync := range []bool{false, true} {
+		t.Run(fmt.Sprintf("range-sync=%t", rangeSync), func(t *testing.T) {
 			const source, target = "source", "target"
 			nodes := newTestCluster(t, 3, 3, 4)
 			for i := range nodes {
-				nodes[i].config.Cluster.ExperimentalRaftJournal = journal
+				nodes[i].config.Cluster.ExperimentalRaftRangeSync = rangeSync
 				_, err := openCluster(nodes[i].config, true)
 				require.NoError(t, err)
 			}
@@ -95,7 +95,6 @@ func TestClusterReliableDeadLetterFanoutAndMultipleNack(t *testing.T) {
 	const source, first, second, exchange = "fanout-source", "fanout-first", "fanout-second", "dead-letter-fanout"
 	nodes := newTestCluster(t, 3, 3, 4)
 	for i := range nodes {
-		nodes[i].config.Cluster.ExperimentalRaftJournal = true
 		_, err := openCluster(nodes[i].config, true)
 		require.NoError(t, err)
 	}
@@ -187,7 +186,6 @@ func TestClusterReliableDeadLetterCrashRestart(t *testing.T) {
 	nodes := newTestCluster(t, 3, 3, 4)
 	configs := make([]*config.AMQPConfig, len(nodes))
 	for i := range nodes {
-		nodes[i].config.Cluster.ExperimentalRaftJournal = true
 		configs[i] = nodes[i].config
 		_, err := openCluster(configs[i], true)
 		require.NoError(t, err)

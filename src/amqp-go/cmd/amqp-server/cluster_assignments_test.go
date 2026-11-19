@@ -113,7 +113,6 @@ func startAssignmentBrokers(t *testing.T, replicaBodies, compressBodies, dualStr
 	nodes := newTestCluster(t, 3, 3, 2)
 	for i := range nodes {
 		settings := &nodes[i].config.Cluster
-		settings.ExperimentalRaftJournal = true
 		settings.ExperimentalRaftRangeSync = dualStream
 		settings.ExperimentalRaftJournalDualStream = dualStream
 		settings.ExperimentalAssignments = true
