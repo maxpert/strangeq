@@ -529,11 +529,18 @@ func (w *journalSegmentOutput) Sync() error {
 		return w.failed
 	}
 	if w.dirty {
-		syncFile := w.store.hooks.syncFile
-		if w.store.processRoots != nil {
-			syncFile = func(*os.File) error { return w.store.processRoots.syncClosure(w) }
+		var err error
+		if roots := w.store.processRoots; roots != nil {
+			var manifest journalSegmentManifest
+			var root processRecoveryRoot
+			manifest, root, err = roots.selectPhysicalClosure(w)
+			if err == nil {
+				err = roots.syncClosure(w, manifest, root.Snapshots)
+			}
+		} else {
+			err = w.store.hooks.syncFile(w.file)
 		}
-		if err := syncFile(w.file); err != nil {
+		if err != nil {
 			w.failed = err
 			w.store.failStorage(err)
 			return err

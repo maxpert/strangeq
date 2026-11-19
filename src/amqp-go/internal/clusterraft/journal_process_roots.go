@@ -14,7 +14,6 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
-	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -159,6 +158,13 @@ func prepareProcessRoots(dir string, create bool, hooks journalSegmentHooks) (*j
 	r := &journalProcessRoots{dir: dir, boot: hooks.processBootID, epoch: hex.EncodeToString(nonce[:]), strict: hooks, recoverEnd: -1}
 	r.process.Store(hooks.processRoots)
 	if err == nil {
+		// The snapshot list defines reachability. Group IDs are optional
+		// retirement hints and can be absent on a persisted root.
+		groups := make(map[string]uint64, len(physical.Snapshots))
+		for _, name := range physical.Snapshots {
+			groups[name] = physical.SnapshotGroups[name]
+		}
+		physical.SnapshotGroups = groups
 		r.physical = physical
 		r.physicalManifest, err = decodeJournalSegmentManifest(physical.Manifest)
 		if err != nil {
@@ -224,7 +230,8 @@ func (r *journalProcessRoots) pinsExtent(id uint64) bool {
 func (r *journalProcessRoots) pinsName(name string) bool {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
-	return name == r.physicalManifest.checkpoint.name || slices.Contains(r.physical.Snapshots, name)
+	_, pinsSnapshot := r.physical.SnapshotGroups[name]
+	return name == r.physicalManifest.checkpoint.name || pinsSnapshot
 }
 func (r *journalProcessRoots) preserveArtifacts(artifacts map[string]int64) {
 	r.mu.RLock()
@@ -235,72 +242,95 @@ func (r *journalProcessRoots) preserveArtifacts(artifacts map[string]int64) {
 	delete(artifacts, r.physicalManifest.checkpoint.name)
 }
 
-// Certification always walks the selected closure, even if the current active
-// descriptor is clean. A process seal/rename is never a physical certificate.
-func (r *journalProcessRoots) syncClosure(w *journalSegmentOutput) error {
-	s := w.store
-	manifest, err := r.minimalPhysicalManifest(s)
+func (r *journalProcessRoots) selectPhysicalClosure(w *journalSegmentOutput) (journalSegmentManifest, processRecoveryRoot, error) {
+	manifest, err := r.minimalPhysicalManifest(w.store)
 	if err != nil {
-		return err
+		return manifest, processRecoveryRoot{}, err
 	}
-	names := make(map[string]bool)
-	for _, e := range manifest.extents {
-		names[fmt.Sprintf("extent-%016x.raft-journal", e.id)] = true
-	}
-	if manifest.checkpoint.name != "" {
-		names[manifest.checkpoint.name] = true
-	}
+	root := processRecoveryRoot{Version: processRecoveryRootVersion, Boot: r.boot, Epoch: r.epoch, End: w.store.end, Next: w.nextSequence, SnapshotGroups: make(map[string]uint64)}
 	if w.index != nil {
-		for _, group := range w.index.shadow.groups {
-			if group.snapshot.name != "" {
-				names[group.snapshot.name] = true
+		for id, group := range w.index.shadow.groups {
+			if name := group.snapshot.name; name != "" {
+				root.Snapshots = append(root.Snapshots, name)
+				root.SnapshotGroups[name] = id
 			}
 		}
 	}
-	for name := range names {
-		file, err := os.OpenFile(filepath.Join(s.dir, name), os.O_RDWR, 0)
-		if err != nil {
+	return manifest, root, nil
+}
+
+func (r *journalProcessRoots) syncClosure(w *journalSegmentOutput, manifest journalSegmentManifest, snapshots []string) error {
+	// The writer owns both manifests. The previous physical root pins its
+	// immutable files until publication succeeds, so their fences carry over.
+	// Its active extent can have gained bytes before being sealed.
+	previous := r.physicalManifest.extents
+	active := manifest.extents[len(manifest.extents)-1]
+	needDirectoryFence := len(previous) == 0 || previous[len(previous)-1] != active
+	for _, extent := range manifest.extents[:len(manifest.extents)-1] {
+		for len(previous) > 0 && previous[0].id < extent.id {
+			previous = previous[1:]
+		}
+		if len(previous) > 0 && previous[0] == extent {
+			continue
+		}
+		if err := r.syncClosureFile(w.store.path(extent.id)); err != nil {
 			return err
 		}
-		err = errors.Join(r.strict.syncFile(file), file.Close())
-		if err != nil {
+		needDirectoryFence = true
+	}
+	if ckpt := manifest.checkpoint; ckpt.name != "" && ckpt != r.physicalManifest.checkpoint {
+		if err := r.syncClosureFile(filepath.Join(r.dir, ckpt.name)); err != nil {
 			return err
+		}
+		needDirectoryFence = true
+	}
+	for _, name := range snapshots {
+		if _, certified := r.physical.SnapshotGroups[name]; !certified {
+			if err := r.syncClosureFile(filepath.Join(r.dir, name)); err != nil {
+				return err
+			}
+			needDirectoryFence = true
 		}
 	}
-	return r.strict.syncDir(s.dir)
+	if err := r.strict.syncFile(w.file); err != nil {
+		return err
+	}
+	if needDirectoryFence {
+		return r.strict.syncDir(r.dir)
+	}
+	return nil
 }
+
+func (r *journalProcessRoots) syncClosureFile(path string) error {
+	file, err := os.OpenFile(path, os.O_RDWR, 0)
+	if err != nil {
+		return err
+	}
+	return errors.Join(r.strict.syncFile(file), file.Close())
+}
+
 func (r *journalProcessRoots) certify(w *journalSegmentOutput) error {
 	s := w.store
-	if err := r.syncClosure(w); err != nil {
-		return err
-	}
-	manifest, err := r.minimalPhysicalManifest(s)
+	manifest, root, err := r.selectPhysicalClosure(w)
 	if err != nil {
 		return err
 	}
-	data, err := manifest.encode()
+	if err = r.syncClosure(w, manifest, root.Snapshots); err != nil {
+		return err
+	}
+	root.Manifest, err = manifest.encode()
 	if err != nil {
 		return err
 	}
-	root := processRecoveryRoot{Version: processRecoveryRootVersion, Boot: r.boot, Epoch: r.epoch, Manifest: data, End: s.end, Next: w.nextSequence, SnapshotGroups: make(map[string]uint64)}
-	if w.index != nil {
-		for id, g := range w.index.shadow.groups {
-			if g.snapshot.name != "" {
-				root.Snapshots = append(root.Snapshots, g.snapshot.name)
-				root.SnapshotGroups[g.snapshot.name] = id
-			}
-		}
-	}
-	if err = r.publishLive(); err != nil {
-		return err
-	}
+	// Manifest installation already published the corresponding live root.
+	// Appending to the active extent leaves the live manifest unchanged.
 	if err = r.writeRoot(processPhysicalRoot, root, true); err != nil {
 		return err
 	}
 	r.mu.Lock()
 	previous, previousManifest := r.physical, r.physicalManifest
 	for _, name := range previous.Snapshots {
-		if !slices.Contains(root.Snapshots, name) {
+		if _, retained := root.SnapshotGroups[name]; !retained {
 			// Only an owning Group's post-publication proof permits immediate GC.
 			if _, proven := r.retiredSnapshots[name]; proven {
 				continue
@@ -482,7 +512,7 @@ func (s *journalGroupStore) sweepProcessSnapshots() {
 func (r *journalProcessRoots) deferRetiredSnapshot(group uint64, name string) bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if !slices.Contains(r.physical.Snapshots, name) {
+	if _, pinned := r.physical.SnapshotGroups[name]; !pinned {
 		// Certification may have inferred this retirement just before the
 		// owning Group arrived at its publication proof. Cancel that retry now.
 		queued := r.pendingSnapshots[group]
@@ -516,7 +546,7 @@ func (r *journalProcessRoots) reapRetiredSnapshots() {
 	r.mu.Lock()
 	var names []string
 	for name := range r.retiredSnapshots {
-		if !slices.Contains(r.physical.Snapshots, name) {
+		if _, pinned := r.physical.SnapshotGroups[name]; !pinned {
 			names = append(names, name)
 			delete(r.retiredSnapshots, name)
 		}
