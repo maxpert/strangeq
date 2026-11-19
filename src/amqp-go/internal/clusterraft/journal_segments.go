@@ -53,6 +53,7 @@ type journalSegmentStorage struct {
 	writerClosed         bool
 	closed               bool
 
+	readFiles journalExtentReadFiles
 	readSlots chan struct{}
 	reads     sync.WaitGroup
 	closeOnce sync.Once
@@ -558,19 +559,16 @@ func (s *journalSegmentStorage) readAtView(manifest journalSegmentManifest, visi
 			break
 		}
 		count := int(min(int64(len(data)-read), end-offset))
-		file, err := os.Open(s.path(extent.id))
+		loan, err := s.borrowReadFile(extent.id)
 		if err != nil {
 			return read, err
 		}
-		n, err := diskRead(file, data[read:read+count], offset-extent.base)
-		closeErr := file.Close()
+		n, err := diskRead(loan.file, data[read:read+count], offset-extent.base)
+		s.releaseReadFile(loan)
 		read += n
 		offset += int64(n)
 		if err != nil {
 			return read, err
-		}
-		if closeErr != nil {
-			return read, closeErr
 		}
 	}
 	if read < len(data) {
@@ -590,7 +588,7 @@ func (r *journalSegmentReader) Close() error {
 	s.mu.Unlock()
 	s.closeOnce.Do(func() {
 		s.reads.Wait()
-		s.closeErr = s.owner.Close()
+		s.closeErr = errors.Join(s.closeReadFiles(), s.owner.Close())
 	})
 	return s.closeErr
 }

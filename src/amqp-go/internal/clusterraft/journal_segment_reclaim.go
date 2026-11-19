@@ -29,6 +29,9 @@ func (w *journalSegmentOutput) reclaimSealedFiles() error {
 	s.mu.Unlock()
 	var reclaimed int64
 	for _, extent := range removed {
+		if err := s.closeReadFile(extent.id); err != nil {
+			return fmt.Errorf("close retired journal extent %d: %w", extent.id, err)
+		}
 		if err := os.Remove(s.path(extent.id)); err != nil {
 			return fmt.Errorf("remove retired journal extent %d: %w", extent.id, err)
 		}
