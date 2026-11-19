@@ -141,6 +141,18 @@ func (p *clusterPublishBurst) finish(index int, outcome error) error {
 	return p.server.finishPublish(p.conn, p.channelID, item.message, item.channel, item.tag, item.started, false, outcome)
 }
 
+// A shared routing or submission failure affects every uncompleted item in
+// the burst. Recoverable failures must settle all their confirm tags before a
+// later publish can advance the contiguous frontier. Never resubmit these items.
+func (p *clusterPublishBurst) finishRemaining(start int, outcome error) error {
+	for i := start; i < len(p.items); i++ {
+		if err := p.finish(i, outcome); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func (p *clusterPublishBurst) flushSingles(start int) error {
 	for i := start; i < len(p.items); i++ {
 		item := p.items[i]
@@ -207,14 +219,14 @@ func (p *clusterPublishBurst) flush() error {
 	if first.Exchange != "" {
 		reply, err := p.broker.exchange(ctx, first.Exchange, clusterExchangeCommand{Kind: exchangeDescribe})
 		if err != nil {
-			return p.finish(0, err)
+			return p.finishRemaining(0, err)
 		}
 		if reply.Exchange.Type == "headers" && !reply.Exchange.Internal {
 			return p.flushSingles(0)
 		}
 		targets, err := routeClusterExchange(reply.Exchange, first.RoutingKey, first.Headers)
 		if err != nil {
-			return p.finish(0, err)
+			return p.finishRemaining(0, err)
 		}
 		switch len(targets) {
 		case 0:
@@ -234,15 +246,15 @@ func (p *clusterPublishBurst) flush() error {
 	}
 	command, err := clusterqueue.EncodePublishBatchRecords(target.Queue, target.Incarnation, records[:len(p.items)])
 	if err != nil {
-		return p.finish(0, err)
+		return p.finishRemaining(0, err)
 	}
 	wire, err := p.broker.cluster.Submit(ctx, target.Queue, command)
 	if err != nil {
-		return p.finish(0, err)
+		return p.finishRemaining(0, err)
 	}
 	result, err := clusterqueue.DecodeResponse(wire)
 	if err != nil {
-		return p.finish(0, err)
+		return p.finishRemaining(0, err)
 	}
 	outcome := result.Err()
 	switch {
@@ -250,7 +262,7 @@ func (p *clusterPublishBurst) flush() error {
 	case (errors.Is(outcome, clusterqueue.ErrCapacity) || errors.Is(outcome, clusterqueue.ErrIDsExhausted)) && result.Count < uint64(len(p.items)):
 	case outcome != nil && result.Count == 0:
 	default:
-		return p.finish(0, fmt.Errorf("invalid cluster publish batch outcome (count %d)", result.Count))
+		return p.finishRemaining(0, fmt.Errorf("invalid cluster publish batch outcome (count %d)", result.Count))
 	}
 	published := int(result.Count)
 	if err := p.finishCommitted(published); err != nil {
@@ -272,6 +284,6 @@ func (p *clusterPublishBurst) flush() error {
 		// opportunity for a smaller, unattempted message to fit.
 		return p.flushSingles(published + 1)
 	default:
-		return p.finish(published, outcome)
+		return p.finishRemaining(published, outcome)
 	}
 }

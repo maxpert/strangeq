@@ -10,6 +10,7 @@ import (
 	"github.com/maxpert/amqp-go/broker"
 	amqperrors "github.com/maxpert/amqp-go/errors"
 	"github.com/maxpert/amqp-go/interfaces"
+	"github.com/maxpert/amqp-go/internal/cluster"
 	"github.com/maxpert/amqp-go/protocol"
 	"github.com/maxpert/amqp-go/transaction"
 	"go.uber.org/zap"
@@ -706,6 +707,12 @@ func (s *Server) finishPublish(conn *protocol.Connection, channelID uint16, mess
 			}
 			return nil
 		}
+		if confirmTag > 0 && (errors.Is(err, cluster.ErrUnavailable) || errors.Is(err, cluster.ErrUncertain)) {
+			// The gateway is healthy while the shard elects or its reply is
+			// unknown. A negative confirm does not assert that no copy committed.
+			// Settle this tag without retrying the publish or closing the session.
+			return s.settleRejectConfirm(conn, confirmCh, confirmTag)
+		}
 		s.Log.Error("Failed to route message",
 			zap.Error(err),
 			zap.String("exchange", message.Exchange),
@@ -718,7 +725,9 @@ func (s *Server) finishPublish(conn *protocol.Connection, channelID uint16, mess
 		// failed. Best-effort: the connection is likely torn down on the returned
 		// error, but the settle keeps the fold consistent if it is not.
 		if confirmTag > 0 {
-			_ = s.settleRejectConfirm(conn, confirmCh, confirmTag)
+			if wireErr := s.settleRejectConfirm(conn, confirmCh, confirmTag); wireErr != nil {
+				return errors.Join(err, wireErr)
+			}
 		}
 		return err
 	}

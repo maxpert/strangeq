@@ -2,16 +2,102 @@ package server
 
 import (
 	"context"
+	"errors"
+	"fmt"
+	"net"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/maxpert/amqp-go/config"
+	"github.com/maxpert/amqp-go/internal/cluster"
 	"github.com/maxpert/amqp-go/internal/clusterqueue"
 	"github.com/maxpert/amqp-go/protocol"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/zap"
 )
+
+func TestClusterPublishAmbiguousBurstNacksEveryTagAndContinues(t *testing.T) {
+	const queue = "ambiguous-batch"
+	state := &localClusterMachine{}
+	var submits int
+	b := NewClusterBroker(clusterSubmitFunc(func(ctx context.Context, key string, wire []byte) ([]byte, error) {
+		command, err := clusterqueue.DecodeCommand(wire)
+		if err == nil && (command.Kind == clusterqueue.PublishBatch || command.Kind == clusterqueue.PublishMessage) {
+			submits++
+			if submits == 1 {
+				require.Equal(t, clusterqueue.PublishBatch, command.Kind, "fixture must reach the actual multi-publish submission")
+				_, err := state.Submit(ctx, key, wire)
+				require.NoError(t, err)
+				return nil, fmt.Errorf("committed batch reply lost: %w", cluster.ErrUncertain)
+			}
+		}
+		return state.Submit(ctx, key, wire)
+	}))
+	_, err := b.DeclareQueue(queue, true, false, false, nil)
+	require.NoError(t, err)
+	srv := &Server{Broker: b, Log: zap.NewNop(), Config: config.DefaultConfig()}
+	conn, output := newPipeConnWithFrames(t)
+	ch := protocol.NewChannel(1, conn)
+	conn.Channels.Store(ch.ID, ch)
+	ch.ConfirmMode.Store(true)
+	burst := &clusterPublishBurst{server: srv, broker: b, conn: conn}
+	for _, body := range []string{"one", "two", "three"} {
+		require.NoError(t, srv.processCompleteMessageWithBurst(conn, ch.ID, makeDurablePendingMessage("", queue, body), burst))
+	}
+	require.Len(t, burst.items, 3)
+	require.NoError(t, burst.flush(), "ambiguous cluster result must settle confirms without closing the healthy gateway")
+	for tag := uint64(1); tag <= 3; tag++ {
+		class, method, payload := nextMethodFrame(t, output)
+		require.EqualValues(t, 60, class)
+		require.EqualValues(t, protocol.BasicNack, method)
+		nack := &protocol.BasicNackMethod{}
+		require.NoError(t, nack.Deserialize(payload))
+		require.Equal(t, tag, nack.DeliveryTag)
+		require.False(t, nack.Multiple)
+		require.False(t, nack.Requeue)
+	}
+	require.EqualValues(t, 3, ch.ConfirmContig(), "no ambiguous batch tag can strand the confirm frontier")
+	require.NoError(t, srv.processCompleteMessageWithBurst(conn, ch.ID, makeDurablePendingMessage("", queue, "later"), burst))
+	require.NoError(t, burst.flush())
+	class, method, payload := nextMethodFrame(t, output)
+	require.EqualValues(t, 60, class)
+	require.EqualValues(t, protocol.BasicAck, method)
+	ack := &protocol.BasicAckMethod{}
+	require.NoError(t, ack.Deserialize(payload))
+	require.EqualValues(t, 4, ack.DeliveryTag, "a later successful publish must confirm on the original channel")
+	require.Equal(t, 2, submits, "an ambiguous committed batch must never be submitted again")
+	require.False(t, conn.Closed.Load())
+	for _, body := range []string{"one", "two", "three", "later"} {
+		message, _, _, err := b.GetMessageForGetOwned(queue, true, "audit")
+		require.NoError(t, err)
+		require.NotNil(t, message)
+		require.Equal(t, body, string(message.Body))
+	}
+	message, _, _, err := b.GetMessageForGetOwned(queue, true, "audit")
+	require.NoError(t, err)
+	require.Nil(t, message, "negative confirmation reports uncertainty without duplicating committed messages")
+}
+
+func TestClusterRecoverablePublishPreservesNoConfirmErrorsAndWireFailures(t *testing.T) {
+	for _, outcome := range []error{cluster.ErrUnavailable, cluster.ErrUncertain} {
+		t.Run(outcome.Error(), func(t *testing.T) {
+			srv := &Server{Log: zap.NewNop()}
+			message := &protocol.Message{Body: []byte("unresolved")}
+			conn, _ := newPipeConnWithFrames(t)
+			require.ErrorIs(t, srv.finishPublish(conn, 1, message, nil, 0, time.Time{}, false, outcome), outcome,
+				"a publisher without confirms must retain its existing error behavior")
+			client, server := net.Pipe()
+			t.Cleanup(func() { _ = client.Close(); _ = server.Close() })
+			wireError := errors.New("injected nack write failure")
+			broken := protocol.NewConnection(&errorConn{Conn: server, writeErr: wireError})
+			ch := protocol.NewChannel(1, broken)
+			ch.ConfirmMode.Store(true)
+			require.ErrorIs(t, srv.finishPublish(broken, 1, message, ch, 1, time.Time{}, false, outcome), wireError,
+				"recoverable shard failure must not hide an actual gateway wire failure")
+		})
+	}
+}
 
 func TestClusterPublishBurstsRespectTopologyAndConfirmOrder(t *testing.T) {
 	const (
