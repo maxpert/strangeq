@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"slices"
 	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
 )
@@ -22,19 +23,23 @@ const (
 )
 
 type journalSegmentHooks struct {
-	sharedQuota       *journalSegmentQuota
-	syncFile          func(*os.File) error
-	syncDir           func(string) error
-	writeAt           func(*os.File, []byte, int64) (int, error)
-	publishManifest   func(install func() error) error
-	restoreCheckpoint func(uint64, int64, map[uint64]*journalGroupState) error
-	recoveredSeal     func(uint64, int64)
+	processRoots              bool
+	processBootID             string
+	beforePhysicalRecoveryCap func(*os.File) error
+	sharedQuota               *journalSegmentQuota
+	syncFile                  func(*os.File) error
+	syncDir                   func(string) error
+	writeAt                   func(*os.File, []byte, int64) (int, error)
+	publishManifest           func(install func() error) error
+	restoreCheckpoint         func(uint64, int64, map[uint64]*journalGroupState) error
+	recoveredSeal             func(uint64, int64)
 }
 
 type journalSegmentStorage struct {
 	dir             string
 	owner           *os.File
 	hooks           journalSegmentHooks
+	processRoots    *journalProcessRoots
 	quota           *journalSegmentQuota
 	checkpointFloor atomic.Int64
 
@@ -81,6 +86,12 @@ type journalSegmentReader struct{ store *journalSegmentStorage }
 func openJournalSegmentsWithQuota(dir string, create bool, extentBytes, retainedBytes int64, hooks journalSegmentHooks,
 	visit func([]journalRecord) error,
 ) (_ *journalSegmentOutput, _ *journalSegmentReader, _ journalScan, err error) {
+	var openedActive *os.File
+	defer func() {
+		if err != nil && openedActive != nil {
+			_ = openedActive.Close()
+		}
+	}()
 	if extentBytes < minJournalSegmentFrameBytes || extentBytes > journalGroupMaxFileBytes {
 		return nil, nil, journalScan{}, fmt.Errorf("invalid raft journal extent size")
 	}
@@ -123,19 +134,29 @@ func openJournalSegmentsWithQuota(dir string, create bool, extentBytes, retained
 		}
 		return nil, nil, journalScan{}, err
 	}
+	roots, workingHooks, rootErr := prepareProcessRoots(dir, create, hooks)
+	if rootErr != nil {
+		return nil, nil, journalScan{}, rootErr
+	}
+	hooks = workingHooks
 	quota := &journalSegmentQuota{limit: retainedBytes}
 	artifacts, err := inventoryJournalSegmentArtifacts(dir, quota)
 	if err != nil {
 		return nil, nil, journalScan{}, err
 	}
 	store := &journalSegmentStorage{
-		dir: dir, owner: owner, hooks: hooks, quota: quota,
+		dir: dir, owner: owner, hooks: hooks, quota: quota, processRoots: roots,
 		readSlots: make(chan struct{}, journalSegmentReadSlots),
 	}
 	manifest, err := loadJournalSegmentManifest(dir)
 	if errors.Is(err, os.ErrNotExist) && create {
-		if len(artifacts) != 0 {
-			return nil, nil, journalScan{}, fmt.Errorf("%w: missing segment manifest with retained journal artifacts", errJournalCorrupt)
+		// Unpublished process-root scratch is never recovery authority. It
+		// alone must not block fresh bootstrap; every previously recognized
+		// retained artifact still requires a valid existing manifest.
+		for name := range artifacts {
+			if !strings.HasPrefix(name, processRootTempPrefix) {
+				return nil, nil, journalScan{}, fmt.Errorf("%w: missing segment manifest with retained journal artifacts", errJournalCorrupt)
+			}
 		}
 		manifest, err = store.initialize(extentBytes)
 	}
@@ -163,6 +184,10 @@ func openJournalSegmentsWithQuota(dir string, create bool, extentBytes, retained
 		start = next
 	}
 	active, state, err := store.replay(manifest, start, visit)
+	openedActive = active
+	if err == nil && roots != nil && roots.recoverEnd >= 0 && (state.end != roots.physical.End || state.nextSequence != roots.physical.Next) {
+		err = fmt.Errorf("%w: physical root cut mismatch", errJournalCorrupt)
+	}
 	if err != nil {
 		return nil, nil, journalScan{}, err
 	}
@@ -188,6 +213,10 @@ func openJournalSegmentsWithQuota(dir string, create bool, extentBytes, retained
 	store.manifest, store.end = manifest, state.end
 	store.advanceCheckpointFloor(manifest.extents[len(manifest.extents)-1].base, manifest.extentBytes)
 	store.durableEnd = state.end
+	if roots != nil {
+		store.durableEnd = roots.physical.End
+		roots.liveSealedEnd = manifest.extents[len(manifest.extents)-1].base
+	}
 	store.completedEnd = state.end
 	if hooks.sharedQuota != nil {
 		if err = hooks.sharedQuota.reserve(quota.used); err != nil {
@@ -196,8 +225,20 @@ func openJournalSegmentsWithQuota(dir string, create bool, extentBytes, retained
 		}
 		store.quota = hooks.sharedQuota
 	}
-	return &journalSegmentOutput{store: store, file: active, nextSequence: state.nextSequence},
-		&journalSegmentReader{store: store}, state, nil
+	output := &journalSegmentOutput{store: store, file: active, nextSequence: state.nextSequence}
+	if roots != nil {
+		if roots.recoverEnd >= 0 {
+			if err = roots.finishPhysicalRecovery(); err != nil {
+				return nil, nil, journalScan{}, err
+			}
+		}
+		if roots.physical.Manifest == nil {
+			if err = roots.certify(output); err != nil {
+				return nil, nil, journalScan{}, err
+			}
+		}
+	}
+	return output, &journalSegmentReader{store: store}, state, nil
 }
 
 func (s *journalSegmentStorage) path(id uint64) string {
@@ -294,7 +335,14 @@ func (s *journalSegmentStorage) replayExtent(extent journalSegmentExtent, active
 			_ = file.Close()
 		}
 	}()
-	state, err := scanJournal(file, info.Size(), sealedBytes, extent.firstSequence, func(records []journalRecord) error {
+	scanBytes := info.Size()
+	if active && s.processRoots != nil && s.processRoots.recoverEnd >= 0 {
+		scanBytes = s.processRoots.recoverEnd - extent.base
+		if scanBytes < 0 || scanBytes > info.Size() {
+			return nil, journalScan{}, fmt.Errorf("%w: physical root exceeds retained bytes", errJournalCorrupt)
+		}
+	}
+	state, err := scanJournal(file, scanBytes, sealedBytes, extent.firstSequence, func(records []journalRecord) error {
 		if visit == nil {
 			return nil
 		}
@@ -308,7 +356,12 @@ func (s *journalSegmentStorage) replayExtent(extent journalSegmentExtent, active
 	}
 	if active {
 		var truncated int64
-		if state.partialTail {
+		if state.partialTail || scanBytes < info.Size() {
+			if s.processRoots != nil && s.processRoots.recoverEnd >= 0 && s.hooks.beforePhysicalRecoveryCap != nil {
+				if err := s.hooks.beforePhysicalRecoveryCap(file); err != nil {
+					return nil, journalScan{}, err
+				}
+			}
 			if err := file.Truncate(state.end); err != nil {
 				return nil, journalScan{}, err
 			}
@@ -333,8 +386,10 @@ func (w *journalSegmentOutput) rotate(offset int64) error {
 	if len(manifest.extents) >= maxJournalSegmentCount {
 		return fmt.Errorf("%w: raft journal extent count limit", errJournalTooLarge)
 	}
-	if err := w.Sync(); err != nil {
-		return err
+	if s.processRoots == nil || !s.processRoots.process.Load() {
+		if err := w.Sync(); err != nil {
+			return err
+		}
 	}
 	manifest.extents = slices.Clone(manifest.extents)
 	last := &manifest.extents[len(manifest.extents)-1]
@@ -358,6 +413,9 @@ func (w *journalSegmentOutput) rotate(offset int64) error {
 	s.mu.Lock()
 	s.manifest = manifest
 	s.mu.Unlock()
+	if s.processRoots != nil {
+		s.processRoots.liveSealedEnd = offset
+	}
 	s.advanceCheckpointFloor(offset, manifest.extentBytes)
 	if w.index != nil {
 		w.sealedIndex = &journalSealedIndex{
@@ -464,7 +522,11 @@ func (w *journalSegmentOutput) Sync() error {
 		return w.failed
 	}
 	if w.dirty {
-		if err := w.store.hooks.syncFile(w.file); err != nil {
+		syncFile := w.store.hooks.syncFile
+		if w.store.processRoots != nil {
+			syncFile = func(*os.File) error { return w.store.processRoots.syncClosure(w) }
+		}
+		if err := syncFile(w.file); err != nil {
 			w.failed = err
 			w.store.failStorage(err)
 			return err

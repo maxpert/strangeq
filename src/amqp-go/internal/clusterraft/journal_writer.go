@@ -128,6 +128,19 @@ func (w *journalWriter) enqueueEncoded(group uint64, size int, syncRequired bool
 }
 
 func (w *journalWriter) enqueueEncodedMode(group uint64, size int, syncRequired, processEligible bool, delta *journalGroupDelta, encode func([]byte) error) (<-chan journalCompletion, error) {
+	return w.enqueueRecordMode(group, size, syncRequired, processEligible, delta, func() (journalRecord, journalScratchLoan, error) {
+		staging := w.staging.acquire(size)
+		body := staging.buffer[:size:size]
+		err := encode(body)
+		return journalRecord{group: group, body: body}, staging, err
+	})
+}
+
+// The same full-byte admission charge is held before preparation, through the
+// OS write/index publication, and until ordinary completion/failure cleanup.
+func (w *journalWriter) enqueueRecordMode(group uint64, size int, syncRequired, processEligible bool, delta *journalGroupDelta,
+	construct func() (journalRecord, journalScratchLoan, error),
+) (<-chan journalCompletion, error) {
 	if group == 0 || size < 0 || size > maxJournalFrameBytes-journalRecordHeaderSize ||
 		size > w.limits.pendingBytes-journalRecordHeaderSize {
 		return nil, errJournalTooLarge
@@ -150,9 +163,7 @@ func (w *journalWriter) enqueueEncodedMode(group uint64, size int, syncRequired,
 	w.reserveAdmissionLocked(charge)
 	w.mu.Unlock()
 
-	staging := w.staging.acquire(size)
-	body := staging.buffer[:size:size]
-	err := encode(body)
+	record, staging, err := construct()
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	if err != nil || w.closing {
@@ -169,7 +180,7 @@ func (w *journalWriter) enqueueEncodedMode(group uint64, size int, syncRequired,
 	}
 	result := make(chan journalCompletion, 1)
 	w.queue = append(w.queue, journalRequest{
-		record: journalRecord{group: group, body: body}, syncRequired: syncRequired, processEligible: processEligible,
+		record: record, syncRequired: syncRequired, processEligible: processEligible,
 		delta: delta, staging: staging, charge: charge, result: result,
 	})
 	w.ready.Signal()
@@ -268,6 +279,12 @@ func (w *journalWriter) run() {
 	}
 	if err := w.sync(); err != nil {
 		w.fail(nil, err)
+		return
+	}
+	if segment, ok := w.file.(*journalSegmentOutput); ok && segment.store.processRoots != nil {
+		if err := segment.store.processRoots.certify(segment); err != nil {
+			w.fail(nil, err)
+		}
 	}
 }
 
@@ -275,8 +292,17 @@ func (w *journalWriter) writeBatch(batch []journalRequest) error {
 	records := make([]journalRecord, 0, len(batch))
 	var syncRequired bool
 	for _, request := range batch {
-		if len(request.record.body) != 0 {
-			records = append(records, request.record)
+		if request.record.bodySize() != 0 {
+			record := request.record
+			if request.delta != nil {
+				for _, entry := range request.delta.entries {
+					if entry.size >= journalFrameCRCReuseMinBytes {
+						record.entryChecksums = request.delta.entries
+						break
+					}
+				}
+			}
+			records = append(records, record)
 		}
 		// Eligibility is rechecked at execution, after any activation latch.
 		syncRequired = syncRequired || request.syncRequired || (request.processEligible && !w.durability.processAllowed())
@@ -310,7 +336,7 @@ func (w *journalWriter) writeBatch(batch []journalRequest) error {
 		}
 		i := 0
 		for j := range batch {
-			if len(batch[j].record.body) == 0 {
+			if batch[j].record.bodySize() == 0 {
 				continue
 			}
 			location := locations[i]
@@ -322,7 +348,9 @@ func (w *journalWriter) writeBatch(batch []journalRequest) error {
 		w.nextSequence++
 		w.dirty = !synced
 	}
-	if syncRequired {
+	segment, rooted := w.file.(*journalSegmentOutput)
+	rooted = rooted && segment.store.processRoots != nil
+	if syncRequired && !rooted {
 		if err := w.sync(); err != nil {
 			return err
 		}
@@ -339,6 +367,12 @@ func (w *journalWriter) writeBatch(batch []journalRequest) error {
 				return err
 			}
 		}
+	}
+	if segment, ok := w.file.(*journalSegmentOutput); ok && segment.store.processRoots != nil && syncRequired {
+		if err := segment.store.processRoots.certify(segment); err != nil {
+			return err
+		}
+		w.dirty = false
 	}
 	// Publish process-readable bytes only after frame checking and append-index
 	// publication both succeeded. Strict reads retain their sync-first boundary.
@@ -415,6 +449,9 @@ func (w *journalWriter) close() error {
 // requireFullDurability closes the fast path before ordering a strict fence.
 // Admission waits rather than allowing a full queue to bypass activation.
 func (w *journalWriter) requireFullDurability() error {
+	if segment, ok := w.file.(*journalSegmentOutput); ok && segment.store.processRoots != nil {
+		segment.store.processRoots.process.Store(false)
+	}
 	if w.durability != nil {
 		w.durability.strict.Store(true)
 	}

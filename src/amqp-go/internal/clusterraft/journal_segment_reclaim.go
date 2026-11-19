@@ -74,7 +74,7 @@ func (r *journalSegmentReader) reserveReclaim() (
 		}
 	}
 	for i, extent := range candidates {
-		protected[i] = s.checkpointOwners[extent.id]
+		protected[i] = s.checkpointOwners[extent.id] || (s.processRoots != nil && s.processRoots.pinsExtent(extent.id))
 	}
 	for span := range s.retainedSources {
 		protect(span.start, span.end)

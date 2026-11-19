@@ -41,12 +41,14 @@ func forwardConsumerMessages(channel *protocol.Channel, msgChan chan *protocol.D
 				select {
 				case <-channel.FlowWake:
 				case <-stop:
+					delivery.ReleaseBody()
 					return
 				}
 			}
 			select {
 			case fanIn <- delivery:
 			case <-stop:
+				delivery.ReleaseBody()
 				return
 			}
 		case <-stop:
@@ -86,7 +88,9 @@ func (s *Server) discoverConsumers(
 				consumerInfos[consumer.ID] = &consumerInfo{channel: channel, tag: consumer.Tag}
 				stop := make(chan struct{})
 				forwarders[consumer.ID] = stop
+				rt.deliveryForwarders.Add(1)
 				s.goConn(rt, "forwarder", func() {
+					defer rt.deliveryForwarders.Done()
 					forwardConsumerMessages(channel, consumer.Messages, fanIn, stop)
 				})
 				s.Log.Debug("Started forwarder for consumer",
@@ -148,10 +152,18 @@ func (s *Server) consumerDeliveryLoop(rt *connRuntime) {
 			delete(forwarders, id)
 		}
 	}
-	defer stopAllForwarders()
+	defer func() {
+		stopAllForwarders()
+		rt.deliveryForwarders.Wait()
+		drainConsumerBodyLeases(fanIn)
+	}()
 
 	batch := make([]*protocol.Delivery, 0, maxBatchSize)
 	extras := make([]*protocol.Delivery, 0, maxBatchSize)
+	defer func() {
+		protocol.ReleaseDeliveryBodies(batch)
+		protocol.ReleaseDeliveryBodies(extras)
+	}()
 
 	for {
 		if conn.Closed.Load() {
@@ -169,6 +181,7 @@ func (s *Server) consumerDeliveryLoop(rt *connRuntime) {
 		}
 
 		if len(consumerInfos) == 0 {
+			drainConsumerBodyLeases(fanIn)
 			time.Sleep(10 * time.Millisecond)
 			continue
 		}
@@ -194,6 +207,7 @@ func (s *Server) consumerDeliveryLoop(rt *connRuntime) {
 
 			info, exists := consumerInfos[delivery.ConsumerID]
 			if !exists {
+				delivery.ReleaseBody()
 				// Consumer was removed after forwarding — the delivery is
 				// dropped without requeue. This is a SILENT message-loss path:
 				// it is counted explicitly so the loss is never invisible
@@ -270,6 +284,7 @@ func (s *Server) sendExtraDeliveries(conn *protocol.Connection, consumerInfos ma
 		extra := extras[i]
 		extraInfo, exists := consumerInfos[extra.ConsumerID]
 		if !exists {
+			extra.ReleaseBody()
 			// The consumer was removed after its delivery was forwarded. The
 			// delivery is dropped without requeue; for a NoAck consumer the
 			// broker already settled and deleted it on enqueue, so this fan-in
@@ -305,6 +320,7 @@ func (s *Server) sendExtraDeliveries(conn *protocol.Connection, consumerInfos ma
 func (s *Server) requeueFailedDeliveries(batch []*protocol.Delivery, extras []*protocol.Delivery) {
 	var requeued, dropped int
 	count := func(d *protocol.Delivery) {
+		defer d.ReleaseBody()
 		if s.requeueSingleDelivery(d) {
 			requeued++
 		} else {

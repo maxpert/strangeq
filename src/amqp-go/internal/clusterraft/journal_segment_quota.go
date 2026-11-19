@@ -35,7 +35,8 @@ func inventoryJournalSegmentArtifacts(dir string, quota *journalSegmentQuota) (m
 				return nil, err
 			}
 			manifestTemp := strings.HasPrefix(name, journalSegmentManifestTempPrefix)
-			if !owned && !manifestTemp {
+			rootTemp := strings.HasPrefix(name, processRootTempPrefix)
+			if !owned && !manifestTemp && !rootTemp {
 				continue
 			}
 			info, err := file.Info()
@@ -49,7 +50,8 @@ func inventoryJournalSegmentArtifacts(dir string, quota *journalSegmentQuota) (m
 				quota.used += info.Size()
 				artifacts[name] = info.Size()
 			} else {
-				artifacts[name] = 0 // Temporary manifests are collected but uncharged.
+				// Temporary authority publications are collected but uncharged.
+				artifacts[name] = 0
 			}
 		}
 		if readErr == io.EOF {
@@ -65,6 +67,9 @@ func inventoryJournalSegmentArtifacts(dir string, quota *journalSegmentQuota) (m
 // Files absent from that manifest cannot be needed by either future replay
 // or any live readers: the opener still holds exclusive ownership.
 func (s *journalSegmentStorage) collectUnselected(manifest journalSegmentManifest, artifacts map[string]int64) error {
+	if s.processRoots != nil {
+		s.processRoots.preserveArtifacts(artifacts)
+	}
 	delete(artifacts, manifest.checkpoint.name)
 	for _, extent := range manifest.extents {
 		delete(artifacts, filepath.Base(s.path(extent.id)))

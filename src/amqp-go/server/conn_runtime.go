@@ -33,8 +33,9 @@ type connRuntime struct {
 	conn *protocol.Connection
 	slot *handshakeSlot
 
-	wg       sync.WaitGroup // every per-connection goroutine (§13)
-	torndown chan struct{}  // closed by finishConnection after cleanupConnection returns
+	wg                 sync.WaitGroup // every per-connection goroutine (§13)
+	deliveryForwarders sync.WaitGroup // joined before draining the delivery fan-in
+	torndown           chan struct{}  // closed by finishConnection after cleanupConnection returns
 
 	handshakeDone         atomic.Bool // connection.open-ok sent
 	connClosing           atomic.Bool // server sent connection.close, awaiting close-ok

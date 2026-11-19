@@ -4,11 +4,19 @@ import "context"
 
 const captureJournalReplyBytes = 32 << 10
 
+type CaptureMode uint8
+
+// CaptureOffLock forbids materialization under Group.mu when an encoder has
+// large body work. Saturated slots fail with ErrBusy before I/O/allocation.
+// Small private copies keep the existing cheap inline threshold; journal cold
+// bodies always meet the large-body threshold.
+const CaptureOffLock CaptureMode = 1
+
 // ReadCaptured captures a quorum-fenced result under the Group lock. Large
 // encoders use the node's existing reply slots and can then read immutable
 // journal bytes outside the lock while Close waits for the captured result.
-func (g *Group) ReadCaptured(ctx context.Context, capture func(Machine) (func() ([]byte, error), int, error)) ([]byte, error) {
-	return g.readCaptured(ctx, g.Read, capture)
+func (g *Group) ReadCaptured(ctx context.Context, capture func(Machine) (func() ([]byte, error), int, error), mode ...CaptureMode) ([]byte, error) {
+	return g.readCaptured(ctx, g.Read, capture, mode...)
 }
 
 // CaptureAppliedLeader reads committed local state for an internal worker.
@@ -34,7 +42,8 @@ func (g *Group) readAppliedLeader(ctx context.Context, query func(Machine) ([]by
 
 func (g *Group) readCaptured(ctx context.Context,
 	read func(context.Context, func(Machine) ([]byte, error)) ([]byte, error),
-	capture func(Machine) (func() ([]byte, error), int, error)) ([]byte, error) {
+	capture func(Machine) (func() ([]byte, error), int, error), mode ...CaptureMode) ([]byte, error) {
+	strict := len(mode) != 0 && mode[0] == CaptureOffLock
 	var encode func() ([]byte, error)
 	var held chan struct{}
 	var unpin func()
@@ -57,6 +66,9 @@ func (g *Group) readCaptured(ctx context.Context,
 				held, encode = slots, reply
 				return nil, nil
 			default:
+				if strict {
+					return nil, ErrBusy
+				}
 			}
 		}
 		body, err := reply()

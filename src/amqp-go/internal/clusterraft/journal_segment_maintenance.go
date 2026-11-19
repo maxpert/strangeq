@@ -121,7 +121,7 @@ func (w *journalSegmentOutput) finishCheckpoint(result journalSegmentCheckpointR
 		return err
 	}
 	s := w.store
-	if old := result.staged.previous; old.name != "" {
+	if old := result.staged.previous; old.name != "" && (s.processRoots == nil || !s.processRoots.pinsName(old.name)) {
 		if err := os.Remove(filepath.Join(s.dir, old.name)); err != nil {
 			return err
 		}
@@ -139,6 +139,9 @@ func (w *journalSegmentOutput) sealedCheckpointCutoff(sequence uint64, end int64
 	s := w.store
 	s.mu.RLock()
 	durableEnd := s.durableEnd
+	if s.processRoots != nil {
+		durableEnd = s.processRoots.liveSealedEnd
+	}
 	s.mu.RUnlock()
 	if end > durableEnd {
 		return 0, fmt.Errorf("%w: checkpoint exceeds physically durable journal prefix", errJournalCorrupt)

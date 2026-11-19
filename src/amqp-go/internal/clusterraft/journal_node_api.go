@@ -26,6 +26,9 @@ func OpenNodeJournalWithRangeSync(dir string, create bool) (*NodeJournal, error)
 // JournalOptions selects append completion; zero values preserve full durability.
 // ProcessDurability is for an isolated one-voter owner. Its caller must invoke
 // RequireFullDurability before activating transport or admitting another member.
+// Linux selects versioned process recovery roots and requires a readable, nonempty
+// kernel boot ID. Other platforms retain the unrooted process-write path.
+// Process recovery roots require fresh storage and cannot migrate an old journal.
 type JournalOptions struct {
 	RangeSync         bool
 	ProcessDurability bool
@@ -40,7 +43,11 @@ func openNodeJournal(dir string, create, rangeSync bool) (*NodeJournal, error) {
 }
 
 func openNodeJournalOptions(dir string, create bool, options JournalOptions, durability *journalDurability) (*NodeJournal, error) {
-	store, err := openSegmentedGroupNode(dir, create, options.RangeSync, journalServingExtentBytes, journalGroupMaxFileBytes, nil, journalSegmentHooks{})
+	hooks, extent, err := processRootServingOptions(dir, create, options)
+	if err != nil {
+		return nil, err
+	}
+	store, err := openSegmentedGroupNode(dir, create, options.RangeSync, extent, journalGroupMaxFileBytes, nil, hooks)
 	if err != nil {
 		return nil, err
 	}
@@ -49,6 +56,12 @@ func openNodeJournalOptions(dir string, create bool, options JournalOptions, dur
 			durability = &journalDurability{}
 		}
 		store.writer.durability = durability
+	}
+	if reader, ok := store.reader.(*journalSegmentReader); ok && reader.store.processRoots != nil && !options.ProcessDurability {
+		if err := store.writer.requireFullDurability(); err != nil {
+			_ = store.close()
+			return nil, err
+		}
 	}
 	return &NodeJournal{store: store}, nil
 }

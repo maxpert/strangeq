@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/maxpert/amqp-go/internal/clusterproposal"
 	"github.com/maxpert/amqp-go/internal/clusterqueue"
 	"github.com/maxpert/amqp-go/internal/clusterraft"
 	"github.com/maxpert/amqp-go/internal/clusterwire"
@@ -104,6 +105,14 @@ func (n *Node) tryQuery(ctx context.Context, id uint64, data []byte) ([]byte, er
 }
 
 func (n *Node) tryRoute(ctx context.Context, id uint64, data []byte, mode routeMode) ([]byte, error) {
+	return n.tryRouteOwned(ctx, id, data, mode, nil)
+}
+
+func (n *Node) tryRouteOwned(ctx context.Context, id uint64, data []byte, mode routeMode, owned *clusterproposal.Submission) ([]byte, error) {
+	return n.tryRouteWithAssignment(ctx, id, data, mode, owned, nil)
+}
+
+func (n *Node) tryRouteWithAssignment(ctx context.Context, id uint64, data []byte, mode routeMode, owned *clusterproposal.Submission, localAssignment *localAssignmentResult) ([]byte, error) {
 	readOnly := mode != routeCommand
 	v := n.view()
 	n.routeMu.RLock()
@@ -146,11 +155,15 @@ func (n *Node) tryRoute(ctx context.Context, id uint64, data []byte, mode routeM
 				if n.assignmentReplicaSlots != nil {
 					localData = clusterqueue.InlineAssignmentReplicaRequest(data)
 				}
-				response = n.executeRead(attempt, id, localData)
+				response = n.executeReadWithAssignment(attempt, id, localData, localAssignment)
 			case routeWait:
 				response = n.executeWait(attempt, id, data)
 			default:
-				response = n.execute(attempt, id, data)
+				if owned != nil && n.SupportsOwnedPublishes() {
+					response = n.executeProposal(attempt, id, data, owned)
+				} else {
+					response = n.execute(attempt, id, data)
+				}
 			}
 		} else {
 			if readOnly && frame == nil {
@@ -232,6 +245,10 @@ func (n *Node) tryRoute(ctx context.Context, id uint64, data []byte, mode routeM
 }
 
 func (n *Node) execute(ctx context.Context, id uint64, data []byte) reply {
+	return n.executeProposal(ctx, id, data, nil)
+}
+
+func (n *Node) executeProposal(ctx context.Context, id uint64, data []byte, owned *clusterproposal.Submission) reply {
 	if n.cfg.ExperimentalRaftJournalDualStream && n.journal != nil && n.journal.Failure() != nil {
 		return reply{code: unavailable}
 	}
@@ -248,7 +265,17 @@ func (n *Node) execute(ctx context.Context, id uint64, data []byte) reply {
 	if leader != n.cfg.Peer.ID {
 		return reply{code: redirect, leader: leader}
 	}
-	result, err := g.Propose(ctx, data)
+	var result []byte
+	var err error
+	if owned != nil && owned.Available() {
+		result, err = g.ProposeOwned(ctx, owned)
+	} else {
+		// A gathered proposal can later be safely rejected. Only the
+		// existing unavailable/redirect route permits reaching this retry;
+		// uncertain results leave retryRoute immediately. Preserve its
+		// old semantics with an ordinary copy after ownership was consumed.
+		result, err = g.Propose(ctx, data)
+	}
 	switch {
 	case err == nil:
 		return reply{body: result}
@@ -325,6 +352,10 @@ func (n *Node) readReply(ctx context.Context, data []byte) (reply, error) {
 }
 
 func (n *Node) executeRead(ctx context.Context, id uint64, data []byte) reply {
+	return n.executeReadWithAssignment(ctx, id, data, nil)
+}
+
+func (n *Node) executeReadWithAssignment(ctx context.Context, id uint64, data []byte, localAssignment *localAssignmentResult) reply {
 	if len(data) > maxEntryBytes-128 {
 		return reply{code: oversize}
 	}
@@ -355,7 +386,40 @@ func (n *Node) executeRead(ctx context.Context, id uint64, data []byte) reply {
 	}
 	var result []byte
 	var err error
-	if assignments || replicaBodies {
+	if assignments && localAssignment != nil && n.SupportsOwnedPublishes() {
+		result, err = g.ReadCaptured(ctx, func(machine clusterraft.Machine) (func() ([]byte, error), int, error) {
+			if query, ok := machine.(interface {
+				CaptureLocalAssignmentPage(clusterqueue.AssignmentRequest, bool) (func() (*clusterqueue.BorrowedAssignmentPage, error), int, error)
+			}); ok {
+				encode, size, err := query.CaptureLocalAssignmentPage(request, g.ProcessReadAllowed())
+				if err != nil {
+					if assignmentResultError(err) {
+						return func() ([]byte, error) { localAssignment.domainErr = err; return nil, nil }, 0, nil
+					}
+					return nil, 0, err
+				}
+				return func() ([]byte, error) {
+					page, err := encode()
+					if err != nil {
+						return nil, err
+					}
+					localAssignment.page = page
+					return nil, nil
+				}, size, nil
+			}
+			// A legacy local machine keeps the same portable capture inside
+			// this one authorized read, without selecting a second time.
+			if query, ok := machine.(interface {
+				CaptureAssignmentPage(clusterqueue.AssignmentRequest) (func() ([]byte, error), int, error)
+			}); ok {
+				return query.CaptureAssignmentPage(request)
+			}
+			return nil, 0, errInvalidRead
+		}, clusterraft.CaptureOffLock)
+		if err != nil {
+			localAssignment.release()
+		}
+	} else if assignments || replicaBodies {
 		result, err = g.ReadCaptured(ctx, func(machine clusterraft.Machine) (func() ([]byte, error), int, error) {
 			if replicaBodies {
 				if query, ok := machine.(interface {

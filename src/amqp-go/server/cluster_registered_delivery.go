@@ -67,9 +67,11 @@ func (entry *clusterConsumer) nextManualPage(ctx context.Context, cursor cluster
 	defer session.broker.mu.Unlock()
 	session.assignmentWait = nil
 	if page := session.takeBufferedAssignmentPage(); len(page.deliveries) != 0 {
+		clusterqueue.ReleaseDeliveryBodies(deliveries)
 		return entry.acceptAssignmentPage(cursor, page)
 	}
 	if err != nil {
+		clusterqueue.ReleaseDeliveryBodies(deliveries)
 		return nil, cursor, err
 	}
 	return entry.acceptAssignmentPage(cursor, bufferedAssignmentPage{deliveries: deliveries, through: next})
@@ -82,10 +84,12 @@ func (entry *clusterConsumer) acceptAssignmentPage(cursor clusterqueue.AttemptID
 	// Only this dispatcher accepts pages. Reserve locally before exposing
 	// any item to the existing handoff and per-channel QoS checks.
 	if err := session.ctx.Err(); err != nil {
+		clusterqueue.ReleaseDeliveryBodies(page.deliveries)
 		return nil, cursor, err
 	}
 	select {
 	case <-entry.protocol.Cancel:
+		clusterqueue.ReleaseDeliveryBodies(page.deliveries)
 		return nil, cursor, context.Canceled
 	default:
 	}
@@ -172,11 +176,13 @@ func (s *clusterSession) takeBufferedAssignmentPage() bufferedAssignmentPage {
 	}
 	s.assignmentPage = bufferedAssignmentPage{}
 	if !page.ready(s.assignmentCursor) {
+		clusterqueue.ReleaseDeliveryBodies(page.deliveries)
 		return bufferedAssignmentPage{}
 	}
 	start := slices.IndexFunc(page.deliveries, func(delivery clusterqueue.Delivery) bool {
 		return delivery.Attempt > s.assignmentCursor
 	})
+	clusterqueue.ReleaseDeliveryBodies(page.deliveries[:start])
 	page.deliveries = page.deliveries[start:]
 	return page
 }

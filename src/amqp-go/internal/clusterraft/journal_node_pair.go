@@ -35,10 +35,20 @@ func OpenNodeJournalPairWithOptions(root string, create bool, peer uint64, optio
 
 	quota := &journalSegmentQuota{limit: journalGroupMaxFileBytes, streams: 2}
 	return openJournalPair(root, peer, func(dir string, _ int, budget *journalBudget) (*journalGroupNode, error) {
-		store, err := openSegmentedGroupNode(dir, create, options.RangeSync, journalServingExtentBytes, journalGroupMaxFileBytes, budget,
-			journalSegmentHooks{sharedQuota: quota})
+		hooks, extent, err := processRootServingOptions(dir, create, options)
+		if err != nil {
+			return nil, err
+		}
+		hooks.sharedQuota = quota
+		store, err := openSegmentedGroupNode(dir, create, options.RangeSync, extent, journalGroupMaxFileBytes, budget, hooks)
 		if err == nil {
 			store.writer.durability = durability
+			if reader, ok := store.reader.(*journalSegmentReader); ok && reader.store.processRoots != nil && !options.ProcessDurability {
+				if err = store.writer.requireFullDurability(); err != nil {
+					_ = store.close()
+					return nil, err
+				}
+			}
 		}
 		return store, err
 	})
@@ -155,6 +165,9 @@ func (n *NodeJournalPair) RequireFullDurability() error {
 		return errJournalClosed
 	}
 	for _, stream := range n.streams {
+		if reader, ok := stream.store.reader.(*journalSegmentReader); ok && reader.store.processRoots != nil {
+			reader.store.processRoots.process.Store(false)
+		}
 		if stream.store.writer.durability != nil {
 			stream.store.writer.durability.strict.Store(true)
 		}

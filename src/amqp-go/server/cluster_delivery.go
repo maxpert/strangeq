@@ -385,6 +385,8 @@ func (b *ClusterBroker) requeueGets(connection string, channel uint16) {
 }
 
 func (b *ClusterBroker) purgeDeliveryLocked(session *clusterSession) {
+	clusterqueue.ReleaseDeliveryBodies(session.assignmentPage.deliveries)
+	session.assignmentPage = bufferedAssignmentPage{}
 	for tag, delivery := range b.deliveries {
 		if delivery.Session == session {
 			delete(b.deliveries, tag)
@@ -672,6 +674,12 @@ func (b *ClusterBroker) consumeManualBatch(id string, entry *clusterConsumer) {
 
 	var pending []clusterqueue.Delivery
 	var message *protocol.Message
+	defer func() {
+		if message != nil {
+			message.ReleaseBody()
+		}
+		clusterqueue.ReleaseDeliveryBodies(pending)
+	}()
 	var cursor clusterqueue.AttemptID
 	for s.ctx.Err() == nil {
 		if len(pending) == 0 {
@@ -707,7 +715,19 @@ func (b *ClusterBroker) consumeManualBatch(id string, entry *clusterConsumer) {
 				return
 			}
 			message.Redelivered = claimed.Redelivered
+			if claimed.BodyLease != nil {
+				// This decoder created a fresh egress-only message. Move the
+				// sole lease owner out of the pending item before publication.
+				message.SetBodyRelease(claimed.BodyLease.Release)
+				pending[0].BodyLease, claimed.BodyLease = nil, nil
+			}
 		}
+		// Drop the envelope aliases before publication. A fast writer may
+		// finish and release the loan as soon as the channel handoff succeeds.
+		// While credit is unavailable, the decoded message and lease suffice
+		// for retry; the envelope is never decoded twice.
+		pending[0].Body = nil
+		claimed.Body = nil
 		issued, delay := b.offerBatchDelivery(id, entry, claimed.Attempt, message, len(pending))
 		if !issued {
 			if !entry.waitForBatchDispatch(timer, delay) {
@@ -825,6 +845,7 @@ func (b *ClusterBroker) consumerExited(id string, entry *clusterConsumer) {
 	}
 	entry.session.cancel()
 	delete(b.consumers, id)
+	drainConsumerBodyLeases(entry.protocol.Messages)
 	b.purgeDeliveryLocked(entry.session)
 	b.mu.Unlock()
 
@@ -845,6 +866,7 @@ func (b *ClusterBroker) unregisterConsumers(ids []string) error {
 		if entry := b.consumers[id]; entry != nil {
 			entry.session.cancel()
 			delete(b.consumers, id)
+			drainConsumerBodyLeases(entry.protocol.Messages)
 			b.purgeDeliveryLocked(entry.session)
 			sessions = append(sessions, entry.session)
 		}
@@ -903,4 +925,20 @@ func (b *ClusterBroker) updateConsumerPrefetch(id string, prefetch uint16) error
 	command.Prefetch = credit
 	_, err := entry.session.runCommand(ctx, command)
 	return err
+}
+
+// Call after producer admission has quiesced under broker.mu. Forwarders may
+// concurrently receive; each channel item has exactly one receiver/owner.
+func drainConsumerBodyLeases(messages <-chan *protocol.Delivery) {
+	for {
+		select {
+		case delivery, ok := <-messages:
+			if !ok {
+				return
+			}
+			delivery.ReleaseBody()
+		default:
+			return
+		}
+	}
 }

@@ -84,6 +84,12 @@ func clusterOptions(cfg *config.AMQPConfig) (cluster.Config, error) {
 		}
 		seeds = append(seeds, cluster.Peer{ID: id, Address: addr})
 	}
+	// This isolated experiment applies only to local process durability. All
+	// data shards on the node share one payload budget, rather than one each.
+	var hotPayloads *clusterqueue.HotPayloadCacheSet
+	if c.Local && cfg.Durability() == interfaces.DurabilityProcess {
+		hotPayloads = clusterqueue.NewShardedHotPayloadCache()
+	}
 	options := cluster.Config{
 		ClusterID: c.ID, Peer: cluster.Peer{ID: c.NodeID, Address: c.PeerAddress}, Seeds: seeds,
 		Discovery: c.Discovery,
@@ -97,9 +103,15 @@ func clusterOptions(cfg *config.AMQPConfig) (cluster.Config, error) {
 		ExperimentalRaftJournalDualStream:       c.ExperimentalRaftJournalDualStream,
 		ExperimentalJournalBodyCompression:      c.ExperimentalJournalBodyCompression,
 		ExperimentalJournalSmallBodyCompression: c.ExperimentalJournalSmallBodyCompression,
-		NewMachine: func(uint64) clusterraft.Machine {
+		NewMachine: func(shard uint64) clusterraft.Machine {
 			if c.ExperimentalAssignments {
+				if hotPayloads != nil {
+					return server.NewClusterHotPayloadAssignmentMachine(hotPayloads.ForShard(shard))
+				}
 				return server.NewClusterAssignmentMachine()
+			}
+			if hotPayloads != nil {
+				return server.NewClusterHotPayloadMachine(hotPayloads.ForShard(shard))
 			}
 			return server.NewClusterMachine()
 		},

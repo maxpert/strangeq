@@ -18,3 +18,7 @@ func (m *ClusterMachine) CaptureAssignmentPage(request clusterqueue.AssignmentRe
 func (m *ClusterMachine) CaptureAssignmentReplica(request clusterqueue.AssignmentRequest, coverage clusterqueue.AssignmentCoverage) (func() ([]byte, error), int, error) {
 	return m.queues.CaptureAssignmentReplica(request, coverage)
 }
+
+func (m *ClusterMachine) CaptureLocalAssignmentPage(request clusterqueue.AssignmentRequest, allowBorrow bool) (func() (*clusterqueue.BorrowedAssignmentPage, error), int, error) {
+	return m.queues.CaptureLocalAssignmentPage(request, allowBorrow)
+}

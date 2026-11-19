@@ -35,6 +35,15 @@ while the OS kernel remains alive. This policy does not promise recovery after
 an OS crash, host reset or power loss. It is rejected for standalone and
 addressed cluster profiles. `none` does not provide this process-kill guarantee.
 
+On Linux, this existing configuration automatically selects versioned recovery
+roots; no extra switch is needed. Provision a fresh directory. Missing or unknown
+root versions are rejected, with no conversion from earlier development roots or
+unrooted journals. Startup requires a readable, nonempty kernel boot ID. A
+same-kernel restart selects the live root; a changed boot selects only the last
+physically certified root. Existing rooted stores are detected even when opening
+with full durability, including peer activation recovery. Such stores require
+Linux; other platforms retain the existing behavior for unrooted journals.
+
 Process mode applies only before peer activation. Activation durably records
 its intent and upgrades the same journal to full durability before opening a
 peer listener or committing the advertised endpoint. This upgrade is one-way,
@@ -196,7 +205,9 @@ format settings on subsequent restarts because they are part of the durable
 node identity. Ordinary standalone mode continues to use its existing storage
 engine; this release does not migrate standalone data into Raft storage.
 
-Each stream rolls into 256 MiB segments. StrangeQ reclaims a sealed segment
+Streams provisioned with full durability roll into 256 MiB segments. Linux
+process-mode streams use 32 MiB segments and preserve that size after activation.
+StrangeQ reclaims a sealed segment
 after a durable checkpoint covers it and all live messages and readers have
 released it. The 8 GiB journal budget counts retained segments and indexes
 across all streams on a node. Cumulative appends can exceed 8 GiB as files are

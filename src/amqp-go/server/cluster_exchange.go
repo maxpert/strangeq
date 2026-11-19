@@ -14,6 +14,7 @@ import (
 
 	"github.com/maxpert/amqp-go/broker"
 	"github.com/maxpert/amqp-go/interfaces"
+	"github.com/maxpert/amqp-go/internal/clusterproposal"
 	"github.com/maxpert/amqp-go/internal/clusterqueue"
 	"github.com/maxpert/amqp-go/protocol"
 )
@@ -89,8 +90,17 @@ type ClusterMachine struct {
 
 func NewClusterMachine() *ClusterMachine { return &ClusterMachine{} }
 
+// NewClusterHotPayloadMachine uses the node's shared, bounded delivery cache.
+func NewClusterHotPayloadMachine(cache *clusterqueue.HotPayloadCache) *ClusterMachine {
+	return &ClusterMachine{queues: clusterqueue.NewHotPayloadMachine(cache)}
+}
+
 func NewClusterAssignmentMachine() *ClusterMachine {
 	return &ClusterMachine{queues: clusterqueue.NewAssignmentMachine()}
+}
+
+func NewClusterHotPayloadAssignmentMachine(cache *clusterqueue.HotPayloadCache) *ClusterMachine {
+	return &ClusterMachine{queues: clusterqueue.NewHotPayloadAssignmentMachine(cache)}
 }
 
 func (m *ClusterMachine) Apply(data []byte) []byte {
@@ -285,6 +295,14 @@ func (m *ClusterMachine) CaptureSnapshot() func([]byte) ([]byte, error) {
 	// Binding updates replace their slices by copy, and arguments are immutable.
 	captured.exchanges = maps.Clone(m.exchanges)
 	return captured.AppendSnapshot
+}
+
+func (m *ClusterMachine) AcceptsImmutableJournalCommands() bool {
+	return m.queues.AcceptsImmutableJournalCommands()
+}
+
+func (m *ClusterMachine) JournalBodyCRCRanges(data []byte) []clusterproposal.BodyRange {
+	return m.queues.JournalBodyCRCRanges(data)
 }
 
 func (m *ClusterMachine) ReleaseJournalSources() { m.queues.ReleaseJournalSources() }

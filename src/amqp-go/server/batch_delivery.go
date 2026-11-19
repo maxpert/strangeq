@@ -25,6 +25,7 @@ const writevBodyThreshold = 32 * 1024
 // buffer and performs a single conn.Conn.Write under a single WriteMutex
 // acquisition. This reduces N syscalls + N mutex acquisitions to 1 of each.
 func (s *Server) sendBatchedDeliveries(conn *protocol.Connection, channelID uint16, consumerTag string, deliveries []*protocol.Delivery) error {
+	defer protocol.ReleaseDeliveryBodies(deliveries)
 	if len(deliveries) == 0 {
 		return nil
 	}
@@ -340,6 +341,7 @@ func (s *Server) writeVectored(conn *protocol.Connection, bufs *net.Buffers, bod
 // The per-message wire-tag stamping and the metrics/counter tail are lifted
 // verbatim from sendBatchedDeliveries.
 func (s *Server) sendBatchedDeliveriesVectored(conn *protocol.Connection, channelID uint16, consumerTag string, channel *protocol.Channel, deliveries []*protocol.Delivery) error {
+	defer protocol.ReleaseDeliveryBodies(deliveries)
 	scratch := protocol.GetFrameSerializationBuffer()
 	defer protocol.PutFrameSerializationBuffer(scratch)
 	vec := &deliveryVec{scratch: scratch}

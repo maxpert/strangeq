@@ -109,6 +109,7 @@ type Delivery struct {
 	Redelivered bool
 	Packed      bool `json:",omitempty"`
 	cold        *journalBody
+	BodyLease   BodyLease `json:"-" cbor:"-"`
 }
 
 type Result struct {
@@ -224,6 +225,11 @@ func encodeFrame(metadata any, body []byte) ([]byte, error) {
 }
 
 func encodeFrameHeader(metadata any, bodySize int) ([]byte, error) {
+	return encodeFrameHeaderReserved(metadata, bodySize, 0)
+}
+
+// Reserved bytes are outside the unchanged queue frame and its size limits.
+func encodeFrameHeaderReserved(metadata any, bodySize, reserved int) ([]byte, error) {
 	header, err := json.Marshal(metadata)
 	if err != nil {
 		return nil, err
@@ -232,11 +238,13 @@ func encodeFrameHeader(metadata any, bodySize int) ([]byte, error) {
 	if size > maxFrame {
 		return nil, ErrCapacity
 	}
-	frame := make([]byte, framePrefix, size)
+	allocation := make([]byte, reserved+framePrefix, reserved+size)
+	frame := allocation[reserved:]
 	frame[0] = frameVersion
 	binary.BigEndian.PutUint32(frame[1:5], uint32(len(header)))
 	binary.BigEndian.PutUint32(frame[5:9], uint32(bodySize))
-	return append(frame, header...), nil
+	allocation = append(allocation, header...)
+	return allocation, nil
 }
 
 func decodeFrame(data []byte, metadata any) ([]byte, error) {
@@ -266,6 +274,10 @@ func EncodeCommand(c QueueCommand) ([]byte, error) {
 }
 
 func encodeCommand(c QueueCommand, prefix []byte) ([]byte, error) {
+	return encodeCommandReserved(c, prefix, 0)
+}
+
+func encodeCommandReserved(c QueueCommand, prefix []byte, reserved int) ([]byte, error) {
 	if len(prefix) > maxMessageBytes-len(c.Body) || !validCommandPayload(c) {
 		return nil, ErrInvalidCommand
 	}
@@ -274,14 +286,14 @@ func encodeCommand(c QueueCommand, prefix []byte) ([]byte, error) {
 	if assignment {
 		metadata = assignmentCommandMetadata{QueueCommand: &c, AutoAssign: c.AutoAssign}
 	}
-	frame, err := encodeFrameHeader(metadata, len(prefix)+len(c.Body))
+	frame, err := encodeFrameHeaderReserved(metadata, len(prefix)+len(c.Body), reserved)
 	if err != nil {
 		return nil, err
 	}
 	if assignment {
-		frame[0] = assignmentCommandVersion
+		frame[reserved] = assignmentCommandVersion
 	} else if c.packedVersion != 0 {
-		frame[0] = c.packedVersion
+		frame[reserved] = c.packedVersion
 	}
 	frame = append(frame, prefix...)
 	return append(frame, c.Body...), nil

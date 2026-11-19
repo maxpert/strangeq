@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"github.com/maxpert/amqp-go/internal/clusterproposal"
 	"hash/crc32"
 	"io"
 	"os"
@@ -68,6 +69,7 @@ type journalGroupStore struct {
 	// entries already durable in the local journal.
 	pendingCommit     uint64
 	processDurability bool
+	bodyCRCRanges     func([]byte) []clusterproposal.BodyRange
 	// The per-group worker owns staged until it hands off completion. A
 	// stopped Group can skip publication, but close runs after its worker
 	// exits and must then preserve the durable delta for the next owner.
@@ -104,7 +106,15 @@ func (n *journalGroupNode) close() error {
 	n.mu.Unlock()
 	n.closeOnce.Do(func() {
 		n.recentEntries.clear()
-		n.closeErr = errors.Join(n.writer.close(), n.reader.Close())
+		writerErr := n.writer.close()
+		if reader, ok := n.reader.(*journalSegmentReader); ok && reader.store.processRoots != nil {
+			// No Group owners or append jobs remain; final certification may have
+			// released the last old snapshot pins after the Groups already closed.
+			for id, state := range n.groups {
+				(&journalGroupStore{node: n, group: id, state: state}).sweepProcessSnapshots()
+			}
+		}
+		n.closeErr = errors.Join(writerErr, n.reader.Close())
 	})
 	return n.closeErr
 }
@@ -139,7 +149,14 @@ func (n *journalGroupNode) openStore(config Config) (*journalGroupStore, *pb.Sna
 		return nil, nil, err
 	}
 	n.owners[config.GroupID] = true
-	return &journalGroupStore{node: n, group: config.GroupID, state: state, processDurability: config.ProcessDurability}, snapshot, nil
+	store := &journalGroupStore{node: n, group: config.GroupID, state: state, processDurability: config.ProcessDurability}
+	if machine, ok := config.Machine.(interface {
+		AcceptsImmutableJournalCommands() bool
+		JournalBodyCRCRanges([]byte) []clusterproposal.BodyRange
+	}); ok && config.ProcessDurability && machine.AcceptsImmutableJournalCommands() {
+		store.bodyCRCRanges = machine.JournalBodyCRCRanges
+	}
+	return store, snapshot, nil
 }
 
 func (n *journalGroupNode) provisionGroup(config Config) error {
@@ -172,15 +189,34 @@ func (n *journalGroupNode) provisionGroup(config Config) error {
 }
 
 func (n *journalGroupNode) persist(group uint64, op journalGroupOp) (journalGroupDelta, error) {
-	return n.persistMode(group, op, false)
+	processCheckpoint := false
+	if reader, ok := n.reader.(*journalSegmentReader); ok && reader.store.processRoots != nil {
+		processCheckpoint = reader.store.processRoots.process.Load() && op.kind == journalGroupSnap
+	}
+	return n.persistMode(group, op, processCheckpoint)
 }
 
 func (n *journalGroupNode) persistMode(group uint64, op journalGroupOp, processEligible bool) (journalGroupDelta, error) {
+	return n.persistModePrepared(group, op, processEligible, false)
+}
+
+func (n *journalGroupNode) persistModePrepared(group uint64, op journalGroupOp, processEligible, immutableReady bool) (journalGroupDelta, error) {
 	size, err := op.size()
 	if err != nil {
 		return journalGroupDelta{}, err
 	}
 	var delta journalGroupDelta
+	if immutableReady && processEligible && n.writer.preparedProcessAllowed() && op.canPrepareJournalRecord() {
+		result, err := n.writer.enqueuePreparedMode(group, size, &delta, op)
+		if err != nil {
+			return journalGroupDelta{}, err
+		}
+		completion := <-result
+		if completion.err != nil {
+			return journalGroupDelta{}, completion.err
+		}
+		return delta, nil
+	}
 	result, err := n.writer.enqueueEncodedMode(group, size, !processEligible, processEligible, &delta, func(body []byte) error {
 		var encodeErr error
 		delta, encodeErr = op.encode(body)
@@ -230,6 +266,12 @@ func (n *journalGroupNode) inventorySnapshots() error {
 		}
 		ref, exists := live[file.Name()]
 		if !exists {
+			if reader, ok := n.reader.(*journalSegmentReader); ok && reader.store.processRoots != nil && reader.store.processRoots.pinsName(file.Name()) {
+				if n.snapshotBytes.Add(info.Size()) > journalGroupMaxSnapshotBytes {
+					return errJournalTooLarge
+				}
+				continue
+			}
 			obsolete = append(obsolete, file.Name())
 			continue
 		}
@@ -548,9 +590,10 @@ func (s *journalGroupStore) persistReady(write readyWrite) (journalGroupDelta, e
 			return journalGroupDelta{}, err
 		}
 	}
-	delta, err := s.node.persistMode(s.group, journalGroupOp{
+	delta, err := s.node.persistModePrepared(s.group, journalGroupOp{
 		kind: journalGroupReady, hard: ready.HardState, snapshot: snapshot, entries: ready.Entries,
-	}, s.processReadyEligible(write))
+		bodyCRCRanges: s.bodyCRCRanges,
+	}, s.processReadyEligible(write), true)
 	if err != nil {
 		return journalGroupDelta{}, err
 	}
@@ -562,16 +605,21 @@ func (s *journalGroupStore) persistReady(write readyWrite) (journalGroupDelta, e
 func (s *journalGroupStore) publishReady(write readyWrite, delta journalGroupDelta) {
 	previous := s.state.snapshot
 	s.state.publish(write, delta)
-	s.node.recentEntries.remember(delta.entries, write.ready.Entries)
+	s.node.recentEntries.rememberChecksummed(delta.entries, write.ready.Entries, delta.bodyChecksums)
 	s.pendingCommit = 0
 	s.staged = nil
+	s.sweepProcessSnapshots()
 	if delta.snapshot.metadata != nil {
 		s.reclaimSnapshot(previous)
 	}
 }
 
 func (s *journalGroupStore) reclaimSnapshot(previous journalSnapshotRef) {
+	s.sweepProcessSnapshots()
 	if previous.metadata == nil || previous.name == s.state.snapshot.name {
+		return
+	}
+	if reader, ok := s.node.reader.(*journalSegmentReader); ok && reader.store.processRoots != nil && reader.store.processRoots.deferRetiredSnapshot(s.group, previous.name) {
 		return
 	}
 	// The caller has fenced a replacement or knows this blob was never
@@ -639,6 +687,7 @@ func (s *journalGroupStore) close() error {
 			s.publishReady(s.staged.write, s.staged.delta)
 		}
 		s.closeErr = s.syncCommit()
+		s.sweepProcessSnapshots()
 		s.node.mu.Lock()
 		delete(s.node.owners, s.group)
 		s.node.mu.Unlock()

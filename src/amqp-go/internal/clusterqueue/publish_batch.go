@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 
 	"github.com/maxpert/amqp-go/internal/clusterpayload"
+	"github.com/maxpert/amqp-go/internal/clusterproposal"
 )
 
 const (
@@ -40,6 +41,17 @@ func EncodePublishCommand(queue string, incarnation QueueID, record PublishRecor
 	return encodeCommand(command, record.Prefix)
 }
 
+// EncodeOwnedPublishCommand reserves the proposal key in the final allocation.
+// The queue frame is byte-for-byte identical to EncodePublishCommand.
+func EncodeOwnedPublishCommand(queue string, incarnation QueueID, record PublishRecord) (*clusterproposal.Owned, error) {
+	command := QueueCommand{Kind: PublishMessage, Queue: queue, Incarnation: incarnation, Body: record.Body, packedVersion: record.packedVersion()}
+	frame, err := encodeCommandReserved(command, record.Prefix, clusterproposal.PrefixBytes)
+	if err != nil {
+		return nil, err
+	}
+	return clusterproposal.Adopt(frame)
+}
+
 // EncodeDeadLetterPublish requires a durable destination. A nonzero move ID
 // also completes that destination on a pending transfer in the same shard.
 func EncodeDeadLetterPublish(queue string, incarnation QueueID, move uint64, record PublishRecord) ([]byte, error) {
@@ -65,6 +77,18 @@ func EncodePublishBatch(queue string, incarnation QueueID, bodies [][]byte) ([]b
 
 // EncodePublishBatchRecords writes the same batch format from split records.
 func EncodePublishBatchRecords(queue string, incarnation QueueID, records []PublishRecord) ([]byte, error) {
+	return encodePublishBatchRecordsReserved(queue, incarnation, records, 0)
+}
+
+func EncodeOwnedPublishBatchRecords(queue string, incarnation QueueID, records []PublishRecord) (*clusterproposal.Owned, error) {
+	frame, err := encodePublishBatchRecordsReserved(queue, incarnation, records, clusterproposal.PrefixBytes)
+	if err != nil {
+		return nil, err
+	}
+	return clusterproposal.Adopt(frame)
+}
+
+func encodePublishBatchRecordsReserved(queue string, incarnation QueueID, records []PublishRecord, reserved int) ([]byte, error) {
 	if !validQueueName(queue) || len(records) < 2 || len(records) > MaxPublishBatchMessages {
 		return nil, ErrInvalidCommand
 	}
@@ -82,12 +106,12 @@ func EncodePublishBatchRecords(queue string, incarnation QueueID, records []Publ
 		packedVersion = max(packedVersion, record.packedVersion())
 	}
 	command := QueueCommand{Kind: PublishBatch, Queue: queue, Incarnation: incarnation}
-	frame, err := encodeFrameHeader(command, size)
+	frame, err := encodeFrameHeaderReserved(command, size, reserved)
 	if err != nil {
 		return nil, err
 	}
 	if packedVersion != 0 {
-		frame[0] = packedVersion
+		frame[reserved] = packedVersion
 	}
 	for _, record := range records {
 		frame = binary.BigEndian.AppendUint32(frame, uint32(len(record.Prefix)+len(record.Body)))

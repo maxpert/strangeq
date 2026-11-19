@@ -1,6 +1,7 @@
 package clusterraft
 
 import (
+	"github.com/maxpert/amqp-go/internal/clusterproposal"
 	"sync"
 
 	pb "go.etcd.io/raft/v3/raftpb"
@@ -13,9 +14,10 @@ const (
 )
 
 type recentJournalEntry struct {
-	ref   journalEntryRef
-	entry *pb.Entry
-	bytes int
+	ref           journalEntryRef
+	entry         *pb.Entry
+	bytes         int
+	bodyChecksums []clusterproposal.BodyChecksum
 }
 
 // A journal's offsets are unique for the life of its node. Keep insertion
@@ -48,6 +50,10 @@ func (c *journalRecentEntries) lookup(ref journalEntryRef) *pb.Entry {
 // remember receives the original, immutable Ready entries only after
 // publication of their synced locations. Reads never add decoded copies.
 func (c *journalRecentEntries) remember(refs []journalEntryRef, entries []*pb.Entry) {
+	c.rememberChecksummed(refs, entries, nil)
+}
+
+func (c *journalRecentEntries) rememberChecksummed(refs []journalEntryRef, entries []*pb.Entry, checksums [][]clusterproposal.BodyChecksum) {
 	if len(refs) == 0 || len(refs) != len(entries) {
 		return
 	}
@@ -64,6 +70,16 @@ func (c *journalRecentEntries) remember(refs []journalEntryRef, entries []*pb.En
 			continue
 		}
 		size := max(int(ref.size), bodyBytes+unknownBytes)
+		var bodyChecksums []clusterproposal.BodyChecksum
+		if len(checksums) == len(entries) && len(checksums[i]) <= clusterproposal.MaxBodyChecksumRanges {
+			bodyChecksums = checksums[i]
+			metadataBytes := cap(bodyChecksums) * clusterproposal.BodyChecksumBytes
+			if metadataBytes > maxJournalRecentEntryBytes-size {
+				bodyChecksums = nil // Preserve the ordinary entry cache on overflow.
+			} else {
+				size += metadataBytes
+			}
+		}
 		if _, exists := c.offsets[ref.offset]; exists {
 			continue
 		}
@@ -78,10 +94,34 @@ func (c *journalRecentEntries) remember(refs []journalEntryRef, entries []*pb.En
 			c.offsets = make(map[int64]int, maxJournalRecentEntries)
 		}
 		slot := (c.first + len(c.offsets)) % maxJournalRecentEntries
-		c.slots[slot] = recentJournalEntry{ref: ref, entry: entry, bytes: size}
+		c.slots[slot] = recentJournalEntry{ref: ref, entry: entry, bytes: size, bodyChecksums: bodyChecksums}
 		c.offsets[ref.offset] = slot
 		c.bytes += size
 	}
+}
+
+// Only the exact immutable Ready allocation that was prepared may consume the
+// proof, once. Copies, cold decodes, retries and mismatching journal refs miss.
+// Scalar sidecars occupy the existing cache byte budget until consumed/evicted.
+func (c *journalRecentEntries) takeBodyChecksums(ref journalEntryRef, entry *pb.Entry) []clusterproposal.BodyChecksum {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	slot, found := c.offsets[ref.offset]
+	if !found {
+		return nil
+	}
+	record := &c.slots[slot]
+	if record.ref != ref || !journalRecentEntryMatches(ref, entry) || record.entry == nil ||
+		len(entry.Data) < clusterproposal.PrefixBytes || len(record.entry.Data) != len(entry.Data) ||
+		&record.entry.Data[0] != &entry.Data[0] {
+		return nil
+	}
+	checksums := record.bodyChecksums
+	record.bodyChecksums = nil
+	metadataBytes := cap(checksums) * clusterproposal.BodyChecksumBytes
+	record.bytes -= metadataBytes
+	c.bytes -= metadataBytes
+	return checksums
 }
 
 func journalRecentEntryMatches(ref journalEntryRef, entry *pb.Entry) bool {

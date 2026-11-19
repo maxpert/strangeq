@@ -33,6 +33,11 @@ func (g *Group) Read(ctx context.Context, query func(Machine) ([]byte, error)) (
 	if query == nil {
 		return nil, errors.New("raft read requires a query")
 	}
+	if g.cfg.ProcessDurability {
+		if body, handled, err := g.tryProcessSingletonRead(ctx, query); handled {
+			return body, err
+		}
+	}
 	var id key
 	if _, err := rand.Read(id[:]); err != nil {
 		return nil, err

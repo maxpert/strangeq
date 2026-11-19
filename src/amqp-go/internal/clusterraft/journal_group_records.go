@@ -3,6 +3,7 @@ package clusterraft
 import (
 	"encoding/binary"
 	"fmt"
+	"github.com/maxpert/amqp-go/internal/clusterproposal"
 	"hash/crc32"
 
 	pb "go.etcd.io/raft/v3/raftpb"
@@ -37,19 +38,21 @@ type journalEntryRef struct {
 }
 
 type journalGroupOp struct {
-	kind     byte
-	identity []byte
-	hard     *pb.HardState
-	snapshot journalSnapshotRef
-	entries  []*pb.Entry
+	kind          byte
+	identity      []byte
+	hard          *pb.HardState
+	snapshot      journalSnapshotRef
+	entries       []*pb.Entry
+	bodyCRCRanges func([]byte) []clusterproposal.BodyRange
 }
 
 type journalGroupDelta struct {
-	kind     byte
-	identity []byte
-	hard     *pb.HardState
-	snapshot journalSnapshotRef
-	entries  []journalEntryRef
+	kind          byte
+	identity      []byte
+	hard          *pb.HardState
+	snapshot      journalSnapshotRef
+	entries       []journalEntryRef
+	bodyChecksums [][]clusterproposal.BodyChecksum // Ephemeral; never encoded/replayed.
 }
 
 func (op journalGroupOp) size() (int, error) {

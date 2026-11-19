@@ -5,17 +5,20 @@ import (
 	"crypto/sha256"
 	"errors"
 	"fmt"
+	"github.com/maxpert/amqp-go/internal/clusterproposal"
 	"hash/crc32"
 	"io"
 )
 
-const minJournalBodyBytes = 32 << 10
+const minJournalBodyBytes = clusterproposal.MinBodyChecksumBytes
 
 var journalBodyChecksum = crc32.MakeTable(crc32.Castagnoli)
 
 type journalBodyOrigin struct {
-	source io.ReaderAt
-	offset int64
+	source      io.ReaderAt
+	offset      int64
+	hotPayloads *HotPayloadCache
+	hotCommand  *hotCommand
 }
 
 type journalBody struct {
@@ -24,16 +27,37 @@ type journalBody struct {
 	checksum         uint32
 	assignmentDigest *[sha256.Size]byte
 	releaseSource    func()
+	// Only hotPayloads.mu may access these fields. Payload slices may escape
+	// through an explicit charged lease that pins their cache ownership.
+	hotPayload *hotPayloadEntry
+	hotStart   int
 }
 
 func (origin journalBodyOrigin) message(id MessageID, body []byte) (messageState, error) {
 	if origin.source == nil || len(body) < minJournalBodyBytes {
 		return messageState{ID: id, Body: bytes.Clone(body)}, nil
 	}
+	// Apply's candidate command may borrow its whole input allocation. Never
+	// embed that candidate in retained cold state or a captured delivery.
+	coldOrigin := origin
+	coldOrigin.hotCommand = nil
+	if source, ok := origin.source.(interface{ ColdJournalSource() io.ReaderAt }); ok {
+		coldOrigin.source = source.ColdJournalSource()
+	}
+	var checksum uint32
+	var reused bool
+	if source, ok := origin.source.(interface {
+		JournalBodyCRC32C(int64, []byte) (uint32, bool)
+	}); ok {
+		checksum, reused = source.JournalBodyCRC32C(origin.offset, body)
+	}
+	if !reused {
+		checksum = crc32.Checksum(body, journalBodyChecksum)
+	}
 	cold := &journalBody{
-		journalBodyOrigin: origin,
+		journalBodyOrigin: coldOrigin,
 		size:              len(body),
-		checksum:          crc32.Checksum(body, journalBodyChecksum),
+		checksum:          checksum,
 	}
 	if source, ok := origin.source.(interface {
 		Retain() (io.ReaderAt, func(), error)
@@ -50,12 +74,18 @@ func (origin journalBodyOrigin) message(id MessageID, body []byte) (messageState
 		digest := sha256.Sum256(body)
 		cold.assignmentDigest = &digest
 	}
+	// Retain only after checksum provenance and source ownership exist.
+	// Certified commands share one charged backing; other callers get a copy.
+	origin.hotPayloads.admit(cold, body, origin.hotCommand)
 	return messageState{ID: id, cold: cold}, nil
 }
 
 func (m messageState) releaseJournalSource() {
-	if m.cold != nil && m.cold.releaseSource != nil {
-		m.cold.releaseSource()
+	if m.cold != nil {
+		m.cold.hotPayloads.remove(m.cold)
+		if m.cold.releaseSource != nil {
+			m.cold.releaseSource()
+		}
 	}
 }
 
@@ -121,8 +151,10 @@ func (d Delivery) appendBody(frame []byte) ([]byte, error) {
 	}
 	start := len(frame)
 	frame = frame[:start+d.cold.size]
-	if err := d.cold.read(frame[start:]); err != nil {
-		return nil, err
+	if !d.cold.hotPayloads.copyBody(d.cold, frame[start:]) {
+		if err := d.cold.read(frame[start:]); err != nil {
+			return nil, err
+		}
 	}
 	return frame, nil
 }

@@ -33,6 +33,17 @@ type journalRecord struct {
 	group    uint64
 	body     []byte
 	location journalLocation
+	// Borrowed only from the writer's immutable staging body, while entry
+	// offsets are still relative to this body. Scan/recovery records stay raw.
+	entryChecksums []journalEntryRef
+	prepared       *journalPreparedRecord
+}
+
+func (r journalRecord) bodySize() int {
+	if r.prepared != nil {
+		return r.prepared.size
+	}
+	return len(r.body)
 }
 
 type journalScan struct {
@@ -53,13 +64,13 @@ func encodeJournalFrame(frame []byte, sequence uint64, records []journalRecord) 
 	}
 	var size int
 	for _, record := range records {
-		if record.group == 0 || len(record.body) == 0 {
+		if record.group == 0 || record.bodySize() == 0 {
 			return nil, nil, errors.New("invalid raft journal record")
 		}
-		if len(record.body) > maxJournalFrameBytes-size-journalRecordHeaderSize {
+		if record.bodySize() > maxJournalFrameBytes-size-journalRecordHeaderSize {
 			return nil, nil, errJournalTooLarge
 		}
-		size += journalRecordHeaderSize + len(record.body)
+		size += journalRecordHeaderSize + record.bodySize()
 	}
 	frameSize := journalFrameHeaderSize + size + journalFrameTrailerSize
 	if frameSize > cap(frame) {
@@ -77,12 +88,16 @@ func encodeJournalFrame(frame []byte, sequence uint64, records []journalRecord) 
 	offset := journalFrameHeaderSize
 	for _, record := range records {
 		binary.BigEndian.PutUint64(frame[offset:offset+8], record.group)
-		binary.BigEndian.PutUint32(frame[offset+8:offset+journalRecordHeaderSize], uint32(len(record.body)))
+		binary.BigEndian.PutUint32(frame[offset+8:offset+journalRecordHeaderSize], uint32(record.bodySize()))
 		offset += journalRecordHeaderSize
-		locations = append(locations, journalLocation{offset: int64(offset), size: len(record.body), sequence: sequence})
-		offset += copy(frame[offset:], record.body)
+		locations = append(locations, journalLocation{offset: int64(offset), size: record.bodySize(), sequence: sequence})
+		if record.prepared != nil {
+			offset += record.prepared.copyInto(frame[offset : offset+record.bodySize()])
+		} else {
+			offset += copy(frame[offset:], record.body)
+		}
 	}
-	binary.BigEndian.PutUint32(frame[offset:offset+4], crc32.Checksum(frame[journalFrameHeaderSize:offset], journalChecksum))
+	binary.BigEndian.PutUint32(frame[offset:offset+4], journalFramePayloadChecksum(frame[:offset], records))
 	copy(frame[offset+4:offset+8], "SQJE")
 	binary.BigEndian.PutUint64(frame[offset+8:], sequence)
 	return frame, locations, nil

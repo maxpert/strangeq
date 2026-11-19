@@ -115,6 +115,10 @@ func loadJournalSegmentManifest(dir string) (journalSegmentManifest, error) {
 	if err != nil {
 		return journalSegmentManifest{}, err
 	}
+	return decodeJournalSegmentManifest(data)
+}
+
+func decodeJournalSegmentManifest(data []byte) (journalSegmentManifest, error) {
 	if len(data) < journalSegmentManifestHeader+journalSegmentManifestTrailer || len(data) > maxJournalSegmentManifestBytes {
 		return journalSegmentManifest{}, fmt.Errorf("%w: invalid segment manifest header", errJournalCorrupt)
 	}
@@ -152,9 +156,9 @@ func loadJournalSegmentManifest(dir string) (journalSegmentManifest, error) {
 	return m, m.validate()
 }
 
-func (m journalSegmentManifest) publish(dir string, hooks journalSegmentHooks) error {
+func (m journalSegmentManifest) encode() ([]byte, error) {
 	if err := m.validate(); err != nil {
-		return err
+		return nil, err
 	}
 	data := append([]byte(nil), journalSegmentManifestMagic...)
 	data = binary.BigEndian.AppendUint64(data, uint64(m.extentBytes))
@@ -173,6 +177,15 @@ func (m journalSegmentManifest) publish(dir string, hooks journalSegmentHooks) e
 		data = append(data, anchor.name...)
 	}
 	data = binary.BigEndian.AppendUint32(data, crc32.Checksum(data, journalChecksum))
+
+	return data, nil
+}
+
+func (m journalSegmentManifest) publish(dir string, hooks journalSegmentHooks) error {
+	data, err := m.encode()
+	if err != nil {
+		return err
+	}
 
 	tmp, err := os.CreateTemp(dir, journalSegmentManifestTempPrefix)
 	if err != nil {

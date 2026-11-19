@@ -12,6 +12,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"syscall"
 	"testing"
 	"time"
@@ -37,6 +38,15 @@ func TestProcessDurabilityCLIChild(t *testing.T) {
 }
 
 func TestLocalProcessDurabilitySIGKILLRecovery(t *testing.T) {
+	runLocalProcessDurabilitySIGKILLRecovery(t, false)
+}
+
+func TestOwnedLocalProcessDurabilitySIGKILLRecovery(t *testing.T) {
+	runLocalProcessDurabilitySIGKILLRecovery(t, true)
+}
+
+func runLocalProcessDurabilitySIGKILLRecovery(t *testing.T, observeOwned bool) {
+	t.Helper()
 	const queue = "process-kill-64k"
 	const count, settled = 16, 4
 	nodes := newTestCluster(t, 1, 1, 1)
@@ -53,7 +63,11 @@ func TestLocalProcessDurabilitySIGKILLRecovery(t *testing.T) {
 	require.NoError(t, err)
 	start := func() func() {
 		t.Helper()
-		cmd := exec.Command(executable, "-test.run=^TestProcessDurabilityCLIChild$")
+		child := "TestProcessDurabilityCLIChild"
+		if observeOwned {
+			child = "TestOwnedProcessDurabilityBrokerChild"
+		}
+		cmd := exec.Command(executable, "-test.run=^"+child+"$")
 		cmd.Env = append(os.Environ(), processDurabilityCLIConfig+"="+settings)
 		output, err := os.CreateTemp(filepath.Dir(settings), "broker-*.log")
 		require.NoError(t, err)
@@ -132,12 +146,56 @@ func TestLocalProcessDurabilitySIGKILLRecovery(t *testing.T) {
 	}
 	consume(writer, 0, settled)
 	settlementBarrier(writer, count-settled)
+	unsettled := 0
+	if observeOwned {
+		observed, err := os.ReadFile(settings + ".owned")
+		require.NoError(t, err)
+		require.Equal(t, strings.Repeat("owned\n", count), string(observed), "every positively confirmed publish must use successful owned submission")
+		unsettled = 2
+		for i := settled; i < settled+unsettled; i++ {
+			message, found, err := writer.Get(queue, false)
+			require.NoError(t, err)
+			require.True(t, found)
+			require.Equal(t, idFor(i), message.MessageId)
+			require.Equal(t, bodyFor(i), message.Body)
+			// Keep this connection alive and deliberately leave the delivery
+			// unacknowledged until SIGKILL; no cleanup can requeue it first.
+		}
+		settlementBarrier(writer, count-settled-unsettled)
+	}
 	crash()
 
 	crash = start()
 	reader := openClusterChannel(t, waitQueue(t, &nodes[0], queue, true))
-	settlementBarrier(reader, count-settled)
-	consume(reader, settled, count)
+	if !observeOwned {
+		settlementBarrier(reader, count-settled)
+		consume(reader, settled, count)
+	} else {
+		// Old sessions retain their in-flight messages until the existing 30s
+		// lease expires. Read the ready survivors first, then their requeued
+		// peers; test the complete set rather than assuming delivery order.
+		seen := make(map[int]bool)
+		deadline := time.Now().Add(45 * time.Second)
+		for len(seen) < count-settled && time.Now().Before(deadline) {
+			message, found, err := reader.Get(queue, false)
+			require.NoError(t, err)
+			if !found {
+				time.Sleep(50 * time.Millisecond)
+				continue
+			}
+			require.Len(t, message.Body, 64<<10)
+			i := int(binary.BigEndian.Uint64(message.Body))
+			require.GreaterOrEqual(t, i, settled, "a persisted ACK must never resurrect")
+			require.Less(t, i, count)
+			require.False(t, seen[i], "a survivor must be delivered exactly once in this recovery drain")
+			require.Equal(t, idFor(i), message.MessageId)
+			require.Equal(t, bodyFor(i), message.Body, "cold owned payload bytes must match exactly")
+			require.Equal(t, i < settled+unsettled, message.Redelivered, "only deliberately unsettled deliveries must be marked redelivered")
+			seen[i] = true
+			require.NoError(t, message.Ack(false))
+		}
+		require.Len(t, seen, count-settled, "every confirmed ready or unsettled survivor must recover")
+	}
 	settlementBarrier(reader, 0)
 	crash()
 

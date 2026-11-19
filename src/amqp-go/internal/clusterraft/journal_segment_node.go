@@ -31,6 +31,11 @@ func openSegmentedGroupNode(dir string, create, rangeSync bool, extentBytes, ret
 		}
 	}()
 	node.reader = reader
+	if output.store.processRoots != nil {
+		output.store.processRoots.snapshotBytes = &node.snapshotBytes
+		node.syncFile = output.store.hooks.syncFile
+		node.syncDir = output.store.hooks.syncDir
+	}
 	if err := node.inventorySnapshots(); err != nil {
 		return nil, err
 	}

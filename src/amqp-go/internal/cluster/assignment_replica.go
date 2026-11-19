@@ -85,12 +85,30 @@ func (n *Node) readAssignmentReplica(ctx context.Context, request clusterqueue.A
 }
 
 func (n *Node) readAssignmentInline(ctx context.Context, request clusterqueue.AssignmentRequest, data []byte) ([]clusterqueue.Delivery, clusterqueue.AttemptID, error) {
-	wire, err := n.Query(ctx, request.Queue, data)
+	if err := n.Ready(); err != nil {
+		return nil, request.After, err
+	}
+	var local localAssignmentResult
+	wire, err := n.retryRoute(ctx, groupFor(request.Queue, n.cfg.Shards), data,
+		func(ctx context.Context, id uint64, data []byte) ([]byte, error) {
+			return n.tryRouteWithAssignment(ctx, id, data, routeRead, nil, &local)
+		})
+	if err != nil {
+		local.release()
+	}
 	if errors.Is(err, errInvalidRead) {
 		return nil, request.After, clusterqueue.ErrInvalidCommand
 	}
 	if err != nil {
 		return nil, request.After, err
+	}
+	if local.domainErr != nil {
+		return nil, request.After, local.domainErr
+	}
+	if local.page != nil {
+		page := local.page
+		local.page = nil
+		return page.TakeItems(), page.Through, nil
 	}
 	return clusterqueue.DecodeAssignmentPage(wire, request)
 }

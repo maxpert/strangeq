@@ -244,11 +244,7 @@ func (p *clusterPublishBurst) flush() error {
 	for i, item := range p.items {
 		records[i] = p.broker.publishRecord(item.header, item.message.Body)
 	}
-	command, err := clusterqueue.EncodePublishBatchRecords(target.Queue, target.Incarnation, records[:len(p.items)])
-	if err != nil {
-		return p.finishRemaining(0, err)
-	}
-	wire, err := p.broker.cluster.Submit(ctx, target.Queue, command)
+	wire, err := p.broker.submitPublishBatch(ctx, target, records[:len(p.items)])
 	if err != nil {
 		return p.finishRemaining(0, err)
 	}

@@ -22,11 +22,27 @@ const (
 )
 
 type Machine struct {
-	state       machineState
-	assignments bool
+	state                   machineState
+	assignments             bool
+	hotPayloads             *HotPayloadCache
+	requireImmutableCommand bool
 }
 
 func NewAssignmentMachine() Machine { return Machine{assignments: true} }
+
+// NewHotPayloadMachine shares a node-wide delivery handoff budget. The cache
+// affects only local body materialization, never replicated queue state.
+func NewHotPayloadMachine(cache *HotPayloadCache) Machine {
+	return Machine{hotPayloads: cache, requireImmutableCommand: true}
+}
+
+// AcceptsImmutableJournalCommands opts into the adapter's audited ownership
+// capability. The source itself never owns or exposes a command buffer.
+func (m *Machine) AcceptsImmutableJournalCommands() bool { return m.hotPayloads != nil }
+
+func NewHotPayloadAssignmentMachine(cache *HotPayloadCache) Machine {
+	return Machine{assignments: true, hotPayloads: cache, requireImmutableCommand: true}
+}
 
 type machineState struct {
 	LastQueue           QueueID
@@ -159,7 +175,15 @@ func (m *Machine) applyCommand(data []byte, wantReply bool, source io.ReaderAt) 
 		return failure(ErrInvalidCommand)
 	}
 	// The validated command body is the suffix of data.
-	origin := journalBodyOrigin{source: source, offset: int64(len(data) - len(c.Body))}
+	origin := journalBodyOrigin{source: source, offset: int64(len(data) - len(c.Body)), hotPayloads: m.hotPayloads}
+	if m.hotPayloads != nil {
+		origin.hotCommand = immutableHotCommand(data, source)
+		if m.requireImmutableCommand && origin.hotCommand == nil {
+			// Provenance disappears before peer activation. Production opt-in
+			// must then take the checked cold path, without creating a clone.
+			origin.hotPayloads = nil
+		}
+	}
 	return m.apply(c, wantReply, origin)
 }
 

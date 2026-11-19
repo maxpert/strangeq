@@ -12,6 +12,29 @@ The client uses round-robin connection allocation, a named direct exchange, pers
 
 `--payload-profile perftest` is the default and preserves the command's built-in PerfTest bodies. In [PerfTest 2.25.0](https://github.com/rabbitmq/rabbitmq-perf-test/blob/v2.25.0/src/main/java/com/rabbitmq/perf/TimeSequenceMessageBodySource.java), these contain changing sequence/timestamp bytes with a zero-filled remainder, so they are highly compressible. For a separate high-entropy run, add `--payload-profile high-entropy`. The runner creates one deterministic SHAKE-256 binary fixture per selected case, passes its path with `--body`, and reuses identical bytes for both engines and every repeat. These are reused payloads, not unique bodies per message. `environment.json` records profile, body size, fixture path, seed and SHA-256. The default profile has no single body digest because its sequence/timestamp varies, recorded as a null SHA with that reason. Keep payload profiles in separate result sets.
 
+## Single-node Classic runs
+
+On November 19, 2026, one native ARM64 Linux VM ran the unified local journal
+and RabbitMQ Classic 4.4.0 on the same scratch filesystem. StrangeQ used the
+`process` durability profile, 32 shards, two journal streams and consumer
+assignments. Both used persistent, mandatory high-entropy messages, confirm
+window 64 and prefetch 100. Each 32-second run excluded its first five seconds.
+The 64 KiB comparison alternated broker order across two pairs. The 1 KiB
+comparison used one pair. All runs recorded zero negative confirms and returns.
+
+| Payload and pair | StrangeQ confirms/s | StrangeQ deliveries/s | StrangeQ peak RSS | Classic confirms/s | Classic deliveries/s | Classic peak RSS |
+|---|---:|---:|---:|---:|---:|---:|
+| 64 KiB, 1 | 37,080 | 37,081 | 400 MiB | 33,818 | 33,811 | 1,197 MiB |
+| 64 KiB, 2 | 37,231 | 37,225 | 368 MiB | 35,131 | 35,136 | 1,204 MiB |
+| 1 KiB, 1 | 129,215 | 129,215 | 42 MiB | 58,458 | 58,458 | 175 MiB |
+
+Use the comparison command below with `--topology singleton`,
+`--strangeq-durability process`, `--payload-profile high-entropy`,
+`--case 65536-10x10-10q`, `--duration 32`, `--warmup 5`, `--repeats 2`,
+`--strangeq-shards 32`, `--strangeq-range-sync`, `--strangeq-dual-stream`
+and `--strangeq-assignments`. For the small-payload pair, use
+`--case 1024-1x1-1q --repeats 1`.
+
 ## Recorded ARM64 runs
 
 These historical normal-workload measurements precede the replicated dead-lettering

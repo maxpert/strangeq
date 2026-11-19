@@ -32,10 +32,22 @@ type assignmentJournalSource struct {
 }
 
 func (s *assignmentJournalSource) Retain() (io.ReaderAt, func(), error) {
-	if source, ok := s.journalCommandReader.(*journalSegmentCommandSource); ok {
+	if source, ok := s.journalCommandReader.(interface {
+		Retain() (io.ReaderAt, func(), error)
+	}); ok {
 		return source.Retain()
 	}
 	return s, func() {}, nil
+}
+
+// Forward only the scalar provenance certificate, never the backing bytes.
+func (s *assignmentJournalSource) ImmutableJournalCommandBacking() (prefix, capacity int) {
+	if source, ok := s.journalCommandReader.(interface {
+		ImmutableJournalCommandBacking() (int, int)
+	}); ok {
+		return source.ImmutableJournalCommandBacking()
+	}
+	return 0, 0
 }
 
 func (s *assignmentJournalSource) AssignmentJournalEntry() (index, term uint64, size int64) {

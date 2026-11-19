@@ -78,6 +78,7 @@ func (w *journalWriter) releaseAdmissionLocked(charge int) {
 func (w *journalWriter) releaseRequestsLocked(batch []journalRequest) {
 	for i := range batch {
 		batch[i].record.body = nil
+		batch[i].record.prepared = nil
 		w.staging.release(batch[i].staging)
 		batch[i].staging = journalScratchLoan{}
 		w.releaseAdmissionLocked(batch[i].charge)

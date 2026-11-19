@@ -287,13 +287,9 @@ func (b *ClusterBroker) publishMessage(exchange, key string, message *protocol.M
 	var stale []clusterTarget
 	published := 0
 	for _, target := range targets {
-		command, err := clusterqueue.EncodePublishCommand(target.Queue, target.Incarnation, record)
+		result, err := b.submitPublishRecord(ctx, target, record)
 		if err == nil {
-			var result clusterqueue.QueueResponse
-			result, err = b.executeEncoded(ctx, target.Queue, command, false)
-			if err == nil {
-				err = result.Err()
-			}
+			err = result.Err()
 		}
 		switch {
 		case errors.Is(err, clusterqueue.ErrQueueNotFound), errors.Is(err, clusterqueue.ErrQueueIncarnation):

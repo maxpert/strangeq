@@ -12,6 +12,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/maxpert/amqp-go/internal/clusterproposal"
+
 	"go.etcd.io/raft/v3"
 	pb "go.etcd.io/raft/v3/raftpb"
 	"go.etcd.io/raft/v3/tracker"
@@ -89,7 +91,7 @@ type Status struct {
 	Progress                                          map[uint64]Progress
 }
 
-type key [16]byte
+type key [clusterproposal.PrefixBytes]byte
 type response struct {
 	body []byte
 	err  error
@@ -344,10 +346,13 @@ func (g *Group) applyCommand(entry *pb.Entry) error {
 		if sourceErr != nil {
 			return sourceErr
 		}
+		section = g.immutableCommandSource(section, cap(data))
 		var source io.ReaderAt = section
 		if g.cfg.AssignmentReplicaBodies {
 			source = &assignmentJournalSource{journalCommandReader: section, index: entry.GetIndex(), term: entry.GetTerm()}
 		}
+		source, releaseChecksums := g.preparedBodyChecksumSource(source, entry)
+		defer releaseChecksums()
 		if captured, ok := machine.(deferredJournalReplyMachine); ok {
 			var encode func() ([]byte, error)
 			reply, encode, err = captured.ApplyJournaledReply(command, wantReply, source)
@@ -607,9 +612,44 @@ func (g *Group) Propose(ctx context.Context, data []byte) ([]byte, error) {
 		gather = g.cfg.GatherProposal(data)
 	}
 	return g.propose(ctx, inputBytes, false, func(id key) error {
-		command := make([]byte, 0, len(id)+len(data))
-		command = append(command, id[:]...)
-		return g.proposeOrdinary(append(command, data...), gather)
+		return g.proposeOrdinary(newProposalCommand(id, data), gather)
+	})
+}
+
+func newProposalCommand(id key, data []byte) []byte {
+	command := make([]byte, 0, len(id)+len(data))
+	command = append(command, id[:]...)
+	return append(command, data...)
+}
+
+// ProposeOwned consumes the final encoder allocation only after the same
+// leader/pending/storage admission as Propose. It saves its full command copy;
+// Raft still makes its existing immutable entry clone.
+func (g *Group) ProposeOwned(ctx context.Context, owned *clusterproposal.Submission) ([]byte, error) {
+	data := owned.Command()
+	if data == nil {
+		return nil, clusterproposal.ErrConsumed
+	}
+	if uint64(len(data)) > g.cfg.MaxEntryBytes-uint64(len(key{})) {
+		return nil, ErrTooLarge
+	}
+	inputBytes := uint64(len(data)) + uint64(len(key{})) + 32 + journalEntryInputOverhead
+	var gather time.Duration
+	if g.cfg.GatherProposal != nil {
+		gather = g.cfg.GatherProposal(data)
+	}
+	return g.propose(ctx, inputBytes, false, func(id key) error {
+		if !g.cfg.ProcessDurability || !g.store.node.writer.durability.processAllowed() {
+			// Activation can fence the process owner after the routing check.
+			command := newProposalCommand(id, data)
+			owned.Discard()
+			return g.proposeOrdinary(command, gather)
+		}
+		command, err := owned.Take(id[:])
+		if err != nil {
+			return err
+		}
+		return g.proposeOrdinary(command, gather)
 	})
 }
 

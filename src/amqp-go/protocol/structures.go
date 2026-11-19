@@ -830,6 +830,10 @@ type Message struct {
 	// always inline, bodyKind 0x00) and leaves it nil; only ITER5 will
 	// produce/consume it. The WAL and segment layers treat its contents as opaque.
 	BodyRef []byte
+	// releaseBody belongs only to a freshly decoded local egress message.
+	// Its one-word optional callback stays within Message's 288-byte class;
+	// stored/published messages always leave it nil and are safe to copy.
+	releaseBody func()
 	// THE ONE-BYTE FIELDS ARE PACKED TOGETHER, LAST. Interleaved with the
 	// pointer-aligned fields above, each of them padded out to a full word
 	// and the struct fell into Go's 320 B size class; packed they share one

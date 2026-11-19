@@ -182,10 +182,26 @@ optional tuning and restart requirements are documented in the
 
 ## Performance
 
-These same-host benchmarks use three voting replicas per queue on an eight-core
-ARM64 Linux VM. Results describe the measured workloads and storage settings.
-The pinned results below predate the journal becoming the Raft default; replay
-them with the runner and binary from their stated revisions.
+### Single-node durable queues
+
+StrangeQ's local journal in process durability mode and RabbitMQ Classic 4.4.0
+ran on the same native ARM64 Linux VM. Both used persistent high-entropy
+messages and manual acknowledgments.
+
+| Workload | Broker | Confirms/s | Deliveries/s | Peak broker RSS |
+|---|---|---:|---:|---:|
+| 64 KiB, 10 producers / 10 consumers, 10 queues | StrangeQ | 37,156 | 37,153 | 384 MiB |
+| | RabbitMQ Classic | 34,475 | 34,473 | 1,201 MiB |
+| 1 KiB, 1 producer / 1 consumer, 1 queue | StrangeQ | 129,215 | 129,215 | 42 MiB |
+| | RabbitMQ Classic | 58,458 | 58,458 | 175 MiB |
+
+The 64 KiB figures average two pairs with the broker order reversed. StrangeQ
+led on all three metrics in both pairs. The 1 KiB figures are from one pair.
+[Methodology and per-pair results](src/amqp-go/benchmark/CLUSTER_COMPARISON.md#single-node-classic-runs)
+
+The cluster results below used three voting replicas per queue on the same
+ARM64 Linux VM. They predate the journal becoming the Raft default and use the
+runner and binaries from their stated revisions.
 
 ### Active dead-lettering
 

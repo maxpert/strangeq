@@ -73,8 +73,12 @@ func TestJournalProcessAppendNeedsOnlyKernelWrite(t *testing.T) {
 		require.NoError(t, os.WriteFile(filepath.Join(crashDir, file.Name()), data, 0600))
 	}
 	require.Equal(t, 1, bodyCopies, "one physical journal body is sufficient for replay and retained reads")
-	recovered, err := OpenNodeJournalWithOptions(crashDir, false, JournalOptions{ProcessDurability: true})
+	// This fixture deliberately exercises the legacy unrooted writer. Reopen
+	// through the same low-level path; Linux serving options require fresh roots.
+	recoveredStore, err := openSegmentedGroupNode(crashDir, false, false, journalServingExtentBytes, journalGroupMaxFileBytes, nil, journalSegmentHooks{})
 	require.NoError(t, err)
+	recoveredStore.writer.durability = &journalDurability{}
+	recovered := &NodeJournal{store: recoveredStore}
 	t.Cleanup(func() { _ = recovered.Close() })
 	restored, err := recovered.OpenGroup(Config{ID: 1, GroupID: 11, Dir: crashDir, Machine: &testMachine{}, TickInterval: -1, ProcessDurability: true})
 	require.NoError(t, err)
