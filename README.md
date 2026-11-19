@@ -9,33 +9,26 @@ connect with RabbitMQ client libraries, and optionally replicate queues with Raf
 
 ## Quick start
 
-Download a macOS or Linux archive from
-[Releases](https://github.com/maxpert/strangeq/releases), verify its checksum,
-extract it, and run the broker.
+Download the archive for your OS and architecture, verify its checksum, and
+extract it. [Release binaries](https://github.com/maxpert/strangeq/releases)
+
+Run this from the extracted directory to start a standalone broker. If you
+plan to add peers later, use the [single-node Raft setup](#local-raft-journal)
+with a fresh data directory.
 
 ```sh
 ./amqp-server
 ```
 
-The default standalone engine listens on `127.0.0.1:5672` and stores data in
-`./data`, with authentication disabled. Use the [client examples](CLIENT_EXAMPLES.md)
-to publish and consume with Python, Node.js, or Go. Configure
-[authentication](docs/AUTHORIZATION.md) and [TLS](docs/TLS.md) for remote access.
-
-To try the clustering settings documented here, build this checkout with Go
-1.27.3 or later.
-
-```sh
-git clone https://github.com/maxpert/strangeq.git
-cd strangeq/src/amqp-go
-go build -o amqp-server ./cmd/amqp-server
-./amqp-server
-```
-
-Commands below assume `amqp-server` is on your `PATH`. Use `./amqp-server` when
-running from the binary's directory.
+The broker listens on `127.0.0.1:5672` and stores data in `./data`, with
+authentication disabled. The [client examples](CLIENT_EXAMPLES.md) show how
+to publish and consume. Configure [authentication](docs/AUTHORIZATION.md)
+and [TLS](docs/TLS.md) for remote access.
 
 ## Clustering
+
+The v0.15.0 release predates distributed queues.
+[Cluster version requirements](docs/CLUSTERING.md#availability)
 
 Clients connect to any enrolled broker using AMQP. StrangeQ routes queue
 operations to the owning Raft shard. Three voting replicas per queue can
@@ -108,7 +101,7 @@ cluster:
 ```
 
 ```sh
-amqp-server --config local.yaml
+./amqp-server --config local.yaml
 ```
 
 Startup creates a one-voter journal without an initialization command or peer
@@ -119,8 +112,8 @@ legacy standalone engine, whose data is not migrated by this configuration.
 
 ### Configuration and durability
 
-Use `amqp-server --generate-config config.yaml` for a full configuration, then
-start with `amqp-server --config config.yaml`. Files overlay defaults, environment
+Use `./amqp-server --generate-config config.yaml` for a full configuration, then
+start with `./amqp-server --config config.yaml`. Files overlay defaults, environment
 variables override files, and explicit flags override both. See the
 [configuration reference](src/amqp-go/config.sample.yaml).
 
@@ -151,7 +144,8 @@ figures are from one matched pair.
 
 ## Documentation and support
 
-[Protocol limits](CLIENT_EXAMPLES.md#protocol-limits) · [Management UI and REST API](docs/MANAGEMENT.md) ·
+[Installation and source builds](QUICKSTART.md#installation) · [Protocol limits](CLIENT_EXAMPLES.md#protocol-limits) ·
+[Management UI and REST API](docs/MANAGEMENT.md) ·
 [Metrics, readiness, and profiling](docs/METRICS.md) · [systemd deployment](deployment/systemd/README.md) ·
 [Release notes](CHANGELOG.md) · [Contributing](CONTRIBUTING.md)
 

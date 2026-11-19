@@ -9,18 +9,25 @@ before allowing remote clients.
 
 ### Pre-built Binary
 
-Download from the [releases page](https://github.com/maxpert/strangeq/releases). Each platform ships as a tarball (`amqp-server-<version>-<os>-<arch>.tar.gz`) containing the `amqp-server` binary, `config.sample.yaml`, `README.txt`, and `LICENSE`, plus a `.sha256` checksum:
+Download the archive and its `.sha256` file for your OS and architecture.
+Release filenames use `darwin` for macOS. Set `archive` to the filename
+you downloaded. This example uses Linux on ARM64.
+[Release binaries](https://github.com/maxpert/strangeq/releases)
 
 ```bash
-tar -xzf amqp-server-<version>-<os>-<arch>.tar.gz
-cd amqp-server-<version>-<os>-<arch>/
-sudo mv amqp-server /usr/local/bin/
-amqp-server --version
+archive=amqp-server-0.15.0-linux-arm64.tar.gz
+sha256sum -c "$archive.sha256" && tar -xzf "$archive" &&
+  cd "${archive%.tar.gz}" && ./amqp-server --version
 ```
+
+On macOS, use `shasum -a 256 -c` in place of `sha256sum -c`. Run the
+binary from its directory as `./amqp-server`, or put it on your `PATH`
+to use the commands below as written.
 
 ### From Source
 
 Install the Go version declared in [go.mod](src/amqp-go/go.mod) or later.
+Check out the branch or tag you intend to build before running `go build`.
 
 ```bash
 git clone https://github.com/maxpert/strangeq.git
@@ -29,8 +36,9 @@ go build -o amqp-server ./cmd/amqp-server
 sudo mv amqp-server /usr/local/bin/
 ```
 
-The module path (`github.com/maxpert/amqp-go`) differs from the repository
-path, so `go install ...@latest` is not supported; build from source instead.
+Run the built binary as described above. See the
+[clustering guide](docs/CLUSTERING.md#availability) for builds that support
+distributed queues.
 
 ## Start Server
 

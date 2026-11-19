@@ -6,15 +6,25 @@ Each broker needs its own persistent directory. AMQP clients can connect to any 
 broker through that broker's application listener. Peer traffic uses a separate
 listener.
 
-The local-journal profile below is a pilot. Without `cluster.local: true` or an explicit
-cluster ID, startup uses the standalone storage engine. Neither path imports existing
-standalone data into a cluster. Read [behavior and limits](#behavior-and-limits) before
-choosing a profile: the management HTTP API is unavailable in both local and addressed
-cluster mode.
+## Availability
+
+[v0.15.0](https://github.com/maxpert/strangeq/releases/tag/v0.15.0) predates
+distributed queues. For the development workflow below, use an
+`amqp-server` binary from the same revision as this guide.
+[Source build instructions](../QUICKSTART.md#from-source)
+
+Use a fresh data directory for Raft storage. The default startup uses
+standalone storage. See [cluster behavior and limits](#behavior-and-limits)
+before deploying, including the scope of the management API.
 
 ## Pilot: start locally, then activate peers
 
-Use a fresh directory for this local one-voter profile.
+This example runs two brokers on one machine. The first broker starts as a
+one-voter Raft node and can accept peers later.
+
+### Start the first broker
+
+Save this as `local.yaml` and choose a fresh data directory.
 
 ```yaml
 network:
@@ -26,26 +36,29 @@ cluster:
   shards: 32
 ```
 
-Save as `local.yaml` and run `amqp-server --config local.yaml` directly, without
-`--initialize-cluster`. Startup provisions the local one-voter journal and prints
-`Cluster lineage: <lineage>; node ID: <id>`. Preserve those actual generated values and
-the data directory. There is no peer socket while peer settings are absent. Publishes
-use the same durable journal/commit/apply path with one voter.
+```sh
+amqp-server --config local.yaml
+```
 
-The default `storage.durability: barrier` keeps the existing durable journal fences. The
-local profile also permits explicit `storage.durability: process`: confirmed
-publications and required settlements survive a broker process kill while the OS kernel
-remains alive. This policy does not promise recovery after an OS crash, host reset or
-power loss. It is rejected for standalone and addressed cluster profiles. `none` does
-not provide this process-kill guarantee.
+The broker provisions its journal and prints its cluster lineage and node ID.
+Record both values for the joiner's configuration. Keep the data directory
+for restarts. You can publish and consume at `127.0.0.1:5672` now.
 
-See [process-mode recovery](#process-mode-recovery) for platform and recovery
-requirements. Peer activation permanently upgrades a process-mode journal to full
-durability, including when an activation attempt fails.
+### Create a peer token
 
-To activate peers in this running process, generate a shared token using the credential
-command below. Keep `local: true` and the same shard/format settings. Add these
-loopback-only test settings to the existing `cluster` section.
+Run this once for a new cluster. Every broker uses the same token. Distribute
+it as a secret file when running on multiple hosts.
+
+```sh
+umask 077
+openssl rand -base64 32 | tr -- '+/' '-_' | tr -d '=\n' > peer.token
+```
+
+### Enable peer connections
+
+Edit `local.yaml` while the first broker is running. Append these settings
+under the existing `cluster` key. Keep `local: true`, the data directory,
+and the original shard and storage settings.
 
 ```yaml
   peer_address: "127.0.0.1:7661"
@@ -53,39 +66,57 @@ loopback-only test settings to the existing `cluster` section.
   allow_loopback_plaintext: true
 ```
 
-For multiple hosts, configure `peer_cert_file`, `peer_key_file` and, for a private CA,
-`peer_ca_file`. Omit plaintext permission. `peer_listen` optionally sets a separate bind
-address. Send `kill -HUP <broker-pid>` after saving the same configuration file. SIGHUP
-activates authenticated peer transport and commits the source's endpoint without
-replacing its journal or AMQP sessions. Only peer settings reload. Runtime storage,
-protocol and identity remain fixed. Repeating activation at the same endpoint is
-idempotent. An already active transport keeps its credentials and certificates. Rotation
-requires separate handling.
+After saving, send SIGHUP to the first broker with `kill -HUP PID`, replacing
+`PID` with its process ID. Peer settings take effect on port 7661. The broker
+keeps its journal and existing AMQP sessions. Keep the activated configuration
+and credentials for restarts. Repeating activation with the same settings is
+safe. An active listener retains its credentials and certificates on reload.
+For brokers on separate hosts, configure [peer TLS](#provision-an-addressed-seed).
 
-Start each joining broker with a fresh directory and the normal addressed peer
-configuration shown below, substituting the printed source lineage for `id` and
-`"<printed-source-id>@127.0.0.1:7661"` for its sole seed. Choose a unique positive
-`node_id`, use the same shard/format settings and credentials, and start normally. Never
-initialize a joiner. Every joining peer retains that same original active-seed identity
-in `seeds`. Keep the original source configured with `local: true` permanently,
-including after activation and restart. Do not convert its profile to a seeded one.
-Restart with the same activated endpoint, credentials and data directory. There is no
-separate startup-conversion step.
+### Join a second broker
 
-A second voter needs both nodes for commits. One-node failure tolerance is available
-only after the catalog and each affected shard have three voting replicas and learners
-have caught up. Enrollment alone does not prove that convergence. The pilot retains the
-cluster feature restrictions listed below, including the unavailable management HTTP
-API.
+Save this as `node-2.yaml`. Replace `SOURCE_LINEAGE` and `SOURCE_NODE_ID`
+with the values printed by the first broker. Use a unique positive `node_id`
+and a fresh data directory for the joiner.
+
+```yaml
+network:
+  address: "127.0.0.1:5673"
+storage:
+  path: "./node-2-data"
+cluster:
+  id: "SOURCE_LINEAGE"
+  node_id: 2
+  peer_address: "127.0.0.1:7662"
+  seeds: ["SOURCE_NODE_ID@127.0.0.1:7661"]
+  shards: 32
+  token_file: "./peer.token"
+  allow_loopback_plaintext: true
+```
+
+```sh
+amqp-server --config node-2.yaml
+```
+
+The joiner enrolls at startup. Use `--initialize-cluster` only when provisioning
+original addressed voters. Publish to a queue with confirms on port 5672
+and consume from the same queue on port 5673 to check routing. Subsequent
+joiners use the same original seed and their own IDs, ports, and data
+directories. With two voters, commits need both. Wait for three caught-up
+voting replicas in the catalog and each affected shard before relying on
+one-broker failure tolerance.
+[Readiness and quorum](#readiness-and-quorum)
+
+The local broker uses full durability by default. The optional `process`
+profile preserves confirmed publishes and required settlements across a broker
+process kill while the OS kernel remains running. Peer activation permanently
+upgrades the journal to full durability.
+[Process-mode recovery](#process-mode-recovery)
 
 ## Provision an addressed seed
 
-Generate a shared peer credential and distribute it to each host as a secret file.
-
-```sh
-umask 077
-openssl rand -base64 32 | tr '+/' '-_' | tr -d '=\n' > peer.token
-```
+Use this path when peer listeners should be available from the start.
+[Create a peer token](#create-a-peer-token) before provisioning.
 
 Save this local test configuration as `node-1.yaml`.
 
@@ -192,7 +223,7 @@ peer TLS. See [TLS](TLS.md) and [Authorization](AUTHORIZATION.md).
 
 Configured Raft nodes always use the shared segmented journal. There is no backend
 selector: `cluster.experimental_raft_journal` has been removed. Provision fresh cluster
-storage directories for this release. Existing bbolt Raft stores and flat journals are
+storage directories for the segmented journal. Existing bbolt Raft stores and flat journals are
 rejected, not converted. Keep the stream and format settings on subsequent restarts
 because they are part of the durable node identity. Ordinary standalone mode continues
 to use its existing storage engine. This release does not migrate standalone data into
