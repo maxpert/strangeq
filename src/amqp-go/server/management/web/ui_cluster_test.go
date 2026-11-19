@@ -123,6 +123,11 @@ func TestUI_ClusterObservationAndControls(t *testing.T) {
 	if !evalBool(t, ctx, `!!document.querySelector('#cluster-read-error [role="alert"]') && !!document.getElementById('cluster-groups') && document.getElementById('cluster-action-n1').disabled`) {
 		t.Fatal("read outage did not preserve stale observation with disabled controls and retry")
 	}
+	mustDo(t, ctx, chromedp.Click(chromedp.CSS("#nav a[data-nav=queues]")), chromedp.WaitVisible(chromedp.CSS(".screen-queues")))
+	mustDo(t, ctx, chromedp.Click(chromedp.CSS("#nav a[data-nav=nodes]")), chromedp.WaitVisible(chromedp.CSS("#cluster-retry")))
+	if !evalBool(t, ctx, `!document.getElementById('cluster-groups') && document.getElementById('cluster-read-error').textContent.includes('could not read cluster status')`) {
+		t.Fatal("Nodes reported a stale observation after leaving the screen that displayed it")
+	}
 	f.mu.Lock()
 	f.failRead = false
 	f.mu.Unlock()

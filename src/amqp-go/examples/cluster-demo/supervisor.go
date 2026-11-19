@@ -33,7 +33,6 @@ type brokerNode struct {
 type supervisor struct {
 	controlMu                           sync.Mutex
 	mu                                  sync.Mutex
-	closed                              bool
 	binary, directory, password, socket string
 	http                                *http.Client
 	nodes                               []*brokerNode
@@ -57,9 +56,6 @@ func (s *supervisor) SetRunning(ctx context.Context, id string, running bool) er
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.closed {
-		return clusteradmin.ErrUnavailable
-	}
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -277,7 +273,6 @@ func (s *supervisor) fetch(ctx context.Context, node *brokerNode) clusteradmin.S
 
 func (s *supervisor) close() {
 	s.mu.Lock()
-	s.closed = true
 	var children []*supervisedProcess
 	for _, node := range s.nodes {
 		if p := node.process; p != nil {

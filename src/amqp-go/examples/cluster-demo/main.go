@@ -135,7 +135,7 @@ func run(ctx context.Context, binary string) error {
 	if err != nil {
 		return err
 	}
-	defer stopSupervisor()
+	defer stopSupervisor() // Drain supervisor calls before closing the brokers.
 	for _, node := range s.nodes {
 		if err := s.SetRunning(ctx, node.id, true); err != nil {
 			return fmt.Errorf("start node %s: %w", node.id, err)

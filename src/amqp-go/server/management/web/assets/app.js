@@ -309,6 +309,7 @@
     state.principal = null;
     state.authed = false;
     state.currentLoad = null;
+    state.cluster = { snapshot: null, pending: {}, readError: null };
     clearTimeout(state.refresh.timer);
     if (document.getElementById("login-form")) return;
     renderLogin();
@@ -1727,7 +1728,7 @@
       onConfirm: function () {
         error.textContent = "";
         var snapshot = state.cluster.snapshot;
-        var latest = snapshot && (snapshot.nodes || []).filter(function (n) { return n.id === node.id; })[0];
+        var latest = snapshot && (snapshot.nodes || []).find(function (n) { return n.id === node.id; });
         if (!latest || !clusterControlAllowed(snapshot, latest) || latest.state !== (action === "start" ? "stopped" : "running")) {
           error.textContent = "Node state or control permission changed. Close this dialog and refresh before trying again.";
           return Promise.resolve(true);
@@ -1753,7 +1754,7 @@
     var pending = Object.keys(state.cluster.pending);
     return h("div", { class: "screen screen-nodes screen-cluster", id: "cluster-screen" }, [
       h("div", { class: "page-head" }, [h("h1", { id: "cluster-heading", tabindex: "-1", text: "Nodes" }), badge("Cluster", "system")]),
-      h("dl", { class: "props cluster-meta" }, [
+      h("dl", { class: "props" }, [
         h("dt", { text: "Cluster" }), h("dd", null, [clusterUnknown(data.cluster_id)]),
         h("dt", { text: "Observed at" }), h("dd", null, [fmtTime(data.observed_at)]),
         h("dt", { text: "Observer" }), h("dd", null, [clusterUnknown(data.observer)])
@@ -1812,6 +1813,7 @@
     var retryFocused = document.activeElement && document.activeElement.id === "cluster-retry";
     Array.prototype.forEach.call(container.querySelectorAll("#cluster-nodes button"), function (btn) { btn.disabled = true; });
     var region = container.querySelector("#cluster-read-error");
+    var showingSnapshot = !!container.querySelector("#cluster-screen");
     if (!region) {
       container.replaceChildren(h("div", { class: "screen screen-nodes" }, [
         h("h1", { text: "Nodes" }), h("div", { id: "cluster-read-error" })
@@ -1821,7 +1823,7 @@
     region.replaceChildren(h("div", { class: "notice permission", role: "alert" }, [
       h("h2", { text: "Cluster observation unavailable" }),
       h("p", { text: detail }),
-      h("p", { text: state.cluster.snapshot ? "Showing the last observation; node states and leadership may have changed. Automatic refresh will retry." : "The management view could not read cluster status. Automatic refresh will retry." }),
+      h("p", { text: showingSnapshot ? "Showing the last observation; node states and leadership may have changed. Automatic refresh will retry." : "The management view could not read cluster status. Automatic refresh will retry." }),
       h("button", { type: "button", id: "cluster-retry", text: "Retry now", onclick: refreshNow })
     ]));
     if (retryFocused) document.getElementById("cluster-retry").focus({ preventScroll: true });
@@ -1841,7 +1843,6 @@
         }
       });
       paintCluster(container, r.data);
-      state.displayed = "cluster";
     }).catch(function (err) {
       if (state.route !== route || !state.authed) throw err;
       state.cluster.readError = err.message || "request failed";
@@ -3410,12 +3411,7 @@
       appendChildren(el, [h("span", { text: state.principal.name })]);
       var logout = h("button", { type: "button", id: "logout-btn", text: "Sign out" });
       logout.addEventListener("click", function () {
-        api(API + "/strangeq/session", { method: "DELETE" }).catch(function () { /* ignore */ }).then(function () {
-          state.csrf = null;
-          state.principal = null;
-          state.authed = false;
-          renderLogin();
-        });
+        api(API + "/strangeq/session", { method: "DELETE" }).then(handleUnauthorized, handleUnauthorized);
       });
       el.appendChild(document.createTextNode(" "));
       el.appendChild(logout);
