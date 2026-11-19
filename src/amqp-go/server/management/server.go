@@ -17,6 +17,7 @@ import (
 
 	"github.com/maxpert/amqp-go/config"
 	"github.com/maxpert/amqp-go/interfaces"
+	"github.com/maxpert/amqp-go/internal/clusteradmin"
 	"github.com/maxpert/amqp-go/server"
 	"go.uber.org/zap"
 	"golang.org/x/crypto/bcrypt"
@@ -31,6 +32,11 @@ type Options struct {
 	AuthFile      string                   // resolved auth.json path; "" => no users
 	Logger        *zap.Logger
 	Metrics       ManagementMetricsSink // nil when telemetry is disabled
+
+	// Cluster selects the cluster-only inspection surface. Process control is
+	// available only through an explicitly injected, local controller.
+	Cluster        clusteradmin.Observer
+	ClusterControl clusteradmin.Controller
 
 	Version, Commit, BuildDate, GoVersion string
 
@@ -105,6 +111,9 @@ type Server struct {
 func New(o Options) (*Server, error) {
 	if o.Config == nil {
 		return nil, errors.New("management: Options.Config is required")
+	}
+	if o.ClusterControl != nil && o.Cluster == nil {
+		return nil, errors.New("management: ClusterControl requires Cluster")
 	}
 	cfg := o.Config
 	mcfg := cfg.Management
@@ -224,6 +233,15 @@ func authFailureLimit(cfg *config.AMQPConfig) int {
 
 func (s *Server) validateStartup() error {
 	m := s.mcfg
+	if s.opts.ClusterControl != nil {
+		addr, err := netip.ParseAddr(m.Address)
+		if err != nil || !addr.Unmap().IsLoopback() {
+			return errors.New("management: cluster node control requires a numeric loopback management.address")
+		}
+		if len(m.TrustedProxies) != 0 {
+			return errors.New("management: cluster node control does not permit trusted proxies")
+		}
+	}
 	switch s.authMode() {
 	case "inherit":
 		if !s.brokerAuthEnabled() {

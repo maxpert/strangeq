@@ -78,6 +78,7 @@
     degraded: null,
     health: null,
     samples: {},
+    cluster: { snapshot: null, pending: {}, readError: null },
     metrics: { filter: "", samples: {}, model: null, tiles: null, text: "", at: 0 },
     refresh: {
       timer: 0,
@@ -744,7 +745,9 @@
       document.removeEventListener("keydown", onKey, true);
       if (overlay.parentNode) overlay.parentNode.removeChild(overlay);
       if (restoreFocus !== false && previous && previous.focus) {
-        try { previous.focus(); } catch (e) { /* ignore */ }
+        var target = previous.isConnected ? previous : (previous.id && document.getElementById(previous.id));
+        if (!target || target.disabled) target = document.getElementById("cluster-heading") || previous;
+        try { target.focus(); } catch (e) { /* ignore */ }
       }
     }
 
@@ -783,7 +786,7 @@
     var principal = document.getElementById("principal");
     var refresh = document.getElementById("refresh-status");
     if (nav) nav.hidden = !authed;
-    if (search) search.hidden = !authed;
+    if (search) search.hidden = !authed || isCluster();
     if (principal) principal.hidden = !authed;
     if (refresh) refresh.hidden = !authed;
   }
@@ -837,7 +840,29 @@
     renderBanner();
   }
 
+  function isCluster() { return state.capabilities.cluster === true; }
+
+  function applyClusterChrome() {
+    Array.prototype.forEach.call(document.querySelectorAll("#nav a[data-nav]"), function (a) {
+      a.hidden = isCluster() && a.dataset.nav !== "nodes";
+    });
+    var search = document.getElementById("global-search");
+    if (search) search.hidden = !state.authed || isCluster();
+    if (isCluster()) clusterObservationStatus(false);
+  }
+
+  function clusterObservationStatus(failed) {
+    var health = document.getElementById("health");
+    var text = document.getElementById("health-text");
+    if (health) health.dataset.state = "unknown";
+    if (text) text.textContent = failed ? "observation unavailable" : "cluster view";
+    state.health = null;
+    state.degraded = null;
+    renderBanner();
+  }
+
   function refreshHealth() {
+    if (isCluster() || !state.capabilitiesLoaded) return Promise.resolve();
     return api(API + "/health").then(function (r) {
       if (r.status === 200 || r.status === 503) applyHealth(r.data);
     }).catch(function () { /* health is best-effort */ });
@@ -1651,6 +1676,7 @@
   }
 
   function loadNodes(container, route) {
+    if (isCluster()) return loadCluster(container, route);
     var path = route.params.name ? API + "/nodes/" + encodeURIComponent(route.params.name) : API + "/nodes";
     return loadList(container, "nodes:" + path, path, {
       backHref: "/nodes", backLabel: "Back to nodes",
@@ -1675,6 +1701,175 @@
       ], nodes, { rowKey: function (r) { return r.name; } }) : emptyState("No node information reported."),
       pagination(data, route)
     ]);
+  }
+
+  /* The cluster management listener survives broker process outages. Never
+   * derive voter liveness from configured membership or process state. */
+  function clusterUnknown(v) {
+    return isNull(v) || v === "" ? h("span", { class: "null", text: "unknown" }) : stat(v);
+  }
+
+  function clusterMembers(values) {
+    return Array.isArray(values) ? (values.length ? values.join(", ") : "none") : "unknown";
+  }
+
+  function clusterControlAllowed(data, node) {
+    return state.authed && !state.cluster.readError && state.capabilities.cluster_node_control === true &&
+      data.can_control === true && node.managed === true;
+  }
+
+  function clusterActionID(id) { return "cluster-action-" + encodeURIComponent(id); }
+
+  function clusterAction(data, node) {
+    if (!clusterControlAllowed(data, node)) return h("span", { class: "null", text: node.managed === true ? "Read only" : "Unmanaged" });
+    var pending = state.cluster.pending[node.id];
+    var action = node.state === "stopped" ? "start" : "stop";
+    var transient = node.state === "starting" || node.state === "stopping";
+    var label = pending ? (pending.action === "start" ? "Starting…" : "Stopping…") :
+      (transient ? (node.state === "starting" ? "Starting…" : "Stopping…") : (action === "start" ? "Start" : "Stop"));
+    var btn = h("button", { type: "button", id: clusterActionID(node.id),
+      class: "row-action" + (action === "stop" ? " danger" : ""), text: label,
+      disabled: !!pending || transient || (node.state !== "running" && node.state !== "stopped"),
+      "aria-label": label + " node " + node.id,
+      title: node.state === "unknown" ? "Node state is unknown; refresh before controlling this node." : null });
+    btn.addEventListener("click", function () { openClusterAction(node, action); });
+    return btn;
+  }
+
+  function openClusterAction(node, action) {
+    var title = action === "stop" ? "Stop node" : "Start node";
+    var error = h("p", { class: "error", role: "alert" });
+    openModal({ title: title + " " + node.id + "?", confirmLabel: title, danger: action === "stop",
+      body: h("div", null, [
+        h("p", { text: action === "stop" ? "Stop this broker process. Its connections will close. Available shard voters may decrease until it is started again." : "Start this broker process and observe its recovery on the Nodes screen." }),
+        h("p", { class: "null", text: "Shard leadership and observed voter counts can change while this dialog is open." }), error
+      ]),
+      onConfirm: function () {
+        error.textContent = "";
+        var snapshot = state.cluster.snapshot;
+        var latest = snapshot && (snapshot.nodes || []).filter(function (n) { return n.id === node.id; })[0];
+        if (!latest || !clusterControlAllowed(snapshot, latest) || latest.state !== (action === "start" ? "stopped" : "running")) {
+          error.textContent = "Node state or control permission changed. Close this dialog and refresh before trying again.";
+          return Promise.resolve(true);
+        }
+        state.cluster.pending[node.id] = { action: action, at: Date.now() };
+        return api(API + "/strangeq/cluster/nodes/" + encodeURIComponent(node.id) + "/" + action, { method: "POST" }).then(function (r) {
+          if (r.status >= 400) throw new Error(errorDetail(r.data));
+          refreshNow();
+          return false;
+        }).catch(function (err) {
+          delete state.cluster.pending[node.id];
+          error.textContent = title + " failed: " + (err.message || "request failed") + ". You can retry.";
+          return true;
+        });
+      }
+    });
+  }
+
+  function buildCluster(data) {
+    var nodes = Array.isArray(data.nodes) ? data.nodes : [];
+    var groups = Array.isArray(data.groups) ? data.groups : [];
+    var running = nodes.filter(function (n) { return n.state === "running"; }).length;
+    var pending = Object.keys(state.cluster.pending);
+    return h("div", { class: "screen screen-nodes screen-cluster", id: "cluster-screen" }, [
+      h("div", { class: "page-head" }, [h("h1", { id: "cluster-heading", tabindex: "-1", text: "Nodes" }), badge("Cluster", "system")]),
+      h("dl", { class: "props cluster-meta" }, [
+        h("dt", { text: "Cluster" }), h("dd", null, [clusterUnknown(data.cluster_id)]),
+        h("dt", { text: "Observed at" }), h("dd", null, [fmtTime(data.observed_at)]),
+        h("dt", { text: "Observer" }), h("dd", null, [clusterUnknown(data.observer)])
+      ]),
+      h("div", { class: "summary-strip" }, [
+        h("span", null, [h("strong", { text: "Nodes: " }), String(nodes.length)]),
+        h("span", null, [h("strong", { text: "Observed running: " }), String(running)]),
+        h("span", null, [h("strong", { text: "Raft groups: " }), String(groups.length)])
+      ]),
+      h("div", { id: "cluster-read-error" }),
+      h("p", { class: "null", text: "Process state and readiness are observations. Group membership does not establish voter availability; unknown observations are shown explicitly." }),
+      data.can_control !== true || state.capabilities.cluster_node_control !== true ? h("p", { class: "null", text: "Node controls are read only for this session." }) : null,
+      pending.length ? h("p", { role: "status", class: "notice", text: "Waiting for observed node state: " + pending.join(", ") + ". Refresh continues automatically." }) : null,
+      nodes.length ? tableBlock([
+        { key: "id", label: "Node", render: function (n) { return clusterUnknown(n.id); } },
+        { key: "address", label: "Address", render: function (n) { return clusterUnknown(n.address); } },
+        { key: "state", label: "Observed state", render: function (n) { return stateCell(n.state); } },
+        { key: "ready", label: "Ready", render: function (n) { return isNull(n.ready) ? clusterUnknown(null) : boolCell(n.ready, "yes", "no"); } },
+        { key: "detail", label: "Detail", render: function (n) { return n.detail || DASH; } },
+        { key: "control", label: "Control", render: function (n) { return clusterAction(data, n); } }
+      ], nodes, { id: "cluster-nodes", rowKey: function (n) { return n.id; } }) : emptyState("No nodes reported by this observer."),
+      h("h2", { text: "Shard leadership and replication" }),
+      h("p", { class: "null", text: "Active voters are reported from the observed leader view. A configured voter can be stopped or unreachable. Commit and applied values are Raft log indexes, not message totals." }),
+      groups.length ? tableBlock([
+        { key: "id", label: "Group / shard", render: function (g) { return h("span", null, [clusterUnknown(g.id), g.catalog ? [" ", badge("Catalog", "system")] : null]); } },
+        { key: "leader", label: "Observed leader", render: function (g) { return clusterUnknown(g.leader); } },
+        { key: "observer", label: "Observer", render: function (g) { return clusterUnknown(g.observer); } },
+        { key: "voters", label: "Configured voters", render: function (g) { return clusterMembers(g.voters); } },
+        { key: "active_voters", label: "Observed active voters", render: function (g) { return clusterUnknown(g.active_voters); } },
+        { key: "quorum", label: "Quorum required", render: function (g) { return clusterUnknown(g.quorum); } },
+        { key: "learners", label: "Learners", render: function (g) { return clusterMembers(g.learners); } },
+        { key: "commit", label: "Commit index", render: function (g) { return clusterUnknown(g.commit); } },
+        { key: "applied", label: "Applied index", render: function (g) { return clusterUnknown(g.applied); } }
+      ], groups, { id: "cluster-groups", rowKey: function (g) { return g.id; } }) : emptyState("No Raft group observations available." )
+    ]);
+  }
+
+  function paintCluster(container, data) {
+    var previous = document.activeElement;
+    var focusID = previous && container.contains(previous) ? previous.id : null;
+    var top = container.scrollTop;
+    var scrolls = Array.prototype.map.call(container.querySelectorAll(".table-scroll"), function (el) { return [el.scrollLeft, el.scrollTop]; });
+    container.replaceChildren(buildCluster(data));
+    Array.prototype.forEach.call(container.querySelectorAll(".table-scroll"), function (el, i) {
+      if (scrolls[i]) { el.scrollLeft = scrolls[i][0]; el.scrollTop = scrolls[i][1]; }
+    });
+    container.scrollTop = top;
+    if (focusID) {
+      var target = document.getElementById(focusID);
+      if (!target || target.disabled) target = document.getElementById("cluster-heading");
+      if (target) target.focus({ preventScroll: true });
+    }
+  }
+
+  function clusterReadError(container, detail) {
+    var retryFocused = document.activeElement && document.activeElement.id === "cluster-retry";
+    Array.prototype.forEach.call(container.querySelectorAll("#cluster-nodes button"), function (btn) { btn.disabled = true; });
+    var region = container.querySelector("#cluster-read-error");
+    if (!region) {
+      container.replaceChildren(h("div", { class: "screen screen-nodes" }, [
+        h("h1", { text: "Nodes" }), h("div", { id: "cluster-read-error" })
+      ]));
+      region = container.querySelector("#cluster-read-error");
+    }
+    region.replaceChildren(h("div", { class: "notice permission", role: "alert" }, [
+      h("h2", { text: "Cluster observation unavailable" }),
+      h("p", { text: detail }),
+      h("p", { text: state.cluster.snapshot ? "Showing the last observation; node states and leadership may have changed. Automatic refresh will retry." : "The management view could not read cluster status. Automatic refresh will retry." }),
+      h("button", { type: "button", id: "cluster-retry", text: "Retry now", onclick: refreshNow })
+    ]));
+    if (retryFocused) document.getElementById("cluster-retry").focus({ preventScroll: true });
+  }
+
+  function loadCluster(container, route) {
+    return api(API + "/strangeq/cluster").then(function (r) {
+      if (state.route !== route || !state.authed) return;
+      if (r.status >= 400 || !r.data) throw new Error(errorDetail(r.data));
+      state.cluster.snapshot = r.data;
+      state.cluster.readError = null;
+      (r.data.nodes || []).forEach(function (node) {
+        var pending = state.cluster.pending[node.id];
+        if (pending && (node.state === (pending.action === "start" ? "running" : "stopped") || Date.now() - pending.at > 30000)) {
+          delete state.cluster.pending[node.id];
+          if (node.state !== (pending.action === "start" ? "running" : "stopped")) toast("State change for " + node.id + " is not confirmed. Review the observed state before retrying.", "error");
+        }
+      });
+      paintCluster(container, r.data);
+      clusterObservationStatus(false);
+      state.displayed = "cluster";
+    }).catch(function (err) {
+      if (state.route !== route || !state.authed) throw err;
+      state.cluster.readError = err.message || "request failed";
+      clusterReadError(container, state.cluster.readError);
+      clusterObservationStatus(true);
+      throw err;
+    });
   }
 
   function loadUsers(container, route) {
@@ -3102,6 +3297,10 @@
 
   function render() {
     var route = parsePath(location.pathname, location.search);
+    if (isCluster() && route.screen !== "nodes" && route.screen !== "node") {
+      history.replaceState({}, "", "/nodes");
+      route = parsePath("/nodes", "");
+    }
     state.route = route;
     if (!state.authed) { renderLogin(); return; }
     setAuthedChrome(true);
@@ -3145,9 +3344,7 @@
         state.principal = r.data;
         state.authed = true;
         updatePrincipal();
-        loadVersion();
-        refreshHealth();
-        render();
+        startAuthenticatedView();
       }, function () {
         submit.disabled = false;
         err.textContent = "Sign in failed";
@@ -3155,6 +3352,19 @@
     });
     var container = document.getElementById("content");
     container.replaceChildren(h("div", { class: "screen screen-login" }, [form]));
+  }
+
+  function startAuthenticatedView() {
+    var version = loadVersion();
+    var screen = parsePath(location.pathname, location.search).screen;
+    // The shared home/Nodes routes need the mode before choosing their API.
+    // Standalone deep links retain their immediate, capability-gated paint.
+    if (screen === "overview" || screen === "nodes" || screen === "node") {
+      version.then(function () { refreshHealth(); render(); });
+    } else {
+      render();
+      version.then(refreshHealth);
+    }
   }
 
   function ensureCapabilities() {
@@ -3215,6 +3425,8 @@
          * so any gated control is currently disabled. */
         if (state.authed && !capabilitiesEqual(before, state.capabilities)) {
           refreshCapabilityControls();
+          applyClusterChrome();
+          if ((before.cluster === true) !== isCluster() && state.route) render();
         }
       }
     }).catch(function () { state.capabilitiesLoaded = false; /* version is best-effort */ });
@@ -3284,9 +3496,7 @@
       state.authed = true;
       if (!state.csrf) state.csrf = readCSRFCookie();
       updatePrincipal();
-      loadVersion();
-      refreshHealth();
-      render();
+      startAuthenticatedView();
     }, function () {
       renderLogin();
     });

@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/maxpert/amqp-go/config"
+	"github.com/maxpert/amqp-go/internal/clusteradmin"
 	"github.com/maxpert/amqp-go/metrics"
 	"github.com/maxpert/amqp-go/server"
 	"github.com/maxpert/amqp-go/server/management"
@@ -382,9 +383,14 @@ func main() {
 		if telemetryServer != nil {
 			metricsURL = metricsURLFor(telemetryServer.Addr(), cfg.Management.TLS.Enabled)
 		}
+		var clusterObserver clusteradmin.Observer
+		if clusterNode != nil {
+			clusterObserver = clusterNode
+		}
 		mgmtServer, err = management.New(management.Options{
 			Server:        amqpServer,
 			Config:        cfg,
+			Cluster:       clusterObserver,
 			Authenticator: amqpServer.Authenticator,
 			AuthFile:      authFile,
 			Logger:        amqpServer.Log,

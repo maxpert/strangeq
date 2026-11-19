@@ -1,16 +1,11 @@
 # Management Control Plane
 
-The optional management listener provides a web UI and a subset of the RabbitMQ 4.4 HTTP
-API. Both are included in `amqp-server`. No separate UI build or asset installation is
-needed. The listener is off by default and binds to loopback by default.
+The optional management listener serves a web UI and an HTTP API. It is off
+by default and binds to loopback by default. Standalone brokers expose a
+subset of the RabbitMQ 4.4 management API. Raft brokers expose the
+[cluster Nodes panel](#cluster-administration).
 
-Management is available only with the standalone storage engine. Both `cluster.local:
-true` and addressed cluster mode reject it. For cluster readiness and telemetry, use
-[METRICS.md](METRICS.md). For cluster setup, see [CLUSTERING.md](CLUSTERING.md).
-
-The management listener is separate from telemetry. It reads broker snapshots and
-performs supported mutations through the broker's normal operation paths. See
-[AUTHORIZATION.md](AUTHORIZATION.md) for permissions shared with AMQP clients.
+The listener is separate from [telemetry](METRICS.md).
 
 ## Enabling it
 
@@ -52,28 +47,28 @@ full management block.
 
 ## Cluster administration
 
-The management UI runs with the standalone storage engine. Its Nodes screen and
-`/api/nodes` describe one synthetic local node. Node mutations and rebalance return
-`501`. Cluster mode provides configuration-driven peer activation and enrollment, as
-described in [cluster setup](CLUSTERING.md#pilot-start-locally-then-activate-peers).
+Enable management on a Raft broker to inspect its catalog members and local
+Raft groups in **Nodes**. Use the same listener and authentication settings
+described above. The panel shows the observing broker, observation time,
+leaders, voters, learners, and commit and applied indexes. Active voter
+counts come from the locally observed leader. Other nodes can be reported
+as unknown. Catalog membership and recent activity describe different facts.
 
-Operators activate authenticated peer transport through configuration and `SIGHUP`.
-Prepared joining processes then enroll on startup. Enrollment records the broker, while
-replica placement and learner catch-up happen separately. Failure tolerance depends on
-the catalog and each affected shard reaching the required committed voter membership
-after catch-up. The current management UI and API expose no cluster administration
-workflow.
+`GET /api/strangeq/cluster` exposes the same observation. A broker's cluster
+listener serves the Nodes panel and its session, identity, and version
+endpoints. The standalone topology and resource APIs apply to standalone brokers.
 
-The proposed roadmap would extend the existing panel in these areas.
+The [three-node demo](../src/amqp-go/examples/cluster-demo/README.md) adds a
+loopback panel in a separate process. Its authenticated administrator can
+stop and start the three demo brokers. The supervisor holds each broker's
+identity and journal across restarts and allows one stopped broker at a time.
+On ordinary deployments, process lifecycle remains with the service manager
+or orchestrator.
 
-- Real node, shard, leader, replica, and quorum status, including stale or unknown observations.
-- Controlled admission with visible learner catch-up and verified completion.
-- Planned drain and removal that preserve required replicas and retire the old identity.
-- Failed-node replacement when quorum survives, plus separate leader and replica placement controls.
-- Durable operation progress and history that survive broker restarts and failover.
-
-These are design proposals, not shipped features. Quorum-loss recovery requires a
-separate operator procedure. Normal enrollment does not repair a lost catalog quorum.
+To enroll additional brokers, follow the
+[cluster configuration guide](CLUSTERING.md#pilot-start-locally-then-activate-peers).
+Membership changes such as drain, retirement, and replica moves remain
+planned workflows. Quorum-loss recovery is a separate operator procedure.
 
 ## Authentication and authorization
 
@@ -473,7 +468,7 @@ differences are.
 
 - **Vhosts** — only the single vhost `"/"` exists. Creating one is `501`. Deleting `"/"` is
   `409`. Entity data is global. Vhosts are not independent.
-- **Cluster administration** — this management surface is standalone-only. Node operations and rebalance are `501`. Replicated queues use the separate [cluster mode](CLUSTERING.md).
+- **Cluster administration.** The RabbitMQ-style standalone node mutation routes return `501`. Raft brokers expose the [cluster Nodes panel](#cluster-administration).
 - **Federation and shovels** — no implementation. Reads answer `200 []`, writes `501`.
 - **Plugins** — no plugin surface. The UI omits it entirely.
 - **Policies, parameters, global parameters, feature flags, deprecated features, vhost

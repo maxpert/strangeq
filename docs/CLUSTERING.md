@@ -422,6 +422,8 @@ backend. See [replicated dead-lettering](DEAD_LETTERING.md#replicated-queues).
 - Durable replicated queues support [at-least-once dead-lettering](DEAD_LETTERING.md#replicated-queues)
   for non-requeued consumer rejections.
 - Cluster mode rejects transactions, exclusive or auto-delete queues, other
-  queue policies, named virtual hosts, and the management HTTP API. Use a separate
-  empty storage directory for a new cluster. Existing standalone stores are not
-  imported.
+  queue policies, and named virtual hosts. Use a fresh storage directory.
+  Existing standalone stores are not imported.
+- Enable the [cluster Nodes panel](MANAGEMENT.md#cluster-administration) to
+  inspect local Raft observations. The [three-node demo](../src/amqp-go/examples/cluster-demo/README.md)
+  includes controls for the broker processes it starts.

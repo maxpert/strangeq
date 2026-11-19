@@ -51,6 +51,9 @@ cluster:
 	cfg.Cluster.PeerKeyFile = "peer.key"
 	require.NoError(t, cfg.Validate())
 	cfg.Management.Enabled = true
-	require.ErrorContains(t, cfg.Validate(), "management")
+	cfg.Management.Authentication = ManagementAuthenticationNone
+	require.NoError(t, cfg.Validate())
+	cfg.Storage.UnsafeRecovery = true
+	require.ErrorContains(t, cfg.Validate(), "unsafe storage recovery")
 	require.NoError(t, DefaultConfig().Validate())
 }

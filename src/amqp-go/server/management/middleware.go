@@ -160,6 +160,12 @@ func (s *Server) serveHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	r = r.WithContext(withEndpoint(r.Context(), m.pattern))
 	endpoint = m.pattern
+	if action := clusterControlAction(m); action != "" {
+		defer func() {
+			id := pathValue(m.pattern, r.URL.EscapedPath(), "id")
+			s.auditMutation(r, "cluster_node", id, action, rw.statusCode())
+		}()
+	}
 
 	// The session-login endpoint authenticates itself and must be reachable
 	// without a prior credential (AUTH-031).
@@ -178,6 +184,11 @@ func (s *Server) serveHTTP(w http.ResponseWriter, r *http.Request) {
 			s.writeAPIError(rw, r, aerr)
 			return
 		}
+
+		// Keep the authenticated identity and client available for denied
+		// cluster-control audit records, including CSRF failures.
+		r = r.WithContext(withPrincipal(r.Context(), p))
+		r = r.WithContext(withClient(r.Context(), ci))
 
 		if ae := s.authorizationDisabledGate(ci); ae != nil {
 			s.writeAPIError(rw, r, ae)
@@ -212,8 +223,6 @@ func (s *Server) serveHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		r = r.WithContext(withPrincipal(r.Context(), p))
-		r = r.WithContext(withClient(r.Context(), ci))
 		// A cookie-authenticated response varies on the Cookie header, exactly
 		// as a Basic-authenticated one varies on Authorization (SEC-020).
 		if p.ViaCookie {

@@ -86,9 +86,9 @@ type Progress struct {
 }
 
 type Status struct {
-	ID, GroupID, Leader, Applied, Commit, ConfigIndex uint64
-	Voters, Learners                                  []uint64
-	Progress                                          map[uint64]Progress
+	ID, GroupID, Leader, Term, Applied, Commit, ConfigIndex uint64
+	Voters, Learners                                        []uint64
+	Progress                                                map[uint64]Progress
 }
 
 type key [clusterproposal.PrefixBytes]byte
@@ -800,7 +800,7 @@ func (g *Group) Status() Status {
 	defer g.mu.Unlock()
 	basic := g.node.BasicStatus()
 	status := Status{
-		ID: g.cfg.ID, GroupID: g.cfg.GroupID, Applied: g.applied, Commit: basic.GetCommit(),
+		ID: g.cfg.ID, GroupID: g.cfg.GroupID, Term: basic.GetTerm(), Applied: g.applied, Commit: basic.GetCommit(),
 		ConfigIndex: g.configIndex, Voters: slices.Clone(g.conf.GetVoters()), Learners: slices.Clone(g.conf.GetLearners()),
 	}
 	slices.Sort(status.Voters)

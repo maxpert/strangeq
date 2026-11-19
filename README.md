@@ -46,9 +46,9 @@ seed, peer TLS, placement, quorum, and recovery. Use fresh stores for the shared
 segmented journal. Existing standalone and older Raft stores are not imported.
 Cluster mode supports routing, confirms, acknowledgments, requeue, and
 [at-least-once dead-lettering](docs/DEAD_LETTERING.md#replicated-queues), with
-[feature limits](docs/CLUSTERING.md#behavior-and-limits). Administration currently
-uses configuration, logs, telemetry, and AMQP. See
-[cluster administration status](docs/MANAGEMENT.md#cluster-administration).
+[feature limits](docs/CLUSTERING.md#behavior-and-limits). Inspect nodes and Raft
+groups in the [cluster panel](docs/MANAGEMENT.md#cluster-administration), or
+[run the three-node demo](src/amqp-go/examples/cluster-demo/README.md).
 
 ### Historical normal workloads
 

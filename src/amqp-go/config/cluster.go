@@ -67,8 +67,8 @@ func (c *AMQPConfig) validateCluster() error {
 		if cfg.Shards > 1024 {
 			return errors.New("local cluster permits at most 1024 shards")
 		}
-		if c.Management.Enabled || c.Storage.UnsafeRecovery {
-			return errors.New("management HTTP and unsafe storage recovery are unavailable in cluster mode")
+		if c.Storage.UnsafeRecovery {
+			return errors.New("unsafe storage recovery is unavailable in cluster mode")
 		}
 		if cfg.PeerAddress == "" {
 			if cfg.PeerListen != "" || cfg.TokenFile != "" || cfg.PeerCertFile != "" || cfg.PeerKeyFile != "" || cfg.PeerCAFile != "" || cfg.AllowLoopbackPlaintext {
@@ -83,8 +83,8 @@ func (c *AMQPConfig) validateCluster() error {
 	if !cfg.Local && (len(cfg.Seeds) < 1 || len(cfg.Seeds) > 3) {
 		return errors.New("cluster requires one to three original voters in seeds")
 	}
-	if c.Management.Enabled || c.Storage.UnsafeRecovery {
-		return errors.New("management HTTP and unsafe storage recovery are unavailable in cluster mode")
+	if c.Storage.UnsafeRecovery {
+		return errors.New("unsafe storage recovery is unavailable in cluster mode")
 	}
 	if !validAdvertisedAddress(cfg.PeerAddress) {
 		return errors.New("cluster peer_address must be host:port")

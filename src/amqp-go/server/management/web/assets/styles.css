@@ -268,7 +268,7 @@ table.data-table { border-collapse: collapse; width: 100%; background: var(--pan
 .modal-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 14px; }
 .modal .effect { margin: 8px 0; }
 
-.toast-root { position: fixed; right: 16px; bottom: 16px; display: flex; flex-direction: column; gap: 8px; z-index: 60; }
+.toast-root { pointer-events: none; position: fixed; right: 16px; bottom: 16px; display: flex; flex-direction: column; gap: 8px; z-index: 60; }
 .toast {
   background: #16202b;
   color: #fff;
@@ -281,7 +281,7 @@ table.data-table { border-collapse: collapse; width: 100%; background: var(--pan
 
 /* A 202 "accepted as a background job" notice is shown in the toast root but
  * carries a link to the job endpoint, so it is not a transient .toast. */
-.toast-root .notice.job-accepted { max-width: 360px; box-shadow: 0 2px 8px rgba(0, 0, 0, 0.25); }
+.toast-root .notice.job-accepted { pointer-events: auto; max-width: 360px; box-shadow: 0 2px 8px rgba(0, 0, 0, 0.25); }
 
 dl.props { display: grid; grid-template-columns: max-content 1fr; gap: 3px 14px; margin: 8px 0; }
 dl.props dt { color: var(--muted); }
@@ -334,3 +334,10 @@ pre.payload {
 @media (prefers-reduced-motion: reduce) {
   * { animation-duration: 0.001ms !important; transition-duration: 0.001ms !important; }
 }
+
+/* Cluster observations use the same management tables and status language. */
+[hidden] { display: none !important; }
+.screen-cluster .table-scroll { max-height: 340px; margin-bottom: 12px; }
+.screen-cluster td[data-col="detail"] { white-space: normal; min-width: 180px; max-width: 360px; }
+.state[data-state="stopped"]::before { background: var(--danger); }
+.state[data-state="starting"]::before, .state[data-state="stopping"]::before { background: var(--warn); }

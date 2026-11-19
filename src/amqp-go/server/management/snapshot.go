@@ -295,6 +295,8 @@ type capabilitiesJSON struct {
 	VHostScoping       bool `json:"vhost_scoping"`
 	CoherentSnapshot   bool `json:"coherent_snapshot"`
 	Unauthenticated    bool `json:"unauthenticated"`
+	Cluster            bool `json:"cluster,omitempty"`
+	ClusterNodeControl bool `json:"cluster_node_control,omitempty"`
 }
 
 type versionResponse struct {
@@ -311,6 +313,14 @@ type versionResponse struct {
 // capabilitiesReport reflects exactly which optional seams are present. It is
 // how a client learns which features are honest-empty (FR-API-006).
 func (s *Server) capabilitiesReport() capabilitiesJSON {
+	if s.opts.Cluster != nil {
+		return capabilitiesJSON{
+			TagCapabilities:    true,
+			Unauthenticated:    s.mcfg.AllowUnauthenticated || s.authMode() == "none",
+			Cluster:            true,
+			ClusterNodeControl: s.opts.ClusterControl != nil,
+		}
+	}
 	b := s.broker()
 	_, queueTotalsOK := b.(queueMessageTotals)
 	_, consumerOK := b.(consumerViews)
