@@ -70,10 +70,6 @@ type journalWriter struct {
 // The caller supplies the validated, durable end and next sequence of this
 // active segment. The writer owns file on success. Opening and repairing the
 // file belong to the store owning it.
-func newJournalWriter(file journalFile, end int64, nextSequence uint64, limits journalLimits) (*journalWriter, error) {
-	return newJournalWriterWithBudget(file, end, nextSequence, limits, nil)
-}
-
 func newJournalWriterWithBudget(file journalFile, end int64, nextSequence uint64, limits journalLimits, budget *journalBudget) (*journalWriter, error) {
 	if file == nil || end < 0 || nextSequence == 0 || nextSequence == math.MaxUint64 ||
 		limits.pendingBytes <= 0 || limits.pendingRequests <= 0 || limits.batchBytes <= 0 ||

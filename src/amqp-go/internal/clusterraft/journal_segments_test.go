@@ -12,6 +12,12 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+func openJournalSegments(dir string, create bool, extentBytes int64, hooks journalSegmentHooks,
+	visit func([]journalRecord) error,
+) (*journalSegmentOutput, *journalSegmentReader, journalScan, error) {
+	return openJournalSegmentsWithQuota(dir, create, extentBytes, journalGroupMaxFileBytes, hooks, visit)
+}
+
 type journalSegmentFixtureHooks = journalSegmentHooks
 
 type journalSegmentFixtureReader interface {

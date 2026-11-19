@@ -19,6 +19,8 @@ import (
 	"go.etcd.io/raft/v3"
 )
 
+func sortMembers(ids []uint64) []uint64 { slices.Sort(ids); return ids }
+
 func TestOpenRejectsReservedRaftIDBeforeEnrollment(t *testing.T) {
 	cfg := Config{
 		ClusterID: "reserved-peer-id", Directory: t.TempDir(), Shards: 1,

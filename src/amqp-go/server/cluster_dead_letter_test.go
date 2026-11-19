@@ -388,3 +388,54 @@ func TestClusterDeadLetterAuthorizationRejectsStaleCapturedPlan(t *testing.T) {
 	require.NoError(t, err)
 	require.EqualValues(t, count, info.Ready)
 }
+
+func TestClusterDeadLetterDestinationGroupingPreservesLimitsAndOrder(t *testing.T) {
+	worker := &deadLetterWorkerFixture{}
+	a := clusterTarget{Queue: "a", Incarnation: 1}
+	b := clusterTarget{Queue: "b", Incarnation: 1}
+	b2 := clusterTarget{Queue: "b", Incarnation: 2}
+	// Two records fit exactly; an interleaved third must start a new
+	// batch for its destination without resetting another target's total.
+	headerBytes := (clusterqueue.DeadLetterPublishRecord{}).WireBytes()
+	record := clusterqueue.PublishRecord{Body: make([]byte, clusterqueue.MaxDeadLetterPublishBatchBytes/2-headerBytes)}
+	candidates := []deadLetterCandidate{
+		{id: 1, planIndex: 0, target: a, record: record},
+		{id: 2, planIndex: 1, target: b, record: record},
+		{id: 3, planIndex: 2, target: a, record: record},
+		{id: 4, planIndex: 3, target: b2, record: record},
+		{id: 5, planIndex: 4, target: a, record: record},
+		{id: 6, planIndex: 5, target: b, record: record}, // not authorized
+	}
+	for _, shard := range []uint64{1, 2} {
+		batches := groupClusterDeadLetterDestinations(candidates, 0b11111, worker, shard)
+		require.Len(t, batches, 4)
+		for i, want := range []struct {
+			target clusterTarget
+			ids    []uint64
+		}{{a, []uint64{1, 3}}, {b, []uint64{2}}, {b2, []uint64{4}}, {a, []uint64{5}}} {
+			batch := batches[i]
+			require.Equal(t, want.target, batch.target)
+			require.Equal(t, want.ids, batch.ids)
+			require.Len(t, batch.moves, len(want.ids))
+			bytes := 0
+			for j, move := range batch.moves {
+				bytes += move.WireBytes()
+				wantMove := uint64(0)
+				if shard == worker.WorkShard(batch.target.Queue) {
+					wantMove = want.ids[j]
+				}
+				require.Equal(t, wantMove, move.Move)
+			}
+			require.LessOrEqual(t, bytes, clusterqueue.MaxDeadLetterPublishBatchBytes)
+		}
+	}
+
+	candidates = make([]deadLetterCandidate, clusterqueue.MaxDeadLetterPublishBatchMessages+1)
+	for i := range candidates {
+		candidates[i] = deadLetterCandidate{id: uint64(i + 1), target: a}
+	}
+	batches := groupClusterDeadLetterDestinations(candidates, 1, worker, 1)
+	require.Len(t, batches, 2)
+	require.Len(t, batches[0].moves, clusterqueue.MaxDeadLetterPublishBatchMessages)
+	require.Equal(t, []uint64{uint64(len(candidates))}, batches[1].ids)
+}

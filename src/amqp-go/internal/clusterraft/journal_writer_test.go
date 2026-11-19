@@ -11,6 +11,10 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+func newJournalWriter(file journalFile, end int64, nextSequence uint64, limits journalLimits) (*journalWriter, error) {
+	return newJournalWriterWithBudget(file, end, nextSequence, limits, nil)
+}
+
 type gatedJournalFile struct {
 	mu          sync.Mutex
 	contents    []byte

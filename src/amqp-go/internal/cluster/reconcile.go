@@ -5,13 +5,10 @@ import (
 	"encoding/json"
 	"errors"
 	"os"
-	"slices"
 	"time"
 
 	"github.com/maxpert/amqp-go/internal/clusterraft"
 )
-
-func sortMembers(ids []uint64) []uint64 { slices.Sort(ids); return ids }
 
 func (n *Node) maintain() {
 	defer n.wg.Done()

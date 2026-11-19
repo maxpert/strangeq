@@ -160,9 +160,10 @@ type deadLetterCandidate struct {
 }
 
 type deadLetterDestinationBatch struct {
-	target clusterTarget
-	moves  []clusterqueue.DeadLetterPublishRecord
-	ids    []uint64
+	target    clusterTarget
+	moves     []clusterqueue.DeadLetterPublishRecord
+	ids       []uint64
+	wireBytes int
 }
 
 type deadLetterPageBudgetError struct{ bytes int }
@@ -336,7 +337,6 @@ func unappliedDeadLetterReceipts(receipts []clusterqueue.DeadLetterUpdate, appli
 func groupClusterDeadLetterDestinations(candidates []deadLetterCandidate, planned uint64, worker clusterLocalWorker, shard uint64) []deadLetterDestinationBatch {
 	var batches []deadLetterDestinationBatch
 	latest := make(map[clusterTarget]int)
-	sizes := make(map[clusterTarget]int)
 	for _, candidate := range candidates {
 		if planned&(1<<candidate.planIndex) == 0 {
 			continue
@@ -348,14 +348,15 @@ func groupClusterDeadLetterDestinations(candidates []deadLetterCandidate, planne
 		index, exists := latest[candidate.target]
 		size := move.WireBytes()
 		if !exists || len(batches[index].moves) == clusterqueue.MaxDeadLetterPublishBatchMessages ||
-			size > clusterqueue.MaxDeadLetterPublishBatchBytes-sizes[candidate.target] {
+			size > clusterqueue.MaxDeadLetterPublishBatchBytes-batches[index].wireBytes {
 			index = len(batches)
-			latest[candidate.target], sizes[candidate.target] = index, 0
+			latest[candidate.target] = index
 			batches = append(batches, deadLetterDestinationBatch{target: candidate.target})
 		}
-		batches[index].ids = append(batches[index].ids, candidate.id)
-		batches[index].moves = append(batches[index].moves, move)
-		sizes[candidate.target] += size
+		batch := &batches[index]
+		batch.ids = append(batch.ids, candidate.id)
+		batch.moves = append(batch.moves, move)
+		batch.wireBytes += size
 	}
 	return batches
 }
