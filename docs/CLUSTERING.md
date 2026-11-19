@@ -9,8 +9,8 @@ and can connect to any enrolled broker.
 
 The local-journal lifecycle is a configured pilot. Ordinary startup without
 `cluster.local: true` or an explicit cluster ID still uses the existing
-standalone engine. Use a fresh directory: this pilot does not migrate legacy
-standalone, bbolt Raft or flat-journal directories.
+standalone engine. Use a fresh directory. Migration from legacy standalone,
+bbolt Raft or flat-journal directories remains separate work.
 
 ```yaml
 network:
@@ -26,11 +26,11 @@ Save as `local.yaml` and run `amqp-server --config local.yaml` directly, without
 `--initialize-cluster`. Startup provisions the local one-voter journal and prints
 `Cluster lineage: <lineage>; node ID: <id>`. Preserve those actual generated
 values and the data directory. There is no peer socket while peer settings are
-absent; publishes use the same durable journal/commit/apply path with one voter.
+absent. Publishes use the same durable journal/commit/apply path with one voter.
 
 To activate peers in this running process, generate a shared token using the
-credential command below. Keep `local: true` and the same shard/format settings;
-add these loopback-only test settings to the existing `cluster` section:
+credential command below. Keep `local: true` and the same shard/format settings.
+Add these loopback-only test settings to the existing `cluster` section:
 
 ```yaml
   peer_address: "127.0.0.1:7661"
@@ -38,22 +38,23 @@ add these loopback-only test settings to the existing `cluster` section:
   allow_loopback_plaintext: true
 ```
 
-For multiple hosts instead configure `peer_cert_file`, `peer_key_file` and, for
-a private CA, `peer_ca_file`; omit plaintext permission. `peer_listen` optionally
+For multiple hosts, configure `peer_cert_file`, `peer_key_file` and, for
+a private CA, `peer_ca_file`. Omit plaintext permission. `peer_listen` optionally
 sets a separate bind address. Send `kill -HUP <broker-pid>` after saving the
 same configuration file. SIGHUP activates authenticated peer transport and
 commits the source's endpoint without replacing its journal or AMQP sessions.
-Only peer settings reload; runtime storage, protocol and identity remain fixed.
-Repeating activation at the same endpoint is idempotent. This is not credential
-or certificate rotation: an already active transport keeps its credentials.
+Only peer settings reload. Runtime storage, protocol and identity remain fixed.
+Repeating activation at the same endpoint is idempotent. An already active
+transport keeps its credentials and certificates. Rotation requires separate
+handling.
 
 Start each joining broker with a fresh directory and the normal addressed peer
 configuration shown below, substituting the printed source lineage for `id`
 and `"<printed-source-id>@127.0.0.1:7661"` for its sole seed. Choose a unique
 positive `node_id`, use the same shard/format settings and credentials, and start
-normally; never initialize a joiner. Every joining peer retains that same
+normally. Never initialize a joiner. Every joining peer retains that same
 original active-seed identity in `seeds`. Keep the original source configured
-with `local: true` permanently, including after activation and restart; do not
+with `local: true` permanently, including after activation and restart. Do not
 convert its profile to a seeded one. Restart with the same activated endpoint,
 credentials and data directory. There is no separate startup-conversion step.
 
@@ -228,6 +229,23 @@ the original seed list, the shared token, and the peer certificate and CA.
 Restart a broker with its existing configuration and persistent directory. If
 a shard loses quorum, restore access to enough of its existing voters before
 expecting new commits.
+
+### Leader loss and client recovery
+
+If a shard leader fails while the connected gateway and voting quorum survive,
+new confirms and deliveries pause while a replacement is elected. In publisher
+confirm mode, transient or ambiguous publish failures nack every affected tag
+while preserving the healthy connection and channel. StrangeQ does not replay
+publishes whose commit outcome is unknown. A nack in this case does not prove
+that no copy committed. Application retries can duplicate messages.
+
+Same-session recovery was verified for the default profile in three in-process
+leader-shutdown checks. These checks do not establish external process-kill,
+indefinite-outage or complete settlement-recovery behavior. If the client's
+gateway dies, reconnect to a healthy endpoint and restore the client session.
+Non-confirm publishes and fatal errors can still close a connection. Without
+quorum, new commits must wait. Use publisher confirms and idempotent consumer
+processing, and handle unresolved publishes and possible redelivery explicitly.
 
 ## Queue placement and metadata
 
