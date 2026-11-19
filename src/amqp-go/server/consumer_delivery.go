@@ -22,7 +22,8 @@ type consumerInfo struct {
 
 // forwardConsumerMessages runs in a per-consumer goroutine, forwarding
 // deliveries from the consumer's Messages channel to the shared fan-in
-// channel. Exits when the Messages channel is closed or stop is signaled.
+// channel. Exits when the Messages channel is closed or stop is signaled,
+// returning the number of auto-ack deliveries it could not forward.
 // Sends *protocol.Delivery directly (no wrapper) to avoid per-message
 // heap allocations — Delivery.ConsumerID is what the fan-in loop routes by,
 // and the client-visible wire tag is read once per consumer off consumerInfo.tag.
@@ -30,30 +31,60 @@ type consumerInfo struct {
 // Flow control: before forwarding, a single atomic load of channel.FlowActive
 // gates the send. When flow is inactive the goroutine parks on FlowWake until
 // flow resumes or stop closes (zero overhead in the common active case).
-func forwardConsumerMessages(channel *protocol.Channel, msgChan chan *protocol.Delivery, fanIn chan<- *protocol.Delivery, stop <-chan struct{}) {
+func forwardConsumerMessages(channel *protocol.Channel, msgChan chan *protocol.Delivery, fanIn chan<- *protocol.Delivery, stop <-chan struct{}) int {
 	for {
 		select {
 		case delivery, ok := <-msgChan:
 			if !ok {
-				return
+				return 0
 			}
 			for !channel.FlowActive.Load() {
 				select {
 				case <-channel.FlowWake:
 				case <-stop:
-					delivery.ReleaseBody()
-					return
+					return releaseDiscardedDelivery(delivery)
 				}
 			}
 			select {
 			case fanIn <- delivery:
 			case <-stop:
-				delivery.ReleaseBody()
-				return
+				return releaseDiscardedDelivery(delivery)
 			}
 		case <-stop:
-			return
+			return 0
 		}
+	}
+}
+
+// Auto-ack deliveries that are discarded cannot be recovered by broker teardown.
+func releaseDiscardedDelivery(delivery *protocol.Delivery) int {
+	delivery.ReleaseBody()
+	if delivery != nil && delivery.NoAck {
+		return 1
+	}
+	return 0
+}
+
+func drainConsumerBodyLeases(messages <-chan *protocol.Delivery) (dropped int) {
+	// A stopping forwarder may still have a producer. Bound cleanup to the
+	// current buffer so joining the forwarder cannot depend on producer exit.
+	for range len(messages) {
+		select {
+		case delivery, ok := <-messages:
+			if !ok {
+				return dropped
+			}
+			dropped += releaseDiscardedDelivery(delivery)
+		default:
+			return dropped
+		}
+	}
+	return dropped
+}
+
+func (s *Server) recordDiscardedAutoAckDeliveries(dropped int) {
+	if dropped != 0 && s.MetricsCollector != nil {
+		s.MetricsCollector.RecordDeliveriesDropped(DeliveryDropConsumerRemoved, dropped)
 	}
 }
 
@@ -91,7 +122,11 @@ func (s *Server) discoverConsumers(
 				rt.deliveryForwarders.Add(1)
 				s.goConn(rt, "forwarder", func() {
 					defer rt.deliveryForwarders.Done()
-					forwardConsumerMessages(channel, consumer.Messages, fanIn, stop)
+					dropped := forwardConsumerMessages(channel, consumer.Messages, fanIn, stop)
+					if consumer.NoAck {
+						dropped += drainConsumerBodyLeases(consumer.Messages)
+					}
+					s.recordDiscardedAutoAckDeliveries(dropped)
 				})
 				s.Log.Debug("Started forwarder for consumer",
 					zap.String("consumer_tag", consumer.Tag),
@@ -155,7 +190,7 @@ func (s *Server) consumerDeliveryLoop(rt *connRuntime) {
 	defer func() {
 		stopAllForwarders()
 		rt.deliveryForwarders.Wait()
-		drainConsumerBodyLeases(fanIn)
+		s.recordDiscardedAutoAckDeliveries(drainConsumerBodyLeases(fanIn))
 	}()
 
 	batch := make([]*protocol.Delivery, 0, maxBatchSize)
@@ -181,7 +216,7 @@ func (s *Server) consumerDeliveryLoop(rt *connRuntime) {
 		}
 
 		if len(consumerInfos) == 0 {
-			drainConsumerBodyLeases(fanIn)
+			s.recordDiscardedAutoAckDeliveries(drainConsumerBodyLeases(fanIn))
 			time.Sleep(10 * time.Millisecond)
 			continue
 		}

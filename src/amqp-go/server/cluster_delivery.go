@@ -845,7 +845,11 @@ func (b *ClusterBroker) consumerExited(id string, entry *clusterConsumer) {
 	}
 	entry.session.cancel()
 	delete(b.consumers, id)
-	drainConsumerBodyLeases(entry.protocol.Messages)
+	// Auto-ack deliveries are already settled. The forwarder can still
+	// send buffered deliveries until the server cancels the consumer.
+	if !entry.protocol.NoAck {
+		drainConsumerBodyLeases(entry.protocol.Messages)
+	}
 	b.purgeDeliveryLocked(entry.session)
 	b.mu.Unlock()
 
@@ -866,7 +870,9 @@ func (b *ClusterBroker) unregisterConsumers(ids []string) error {
 		if entry := b.consumers[id]; entry != nil {
 			entry.session.cancel()
 			delete(b.consumers, id)
-			drainConsumerBodyLeases(entry.protocol.Messages)
+			if !entry.protocol.NoAck {
+				drainConsumerBodyLeases(entry.protocol.Messages)
+			}
 			b.purgeDeliveryLocked(entry.session)
 			sessions = append(sessions, entry.session)
 		}
@@ -925,20 +931,4 @@ func (b *ClusterBroker) updateConsumerPrefetch(id string, prefetch uint16) error
 	command.Prefetch = credit
 	_, err := entry.session.runCommand(ctx, command)
 	return err
-}
-
-// Call after producer admission has quiesced under broker.mu. Forwarders may
-// concurrently receive; each channel item has exactly one receiver/owner.
-func drainConsumerBodyLeases(messages <-chan *protocol.Delivery) {
-	for {
-		select {
-		case delivery, ok := <-messages:
-			if !ok {
-				return
-			}
-			delivery.ReleaseBody()
-		default:
-			return
-		}
-	}
 }

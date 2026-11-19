@@ -5,6 +5,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/maxpert/amqp-go/config"
@@ -13,6 +14,108 @@ import (
 	"github.com/stretchr/testify/require"
 	"go.uber.org/zap"
 )
+
+func TestClusterAutoAckConsumerExitPreservesBufferedDelivery(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		const queue = "jobs"
+		state := &localClusterMachine{}
+		releasing, allowRelease, cancelled := make(chan struct{}), make(chan struct{}), make(chan struct{})
+		defer close(allowRelease)
+		b := NewClusterBroker(clusterSubmitFunc(func(ctx context.Context, key string, request []byte) ([]byte, error) {
+			command, err := clusterqueue.DecodeCommand(request)
+			if err != nil {
+				return nil, err
+			}
+			if command.Kind == clusterqueue.ReleaseQueueSession {
+				close(releasing)
+				<-allowRelease
+			}
+			return state.Submit(ctx, key, request)
+		}))
+		b.cancelConsumers = func([]string) { close(cancelled) }
+		_, err := b.DeclareQueue(queue, true, false, false, nil)
+		require.NoError(t, err)
+		for _, body := range []string{"held by forwarder", "buffered for forwarder"} {
+			require.NoError(t, b.PublishMessage("", queue, &protocol.Message{Body: []byte(body)}))
+		}
+
+		channel := protocol.NewChannel(1, nil)
+		channel.FlowActive.Store(false)
+		consumer := &protocol.Consumer{ID: "reader", NoAck: true, Messages: make(chan *protocol.Delivery, 1), Cancel: make(chan struct{})}
+		require.NoError(t, b.registerConsumer(queue, consumer.ID, consumer))
+		entry := b.consumers[consumer.ID]
+		defer entry.session.cancel()
+		fanIn := make(chan *protocol.Delivery, 2)
+		stop := make(chan struct{})
+		defer close(stop)
+		go forwardConsumerMessages(channel, consumer.Messages, fanIn, stop)
+		b.startConsumer(consumer.ID)
+		synctest.Wait()
+		require.Len(t, consumer.Messages, 1, "flow control must leave the second delivery buffered")
+		require.Empty(t, fanIn)
+		info, err := b.describe(context.Background(), queue)
+		require.NoError(t, err)
+		require.Zero(t, info.Ready)
+		require.Zero(t, info.Unacknowledged, "both deliveries must already be settled")
+
+		entry.session.cancel()
+		synctest.Wait()
+		select {
+		case <-releasing:
+		default:
+			t.Fatal("consumer exit did not reach session release")
+		}
+		select {
+		case <-cancelled:
+			t.Fatal("consumer was cancelled before session release")
+		default:
+		}
+		channel.FlowActive.Store(true)
+		channel.FlowWake <- struct{}{}
+		synctest.Wait()
+		require.Len(t, fanIn, 2, "a live forwarder must receive the buffered auto-ack delivery before consumer cancellation")
+		require.Equal(t, "held by forwarder", string((<-fanIn).Message.Body))
+		require.Equal(t, "buffered for forwarder", string((<-fanIn).Message.Body))
+	})
+}
+
+func TestRemovedConsumerCountsDiscardedAutoAckDeliveries(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		spy := &wireSpy{}
+		s := &Server{Log: zap.NewNop(), MetricsCollector: spy}
+		conn := protocol.NewConnection(nil)
+		channel := protocol.NewChannel(1, conn)
+		channel.FlowActive.Store(false)
+		consumer := &protocol.Consumer{ID: "reader", Tag: "reader", NoAck: true, Messages: make(chan *protocol.Delivery, 2)}
+		channel.Consumers[consumer.Tag] = consumer
+		conn.Channels.Store(channel.ID, channel)
+		for range 2 {
+			consumer.Messages <- &protocol.Delivery{ConsumerID: consumer.ID, NoAck: true}
+		}
+
+		rt := s.runtimeFor(conn)
+		defer rt.leaseCancel()
+		consumerInfos := make(map[string]*consumerInfo)
+		forwarders := make(map[string]chan struct{})
+		activeIDs := make(map[string]struct{})
+		fanIn := make(chan *protocol.Delivery)
+		defer func() {
+			for _, stop := range forwarders {
+				close(stop)
+			}
+			rt.deliveryForwarders.Wait()
+		}()
+		s.discoverConsumers(rt, consumerInfos, forwarders, activeIDs, fanIn)
+		synctest.Wait()
+		require.Len(t, consumer.Messages, 1, "flow control must park the forwarder holding the first delivery")
+
+		delete(channel.Consumers, consumer.Tag)
+		s.discoverConsumers(rt, consumerInfos, forwarders, activeIDs, fanIn)
+		rt.deliveryForwarders.Wait()
+		require.EqualValues(t, 2, spy.droppedCount(DeliveryDropConsumerRemoved), "one held and one buffered auto-ack delivery were discarded")
+		require.Empty(t, consumer.Messages)
+	})
+}
 
 func TestClusterManualConsumerBatchesClaimsAndFencesDeliveryByCredit(t *testing.T) {
 	const queue = "jobs"
