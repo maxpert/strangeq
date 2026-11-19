@@ -5050,7 +5050,7 @@ func (qw *QueueWAL) reclaimUnlinkPass(newPaths []string) {
 // fileMutex.
 func (qw *QueueWAL) readMessage(queueName string, offset uint64) (*protocol.Message, error) {
 	if qw.isAcknowledged(queueName, offset) {
-		return nil, fmt.Errorf("message not in WAL")
+		return nil, interfaces.ErrMessageNotFound
 	}
 
 	key := recordKey{queueName: queueName, deliveryTag: offset}
@@ -5062,7 +5062,7 @@ func (qw *QueueWAL) readMessage(queueName string, offset uint64) (*protocol.Mess
 		location, ok := sh.offset[key]
 		if !ok {
 			sh.mu.RUnlock()
-			return nil, fmt.Errorf("message not in WAL")
+			return nil, interfaces.ErrMessageNotFound
 		}
 		if location.pos.segmentID == qw.fileNum.Load() {
 			sh.mu.RUnlock()

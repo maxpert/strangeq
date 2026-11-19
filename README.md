@@ -13,7 +13,8 @@ to distribute queues across brokers.
 - Direct, fanout, topic, and headers exchanges, including exchange-to-exchange bindings.
 - Durable queues, persistent messages, publisher confirms, manual acknowledgments,
   redelivery, and crash recovery.
-- Standalone queue TTL, dead-letter exchanges, queue length limits, and transactions.
+- Standalone queue TTL, [dead-letter exchanges](docs/DEAD_LETTERING.md), queue
+  length limits, and transactions.
 - TLS and mutual TLS, file-based authentication, and per-vhost permissions.
 - Optional replicated queues accessible through any enrolled broker.
 - Prometheus metrics, readiness checks, and optional Go pprof profiling.
@@ -119,8 +120,8 @@ Run `amqp-server --help` for command-line options.
 
 ### Management and telemetry
 
-For a standalone broker, enable the management UI and API at
-`http://127.0.0.1:15672`:
+For a standalone broker, configure [management authentication](docs/MANAGEMENT.md)
+before enabling the UI and API at `http://127.0.0.1:15672`.
 
 ```sh
 amqp-server --config config.yaml --management

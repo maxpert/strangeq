@@ -534,6 +534,9 @@ func (b *ServerBuilder) Build() (*Server, error) {
 	// entities are seeded rather than double-counted by later observer events,
 	// and BEFORE the management listener starts (mgmt-03 §5).
 	server.InitEntityCounters()
+	if adapter, ok := unifiedBroker.(*StorageBrokerAdapter); ok {
+		adapter.broker.StartDeadLetterWorker()
+	}
 
 	return server, nil
 }

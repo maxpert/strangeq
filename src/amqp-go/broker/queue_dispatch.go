@@ -15,6 +15,8 @@ const (
 type requeueEntry struct {
 	tag         uint64
 	redelivered bool
+	retryRead   bool
+	retryExpiry bool
 }
 
 type QueueState struct {
@@ -81,6 +83,8 @@ type QueueState struct {
 	// reaper goroutine (started at declare/recovery when the policy needs it,
 	// stopped when the queue's stopCh closes). Redeclare must not spawn a second.
 	reaperStarted atomic.Bool
+	// Use the padding before lastActivityMilli to keep the dispatch layout fixed.
+	requeueRetryCount atomic.Int32
 
 	// lastActivityMilli is the Unix-milli timestamp of the most recent queue
 	// "use" for x-expires (SQ-9): consumer register, basic.get, and (re)declare
@@ -524,33 +528,38 @@ func (qs *QueueState) WakeAll() {
 }
 
 func (qs *QueueState) Claim(stop <-chan struct{}, timer *time.Timer) (uint64, bool, bool) {
+	entry, ok := qs.claimEntry(stop, timer)
+	return entry.tag, entry.redelivered, ok
+}
+
+func (qs *QueueState) claimEntry(stop <-chan struct{}, timer *time.Timer) (requeueEntry, bool) {
 	select {
 	case <-stop:
-		return 0, false, false
+		return requeueEntry{}, false
 	default:
 	}
-	if t, r, ok := qs.tryPopRequeue(); ok {
-		return t, r, true
+	if entry, ok := qs.tryPopRequeueEntry(); ok {
+		return entry, true
 	}
 	for {
 		t := qs.tail.Load()
 		h := qs.head.Load()
 		if t < h {
 			if qs.tail.CompareAndSwap(t, t+1) {
-				return t, false, true
+				return requeueEntry{tag: t}, true
 			}
 			continue
 		}
 		select {
 		case <-stop:
-			return 0, false, false
+			return requeueEntry{}, false
 		default:
 		}
-		if t2, r, ok := qs.tryPopRequeue(); ok {
-			return t2, r, true
+		if entry, ok := qs.tryPopRequeueEntry(); ok {
+			return entry, true
 		}
 		if !qs.park(stop, timer) {
-			return 0, false, false
+			return requeueEntry{}, false
 		}
 	}
 }
@@ -590,6 +599,17 @@ func (qs *QueueState) park(stop <-chan struct{}, timer *time.Timer) bool {
 }
 
 func (qs *QueueState) Requeue(tag uint64) {
+	qs.requeue(requeueEntry{tag: tag, redelivered: true})
+}
+
+func (qs *QueueState) requeue(entry requeueEntry) {
+	qs.waiting.Add(1)
+	qs.inflight.Add(-1)
+	qs.putBackReady(entry)
+}
+
+// putBackReady restores a claimed cursor entry that was never made inflight.
+func (qs *QueueState) putBackReady(entry requeueEntry) {
 	qs.requeueMu.Lock()
 	bufCap := cap(qs.requeueBuf)
 	if qs.requeueLen >= bufCap {
@@ -603,29 +623,38 @@ func (qs *QueueState) Requeue(tag uint64) {
 		bufCap = newCap
 	}
 	writeIdx := (qs.requeueHead + qs.requeueLen) % bufCap
-	qs.requeueBuf[writeIdx] = requeueEntry{tag: tag, redelivered: true}
+	qs.requeueBuf[writeIdx] = entry
 	qs.requeueLen++
 	qs.requeueCount.Add(1)
+	if entry.retryRead {
+		qs.requeueRetryCount.Add(1)
+	}
 	qs.requeueMu.Unlock()
-	qs.waiting.Add(1)
-	qs.inflight.Add(-1)
 	qs.NotifyNewMessage()
 }
 
 func (qs *QueueState) tryPopRequeue() (uint64, bool, bool) {
+	entry, ok := qs.tryPopRequeueEntry()
+	return entry.tag, entry.redelivered, ok
+}
+
+func (qs *QueueState) tryPopRequeueEntry() (requeueEntry, bool) {
 	if qs.requeueCount.Load() <= 0 {
-		return 0, false, false
+		return requeueEntry{}, false
 	}
 	qs.requeueMu.Lock()
 	if qs.requeueLen == 0 {
 		qs.requeueMu.Unlock()
-		return 0, false, false
+		return requeueEntry{}, false
 	}
 	bufCap := cap(qs.requeueBuf)
 	entry := qs.requeueBuf[qs.requeueHead]
 	qs.requeueHead = (qs.requeueHead + 1) % bufCap
 	qs.requeueLen--
 	qs.requeueCount.Add(-1)
+	if entry.retryRead {
+		qs.requeueRetryCount.Add(-1)
+	}
 
 	if qs.requeueLen > 0 && qs.requeueLen < bufCap/4 && bufCap > requeueInitialCap*2 {
 		newCap := bufCap / 2
@@ -641,7 +670,33 @@ func (qs *QueueState) tryPopRequeue() (uint64, bool, bool) {
 	}
 
 	qs.requeueMu.Unlock()
-	return entry.tag, entry.redelivered, true
+	return entry, true
+}
+
+// takeReadRetries claims entries left by a failed read or expiry without
+// moving other redeliveries. The ready count already includes each entry.
+func (qs *QueueState) takeReadRetries(limit int) []requeueEntry {
+	if qs.requeueRetryCount.Load() == 0 {
+		return nil
+	}
+	qs.requeueMu.Lock()
+	defer qs.requeueMu.Unlock()
+	var retries []requeueEntry
+	bufCap := cap(qs.requeueBuf)
+	write := 0
+	for i := 0; i < qs.requeueLen; i++ {
+		entry := qs.requeueBuf[(qs.requeueHead+i)%bufCap]
+		if entry.retryRead && len(retries) < limit {
+			retries = append(retries, entry)
+			continue
+		}
+		qs.requeueBuf[(qs.requeueHead+write)%bufCap] = entry
+		write++
+	}
+	qs.requeueLen = write
+	qs.requeueCount.Add(-int64(len(retries)))
+	qs.requeueRetryCount.Add(-int32(len(retries)))
+	return retries
 }
 
 func (qs *QueueState) ClaimInflight(tag uint64) {
@@ -700,11 +755,10 @@ func (qs *QueueState) AckAdvance(tag uint64) {
 }
 
 // ReapDrop accounts a READY (never-delivered) message removed by the SQ-9 TTL
-// reaper or the delivery-time head-check: it decrements the ready count only. It
-// never touches the inflight counter (a reaped message was never delivered) and
-// is invoked ONLY by the winner of the ring Delete (deleteIfPresent==true), so
-// across {reaper drop, consumer head-check} at most one caller decrements depth
-// per tag. waiting is clamped at zero defensively.
+// reaper or the delivery-time head-check. The best-effort path calls it after
+// winning the storage removal. Reliable expiry first claims the tail or pops
+// the requeue entry, then calls it after staging the transfer. Only the owner
+// decrements depth per tag. The inflight count is untouched.
 func (qs *QueueState) ReapDrop() {
 	if qs.waiting.Add(-1) < 0 {
 		for {
@@ -753,14 +807,16 @@ func (qs *QueueState) Recover(minTag, maxTag, count uint64) {
 	// sequentially-consistent atomics, a reaper that observes the new head is then
 	// guaranteed to observe the already-set waiting, and its ReapDrop applies on top.
 	qs.waiting.Store(int64(count))
-	qs.head.Store(maxTag + 1)
 	qs.requeueMu.Lock()
 	qs.requeueBuf = make([]requeueEntry, requeueInitialCap)
 	qs.requeueHead = 0
 	qs.requeueLen = 0
 	qs.requeueCount.Store(0)
+	qs.requeueRetryCount.Store(0)
 	qs.requeueMu.Unlock()
 	qs.RecoverSeq(TagSeq(maxTag) + 1)
+	// An expiry after head becomes visible may put a tag back in the ring.
+	qs.head.Store(maxTag + 1)
 	qs.NotifyNewMessage()
 }
 

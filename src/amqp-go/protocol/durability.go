@@ -21,6 +21,7 @@ type PendingAck struct {
 	DeliveredAt     time.Time `json:"delivered_at"`
 	RedeliveryCount int       `json:"redelivery_count"` // Track redeliveries
 	Redelivered     bool      `json:"redelivered"`      // Whether this is a redelivery
+	BodyBytes       int       `json:"-"`                // Ready-byte accounting for a failed reliable settlement
 }
 
 // DurableEntityMetadata contains metadata about durable entities for recovery

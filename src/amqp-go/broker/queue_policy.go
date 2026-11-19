@@ -76,6 +76,7 @@ type QueuePolicy struct {
 	HasDeadLetterExchange   bool
 	DeadLetterRoutingKey    string
 	HasDeadLetterRoutingKey bool
+	ReliableDeadLetter      bool
 
 	// MaxLength / MaxLengthBytes cap queue depth (x-max-length /
 	// x-max-length-bytes, non-negative). Enforced by SQ-11.
@@ -186,6 +187,19 @@ func ResolveQueuePolicy(arguments map[string]interface{}) (*QueuePolicy, error) 
 			policy.Overflow = OverflowRejectPublish
 		default:
 			return nil, invalidArg("x-overflow", `"drop-head" or "reject-publish"`, v)
+		}
+		found = true
+	}
+	if v, ok := arguments["x-dead-letter-strategy"]; ok {
+		switch v {
+		case "at-most-once":
+		case "at-least-once":
+			if !policy.HasDeadLetterExchange || policy.Overflow != OverflowRejectPublish {
+				return nil, fmt.Errorf("%w: at-least-once dead-lettering requires x-dead-letter-exchange and x-overflow=reject-publish", ErrInvalidQueueArgument)
+			}
+			policy.ReliableDeadLetter = true
+		default:
+			return nil, invalidArg("x-dead-letter-strategy", `"at-most-once" or "at-least-once"`, v)
 		}
 		found = true
 	}

@@ -897,7 +897,7 @@ func (sm *SegmentManager) segmentDirFor(queueName string) (string, error) {
 func (sm *SegmentManager) Read(queueName string, offset uint64) (*protocol.Message, error) {
 	val, ok := sm.queueSegments.Load(queueName)
 	if !ok {
-		return nil, fmt.Errorf("segments not found for queue %s", queueName)
+		return nil, interfaces.ErrMessageNotFound
 	}
 	segments := val.(*QueueSegments)
 
@@ -1367,7 +1367,7 @@ func (qs *QueueSegments) readMessage(offset uint64) (*protocol.Message, error) {
 	if qs.metrics != nil {
 		qs.metrics.RecordSegmentReadError()
 	}
-	return nil, fmt.Errorf("message not in segments")
+	return nil, interfaces.ErrMessageNotFound
 }
 
 // sealSegment moves current segment to sealed segments.

@@ -1563,8 +1563,7 @@ const (
 // over-settled. When channel is nil (legacy tests) it falls back to routing the
 // wire tag (== msgID) to the owning consumer's broker multi-ack.
 //
-// It returns the number of settled deliveries for metrics. Clustered settlements
-// surface the first failure because quorum may be lost partway through a batch.
+// It returns the number of successfully settled deliveries and the first error.
 func (s *Server) cumulativeSettle(channel *protocol.Channel, wireTag uint64, kind settleKind, requeue bool) (int, error) {
 	// Spec: delivery-tag 0 with multiple=true means "every outstanding delivery
 	// on the channel". Wire tags are 1-based, so 0 would otherwise match nothing
@@ -1581,11 +1580,15 @@ func (s *Server) cumulativeSettle(channel *protocol.Channel, wireTag uint64, kin
 		case ctag == "" && kind == settleAck:
 			s.Broker.AcknowledgeGetDelivery(wireTag)
 		case ctag == "":
-			s.Broker.NackGetDelivery(wireTag, requeue)
+			if err := s.Broker.NackGetDelivery(wireTag, requeue); err != nil {
+				return 0, err
+			}
 		case kind == settleAck:
 			s.Broker.AcknowledgeMessage(ctag, wireTag, true)
 		default:
-			s.Broker.NacknowledgeMessage(ctag, wireTag, true, requeue)
+			if err := s.Broker.NacknowledgeMessage(ctag, wireTag, true, requeue); err != nil {
+				return 0, err
+			}
 		}
 		return 1, nil
 	}
@@ -1594,19 +1597,27 @@ func (s *Server) cumulativeSettle(channel *protocol.Channel, wireTag uint64, kin
 		return distributed.settleWireTags(channel, wireTag, kind, requeue)
 	}
 	refs := channel.TakeWireTagsUpTo(wireTag)
+	var firstErr error
+	settled := 0
 	for _, ref := range refs {
+		var err error
 		switch {
 		case ref.IsGet && kind == settleAck:
 			s.Broker.AcknowledgeGetDelivery(ref.MsgID)
 		case ref.IsGet:
-			s.Broker.NackGetDelivery(ref.MsgID, requeue)
+			err = s.Broker.NackGetDelivery(ref.MsgID, requeue)
 		case kind == settleAck:
 			s.Broker.AcknowledgeMessage(ref.ConsumerID, ref.MsgID, false)
 		default:
-			s.Broker.NacknowledgeMessage(ref.ConsumerID, ref.MsgID, false, requeue)
+			err = s.Broker.NacknowledgeMessage(ref.ConsumerID, ref.MsgID, false, requeue)
+		}
+		if err == nil {
+			settled++
+		} else if firstErr == nil {
+			firstErr = err
 		}
 	}
-	return len(refs), nil
+	return settled, firstErr
 }
 
 func (s *Server) handleBasicRecover(conn *protocol.Connection, channelID uint16, payload []byte) error {

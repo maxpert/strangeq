@@ -13,9 +13,16 @@ import (
 // flush. The atomic
 // temp+rename shape is unchanged.
 func atomicWriteFileWithPolicy(path string, data []byte, perm os.FileMode, pol syncPolicy) error {
+	_, err := replaceFileWithPolicy(path, data, perm, pol)
+	return err
+}
+
+// replaceFileWithPolicy reports whether the rename made the new file visible,
+// even if the subsequent directory sync failed.
+func replaceFileWithPolicy(path string, data []byte, perm os.FileMode, pol syncPolicy) (replaced bool, err error) {
 	dir := filepath.Dir(path)
 	if err := os.MkdirAll(dir, 0755); err != nil {
-		return fmt.Errorf("failed to create directory: %w", err)
+		return false, fmt.Errorf("failed to create directory: %w", err)
 	}
 
 	// Any error below removes the temp file, so a failure never leaves a .tmp
@@ -23,31 +30,31 @@ func atomicWriteFileWithPolicy(path string, data []byte, perm os.FileMode, pol s
 	tempPath := path + TempFileExtension
 	f, err := os.OpenFile(tempPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, perm)
 	if err != nil {
-		return fmt.Errorf("failed to create temp file: %w", err)
+		return false, fmt.Errorf("failed to create temp file: %w", err)
 	}
 	if _, err := f.Write(data); err != nil {
 		_ = f.Close()
 		_ = os.Remove(tempPath)
-		return fmt.Errorf("failed to write temp file: %w", err)
+		return false, fmt.Errorf("failed to write temp file: %w", err)
 	}
 	if err := pol.file(f); err != nil {
 		_ = f.Close()
 		_ = os.Remove(tempPath)
-		return fmt.Errorf("failed to fsync temp file: %w", err)
+		return false, fmt.Errorf("failed to fsync temp file: %w", err)
 	}
 	if err := f.Close(); err != nil {
 		_ = os.Remove(tempPath)
-		return fmt.Errorf("failed to close temp file: %w", err)
+		return false, fmt.Errorf("failed to close temp file: %w", err)
 	}
 
 	if err := os.Rename(tempPath, path); err != nil {
 		_ = os.Remove(tempPath)
-		return fmt.Errorf("failed to rename temp file: %w", err)
+		return false, fmt.Errorf("failed to rename temp file: %w", err)
 	}
 
 	if err := pol.dir(dir); err != nil {
-		return fmt.Errorf("failed to fsync directory: %w", err)
+		return true, fmt.Errorf("failed to fsync directory: %w", err)
 	}
 
-	return nil
+	return true, nil
 }

@@ -381,7 +381,7 @@ func BenchmarkDeliverMessage_ManualAck(b *testing.B) {
 		broker.storage.StoreMessage(queueName, msg)
 		b.StartTimer()
 
-		broker.deliverMessage(qs, state, claimedTag, redelivered)
+		broker.deliverMessage(qs, state, requeueEntry{tag: claimedTag, redelivered: redelivered})
 	}
 
 	b.StopTimer()

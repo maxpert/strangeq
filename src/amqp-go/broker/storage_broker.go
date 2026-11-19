@@ -315,6 +315,7 @@ type StorageBroker struct {
 	// entity-counter wiring; nil means no observer. Read lock-free on the
 	// control-plane mutation paths.
 	entityObserver atomic.Pointer[EntityObserver]
+	deadLetters    deadLetterWorker
 }
 
 // maxLenTrimReq is a deferred drop-head trim handed from an async publish
@@ -649,6 +650,7 @@ func (b *StorageBroker) SetTTLClock(now func() int64) { b.ttlNow = now }
 // stop; tests call it before closing storage so a reaper never touches a closed
 // store (the synchronous wait is what makes that guarantee hold under -race).
 func (b *StorageBroker) Close() {
+	b.deadLetters.close()
 	b.queueStates.Range(func(_, v interface{}) bool {
 		v.(*QueueState).Close()
 		return true
@@ -905,10 +907,7 @@ func (b *StorageBroker) getQueueConsumersMutex(queueName string) *sync.Mutex {
 // one name. Same LoadOrStore-one-mutex-per-key pattern as
 // getQueueConsumersMutex above.
 //
-// FIVE acquirers. The first four HOLD IT ACROSS the QueueState work rather than
-// unlocking first — that is the invariant, and it is the opposite of what this
-// comment said before the C1 fixes. The fifth, BindQueue, holds no QueueState
-// and takes it purely to serialize against the fourth:
+// Acquisition spans include:
 //   - getOrCreateQueueState — cold-path creation; defer-unlocks, so it is held
 //     across createQueueStateLocked.
 //   - DeclareQueue, existing-queue branch — re-reads the record under the lock
@@ -937,19 +936,20 @@ func (b *StorageBroker) getQueueConsumersMutex(queueName string) *sync.Mutex {
 // NON-REENTRANT. While holding it, call createQueueStateLocked, NEVER
 // getOrCreateQueueState — the latter takes this same mutex and self-deadlocks.
 //
-// LOCK ORDERING RULE — this mutex is a LEAF among broker locks. While it is
-// held you may descend only into the storage/metadata layer (GetQueue /
-// StoreQueue, i.e. PersistentMetadataStore.mutex). You must NEVER acquire
-// another broker-level lock beneath it — in particular getQueueConsumersMutex —
-// and nothing may acquire this one while holding that. Two per-name mutexes
-// taken in opposite orders on two queue names is a textbook deadlock, and the
-// storage layer never calls back up into the broker, so keeping this a leaf is
-// what makes the ordering trivially acyclic.
+// LOCK ORDERING RULE — after acquiring this mutex, callers can enter storage
+// and the same queue's admission/frontier locks. Never acquire a different
+// queue lifecycle lock or the consumers mutex under it, and never acquire it
+// while holding either frontier or admission. Storage never acquires it.
 //
 // SIBLING, NOT NESTED, with the consumers mutex: DeleteQueue takes the
 // consumers mutex to stop and unregister consumers, and RELEASES it before
 // acquiring this one for the teardown span. The two spans are strictly
 // disjoint. Preserve that if you reorder teardown.
+//
+// deliverDurableDeadLetter may acquire the same queue's maxLenMu and frontier
+// mutex while pinned here. The admission and frontier operations release
+// their locks before any lifecycle action. The synchronous WAL completion
+// does not call into the broker. Target trimming runs after releasing this pin.
 //
 // If you add a call under this lock, re-verify the leaf rule and the
 // sibling-not-nested property — and if you change who holds it across what,
@@ -1227,7 +1227,7 @@ func (b *StorageBroker) consumerPollLoop(state *ConsumerState, queueState *Queue
 			}
 		}
 
-		tag, redelivered, ok := queueState.Claim(state.stopCh, parkTimer)
+		entry, ok := queueState.claimEntry(state.stopCh, parkTimer)
 		if !ok {
 			if !bypass {
 				state.gate.release(1)
@@ -1235,7 +1235,7 @@ func (b *StorageBroker) consumerPollLoop(state *ConsumerState, queueState *Queue
 			return
 		}
 
-		b.deliverMessage(queueState, state, tag, redelivered)
+		b.deliverMessage(queueState, state, entry)
 	}
 }
 
@@ -1259,7 +1259,7 @@ func (b *StorageBroker) consumerPollLoop(state *ConsumerState, queueState *Queue
 // The gate credit itself was already reserved by the poll loop's acquire; deliver
 // does not touch it. It runs only after GetMessage has succeeded, so a gap tag
 // never reaches here (its reserved credit is released tagless in deliverMessage).
-func (b *StorageBroker) deliver(queueState *QueueState, state *ConsumerState, msgID uint64, redelivered bool) {
+func (b *StorageBroker) deliver(queueState *QueueState, state *ConsumerState, msgID uint64, redelivered bool, bodyBytes int) {
 	b.deliveryIndex.Store(msgID, state.consumer.ID)
 	queueState.ClaimInflight(msgID)
 	if !state.consumer.NoAck {
@@ -1269,6 +1269,7 @@ func (b *StorageBroker) deliver(queueState *QueueState, state *ConsumerState, ms
 			DeliveryTag: msgID,
 			ConsumerTag: state.consumer.ID,
 			Redelivered: redelivered,
+			BodyBytes:   bodyBytes,
 		})
 	}
 }
@@ -1277,18 +1278,23 @@ func (b *StorageBroker) deliver(queueState *QueueState, state *ConsumerState, ms
 // This provides natural TCP backpressure when consumer is slow
 // Messages are never put back in normal operation, preserving FIFO order
 // Put-backs only occur on shutdown/cancellation (rare events) via Requeue
-func (b *StorageBroker) deliverMessage(queueState *QueueState, state *ConsumerState, msgID uint64, redelivered bool) {
+func (b *StorageBroker) deliverMessage(queueState *QueueState, state *ConsumerState, entry requeueEntry) {
 	noAck := state.consumer.NoAck
+	msgID, redelivered := entry.tag, entry.redelivered
 
 	message, err := b.storage.GetMessageForDelivery(state.queueName, msgID)
 	if err != nil {
-		// Gap tag (recovered/acked message no longer in storage). deliver() —
-		// which Stores the ledger entry — has not run, so no tag exists for any
-		// terminal path to claim. The poll loop's reserved credit is therefore
-		// tagless and released directly (it cannot race any owner, exactly like
-		// the Claim-failure path); only the depth-frontier advance is
-		// path-specific.
+		// There is no ledger entry yet, so return the poll loop's credit
+		// directly. A reliable queue retries unreadable messages and skips
+		// only tags that storage knows are absent.
 		state.releaseGate(1)
+		if p := queueState.Policy(); p != nil && p.ReliableDeadLetter && !isAbsentMessage(err) {
+			entry.retryRead = true
+			queueState.putBackReady(entry)
+			b.logDeadLetterRetry("source message read failed; will retry", state.queueName, "", err)
+			waitDeadLetterReadRetry(queueState, state)
+			return
+		}
 		queueState.GapSkipAdvance(msgID)
 		return
 	}
@@ -1300,7 +1306,7 @@ func (b *StorageBroker) deliverMessage(queueState *QueueState, state *ConsumerSt
 	// BenchmarkDeliver_NoTTL_ZeroCost. An expired message is dead-lettered
 	// (reason=expired) or dropped instead of delivered.
 	p := queueState.Policy()
-	if message.EnqueueUnixMilli != 0 && messageExpired(message, p, b.ttlNowMillis()) {
+	if entry.retryExpiry || message.EnqueueUnixMilli != 0 && messageExpired(message, p, b.ttlNowMillis()) {
 		b.dropExpiredOnDelivery(queueState, state, message, msgID, p)
 		return
 	}
@@ -1321,7 +1327,11 @@ func (b *StorageBroker) deliverMessage(queueState *QueueState, state *ConsumerSt
 
 	// Record all pre-send bookkeeping in one place before the message can reach
 	// the consumer (see deliver()).
-	b.deliver(queueState, state, msgID, redelivered)
+	bodyBytes := 0
+	if p != nil && p.ReliableDeadLetter && p.HasMaxLengthBytes {
+		bodyBytes = len(message.Body)
+	}
+	b.deliver(queueState, state, msgID, redelivered, bodyBytes)
 
 	// SQ-11 max-length: the claimed message left the ready set (deliver ->
 	// ClaimInflight). Subtract its bytes when the queue enforces
@@ -1383,6 +1393,14 @@ func (b *StorageBroker) deliverMessage(queueState *QueueState, state *ConsumerSt
 // where the reaper and head-check both act on the same queue, which RabbitMQ's
 // at-least-once dead-letter semantics permit.
 func (b *StorageBroker) dropExpiredOnDelivery(qs *QueueState, state *ConsumerState, msg *protocol.Message, tag uint64, p *QueuePolicy) {
+	if p != nil && p.ReliableDeadLetter {
+		err := b.expireReliableReady(qs, state.queueName, msg, tag, p)
+		state.releaseGate(1)
+		if err != nil {
+			waitDeadLetterReadRetry(qs, state)
+		}
+		return
+	}
 	if p != nil && p.HasDeadLetterExchange {
 		_ = b.deadLetter(p, state.queueName, msg, DeadLetterExpired)
 	}
@@ -1404,7 +1422,10 @@ func (b *StorageBroker) dropExpiredOnDelivery(qs *QueueState, state *ConsumerSta
 // head-check during GetMessageForGet, gating the depth decrement on winning the
 // ring removal so it reconciles with the reaper. basic.get holds no prefetch
 // gate, so there is nothing to release.
-func (b *StorageBroker) dropExpiredOnGet(qs *QueueState, queueName string, msg *protocol.Message, tag uint64, p *QueuePolicy) {
+func (b *StorageBroker) dropExpiredOnGet(qs *QueueState, queueName string, msg *protocol.Message, tag uint64, p *QueuePolicy) error {
+	if p != nil && p.ReliableDeadLetter {
+		return b.expireReliableReady(qs, queueName, msg, tag, p)
+	}
 	if p != nil && p.HasDeadLetterExchange {
 		_ = b.deadLetter(p, queueName, msg, DeadLetterExpired)
 	}
@@ -1417,6 +1438,26 @@ func (b *StorageBroker) dropExpiredOnGet(qs *QueueState, queueName string, msg *
 	} else {
 		qs.GapSkipAdvance(tag)
 	}
+	return nil
+}
+
+// expireReliableReady owns a ready tag through a tail claim or requeue pop.
+// Once the pending transfer is durable, settlement needs no second body read.
+func (b *StorageBroker) expireReliableReady(qs *QueueState, queueName string, msg *protocol.Message, tag uint64, p *QueuePolicy) error {
+	if err := b.deadLetter(p, queueName, msg, DeadLetterExpired); err != nil {
+		qs.putBackReady(requeueEntry{tag: tag, retryRead: true, retryExpiry: true})
+		return err
+	}
+	if err := b.storage.DeleteMessage(queueName, tag); err != nil && !errors.Is(err, interfaces.ErrQueueNotFound) {
+		b.logDeadLetterRetry("could not remove the transferred source message", queueName, "", err)
+	}
+	qs.ReapDrop()
+	subReadyBytesOnClaim(qs, p, len(msg.Body))
+	return nil
+}
+
+func isAbsentMessage(err error) bool {
+	return errors.Is(err, interfaces.ErrMessageNotFound) || errors.Is(err, interfaces.ErrQueueNotFound)
 }
 
 // ackDelivered performs the storage and queue bookkeeping to acknowledge a
@@ -1450,10 +1491,10 @@ func (b *StorageBroker) finishAck(queueState *QueueState, queueName, consumerID 
 // requeue it for redelivery or discard it and advance the depth frontier. Like
 // finishAck it does NOT release the prefetch gate (settle() owns that). The tag
 // must already have been claimed via settle().
-func (b *StorageBroker) finishNack(queueState *QueueState, queueName, consumerID string, deliveryTag uint64, requeue bool) {
+func (b *StorageBroker) finishNack(queueState *QueueState, queueName, consumerID string, deliveryTag uint64, requeue bool) error {
 	b.storage.NackFromConsumer(queueName, consumerID, deliveryTag)
-	b.storage.DeletePendingAck(queueName, deliveryTag)
 	if requeue {
+		b.storage.DeletePendingAck(queueName, deliveryTag)
 		// SQ-11: the message re-enters the ready set — restore its bytes when
 		// the queue enforces x-max-length-bytes. Divergence (documented, W7):
 		// unlike RabbitMQ we do NOT drop-head a requeue that pushes the queue
@@ -1461,7 +1502,7 @@ func (b *StorageBroker) finishNack(queueState *QueueState, queueName, consumerID
 		// set and re-trimmed on the next publish.
 		b.restoreReadyBytesOnRequeue(queueState, queueName, deliveryTag)
 		queueState.Requeue(deliveryTag)
-		return
+		return nil
 	}
 	// requeue==false discard. Dead-letter (reason=rejected) BEFORE deleting the
 	// source: republish StoreMessage precedes DeleteMessage so a crash between
@@ -1469,39 +1510,41 @@ func (b *StorageBroker) finishNack(queueState *QueueState, queueName, consumerID
 	// RabbitMQ). qs.Policy() is loaded STRICTLY here, inside the requeue==false
 	// branch, so the requeue==true redelivery hot path (and ack, and publish)
 	// pays zero: no load, no map lookup, one not-taken branch.
-	b.deadLetterOnDiscard(queueState, queueName, deliveryTag)
-	b.storage.DeleteMessage(queueName, deliveryTag)
-	queueState.AckAdvance(deliveryTag)
+	return b.finishDiscard(queueState, queueState.Policy(), queueName, deliveryTag)
 }
 
-// deadLetterOnDiscard dead-letters a single about-to-be-discarded message with
-// reason=rejected when the queue has a dead-letter exchange configured. It is
-// the shared reject/nack/basic.get-reject hook, invoked only on the cold
-// requeue==false path. The Policy() guard short-circuits before any storage
-// read when no DLX is set, so a queue without dead-lettering pays only one
-// atomic load plus a not-taken branch.
-func (b *StorageBroker) deadLetterOnDiscard(queueState *QueueState, queueName string, deliveryTag uint64) {
-	p := queueState.Policy()
-	if p == nil || !p.HasDeadLetterExchange {
-		return
+// finishDiscard is the single-settlement path after claiming the inflight tag
+// and clearing the consumer cursor. A reliable transfer failure puts it back.
+func (b *StorageBroker) finishDiscard(qs *QueueState, p *QueuePolicy, queueName string, tag uint64) error {
+	if p != nil && p.HasDeadLetterExchange {
+		// Peek without admitting the discarded body into cache.
+		msg, err := b.storage.GetMessage(queueName, tag)
+		if err == nil && msg != nil {
+			err = b.deadLetter(p, queueName, msg, DeadLetterRejected)
+		} else if p.ReliableDeadLetter {
+			// A delivery we still own must survive a failed source peek.
+			if err == nil {
+				err = errors.New("storage returned an empty message")
+			}
+			b.logDeadLetterRetry("could not read source for dead-lettering; source kept", queueName, "", err)
+		}
+		if p.ReliableDeadLetter && err != nil {
+			if msg != nil {
+				addReadyBytesOnEnqueue(qs, p, len(msg.Body))
+			} else if p.HasMaxLengthBytes {
+				if ack, lookupErr := b.storage.GetPendingAck(queueName, tag); lookupErr == nil && ack != nil {
+					qs.AddReadyBytes(int64(ack.BodyBytes))
+				}
+			}
+			b.storage.DeletePendingAck(queueName, tag)
+			qs.requeue(requeueEntry{tag: tag, redelivered: true, retryRead: true})
+			return fmt.Errorf("dead letter from %q: %w", queueName, err)
+		}
 	}
-	// A DEAD-LETTER READ IS A SETTLE, NOT A CONSUMER DELIVERY, so it PEEKS.
-	//
-	// Nothing asked for this message: it is being DISCARDED (it is
-	// dead-lettered and dropped), and the source message is removed from
-	// this queue immediately afterwards by the caller. Admitting it would
-	// only churn the hot cache (the entry is created and destroyed within
-	// the same call) and would inflate the queue's reported message count
-	// with a message that is about to be gone.
-	//
-	// This is the SAME contract the BATCH path follows (discardNackedBatch
-	// peeks), and the same contract the read triage states: a delivery
-	// admits, a peek does not.
-	msg, err := b.storage.GetMessage(queueName, deliveryTag)
-	if err != nil || msg == nil {
-		return
-	}
-	_ = b.deadLetter(p, queueName, msg, DeadLetterRejected)
+	b.storage.DeletePendingAck(queueName, tag)
+	b.storage.DeleteMessage(queueName, tag)
+	qs.AckAdvance(tag)
+	return nil
 }
 
 // discardNackedBatch settles and discards every unacked tag <= upTo for a
@@ -1518,7 +1561,7 @@ func (b *StorageBroker) deadLetterOnDiscard(queueState *QueueState, queueName st
 // A single Policy() load is hoisted before the loop (the hot-path zero-cost
 // contract for multi-nack). The gate-credit release still funnels through
 // settle() exactly once per tag.
-func (b *StorageBroker) discardNackedBatch(queueState *QueueState, queueName, consumerID string, tags []uint64, upTo uint64) {
+func (b *StorageBroker) discardNackedBatch(queueState *QueueState, queueName, consumerID string, tags []uint64, upTo uint64) error {
 	p := queueState.Policy()
 	if p == nil || !p.HasDeadLetterExchange {
 		// No dead-lettering: discard inline in a single pass — no fan-out, no
@@ -1536,7 +1579,23 @@ func (b *StorageBroker) discardNackedBatch(queueState *QueueState, queueName, co
 			b.storage.DeleteMessage(queueName, tag)
 			queueState.AckAdvance(tag)
 		}
-		return
+		return nil
+	}
+	if p.ReliableDeadLetter {
+		var firstErr error
+		for _, tag := range tags {
+			if tag > upTo {
+				continue
+			}
+			if _, won := b.settle(tag); !won {
+				continue
+			}
+			b.storage.NackFromConsumer(queueName, consumerID, tag)
+			if err := b.finishDiscard(queueState, p, queueName, tag); err != nil && firstErr == nil {
+				firstErr = err
+			}
+		}
+		return firstErr
 	}
 
 	// DLX configured: fan the per-message republishes out concurrently and await
@@ -1580,6 +1639,7 @@ func (b *StorageBroker) discardNackedBatch(queueState *QueueState, queueName, co
 		b.storage.DeleteMessage(queueName, tag)
 		queueState.AckAdvance(tag)
 	}
+	return nil
 }
 
 // settle removes a tag from the single delivery ledger (deliveryIndex) and
@@ -1876,6 +1936,9 @@ func (b *StorageBroker) DeclareQueue(name string, durable, autoDelete, exclusive
 	if err != nil {
 		return nil, fmt.Errorf("queue '%s': %w", name, err)
 	}
+	if err := b.validateDeadLetterPolicy(policy, durable); err != nil {
+		return nil, fmt.Errorf("queue '%s': %w", name, err)
+	}
 
 	// New queue: serialize the whole check-allocate-persist sequence per
 	// queue NAME. Two connections idempotently declaring the SAME brand-new
@@ -2043,6 +2106,13 @@ func (b *StorageBroker) declareExistingQueueLocked(existing *protocol.Queue, dur
 		}
 	}
 
+	policy, perr := ResolveQueuePolicy(existing.Arguments)
+	if perr == nil {
+		if err := b.validateDeadLetterPolicy(policy, existing.Durable); err != nil {
+			return nil, fmt.Errorf("queue '%s': %w", existing.Name, err)
+		}
+	}
+
 	// Add to active cache (lock-free)
 	b.activeQueues.Store(existing.Name, existing)
 
@@ -2054,7 +2124,7 @@ func (b *StorageBroker) declareExistingQueueLocked(existing *protocol.Queue, dur
 	// (nil policy) so queues persisted before validation existed remain
 	// usable.
 	qs := b.createQueueStateLocked(existing.Name)
-	if policy, perr := ResolveQueuePolicy(existing.Arguments); perr == nil {
+	if perr == nil {
 		qs.SetPolicy(policy)
 	}
 	// W4 SQ-9: a (re)declare is queue "use" (resets the x-expires idle clock)
@@ -2066,15 +2136,15 @@ func (b *StorageBroker) declareExistingQueueLocked(existing *protocol.Queue, dur
 	return existing, nil
 }
 
-// classicQueueArgumentKeys is RabbitMQ's classic-queue argument list (R6,
-// rabbit_classic_queue.erl capabilities/0 queue_arguments), in the fixed
-// comparison order of §2.2. Redeclare equivalence compares ONLY these keys;
-// plugin/client keys outside the list are ignored (D3).
+// classicQueueArgumentKeys is RabbitMQ's classic-queue argument list plus
+// StrangeQ's dead-letter strategy argument. Redeclare equivalence compares
+// only these keys, so other plugin/client keys are ignored (D3).
 var classicQueueArgumentKeys = []string{
 	"x-expires",
 	"x-message-ttl",
 	"x-dead-letter-exchange",
 	"x-dead-letter-routing-key",
+	"x-dead-letter-strategy",
 	"x-max-length",
 	"x-max-length-bytes",
 	"x-max-priority",
@@ -4649,9 +4719,7 @@ func (b *StorageBroker) RejectMessage(consumerID string, deliveryTag uint64, req
 	if _, won := b.settle(deliveryTag); !won {
 		return nil
 	}
-	b.finishNack(queueState, state.queueName, state.consumer.ID, deliveryTag, requeue)
-
-	return nil
+	return b.finishNack(queueState, state.queueName, state.consumer.ID, deliveryTag, requeue)
 }
 
 // NacknowledgeMessage handles negative acknowledgment (lock-free hot path).
@@ -4689,7 +4757,7 @@ func (b *StorageBroker) NacknowledgeMessage(consumerID string, deliveryTag uint6
 			// requeue==false discard: batch the DLX republishes so we do not
 			// serialize N synchronous WAL group-commit fsyncs on this frame
 			// goroutine (a real latency cliff). One Policy() load is hoisted.
-			b.discardNackedBatch(queueState, state.queueName, consumerID, tags, deliveryTag)
+			return b.discardNackedBatch(queueState, state.queueName, consumerID, tags, deliveryTag)
 		}
 	} else {
 		// Nacknowledge single message. Settle funnels the LoadAndDelete guard
@@ -4698,7 +4766,7 @@ func (b *StorageBroker) NacknowledgeMessage(consumerID string, deliveryTag uint6
 		if _, won := b.settle(deliveryTag); !won {
 			return nil
 		}
-		b.finishNack(queueState, state.queueName, state.consumer.ID, deliveryTag, requeue)
+		return b.finishNack(queueState, state.queueName, state.consumer.ID, deliveryTag, requeue)
 	}
 
 	return nil
@@ -4742,14 +4810,14 @@ func (b *StorageBroker) RebuildDeliveryIndex(deliveryTag uint64, consumerID stri
 // and head stay at 0 and consumers park until the first Publish.
 func (b *StorageBroker) RecoverQueue(queueName string, minTag, maxTag, count uint64) {
 	queueState := b.getOrCreateQueueState(queueName)
-	queueState.Recover(minTag, maxTag, count)
 
 	// SQ-11: reconstruct the ready-bytes counter for a durable queue that
 	// enforces x-max-length-bytes so the byte limit is enforced correctly after
 	// a restart. Queue metadata (and thus the policy) is recovered BEFORE
 	// messages (recovery steps 3 then 5), so the policy is already attached.
 	// One-time, cold, and only for byte-limited queues; gaps (tags acked before
-	// restart) return not-found and are skipped.
+	// restart) return not-found and are skipped. Compute the count before
+	// publishing the recovered frontier so expiry sees initialized accounting.
 	if p := queueState.Policy(); p != nil && p.HasMaxLengthBytes && count > 0 {
 		var total int64
 		for tag := minTag; tag <= maxTag; tag++ {
@@ -4764,6 +4832,7 @@ func (b *StorageBroker) RecoverQueue(queueName string, minTag, maxTag, count uin
 			queueState.AddReadyBytes(total)
 		}
 	}
+	queueState.Recover(minTag, maxTag, count)
 }
 
 // GetMessageForGet attempts to synchronously retrieve the next message from a
@@ -4808,18 +4877,25 @@ func (b *StorageBroker) GetMessageForGetOwned(queueName string, noAck bool, conn
 	var tag uint64
 	var message *protocol.Message
 
-	if t, r, ok := queueState.tryPopRequeue(); ok {
-		tag = t
-		message, _ = b.storage.GetMessageForDelivery(queueName, tag)
+	if entry, ok := queueState.tryPopRequeueEntry(); ok {
+		tag = entry.tag
+		message, err = b.storage.GetMessageForDelivery(queueName, tag)
+		if err != nil && p != nil && p.ReliableDeadLetter && !isAbsentMessage(err) {
+			entry.retryRead = true
+			queueState.putBackReady(entry)
+			return nil, 0, 0, err
+		}
 		if message != nil {
 			// W4 SQ-9: drop an expired requeued message instead of returning it;
 			// fall through to the tail cursor for the next candidate.
-			if message.EnqueueUnixMilli != 0 && messageExpired(message, p, b.ttlNowMillis()) {
-				b.dropExpiredOnGet(queueState, queueName, message, tag, p)
+			if entry.retryExpiry || message.EnqueueUnixMilli != 0 && messageExpired(message, p, b.ttlNowMillis()) {
+				if err := b.dropExpiredOnGet(queueState, queueName, message, tag, p); err != nil {
+					return nil, 0, 0, err
+				}
 				message = nil
 			}
 			if message != nil {
-				message.Redelivered = r
+				message.Redelivered = entry.redelivered
 			}
 		}
 	}
@@ -4837,6 +4913,10 @@ func (b *StorageBroker) GetMessageForGetOwned(queueName string, noAck bool, conn
 			tag = t
 			msg, err := b.storage.GetMessageForDelivery(queueName, tag)
 			if err != nil {
+				if p != nil && p.ReliableDeadLetter && !isAbsentMessage(err) {
+					queueState.putBackReady(requeueEntry{tag: tag, retryRead: true})
+					return nil, 0, 0, err
+				}
 				queueState.GapSkipAdvance(tag)
 				continue
 			}
@@ -4845,7 +4925,9 @@ func (b *StorageBroker) GetMessageForGetOwned(queueName string, noAck bool, conn
 			// it, then keep walking the cursor. Depth accounting is gated on the
 			// ring-delete win (see dropExpiredOnGet), reconciling with the reaper.
 			if msg.EnqueueUnixMilli != 0 && messageExpired(msg, p, b.ttlNowMillis()) {
-				b.dropExpiredOnGet(queueState, queueName, msg, tag, p)
+				if err := b.dropExpiredOnGet(queueState, queueName, msg, tag, p); err != nil {
+					return nil, 0, 0, err
+				}
 				continue
 			}
 			message = msg
@@ -4878,10 +4960,15 @@ func (b *StorageBroker) GetMessageForGetOwned(queueName string, noAck bool, conn
 		if connID != "" {
 			b.getDeliveryOwners.Store(tag, connID)
 		}
+		bodyBytes := 0
+		if p != nil && p.ReliableDeadLetter && p.HasMaxLengthBytes {
+			bodyBytes = len(message.Body)
+		}
 		b.storage.StorePendingAck(&protocol.PendingAck{
 			QueueName:   queueName,
 			DeliveryTag: tag,
 			ConsumerTag: "",
+			BodyBytes:   bodyBytes,
 		})
 	} else {
 		// No-ack basic.get is an implicit ack (§4): the message must be settled
@@ -4961,6 +5048,7 @@ func (b *StorageBroker) purgeIncarnation(name string, qs *QueueState) (int, erro
 	}
 	qs.requeueHead, qs.requeueLen = 0, 0
 	qs.requeueCount.Store(0)
+	qs.requeueRetryCount.Store(0)
 	qs.requeueMu.Unlock()
 	for _, tag := range snap {
 		if b.purgeOne(qs, name, tag, p) {
@@ -5062,22 +5150,15 @@ func (b *StorageBroker) RejectGetDelivery(deliveryTag uint64, requeue bool) erro
 	queueName := val.(string)
 
 	queueState := b.getOrCreateQueueState(queueName)
-	b.storage.DeletePendingAck(queueName, deliveryTag)
 
 	if requeue {
+		b.storage.DeletePendingAck(queueName, deliveryTag)
 		// SQ-11: restore ready bytes when the queue enforces x-max-length-bytes.
 		b.restoreReadyBytesOnRequeue(queueState, queueName, deliveryTag)
 		queueState.Requeue(deliveryTag)
-	} else {
-		// Dead-letter (reason=rejected) before discarding, mirroring finishNack:
-		// republish precedes DeleteMessage (at-least-once); Policy() loaded only
-		// on this requeue==false path.
-		b.deadLetterOnDiscard(queueState, queueName, deliveryTag)
-		b.storage.DeleteMessage(queueName, deliveryTag)
-		queueState.AckAdvance(deliveryTag)
+		return nil
 	}
-
-	return nil
+	return b.finishDiscard(queueState, queueState.Policy(), queueName, deliveryTag)
 }
 
 // NackGetDelivery handles negative acknowledgment of a basic.get delivery.
