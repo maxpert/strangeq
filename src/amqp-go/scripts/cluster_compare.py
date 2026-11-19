@@ -31,6 +31,7 @@ VOTERS = {1, 2, 3}
 TOPOLOGIES = {"quorum3": 3, "singleton": 1}
 CATALOG_GROUP = (1 << 64) - 1
 EXCHANGE = "bench-exchange"
+PAYLOAD_SEED_VERSION = "strangeq-cluster-compare/high-entropy/v1"
 
 
 class BenchmarkError(RuntimeError):
@@ -146,6 +147,23 @@ def parse_rabbit_queues(output, case, nodes, *, topology="quorum3"):
 
 def write_json(path, value):
     path.write_text(json.dumps(value, indent=2) + "\n", encoding="utf-8")
+
+
+def prepare_payloads(profile, cases, output):
+    payloads = {}
+    for case in cases:
+        if profile == "high-entropy":
+            seed = f"{PAYLOAD_SEED_VERSION}/{case.name}"
+            body = hashlib.shake_256(seed.encode("ascii")).digest(case.size)
+            path = output / f"payload-{case.name}.bin"
+            path.write_bytes(body)
+            payloads[case.name] = {"size_bytes": len(body), "sha256": hashlib.sha256(body).hexdigest(),
+                                   "path": str(path), "seed": seed, "source": "SHAKE-256 reused binary fixture"}
+        else:
+            payloads[case.name] = {"size_bytes": case.size, "sha256": None, "path": None,
+                                   "source": "PerfTest time/sequence body with zero-filled remainder",
+                                   "sha256_reason": "sequence and timestamp vary per publish"}
+    return payloads
 
 
 def free_ports(count):
@@ -552,6 +570,8 @@ def perftest_args(args, case, ports, rabbitmq, prepare=False):
                         "--queue-pattern-to", str(case.queues)])
     if rabbitmq and args.topology == "quorum3":
         command.append("--quorum-queue")
+    if args.payload_profile == "high-entropy":
+        command.extend(["--body", args.payloads[case.name]["path"]])
     if args.rate_per_producer is not None and not prepare:
         command.extend(["--rate", str(args.rate_per_producer)])
     return command
@@ -705,6 +725,8 @@ def arguments():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--topology", choices=TOPOLOGIES, default="quorum3",
                         help="quorum3: three StrangeQ voters vs RabbitMQ quorum; singleton: local journal vs Classic")
+    parser.add_argument("--payload-profile", choices=("perftest", "high-entropy"), default="perftest",
+                        help="perftest: built-in time/sequence bodies; high-entropy: one reused deterministic binary per case")
     parser.add_argument("--strangeq-bin", type=Path, required=True)
     parser.add_argument("--strangeq-range-sync", action="store_true", help="enable full synchronous journal range writes where supported")
     parser.add_argument("--strangeq-dual-stream", action="store_true", help="use two journal streams on fresh StrangeQ brokers")
@@ -781,6 +803,8 @@ def main():
     args.output.mkdir(parents=True, exist_ok=True)
     output = Path(tempfile.mkdtemp(prefix="cluster-compare-", dir=args.output))
     print(f"Evidence directory {output}", flush=True)
+    cases = [CASES[name] for name in (args.case or CASES)]
+    args.payloads = prepare_payloads(args.payload_profile, cases, output)
     version = run_logged([*args.perftest, "--version"], output, env, output / "perftest-version.log")
     if not re.search(rf"\b{re.escape(PERF_TEST_VERSION)}\b", version):
         raise BenchmarkError(f"PerfTest must report version {PERF_TEST_VERSION}")
@@ -790,6 +814,7 @@ def main():
     write_json(output / "environment.json", {
         "platform": platform.platform(), "cpu_count": os.cpu_count(), "scratch": str(args.scratch), "locale": locale,
         "benchmark_mode": "same-host Linux" if system == "Linux" else "Darwin diagnostic only",
+        "payload_profile": args.payload_profile, "payloads": args.payloads,
         "topology": args.topology, "broker_processes_per_engine": TOPOLOGIES[args.topology],
         "rabbitmq_queue_type": "classic" if args.topology == "singleton" else "quorum",
         "strangeq_peer_transport": args.topology != "singleton",
@@ -811,7 +836,6 @@ def main():
         "duration": args.duration, "warmup": args.warmup, "repeats": args.repeats,
         "rate_per_producer": args.rate_per_producer, "validate_only": args.validate_only,
     })
-    cases = [CASES[name] for name in (args.case or CASES)]
     rows = {case.name: {"strangeq": [], "rabbitmq": []} for case in cases}
     rejected = []
     for repeat in range(1, args.repeats + 1):

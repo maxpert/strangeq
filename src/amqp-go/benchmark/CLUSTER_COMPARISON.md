@@ -10,6 +10,8 @@ Run `scripts/cluster_compare.py` from `src/amqp-go` to compare StrangeQ with Rab
 
 The client uses round-robin connection allocation, a named direct exchange, persistent mandatory publishes, a confirm window of 64 per publisher, and manual acknowledgments with prefetch 100 in both modes. The RabbitMQ quorum command window of 32 is explicit in `quorum3`; it does not apply to Classic. Use `--rabbit-window` to record a separate quorum tuning trial. Use `--rate-per-producer` to repeat any workload in either mode at a fixed offered rate. Accept a matched-load RSS comparison only after checking each broker sustained that load on both its confirm and delivery paths.
 
+`--payload-profile perftest` is the default and preserves the command's built-in PerfTest bodies. In [PerfTest 2.25.0](https://github.com/rabbitmq/rabbitmq-perf-test/blob/v2.25.0/src/main/java/com/rabbitmq/perf/TimeSequenceMessageBodySource.java), these contain changing sequence/timestamp bytes with a zero-filled remainder, so they are highly compressible. For a separate high-entropy run, add `--payload-profile high-entropy`. The runner creates one deterministic SHAKE-256 binary fixture per selected case, passes its path with `--body`, and reuses identical bytes for both engines and every repeat. These are reused payloads, not unique bodies per message. `environment.json` records profile, body size, fixture path, seed and SHA-256. The default profile has no single body digest because its sequence/timestamp varies, recorded as a null SHA with that reason. Keep payload profiles in separate result sets.
+
 ## Recorded ARM64 runs
 
 These historical normal-workload measurements precede the replicated dead-lettering

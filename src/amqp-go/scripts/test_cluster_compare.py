@@ -1,4 +1,5 @@
 import copy
+import hashlib
 import io
 import json
 import sys
@@ -40,7 +41,10 @@ class PairedWorkloadTests(unittest.TestCase):
     def test_singleton_metadata_and_rejected_pair_use_the_same_trial_loop(self):
         self.check_rejected_pair("singleton")
 
-    def check_rejected_pair(self, topology):
+    def test_high_entropy_metadata_records_selected_fixture_for_both_engines(self):
+        self.check_rejected_pair("singleton", payload_profile="high-entropy")
+
+    def check_rejected_pair(self, topology, payload_profile="perftest"):
         with tempfile.TemporaryDirectory() as scratch:
             root = Path(scratch)
             jar = root / "perftest.jar"
@@ -52,6 +56,7 @@ class PairedWorkloadTests(unittest.TestCase):
                 "--perftest-jar", str(jar), "--scratch", str(root), "--output", str(report),
                 "--case", "1024-1x1-1q", "--duration", "6", "--warmup", "2", "--repeats", "1",
                 "--topology", topology,
+                "--payload-profile", payload_profile,
             ]
             observed = []
 
@@ -78,6 +83,17 @@ class PairedWorkloadTests(unittest.TestCase):
             evidence = next(report.iterdir())
             environment = json.loads((evidence / "environment.json").read_text())
             self.assertEqual(environment["strangeq_storage"], "segmented_journal")
+            self.assertEqual(environment["payload_profile"], payload_profile)
+            self.assertEqual(set(environment["payloads"]), {"1024-1x1-1q"})
+            payload = environment["payloads"]["1024-1x1-1q"]
+            self.assertEqual(payload["size_bytes"], 1024)
+            if payload_profile == "high-entropy":
+                body = Path(payload["path"]).read_bytes()
+                self.assertEqual(len(body), 1024)
+                self.assertEqual(payload["sha256"], hashlib.sha256(body).hexdigest())
+            else:
+                self.assertIsNone(payload["sha256"])
+                self.assertIsNone(payload["path"])
             self.assertEqual(environment["topology"], topology)
             self.assertEqual(environment["broker_processes_per_engine"], 1 if topology == "singleton" else 3)
             self.assertEqual(environment["rabbitmq_queue_type"], "classic" if topology == "singleton" else "quorum")
@@ -117,6 +133,49 @@ class JournalDefaultTests(unittest.TestCase):
 
     def test_ack_and_claim_does_not_require_a_backend_selector(self):
         self.assertTrue(self.arguments(Path("/fixture"), "--strangeq-ack-and-claim").strangeq_ack_and_claim)
+
+    def test_payload_profile_defaults_preserve_perftest_bodies_without_files(self):
+        with tempfile.TemporaryDirectory() as scratch:
+            root = Path(scratch)
+            args = self.arguments(root)
+            self.assertEqual(args.payload_profile, "perftest")
+            cases = [CASES["1024-1x1-1q"]]
+            args.payloads = cluster_compare.prepare_payloads(args.payload_profile, cases, root)
+            args.perftest = ["java", "perftest.jar"]
+            self.assertEqual(list(root.iterdir()), [])
+            command = cluster_compare.perftest_args(args, cases[0], [16000], False)
+            self.assertNotIn("--body", command)
+            self.assertEqual(command[command.index("--size") + 1], "1024")
+            self.assertIsNone(args.payloads[cases[0].name]["sha256"])
+
+    def test_high_entropy_selection_is_deterministic_and_reused_across_trials(self):
+        expected = {"1024-1x1-1q": "839acc6bfc1d5ee5b70027f5d8227ed4bf5e23419fed311fff31e97a2e2c7635",
+                    "65536-10x10-10q": "f779634882a1b1c058d0d4467b87c6f427178b5a7e527a5cad793824c4cf7dc5"}
+        cases = [CASES[name] for name in expected]
+        with tempfile.TemporaryDirectory() as scratch:
+            root = Path(scratch)
+            args = self.arguments(root, "--payload-profile", "high-entropy")
+            args.payloads = cluster_compare.prepare_payloads(args.payload_profile, cases, root)
+            args.perftest = ["java", "perftest.jar"]
+            self.assertEqual({path.name for path in root.iterdir()}, {f"payload-{case.name}.bin" for case in cases})
+            self.assertEqual(set(args.payloads), set(expected))
+            for case in cases:
+                payload = args.payloads[case.name]
+                body = Path(payload["path"]).read_bytes()
+                self.assertEqual(len(body), case.size)
+                self.assertEqual(payload["size_bytes"], case.size)
+                self.assertEqual(payload["sha256"], expected[case.name])
+                self.assertEqual(hashlib.sha256(body).hexdigest(), expected[case.name])
+                for _ in range(2):
+                    for rabbitmq in (False, True):
+                        for prepare in (False, True):
+                            command = cluster_compare.perftest_args(args, case, [16000], rabbitmq, prepare)
+                            self.assertEqual(command[command.index("--body") + 1], payload["path"])
+                self.assertEqual(Path(payload["path"]).read_bytes(), body)
+            other = root / "another-result"
+            other.mkdir()
+            replay = cluster_compare.prepare_payloads("high-entropy", cases, other)
+            self.assertEqual({name: row["sha256"] for name, row in replay.items()}, expected)
 
     def test_singleton_launch_opens_local_journal_without_provisioning_or_peer_transport(self):
         with tempfile.TemporaryDirectory() as scratch:
