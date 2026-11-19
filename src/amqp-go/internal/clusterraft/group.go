@@ -133,6 +133,7 @@ type Group struct {
 	gatheredProposal                              []byte
 	bufferedOps                                   int
 	bufferedBytes                                 uint64
+	maxReadyInputBytes                            uint64
 	maxBufferedBytes                              uint64
 	exclusiveWaiters                              int
 	closeOnce                                     sync.Once
@@ -206,10 +207,12 @@ func (n *journalGroupNode) openValidatedGroup(config Config) (_ *Group, err erro
 			_ = store.close()
 		}
 	}()
-	maxBufferedBytes := min(4*config.MaxEntryBytes, journalReadyInputBytes)
+	maxUncommittedBytes := min(4*config.MaxEntryBytes, journalReadyInputBytes)
+	maxReadyInputBytes := journalReadyInputLimit(store.node.writer.limits.pendingBytes)
 	g := &Group{
 		cfg: config, store: store, storeFailed: store.failureSignal(), conf: &pb.ConfState{},
-		pending: make(map[key]chan response), done: make(chan struct{}), maxBufferedBytes: maxBufferedBytes,
+		pending: make(map[key]chan response), done: make(chan struct{}),
+		maxReadyInputBytes: maxReadyInputBytes, maxBufferedBytes: min(maxUncommittedBytes, maxReadyInputBytes),
 	}
 	defer g.stopOnStoreReadError(&err)
 	if !raft.IsEmptySnap(snapshot) {
@@ -221,7 +224,7 @@ func (n *journalGroupNode) openValidatedGroup(config Config) (_ *Group, err erro
 		ID: config.ID, Storage: g.store, Applied: g.applied, ElectionTick: 10, HeartbeatTick: 2,
 		PreVote: true, CheckQuorum: true, DisableProposalForwarding: true, AsyncStorageWrites: true,
 		MaxSizePerMsg: raftAppendMessageBytes, MaxInflightMsgs: 64, MaxInflightBytes: 4 * config.MaxEntryBytes,
-		MaxUncommittedEntriesSize: maxBufferedBytes, Logger: config.Logger,
+		MaxUncommittedEntriesSize: maxUncommittedBytes, Logger: config.Logger,
 	})
 	if err != nil {
 		return nil, err
@@ -503,8 +506,10 @@ func (g *Group) changeAndDrive(ctx context.Context, inputBytes uint64, syncWrite
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	defer g.stopOnStoreReadError(&err)
-	if !ordinaryProposal && g.gatheredProposal != nil {
-		// Preserve proposal order across Raft inputs and exclusive operations.
+	if g.gatheredProposal != nil &&
+		(!ordinaryProposal || journalProposalInputBytes(uint64(len(g.gatheredProposal)))+inputBytes > g.maxReadyInputBytes) {
+		// Preserve proposal order across other Raft inputs. A second proposal
+		// can join the gathered one only if both fit the next journal record.
 		if err := g.drive(false); err != nil {
 			return err
 		}
@@ -586,7 +591,7 @@ func (g *Group) Step(ctx context.Context, message *pb.Message) error {
 	if message.GetType() == pb.MsgReadIndex || message.GetType() == pb.MsgReadIndexResp {
 		return errors.New("raft read index must be requested locally on the leader")
 	}
-	inputBytes, err := journalPeerInputBytes(message, g.cfg.MaxEntryBytes, uint64(proto.Size(message)))
+	inputBytes, err := g.journalPeerInputBytes(message, uint64(proto.Size(message)))
 	if err != nil {
 		return err
 	}
@@ -602,11 +607,10 @@ func (g *Group) Step(ctx context.Context, message *pb.Message) error {
 }
 
 func (g *Group) Propose(ctx context.Context, data []byte) ([]byte, error) {
-	if uint64(len(data)) > g.cfg.MaxEntryBytes-uint64(len(key{})) {
-		return nil, ErrTooLarge
+	inputBytes, err := g.proposalInputBytes(len(data))
+	if err != nil {
+		return nil, err
 	}
-	// Include the proposal key and maximum protobuf encoding overhead.
-	inputBytes := uint64(len(data)) + uint64(len(key{})) + 32 + journalEntryInputOverhead
 	var gather time.Duration
 	if g.cfg.GatherProposal != nil {
 		gather = g.cfg.GatherProposal(data)
@@ -630,10 +634,10 @@ func (g *Group) ProposeOwned(ctx context.Context, owned *clusterproposal.Submiss
 	if data == nil {
 		return nil, clusterproposal.ErrConsumed
 	}
-	if uint64(len(data)) > g.cfg.MaxEntryBytes-uint64(len(key{})) {
-		return nil, ErrTooLarge
+	inputBytes, err := g.proposalInputBytes(len(data))
+	if err != nil {
+		return nil, err
 	}
-	inputBytes := uint64(len(data)) + uint64(len(key{})) + 32 + journalEntryInputOverhead
 	var gather time.Duration
 	if g.cfg.GatherProposal != nil {
 		gather = g.cfg.GatherProposal(data)
