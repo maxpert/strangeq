@@ -12,11 +12,60 @@ The client uses round-robin connection allocation, a named direct exchange, pers
 
 ## Recorded ARM64 runs
 
-The [README results](../../../README.md#performance) are medians of three paired runs per workload from StrangeQ `f02275a` and RabbitMQ 4.4.0 on the same eight-core ARM64 Linux VM and scratch volume. Both systems used three voters per queue, persistent mandatory publishes, manual acknowledgments, and the same high-entropy payload files supplied to RabbitMQ PerfTest 2.25.0. Trial order alternated, and the volume idled for 45 seconds before each timed run.
+These historical normal-workload measurements precede the replicated dead-lettering
+results below. The [historical README results](../../../README.md#historical-normal-workloads) are medians of three paired runs per workload from StrangeQ `f02275a` and RabbitMQ 4.4.0 on the same eight-core ARM64 Linux VM and scratch volume. Both systems used three voters per queue, persistent mandatory publishes, manual acknowledgments, and the same high-entropy payload files supplied to RabbitMQ PerfTest 2.25.0. Trial order alternated, and the volume idled for 45 seconds before each timed run.
 
 The 1 KiB single-queue case ran for 24 seconds with one publisher and one consumer. The 64 KiB ten-queue case ran for 23 seconds with ten publishers, ten consumers, and an offered rate of 500 messages/s per publisher. The throughput medians exclude the first four seconds of each run. Peak RSS is the highest simultaneous sum across the three broker processes for each run.
 
 StrangeQ used 32 shards, the experimental segmented journal, synchronous range writes, consumer assignments, and both body compression options. The 64 KiB case also used two journal streams per broker. Use `--strangeq-shards 32 --strangeq-journal --strangeq-range-sync --strangeq-assignments --strangeq-journal-body-compression --strangeq-journal-small-body-compression` to select the same broker settings. For the 64 KiB case, add `--strangeq-dual-stream --rate-per-producer 500`.
+
+## Replicated dead-lettering runs
+
+On November 19, 2026, StrangeQ `bf52074` and RabbitMQ 4.4.0 ran three paired,
+order-alternating active dead-lettering trials on the same native eight-core
+ARM64 Linux VM and local scratch volume. Both used three durable replicas per
+queue, ten source queues and ten dead-letter targets. StrangeQ targets were on
+separate shards from their sources. RabbitMQ used quorum queues with
+`dead-letter-strategy=at-least-once` and `overflow=reject-publish`.
+
+A separate reconciliation client used ten producers, ten source consumers, and
+ten target consumers. It published persistent 65,536-byte high-entropy messages,
+with an offered limit of 500 messages/s per producer, a confirm window of 64,
+64 end-to-end credits per queue, and prefetch 100. Each source delivery received
+a separate NACK with requeue disabled. The client reused one high-entropy body
+with distinct message IDs. Rates cover seconds 4–12 of each 12-second run.
+Peak RSS is the highest simultaneous sum across the three broker processes.
+Each trial used fresh storage, the same between-trial filesystem flush, and a
+five-second topology quiet period before client start.
+
+StrangeQ used 32 shards, the experimental dual-stream segmented journal,
+synchronous range writes, consumer assignments, and both body compression
+settings. The measurements cover short steady-state windows on this host and
+storage configuration, using one reused payload body. Crash recovery, failover,
+and unique payload bodies require separate measurements.
+
+| Pair | StrangeQ confirms/s | StrangeQ DLQ deliveries/s | StrangeQ RSS (MiB) | RabbitMQ confirms/s | RabbitMQ DLQ deliveries/s | RabbitMQ RSS (MiB) |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 1,915 | 1,921 | 634 | 1,663 | 1,673 | 1,835 |
+| 2 | 1,941 | 1,941 | 618 | 1,347 | 1,352 | 1,930 |
+| 3 | 1,821 | 1,822 | 627 | 1,672 | 1,684 | 1,882 |
+| Median | 1,915 | 1,921 | 627 | 1,663 | 1,673 | 1,882 |
+
+StrangeQ had higher confirms and DLQ deliveries and lower peak RSS in each pair.
+After draining, each run reconciled all sent, confirmed, source-rejected, and
+DLQ-delivered messages, with zero observed duplicates. Replicated dead-lettering
+remains [at-least-once](../../../docs/DEAD_LETTERING.md#replicated-queues). Retrying
+a transfer after an uncertain destination outcome can produce duplicates.
+
+Two separate same-cluster controls enabled an idle policy on half the source
+queues, then swapped the enabled half. All target queues remained declared.
+Messages were acknowledged normally. Each control ran for ten seconds, measuring
+seconds 4–10. Enabled versus disabled queues differed by -0.04% in confirms and
+-0.06% in deliveries in the first control, and -0.04% and +0.16% in the second.
+All publications reconciled. These controls compare queue groups within each run.
+
+[Recorded per-run counts, rates, RSS, and environment](REPLICATED_DLQ_RESULTS.json)
+include the active trials and idle-policy lane counts used for these figures.
 
 ## Set up an isolated comparison
 

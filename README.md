@@ -16,7 +16,8 @@ to distribute queues across brokers.
 - Standalone queue TTL, [dead-letter exchanges](docs/DEAD_LETTERING.md), queue
   length limits, and transactions.
 - TLS and mutual TLS, file-based authentication, and per-vhost permissions.
-- Optional replicated queues accessible through any enrolled broker.
+- Optional replicated queues accessible through any enrolled broker, with
+  [at-least-once dead-lettering](docs/DEAD_LETTERING.md#replicated-queues) for durable queues.
 - Prometheus metrics, readiness checks, and optional Go pprof profiling.
 - A standalone management web UI and RabbitMQ-compatible REST API subset, served
   by the broker binary.
@@ -165,15 +166,39 @@ routes queue operations to the owning Raft shard. A queue with three voting
 replicas can continue committing through one replica outage.
 
 Follow the [cluster setup guide](docs/CLUSTERING.md) to initialize a cluster,
-enroll brokers, configure peer TLS, and understand quorum and recovery. Cluster
-mode has a smaller feature set than standalone mode; its limits are listed below
-and in the guide.
+enroll brokers, configure peer TLS, and understand quorum and recovery. See
+[how clustered messages are committed and read](docs/CLUSTERING.md#how-clustered-messages-are-committed-and-read)
+for the publish and delivery paths. Cluster mode has a smaller feature set than
+standalone mode; its limits are listed below and in the guide.
 
 The segmented shared journal is **experimental and disabled by default**. Enable
 it only when provisioning fresh cluster stores. Its configuration and restart
 requirements are documented in the [experimental journal guide](docs/CLUSTERING.md#experimental-shared-journal).
 
 ## Performance
+
+These same-host benchmarks use three voting replicas per queue on an eight-core
+ARM64 Linux VM. Results describe the measured workloads and storage settings.
+
+### Active dead-lettering
+
+Three paired, order-alternating runs compared StrangeQ `bf52074` using the
+experimental segmented journal with RabbitMQ 4.4.0 quorum queues and at-least-once
+dead-lettering. Ten producers sent 64 KiB persistent messages to ten source
+queues. Ten source consumers rejected them into ten dead-letter queues.
+
+| Broker | Confirms/s | DLQ deliveries/s | Peak cluster RSS |
+|---|---:|---:|---:|
+| StrangeQ | 1,915 | 1,921 | 627 MiB |
+| RabbitMQ | 1,663 | 1,673 | 1,882 MiB |
+
+Figures are medians. StrangeQ had higher confirm and DLQ delivery rates and lower
+peak cluster RSS in all three pairs. Every accepted message reconciled after
+draining, with no duplicates observed. In separate same-cluster controls, enabling
+an idle dead-letter policy changed confirm and delivery throughput by less than
+0.2%. [Methodology and per-run evidence](src/amqp-go/benchmark/CLUSTER_COMPARISON.md#replicated-dead-lettering-runs)
+
+### Historical normal workloads
 
 Three paired runs per workload compared StrangeQ `f02275a` using the experimental
 segmented journal with RabbitMQ 4.4.0 quorum queues. The runs used three voting

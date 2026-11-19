@@ -184,6 +184,80 @@ catalog on its replicas. With either backend, the broker persists Raft updates
 before sending replication acknowledgments or reporting a committed queue
 operation.
 
+## How clustered messages are committed and read
+
+Cluster mode starts its selected Raft storage backend. The normal
+`amqp-server` startup constructs `ClusterBroker`, and the server builder
+bypasses construction of the standalone storage engine. A clustered publish
+therefore has **no additional write to the standalone queue WAL**.
+
+For an ordinary successful publish to one queue with the experimental journal,
+the body is carried by one Raft log entry and appended to the journal once on
+each participating replica. The leader waits for a durable quorum and applies
+the committed command before returning success for the publisher confirm.
+The quorum can respond while remaining followers catch up. Replication creates
+durable copies on other brokers. Batching can put several messages or entries
+into one write, so system call and sync counts depend on the batch.
+
+```mermaid
+flowchart TD
+    P[Producer] --> I[Any connected broker]
+    I --> L[Owning shard leader]
+    L --> J[Leader journal persists publish entry]
+    L --> F[Follower journals persist publish entry]
+    J --> Q[Durable quorum and committed queue state]
+    F --> Q
+    Q --> C[Publisher confirm]
+    Q --> D[Committed claim or consumer assignment]
+    D --> B[Read body from queue state or retained journal]
+    B --> E[Consumer gateway broker]
+    E --> W[Consumer / worker]
+```
+
+The diagram uses the experimental journal for the storage step. The default
+backend instead stores each shard's Raft log, hard state (term, vote and commit
+progress), and snapshots in its own bbolt `raft.db`. Both are cluster storage
+backends with their own persistence. The experimental two-stream journal
+assigns even group IDs to stream 0 and odd IDs to stream 1. Each group uses one
+stream and writes its payload only to that assigned stream.
+
+A worker consumes through its connected broker, which routes queue operations
+to the owning shard leader:
+
+- Without experimental assignments, a replicated claim moves a message into
+  the consumer session's in-flight state before returning its body. Manual
+  consumers can claim batches. ACK, requeue, and rejection are replicated
+  state changes as well.
+- With experimental assignments, committed queue operations assign messages
+  to registered consumer sessions. The broker reads those assignments through
+  a quorum-fenced leader query, or receives a page with an ACK response. Reading
+  an assignment page uses the already committed payload bytes.
+- In the journal path, eligible stored bodies of at least 32 KiB stay as
+  references into retained journal data. Smaller bodies remain in queue memory.
+  Delivery encoders read and checksum the referenced bytes when needed. These
+  references retain the source segments until the messages and readers release
+  them.
+- With `experimental_replica_bodies`, an eligible remote assignment page can
+  carry verified body references instead of full bodies. If the consumer's
+  broker has the matching local shard journal data, it reads the bodies there.
+  The leader still authorizes the assignments. Missing or compacted references
+  fall back to a full page from the leader.
+
+"One payload-bearing append per replica" describes the ordinary single-target
+publish path. Additional writes occur over a message's lifetime. Checkpoints
+persist complete queue state images, including live message bodies, so a body can exist
+in both a retained log segment and a checkpoint. Raft hard-state updates,
+membership records, and commit progress also cause persistence. Exchange fanout
+publishes separately to each destination queue. A non-requeued rejection with
+dead-lettering stages a durable source-side move and publishes the body to each
+destination. Even a same-shard destination publish currently carries the body
+again. It commits the target copy and marks that destination complete in the
+source outbox atomically in one shard command. A cross-shard destination
+commits its publish separately before source completion. These destination
+publications and any retries are additional queue operations using the Raft
+backend.
+See [replicated dead-lettering](DEAD_LETTERING.md#replicated-queues).
+
 ## Behavior and limits
 
 - One voter commits to its local durable store. With two voters, both must

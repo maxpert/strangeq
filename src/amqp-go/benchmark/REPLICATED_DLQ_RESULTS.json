@@ -1,0 +1,507 @@
+{
+  "description": "Recorded replicated dead-lettering comparison and same-cluster idle-policy controls; original measurement values, with active per-lane breakdowns omitted.",
+  "date": "2026-11-19",
+  "strangeq_revision": "bf52074",
+  "active_environment": {
+    "linux": "Linux-6.8.0-117-generic-aarch64-with-glibc2.41",
+    "cpu_count": 8,
+    "otp_version": "28.5.0.8",
+    "erlang_beam": "/usr/local/lib/erlang/erts-16.4.0.7/bin/beam.smp",
+    "erlang_beam_sha256": "d28b1ecfe95a862edfa815976965b5ba10bef7c6686047f666a64e071e82eb33",
+    "rabbitmq": "4.4.0",
+    "benchmark": {
+      "seconds": 12,
+      "warmup": 3,
+      "rate": 500,
+      "flush_between": true,
+      "settle_seconds": 5,
+      "repeats": 3,
+      "case": [
+        "strangeq-transfer",
+        "rabbit-transfer"
+      ]
+    },
+    "broker_sha256": {
+      "current": "c0954494777e5958fb723e7f31e490ea9e7cc414c327c28505d84ca9454d4e80",
+      "baseline": "dca49e890ac158be0df3071bebbc36e7217cecc7b05d0ddb2e30088f3679dc5d",
+      "client": "2a67c579b17565f6459aa3970fced7786f5cf881ec7a08c52edf50a6ab580e5f"
+    },
+    "filesystem": "ext2/ext3",
+    "payload_bytes": 65536,
+    "queues": 10,
+    "confirm_window": 64,
+    "end_to_end_window": 64,
+    "prefetch": 100,
+    "strangeq_shards": 32,
+    "strangeq_storage": "dual-stream segmented journal with range sync, assignments, and both compression settings"
+  },
+  "active_runs": {
+    "strangeq-transfer": [
+      {
+        "drain_seconds": 0.38860334,
+        "total": {
+          "sent": 24671,
+          "confirmed": 24671,
+          "delivered": 24671,
+          "source_rejected": 24671,
+          "duplicates": 0
+        },
+        "window_counts": {
+          "sent": 17303,
+          "confirmed": 17231,
+          "delivered": 17288,
+          "source_rejected": 17187,
+          "duplicates": 0
+        },
+        "window_seconds": 9,
+        "sent_per_second": 1922.5555555555557,
+        "confirmed_per_second": 1914.5555555555557,
+        "delivered_per_second": 1920.888888888889,
+        "source_rejected_per_second": 1909.6666666666667,
+        "duplicates_per_second": 0.0,
+        "offered_rate_per_producer": 500,
+        "peak_rss_mib": 633.73046875
+      },
+      {
+        "drain_seconds": 0.261980153,
+        "total": {
+          "sent": 24894,
+          "confirmed": 24894,
+          "delivered": 24894,
+          "source_rejected": 24894,
+          "duplicates": 0
+        },
+        "window_counts": {
+          "sent": 17455,
+          "confirmed": 17472,
+          "delivered": 17469,
+          "source_rejected": 17444,
+          "duplicates": 0
+        },
+        "window_seconds": 9,
+        "sent_per_second": 1939.4444444444443,
+        "confirmed_per_second": 1941.3333333333333,
+        "delivered_per_second": 1941.0,
+        "source_rejected_per_second": 1938.2222222222222,
+        "duplicates_per_second": 0.0,
+        "offered_rate_per_producer": 500,
+        "peak_rss_mib": 618.0
+      },
+      {
+        "drain_seconds": 0.375555668,
+        "total": {
+          "sent": 23295,
+          "confirmed": 23295,
+          "delivered": 23295,
+          "source_rejected": 23295,
+          "duplicates": 0
+        },
+        "window_counts": {
+          "sent": 16412,
+          "confirmed": 16386,
+          "delivered": 16398,
+          "source_rejected": 16383,
+          "duplicates": 0
+        },
+        "window_seconds": 9,
+        "sent_per_second": 1823.5555555555557,
+        "confirmed_per_second": 1820.6666666666667,
+        "delivered_per_second": 1822.0,
+        "source_rejected_per_second": 1820.3333333333333,
+        "duplicates_per_second": 0.0,
+        "offered_rate_per_producer": 500,
+        "peak_rss_mib": 626.84765625
+      }
+    ],
+    "rabbit-transfer": [
+      {
+        "drain_seconds": 0.58580086,
+        "total": {
+          "sent": 23026,
+          "confirmed": 23026,
+          "delivered": 23026,
+          "source_rejected": 23026,
+          "duplicates": 0
+        },
+        "window_counts": {
+          "sent": 15113,
+          "confirmed": 14965,
+          "delivered": 15054,
+          "source_rejected": 15098,
+          "duplicates": 0
+        },
+        "window_seconds": 9,
+        "sent_per_second": 1679.2222222222222,
+        "confirmed_per_second": 1662.7777777777778,
+        "delivered_per_second": 1672.6666666666667,
+        "source_rejected_per_second": 1677.5555555555557,
+        "duplicates_per_second": 0.0,
+        "offered_rate_per_producer": 500,
+        "peak_rss_mib": 1835.38671875
+      },
+      {
+        "drain_seconds": 0.497214578,
+        "total": {
+          "sent": 20839,
+          "confirmed": 20839,
+          "delivered": 20839,
+          "source_rejected": 20839,
+          "duplicates": 0
+        },
+        "window_counts": {
+          "sent": 12172,
+          "confirmed": 12120,
+          "delivered": 12172,
+          "source_rejected": 12120,
+          "duplicates": 0
+        },
+        "window_seconds": 9,
+        "sent_per_second": 1352.4444444444443,
+        "confirmed_per_second": 1346.6666666666667,
+        "delivered_per_second": 1352.4444444444443,
+        "source_rejected_per_second": 1346.6666666666667,
+        "duplicates_per_second": 0.0,
+        "offered_rate_per_producer": 500,
+        "peak_rss_mib": 1929.5390625
+      },
+      {
+        "drain_seconds": 0.419101688,
+        "total": {
+          "sent": 23484,
+          "confirmed": 23484,
+          "delivered": 23484,
+          "source_rejected": 23484,
+          "duplicates": 0
+        },
+        "window_counts": {
+          "sent": 15167,
+          "confirmed": 15047,
+          "delivered": 15157,
+          "source_rejected": 15173,
+          "duplicates": 0
+        },
+        "window_seconds": 9,
+        "sent_per_second": 1685.2222222222222,
+        "confirmed_per_second": 1671.888888888889,
+        "delivered_per_second": 1684.111111111111,
+        "source_rejected_per_second": 1685.888888888889,
+        "duplicates_per_second": 0.0,
+        "offered_rate_per_producer": 500,
+        "peak_rss_mib": 1881.8125
+      }
+    ]
+  },
+  "idle_environment": {
+    "linux": "Linux-6.8.0-117-generic-aarch64-with-glibc2.41",
+    "cpu_count": 8,
+    "otp_version": "28.5.0.8",
+    "erlang_beam": "/usr/local/lib/erlang/erts-16.4.0.7/bin/beam.smp",
+    "erlang_beam_sha256": "d28b1ecfe95a862edfa815976965b5ba10bef7c6686047f666a64e071e82eb33",
+    "rabbitmq": "4.4.0",
+    "benchmark": {
+      "seconds": 10,
+      "warmup": 3,
+      "rate": 500,
+      "flush_between": true,
+      "settle_seconds": 5,
+      "repeats": 1,
+      "case": [
+        "split-even",
+        "split-odd"
+      ]
+    },
+    "broker_sha256": {
+      "current": "c0954494777e5958fb723e7f31e490ea9e7cc414c327c28505d84ca9454d4e80",
+      "baseline": "dca49e890ac158be0df3071bebbc36e7217cecc7b05d0ddb2e30088f3679dc5d",
+      "client": "2a67c579b17565f6459aa3970fced7786f5cf881ec7a08c52edf50a6ab580e5f"
+    },
+    "filesystem": "ext2/ext3",
+    "payload_bytes": 65536,
+    "queues": 10,
+    "confirm_window": 64,
+    "end_to_end_window": 64,
+    "prefetch": 100,
+    "strangeq_shards": 32,
+    "strangeq_storage": "dual-stream segmented journal with range sync, assignments, and both compression settings"
+  },
+  "idle_runs": {
+    "split-even": [
+      {
+        "drain_seconds": 0.289229006,
+        "lanes": [
+          {
+            "counts": {
+              "sent": 3159,
+              "confirmed": 3126,
+              "delivered": 3113,
+              "source_rejected": 0,
+              "duplicates": 0
+            },
+            "policy": true,
+            "source": "65536-10x10-10q-1"
+          },
+          {
+            "counts": {
+              "sent": 3172,
+              "confirmed": 3134,
+              "delivered": 3134,
+              "source_rejected": 0,
+              "duplicates": 0
+            },
+            "policy": false,
+            "source": "65536-10x10-10q-2"
+          },
+          {
+            "counts": {
+              "sent": 3194,
+              "confirmed": 3146,
+              "delivered": 3153,
+              "source_rejected": 0,
+              "duplicates": 0
+            },
+            "policy": true,
+            "source": "65536-10x10-10q-3"
+          },
+          {
+            "counts": {
+              "sent": 3201,
+              "confirmed": 3159,
+              "delivered": 3159,
+              "source_rejected": 0,
+              "duplicates": 0
+            },
+            "policy": false,
+            "source": "65536-10x10-10q-4"
+          },
+          {
+            "counts": {
+              "sent": 3255,
+              "confirmed": 3210,
+              "delivered": 3215,
+              "source_rejected": 0,
+              "duplicates": 0
+            },
+            "policy": true,
+            "source": "65536-10x10-10q-5"
+          },
+          {
+            "counts": {
+              "sent": 3190,
+              "confirmed": 3156,
+              "delivered": 3156,
+              "source_rejected": 0,
+              "duplicates": 0
+            },
+            "policy": false,
+            "source": "65536-10x10-10q-6"
+          },
+          {
+            "counts": {
+              "sent": 3214,
+              "confirmed": 3184,
+              "delivered": 3171,
+              "source_rejected": 0,
+              "duplicates": 0
+            },
+            "policy": true,
+            "source": "65536-10x10-10q-7"
+          },
+          {
+            "counts": {
+              "sent": 3204,
+              "confirmed": 3174,
+              "delivered": 3163,
+              "source_rejected": 0,
+              "duplicates": 0
+            },
+            "policy": false,
+            "source": "65536-10x10-10q-8"
+          },
+          {
+            "counts": {
+              "sent": 3168,
+              "confirmed": 3124,
+              "delivered": 3124,
+              "source_rejected": 0,
+              "duplicates": 0
+            },
+            "policy": true,
+            "source": "65536-10x10-10q-9"
+          },
+          {
+            "counts": {
+              "sent": 3208,
+              "confirmed": 3173,
+              "delivered": 3173,
+              "source_rejected": 0,
+              "duplicates": 0
+            },
+            "policy": false,
+            "source": "65536-10x10-10q-10"
+          }
+        ],
+        "total": {
+          "sent": 46040,
+          "confirmed": 46040,
+          "delivered": 46040,
+          "source_rejected": 0,
+          "duplicates": 0
+        },
+        "window_counts": {
+          "sent": 31965,
+          "confirmed": 31586,
+          "delivered": 31561,
+          "source_rejected": 0,
+          "duplicates": 0
+        },
+        "window_seconds": 7,
+        "sent_per_second": 4566.428571428572,
+        "confirmed_per_second": 4512.285714285715,
+        "delivered_per_second": 4508.714285714285,
+        "source_rejected_per_second": 0.0,
+        "duplicates_per_second": 0.0,
+        "offered_rate_per_producer": 500,
+        "peak_rss_mib": 578.28515625
+      }
+    ],
+    "split-odd": [
+      {
+        "drain_seconds": 0.673475239,
+        "lanes": [
+          {
+            "counts": {
+              "sent": 2888,
+              "confirmed": 2833,
+              "delivered": 2837,
+              "source_rejected": 0,
+              "duplicates": 0
+            },
+            "policy": false,
+            "source": "65536-10x10-10q-1"
+          },
+          {
+            "counts": {
+              "sent": 2883,
+              "confirmed": 2827,
+              "delivered": 2827,
+              "source_rejected": 0,
+              "duplicates": 0
+            },
+            "policy": true,
+            "source": "65536-10x10-10q-2"
+          },
+          {
+            "counts": {
+              "sent": 2923,
+              "confirmed": 2868,
+              "delivered": 2868,
+              "source_rejected": 0,
+              "duplicates": 0
+            },
+            "policy": false,
+            "source": "65536-10x10-10q-3"
+          },
+          {
+            "counts": {
+              "sent": 2871,
+              "confirmed": 2815,
+              "delivered": 2815,
+              "source_rejected": 0,
+              "duplicates": 0
+            },
+            "policy": true,
+            "source": "65536-10x10-10q-4"
+          },
+          {
+            "counts": {
+              "sent": 2871,
+              "confirmed": 2844,
+              "delivered": 2818,
+              "source_rejected": 0,
+              "duplicates": 0
+            },
+            "policy": false,
+            "source": "65536-10x10-10q-5"
+          },
+          {
+            "counts": {
+              "sent": 2918,
+              "confirmed": 2861,
+              "delivered": 2861,
+              "source_rejected": 0,
+              "duplicates": 0
+            },
+            "policy": true,
+            "source": "65536-10x10-10q-6"
+          },
+          {
+            "counts": {
+              "sent": 2885,
+              "confirmed": 2832,
+              "delivered": 2832,
+              "source_rejected": 0,
+              "duplicates": 0
+            },
+            "policy": false,
+            "source": "65536-10x10-10q-7"
+          },
+          {
+            "counts": {
+              "sent": 2880,
+              "confirmed": 2821,
+              "delivered": 2827,
+              "source_rejected": 0,
+              "duplicates": 0
+            },
+            "policy": true,
+            "source": "65536-10x10-10q-8"
+          },
+          {
+            "counts": {
+              "sent": 2859,
+              "confirmed": 2808,
+              "delivered": 2808,
+              "source_rejected": 0,
+              "duplicates": 0
+            },
+            "policy": false,
+            "source": "65536-10x10-10q-9"
+          },
+          {
+            "counts": {
+              "sent": 2912,
+              "confirmed": 2855,
+              "delivered": 2855,
+              "source_rejected": 0,
+              "duplicates": 0
+            },
+            "policy": true,
+            "source": "65536-10x10-10q-10"
+          }
+        ],
+        "total": {
+          "sent": 42328,
+          "confirmed": 42328,
+          "delivered": 42328,
+          "source_rejected": 0,
+          "duplicates": 0
+        },
+        "window_counts": {
+          "sent": 28890,
+          "confirmed": 28364,
+          "delivered": 28348,
+          "source_rejected": 0,
+          "duplicates": 0
+        },
+        "window_seconds": 7,
+        "sent_per_second": 4127.142857142857,
+        "confirmed_per_second": 4052.0,
+        "delivered_per_second": 4049.714285714286,
+        "source_rejected_per_second": 0.0,
+        "duplicates_per_second": 0.0,
+        "offered_rate_per_producer": 500,
+        "peak_rss_mib": 572.828125
+      }
+    ]
+  }
+}
