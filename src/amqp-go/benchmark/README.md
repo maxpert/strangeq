@@ -1,10 +1,9 @@
 # StrangeQ Performance Benchmarks
 
-`cmd/perftest` is the load client behind the numbers in the repository
-[Performance section](../../README.md#performance). It is built on
-[amqp091-go](https://github.com/rabbitmq/amqp091-go): producers and consumers
+`cmd/perftest` drives standalone broker benchmarks. It uses
+[amqp091-go](https://github.com/rabbitmq/amqp091-go). Producers and consumers
 run on separate connections, and consumers use manual acknowledgement with a
-QoS prefetch.
+QoS prefetch. For replicated queues, use the [cluster comparison guide](CLUSTER_COMPARISON.md).
 
 ## Quick Start
 
@@ -60,10 +59,9 @@ Confirm latency   p50=…  p75=…  p95=…  p99=…  p99.9=…
 
 ## Head-to-head vs RabbitMQ
 
-The authoritative StrangeQ-vs-RabbitMQ matrix, its methodology, validity gates,
-and caveats live in the repository
-[Performance section](../../README.md#performance). The client and its flags are
-identical for both brokers.
+The [repository benchmark results](../../../README.md#performance) cover
+replicated clusters. The standalone command below runs `cmd/perftest` against
+one RabbitMQ broker.
 
 ## Running Against RabbitMQ
 

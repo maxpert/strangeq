@@ -10,6 +10,14 @@ Run `scripts/cluster_compare.py` from `src/amqp-go` to compare three StrangeQ br
 
 The client uses round-robin connection allocation, a named direct exchange, persistent mandatory publishes, a confirm window of 64 per publisher, and manual acknowledgments with prefetch 100. The RabbitMQ default quorum command window of 32 is explicit. Use `--rabbit-window` to record a separate RabbitMQ tuning trial. Use `--rate-per-producer` to repeat a workload at a fixed offered rate. Accept a matched-load RSS comparison only after checking each broker sustained that load on both its confirm and delivery paths.
 
+## Recorded ARM64 runs
+
+The [README results](../../../README.md#performance) are medians of three paired runs per workload from StrangeQ `f02275a` and RabbitMQ 4.4.0 on the same eight-core ARM64 Linux VM and scratch volume. Both systems used three voters per queue, persistent mandatory publishes, manual acknowledgments, and the same high-entropy payload files supplied to RabbitMQ PerfTest 2.25.0. Trial order alternated, and the volume idled for 45 seconds before each timed run.
+
+The 1 KiB single-queue case ran for 24 seconds with one publisher and one consumer. The 64 KiB ten-queue case ran for 23 seconds with ten publishers, ten consumers, and an offered rate of 500 messages/s per publisher. The throughput medians exclude the first four seconds of each run. Peak RSS is the highest simultaneous sum across the three broker processes for each run.
+
+StrangeQ used 32 shards, the experimental segmented journal, synchronous range writes, consumer assignments, and both body compression options. The 64 KiB case also used two journal streams per broker. Use `--strangeq-shards 32 --strangeq-journal --strangeq-range-sync --strangeq-assignments --strangeq-journal-body-compression --strangeq-journal-small-body-compression` to select the same broker settings. For the 64 KiB case, add `--strangeq-dual-stream --rate-per-producer 500`.
+
 ## Set up an isolated comparison
 
 Use Python 3.11 or later, Java, and a release build of `amqp-server`. Obtain and verify the official [RabbitMQ 4.4.0 generic UNIX archive](https://github.com/rabbitmq/rabbitmq-server/releases/tag/v4.4.0), [Erlang/OTP 28.5.0.8](https://github.com/erlang/otp/releases/tag/OTP-28.5.0.8), and [RabbitMQ PerfTest 2.25.0 shaded JAR](https://github.com/rabbitmq/rabbitmq-perf-test/releases/tag/v2.25.0). The three paths below point to locally extracted or installed copies. The script checks the versions reported by the client and running RabbitMQ nodes. It does not fetch or install packages.

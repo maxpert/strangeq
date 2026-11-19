@@ -100,8 +100,9 @@ known-new cluster and preserve the durable identity of an existing voter.
 | `peer_cert_file`, `peer_key_file` | Empty | PEM certificate and private key for peer TLS. Set both for multi-host deployments. |
 | `peer_ca_file` | System trust roots | PEM trust roots for a private CA. |
 | `allow_loopback_plaintext` | `false` | Allows peer traffic without TLS on numeric loopback addresses for local tests. |
-| `experimental_raft_journal` | `false` | Uses one shared append journal per node. Select this when provisioning a fresh cluster storage directory. |
+| `experimental_raft_journal` | `false` | Uses a shared segmented Raft journal. Select this when provisioning a fresh cluster storage directory. |
 | `experimental_raft_range_sync` | `false` | Enables Linux synchronous range writes for eligible journal appends. Requires `experimental_raft_journal`; other platforms retain normal sync. |
+| `experimental_raft_journal_dual_stream` | `false` | Uses two journal streams per node. Requires the experimental journal and range sync. Select this during provisioning. |
 | `experimental_ack_and_claim` | `false` | Combines manual acknowledgments and delivery refill in a fresh journal cluster. Enable it on every broker when provisioning. |
 | `experimental_assignments` | `false` | Uses committed consumer assignments in a fresh journal cluster. Enable it on every broker when provisioning. |
 | `experimental_replica_bodies` | `false` | Lets a broker reconstruct eligible remote assignment bodies from its own durable journal. Requires `experimental_assignments`. |
@@ -115,18 +116,17 @@ separately from peer TLS. See [TLS](TLS.md) and [Authorization](AUTHORIZATION.md
 ### Experimental shared journal
 
 Set `cluster.experimental_raft_journal: true` on a fresh cluster storage
-directory to try the shared journal. Keep the setting on subsequent restarts.
-The selected backend is part of the durable node identity, and a backend
-mismatch stops startup. The default bbolt backend continues to open existing
-cluster stores.
+directory to try the shared journal. Keep the backend and stream settings on
+subsequent restarts. The selected format is part of the durable node identity.
+StrangeQ rejects flat journal directories and backend mismatches at startup.
+The default cluster backend is bbolt.
 
-The journal uses one active file for the catalog and data shards and syncs
-Raft updates before releasing durability-dependent responses. A durable
-checkpoint allows the previous snapshot blob to be reclaimed. The active
-journal caps at 8 GiB and retained snapshot blobs at another 8 GiB per node.
-A write that exceeds a cap fails the affected storage path. Use disposable
-test clusters for this option while segment reclamation and migration are
-pending.
+Each stream rolls into 256 MiB segments. StrangeQ reclaims a sealed segment
+after a durable checkpoint covers it and all live messages and readers have
+released it. The 8 GiB journal budget counts retained segments and indexes
+across all streams on a node. Cumulative appends can exceed 8 GiB as files are
+reclaimed. Snapshot blobs have a separate 8 GiB budget per stream. A write
+that exceeds a retained-space budget fails the affected storage path.
 
 Set `cluster.experimental_raft_range_sync: true` to try Linux
 `pwritev2(RWF_SYNC)` for nonempty durable append batches with no earlier dirty
@@ -197,9 +197,9 @@ operation.
   to spread across more brokers. The supported configuration range is 1–1024
   shards.
 - Each data shard has a 48 MiB live payload budget and bounds on queues,
-  messages, and sessions. Snapshots prune committed log prefixes and the disk
-  store reuses their pages. A database file can retain its physical high-water
-  size until offline compaction.
+  messages, and sessions. In bbolt, snapshots prune committed log prefixes and
+  free pages for reuse. A bbolt file can retain its high-water size until offline
+  compaction.
 - Run the same StrangeQ build on every broker. The current build reads legacy
   JSON queue snapshots and writes CBOR queue snapshots. Earlier builds cannot
   install or reopen the new snapshots.
