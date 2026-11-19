@@ -65,6 +65,7 @@ type journalSegmentOutput struct {
 	rangeSync       bool
 	lastMaintain    int64
 	checkpointBuild <-chan journalSegmentCheckpointResult
+	checkpointReady func() // Wakes the writer; never publishes metadata from the builder.
 	index           *journalAppendIndex
 	sealedIndex     *journalSealedIndex
 	store           *journalSegmentStorage

@@ -65,6 +65,7 @@ type journalWriter struct {
 	pendingBytes     int
 	pendingRequests  int
 	admissionWaiters int
+	maintenanceReady bool
 	closing          bool
 	err              error
 
@@ -106,6 +107,14 @@ func newJournalWriterWithBudget(file journalFile, end int64, nextSequence uint64
 		w.mu, w.space, w.staging = &budget.mu, budget.space, budget.staging
 	}
 	w.ready = sync.NewCond(w.mu)
+	if segmented, ok := file.(*journalSegmentOutput); ok {
+		segmented.checkpointReady = func() {
+			w.mu.Lock()
+			w.maintenanceReady = true
+			w.ready.Signal()
+			w.mu.Unlock()
+		}
+	}
 	go w.run()
 	return w, nil
 }
@@ -203,15 +212,18 @@ func (w *journalWriter) enqueue(group uint64, body []byte, syncRequired bool) (<
 	return result, nil
 }
 
-func (w *journalWriter) takeBatch() []journalRequest {
+func (w *journalWriter) takeBatch() ([]journalRequest, bool) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	for len(w.queue) == 0 && !w.closing {
+	for len(w.queue) == 0 && !w.maintenanceReady && !w.closing {
 		w.ready.Wait()
 	}
 	if len(w.queue) == 0 {
-		return nil
+		running := !w.closing
+		w.maintenanceReady = false
+		return nil, running
 	}
+	w.maintenanceReady = false
 	// A single admitted record above the ordinary batch target still fits
 	// the format and is written alone. Other groups keep their FIFO order.
 	count, size := 1, w.queue[0].charge
@@ -223,7 +235,7 @@ func (w *journalWriter) takeBatch() []journalRequest {
 	left := copy(w.queue, w.queue[count:])
 	clear(w.queue[left:])
 	w.queue = w.queue[:left]
-	return batch
+	return batch, true
 }
 
 func (w *journalWriter) run() {
@@ -235,14 +247,20 @@ func (w *journalWriter) run() {
 		w.mu.Unlock()
 		close(w.done)
 	}()
-	for batch := w.takeBatch(); len(batch) != 0; batch = w.takeBatch() {
-		if err := w.writeBatch(batch); err != nil {
-			w.fail(batch, err)
-			return
+	for {
+		batch, running := w.takeBatch()
+		if !running {
+			break
 		}
-		w.complete(batch)
+		if len(batch) != 0 {
+			if err := w.writeBatch(batch); err != nil {
+				w.fail(batch, err)
+				return
+			}
+			w.complete(batch)
+		}
 		if segmented, ok := w.file.(*journalSegmentOutput); ok {
-			if err := segmented.maintain(false); err != nil && !errors.Is(err, errJournalBusy) {
+			if err := segmented.maintainSealed(false, w.durability.processAllowed()); err != nil && !errors.Is(err, errJournalBusy) {
 				w.fail(nil, err)
 				return
 			}

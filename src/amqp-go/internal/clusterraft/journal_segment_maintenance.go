@@ -37,20 +37,33 @@ func (w *journalSegmentOutput) reserveFrame(size int64) error {
 // writes a metadata image captured at the last rotation. The worker needs
 // only the immutable references built by successful appends.
 func (w *journalSegmentOutput) maintain(wait bool) error {
+	return w.maintainSealed(wait, false)
+}
+
+// Process completion can leave the active suffix dirty indefinitely. Its
+// owner may maintain the separately fenced sealed prefix without syncing or
+// changing either dirty flag. Other profiles retain their existing schedule.
+func (w *journalSegmentOutput) maintainSealed(wait, process bool) error {
 	s := w.store
-	if w.index == nil || w.dirty {
+	if w.index == nil || (w.dirty && !process) {
 		return nil
 	}
 	if w.checkpointBuild != nil {
 		if !wait {
 			select {
 			case result := <-w.checkpointBuild:
-				return w.finishCheckpoint(result)
+				if err := w.finishCheckpoint(result); err != nil {
+					return err
+				}
 			default:
 				return nil
 			}
-		}
-		if err := w.finishCheckpoint(<-w.checkpointBuild); err != nil {
+			// A process writer may have rolled again while the old build ran.
+			// Continue to its latest sealed cut before becoming idle.
+			if !process {
+				return nil
+			}
+		} else if err := w.finishCheckpoint(<-w.checkpointBuild); err != nil {
 			return err
 		}
 	} else if !wait && s.end-w.lastMaintain < max(1, s.manifest.extentBytes/8) {
@@ -68,7 +81,7 @@ func (w *journalSegmentOutput) maintain(wait bool) error {
 	}
 	w.sealedIndex = nil
 	manifest := s.manifest
-	cutoff, err := manifest.cutoff(sealed.sequence, sealed.end)
+	cutoff, err := w.sealedCheckpointCutoff(sealed.sequence, sealed.end)
 	if err != nil {
 		return err
 	}
@@ -84,6 +97,11 @@ func (w *journalSegmentOutput) maintain(wait bool) error {
 			}
 		}
 		ready <- result
+		// The bounded wake merely schedules owner-thread publication. A builder
+		// never mutates the manifest, reclaims files, or fences the active suffix.
+		if process && w.checkpointReady != nil {
+			w.checkpointReady()
+		}
 	}()
 	if wait {
 		return w.finishCheckpoint(<-ready)
@@ -95,6 +113,9 @@ func (w *journalSegmentOutput) finishCheckpoint(result journalSegmentCheckpointR
 	w.checkpointBuild = nil
 	if result.err != nil {
 		return result.err
+	}
+	if _, err := w.sealedCheckpointCutoff(result.staged.ref.sequence, result.staged.ref.end); err != nil {
+		return err
 	}
 	if err := w.installCheckpoint(result.staged); err != nil {
 		return err
@@ -110,4 +131,17 @@ func (w *journalSegmentOutput) finishCheckpoint(result journalSegmentCheckpointR
 		s.quota.release(old.size)
 	}
 	return w.reclaimSealedFiles()
+}
+
+// A readable process frame is never checkpoint authority. Both a captured
+// seal and a completed build must fit the physically fenced sealed prefix.
+func (w *journalSegmentOutput) sealedCheckpointCutoff(sequence uint64, end int64) (int, error) {
+	s := w.store
+	s.mu.RLock()
+	durableEnd := s.durableEnd
+	s.mu.RUnlock()
+	if end > durableEnd {
+		return 0, fmt.Errorf("%w: checkpoint exceeds physically durable journal prefix", errJournalCorrupt)
+	}
+	return s.manifest.cutoff(sequence, end)
 }

@@ -212,17 +212,7 @@ func (n *Node) ActivatePeers(options Config) error {
 			n.transport.Store(nil)
 		}
 	}()
-	raw, err := os.ReadFile(n.path(peerActivationFile))
-	if err == nil {
-		var prior peerActivation
-		if json.Unmarshal(raw, &prior) != nil || prior != want {
-			return errors.New("persistent peer activation does not match endpoint")
-		}
-	} else if errors.Is(err, os.ErrNotExist) {
-		if err := provisionFile(n.path(peerActivationFile), encode(want)); err != nil {
-			return err
-		}
-	} else {
+	if err := preparePeerActivationIntent(n.path(peerActivationFile), want, syncStorageDirectory); err != nil {
 		return err
 	}
 	// The intent is durable before the one-way policy upgrade. A failed
@@ -251,7 +241,7 @@ func (n *Node) ActivatePeers(options Config) error {
 	}
 	ctx, cancel := context.WithTimeout(n.ctx, requestTimeout)
 	defer cancel()
-	raw, err = n.submit(ctx, catalogID, encode(catalogCommand{ActivateSeed: &want.Peer}))
+	raw, err := n.submit(ctx, catalogID, encode(catalogCommand{ActivateSeed: &want.Peer}))
 	if err != nil {
 		return err
 	}
@@ -266,6 +256,27 @@ func (n *Node) ActivatePeers(options Config) error {
 	transport.ready.Store(true)
 	failed = false
 	return nil
+}
+
+// preparePeerActivationIntent publishes a fresh intent or durably re-fences a
+// matching retry. A prior link may be visible even though its directory sync
+// failed, so visibility alone cannot authorize the durability latch or listener.
+func preparePeerActivationIntent(path string, want peerActivation, syncDirectory func(string) error) error {
+	raw, err := os.ReadFile(path)
+	if err == nil {
+		var prior peerActivation
+		if json.Unmarshal(raw, &prior) != nil || prior != want {
+			return errors.New("persistent peer activation does not match endpoint")
+		}
+		if err := syncDirectory(filepath.Dir(path)); err != nil {
+			return fmt.Errorf("sync persistent peer activation directory: %w", err)
+		}
+		return nil
+	}
+	if errors.Is(err, os.ErrNotExist) {
+		return provisionFile(path, encode(want))
+	}
+	return err
 }
 
 // Every inbound peer operation is gated until endpoint publication commits.

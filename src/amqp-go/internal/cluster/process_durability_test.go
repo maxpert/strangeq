@@ -72,3 +72,31 @@ func TestProcessActivationPersistsIntentBeforeUpgradeAndExposure(t *testing.T) {
 	require.True(t, node.transport.Load().ready.Load())
 	submitEventually(t, node, "q", "after", `["before","after"]`)
 }
+
+func TestProcessActivationExistingIntentRequiresDirectoryFence(t *testing.T) {
+	directory := t.TempDir()
+	path := filepath.Join(directory, peerActivationFile)
+	want := peerActivation{Peer: Peer{ID: 1, Address: "127.0.0.1:7661"}, Listen: "127.0.0.1:7661"}
+	// Reproduce the state left by a successful link followed by a failed
+	// directory sync: the matching intent is visible but not yet trusted.
+	require.NoError(t, os.WriteFile(path, encode(want), 0600))
+	fenceFailure := errors.New("injected activation directory sync failure")
+	calls := 0
+	err := preparePeerActivationIntent(path, want, func(parent string) error {
+		calls++
+		require.Equal(t, directory, parent)
+		return fenceFailure
+	})
+	require.ErrorIs(t, err, fenceFailure)
+	require.Equal(t, 1, calls, "matching retry must not trust an unfenced directory entry")
+	require.FileExists(t, path)
+	// Retrying with a successful fence preserves the same immutable intent.
+	require.NoError(t, preparePeerActivationIntent(path, want, func(parent string) error {
+		calls++
+		return syncStorageDirectory(parent)
+	}))
+	require.Equal(t, 2, calls)
+	actual, err := os.ReadFile(path)
+	require.NoError(t, err)
+	require.Equal(t, encode(want), actual)
+}
