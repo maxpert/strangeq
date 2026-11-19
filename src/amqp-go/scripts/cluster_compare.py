@@ -275,6 +275,7 @@ def verify_journal_layout(cluster, ack_and_claim, assignments=False, body_compre
     expected_mode = b"segmented-" + expected_mode
     if dual_stream:
         expected_mode += b"-two-stream-parity-v1"
+    expected_mode += b"-dead-letter-v1"
     if (not mode.is_file() or mode.read_bytes() != expected_mode
             or not provisioned.is_file() or provisioned.read_bytes() != b"\x01"):
         raise BenchmarkError(f"StrangeQ journal mode or provision marker is invalid at {cluster}")
