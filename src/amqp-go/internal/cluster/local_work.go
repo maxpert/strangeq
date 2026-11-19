@@ -10,7 +10,7 @@ import (
 func (n *Node) WorkShard(queue string) uint64 { return groupFor(queue, n.cfg.Shards) }
 
 // LocalWorkShards finds locally led data shards with work using a cheap
-// advisory predicate. The subsequent read must still pass a quorum fence.
+// advisory predicate. The worker must authorize its effects by quorum.
 func (n *Node) LocalWorkShards(pending func(clusterraft.Machine) bool) []uint64 {
 	if n.Ready() != nil {
 		return nil
@@ -26,14 +26,14 @@ func (n *Node) LocalWorkShards(pending func(clusterraft.Machine) bool) []uint64 
 
 func (n *Node) ReadLocalWork(ctx context.Context, id uint64, capture func(clusterraft.Machine) (func() ([]byte, error), int, error)) ([]byte, error) {
 	if group := n.group(id); group != nil {
-		return group.ReadCaptured(ctx, capture)
+		return group.CaptureAppliedLeader(ctx, capture)
 	}
-	return nil, ErrUnavailable
+	return nil, clusterraft.ErrNotLeader
 }
 
 func (n *Node) SubmitLocalWork(ctx context.Context, id uint64, data []byte) ([]byte, error) {
 	if group := n.group(id); group != nil {
 		return group.Propose(ctx, data)
 	}
-	return nil, ErrUnavailable
+	return nil, clusterraft.ErrNotLeader
 }

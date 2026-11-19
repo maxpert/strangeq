@@ -33,7 +33,7 @@ const (
 	assignmentPeerProtocol          = 3
 	compressedBodyPeerProtocol      = 4
 	smallCompressedBodyPeerProtocol = 5
-	deadLetterPeerProtocolOffset    = 8
+	deadLetterPeerProtocolOffset    = 16
 )
 
 var ErrUnavailable = errors.New("shard leader unavailable")

@@ -19,7 +19,7 @@ const (
 	clusterProvisionTemp         = ".cluster-provision-"
 	journalDirectory             = "raft-journal"
 	journalProvisionedFile       = "journal-provisioned-v1"
-	deadLetterStorageModeSuffix  = "-dead-letter-v1"
+	deadLetterStorageModeSuffix  = "-dead-letter-v2"
 )
 
 type nodeJournalOwner interface {
@@ -88,10 +88,18 @@ func (n *Node) checkStorageModeClaim(mode string) error {
 	if err != nil {
 		return err
 	}
-	if string(prior) != mode && string(prior) != strings.TrimSuffix(mode, deadLetterStorageModeSuffix) {
+	if !matchesStorageModeEpoch(mode, string(prior)) {
 		return fmt.Errorf("cluster storage mode %s conflicts with persistent mode %q", mode, prior)
 	}
 	return nil
+}
+
+func matchesStorageModeEpoch(mode, prior string) bool {
+	if mode == prior {
+		return true
+	}
+	base, current := strings.CutSuffix(mode, deadLetterStorageModeSuffix)
+	return current && (prior == base || prior == base+"-dead-letter-v1")
 }
 
 // Install the new epoch before opening any Raft group. An older binary
@@ -108,7 +116,7 @@ func (n *Node) ensureStorageModeEpoch(mode string) error {
 	if string(prior) == mode {
 		return nil
 	}
-	if string(prior) != strings.TrimSuffix(mode, deadLetterStorageModeSuffix) {
+	if !matchesStorageModeEpoch(mode, string(prior)) {
 		return fmt.Errorf("cluster storage mode %s conflicts with persistent mode %q", mode, prior)
 	}
 	return durableFile(path, []byte(mode))

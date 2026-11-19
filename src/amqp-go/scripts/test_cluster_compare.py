@@ -175,7 +175,7 @@ class PlacementTests(unittest.TestCase):
                 (cluster / "raft-journal" / "extent-0000000000000001.raft-journal").write_bytes(b"frame")
                 (cluster / "raft-journal" / "segments.manifest").write_bytes(b"manifest")
                 (cluster / "journal-provisioned-v1").write_bytes(b"\x01")
-                (cluster / "raft-storage-mode-v1").write_text("segmented-journal-dead-letter-v1")
+                (cluster / "raft-storage-mode-v1").write_text("segmented-journal-dead-letter-v2")
                 (cluster / "opened-18446744073709551615").write_bytes(b"\x01")
                 (cluster / "opened-1").write_bytes(b"\x01")
                 (cluster / "journal-identity-v1.json").write_text(json.dumps(identity))
@@ -254,10 +254,10 @@ class PlacementTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as scratch:
             context, _ = self.make_strangeq_cluster(Path(scratch), journal=True)
             for node in context[0][:-1]:
-                (node / "cluster/raft-storage-mode-v1").write_bytes(b"segmented-journal-ack-and-claim-dead-letter-v1")
+                (node / "cluster/raft-storage-mode-v1").write_bytes(b"segmented-journal-ack-and-claim-dead-letter-v2")
             with self.assertRaisesRegex(BenchmarkError, "journal mode"):
                 verify_strangeq_placement(context, case, journal=True, ack_and_claim=True)
-            (context[0][-1] / "cluster/raft-storage-mode-v1").write_bytes(b"segmented-journal-ack-and-claim-dead-letter-v1")
+            (context[0][-1] / "cluster/raft-storage-mode-v1").write_bytes(b"segmented-journal-ack-and-claim-dead-letter-v2")
             placement = verify_strangeq_placement(context, case, journal=True, ack_and_claim=True)
             self.assertEqual(placement[case.queue_names[0]]["voters"], [1, 2, 3])
             with self.assertRaisesRegex(BenchmarkError, "journal mode"):
@@ -269,7 +269,7 @@ class PlacementTests(unittest.TestCase):
             context, _ = self.make_strangeq_cluster(Path(scratch), journal=True)
             for node in context[0]:
                 cluster = node / "cluster"
-                (cluster / "raft-storage-mode-v1").write_bytes(b"segmented-journal-assignments-small-compressed-bodies-dead-letter-v1")
+                (cluster / "raft-storage-mode-v1").write_bytes(b"segmented-journal-assignments-small-compressed-bodies-dead-letter-v2")
                 (cluster / "journal-identity-v1.json").rename(cluster / "journal-small-body-identity-v1.json")
             options = dict(journal=True, assignments=True, body_compression=True, small_body_compression=True)
             placement = verify_strangeq_placement(context, case, **options)

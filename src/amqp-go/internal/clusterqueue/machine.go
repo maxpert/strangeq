@@ -193,6 +193,8 @@ func (m *Machine) apply(c QueueCommand, wantReply bool, origin journalBodyOrigin
 	switch c.Kind {
 	case UpdateDeadLetter:
 		return m.updateDeadLetter(*c.DeadLetter)
+	case UpdateDeadLetterBatch:
+		return m.applyDeadLetterUpdates(*c.DeadLetterUpdates)
 	case ExpireSessions:
 		if c.Deadline <= 0 {
 			return failure(ErrInvalidCommand)
@@ -205,7 +207,7 @@ func (m *Machine) apply(c QueueCommand, wantReply bool, origin journalBodyOrigin
 		return m.list()
 	case DeclareQueue, DescribeQueue, DeleteQueue, PurgeQueue, OpenQueueSession, RenewQueueSession,
 		ReleaseQueueSession, PublishMessage, PublishDeadLetter, ClaimMessage, AckMessage, RequeueMessage, DropMessage, SettleBatch,
-		PublishBatch, ClaimBatch, AckAndClaim, SetAssignmentCredit:
+		PublishBatch, PublishDeadLetterBatch, ClaimBatch, AckAndClaim, SetAssignmentCredit:
 	default:
 		return failure(ErrInvalidCommand)
 	}
@@ -223,7 +225,7 @@ func (m *Machine) apply(c QueueCommand, wantReply bool, origin journalBodyOrigin
 	if c.Kind == DescribeQueue {
 		return QueueResponse{Queue: q.info(c.Queue)}
 	}
-	usesCurrentQueue := (c.Kind == PublishMessage || c.Kind == PublishBatch || c.Kind == PublishDeadLetter) && c.Incarnation == 0 && c.Session == 0
+	usesCurrentQueue := (c.Kind == PublishMessage || c.Kind == PublishBatch || c.Kind == PublishDeadLetter || c.Kind == PublishDeadLetterBatch) && c.Incarnation == 0 && c.Session == 0
 	if c.Incarnation != q.ID && !usesCurrentQueue {
 		return failure(ErrQueueIncarnation)
 	}
@@ -241,6 +243,8 @@ func (m *Machine) apply(c QueueCommand, wantReply bool, origin journalBodyOrigin
 		return m.publishBatch(q, c.Body, origin, c.packedVersion != 0)
 	case PublishDeadLetter:
 		return m.publishDeadLetter(c, q, origin)
+	case PublishDeadLetterBatch:
+		return m.applyDeadLetterPublishBatch(q, c, origin)
 	case PublishMessage:
 		if len(c.Body) > maxMessageBytes {
 			return failure(ErrCapacity)

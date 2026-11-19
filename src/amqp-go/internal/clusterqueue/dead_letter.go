@@ -45,6 +45,7 @@ type DeadLetterUpdate struct {
 	ID        uint64
 	Plan      []string `json:",omitempty"`
 	Completed string   `json:",omitempty"`
+	Authorize string   `json:",omitempty"`
 }
 
 type DeadLetterTransfer struct {
@@ -230,42 +231,9 @@ func (s *machineState) compactDeadLetterIDs() {
 	}
 }
 
-// HasDeadLetters is an advisory check. A worker must fence the capture through
-// Raft before reading an entry and attempting a publish.
+// HasDeadLetters is an advisory check. A worker must confirm each destination
+// against the replicated pending plan before sending a copy.
 func (m *Machine) HasDeadLetters() bool { return len(m.state.DeadLetters) != 0 }
-
-// CaptureDeadLetter returns the next pending entry in this pass. Each pass
-// fixes its upper bound so continuous arrivals can't starve older retries.
-// The encoder needs the Group's journal capture pin.
-func (m *Machine) CaptureDeadLetter(after, through uint64) (func() ([]byte, error), int, error) {
-	s := &m.state
-	start, exact := slices.BinarySearch(s.deadLetterIDs, after)
-	if exact {
-		start++
-	}
-	for _, id := range s.deadLetterIDs[start:] {
-		if id > through {
-			break
-		}
-		if entry, ok := s.DeadLetters[id]; ok {
-			return captureDeadLetter(entry, through)
-		}
-	}
-	for _, id := range s.deadLetterIDs {
-		if entry, ok := s.DeadLetters[id]; ok {
-			return captureDeadLetter(entry, s.LastDeadLetter)
-		}
-	}
-	return func() ([]byte, error) { return encodeQueueReply(QueueResponse{}) }, 0, nil
-}
-
-func captureDeadLetter(entry pendingDeadLetter, through uint64) (func() ([]byte, error), int, error) {
-	delivery := entry.Message.delivery(0)
-	reply := QueueResponse{
-		DeadLetter: &entry.DeadLetterTransfer, DeadLetterThrough: through, Result: Result{Delivery: delivery},
-	}
-	return func() ([]byte, error) { return encodeQueueReply(reply) }, delivery.bodySize(), nil
-}
 
 func (s *machineState) validateDeadLetters() error {
 	if len(s.DeadLetters) == 0 {

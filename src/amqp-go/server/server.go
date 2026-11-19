@@ -1541,22 +1541,22 @@ func (s *Server) processFrames(rt *connRuntime, done chan struct{}) {
 	conn := rt.conn
 	defer close(done)
 	var publishes *clusterPublishBurst
-	var acknowledgments *clusterSingleAckBatch
+	var settlements *clusterSingleSettlementBatch
 	if broker, clustered := s.Broker.(*ClusterBroker); clustered {
 		runtime, hasAssignmentMode := broker.cluster.(interface{ SupportsAssignments() bool })
 		allowGather := hasAssignmentMode && runtime.SupportsAssignments()
 		publishes = &clusterPublishBurst{
 			server: s, broker: broker, conn: conn, allowGather: allowGather,
 		}
-		acknowledgments = &clusterSingleAckBatch{broker: broker, allowGather: allowGather}
+		settlements = &clusterSingleSettlementBatch{broker: broker, allowGather: allowGather}
 		defer publishes.discard()
-		defer acknowledgments.stopGather()
+		defer settlements.stopGather()
 	}
 
 	for {
 		select {
-		case <-acknowledgments.gatherSignal():
-			if s.flushClusterSingleAcks(rt, acknowledgments) {
+		case <-settlements.gatherSignal():
+			if s.flushClusterSingleSettlements(rt, settlements) {
 				return
 			}
 		case <-publishes.gatherSignal():
@@ -1568,7 +1568,7 @@ func (s *Server) processFrames(rt *connRuntime, done chan struct{}) {
 			}
 		case frame, ok := <-conn.FrameQueue:
 			if !ok {
-				s.flushClusterSingleAcks(rt, acknowledgments)
+				s.flushClusterSingleSettlements(rt, settlements)
 				s.flushClusterPublishes(rt, publishes)
 				s.Log.Info("Frame queue closed", zap.String("connection_id", conn.ID))
 				return
@@ -1581,17 +1581,18 @@ func (s *Server) processFrames(rt *connRuntime, done chan struct{}) {
 			// (whether the frame is pooled or handed to the AckQueue).
 			cost := frameCost(frame)
 
-			var ackTag uint64
-			var singleAck bool
-			if acknowledgments != nil {
-				ackTag, singleAck = singleAckFrame(frame)
-				if singleAck {
+			var settlementTag uint64
+			var settlementMethod uint16
+			if settlements != nil {
+				settlementTag, settlementMethod = singleSettlementFrame(frame)
+				if settlementMethod != 0 {
 					if txm := s.txm(conn); txm != nil && txm.IsTransactional(frame.Channel) {
-						singleAck = false
+						settlementMethod = 0
 					}
 				}
-				if (!singleAck || acknowledgments.channelID != frame.Channel || acknowledgments.gatherExpired()) &&
-					s.flushClusterSingleAcks(rt, acknowledgments) {
+				if (settlementMethod == 0 || settlements.methodID != settlementMethod ||
+					settlements.channelID != frame.Channel || settlements.gatherExpired()) &&
+					s.flushClusterSingleSettlements(rt, settlements) {
 					s.releaseFrameBudget(conn, cost)
 					protocol.PutFrame(frame)
 					return
@@ -1667,13 +1668,13 @@ func (s *Server) processFrames(rt *connRuntime, done chan struct{}) {
 				}
 			}
 
-			if singleAck {
-				acknowledgments.add(frame.Channel, ackTag)
+			if settlementMethod != 0 {
+				settlements.add(frame.Channel, settlementMethod, settlementTag)
 				s.releaseFrameBudget(conn, cost)
 				protocol.PutFrame(frame)
-				if (acknowledgments.count == len(acknowledgments.tags) ||
-					(len(conn.FrameQueue) == 0 && !acknowledgments.waitAtIdle())) &&
-					s.flushClusterSingleAcks(rt, acknowledgments) {
+				if (settlements.count == len(settlements.tags) ||
+					(len(conn.FrameQueue) == 0 && !settlements.waitAtIdle())) &&
+					s.flushClusterSingleSettlements(rt, settlements) {
 					return
 				}
 				continue

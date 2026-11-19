@@ -2,12 +2,69 @@ package clusterqueue
 
 import (
 	"bytes"
+	"encoding/binary"
 	"testing"
 
+	"github.com/maxpert/amqp-go/internal/clusterpayload"
 	"github.com/stretchr/testify/require"
 )
 
 const deadLetterTestTime = 1700000000000000000
+
+func TestDeadLetterPageBudgetUsesLogicalPayloadBytes(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		logicalBytes int
+		packed       bool
+		pageCount    int
+		totalCount   int
+	}{
+		{name: "raw boundary", logicalBytes: DeadLetterPageBytes / 2, pageCount: 2, totalCount: 3},
+		{name: "packed boundary", logicalBytes: 128 << 10, packed: true, pageCount: 16, totalCount: 17},
+		{name: "packed overflow", logicalBytes: (128 << 10) + 21, packed: true, pageCount: 15, totalCount: 17},
+		{name: "oversized singleton", logicalBytes: DeadLetterPageBytes + 1, pageCount: 1, totalCount: 3},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			m := &Machine{}
+			session := deadLetterSource(t, m)
+			header := make([]byte, 21)
+			header[0] = clusterpayload.RawEnvelope
+			body := make([]byte, tc.logicalBytes-len(header))
+			binary.BigEndian.PutUint32(header[3:7], 14)
+			binary.BigEndian.PutUint64(header[11:19], uint64(len(body)))
+			if tc.packed {
+				header[0] = clusterpayload.PackedEnvelope
+				body = clusterpayload.Pack(body)
+				require.NotEmpty(t, body)
+			}
+			command, err := EncodePublishCommand(queueName, session.Incarnation, PublishRecord{
+				Prefix: header, Body: body, Packed: tc.packed,
+			})
+			require.NoError(t, err)
+			for range tc.totalCount {
+				require.NoError(t, m.applyCommand(command, true, nil).Err())
+				session.Kind, session.Sequence = ClaimMessage, session.Sequence+1
+				session.Attempt, session.RejectedAt = 0, 0
+				delivery := apply(t, m, session).Result.Delivery
+				require.NotNil(t, delivery)
+				session.Kind, session.Sequence, session.Attempt, session.RejectedAt = DropMessage, session.Sequence+1, delivery.Attempt, deadLetterTestTime
+				require.NoError(t, apply(t, m, session).Err())
+			}
+			encode, wireBytes, logicalBytes := m.CaptureDeadLetterPage(0, 0)
+			require.Equal(t, tc.pageCount*tc.logicalBytes, logicalBytes)
+			require.Equal(t, tc.pageCount*(len(header)+len(body)), wireBytes)
+			wire, err := encode()
+			require.NoError(t, err)
+			page, err := DecodeDeadLetterPage(wire)
+			require.NoError(t, err)
+			require.Len(t, page.Entries, tc.pageCount)
+			require.EqualValues(t, tc.totalCount, page.Through)
+			for i, entry := range page.Entries {
+				require.EqualValues(t, i+1, entry.ID, "page capture must preserve source order")
+			}
+		})
+	}
+}
 
 func deadLetterSource(t *testing.T, m *Machine) QueueCommand {
 	t.Helper()
@@ -22,15 +79,15 @@ func deadLetterSource(t *testing.T, m *Machine) QueueCommand {
 	return session
 }
 
-func deadLetterView(t *testing.T, m *Machine) QueueResponse {
+func deadLetterView(t *testing.T, m *Machine) DeadLetterPageEntry {
 	t.Helper()
-	encode, _, err := m.CaptureDeadLetter(0, 0)
-	require.NoError(t, err)
+	encode, _, _ := m.CaptureDeadLetterPage(0, 0)
 	wire, err := encode()
 	require.NoError(t, err)
-	reply, err := DecodeResponse(wire)
+	page, err := DecodeDeadLetterPage(wire)
 	require.NoError(t, err)
-	return reply
+	require.Len(t, page.Entries, 1)
+	return page.Entries[0]
 }
 
 func deadLetterUpdate(t *testing.T, m *Machine, update DeadLetterUpdate) {
@@ -70,10 +127,10 @@ func TestDeadLetterKeepsJournalBodyAndFanoutProgressThroughSnapshot(t *testing.T
 	checkpoint := m.CloneForSnapshot()
 	require.NoError(t, m.Restore(mustSnapshot(t, &checkpoint)))
 	reply := deadLetterView(t, m)
-	require.Equal(t, body, reply.Result.Delivery.Body)
-	require.Equal(t, []string{"second"}, reply.DeadLetter.Remaining)
-	require.Equal(t, queueName, reply.DeadLetter.Source)
-	require.EqualValues(t, deadLetterTestTime, reply.DeadLetter.Rejected)
+	require.Equal(t, body, reply.Body)
+	require.Equal(t, []string{"second"}, reply.Remaining)
+	require.Equal(t, queueName, reply.Source)
+	require.EqualValues(t, deadLetterTestTime, reply.Rejected)
 	require.EqualValues(t, 1, m.state.messages)
 	deadLetterUpdate(t, m, DeadLetterUpdate{ID: 1, Completed: "first"})
 	require.True(t, m.HasDeadLetters())

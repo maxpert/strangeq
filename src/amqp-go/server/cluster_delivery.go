@@ -164,7 +164,8 @@ func (s *clusterSession) runCommandLocked(ctx context.Context, command clusterqu
 		maxCount := uint64(len(command.Attempts))
 		switch {
 		case err == nil && result.Count == maxCount:
-		case errors.Is(err, clusterqueue.ErrUnknownAttempt) && result.Count < maxCount:
+		case result.Count < maxCount && (errors.Is(err, clusterqueue.ErrUnknownAttempt) ||
+			command.Settlement == clusterqueue.DropMessage && errors.Is(err, clusterqueue.ErrIDsExhausted)):
 		case err != nil && result.Count == 0:
 		default:
 			s.failed = errors.New("queue settlement outcome has an invalid count")

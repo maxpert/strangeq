@@ -8,10 +8,37 @@ const captureJournalReplyBytes = 32 << 10
 // encoders use the node's existing reply slots and can then read immutable
 // journal bytes outside the lock while Close waits for the captured result.
 func (g *Group) ReadCaptured(ctx context.Context, capture func(Machine) (func() ([]byte, error), int, error)) ([]byte, error) {
+	return g.readCaptured(ctx, g.Read, capture)
+}
+
+// CaptureAppliedLeader reads committed local state for an internal worker.
+// The worker must obtain a quorum authorization before acting on this view.
+func (g *Group) CaptureAppliedLeader(ctx context.Context, capture func(Machine) (func() ([]byte, error), int, error)) ([]byte, error) {
+	return g.readCaptured(ctx, g.readAppliedLeader, capture)
+}
+
+func (g *Group) readAppliedLeader(ctx context.Context, query func(Machine) ([]byte, error)) ([]byte, error) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if err := g.stopped(); err != nil {
+		return nil, err
+	}
+	if leader, _ := g.readQuorum(g.node.BasicStatus()); !leader {
+		return nil, ErrNotLeader
+	}
+	return query(g.cfg.Machine)
+}
+
+func (g *Group) readCaptured(ctx context.Context,
+	read func(context.Context, func(Machine) ([]byte, error)) ([]byte, error),
+	capture func(Machine) (func() ([]byte, error), int, error)) ([]byte, error) {
 	var encode func() ([]byte, error)
 	var held chan struct{}
 	var unpin func()
-	inline, err := g.Read(ctx, func(machine Machine) ([]byte, error) {
+	inline, err := read(ctx, func(machine Machine) ([]byte, error) {
 		reply, size, err := capture(machine)
 		if err != nil {
 			return nil, err

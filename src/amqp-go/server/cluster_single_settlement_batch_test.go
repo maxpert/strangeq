@@ -13,7 +13,32 @@ import (
 	"go.uber.org/zap"
 )
 
-func TestClusterSingleAckFramesBatchExactTagsBeforeBarrier(t *testing.T) {
+func TestClusterSingleSettlementFramesBatchExactTagsBeforeBarrier(t *testing.T) {
+	for _, method := range []struct {
+		name  string
+		id    uint16
+		kind  clusterqueue.QueueCommandKind
+		frame func(*testing.T, uint16, uint64) *protocol.Frame
+	}{
+		{"ack", protocol.BasicAck, clusterqueue.AckMessage, func(t *testing.T, ch uint16, tag uint64) *protocol.Frame {
+			return encodeAckFrame(t, ch, tag, false)
+		}},
+		{"reject", protocol.BasicReject, clusterqueue.DropMessage, func(t *testing.T, ch uint16, tag uint64) *protocol.Frame {
+			return encodeRejectFrame(t, ch, tag, false)
+		}},
+		{"nack", protocol.BasicNack, clusterqueue.DropMessage, func(t *testing.T, ch uint16, tag uint64) *protocol.Frame {
+			return encodeNackFrame(t, ch, tag, false, false)
+		}},
+	} {
+		t.Run(method.name, func(t *testing.T) {
+			checkClusterSingleSettlementFrames(t, method.id, method.kind, method.frame)
+		})
+	}
+}
+
+func checkClusterSingleSettlementFrames(t *testing.T, methodID uint16, settlement clusterqueue.QueueCommandKind,
+	frame func(*testing.T, uint16, uint64) *protocol.Frame) {
+	t.Helper()
 	for _, tc := range []struct {
 		name      string
 		partial   bool
@@ -39,7 +64,10 @@ func TestClusterSingleAckFramesBatchExactTagsBeforeBarrier(t *testing.T) {
 					return nil, err
 				}
 				switch command.Kind {
-				case clusterqueue.AckMessage, clusterqueue.SettleBatch:
+				case clusterqueue.AckMessage, clusterqueue.DropMessage, clusterqueue.SettleBatch:
+					if command.Kind == clusterqueue.SettleBatch {
+						require.Equal(t, settlement, command.Settlement)
+					}
 					submissions = append(submissions, command.Kind)
 				case clusterqueue.DescribeQueue:
 					if observeBarrier {
@@ -89,7 +117,7 @@ func TestClusterSingleAckFramesBatchExactTagsBeforeBarrier(t *testing.T) {
 				tags = []uint64{1, 3, 3, 4}
 			}
 			for _, tag := range tags {
-				push(encodeAckFrame(t, ch.ID, tag, false))
+				push(frame(t, ch.ID, tag))
 			}
 			barrier, err := (&protocol.QueueDeclareMethod{Queue: queue, Passive: true}).Serialize()
 			require.NoError(t, err)
@@ -125,7 +153,7 @@ func TestClusterSingleAckFramesBatchExactTagsBeforeBarrier(t *testing.T) {
 				require.NoError(t, closeMethod.Deserialize(payload))
 				require.EqualValues(t, amqperrors.InternalError, closeMethod.ReplyCode)
 				require.EqualValues(t, 60, closeMethod.ClassID)
-				require.EqualValues(t, protocol.BasicAck, closeMethod.MethodID)
+				require.EqualValues(t, methodID, closeMethod.MethodID)
 			case tc.duplicate:
 				require.EqualValues(t, 20, class)
 				require.EqualValues(t, protocol.ChannelClose, method)
@@ -135,7 +163,7 @@ func TestClusterSingleAckFramesBatchExactTagsBeforeBarrier(t *testing.T) {
 				require.NoError(t, closeMethod.Deserialize(payload))
 				require.EqualValues(t, amqperrors.PreconditionFailed, closeMethod.ReplyCode)
 				require.EqualValues(t, 60, closeMethod.ClassID)
-				require.EqualValues(t, protocol.BasicAck, closeMethod.MethodID)
+				require.EqualValues(t, methodID, closeMethod.MethodID)
 				require.Contains(t, closeMethod.ReplyText, "unknown delivery tag 3")
 			default:
 				require.EqualValues(t, 50, class)
@@ -170,7 +198,7 @@ func TestClusterSingleAckFramesBatchExactTagsBeforeBarrier(t *testing.T) {
 					require.Equal(t, wantTracked, tracked, "wire tag %d", tag)
 				}
 			}
-			require.Len(t, submissions, 1, "consecutive individual ACK frames use one replicated settlement")
+			require.Len(t, submissions, 1, "consecutive individual settlement frames use one replicated settlement")
 			require.Equal(t, clusterqueue.SettleBatch, submissions[0])
 		})
 	}

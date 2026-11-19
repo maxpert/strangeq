@@ -29,7 +29,7 @@ func TestDeadLetterEpochFencesOlderClusterPeersAndStores(t *testing.T) {
 	stub := &Node{cfg: cfg}
 	_, mode, err := stub.storageIdentity()
 	require.NoError(t, err)
-	olderMode := strings.TrimSuffix(mode, deadLetterStorageModeSuffix)
+	olderMode := strings.TrimSuffix(mode, deadLetterStorageModeSuffix) + "-dead-letter-v1"
 	require.NotEqual(t, mode, olderMode)
 	require.NoError(t, durableFile(stub.path(clusterStorageModeFile), []byte(olderMode)))
 
@@ -41,7 +41,7 @@ func TestDeadLetterEpochFencesOlderClusterPeersAndStores(t *testing.T) {
 	require.Equal(t, mode, string(raw))
 	require.ErrorContains(t, stub.checkStorageModeClaim(olderMode), "conflicts with persistent mode")
 
-	wireConfig := clusterwire.Config{ClusterID: cfg.ClusterID, Token: cfg.Token, AllowInsecure: true}
+	wireConfig := clusterwire.Config{ClusterID: cfg.ClusterID, Token: cfg.Token, AllowInsecure: true, ProtocolVersion: 8}
 	older, err := clusterwire.NewClient(wireConfig)
 	require.NoError(t, err)
 	defer older.Close()
