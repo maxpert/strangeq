@@ -1,0 +1,155 @@
+package clusterqueue
+
+import (
+	"bytes"
+	"crypto/sha256"
+	"errors"
+	"fmt"
+	"hash/crc32"
+	"io"
+)
+
+const minJournalBodyBytes = 32 << 10
+
+var journalBodyChecksum = crc32.MakeTable(crc32.Castagnoli)
+
+type journalBodyOrigin struct {
+	source io.ReaderAt
+	offset int64
+}
+
+type journalBody struct {
+	journalBodyOrigin
+	size             int
+	checksum         uint32
+	assignmentDigest *[sha256.Size]byte
+}
+
+func (origin journalBodyOrigin) message(id MessageID, body []byte) messageState {
+	if origin.source == nil || len(body) < minJournalBodyBytes {
+		return messageState{ID: id, Body: bytes.Clone(body)}
+	}
+	cold := &journalBody{
+		journalBodyOrigin: origin,
+		size:              len(body),
+		checksum:          crc32.Checksum(body, journalBodyChecksum),
+	}
+	if _, ok := origin.source.(assignmentJournalEntry); ok && len(body) <= maxAssignmentReferenceBody {
+		digest := sha256.Sum256(body)
+		cold.assignmentDigest = &digest
+	}
+	return messageState{ID: id, cold: cold}
+}
+
+func (b *journalBody) read(dst []byte) error {
+	n, err := b.source.ReadAt(dst, b.offset)
+	if err != nil && !(n == len(dst) && errors.Is(err, io.EOF)) {
+		return fmt.Errorf("read journal queue body: %w", err)
+	}
+	if n != len(dst) {
+		return fmt.Errorf("read journal queue body: %w", io.ErrUnexpectedEOF)
+	}
+	if crc32.Checksum(dst, journalBodyChecksum) != b.checksum {
+		return errors.New("journal queue body checksum mismatch")
+	}
+	return nil
+}
+
+func (m messageState) bodySize() int {
+	if m.cold != nil {
+		return m.cold.size
+	}
+	return len(m.Body)
+}
+
+func (m messageState) logicalBodySize() int {
+	return max(m.LogicalSize, m.bodySize())
+}
+
+func (m messageState) delivery(attempt AttemptID) Delivery {
+	return Delivery{
+		MessageID: m.ID, Attempt: attempt, Body: m.Body, Redelivered: m.Redelivered,
+		Packed: m.LogicalSize != 0, cold: m.cold,
+	}
+}
+
+func (d Delivery) bodySize() int {
+	if d.cold != nil {
+		return d.cold.size
+	}
+	return len(d.Body)
+}
+
+func (d Delivery) appendBody(frame []byte) ([]byte, error) {
+	if d.cold == nil {
+		return append(frame, d.Body...), nil
+	}
+	start := len(frame)
+	frame = frame[:start+d.cold.size]
+	if err := d.cold.read(frame[start:]); err != nil {
+		return nil, err
+	}
+	return frame, nil
+}
+
+// Snapshot encoding continues to see the original message representation.
+// The caller serializes machine operations and clears the borrowed slices on exit.
+func (s *machineState) loadJournalBodies() error {
+	scratch := make([]byte, int(s.coldBytes))
+	load := func(message *messageState) error {
+		if message.cold == nil {
+			return nil
+		}
+		size := message.cold.size
+		if size > len(scratch) {
+			return errors.New("journal queue body accounting mismatch")
+		}
+		body := scratch[:size:size]
+		if err := message.cold.read(body); err != nil {
+			return err
+		}
+		message.Body = body
+		scratch = scratch[size:]
+		return nil
+	}
+	for _, queue := range s.Queues {
+		for i := range queue.Ready {
+			if err := load(&queue.Ready[i]); err != nil {
+				return err
+			}
+		}
+		for _, session := range queue.Sessions {
+			for attempt, message := range session.Flights {
+				if message.cold == nil {
+					continue
+				}
+				if err := load(&message); err != nil {
+					return err
+				}
+				session.Flights[attempt] = message
+			}
+		}
+	}
+	if len(scratch) != 0 {
+		return errors.New("journal queue body accounting mismatch")
+	}
+	return nil
+}
+
+func (s *machineState) clearJournalBodies() {
+	for _, queue := range s.Queues {
+		for i := range queue.Ready {
+			if queue.Ready[i].cold != nil {
+				queue.Ready[i].Body = nil
+			}
+		}
+		for _, session := range queue.Sessions {
+			for attempt, message := range session.Flights {
+				if message.cold != nil {
+					message.Body = nil
+					session.Flights[attempt] = message
+				}
+			}
+		}
+	}
+}

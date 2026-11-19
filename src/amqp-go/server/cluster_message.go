@@ -5,11 +5,13 @@ import (
 	"errors"
 	"math"
 
+	"github.com/maxpert/amqp-go/internal/clusterpayload"
 	"github.com/maxpert/amqp-go/protocol"
 )
 
-// The envelope uses the same AMQP properties payload as a client delivery.
-func encodeClusterMessage(message *protocol.Message) ([]byte, error) {
+// The envelope header uses the same AMQP properties payload as a client
+// delivery. The queue command encoder appends the body after this header.
+func encodeClusterMessageHeader(message *protocol.Message) ([]byte, error) {
 	if len(message.Exchange) > 255 || len(message.RoutingKey) > 255 {
 		return nil, errors.New("exchange or routing key exceeds the AMQP short-string limit")
 	}
@@ -20,17 +22,21 @@ func encodeClusterMessage(message *protocol.Message) ([]byte, error) {
 	if len(header) > math.MaxUint32 {
 		return nil, errors.New("AMQP properties exceed the cluster envelope limit")
 	}
-	data := make([]byte, 0, 7+len(message.Exchange)+len(message.RoutingKey)+len(header)+len(message.Body))
-	data = append(data, 1, byte(len(message.Exchange)), byte(len(message.RoutingKey)))
+	data := make([]byte, 0, 7+len(message.Exchange)+len(message.RoutingKey)+len(header))
+	data = append(data, clusterpayload.RawEnvelope, byte(len(message.Exchange)), byte(len(message.RoutingKey)))
 	data = binary.BigEndian.AppendUint32(data, uint32(len(header)))
 	data = append(data, message.Exchange...)
 	data = append(data, message.RoutingKey...)
-	data = append(data, header...)
-	return append(data, message.Body...), nil
+	return append(data, header...), nil
 }
 
 func decodeClusterMessage(data []byte) (*protocol.Message, error) {
-	if len(data) < 7 || data[0] != 1 {
+	return decodeStoredClusterMessage(data, false)
+}
+
+func decodeStoredClusterMessage(data []byte, packed bool) (*protocol.Message, error) {
+	if len(data) < 7 || (!packed && data[0] != clusterpayload.RawEnvelope) ||
+		(packed && !clusterpayload.IsPackedEnvelope(data[0])) {
 		return nil, errors.New("invalid cluster message envelope")
 	}
 	exchangeEnd := 7 + int(data[1])
@@ -45,7 +51,12 @@ func decodeClusterMessage(data []byte) (*protocol.Message, error) {
 	}
 	defer protocol.PutContentHeader(props)
 	body := data[headerEnd:]
-	if uint64(len(body)) != props.BodySize {
+	if packed {
+		body, err = clusterpayload.Unpack(body, props.BodySize, data[0])
+		if err != nil {
+			return nil, err
+		}
+	} else if uint64(len(body)) != props.BodySize {
 		return nil, errors.New("cluster message body size mismatch")
 	}
 	return &protocol.Message{

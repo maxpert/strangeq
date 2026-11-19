@@ -48,6 +48,10 @@ func (a authenticator) mac(label, path string, auth credentials) []byte {
 }
 
 func (a authenticator) signRequest(req *http.Request, body []byte) (credentials, error) {
+	return a.signRequestParts(req, nil, body)
+}
+
+func (a authenticator) signRequestParts(req *http.Request, prefix, body []byte) (credentials, error) {
 	var nonce [16]byte
 	if _, err := rand.Read(nonce[:]); err != nil {
 		return credentials{}, err
@@ -55,7 +59,7 @@ func (a authenticator) signRequest(req *http.Request, body []byte) (credentials,
 	auth := credentials{
 		timestamp: strconv.FormatInt(time.Now().Unix(), 10),
 		nonce:     hex.EncodeToString(nonce[:]),
-		digest:    bodyDigest(body),
+		digest:    bodyPartsDigest(prefix, body),
 	}
 	req.Header.Set(headerTime, auth.timestamp)
 	req.Header.Set(headerNonce, auth.nonce)
@@ -92,8 +96,23 @@ func decodeHex(dest []byte, value string) bool {
 	return err == nil
 }
 
-func (a authenticator) signResponse(header http.Header, path string, auth credentials, result []byte) {
-	auth.digest = bodyDigest(result)
+func bodyPartsDigest(prefix, body []byte) string {
+	switch {
+	case len(prefix) == 0:
+		return bodyDigest(body)
+	case len(body) == 0:
+		return bodyDigest(prefix)
+	default:
+		hash := sha256.New()
+		_, _ = hash.Write(prefix)
+		_, _ = hash.Write(body)
+		var digest [sha256.Size]byte
+		return hex.EncodeToString(hash.Sum(digest[:0]))
+	}
+}
+
+func (a authenticator) signResponse(header http.Header, path string, auth credentials, prefix, body []byte) {
+	auth.digest = bodyPartsDigest(prefix, body)
 	header.Set(headerMAC, hex.EncodeToString(a.mac("response", path, auth)))
 }
 

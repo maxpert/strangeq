@@ -19,8 +19,9 @@ func TestClusterMessageRoundTripPreservesAMQPProperties(t *testing.T) {
 			"table": map[string]interface{}{"n": int32(5)}, "array": []interface{}{true, "ok", nil},
 		},
 	}
-	data, err := encodeClusterMessage(message)
+	header, err := encodeClusterMessageHeader(message)
 	require.NoError(t, err)
+	data := append(header, message.Body...)
 	recovered, err := decodeClusterMessage(data)
 	require.NoError(t, err)
 	require.Equal(t, message.Body, recovered.Body)

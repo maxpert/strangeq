@@ -3,6 +3,8 @@ package clusterqueue
 import (
 	"bytes"
 	"crypto/sha256"
+	"encoding/binary"
+	"io"
 	"math"
 	"slices"
 	"unicode/utf8"
@@ -20,44 +22,56 @@ const (
 )
 
 type Machine struct {
-	state machineState
+	state       machineState
+	assignments bool
 }
 
+func NewAssignmentMachine() Machine { return Machine{assignments: true} }
+
 type machineState struct {
-	LastQueue QueueID
-	Queues    map[string]*queueState
-	bodies    uint64
-	messages  uint64
-	sessions  uint64
+	LastQueue      QueueID
+	Queues         map[string]*queueState
+	bodies         uint64
+	coldBytes      uint64
+	packingSavings uint64
+	messages       uint64
+	sessions       uint64
 }
 
 type queueState struct {
-	ID          QueueID
-	Spec        QueueSpec
-	LastSession SessionID
-	LastMessage MessageID
-	LastAttempt AttemptID
-	Ready       []messageState
-	Sessions    map[SessionID]*sessionState
-	unacked     uint64
-	consumers   uint64
+	ID                  QueueID
+	Spec                QueueSpec
+	LastSession         SessionID
+	LastMessage         MessageID
+	LastAttempt         AttemptID
+	LastAssignedSession SessionID `json:",omitempty" cbor:",omitempty"`
+	Ready               []messageState
+	Sessions            map[SessionID]*sessionState
+	unacked             uint64
+	consumers           uint64
+	pushEligible        []SessionID
 }
 
 type sessionState struct {
-	Owner    string
-	Prefetch uint32
-	Consumer bool
-	Deadline int64
-	Sequence uint64
-	LastKey  commandKey
-	Last     outcome
-	Flights  map[AttemptID]messageState
+	Owner            string
+	Prefetch         uint32
+	Consumer         bool
+	AutoAssign       bool      `json:",omitempty" cbor:",omitempty"`
+	AssignedThrough  AttemptID `json:",omitempty" cbor:",omitempty"`
+	RegisteredCredit uint32    `json:",omitempty" cbor:",omitempty"`
+	Deadline         int64
+	Sequence         uint64
+	LastKey          commandKey
+	Last             outcome
+	Flights          map[AttemptID]messageState
 }
 
 type messageState struct {
 	ID          MessageID
 	Body        []byte `json:",omitempty"`
 	Redelivered bool   `json:",omitempty"`
+	LogicalSize int    `json:",omitempty" cbor:",omitempty"`
+	cold        *journalBody
 }
 
 type commandKey struct {
@@ -67,34 +81,100 @@ type commandKey struct {
 }
 
 type outcome struct {
-	Message MessageID `json:",omitempty"`
-	Attempt AttemptID `json:",omitempty"`
-	Code    string    `json:",omitempty"`
-	Ready   uint64    `json:",omitempty"`
+	Message    MessageID `json:",omitempty"`
+	Attempt    AttemptID `json:",omitempty"`
+	Code       string    `json:",omitempty"`
+	Ready      uint64    `json:",omitempty"`
+	Settled    uint64    `json:",omitempty" cbor:",omitempty"`
+	ClaimCode  string    `json:",omitempty" cbor:",omitempty"`
+	BatchFirst AttemptID `json:",omitempty" cbor:",omitempty"`
+	BatchCount uint32    `json:",omitempty" cbor:",omitempty"`
 }
 
 // Apply executes one committed queue command. The caller serializes machine
 // methods in log order for each replica.
 func (m *Machine) Apply(data []byte) []byte {
-	c, err := DecodeCommand(data)
-	var r QueueResponse
-	if err != nil {
-		r = failure(ErrInvalidCommand)
-	} else {
-		r = m.apply(c)
-	}
-	reply, err := encodeFrame(r, r.Result.Delivery.Body)
-	if err != nil {
-		reply, _ = encodeFrame(failure(ErrCapacity), nil)
-	}
+	reply, _ := m.ApplyCommitted(data, true)
 	return reply
+}
+
+// ApplyCommitted preserves all queue and session transitions. It materializes a
+// response only when the local Raft request still has a waiter.
+func (m *Machine) ApplyCommitted(data []byte, wantReply bool) ([]byte, error) {
+	return m.ApplyJournaled(data, wantReply, nil)
+}
+
+// ApplyJournaled may retain a reference to large bodies in source. Source must
+// provide immutable command bytes at offset zero for the lifetime of the group.
+func (m *Machine) ApplyJournaled(data []byte, wantReply bool, source io.ReaderAt) ([]byte, error) {
+	return m.applyCommitted(data, wantReply, source, encodeQueueReply)
+}
+
+const minDeferredReplyBytes = 32 << 10
+
+// ApplyJournaledReply applies a command and captures large replies for later
+// encoding. The encoder uses only the captured outcome and its immutable
+// payloads. The caller keeps journal sources readable until encoding finishes.
+func (m *Machine) ApplyJournaledReply(data []byte, wantReply bool, source io.ReaderAt) (inline []byte, encode func() ([]byte, error), err error) {
+	reply := m.applyCommand(data, wantReply, source)
+	if !wantReply {
+		return nil, nil, nil
+	}
+	if reply.deliveryBytes()+reply.assignmentPageBytes >= minDeferredReplyBytes {
+		return nil, func() ([]byte, error) { return encodeQueueReply(reply) }, nil
+	}
+	inline, err = encodeQueueReply(reply)
+	return inline, nil, err
+}
+
+func (m *Machine) applyCommitted(data []byte, wantReply bool, source io.ReaderAt, encode func(QueueResponse) ([]byte, error)) ([]byte, error) {
+	reply := m.applyCommand(data, wantReply, source)
+	if !wantReply {
+		return nil, nil
+	}
+	return encode(reply)
+}
+
+func (m *Machine) applyCommand(data []byte, wantReply bool, source io.ReaderAt) QueueResponse {
+	if IsAssignmentCommand(data) && !m.assignments {
+		return failure(ErrInvalidCommand)
+	}
+	c, err := DecodeCommand(data)
+	if err != nil {
+		return failure(ErrInvalidCommand)
+	}
+	// The validated command body is the suffix of data.
+	origin := journalBodyOrigin{source: source, offset: int64(len(data) - len(c.Body))}
+	return m.apply(c, wantReply, origin)
+}
+
+func encodeQueueReply(r QueueResponse) ([]byte, error) {
+	if r.assignmentPageEncode != nil {
+		page, err := r.assignmentPageEncode()
+		if err != nil {
+			return nil, err
+		}
+		if len(page) <= MaxSettlementAssignmentPageBytes {
+			return encodeFrame(r, page)
+		}
+		r.AssignmentAfter = nil
+	}
+	if r.DeliveryBatch {
+		return encodeClaimBatchResponse(r)
+	}
+	delivery := r.Result.Delivery
+	frame, err := encodeFrameHeader(r, delivery.bodySize())
+	if err != nil {
+		return encodeFrame(failure(ErrCapacity), nil)
+	}
+	return delivery.appendBody(frame)
 }
 
 func validQueueName(name string) bool {
 	return name != "" && len(name) <= 1024 && utf8.ValidString(name)
 }
 
-func (m *Machine) apply(c QueueCommand) QueueResponse {
+func (m *Machine) apply(c QueueCommand, wantReply bool, origin journalBodyOrigin) QueueResponse {
 	switch c.Kind {
 	case ExpireSessions:
 		if c.Deadline <= 0 {
@@ -102,9 +182,13 @@ func (m *Machine) apply(c QueueCommand) QueueResponse {
 		}
 		return QueueResponse{Count: m.expire(c.Deadline)}
 	case ListQueues:
+		if !wantReply {
+			return QueueResponse{}
+		}
 		return m.list()
 	case DeclareQueue, DescribeQueue, DeleteQueue, PurgeQueue, OpenQueueSession, RenewQueueSession,
-		ReleaseQueueSession, PublishMessage, ClaimMessage, AckMessage, RequeueMessage, DropMessage:
+		ReleaseQueueSession, PublishMessage, ClaimMessage, AckMessage, RequeueMessage, DropMessage, SettleBatch,
+		PublishBatch, ClaimBatch, AckAndClaim, SetAssignmentCredit:
 	default:
 		return failure(ErrInvalidCommand)
 	}
@@ -122,7 +206,8 @@ func (m *Machine) apply(c QueueCommand) QueueResponse {
 	if c.Kind == DescribeQueue {
 		return QueueResponse{Queue: q.info(c.Queue)}
 	}
-	if c.Incarnation != q.ID && !(c.Kind == PublishMessage && c.Incarnation == 0 && c.Session == 0) {
+	usesCurrentQueue := (c.Kind == PublishMessage || c.Kind == PublishBatch) && c.Incarnation == 0 && c.Session == 0
+	if c.Incarnation != q.ID && !usesCurrentQueue {
 		return failure(ErrQueueIncarnation)
 	}
 
@@ -135,6 +220,8 @@ func (m *Machine) apply(c QueueCommand) QueueResponse {
 		return m.open(c, q)
 	case ReleaseQueueSession, RenewQueueSession:
 		return m.updateLease(c, q)
+	case PublishBatch:
+		return m.publishBatch(q, c.Body, origin, c.packedVersion != 0)
 	case PublishMessage:
 		if len(c.Body) > maxMessageBytes {
 			return failure(ErrCapacity)
@@ -143,10 +230,10 @@ func (m *Machine) apply(c QueueCommand) QueueResponse {
 			if c.Sequence != 0 {
 				return failure(ErrInvalidSequence)
 			}
-			return m.publish(q, c.Body)
+			return m.publish(q, c.Body, origin, c.logicalSize)
 		}
 	}
-	return m.operate(c, q)
+	return m.operate(c, q, wantReply, origin)
 }
 
 func (m *Machine) declare(c QueueCommand, q *queueState) QueueResponse {
@@ -227,7 +314,8 @@ func (m *Machine) open(c QueueCommand, q *queueState) QueueResponse {
 		if prior == nil {
 			return failure(ErrSessionClosed)
 		}
-		if prior.Owner != c.Owner || prior.Prefetch != c.Prefetch || prior.Consumer != c.Consumer {
+		if prior.Owner != c.Owner || prior.Prefetch != c.Prefetch || prior.Consumer != c.Consumer ||
+			prior.AutoAssign != c.AutoAssign {
 			return failure(ErrSessionConflict)
 		}
 		return QueueResponse{Queue: q.info(c.Queue)}
@@ -241,13 +329,19 @@ func (m *Machine) open(c QueueCommand, q *queueState) QueueResponse {
 	if q.Sessions == nil {
 		q.Sessions = make(map[SessionID]*sessionState)
 	}
-	q.Sessions[c.Session] = &sessionState{
-		Owner: c.Owner, Deadline: c.Deadline, Prefetch: c.Prefetch, Consumer: c.Consumer,
+	session := &sessionState{
+		Owner: c.Owner, Deadline: c.Deadline, Prefetch: c.Prefetch, Consumer: c.Consumer, AutoAssign: c.AutoAssign,
 	}
+	q.Sessions[c.Session] = session
 	q.LastSession = c.Session
 	m.state.sessions++
 	if c.Consumer {
 		q.consumers++
+	}
+	if session.AutoAssign {
+		session.RegisteredCredit = c.Prefetch
+		q.addEligibleConsumer(c.Session)
+		q.assignReady()
 	}
 	return QueueResponse{Queue: q.info(c.Queue)}
 }
@@ -276,6 +370,7 @@ func (m *Machine) updateLease(c QueueCommand, q *queueState) QueueResponse {
 	}
 	if c.Kind == ReleaseQueueSession {
 		m.release(q, c.Session, sess)
+		q.assignReady()
 		return QueueResponse{}
 	}
 	if c.Deadline <= 0 {
@@ -286,6 +381,9 @@ func (m *Machine) updateLease(c QueueCommand, q *queueState) QueueResponse {
 }
 
 func (m *Machine) release(q *queueState, id SessionID, sess *sessionState) {
+	if sess.AutoAssign {
+		q.removeEligibleConsumer(id)
+	}
 	attempts := make([]AttemptID, 0, len(sess.Flights))
 	for attempt := range sess.Flights {
 		attempts = append(attempts, attempt)
@@ -341,15 +439,17 @@ func (m *Machine) expire(cutoff int64) uint64 {
 			m.release(q, id, q.Sessions[id])
 			count++
 			if count == maxExpiryBatch {
+				q.assignReady()
 				return count
 			}
 		}
+		q.assignReady()
 	}
 	return count
 }
 
-func (m *Machine) publish(q *queueState, body []byte) QueueResponse {
-	size := uint64(len(body))
+func (m *Machine) publish(q *queueState, body []byte, origin journalBodyOrigin, logical int) QueueResponse {
+	size := uint64(max(logical, len(body)))
 	if m.state.bodies+size > maxBodyBytes || m.state.messages >= maxMessages {
 		return failure(ErrCapacity)
 	}
@@ -357,21 +457,38 @@ func (m *Machine) publish(q *queueState, body []byte) QueueResponse {
 		return failure(ErrIDsExhausted)
 	}
 	q.LastMessage++
-	q.Ready = append(q.Ready, messageState{ID: q.LastMessage, Body: bytes.Clone(body)})
+	message := origin.message(q.LastMessage, body)
+	if logical > len(body) {
+		message.LogicalSize = logical
+		m.state.packingSavings += uint64(logical - len(body))
+	}
+	q.Ready = append(q.Ready, message)
+	if message.cold != nil {
+		m.state.coldBytes += uint64(len(body))
+	}
 	m.state.bodies += size
 	m.state.messages++
+	q.assignReady()
 	return QueueResponse{Result: Result{MessageID: q.LastMessage}}
 }
 
 func (m *Machine) removeBody(message messageState) {
-	m.state.bodies -= uint64(len(message.Body))
+	size := uint64(message.logicalBodySize())
+	m.state.bodies -= size
+	m.state.packingSavings -= size - uint64(message.bodySize())
+	if message.cold != nil {
+		m.state.coldBytes -= uint64(message.bodySize())
+	}
 	m.state.messages--
 }
 
-func (m *Machine) operate(c QueueCommand, q *queueState) QueueResponse {
+func (m *Machine) operate(c QueueCommand, q *queueState, wantReply bool, origin journalBodyOrigin) QueueResponse {
 	sess, err := q.session(c.Session, c.Owner)
 	if err != nil {
 		return failure(err)
+	}
+	if sess.AutoAssign && isPullCommand(c.Kind) || !sess.AutoAssign && c.Kind == SetAssignmentCredit {
+		return failure(ErrInvalidCommand)
 	}
 	switch {
 	case c.Sequence == 0:
@@ -387,63 +504,136 @@ func (m *Machine) operate(c QueueCommand, q *queueState) QueueResponse {
 		key.Hash = sha256.Sum256(c.Body)
 	case AckMessage, RequeueMessage, DropMessage:
 		key.Attempt = c.Attempt
+	case SetAssignmentCredit:
+		key.Hash = assignmentCreditKey(c.Prefetch)
+	case SettleBatch:
+		var ordered [1 + 8*MaxSettlementBatch]byte
+		ordered[0] = byte(c.Settlement)
+		for i, attempt := range c.Attempts {
+			binary.BigEndian.PutUint64(ordered[1+8*i:], uint64(attempt))
+		}
+		key.Hash = sha256.Sum256(ordered[:1+8*len(c.Attempts)])
+	case ClaimBatch:
+		var limits [8]byte
+		binary.BigEndian.PutUint32(limits[:4], c.ClaimLimit)
+		binary.BigEndian.PutUint32(limits[4:], c.ClaimBytes)
+		key.Hash = sha256.Sum256(limits[:])
+	case AckAndClaim:
+		var ordered [8 + 8*MaxSettlementBatch]byte
+		binary.BigEndian.PutUint32(ordered[:4], c.ClaimLimit)
+		binary.BigEndian.PutUint32(ordered[4:8], c.ClaimBytes)
+		for i, attempt := range c.Attempts {
+			binary.BigEndian.PutUint64(ordered[8+8*i:], uint64(attempt))
+		}
+		key.Hash = sha256.Sum256(ordered[:8+8*len(c.Attempts)])
 	}
+	previousAssignment := sess.AssignedThrough
 	if c.Sequence == sess.Sequence {
 		if key != sess.LastKey {
 			return failure(ErrSequenceConflict)
 		}
-		return sess.outcome()
+	} else {
+		sess.Sequence = c.Sequence
+		sess.LastKey = key
+		sess.Last = m.applyOperation(c, q, sess, origin)
+		switch c.Kind {
+		case AckMessage, RequeueMessage, DropMessage, SettleBatch, SetAssignmentCredit:
+			if sess.AutoAssign {
+				if len(sess.Flights) < int(sess.RegisteredCredit) {
+					q.addEligibleConsumer(c.Session)
+				} else {
+					q.removeEligibleConsumer(c.Session)
+				}
+			}
+			q.assignReady()
+		}
 	}
-	sess.Sequence = c.Sequence
-	sess.LastKey = key
-	sess.Last = m.applyOperation(c, q, sess)
-	return sess.outcome()
+	if wantReply {
+		reply := sess.outcome()
+		if sess.AutoAssign && c.AssignmentAfter != nil && reply.Code == "" {
+			after := max(previousAssignment, *c.AssignmentAfter)
+			if sess.AssignedThrough > after {
+				m.captureSettlementAssignment(c, q, after, &reply)
+			}
+		}
+		return reply
+	}
+	return QueueResponse{}
 }
 
 func (sess *sessionState) outcome() QueueResponse {
 	last := sess.Last
+	if sess.LastKey.Kind == AckAndClaim {
+		return sess.ackAndClaimOutcome(last)
+	}
+	if last.BatchCount != 0 {
+		return sess.claimBatchOutcome(last)
+	}
 	if last.Attempt == 0 {
-		return QueueResponse{Code: last.Code, Queue: QueueInfo{Ready: last.Ready}, Result: Result{MessageID: last.Message}}
+		return QueueResponse{Code: last.Code, Queue: QueueInfo{Ready: last.Ready}, Result: Result{MessageID: last.Message}, Count: last.Settled}
 	}
 	message := sess.Flights[last.Attempt]
-	return QueueResponse{Queue: QueueInfo{Ready: last.Ready}, Result: Result{Delivery: Delivery{
-		MessageID: message.ID, Attempt: last.Attempt, Body: message.Body, Redelivered: message.Redelivered,
-	}}}
+	return QueueResponse{Queue: QueueInfo{Ready: last.Ready}, Result: Result{Delivery: message.delivery(last.Attempt)}}
 }
 
-func (m *Machine) applyOperation(c QueueCommand, q *queueState, sess *sessionState) outcome {
+func (m *Machine) applyOperation(c QueueCommand, q *queueState, sess *sessionState, origin journalBodyOrigin) outcome {
 	switch c.Kind {
+	case SetAssignmentCredit:
+		sess.RegisteredCredit = c.Prefetch
+		return outcome{}
 	case PublishMessage:
-		result := m.publish(q, c.Body)
+		result := m.publish(q, c.Body, origin, 0)
 		return outcome{Message: result.Result.MessageID, Code: result.Code}
 	case ClaimMessage:
 		result := q.claim(sess)
 		result.Ready = uint64(len(q.Ready))
 		return result
+	case ClaimBatch:
+		return q.claimBatch(c, sess)
+	case AckAndClaim:
+		return m.ackAndClaim(c, q, sess)
 	case AckMessage, RequeueMessage, DropMessage:
-		old, ok := sess.Flights[c.Attempt]
-		if !ok {
+		if !m.settle(q, sess, c.Kind, c.Attempt) {
 			return outcome{Code: errorsToCode[ErrUnknownAttempt]}
 		}
-		delete(sess.Flights, c.Attempt)
-		if len(sess.Flights) == 0 {
-			sess.Flights = nil
-		}
-		q.unacked--
-		if c.Kind == RequeueMessage {
-			q.requeue(old)
-		} else {
-			m.removeBody(old)
-		}
 		return outcome{}
+	case SettleBatch:
+		for i, attempt := range c.Attempts {
+			if !m.settle(q, sess, c.Settlement, attempt) {
+				return outcome{Settled: uint64(i), Code: errorsToCode[ErrUnknownAttempt]}
+			}
+		}
+		return outcome{Settled: uint64(len(c.Attempts))}
 	default:
 		return outcome{Code: errorsToCode[ErrInvalidCommand]}
 	}
 }
 
+func (m *Machine) settle(q *queueState, sess *sessionState, kind QueueCommandKind, attempt AttemptID) bool {
+	old, ok := sess.Flights[attempt]
+	if !ok {
+		return false
+	}
+	delete(sess.Flights, attempt)
+	if len(sess.Flights) == 0 {
+		sess.Flights = nil
+	}
+	q.unacked--
+	if kind == RequeueMessage {
+		q.requeue(old)
+	} else {
+		m.removeBody(old)
+	}
+	return true
+}
+
 func (q *queueState) claim(sess *sessionState) outcome {
+	credit := sess.Prefetch
+	if sess.AutoAssign {
+		credit = sess.RegisteredCredit
+	}
 	switch {
-	case uint64(len(sess.Flights)) >= uint64(sess.Prefetch):
+	case uint64(len(sess.Flights)) >= uint64(credit):
 		return outcome{Code: errorsToCode[ErrNoCredit]}
 	case len(q.Ready) == 0:
 		return outcome{Code: errorsToCode[ErrEmpty]}

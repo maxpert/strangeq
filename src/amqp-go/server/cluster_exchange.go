@@ -7,6 +7,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"maps"
 	"slices"
 	"strings"
 
@@ -87,19 +89,65 @@ type ClusterMachine struct {
 
 func NewClusterMachine() *ClusterMachine { return &ClusterMachine{} }
 
+func NewClusterAssignmentMachine() *ClusterMachine {
+	return &ClusterMachine{queues: clusterqueue.NewAssignmentMachine()}
+}
+
 func (m *ClusterMachine) Apply(data []byte) []byte {
+	result, _ := m.ApplyCommitted(data, true)
+	return result
+}
+
+func (m *ClusterMachine) ApplyJournaled(data []byte, wantReply bool, source io.ReaderAt) ([]byte, error) {
 	if len(data) == 0 || data[0] != exchangePrefix {
-		return m.queues.Apply(data)
+		return m.queues.ApplyJournaled(data, wantReply, source)
+	}
+	return m.ApplyCommitted(data, wantReply)
+}
+
+// ApplyJournaledReply can defer queue delivery encoding after applying the
+// command. Exchange results use the inline response.
+func (m *ClusterMachine) ApplyJournaledReply(data []byte, wantReply bool, source io.ReaderAt) (inline []byte, encode func() ([]byte, error), err error) {
+	if len(data) == 0 || data[0] != exchangePrefix {
+		return m.queues.ApplyJournaledReply(data, wantReply, source)
+	}
+	inline, err = m.ApplyCommitted(data, wantReply)
+	return inline, nil, err
+}
+
+func (m *ClusterMachine) ApplyCommitted(data []byte, wantReply bool) ([]byte, error) {
+	if len(data) == 0 || data[0] != exchangePrefix {
+		return m.queues.ApplyCommitted(data, wantReply)
 	}
 	var request clusterExchangeCommand
 	var response clusterExchangeReply
 	if err := json.Unmarshal(data[1:], &request); err != nil {
 		response.Code = "invalid"
 	} else {
+		if !wantReply && (request.Kind == exchangeDescribe || request.Kind == exchangeList) {
+			return nil, nil
+		}
 		response = m.applyExchange(request)
 	}
-	result, _ := json.Marshal(response)
-	return result
+	if !wantReply {
+		return nil, nil
+	}
+	return json.Marshal(response)
+}
+
+// Query accepts exchange descriptions. The caller establishes a quorum fence.
+func (m *ClusterMachine) Query(data []byte) ([]byte, error) {
+	if len(data) == 0 || data[0] != exchangePrefix {
+		return nil, errors.New("invalid cluster exchange query")
+	}
+	var request clusterExchangeCommand
+	if err := json.Unmarshal(data[1:], &request); err != nil {
+		return nil, err
+	}
+	if request.Kind != exchangeDescribe {
+		return nil, errors.New("unsupported cluster exchange query")
+	}
+	return json.Marshal(m.describeExchange(request.Name))
 }
 
 func knownClusterExchange(name string) (clusterExchange, bool) {
@@ -111,7 +159,25 @@ func knownClusterExchange(name string) (clusterExchange, bool) {
 	}
 }
 
+func (m *ClusterMachine) describeExchange(name string) clusterExchangeReply {
+	if len(name) == 0 || len(name) > 255 {
+		return clusterExchangeReply{Code: "invalid"}
+	}
+	exchange, exists := m.exchanges[name]
+	if !exists {
+		exchange, exists = knownClusterExchange(name)
+	}
+	if !exists {
+		return clusterExchangeReply{Code: "missing"}
+	}
+	return clusterExchangeReply{Exchange: exchange}
+}
+
 func (m *ClusterMachine) applyExchange(request clusterExchangeCommand) clusterExchangeReply {
+	if request.Kind == exchangeDescribe {
+		// Preserve replay of describe entries from existing shard logs.
+		return m.describeExchange(request.Name)
+	}
 	if request.Kind == exchangeList {
 		exchanges := make([]clusterExchange, 0, len(m.exchanges))
 		for _, exchange := range m.exchanges {
@@ -133,8 +199,6 @@ func (m *ClusterMachine) applyExchange(request clusterExchangeCommand) clusterEx
 		return clusterExchangeReply{Code: "missing"}
 	}
 	switch request.Kind {
-	case exchangeDescribe:
-		return clusterExchangeReply{Exchange: old}
 	case exchangeDeclare:
 		want := request.Exchange
 		if !isSupportedExchangeType(want.Type) || want.Name != request.Name || len(want.Arguments) > 64<<10 {
@@ -213,11 +277,26 @@ func exchangeRecordSize(ex clusterExchange) int {
 	return len(key) + 1 + len(record) + 1
 }
 
+// CaptureSnapshot freezes shard state for one encoder. The caller serializes
+// capture with machine changes and keeps journal sources open through encoding.
+func (m *ClusterMachine) CaptureSnapshot() func([]byte) ([]byte, error) {
+	captured := *m
+	captured.queues = m.queues.CloneForSnapshot()
+	// Binding updates replace their slices by copy, and arguments are immutable.
+	captured.exchanges = maps.Clone(m.exchanges)
+	return captured.AppendSnapshot
+}
+
+func (m *ClusterMachine) CheckpointCostBytes() uint64 {
+	return m.queues.EstimatedSnapshotBytes() + uint64(m.exchangeBytes)
+}
+
 func (m *ClusterMachine) Snapshot() ([]byte, error) {
-	queueSnapshot, err := m.queues.Snapshot()
-	if err != nil {
-		return nil, err
-	}
+	return m.AppendSnapshot(nil)
+}
+
+// AppendSnapshot appends a complete AMQP shard snapshot to dst.
+func (m *ClusterMachine) AppendSnapshot(dst []byte) ([]byte, error) {
 	exchangeSnapshot, err := json.Marshal(m.exchanges)
 	if err != nil {
 		return nil, err
@@ -225,11 +304,9 @@ func (m *ClusterMachine) Snapshot() ([]byte, error) {
 	if len(exchangeSnapshot) > maxExchangeSnapshot {
 		return nil, errors.New("cluster exchange snapshot exceeds its size limit")
 	}
-	out := make([]byte, 0, 5+len(exchangeSnapshot)+len(queueSnapshot))
-	out = append(out, 1)
-	out = binary.BigEndian.AppendUint32(out, uint32(len(exchangeSnapshot)))
-	out = append(out, exchangeSnapshot...)
-	return append(out, queueSnapshot...), nil
+	header := [5]byte{1}
+	binary.BigEndian.PutUint32(header[1:], uint32(len(exchangeSnapshot)))
+	return m.queues.AppendSnapshot(dst, header[:], exchangeSnapshot)
 }
 
 func (m *ClusterMachine) Restore(data []byte) error {
@@ -240,7 +317,7 @@ func (m *ClusterMachine) Restore(data []byte) error {
 	if length > maxExchangeSnapshot || length > len(data)-5 {
 		return errors.New("invalid AMQP exchange snapshot length")
 	}
-	var restored ClusterMachine
+	restored := ClusterMachine{queues: m.queues}
 	if err := json.Unmarshal(data[5:5+length], &restored.exchanges); err != nil {
 		return err
 	}
@@ -268,6 +345,10 @@ func exchangeRequest(request clusterExchangeCommand) ([]byte, error) {
 	return append([]byte{exchangePrefix}, data...), nil
 }
 
+type exchangeReader interface {
+	Query(context.Context, string, []byte) ([]byte, error)
+}
+
 func (b *ClusterBroker) exchange(ctx context.Context, name string, request clusterExchangeCommand) (clusterExchangeReply, error) {
 	request.Name = name
 	encoded, err := exchangeRequest(request)
@@ -279,7 +360,11 @@ func (b *ClusterBroker) exchange(ctx context.Context, name string, request clust
 	key := "\x00exchange:" + name
 	var raw []byte
 	if request.Kind == exchangeDescribe {
-		raw, err = b.submitReplay(ctx, key, encoded)
+		if reader, ok := b.cluster.(exchangeReader); ok {
+			raw, err = reader.Query(ctx, key, encoded)
+		} else {
+			raw, err = b.submitReplay(ctx, key, encoded)
+		}
 	} else {
 		raw, err = b.cluster.Submit(ctx, key, encoded)
 	}
@@ -427,7 +512,10 @@ func (b *ClusterBroker) route(ctx context.Context, name, key string, headers map
 	if err != nil {
 		return nil, err
 	}
-	ex := reply.Exchange
+	return routeClusterExchange(reply.Exchange, key, headers)
+}
+
+func routeClusterExchange(ex clusterExchange, key string, headers map[string]interface{}) ([]clusterTarget, error) {
 	if ex.Internal {
 		return nil, broker.ErrExchangeInternal
 	}

@@ -17,6 +17,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/maxpert/amqp-go/internal/clusterqueue"
 	"github.com/maxpert/amqp-go/internal/clusterraft"
 	"github.com/maxpert/amqp-go/internal/clusterwire"
 	pb "go.etcd.io/raft/v3/raftpb"
@@ -24,48 +25,64 @@ import (
 )
 
 const (
-	defaultShards  = 32
-	maxEntryBytes  = 32 << 20
-	maxWireBytes   = 128 << 20
-	requestTimeout = 6 * time.Second
+	defaultShards                   = 32
+	maxEntryBytes                   = 32 << 20
+	maxWireBytes                    = 128 << 20
+	requestTimeout                  = 6 * time.Second
+	ackAndClaimPeerProtocol         = 2
+	assignmentPeerProtocol          = 3
+	compressedBodyPeerProtocol      = 4
+	smallCompressedBodyPeerProtocol = 5
 )
 
 var ErrUnavailable = errors.New("shard leader unavailable")
 var ErrUncertain = errors.New("shard command outcome uncertain")
 
 type Config struct {
-	ClusterID                string
-	Peer                     Peer
-	Seeds                    []Peer
-	Discovery                []string
-	Listen, Directory, Token string
-	Shards                   uint64
-	AllowInsecure            bool
-	TLS                      *tls.Config
-	NewMachine               func(uint64) clusterraft.Machine
-	ExpiryCommand            func(time.Time) []byte
+	ClusterID                               string
+	Peer                                    Peer
+	Seeds                                   []Peer
+	Discovery                               []string
+	Listen, Directory, Token                string
+	Shards                                  uint64
+	AllowInsecure                           bool
+	ExperimentalRaftJournal                 bool
+	ExperimentalRaftRangeSync               bool
+	ExperimentalAckAndClaim                 bool
+	ExperimentalAssignments                 bool
+	ExperimentalReplicaBodies               bool
+	ExperimentalRaftJournalDualStream       bool
+	ExperimentalJournalBodyCompression      bool
+	ExperimentalJournalSmallBodyCompression bool
+	TLS                                     *tls.Config
+	NewMachine                              func(uint64) clusterraft.Machine
+	ExpiryCommand                           func(time.Time) []byte
 }
 
 type Node struct {
-	cfg       Config
-	nonce     string
-	catalog   *catalog
-	current   atomic.Pointer[view]
-	viewMu    sync.Mutex
-	client    *clusterwire.Client
-	wire      *clusterwire.Server
-	ctx       context.Context
-	cancel    context.CancelFunc
-	groupsMu  sync.RWMutex
-	groups    map[uint64]*clusterraft.Group
-	routeMu   sync.RWMutex
-	routes    map[uint64]uint64
-	sendMu    sync.Mutex
-	lanes     map[uint64][3]chan packet
-	sendBytes atomic.Int64
-	wg        sync.WaitGroup
-	closeOnce sync.Once
-	closeErr  error
+	cfg                    Config
+	nonce                  string
+	catalog                *catalog
+	current                atomic.Pointer[view]
+	viewMu                 sync.Mutex
+	client                 *clusterwire.Client
+	wire                   *clusterwire.Server
+	ctx                    context.Context
+	cancel                 context.CancelFunc
+	groupsMu               sync.RWMutex
+	groups                 map[uint64]*clusterraft.Group
+	journal                nodeJournalOwner
+	assignmentReplicaSlots chan struct{}
+	routeMu                sync.RWMutex
+	routes                 map[uint64]uint64
+	waitCount              atomic.Int32
+	sendMu                 sync.Mutex
+	receipts               raftReceipts
+	lanes                  map[uint64][3]chan packet
+	sendBytes              atomic.Int64
+	wg                     sync.WaitGroup
+	closeOnce              sync.Once
+	closeErr               error
 }
 
 type identity struct {
@@ -95,6 +112,27 @@ func open(cfg Config, initialize bool) (*Node, error) {
 	if !clusterraft.ValidMemberID(cfg.Peer.ID) || !validAddress(cfg.Peer.Address) || cfg.Listen == "" || cfg.Directory == "" || cfg.NewMachine == nil {
 		return nil, errors.New("cluster requires a valid peer, listener, storage directory and machine")
 	}
+	if cfg.ExperimentalRaftRangeSync && !cfg.ExperimentalRaftJournal {
+		return nil, errors.New("cluster range sync requires journal storage")
+	}
+	if cfg.ExperimentalRaftJournalDualStream && (!cfg.ExperimentalRaftJournal || !cfg.ExperimentalRaftRangeSync) {
+		return nil, errors.New("cluster two-stream journal requires journal storage and range sync")
+	}
+	if cfg.ExperimentalAckAndClaim && !cfg.ExperimentalRaftJournal {
+		return nil, errors.New("cluster ACK and claim requires journal storage")
+	}
+	if cfg.ExperimentalAssignments && (!cfg.ExperimentalRaftJournal || cfg.ExperimentalAckAndClaim) {
+		return nil, errors.New("cluster assignments require a separate journal storage mode")
+	}
+	if cfg.ExperimentalReplicaBodies && !cfg.ExperimentalAssignments {
+		return nil, errors.New("cluster replica bodies require assignments")
+	}
+	if cfg.ExperimentalJournalBodyCompression && !cfg.ExperimentalAssignments {
+		return nil, errors.New("cluster journal body compression requires assignments")
+	}
+	if cfg.ExperimentalJournalSmallBodyCompression && !cfg.ExperimentalJournalBodyCompression {
+		return nil, errors.New("cluster journal small body compression requires journal body compression")
+	}
 	c, err := newCatalog(cfg.ClusterID, cfg.Shards, cfg.Seeds)
 	if err != nil {
 		return nil, err
@@ -106,6 +144,18 @@ func open(cfg Config, initialize bool) (*Node, error) {
 	}
 	wcfg := clusterwire.Config{Listen: cfg.Listen, ClusterID: cfg.ClusterID, Token: cfg.Token, TLS: cfg.TLS,
 		AllowInsecure: cfg.AllowInsecure, Timeout: requestTimeout + time.Second, MaxBodyBytes: maxWireBytes}
+	if cfg.ExperimentalAckAndClaim {
+		wcfg.ProtocolVersion = ackAndClaimPeerProtocol
+	}
+	if cfg.ExperimentalAssignments {
+		wcfg.ProtocolVersion = assignmentPeerProtocol
+	}
+	if cfg.ExperimentalJournalBodyCompression {
+		wcfg.ProtocolVersion = compressedBodyPeerProtocol
+	}
+	if cfg.ExperimentalJournalSmallBodyCompression {
+		wcfg.ProtocolVersion = smallCompressedBodyPeerProtocol
+	}
 	client, err := clusterwire.NewClient(wcfg)
 	if err != nil {
 		return nil, err
@@ -113,6 +163,9 @@ func open(cfg Config, initialize bool) (*Node, error) {
 	ctx, cancel := context.WithCancel(context.Background())
 	n := &Node{cfg: cfg, catalog: c, client: client, ctx: ctx, cancel: cancel, groups: map[uint64]*clusterraft.Group{},
 		routes: map[uint64]uint64{}, lanes: map[uint64][3]chan packet{}}
+	if cfg.ExperimentalReplicaBodies && !initialize {
+		n.assignmentReplicaSlots = make(chan struct{}, maxAssignmentReplicaRequests)
+	}
 	success := false
 	defer func() {
 		if !success {
@@ -121,6 +174,11 @@ func open(cfg Config, initialize bool) (*Node, error) {
 	}()
 	if err := n.prepareIdentity(seed, initialize); err != nil {
 		return nil, err
+	}
+	if cfg.ExperimentalRaftJournal {
+		if err := n.prepareJournal(); err != nil {
+			return nil, err
+		}
 	}
 	n.current.Store(&c.initial)
 	cache, err := os.ReadFile(n.path("catalog-cache"))
@@ -160,7 +218,11 @@ func (n *Node) retired(id uint64) string  { return n.path("retired-" + strconv.F
 func (n *Node) validGroup(id uint64) bool { return id == catalogID || (id > 0 && id <= n.cfg.Shards) }
 
 func (n *Node) prepareIdentity(seed, initialize bool) error {
-	p := n.path("identity.json")
+	name, mode, err := n.storageIdentity()
+	if err != nil {
+		return err
+	}
+	p := n.path(name)
 	want := identity{Peer: n.cfg.Peer, Cluster: n.cfg.ClusterID, Shards: n.cfg.Shards, Seeds: n.catalog.initial.Nodes}
 	raw, err := os.ReadFile(p)
 	if errors.Is(err, os.ErrNotExist) {
@@ -194,8 +256,11 @@ func (n *Node) prepareIdentity(seed, initialize bool) error {
 		if err != nil {
 			return err
 		}
-		if len(entries) != 0 {
+		if !freshStorageDirectory(entries) {
 			return errors.New("cluster directory exists without its persistent identity")
+		}
+		if err := n.claimStorageMode(mode); err != nil {
+			return err
 		}
 		if !seed {
 			var b [16]byte
@@ -204,8 +269,18 @@ func (n *Node) prepareIdentity(seed, initialize bool) error {
 			}
 			want.Nonce = hex.EncodeToString(b[:])
 		}
-		n.nonce = want.Nonce
-		return durableFile(p, encode(want))
+		if err := provisionFile(p, encode(want)); !errors.Is(err, os.ErrExist) {
+			if err == nil {
+				n.nonce = want.Nonce
+			}
+			return err
+		}
+		// A matching initializer published the identity while we created
+		// the mode claim. Sync the directory before trusting that identity.
+		if err := syncStorageDirectory(n.cfg.Directory); err != nil {
+			return err
+		}
+		raw, err = os.ReadFile(p)
 	}
 	if err != nil {
 		return err
@@ -241,7 +316,15 @@ func durableDirectory(path string) error {
 }
 
 func durableFile(path string, value []byte) error {
-	f, err := os.CreateTemp(filepath.Dir(path), ".cluster-")
+	return writeDurableFile(path, value, ".cluster-", os.Rename)
+}
+
+func provisionFile(path string, value []byte) error {
+	return writeDurableFile(path, value, clusterProvisionTemp, os.Link)
+}
+
+func writeDurableFile(path string, value []byte, prefix string, publish func(string, string) error) error {
+	f, err := os.CreateTemp(filepath.Dir(path), prefix)
 	if err != nil {
 		return err
 	}
@@ -256,10 +339,14 @@ func durableFile(path string, value []byte) error {
 	if err != nil {
 		return err
 	}
-	if err = os.Rename(f.Name(), path); err != nil {
+	if err = publish(f.Name(), path); err != nil {
 		return err
 	}
-	dir, err := os.Open(filepath.Dir(path))
+	return syncStorageDirectory(filepath.Dir(path))
+}
+
+func syncStorageDirectory(path string) error {
+	dir, err := os.Open(path)
 	if err != nil {
 		return err
 	}
@@ -299,6 +386,14 @@ func (n *Node) openExisting(seed, initialize bool) error {
 			ids[id] = true
 		}
 	}
+	if n.journal != nil {
+		for _, id := range n.journal.GroupIDs() {
+			if !n.validGroup(id) {
+				return fmt.Errorf("persistent raft journal contains unknown group %d", id)
+			}
+			ids[id] = true
+		}
+	}
 	if seed {
 		ids[catalogID] = true
 		for id := uint64(1); id <= n.cfg.Shards; id++ {
@@ -311,12 +406,14 @@ func (n *Node) openExisting(seed, initialize bool) error {
 			return err
 		}
 		if retired {
-			if err := os.RemoveAll(n.store(id)); err != nil {
-				return err
+			if n.journal == nil {
+				if err := os.RemoveAll(n.store(id)); err != nil {
+					return err
+				}
 			}
 			continue
 		}
-		exists, err := clusterraft.Exists(n.store(id))
+		exists, err := n.storeExists(id)
 		if err != nil {
 			return err
 		}
@@ -348,7 +445,7 @@ func (n *Node) openGroup(id uint64, peers []uint64) error {
 	if retired {
 		return errors.New("shard replica identity retired")
 	}
-	exists, err := clusterraft.Exists(n.store(id))
+	exists, err := n.storeExists(id)
 	if err != nil {
 		return err
 	}
@@ -363,9 +460,21 @@ func (n *Node) openGroup(id uint64, peers []uint64) error {
 	if id != catalogID {
 		machine = n.cfg.NewMachine(id)
 	}
-	g, err := clusterraft.Open(clusterraft.Config{
+	storeOpen := clusterraft.Open
+	var gatherProposal func([]byte) time.Duration
+	if n.journal != nil {
+		storeOpen = n.journal.OpenGroup
+		if n.cfg.ExperimentalAssignments && id != catalogID {
+			gatherProposal = gatherSettlement
+		}
+	}
+	g, err := storeOpen(clusterraft.Config{
 		ID: n.cfg.Peer.ID, GroupID: id, Dir: n.store(id), Peers: peers, Machine: machine, MaxEntryBytes: maxEntryBytes,
-		Send: func(msg *pb.Message) error { return n.send(id, msg) },
+		DeferJournalCommit:           n.journal != nil && id != catalogID,
+		BackgroundJournalCheckpoints: n.journal != nil && id != catalogID,
+		AssignmentReplicaBodies:      n.assignmentReplicaSlots != nil && id != catalogID,
+		GatherProposal:               gatherProposal,
+		Send:                         func(msg *pb.Message) error { return n.send(id, msg) },
 	})
 	if err != nil {
 		return err
@@ -380,6 +489,13 @@ func (n *Node) openGroup(id uint64, peers []uint64) error {
 	n.groups[id] = g
 	n.groupsMu.Unlock()
 	return nil
+}
+
+func gatherSettlement(data []byte) time.Duration {
+	if len(data) <= 4096 && clusterqueue.IsSettlementCommand(data) {
+		return 125 * time.Microsecond
+	}
+	return 0
 }
 
 func (n *Node) group(id uint64) *clusterraft.Group {
@@ -415,17 +531,35 @@ func (n *Node) install(v view) {
 func (n *Node) enrolled(v view) bool {
 	return address(v, n.cfg.Peer.ID) == n.cfg.Peer.Address && v.Nonces[n.cfg.Peer.ID] == n.nonce
 }
+func (n *Node) SupportsAckAndClaim() bool { return n.cfg.ExperimentalAckAndClaim }
+
+func (n *Node) SupportsAssignments() bool { return n.cfg.ExperimentalAssignments }
+
+func (n *Node) SupportsJournalBodyCompression() bool { return n.cfg.ExperimentalJournalBodyCompression }
+
+func (n *Node) SupportsJournalSmallBodyCompression() bool {
+	return n.cfg.ExperimentalJournalSmallBodyCompression
+}
+
 func (n *Node) Ready() error {
 	if n.ctx.Err() != nil || !n.enrolled(n.view()) {
 		return ErrUnavailable
+	}
+	if n.journal != nil {
+		if err := n.journal.Failure(); err != nil {
+			return errors.Join(ErrUnavailable, err)
+		}
 	}
 	return nil
 }
 func (n *Node) Close() error {
 	n.closeOnce.Do(func() {
 		n.cancel()
+		// Quiesce admissions that can register workers before waiting on n.wg.
 		n.sendMu.Lock()
 		n.sendMu.Unlock()
+		n.receipts.mu.Lock()
+		n.receipts.mu.Unlock()
 		if n.wire != nil {
 			ctx, cancel := context.WithTimeout(context.Background(), requestTimeout)
 			n.closeErr = n.wire.Close(ctx)
@@ -434,6 +568,9 @@ func (n *Node) Close() error {
 		n.wg.Wait()
 		for _, g := range n.groups {
 			n.closeErr = errors.Join(n.closeErr, g.Close())
+		}
+		if n.journal != nil {
+			n.closeErr = errors.Join(n.closeErr, n.journal.Close())
 		}
 		n.client.Close()
 	})
@@ -485,53 +622,84 @@ func (n *Node) send(group uint64, msg *pb.Message) error {
 
 func (n *Node) sendLoop(peer uint64, queue <-chan packet) {
 	defer n.wg.Done()
+	var ahead packet
+	defer func() { n.discardRaftSendQueue(queue, ahead) }()
+	var messages [16]*pb.Message
 	for n.ctx.Err() == nil {
-		select {
-		case <-n.ctx.Done():
-			return
-		case p := <-queue:
-			timeout := 1500 * time.Millisecond
-			snapshot := p.msg.GetType() == pb.MsgSnap
-			if snapshot {
-				timeout = requestTimeout
+		p := ahead
+		ahead = packet{}
+		if p.msg == nil {
+			select {
+			case <-n.ctx.Done():
+				return
+			case p = <-queue:
 			}
-			ctx, cancel := context.WithTimeout(n.ctx, timeout)
-			err := n.client.Raft(ctx, address(n.view(), peer), p.group, []*pb.Message{p.msg})
-			cancel()
-			n.sendBytes.Add(-p.bytes)
-			g := n.group(p.group)
-			if g == nil {
-				continue
-			}
-			ctx, cancel = context.WithTimeout(n.ctx, time.Second)
-			if snapshot {
-				_ = g.ReportSnapshot(ctx, peer, err == nil)
-			} else if err != nil {
-				_ = g.ReportUnreachable(ctx, peer)
-			}
-			cancel()
 		}
+		messages[0] = p.msg
+		batch, charged := messages[:1], p.bytes
+		timeout := 1500 * time.Millisecond
+		snapshot := p.msg.GetType() == pb.MsgSnap
+		if snapshot {
+			timeout = requestTimeout
+		} else {
+			batch, charged, ahead = gatherRaftSendBatch(queue, p.group, batch, charged)
+		}
+		if n.ctx.Err() != nil {
+			n.sendBytes.Add(-charged)
+			return
+		}
+		ctx, cancel := context.WithTimeout(n.ctx, timeout)
+		err := n.client.Raft(ctx, address(n.view(), peer), p.group, batch)
+		cancel()
+		n.sendBytes.Add(-charged)
+		clear(batch)
+
+		if !snapshot && err == nil {
+			continue
+		}
+		g := n.group(p.group)
+		if g == nil {
+			continue
+		}
+		ctx, cancel = context.WithTimeout(n.ctx, time.Second)
+		if snapshot {
+			_ = g.ReportSnapshot(ctx, peer, err == nil)
+		} else {
+			_ = g.ReportUnreachable(ctx, peer)
+		}
+		cancel()
 	}
 }
 
-func (n *Node) Raft(ctx context.Context, id uint64, messages []*pb.Message) error {
-	g := n.group(id)
-	if g == nil {
-		return ErrUnavailable
-	}
-	v := n.view()
-	if !n.enrolled(v) {
-		return ErrUnavailable
-	}
-	for _, m := range messages {
-		if m == nil || m.GetTo() != n.cfg.Peer.ID || address(v, m.GetFrom()) == "" {
-			return errors.New("invalid Raft sender or recipient")
+func gatherRaftSendBatch(queue <-chan packet, group uint64, batch []*pb.Message, charged int64) ([]*pb.Message, int64, packet) {
+	const target = 1 << 20
+	// The wire format has a 10-byte batch header and a 4-byte length per
+	// message. A first packet above the target still travels on its own.
+	size := 10 + 4 + charged
+	for len(batch) < cap(batch) && size < target {
+		select {
+		case next := <-queue:
+			if next.group != group || next.msg.GetType() == pb.MsgSnap || size+4+next.bytes > target {
+				return batch, charged, next
+			}
+			batch = append(batch, next.msg)
+			size += 4 + next.bytes
+			charged += next.bytes
+		default:
+			return batch, charged, packet{}
 		}
 	}
-	for _, m := range messages {
-		if err := g.Step(ctx, m); err != nil {
-			return err
-		}
+	return batch, charged, packet{}
+}
+
+func (n *Node) discardRaftSendQueue(queue <-chan packet, ahead packet) {
+	// A sender that passed the cancellation check can still be enqueuing.
+	// Take the admission lock before returning its packet charge.
+	n.sendMu.Lock()
+	defer n.sendMu.Unlock()
+	charged := ahead.bytes
+	for len(queue) != 0 {
+		charged += (<-queue).bytes
 	}
-	return nil
+	n.sendBytes.Add(-charged)
 }

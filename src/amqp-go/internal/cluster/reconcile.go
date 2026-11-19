@@ -159,6 +159,11 @@ func (n *Node) removeLocal(group uint64, g *clusterraft.Group) error {
 	n.groupsMu.Lock()
 	delete(n.groups, group)
 	n.groupsMu.Unlock()
+	if n.journal != nil {
+		// The durable retirement marker fences the old group's records.
+		// This prototype retains the shared journal until Node closes.
+		return g.Close()
+	}
 	return errors.Join(g.Close(), os.RemoveAll(n.store(group)))
 }
 

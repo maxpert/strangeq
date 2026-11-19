@@ -94,7 +94,13 @@ func (s *Server) handleBasicQos(conn *protocol.Connection, channelID uint16, pay
 	channel.Mutex.Unlock()
 
 	for _, id := range consumerIDs {
-		s.Broker.UpdateConsumerPrefetch(id, qosMethod.PrefetchCount)
+		if clustered, ok := s.Broker.(*ClusterBroker); ok {
+			if err := clustered.updateConsumerPrefetch(id, qosMethod.PrefetchCount); err != nil {
+				return err
+			}
+		} else {
+			s.Broker.UpdateConsumerPrefetch(id, qosMethod.PrefetchCount)
+		}
 	}
 
 	return s.sendBasicQosOK(conn, channelID)
@@ -102,6 +108,10 @@ func (s *Server) handleBasicQos(conn *protocol.Connection, channelID uint16, pay
 
 // handleBasicPublish handles the basic.publish method
 func (s *Server) handleBasicPublish(conn *protocol.Connection, channelID uint16, payload []byte) error {
+	return s.handleBasicPublishWithBurst(conn, channelID, payload, nil)
+}
+
+func (s *Server) handleBasicPublishWithBurst(conn *protocol.Connection, channelID uint16, payload []byte, publishes *clusterPublishBurst) error {
 	// Deserialize the basic.publish method
 	publishMethod := protocol.GetBasicPublishMethod()
 	err := publishMethod.Deserialize(payload)
@@ -111,11 +121,17 @@ func (s *Server) handleBasicPublish(conn *protocol.Connection, channelID uint16,
 			zap.Error(err),
 			zap.String("connection_id", conn.ID),
 			zap.Uint16("channel_id", channelID))
+		if err := publishes.flush(); err != nil {
+			return err
+		}
 		return s.malformed(conn, err, 60, 40)
 	}
 
 	if publishMethod.Immediate {
 		protocol.PutBasicPublishMethod(publishMethod)
+		if err := publishes.flush(); err != nil {
+			return err
+		}
 		return s.connectionError(conn, amqperrors.NotImplemented, "NOT_IMPLEMENTED - immediate=true", 60, 40)
 	}
 
@@ -134,6 +150,10 @@ func (s *Server) handleBasicPublish(conn *protocol.Connection, channelID uint16,
 		Resource:     publishMethod.Exchange,
 		VHost:        conn.Vhost,
 	}); err != nil {
+		protocol.PutBasicPublishMethod(publishMethod)
+		if err := publishes.flush(); err != nil {
+			return err
+		}
 		return s.authzChannelError(conn, channelID, err, 60, 40)
 	}
 
@@ -182,12 +202,19 @@ func (s *Server) handleBasicPublish(conn *protocol.Connection, channelID uint16,
 
 // processHeaderFrame processes content header frames
 func (s *Server) processHeaderFrame(conn *protocol.Connection, frame *protocol.Frame) error {
+	return s.processHeaderFrameWithBurst(conn, frame, nil)
+}
+
+func (s *Server) processHeaderFrameWithBurst(conn *protocol.Connection, frame *protocol.Frame, publishes *clusterPublishBurst) error {
 	// Check if there's a pending message for this channel that needs a header
 	pendingMsg, exists := conn.PendingMessages[frame.Channel]
 	if !exists {
 		s.Log.Warn("Header frame received for channel with no pending message",
 			zap.Uint16("channel", frame.Channel),
 			zap.String("connection_id", conn.ID))
+		if err := publishes.flush(); err != nil {
+			return err
+		}
 		return s.connectionError(conn, amqperrors.UnexpectedFrame,
 			"UNEXPECTED_FRAME - content header without basic.publish", 60, 0)
 	}
@@ -199,6 +226,9 @@ func (s *Server) processHeaderFrame(conn *protocol.Connection, frame *protocol.F
 			zap.Error(err),
 			zap.String("connection_id", conn.ID),
 			zap.Uint16("channel", frame.Channel))
+		if err := publishes.flush(); err != nil {
+			return err
+		}
 		return s.malformed(conn, err, 60, 0)
 	}
 
@@ -217,6 +247,9 @@ func (s *Server) processHeaderFrame(conn *protocol.Connection, frame *protocol.F
 		// 406 precondition-failed is RabbitMQ ≥3.8 parity for body-too-large
 		// (506 resource-error is a hard code and would kill the connection).
 		// The pending publish is dropped by teardown.
+		if err := publishes.flush(); err != nil {
+			return err
+		}
 		return s.channelError(conn, frame.Channel, amqperrors.PreconditionFailed,
 			fmt.Sprintf("PRECONDITION_FAILED - message size %d is larger than configured max size %d", contentHeader.BodySize, s.Config.Server.MaxMessageSize),
 			60, 40)
@@ -255,7 +288,7 @@ func (s *Server) processHeaderFrame(conn *protocol.Connection, frame *protocol.F
 
 		delete(conn.PendingMessages, frame.Channel)
 
-		err := s.processCompleteMessage(conn, frame.Channel, pendingMsg)
+		err := s.processCompleteMessageWithBurst(conn, frame.Channel, pendingMsg, publishes)
 		protocol.PutBasicPublishMethod(pendingMsg.Method)
 		protocol.PutContentHeader(pendingMsg.Header)
 		protocol.PutPendingMessage(pendingMsg)
@@ -273,12 +306,19 @@ func (s *Server) processHeaderFrame(conn *protocol.Connection, frame *protocol.F
 
 // processBodyFrame processes content body frames
 func (s *Server) processBodyFrame(conn *protocol.Connection, frame *protocol.Frame) error {
+	return s.processBodyFrameWithBurst(conn, frame, nil)
+}
+
+func (s *Server) processBodyFrameWithBurst(conn *protocol.Connection, frame *protocol.Frame, publishes *clusterPublishBurst) error {
 	// Check if there's a pending message for this channel that needs body content
 	pendingMsg, exists := conn.PendingMessages[frame.Channel]
 	if !exists {
 		s.Log.Warn("Body frame received for channel with no pending message",
 			zap.Uint16("channel", frame.Channel),
 			zap.String("connection_id", conn.ID))
+		if err := publishes.flush(); err != nil {
+			return err
+		}
 		return s.connectionError(conn, amqperrors.UnexpectedFrame,
 			"UNEXPECTED_FRAME - content body without basic.publish", 60, 0)
 	}
@@ -288,6 +328,9 @@ func (s *Server) processBodyFrame(conn *protocol.Connection, frame *protocol.Fra
 		s.Log.Warn("Body frame received before header frame",
 			zap.Uint16("channel", frame.Channel),
 			zap.String("connection_id", conn.ID))
+		if err := publishes.flush(); err != nil {
+			return err
+		}
 		return s.connectionError(conn, amqperrors.UnexpectedFrame,
 			"UNEXPECTED_FRAME - content body before header", 60, 0)
 	}
@@ -336,6 +379,9 @@ func (s *Server) processBodyFrame(conn *protocol.Connection, frame *protocol.Fra
 			s.Log.Error("Received more body data than expected",
 				zap.Uint64("received", pendingMsg.Received),
 				zap.Uint64("expected", pendingMsg.Header.BodySize))
+			if err := publishes.flush(); err != nil {
+				return err
+			}
 			return s.connectionError(conn, amqperrors.UnexpectedFrame,
 				"UNEXPECTED_FRAME - content body exceeds declared size", 60, 0)
 		}
@@ -351,7 +397,7 @@ func (s *Server) processBodyFrame(conn *protocol.Connection, frame *protocol.Fra
 		// Remove the pending message from the map before processing
 		delete(conn.PendingMessages, frame.Channel)
 
-		err := s.processCompleteMessage(conn, frame.Channel, pendingMsg)
+		err := s.processCompleteMessageWithBurst(conn, frame.Channel, pendingMsg, publishes)
 		protocol.PutBasicPublishMethod(pendingMsg.Method)
 		protocol.PutContentHeader(pendingMsg.Header)
 		protocol.PutPendingMessage(pendingMsg)
@@ -371,6 +417,10 @@ func (s *Server) processBodyFrame(conn *protocol.Connection, frame *protocol.Fra
 
 // processCompleteMessage processes a message that has been fully received (method + header + body)
 func (s *Server) processCompleteMessage(conn *protocol.Connection, channelID uint16, pendingMsg *protocol.PendingMessage) error {
+	return s.processCompleteMessageWithBurst(conn, channelID, pendingMsg, nil)
+}
+
+func (s *Server) processCompleteMessageWithBurst(conn *protocol.Connection, channelID uint16, pendingMsg *protocol.PendingMessage, publishes *clusterPublishBurst) error {
 	// WS-I Phase B (generational tokens): take the publish lease token out of
 	// the pending message at entry. The single open-coded defer marks the
 	// server part done; if the lease was never transferred (every early
@@ -379,7 +429,7 @@ func (s *Server) processCompleteMessage(conn *protocol.Connection, channelID uin
 	// exactly once.
 	token := pendingMsg.LeaseToken
 	pendingMsg.LeaseToken = protocol.PublishLeaseToken{}
-	defer token.ServerFinish()
+	defer func() { token.ServerFinish() }()
 
 	// SQ-12: mark this connection as a publisher so the reader-pause applies to
 	// it (consumer-only connections are never paused). Load-guarded so it is a
@@ -445,8 +495,20 @@ func (s *Server) processCompleteMessage(conn *protocol.Connection, channelID uin
 	}
 
 	if message.UserID != "" && message.UserID != conn.Username {
+		if err := publishes.flush(); err != nil {
+			return err
+		}
 		return s.channelError(conn, channelID, amqperrors.PreconditionFailed,
 			fmt.Sprintf("PRECONDITION_FAILED - user_id property set to '%s' but authenticated user was '%s'", message.UserID, conn.Username), 60, 40)
+	}
+
+	var clusterHeader []byte
+	if publishes != nil {
+		var err error
+		clusterHeader, err = publishes.prepare(channelID, message)
+		if err != nil {
+			return err
+		}
 	}
 
 	// Assign confirm delivery tag if channel is in confirm mode (before
@@ -486,6 +548,13 @@ func (s *Server) processCompleteMessage(conn *protocol.Connection, channelID uin
 	var publishStart time.Time
 	if s.MetricsCollector != nil {
 		publishStart = time.Now()
+	}
+	if clusterHeader != nil {
+		publishes.add(channelID, clusterPublishItem{
+			message: message, header: clusterHeader, lease: token, channel: confirmCh, tag: confirmTag, started: publishStart,
+		})
+		token = protocol.PublishLeaseToken{}
+		return nil
 	}
 
 	// Iteration 2: durable and/or publisher-confirm publishes take the async
@@ -566,10 +635,14 @@ func (s *Server) processCompleteMessage(conn *protocol.Connection, channelID uin
 		}
 	}
 
+	return s.finishPublish(conn, channelID, message, confirmCh, confirmTag, publishStart, durableInflight, err)
+}
+
+func (s *Server) finishPublish(conn *protocol.Connection, channelID uint16, message *protocol.Message,
+	confirmCh *protocol.Channel, confirmTag uint64, publishStart time.Time, durableInflight bool, err error) error {
 	if s.MetricsCollector != nil {
 		s.MetricsCollector.RecordPublishLatency(time.Since(publishStart).Seconds())
 	}
-
 	if err != nil {
 		if errors.Is(err, broker.ErrNoRoute) {
 			if s.MetricsCollector != nil {

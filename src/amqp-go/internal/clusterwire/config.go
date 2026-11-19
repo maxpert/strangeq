@@ -4,6 +4,8 @@ package clusterwire
 
 import (
 	"context"
+	"crypto/hmac"
+	"crypto/sha256"
 	"crypto/tls"
 	"encoding/base64"
 	"errors"
@@ -19,10 +21,14 @@ import (
 const (
 	raftPath       = "/strangeq/peer/v1/raft"
 	commandPath    = "/strangeq/peer/v1/command"
+	readPath       = "/strangeq/peer/v1/read"
+	waitPath       = "/strangeq/peer/v1/wait"
 	membershipPath = "/strangeq/peer/v1/membership"
 
 	defaultTimeout      = 5 * time.Second
 	defaultMaxBodyBytes = 32 << 20
+	MaxWaitQueueBytes   = 1024
+	maxWaitBodyBytes    = 16 + (8 << 10)
 )
 
 var (
@@ -38,14 +44,34 @@ type Handler interface {
 	Membership(context.Context, []byte) ([]byte, error)
 }
 
+// A command parts handler returns the consecutive, owned slices of one reply.
+// The slices must remain immutable while the server signs and writes them.
+type commandPartsHandler interface {
+	CommandParts(context.Context, []byte) ([]byte, []byte, error)
+}
+
+type readHandler interface {
+	ReadCommand(context.Context, []byte) ([]byte, error)
+}
+
+// A read parts handler owns its consecutive reply slices until writing ends.
+type readPartsHandler interface {
+	ReadCommandParts(context.Context, []byte) ([]byte, []byte, error)
+}
+
+type waitHandler interface {
+	WaitCommand(context.Context, []byte) ([]byte, error)
+}
+
 type Config struct {
-	Listen        string
-	ClusterID     string
-	Token         string // 32 random bytes encoded as unpadded base64url.
-	TLS           *tls.Config
-	AllowInsecure bool // Enable cleartext on numeric loopback when TLS is nil.
-	Timeout       time.Duration
-	MaxBodyBytes  int64
+	Listen          string
+	ClusterID       string
+	Token           string // 32 random bytes encoded as unpadded base64url.
+	TLS             *tls.Config
+	AllowInsecure   bool // Enable cleartext on numeric loopback when TLS is nil.
+	Timeout         time.Duration
+	MaxBodyBytes    int64
+	ProtocolVersion uint8 // Zero retains the original peer authentication domain.
 }
 
 func normalize(cfg Config) (Config, authenticator, error) {
@@ -55,6 +81,12 @@ func normalize(cfg Config) (Config, authenticator, error) {
 	key, err := base64.RawURLEncoding.Strict().DecodeString(cfg.Token)
 	if err != nil || len(key) != 32 {
 		return cfg, authenticator{}, errors.New("peer token must encode 32 bytes as unpadded base64url")
+	}
+	if cfg.ProtocolVersion != 0 {
+		scope := hmac.New(sha256.New, key)
+		_, _ = scope.Write([]byte("StrangeQ peer protocol"))
+		_, _ = scope.Write([]byte{cfg.ProtocolVersion})
+		key = scope.Sum(nil)
 	}
 	if cfg.Timeout < 0 || cfg.MaxBodyBytes < 0 || cfg.MaxBodyBytes > 1<<30 {
 		return cfg, authenticator{}, errors.New("invalid peer timeout or body limit")

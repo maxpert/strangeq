@@ -1523,11 +1523,36 @@ func (s *Server) readFrames(rt *connRuntime, done chan struct{}) {
 func (s *Server) processFrames(rt *connRuntime, done chan struct{}) {
 	conn := rt.conn
 	defer close(done)
+	var publishes *clusterPublishBurst
+	var acknowledgments *clusterSingleAckBatch
+	if broker, clustered := s.Broker.(*ClusterBroker); clustered {
+		runtime, hasAssignmentMode := broker.cluster.(interface{ SupportsAssignments() bool })
+		allowGather := hasAssignmentMode && runtime.SupportsAssignments()
+		publishes = &clusterPublishBurst{
+			server: s, broker: broker, conn: conn, allowGather: allowGather,
+		}
+		acknowledgments = &clusterSingleAckBatch{broker: broker, allowGather: allowGather}
+		defer publishes.discard()
+		defer acknowledgments.stopGather()
+	}
 
 	for {
 		select {
+		case <-acknowledgments.gatherSignal():
+			if s.flushClusterSingleAcks(rt, acknowledgments) {
+				return
+			}
+		case <-publishes.gatherSignal():
+			publishes.gatherReady = nil
+			// Drain already queued frames through the ordinary burst limits.
+			// The deadline never waits for another arrival in this burst.
+			if len(conn.FrameQueue) == 0 && s.flushClusterPublishes(rt, publishes) {
+				return
+			}
 		case frame, ok := <-conn.FrameQueue:
 			if !ok {
+				s.flushClusterSingleAcks(rt, acknowledgments)
+				s.flushClusterPublishes(rt, publishes)
 				s.Log.Info("Frame queue closed", zap.String("connection_id", conn.ID))
 				return
 			}
@@ -1538,6 +1563,29 @@ func (s *Server) processFrames(rt *connRuntime, done chan struct{}) {
 			// the frame — heartbeat, gate discards, and after processFrame
 			// (whether the frame is pooled or handed to the AckQueue).
 			cost := frameCost(frame)
+
+			var ackTag uint64
+			var singleAck bool
+			if acknowledgments != nil {
+				ackTag, singleAck = singleAckFrame(frame)
+				if singleAck {
+					if txm := s.txm(conn); txm != nil && txm.IsTransactional(frame.Channel) {
+						singleAck = false
+					}
+				}
+				if (!singleAck || acknowledgments.channelID != frame.Channel || acknowledgments.gatherExpired()) &&
+					s.flushClusterSingleAcks(rt, acknowledgments) {
+					s.releaseFrameBudget(conn, cost)
+					protocol.PutFrame(frame)
+					return
+				}
+			}
+
+			if publishes != nil && !publishes.continues(frame) && s.flushClusterPublishes(rt, publishes) {
+				s.releaseFrameBudget(conn, cost)
+				protocol.PutFrame(frame)
+				return
+			}
 
 			if frame.Type == protocol.FrameHeartbeat {
 				s.releaseFrameBudget(conn, cost)
@@ -1602,7 +1650,19 @@ func (s *Server) processFrames(rt *connRuntime, done chan struct{}) {
 				}
 			}
 
-			pooled, err := s.processFrame(conn, frame)
+			if singleAck {
+				acknowledgments.add(frame.Channel, ackTag)
+				s.releaseFrameBudget(conn, cost)
+				protocol.PutFrame(frame)
+				if (acknowledgments.count == len(acknowledgments.tags) ||
+					(len(conn.FrameQueue) == 0 && !acknowledgments.waitAtIdle())) &&
+					s.flushClusterSingleAcks(rt, acknowledgments) {
+					return
+				}
+				continue
+			}
+
+			pooled, err := s.processFrameWithPublishBurst(conn, frame, publishes)
 			s.releaseFrameBudget(conn, cost)
 			if pooled {
 				protocol.PutFrame(frame)
@@ -1614,6 +1674,10 @@ func (s *Server) processFrames(rt *connRuntime, done chan struct{}) {
 				if s.handleFrameError(rt, fc, err, true) {
 					return
 				}
+			}
+			if publishes != nil && len(conn.FrameQueue) == 0 && !publishes.waitAtIdle() &&
+				s.flushClusterPublishes(rt, publishes) {
+				return
 			}
 
 		case <-conn.Done:
@@ -1627,6 +1691,10 @@ func (s *Server) processFrames(rt *connRuntime, done chan struct{}) {
 // caller may return it to the frame pool; pooled=false means the frame was
 // handed off to another goroutine (e.g., AckQueue) and must NOT be pooled.
 func (s *Server) processFrame(conn *protocol.Connection, frame *protocol.Frame) (bool, error) {
+	return s.processFrameWithPublishBurst(conn, frame, nil)
+}
+
+func (s *Server) processFrameWithPublishBurst(conn *protocol.Connection, frame *protocol.Frame, publishes *clusterPublishBurst) (bool, error) {
 	switch frame.Type {
 	case protocol.FrameMethod:
 		if isAckFrame(frame) {
@@ -1640,11 +1708,22 @@ func (s *Server) processFrame(conn *protocol.Connection, frame *protocol.Frame) 
 				return true, nil
 			}
 		}
+		if publishes != nil && frame.Channel != 0 {
+			class, method, ok := methodIDs(frame)
+			if ok && class == 60 && method == protocol.BasicPublish {
+				if _, open := conn.Channels.Load(frame.Channel); open {
+					return true, s.handleBasicPublishWithBurst(conn, frame.Channel, frame.Payload[4:], publishes)
+				}
+				if err := publishes.flush(); err != nil {
+					return true, err
+				}
+			}
+		}
 		return true, s.processMethodFrame(conn, frame)
 	case protocol.FrameHeader:
-		return true, s.processHeaderFrame(conn, frame)
+		return true, s.processHeaderFrameWithBurst(conn, frame, publishes)
 	case protocol.FrameBody:
-		return true, s.processBodyFrame(conn, frame)
+		return true, s.processBodyFrameWithBurst(conn, frame, publishes)
 	case protocol.FrameHeartbeat:
 		return true, nil
 	default:

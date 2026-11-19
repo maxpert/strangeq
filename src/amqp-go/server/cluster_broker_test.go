@@ -279,29 +279,12 @@ func (f clusterSubmitFunc) Submit(ctx context.Context, queue string, request []b
 func TestClusterCumulativeSettlementReportsPartialFailure(t *testing.T) {
 	for _, nack := range []bool{false, true} {
 		name := "ack"
-		kind := clusterqueue.AckMessage
 		if nack {
 			name = "nack"
-			kind = clusterqueue.RequeueMessage
 		}
 		t.Run(name, func(t *testing.T) {
 			state := &localClusterMachine{}
-			var failedAttempt clusterqueue.AttemptID
-			submitter := clusterSubmitFunc(func(ctx context.Context, queue string, request []byte) ([]byte, error) {
-				command, err := clusterqueue.DecodeCommand(request)
-				if err != nil {
-					return nil, err
-				}
-				if command.Kind == kind && command.Attempt == failedAttempt {
-					command.Attempt = 0
-					request, err = clusterqueue.EncodeCommand(command)
-					if err != nil {
-						return nil, err
-					}
-				}
-				return state.Submit(ctx, queue, request)
-			})
-			b := NewClusterBroker(submitter)
+			b := NewClusterBroker(state)
 			_, err := b.DeclareQueue("jobs", true, false, false, nil)
 			require.NoError(t, err)
 			client, transport := net.Pipe()
@@ -316,7 +299,13 @@ func TestClusterCumulativeSettlementReportsPartialFailure(t *testing.T) {
 				require.NoError(t, err)
 				ch.TrackDelivery(uint64(i+1), tag, "", true)
 				if i == 1 {
-					failedAttempt = b.deliveries[tag].Attempt
+					// Keep the broker and wire tags visible while forcing the
+					// state machine to reject this attempt.
+					b.mu.Lock()
+					delivery := b.deliveries[tag]
+					delivery.Attempt = 100
+					b.deliveries[tag] = delivery
+					b.mu.Unlock()
 				}
 			}
 

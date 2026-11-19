@@ -1,6 +1,7 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -10,6 +11,7 @@ import (
 	"time"
 
 	"github.com/maxpert/amqp-go/broker"
+	"github.com/maxpert/amqp-go/internal/clusterpayload"
 	"github.com/maxpert/amqp-go/internal/clusterqueue"
 	"github.com/maxpert/amqp-go/protocol"
 )
@@ -30,20 +32,44 @@ type clusterShardReader interface {
 
 // ClusterBroker adapts AMQP to the replicated work-queue state machine.
 type ClusterBroker struct {
-	cluster         ClusterSubmitter
-	mu              sync.Mutex
-	consumers       map[string]*clusterConsumer
-	gets            map[clusterGetKey]*clusterSession
-	deliveries      map[uint64]clusterDelivery
-	nextTag         atomic.Uint64
-	cancelConsumers func([]string)
+	cluster             ClusterSubmitter
+	compressBodies      bool
+	compressSmallBodies bool
+	mu                  sync.Mutex
+	consumers           map[string]*clusterConsumer
+	gets                map[clusterGetKey]*clusterSession
+	deliveries          map[uint64]clusterDelivery
+	nextTag             atomic.Uint64
+	cancelConsumers     func([]string)
 }
 
 func NewClusterBroker(cluster ClusterSubmitter) *ClusterBroker {
+	support, _ := cluster.(interface{ SupportsJournalBodyCompression() bool })
+	small, _ := cluster.(interface{ SupportsJournalSmallBodyCompression() bool })
 	return &ClusterBroker{
-		cluster: cluster, consumers: make(map[string]*clusterConsumer),
-		gets: make(map[clusterGetKey]*clusterSession), deliveries: make(map[uint64]clusterDelivery),
+		cluster: cluster, compressBodies: support != nil && support.SupportsJournalBodyCompression(),
+		compressSmallBodies: small != nil && small.SupportsJournalSmallBodyCompression(),
+		consumers:           make(map[string]*clusterConsumer),
+		gets:                make(map[clusterGetKey]*clusterSession), deliveries: make(map[uint64]clusterDelivery),
 	}
+}
+
+func (b *ClusterBroker) publishRecord(header, body []byte) clusterqueue.PublishRecord {
+	if b.compressBodies {
+		var packed []byte
+		version := byte(clusterpayload.PackedEnvelope)
+		if b.compressSmallBodies {
+			packed, version = clusterpayload.PackSmall(body)
+		} else {
+			packed = clusterpayload.Pack(body)
+		}
+		if packed != nil {
+			header = bytes.Clone(header)
+			header[0] = version
+			return clusterqueue.PublishRecord{Prefix: header, Body: packed, Packed: true}
+		}
+	}
+	return clusterqueue.PublishRecord{Prefix: header, Body: body}
 }
 
 var _ UnifiedBroker = (*ClusterBroker)(nil)
@@ -58,11 +84,16 @@ func (b *ClusterBroker) execute(ctx context.Context, command clusterqueue.QueueC
 	if err != nil {
 		return clusterqueue.QueueResponse{}, err
 	}
+	return b.executeEncoded(ctx, command.Queue, encoded, repeatable)
+}
+
+func (b *ClusterBroker) executeEncoded(ctx context.Context, queue string, encoded []byte, repeatable bool) (clusterqueue.QueueResponse, error) {
 	var data []byte
+	var err error
 	if repeatable {
-		data, err = b.submitReplay(ctx, command.Queue, encoded)
+		data, err = b.submitReplay(ctx, queue, encoded)
 	} else {
-		data, err = b.cluster.Submit(ctx, command.Queue, encoded)
+		data, err = b.cluster.Submit(ctx, queue, encoded)
 	}
 	if err != nil {
 		return clusterqueue.QueueResponse{}, err
@@ -220,6 +251,10 @@ func (b *ClusterBroker) PurgeQueue(name string) (int, error) {
 }
 
 func (b *ClusterBroker) PublishMessage(exchange, key string, message *protocol.Message) error {
+	return b.publishMessage(exchange, key, message, nil)
+}
+
+func (b *ClusterBroker) publishMessage(exchange, key string, message *protocol.Message, header []byte) error {
 	if message.Expiration != "" {
 		return errors.New("per-message expiration is unavailable in cluster mode")
 	}
@@ -240,16 +275,25 @@ func (b *ClusterBroker) PublishMessage(exchange, key string, message *protocol.M
 		return nil
 	}
 
-	body, err := encodeClusterMessage(message)
-	if err != nil {
-		return err
+	if header == nil {
+		var err error
+		header, err = encodeClusterMessageHeader(message)
+		if err != nil {
+			return err
+		}
 	}
+	record := b.publishRecord(header, message.Body)
 	var stale []clusterTarget
 	published := 0
 	for _, target := range targets {
-		_, err := b.queue(ctx, clusterqueue.QueueCommand{
-			Kind: clusterqueue.PublishMessage, Queue: target.Queue, Body: body, Incarnation: target.Incarnation,
-		})
+		command, err := clusterqueue.EncodePublishCommand(target.Queue, target.Incarnation, record)
+		if err == nil {
+			var result clusterqueue.QueueResponse
+			result, err = b.executeEncoded(ctx, target.Queue, command, false)
+			if err == nil {
+				err = result.Err()
+			}
+		}
 		switch {
 		case errors.Is(err, clusterqueue.ErrQueueNotFound), errors.Is(err, clusterqueue.ErrQueueIncarnation):
 			stale = append(stale, target)

@@ -47,7 +47,7 @@ func TestQueueSnapshotFitsAtLegalCapacity(t *testing.T) {
 		}
 		machine.state.Queues[name] = q
 	}
-	require.NoError(t, machine.state.validate())
+	require.NoError(t, machine.state.validate(machine.assignments))
 	data, err := machine.Snapshot()
 	require.NoError(t, err)
 	require.Less(t, len(data), maxSnapshotBytes)

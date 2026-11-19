@@ -50,7 +50,20 @@ func openCluster(cfg *config.AMQPConfig, bootstrap bool) (*cluster.Node, error) 
 		Discovery: c.Discovery,
 		Listen:    listen, Directory: filepath.Join(cfg.Storage.Path, "cluster"), Token: strings.TrimSpace(string(token)),
 		Shards: c.Shards, AllowInsecure: c.AllowLoopbackPlaintext, TLS: tlsConfig,
-		NewMachine: func(uint64) clusterraft.Machine { return server.NewClusterMachine() },
+		ExperimentalRaftJournal:                 c.ExperimentalRaftJournal,
+		ExperimentalRaftRangeSync:               c.ExperimentalRaftRangeSync,
+		ExperimentalAckAndClaim:                 c.ExperimentalAckAndClaim,
+		ExperimentalAssignments:                 c.ExperimentalAssignments,
+		ExperimentalReplicaBodies:               c.ExperimentalReplicaBodies,
+		ExperimentalRaftJournalDualStream:       c.ExperimentalRaftJournalDualStream,
+		ExperimentalJournalBodyCompression:      c.ExperimentalJournalBodyCompression,
+		ExperimentalJournalSmallBodyCompression: c.ExperimentalJournalSmallBodyCompression,
+		NewMachine: func(uint64) clusterraft.Machine {
+			if c.ExperimentalAssignments {
+				return server.NewClusterAssignmentMachine()
+			}
+			return server.NewClusterMachine()
+		},
 		ExpiryCommand: func(now time.Time) []byte {
 			request, _ := clusterqueue.EncodeCommand(clusterqueue.QueueCommand{Kind: clusterqueue.ExpireSessions, Deadline: now.UnixNano()})
 			return request

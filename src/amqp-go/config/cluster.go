@@ -8,18 +8,26 @@ import (
 )
 
 type ClusterConfig struct {
-	ID                     string   `json:"id"`
-	NodeID                 uint64   `json:"node_id"`
-	PeerAddress            string   `json:"peer_address"`
-	PeerListen             string   `json:"peer_listen"`
-	Seeds                  []string `json:"seeds"`
-	Discovery              []string `json:"discovery"`
-	Shards                 uint64   `json:"shards"`
-	TokenFile              string   `json:"token_file"`
-	PeerCertFile           string   `json:"peer_cert_file"`
-	PeerKeyFile            string   `json:"peer_key_file"`
-	PeerCAFile             string   `json:"peer_ca_file"`
-	AllowLoopbackPlaintext bool     `json:"allow_loopback_plaintext"`
+	ID                                      string   `json:"id"`
+	NodeID                                  uint64   `json:"node_id"`
+	PeerAddress                             string   `json:"peer_address"`
+	PeerListen                              string   `json:"peer_listen"`
+	Seeds                                   []string `json:"seeds"`
+	Discovery                               []string `json:"discovery"`
+	Shards                                  uint64   `json:"shards"`
+	TokenFile                               string   `json:"token_file"`
+	PeerCertFile                            string   `json:"peer_cert_file"`
+	PeerKeyFile                             string   `json:"peer_key_file"`
+	PeerCAFile                              string   `json:"peer_ca_file"`
+	AllowLoopbackPlaintext                  bool     `json:"allow_loopback_plaintext"`
+	ExperimentalRaftJournal                 bool     `json:"experimental_raft_journal"`
+	ExperimentalRaftRangeSync               bool     `json:"experimental_raft_range_sync"`
+	ExperimentalAckAndClaim                 bool     `json:"experimental_ack_and_claim"`
+	ExperimentalAssignments                 bool     `json:"experimental_assignments"`
+	ExperimentalReplicaBodies               bool     `json:"experimental_replica_bodies"`
+	ExperimentalRaftJournalDualStream       bool     `json:"experimental_raft_journal_dual_stream"`
+	ExperimentalJournalBodyCompression      bool     `json:"experimental_journal_body_compression"`
+	ExperimentalJournalSmallBodyCompression bool     `json:"experimental_journal_small_body_compression"`
 }
 
 func (c ClusterConfig) Enabled() bool { return c.ID != "" }
@@ -30,13 +38,36 @@ func (c *AMQPConfig) validateCluster() error {
 		if cfg.NodeID != 0 || cfg.PeerAddress != "" || cfg.PeerListen != "" || len(cfg.Seeds) != 0 ||
 			len(cfg.Discovery) != 0 ||
 			cfg.Shards != 0 || cfg.TokenFile != "" || cfg.PeerCertFile != "" || cfg.PeerKeyFile != "" ||
-			cfg.PeerCAFile != "" || cfg.AllowLoopbackPlaintext {
+			cfg.PeerCAFile != "" || cfg.AllowLoopbackPlaintext || cfg.ExperimentalRaftJournal ||
+			cfg.ExperimentalRaftRangeSync || cfg.ExperimentalRaftJournalDualStream || cfg.ExperimentalAckAndClaim || cfg.ExperimentalAssignments ||
+			cfg.ExperimentalReplicaBodies || cfg.ExperimentalJournalBodyCompression || cfg.ExperimentalJournalSmallBodyCompression {
 			return errors.New("cluster.id is required with cluster options")
 		}
 		return nil
 	}
 	if cfg.NodeID == 0 || cfg.PeerAddress == "" || cfg.TokenFile == "" || cfg.Shards > 1024 {
 		return errors.New("cluster requires node_id, peer_address, token_file, and at most 1024 shards")
+	}
+	if cfg.ExperimentalRaftRangeSync && !cfg.ExperimentalRaftJournal {
+		return errors.New("experimental_raft_range_sync requires experimental_raft_journal")
+	}
+	if cfg.ExperimentalRaftJournalDualStream && (!cfg.ExperimentalRaftJournal || !cfg.ExperimentalRaftRangeSync) {
+		return errors.New("experimental_raft_journal_dual_stream requires experimental_raft_journal and experimental_raft_range_sync")
+	}
+	if cfg.ExperimentalAckAndClaim && !cfg.ExperimentalRaftJournal {
+		return errors.New("experimental_ack_and_claim requires experimental_raft_journal")
+	}
+	if cfg.ExperimentalAssignments && (!cfg.ExperimentalRaftJournal || cfg.ExperimentalAckAndClaim) {
+		return errors.New("experimental_assignments requires experimental_raft_journal and its own storage mode")
+	}
+	if cfg.ExperimentalReplicaBodies && !cfg.ExperimentalAssignments {
+		return errors.New("experimental_replica_bodies requires experimental_assignments")
+	}
+	if cfg.ExperimentalJournalBodyCompression && !cfg.ExperimentalAssignments {
+		return errors.New("experimental_journal_body_compression requires experimental_assignments")
+	}
+	if cfg.ExperimentalJournalSmallBodyCompression && !cfg.ExperimentalJournalBodyCompression {
+		return errors.New("experimental_journal_small_body_compression requires experimental_journal_body_compression")
 	}
 	if len(cfg.Seeds) < 1 || len(cfg.Seeds) > 3 {
 		return errors.New("cluster requires one to three original voters in seeds")

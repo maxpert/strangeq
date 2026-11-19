@@ -2,13 +2,16 @@ package clusterraft
 
 import (
 	"context"
+	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"path/filepath"
 	"strconv"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/require"
+	"go.etcd.io/bbolt"
 	"go.etcd.io/raft/v3/raftpb"
 )
 
@@ -20,6 +23,8 @@ func (m *testMachine) Apply(entry []byte) []byte {
 }
 func (m *testMachine) Snapshot() ([]byte, error) { return json.Marshal(m.entries) }
 func (m *testMachine) Restore(data []byte) error { return json.Unmarshal(data, &m.entries) }
+
+func testBoltDB(group *Group) *bbolt.DB { return group.store.(*boltGroupStore).db }
 
 type testCluster struct {
 	t      *testing.T
@@ -63,6 +68,7 @@ func TestDurableQuorumAndRestart(t *testing.T) {
 	default:
 	}
 	require.NoError(t, cluster.groups[2].Step(ctx, appendMessage))
+	require.NoError(t, waitTestLocalWrites(ctx, cluster.groups[2]))
 	cluster.drain()
 	select {
 	case result := <-reply:
@@ -157,6 +163,7 @@ func TestNewLeaderCanRetryConfigurationDiscardedAsNoOp(t *testing.T) {
 			require.Equal(t, raftpb.MsgApp, message.GetType())
 			if message.GetTo() == 2 {
 				require.NoError(t, nextLeader.Step(ctx, message))
+				require.NoError(t, waitTestLocalWrites(ctx, nextLeader))
 			}
 		case <-ctx.Done():
 			t.Fatal("leader did not send uncommitted configuration")
@@ -324,7 +331,7 @@ func TestReplicaStorageFailureDoesNotAcknowledgeAppend(t *testing.T) {
 	leader, failed := cluster.groups[1], cluster.groups[2]
 	require.NoError(t, leader.Campaign(ctx))
 	cluster.drain()
-	require.NoError(t, failed.db.Close())
+	require.NoError(t, testBoltDB(failed).Close())
 
 	reply := make(chan error, 1)
 	go func() {
@@ -347,7 +354,8 @@ func TestReplicaStorageFailureDoesNotAcknowledgeAppend(t *testing.T) {
 			t.Fatal("leader did not append")
 		}
 	}
-	require.Error(t, failed.Step(ctx, toFailed))
+	require.NoError(t, failed.Step(ctx, toFailed), "the transport can accept a message before its write fails")
+	require.ErrorIs(t, waitTestLocalWrites(ctx, failed), bbolt.ErrDatabaseNotOpen)
 	require.Equal(t, uint64(0), failed.Leader())
 	select {
 	case sent := <-cluster.out:
@@ -368,6 +376,69 @@ func TestReplicaStorageFailureDoesNotAcknowledgeAppend(t *testing.T) {
 			return
 		case <-ctx.Done():
 			t.Fatal("leader did not commit with a durable majority")
+		}
+	}
+}
+
+func TestStableReadFailureStopsRaftGroupWithoutConfirming(t *testing.T) {
+	cluster := newTestCluster(t)
+	for _, id := range []uint64{1, 2, 3} {
+		cluster.open(id, []uint64{1, 2, 3})
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	leader, follower := cluster.groups[1], cluster.groups[2]
+	require.NoError(t, leader.Campaign(ctx))
+	cluster.drain()
+	require.Equal(t, uint64(1), leader.Leader())
+
+	reply := make(chan error, 1)
+	go func() {
+		_, err := leader.Propose(ctx, []byte("pending"))
+		reply <- err
+	}()
+	var appendMessage *raftpb.Message
+	for appendMessage == nil {
+		select {
+		case m := <-cluster.out:
+			if m.GetType() == raftpb.MsgApp && m.GetTo() == 2 {
+				appendMessage = m
+			}
+		case <-ctx.Done():
+			t.Fatal("leader did not enqueue append")
+		}
+	}
+	require.Len(t, appendMessage.GetEntries(), 1)
+	index := appendMessage.GetEntries()[0].GetIndex()
+	require.NoError(t, waitTestLocalWrites(ctx, leader))
+	require.Less(t, leader.Status().Commit, index)
+	require.NoError(t, testBoltDB(leader).Update(func(tx *bbolt.Tx) error {
+		entries := tx.Bucket(logBucket)
+		key := binary.BigEndian.AppendUint64(nil, index)
+		require.NotEmpty(t, entries.Get(key), "leader must already have persisted this append")
+		return entries.Put(key, []byte{0})
+	}))
+	require.NoError(t, follower.Step(ctx, appendMessage))
+	for {
+		select {
+		case m := <-cluster.out:
+			if m.GetType() != raftpb.MsgAppResp || m.GetFrom() != 2 || m.GetTo() != 1 {
+				continue
+			}
+			require.Equal(t, index, m.GetIndex(), "follower must durably acknowledge the corrupted index")
+			stepErr := leader.Step(ctx, m)
+			require.Error(t, errors.Join(stepErr, waitTestLocalWrites(ctx, leader)), "failed stable read must stop the group")
+			require.Equal(t, uint64(0), leader.Leader())
+			require.NoError(t, follower.Tick(ctx), "another group instance must remain available")
+			select {
+			case err := <-reply:
+				require.ErrorIs(t, err, ErrLeadershipLost)
+			case <-ctx.Done():
+				t.Fatal("stopping the group did not release its pending proposal")
+			}
+			return
+		case <-ctx.Done():
+			t.Fatal("follower did not acknowledge append")
 		}
 	}
 }
@@ -395,10 +466,15 @@ func (c *testCluster) deliver(message *raftpb.Message) {
 	c.t.Helper()
 	if group := c.groups[message.GetTo()]; group != nil {
 		require.NoError(c.t, group.Step(context.Background(), message))
+		require.NoError(c.t, waitTestLocalWrites(context.Background(), group))
 	}
 	if message.GetType() == raftpb.MsgSnap {
 		require.NoError(c.t, c.groups[message.GetFrom()].ReportSnapshot(context.Background(), message.GetTo(), c.groups[message.GetTo()] != nil))
 	}
+}
+
+func waitTestLocalWrites(ctx context.Context, group *Group) error {
+	return group.changeWithStorage(ctx, 0, true, func() error { return nil })
 }
 func (c *testCluster) drain() {
 	c.t.Helper()

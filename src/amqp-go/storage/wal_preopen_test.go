@@ -103,14 +103,21 @@ func TestWALPreopen_RollTakesParkedFileWithoutBlockingOnTheFlush(t *testing.T) {
 	})
 	defer restoreDone()
 
-	// Count every commit-path open and directory flush. The helper's own
-	// directory barrier is gated (blocked) once armed, so any delta during the
-	// armed roll is the roll's.
+	// Gate the subsequent background pre-open before counting it. After
+	// the roll consumes the parked file, the helper can reach that open
+	// before the test goroutine samples the commit-path counters.
 	var mu sync.Mutex
 	opens, syncs := 0, 0
 	armed := false
+	var nextHelperFile string
 	gate := make(chan struct{})
 	restoreOpen := SetWALOpenFileForTest(func(name string, flag int, perm os.FileMode) (*os.File, error) {
+		mu.Lock()
+		wait := armed && name == nextHelperFile
+		mu.Unlock()
+		if wait {
+			<-gate
+		}
 		mu.Lock()
 		opens++
 		mu.Unlock()
@@ -146,6 +153,7 @@ func TestWALPreopen_RollTakesParkedFileWithoutBlockingOnTheFlush(t *testing.T) {
 	mu.Lock()
 	opensBefore, syncsBefore := opens, syncs
 	beforeNum := sw.fileNum.Load()
+	nextHelperFile = filepath.Join(sw.dataDir, fmt.Sprintf("%020d%s", parked+1, WALFileExtension))
 	armed = true
 	mu.Unlock()
 

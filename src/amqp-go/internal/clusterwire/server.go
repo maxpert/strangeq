@@ -41,14 +41,16 @@ func (a *admission) release(size int64) {
 }
 
 type Server struct {
-	config  Config
-	handler Handler
-	auth    authenticator
-	replay  replayCache
-	server  *http.Server
-	cancel  context.CancelFunc
+	config     Config
+	handler    Handler
+	auth       authenticator
+	replay     replayCache
+	waitReplay replayCache
+	server     *http.Server
+	cancel     context.CancelFunc
 
-	raftAdmission, commandAdmission, membershipAdmission *admission
+	raftAdmission, commandAdmission, waitAdmission, membershipAdmission *admission
+	raftBodies                                                          raftBodyPool
 
 	mu       sync.Mutex
 	listener net.Listener
@@ -76,7 +78,9 @@ func NewServer(cfg Config, handler Handler) (*Server, error) {
 	s := &Server{
 		config: cfg, handler: handler, auth: auth, cancel: cancel, done: make(chan struct{}),
 		raftAdmission: newAdmission(32, cfg.MaxBodyBytes), commandAdmission: newAdmission(32, cfg.MaxBodyBytes),
+		waitAdmission:       newAdmission(256, maxWaitBodyBytes),
 		membershipAdmission: newAdmission(8, cfg.MaxBodyBytes),
+		raftBodies:          raftBodyPool{free: raftBodySlots},
 	}
 	s.server = &http.Server{
 		Handler:           http.HandlerFunc(s.handle),
@@ -162,11 +166,17 @@ func (s *Server) handle(w http.ResponseWriter, req *http.Request) {
 	}
 
 	var quota *admission
+	maxBody := s.config.MaxBodyBytes
+	replay := &s.replay
 	switch req.URL.Path {
 	case raftPath:
 		quota = s.raftAdmission
-	case commandPath:
+	case commandPath, readPath:
 		quota = s.commandAdmission
+	case waitPath:
+		quota = s.waitAdmission
+		maxBody = min(maxBody, maxWaitBodyBytes)
+		replay = &s.waitReplay
 	case membershipPath:
 		quota = s.membershipAdmission
 	default:
@@ -178,11 +188,11 @@ func (s *Server) handle(w http.ResponseWriter, req *http.Request) {
 		http.Error(w, "content length required", http.StatusLengthRequired)
 		return
 	}
-	if size > s.config.MaxBodyBytes {
+	if size > maxBody {
 		http.Error(w, "peer payload too large", http.StatusRequestEntityTooLarge)
 		return
 	}
-	auth, ok := s.auth.verifyRequest(req, &s.replay)
+	auth, ok := s.auth.verifyRequest(req, replay)
 	if !ok {
 		http.Error(w, "peer authorization failed", http.StatusUnauthorized)
 		return
@@ -192,22 +202,60 @@ func (s *Server) handle(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 	defer quota.release(size)
-	body := make([]byte, size)
+	var body []byte
+	var borrowed bool
+	if req.URL.Path == raftPath {
+		body, borrowed = s.raftBodies.borrow(int(size))
+	} else {
+		body = make([]byte, size)
+	}
+	if borrowed {
+		defer func() {
+			if body != nil {
+				s.raftBodies.release(body)
+			}
+		}()
+	}
 	if _, err := io.ReadFull(req.Body, body); err != nil || bodyDigest(body) != auth.digest {
 		http.Error(w, "peer payload rejected", http.StatusBadRequest)
 		return
 	}
 	ctx, cancel := context.WithTimeout(req.Context(), s.config.Timeout)
 	defer cancel()
-	var output []byte
+	var prefix, output []byte
 	var err error
 	switch req.URL.Path {
 	case commandPath:
-		output, err = s.handler.Command(ctx, body)
+		if parts, ok := s.handler.(commandPartsHandler); ok {
+			prefix, output, err = parts.CommandParts(ctx, body)
+		} else {
+			output, err = s.handler.Command(ctx, body)
+		}
+	case readPath:
+		switch reader := s.handler.(type) {
+		case readPartsHandler:
+			prefix, output, err = reader.ReadCommandParts(ctx, body)
+		case readHandler:
+			output, err = reader.ReadCommand(ctx, body)
+		default:
+			http.NotFound(w, req)
+			return
+		}
+	case waitPath:
+		waiter, ok := s.handler.(waitHandler)
+		if !ok {
+			http.NotFound(w, req)
+			return
+		}
+		output, err = waiter.WaitCommand(ctx, body)
 	case membershipPath:
 		output, err = s.handler.Membership(ctx, body)
 	case raftPath:
 		group, messages, decodeErr := decodeBatch(body)
+		if borrowed {
+			s.raftBodies.release(body)
+			body = nil
+		}
 		if decodeErr != nil {
 			http.Error(w, "invalid Raft batch", http.StatusBadRequest)
 			return
@@ -218,13 +266,20 @@ func (s *Server) handle(w http.ResponseWriter, req *http.Request) {
 		http.Error(w, "peer operation failed", http.StatusServiceUnavailable)
 		return
 	}
-	if int64(len(output)) > s.config.MaxBodyBytes {
+	prefixBytes, outputBytes := int64(len(prefix)), int64(len(output))
+	if prefixBytes > maxBody || outputBytes > maxBody-prefixBytes {
 		http.Error(w, "peer response too large", http.StatusServiceUnavailable)
 		return
 	}
-	s.auth.signResponse(w.Header(), req.URL.Path, auth, output)
+	s.auth.signResponse(w.Header(), req.URL.Path, auth, prefix, output)
 	w.Header().Set("Content-Type", "application/octet-stream")
-	w.Header().Set("Content-Length", strconv.Itoa(len(output)))
+	w.Header().Set("Content-Length", strconv.FormatInt(prefixBytes+outputBytes, 10))
 	w.WriteHeader(http.StatusOK)
+	if len(prefix) != 0 {
+		n, err := w.Write(prefix)
+		if err != nil || n != len(prefix) || len(output) == 0 {
+			return
+		}
+	}
 	_, _ = w.Write(output)
 }

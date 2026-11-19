@@ -100,10 +100,62 @@ known-new cluster and preserve the durable identity of an existing voter.
 | `peer_cert_file`, `peer_key_file` | Empty | PEM certificate and private key for peer TLS. Set both for multi-host deployments. |
 | `peer_ca_file` | System trust roots | PEM trust roots for a private CA. |
 | `allow_loopback_plaintext` | `false` | Allows peer traffic without TLS on numeric loopback addresses for local tests. |
+| `experimental_raft_journal` | `false` | Uses one shared append journal per node. Select this when provisioning a fresh cluster storage directory. |
+| `experimental_raft_range_sync` | `false` | Enables Linux synchronous range writes for eligible journal appends. Requires `experimental_raft_journal`; other platforms retain normal sync. |
+| `experimental_ack_and_claim` | `false` | Combines manual acknowledgments and delivery refill in a fresh journal cluster. Enable it on every broker when provisioning. |
+| `experimental_assignments` | `false` | Uses committed consumer assignments in a fresh journal cluster. Enable it on every broker when provisioning. |
+| `experimental_replica_bodies` | `false` | Lets a broker reconstruct eligible remote assignment bodies from its own durable journal. Requires `experimental_assignments`. |
+| `experimental_journal_body_compression` | `false` | Losslessly packs eligible 32–128 KiB bodies. Requires `experimental_assignments`. |
+| `experimental_journal_small_body_compression` | `false` | Extends body compression down to 1 KiB in a fresh cluster. Requires `experimental_journal_body_compression`. |
 
 Cluster state lives under `storage.path/cluster`. Relative paths resolve from
 the working directory. Configure AMQP client authentication and encryption
 separately from peer TLS. See [TLS](TLS.md) and [Authorization](AUTHORIZATION.md).
+
+### Experimental shared journal
+
+Set `cluster.experimental_raft_journal: true` on a fresh cluster storage
+directory to try the shared journal. Keep the setting on subsequent restarts.
+The selected backend is part of the durable node identity, and a backend
+mismatch stops startup. The default bbolt backend continues to open existing
+cluster stores.
+
+The journal uses one active file for the catalog and data shards and syncs
+Raft updates before releasing durability-dependent responses. A durable
+checkpoint allows the previous snapshot blob to be reclaimed. The active
+journal caps at 8 GiB and retained snapshot blobs at another 8 GiB per node.
+A write that exceeds a cap fails the affected storage path. Use disposable
+test clusters for this option while segment reclamation and migration are
+pending.
+
+Set `cluster.experimental_raft_range_sync: true` to try Linux
+`pwritev2(RWF_SYNC)` for nonempty durable append batches with no earlier dirty
+bytes. The normal journal path handles earlier dirty data and empty barriers.
+An unsupported syscall or operation (`ENOSYS` or `EOPNOTSUPP`) falls back to
+write-and-sync only when no bytes were written. Short writes and other errors
+still stop the writer. Other platforms retain normal sync. This option is
+off by default and can change on restart with the same journal; it changes
+neither the disk format nor peer protocol and need not match across brokers.
+
+Set `cluster.experimental_ack_and_claim: true` together with the journal
+setting on every broker in a fresh test cluster to enable combined manual ACK
+and delivery refill. Keep both settings on restart. This mode uses a distinct
+storage marker and peer protocol identity so earlier brokers cannot open its
+journals or join its Raft groups.
+
+Enable small-body compression on every broker when provisioning a fresh
+cluster. Keep the setting on restart. The mode has its own disk identity and
+peer protocol. Packing requires a saving of at least 25%. AMQP clients receive
+the original bytes, queue quotas use the original size, and publisher confirms
+follow the journal's existing durability requirements.
+
+For a cluster already using experimental assignments, set
+`cluster.experimental_replica_bodies: true` to try reconstructing 32–128 KiB
+assignment bodies from the receiving broker's journal. This setting can change
+on restart with the same assignment journal. Older assignment peers and
+unavailable references use full assignment pages with the original delivery
+cursor. If local body verification fails, the broker logs the fault and stops
+its affected shard replica before retrying through a healthy leader.
 
 ## Readiness and quorum
 
@@ -126,10 +178,11 @@ replica membership. Brokers keep a routing view in
 brokers update their leader hints as they route requests.
 
 StrangeQ embeds the [etcd Raft library](https://github.com/etcd-io/raft).
-StrangeQ persists each group's log, term, vote, and snapshots in a local
-bbolt `raft.db`. That includes a separate database for the catalog on its
-replicas. On each Raft update, the broker saves the batch before sending
-replication acknowledgments or reporting a committed queue operation.
+With its default backend, StrangeQ persists each group's log, term, vote, and
+snapshots in a local bbolt `raft.db`, including a separate database for the
+catalog on its replicas. With either backend, the broker persists Raft updates
+before sending replication acknowledgments or reporting a committed queue
+operation.
 
 ## Behavior and limits
 

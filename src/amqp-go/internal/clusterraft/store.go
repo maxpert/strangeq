@@ -13,6 +13,7 @@ import (
 	"go.etcd.io/bbolt"
 	"go.etcd.io/raft/v3"
 	pb "go.etcd.io/raft/v3/raftpb"
+	"google.golang.org/protobuf/encoding/protowire"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -26,11 +27,60 @@ var (
 
 const dbName = "raft.db"
 
-type persisted struct {
-	hard     *pb.HardState
-	snapshot *pb.Snapshot
-	entries  []*pb.Entry
+type groupStore interface {
+	raft.Storage
+	planReady(raft.Ready) (readyWrite, error)
+	persistReady(readyWrite) (journalGroupDelta, error)
+	publishReady(readyWrite, journalGroupDelta)
+	checkpoint(uint64, *pb.ConfState, []byte) error
+	failureSignal() <-chan struct{}
+	failureCause() error
+	close() error
 }
+
+type boltGroupStore struct{ *diskStorage }
+
+func openBoltGroupStore(config Config) (groupStore, *pb.Snapshot, error) {
+	db, err := createStore(config)
+	if err != nil {
+		return nil, nil, err
+	}
+	store, snapshot, err := loadStore(db)
+	if err != nil {
+		_ = db.Close()
+		return nil, nil, err
+	}
+	return &boltGroupStore{store}, snapshot, nil
+}
+
+func (s *boltGroupStore) persistReady(write readyWrite) (journalGroupDelta, error) {
+	return journalGroupDelta{}, saveReady(s.db, write.ready)
+}
+
+func (s *boltGroupStore) publishReady(write readyWrite, _ journalGroupDelta) {
+	s.diskStorage.publishReady(write)
+}
+
+func (s *boltGroupStore) close() error { return s.db.Close() }
+
+func (*boltGroupStore) failureSignal() <-chan struct{} { return nil }
+
+func (*boltGroupStore) failureCause() error { return nil }
+
+// diskStorage is owned by Group under its mutex. Index and term lookups do
+// not read payloads, and entries and snapshots outlive their read transactions.
+type diskStorage struct {
+	db       *bbolt.DB
+	hard     *pb.HardState
+	snapshot *pb.SnapshotMetadata
+	terms    []uint64 // The first term follows the snapshot index.
+}
+
+// etcd Raft panics on unexpected Storage errors. Tag local read failures so
+// Group stops the affected replica while unrelated groups keep running.
+type raftStoreReadError struct{ error }
+
+func (e *raftStoreReadError) Unwrap() error { return e.error }
 
 func Exists(dir string) (bool, error) {
 	_, err := os.Stat(filepath.Join(dir, dbName))
@@ -188,8 +238,9 @@ func putMessage(bucket *bbolt.Bucket, key []byte, message proto.Message) error {
 	return bucket.Put(key, data)
 }
 
-func loadStore(db *bbolt.DB) (persisted, error) {
-	store := persisted{hard: &pb.HardState{}}
+func loadStore(db *bbolt.DB) (*diskStorage, *pb.Snapshot, error) {
+	store := &diskStorage{db: db, hard: &pb.HardState{}}
+	var snapshot *pb.Snapshot
 	err := db.View(func(tx *bbolt.Tx) error {
 		state := tx.Bucket(stateBucket)
 		if data := state.Get(keyHard); data != nil {
@@ -199,12 +250,13 @@ func loadStore(db *bbolt.DB) (persisted, error) {
 		}
 		var previous uint64
 		if data := state.Get(keySnapshot); data != nil {
-			store.snapshot = &pb.Snapshot{}
-			if err := proto.Unmarshal(data, store.snapshot); err != nil {
+			snapshot = &pb.Snapshot{}
+			if err := proto.Unmarshal(data, snapshot); err != nil {
 				return err
 			}
-			previous = store.snapshot.GetMetadata().GetIndex()
-			if previous == 0 || store.snapshot.GetMetadata().GetTerm() == 0 || store.snapshot.GetMetadata().GetConfState() == nil {
+			store.snapshot = snapshot.GetMetadata()
+			previous = store.snapshot.GetIndex()
+			if previous == 0 || store.snapshot.GetTerm() == 0 || store.snapshot.GetConfState() == nil {
 				return errors.New("invalid persisted raft snapshot")
 			}
 		}
@@ -212,31 +264,251 @@ func loadStore(db *bbolt.DB) (persisted, error) {
 			if len(key) != 8 || binary.BigEndian.Uint64(key) != previous+1 {
 				return errors.New("gap in persisted raft log")
 			}
-			entry := &pb.Entry{}
-			if err := proto.Unmarshal(data, entry); err != nil {
+			index, term, err := entryMetadata(data)
+			if err != nil {
 				return err
 			}
-			if entry.GetIndex() != previous+1 || entry.GetTerm() == 0 {
+			if index != previous+1 || term == 0 {
 				return errors.New("invalid persisted raft entry")
 			}
 			previous++
-			store.entries = append(store.entries, entry)
+			store.terms = append(store.terms, term)
 			return nil
 		}); err != nil {
 			return err
 		}
-		if store.hard.GetCommit() > previous || store.hard.GetCommit() < store.snapshot.GetMetadata().GetIndex() {
+		if store.hard.GetCommit() > previous || store.hard.GetCommit() < store.snapshot.GetIndex() {
 			return errors.New("invalid persisted raft commit")
 		}
 		return nil
 	})
-	return store, err
+	return store, snapshot, err
+}
+
+type entryWireMetadata struct {
+	index, term          uint64
+	dataOffset, dataSize uint32
+}
+
+func entryMetadata(data []byte) (index, term uint64, err error) {
+	meta, err := parseEntryWire(data)
+	return meta.index, meta.term, err
+}
+
+// parseEntryWire validates the Entry wire encoding without copying its body.
+// The field numbers are fixed by raftpb/raft.proto.
+func parseEntryWire(data []byte) (entryWireMetadata, error) {
+	var meta entryWireMetadata
+	total := len(data)
+	for len(data) > 0 {
+		field, wire, size := protowire.ConsumeTag(data)
+		if size < 0 {
+			return entryWireMetadata{}, protowire.ParseError(size)
+		}
+		data = data[size:]
+		size = protowire.ConsumeFieldValue(field, wire, data)
+		if size < 0 {
+			return entryWireMetadata{}, protowire.ParseError(size)
+		}
+		if wire == protowire.VarintType {
+			switch field {
+			case 2:
+				meta.term, _ = protowire.ConsumeVarint(data)
+			case 3:
+				meta.index, _ = protowire.ConsumeVarint(data)
+			}
+		}
+		if field == 4 && wire == protowire.BytesType {
+			body, _ := protowire.ConsumeBytes(data)
+			meta.dataOffset = uint32(total - len(data) + size - len(body))
+			meta.dataSize = uint32(len(body))
+		}
+		data = data[size:]
+	}
+	return meta, nil
+}
+
+func (s *diskStorage) InitialState() (*pb.HardState, *pb.ConfState, error) {
+	// Raft's normalization fills absent protobuf fields by mutating its
+	// argument. Leave the persisted snapshot metadata intact for comparison.
+	conf := proto.CloneOf(s.snapshot.GetConfState())
+	return s.hard, pb.EnsureConfState(conf), nil
+}
+
+func (s *diskStorage) FirstIndex() (uint64, error) {
+	return s.snapshot.GetIndex() + 1, nil
+}
+
+func (s *diskStorage) LastIndex() (uint64, error) {
+	return s.snapshot.GetIndex() + uint64(len(s.terms)), nil
+}
+
+func (s *diskStorage) Term(index uint64) (uint64, error) {
+	base := s.snapshot.GetIndex()
+	switch {
+	case index < base:
+		return 0, raft.ErrCompacted
+	case index == base:
+		return s.snapshot.GetTerm(), nil
+	case index-base > uint64(len(s.terms)):
+		return 0, raft.ErrUnavailable
+	default:
+		return s.terms[index-base-1], nil
+	}
+}
+
+func (s *diskStorage) Entries(lo, hi, maxSize uint64) ([]*pb.Entry, error) {
+	base := s.snapshot.GetIndex()
+	if lo <= base {
+		return nil, raft.ErrCompacted
+	}
+	if lo > hi || hi-base-1 > uint64(len(s.terms)) {
+		return nil, raft.ErrUnavailable
+	}
+	if lo == hi {
+		return nil, nil
+	}
+	var entries []*pb.Entry
+	err := s.db.View(func(tx *bbolt.Tx) error {
+		cursor := tx.Bucket(logBucket).Cursor()
+		start := binary.BigEndian.AppendUint64(nil, lo)
+		key, data := cursor.Seek(start)
+		var size uint64
+		for index := lo; index < hi; index++ {
+			if len(key) != 8 || binary.BigEndian.Uint64(key) != index {
+				return fmt.Errorf("missing raft entry %d", index)
+			}
+			// bbolt stores the protobuf encoding unchanged. Include the first
+			// entry even if it exceeds the byte limit, as required by Raft.
+			if len(entries) > 0 && (size >= maxSize || uint64(len(data)) > maxSize-size) {
+				break
+			}
+			entry := &pb.Entry{}
+			if err := proto.Unmarshal(data, entry); err != nil {
+				return fmt.Errorf("decode raft entry %d: %w", index, err)
+			}
+			if entry.GetIndex() != index || entry.GetTerm() != s.terms[index-base-1] {
+				return fmt.Errorf("invalid raft entry %d", index)
+			}
+			entries = append(entries, entry)
+			size += uint64(len(data))
+			if size >= maxSize || index+1 == hi {
+				break
+			}
+			key, data = cursor.Next()
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, &raftStoreReadError{err}
+	}
+	return entries, nil
+}
+
+func (s *diskStorage) Snapshot() (*pb.Snapshot, error) {
+	if s.snapshot == nil {
+		return &pb.Snapshot{}, nil
+	}
+	snapshot := &pb.Snapshot{}
+	err := s.db.View(func(tx *bbolt.Tx) error {
+		if err := proto.Unmarshal(tx.Bucket(stateBucket).Get(keySnapshot), snapshot); err != nil {
+			return fmt.Errorf("decode raft snapshot: %w", err)
+		}
+		if !proto.Equal(snapshot.GetMetadata(), s.snapshot) {
+			return errors.New("persisted raft snapshot metadata changed")
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, &raftStoreReadError{err}
+	}
+	return snapshot, nil
+}
+
+type readyWrite struct {
+	ready       raft.Ready
+	hard        *pb.HardState
+	offset      uint64
+	replacesLog bool
+}
+
+func (s *diskStorage) planReady(ready raft.Ready) (readyWrite, error) {
+	write := readyWrite{ready: ready, hard: s.hard}
+	base, length := s.snapshot.GetIndex(), uint64(len(s.terms))
+	if !raft.IsEmptySnap(ready.Snapshot) {
+		incoming := ready.Snapshot.GetMetadata()
+		if incoming.GetIndex() <= base || incoming.GetTerm() == 0 || incoming.GetConfState() == nil {
+			return readyWrite{}, errors.New("invalid incoming raft snapshot")
+		}
+		write.replacesLog = true
+		base, length = incoming.GetIndex(), 0
+	}
+	if len(ready.Entries) > 0 {
+		first := ready.Entries[0].GetIndex()
+		if first <= base || first-base-1 > length {
+			return readyWrite{}, errors.New("gap or overlap with snapshot in raft append")
+		}
+		write.offset = first - base - 1
+		write.replacesLog = write.replacesLog || write.offset < length
+		length = write.offset + uint64(len(ready.Entries))
+		for i, entry := range ready.Entries {
+			if entry.GetIndex() != first+uint64(i) || entry.GetTerm() == 0 {
+				return readyWrite{}, errors.New("invalid entry in raft append")
+			}
+		}
+	}
+	if !raft.IsEmptyHardState(ready.HardState) {
+		write.hard = ready.HardState
+	}
+	if write.hard.GetCommit() < base || write.hard.GetCommit()-base > length {
+		return readyWrite{}, errors.New("raft commit outside persisted log")
+	}
+	return write, nil
+}
+
+func (s *diskStorage) publishReady(write readyWrite) {
+	ready := write.ready
+	if !raft.IsEmptySnap(ready.Snapshot) {
+		s.snapshot = ready.Snapshot.GetMetadata()
+		s.terms = nil
+	}
+	if len(ready.Entries) > 0 {
+		s.terms = s.terms[:write.offset]
+		for _, entry := range ready.Entries {
+			s.terms = append(s.terms, entry.GetTerm())
+		}
+	}
+	s.hard = write.hard
+}
+
+func (s *diskStorage) checkpoint(index uint64, conf *pb.ConfState, data []byte) error {
+	base := s.snapshot.GetIndex()
+	if index <= base {
+		return raft.ErrSnapOutOfDate
+	}
+	if index > s.hard.GetCommit() {
+		return errors.New("raft checkpoint exceeds persisted commit")
+	}
+	term, err := s.Term(index)
+	if err != nil {
+		return err
+	}
+	snapshot := &pb.Snapshot{
+		Metadata: &pb.SnapshotMetadata{Index: new(index), Term: new(term), ConfState: conf},
+		Data:     data,
+	}
+	if err := saveSnapshot(s.db, snapshot); err != nil {
+		return err
+	}
+	s.snapshot = snapshot.GetMetadata()
+	s.terms = slices.Clone(s.terms[index-base:])
+	return nil
 }
 
 // saveReady atomically commits snapshot, conflicting suffix replacement, and
 // HardState. A successful synchronous bbolt commit precedes every Raft reply.
 func saveReady(db *bbolt.DB, ready raft.Ready) error {
-	if raft.IsEmptyHardState(ready.HardState) && raft.IsEmptySnap(ready.Snapshot) && len(ready.Entries) == 0 {
+	if !needsDurableWrite(ready) {
 		return nil
 	}
 	return db.Update(func(tx *bbolt.Tx) error {
@@ -275,6 +547,10 @@ func saveReady(db *bbolt.DB, ready raft.Ready) error {
 		}
 		return nil
 	})
+}
+
+func needsDurableWrite(ready raft.Ready) bool {
+	return !raft.IsEmptyHardState(ready.HardState) || !raft.IsEmptySnap(ready.Snapshot) || len(ready.Entries) != 0
 }
 
 func saveSnapshot(db *bbolt.DB, snapshot *pb.Snapshot) error {
