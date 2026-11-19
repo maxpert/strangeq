@@ -25,6 +25,9 @@ func (f journalRangeSyncFile) writeAtSync(data []byte, offset int64) (int, error
 }
 
 func writeJournalFrame(file journalFile, data []byte, offset int64, syncRange bool) (int, bool, error) {
+	if segmented, ok := file.(*journalSegmentOutput); ok {
+		return segmented.writeFrame(data, offset, syncRange)
+	}
 	if syncRange {
 		if ranged, ok := file.(interface {
 			writeAtSync([]byte, int64) (int, error)

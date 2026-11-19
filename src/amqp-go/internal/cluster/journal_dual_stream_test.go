@@ -32,13 +32,13 @@ func TestDualJournalNodeUsesFreshStableParityStorage(t *testing.T) {
 	cfg := dualStreamTestConfig(t)
 	require.NoError(t, Initialize(cfg))
 	for stream := range 2 {
-		require.FileExists(t, filepath.Join(dualStreamTestPath(cfg, stream), "active.raft-journal"),
+		require.FileExists(t, filepath.Join(dualStreamTestPath(cfg, stream), "extent-0000000000000001.raft-journal"),
 			"explicit two-stream mode must provision both independent journals")
 	}
 	require.NoDirExists(t, filepath.Join(cfg.Directory, "raft-journal"))
 	mode, err := os.ReadFile(filepath.Join(cfg.Directory, "raft-storage-mode-v1"))
 	require.NoError(t, err)
-	require.Equal(t, "journal-two-stream-parity-v1", string(mode))
+	require.Equal(t, "segmented-journal-two-stream-parity-v1", string(mode))
 
 	assertInventory := func() {
 		t.Helper()
@@ -94,7 +94,7 @@ func TestDualJournalNodeResumesPartialProvisioning(t *testing.T) {
 	require.NoFileExists(t, stub.path(journalProvisionedFile))
 
 	require.NoError(t, Initialize(cfg))
-	require.FileExists(t, filepath.Join(dualStreamTestPath(cfg, 1), "active.raft-journal"))
+	require.FileExists(t, filepath.Join(dualStreamTestPath(cfg, 1), "extent-0000000000000001.raft-journal"))
 	pair, err := clusterraft.OpenNodeJournalPairWithRangeSync(cfg.Directory, false, cfg.Peer.ID)
 	require.NoError(t, err)
 	defer func() { require.NoError(t, pair.Close()) }()
@@ -116,14 +116,14 @@ func TestDualJournalNodeRejectsModeChangeAndMissingStream(t *testing.T) {
 	require.Equal(t, before, journalTestStorageDigest(t, cfg.Directory))
 
 	for stream := range 2 {
-		active := filepath.Join(dualStreamTestPath(cfg, stream), "active.raft-journal")
-		backup := filepath.Join(t.TempDir(), "active.raft-journal")
+		active := filepath.Join(dualStreamTestPath(cfg, stream), "extent-0000000000000001.raft-journal")
+		backup := filepath.Join(t.TempDir(), "extent-0000000000000001.raft-journal")
 		require.NoError(t, os.Rename(active, backup))
 		node, err := Open(cfg)
 		if node != nil {
 			_ = node.Close()
 		}
-		require.ErrorContains(t, err, "lost its established persistent raft journal")
+		require.ErrorContains(t, err, "missing journal extent")
 		require.NoFileExists(t, active)
 		require.NoError(t, os.Rename(backup, active))
 	}

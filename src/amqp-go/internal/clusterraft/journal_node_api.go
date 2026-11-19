@@ -1,7 +1,6 @@
 package clusterraft
 
 import (
-	"os"
 	"slices"
 )
 
@@ -11,21 +10,21 @@ type NodeJournal struct {
 	store *journalGroupNode
 }
 
-// OpenNodeJournal permits a missing active file only during node provisioning.
-// An established node must pass create=false so storage loss fails closed.
+// OpenNodeJournal opens the segmented store. Only provisioning may create
+// its manifest. The selected journal files are required on every reopen.
 func OpenNodeJournal(dir string, create bool) (*NodeJournal, error) {
-	return openNodeJournal(dir, create, nil)
+	return openNodeJournal(dir, create, false)
 }
 
 // OpenNodeJournalWithRangeSync opts into Linux synchronous range writes for
 // clean-prefix append batches. Other platforms retain normal journal sync.
 // The format and create semantics are identical to OpenNodeJournal.
 func OpenNodeJournalWithRangeSync(dir string, create bool) (*NodeJournal, error) {
-	return openNodeJournal(dir, create, wrapRangeSyncJournalFile)
+	return openNodeJournal(dir, create, true)
 }
 
-func openNodeJournal(dir string, create bool, wrap func(*os.File) journalFile) (*NodeJournal, error) {
-	store, err := openJournal(dir, create, wrap)
+func openNodeJournal(dir string, create, rangeSync bool) (*NodeJournal, error) {
+	store, err := openSegmentedGroupNode(dir, create, rangeSync, journalServingExtentBytes, journalGroupMaxFileBytes, nil, journalSegmentHooks{})
 	if err != nil {
 		return nil, err
 	}

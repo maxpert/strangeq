@@ -50,13 +50,13 @@ func TestJournalRangeSyncTogglesOnExistingJournal(t *testing.T) {
 	normal, err := OpenNodeJournal(dir, true)
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, normal.Close()) })
-	require.IsType(t, journalDataFile{}, normal.store.writer.file)
+	require.False(t, normal.store.writer.file.(*journalSegmentOutput).rangeSync)
 	require.NoError(t, normal.Close())
 
 	ranged, err := OpenNodeJournalWithRangeSync(dir, false)
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, ranged.Close()) })
-	require.IsType(t, journalRangeSyncFile{}, ranged.store.writer.file)
+	require.True(t, ranged.store.writer.file.(*journalSegmentOutput).rangeSync)
 	config := Config{
 		ID: 1, GroupID: 1, Dir: filepath.Join(dir, "group"), Peers: []uint64{1},
 		Machine: &testMachine{}, TickInterval: -1,
@@ -72,7 +72,7 @@ func TestJournalRangeSyncTogglesOnExistingJournal(t *testing.T) {
 	restored, err := OpenNodeJournal(dir, false)
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, restored.Close()) })
-	require.IsType(t, journalDataFile{}, restored.store.writer.file)
+	require.False(t, restored.store.writer.file.(*journalSegmentOutput).rangeSync)
 	config.Peers = nil
 	config.Machine = &testMachine{}
 	group = openTestJournalGroup(t, restored.store, config)

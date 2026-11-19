@@ -60,7 +60,7 @@ func TestExperimentalJournalClusterBootstrapsAndRestartsWithoutBolt(t *testing.T
 			switch entry.Name() {
 			case "raft.db":
 				boltFiles = append(boltFiles, path)
-			case "active.raft-journal":
+			case "extent-0000000000000001.raft-journal":
 				journals = append(journals, path)
 			}
 			return nil

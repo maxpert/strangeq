@@ -3,7 +3,6 @@ package clusterraft
 import (
 	"errors"
 	"fmt"
-	"os"
 	"path/filepath"
 	"slices"
 	"sync"
@@ -25,12 +24,14 @@ type NodeJournalPair struct {
 // before returning. create has the same provisioning-only meaning as it does
 // for OpenNodeJournal. There is deliberately no single-stream fallback.
 func OpenNodeJournalPairWithRangeSync(root string, create bool, peer uint64) (*NodeJournalPair, error) {
-	return openNodeJournalPair(root, create, peer, func(_ int, file *os.File) journalFile {
-		return wrapRangeSyncJournalFile(file)
+	quota := &journalSegmentQuota{limit: journalGroupMaxFileBytes, streams: 2}
+	return openJournalPair(root, peer, func(dir string, _ int, budget *journalBudget) (*journalGroupNode, error) {
+		return openSegmentedGroupNode(dir, create, true, journalServingExtentBytes, journalGroupMaxFileBytes, budget,
+			journalSegmentHooks{sharedQuota: quota})
 	})
 }
 
-func openNodeJournalPair(root string, create bool, peer uint64, wrap func(int, *os.File) journalFile) (_ *NodeJournalPair, err error) {
+func openJournalPair(root string, peer uint64, open func(string, int, *journalBudget) (*journalGroupNode, error)) (_ *NodeJournalPair, err error) {
 	if !ValidMemberID(peer) {
 		return nil, errors.New("two-stream journal requires a valid node identity")
 	}
@@ -47,9 +48,7 @@ func openNodeJournalPair(root string, create bool, peer uint64, wrap func(int, *
 	}()
 	for index := range n.streams {
 		dir := filepath.Join(root, fmt.Sprintf("raft-journal-%d", index))
-		store, openErr := openJournalWithBudget(dir, create, func(file *os.File) journalFile {
-			return wrap(index, file)
-		}, budget)
+		store, openErr := open(dir, index, budget)
 		if openErr != nil {
 			return nil, fmt.Errorf("open node journal stream %d: %w", index, openErr)
 		}

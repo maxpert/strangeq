@@ -4,7 +4,6 @@ package clusterraft
 
 import (
 	"os"
-	"path/filepath"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -82,9 +81,9 @@ func TestNodeJournalPairRecoversSharedBudgetFromSyncedValidatedEnds(t *testing.T
 		require.NoError(t, group.Close())
 	}
 	require.NoError(t, node.Close())
-	paths := [2]string{
-		filepath.Join(root, "raft-journal-0", journalActiveName),
-		filepath.Join(root, "raft-journal-1", journalActiveName),
+	var paths [2]string
+	for i, stream := range node.streams {
+		paths[i] = stream.store.reader.(*journalSegmentReader).store.path(1)
 	}
 	var expected int64
 	for _, path := range paths {
@@ -106,11 +105,13 @@ func TestNodeJournalPairRecoversSharedBudgetFromSyncedValidatedEnds(t *testing.T
 	t.Cleanup(func() { _ = reopened.Close() })
 	budget := reopened.streams[0].store.writer.budget
 	require.Same(t, budget, reopened.streams[1].store.writer.budget)
-	budget.mu.Lock()
-	actual := budget.fileBytes
-	budget.mu.Unlock()
+	quota := reopened.streams[0].store.reader.(*journalSegmentReader).store.quota
+	require.Same(t, quota, reopened.streams[1].store.reader.(*journalSegmentReader).store.quota)
+	quota.mu.Lock()
+	actual := quota.used
+	quota.mu.Unlock()
 	require.Equal(t, expected, actual)
-	require.Equal(t, int64(8<<30), budget.maxFileBytes)
+	require.Equal(t, int64(8<<30), quota.limit)
 	require.Equal(t, 128<<20, budget.maxPendingBytes)
 	require.Equal(t, 64, budget.maxPendingRequests)
 	var physical int64

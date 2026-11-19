@@ -27,8 +27,15 @@ func (g *Group) StopOnAssignmentBodyFailure(cause error) bool {
 }
 
 type assignmentJournalSource struct {
-	io.SectionReader
+	journalCommandReader
 	index, term uint64
+}
+
+func (s *assignmentJournalSource) Retain() (io.ReaderAt, func(), error) {
+	if source, ok := s.journalCommandReader.(*journalSegmentCommandSource); ok {
+		return source.Retain()
+	}
+	return s, func() {}, nil
 }
 
 func (s *assignmentJournalSource) AssignmentJournalEntry() (index, term uint64, size int64) {
@@ -76,6 +83,7 @@ func (g *Group) TryPinAssignmentJournal(spans []AssignmentJournalSpan) (read fun
 	}
 	base := store.state.snapshot.metadata.GetIndex()
 	var offsets [MaxAssignmentJournalSpans]int64
+	var start, end int64
 	keySize := uint32(len(key{}))
 	for i, span := range spans {
 		if span.Index <= base {
@@ -97,8 +105,19 @@ func (g *Group) TryPinAssignmentJournal(spans []AssignmentJournalSpan) (read fun
 			return nil, nil, ErrAssignmentJournalRange
 		}
 		offsets[i] = ref.offset + int64(ref.dataOffset) + int64(keySize) + int64(span.Offset)
+		if i == 0 || start > offsets[i] {
+			start = offsets[i]
+		}
+		end = max(end, offsets[i]+int64(span.Length))
 	}
 	reader := store.node.reader
+	unpin := func() {}
+	if segmented, ok := reader.(*journalSegmentReader); ok {
+		unpin, err = segmented.store.pinReadRange(start, end)
+		if err != nil {
+			return nil, nil, ErrBusy
+		}
+	}
 	g.replyWorkers.Add(1)
 	read = func(i int, dst []byte) error {
 		if i < 0 || i >= len(spans) || uint64(len(dst)) != uint64(spans[i].Length) {
@@ -113,7 +132,10 @@ func (g *Group) TryPinAssignmentJournal(spans []AssignmentJournalSpan) (read fun
 		}
 		return err
 	}
-	return read, g.replyWorkers.Done, nil
+	return read, func() {
+		unpin()
+		g.replyWorkers.Done()
+	}, nil
 }
 
 func (g *Group) assignmentJournal() (*journalGroupStore, error) {

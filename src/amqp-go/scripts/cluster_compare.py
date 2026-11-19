@@ -272,16 +272,20 @@ def verify_journal_layout(cluster, ack_and_claim, assignments=False, body_compre
         expected_mode = b"journal-assignments-compressed-bodies"
     if small_body_compression:
         expected_mode = b"journal-assignments-small-compressed-bodies"
+    expected_mode = b"segmented-" + expected_mode
     if dual_stream:
         expected_mode += b"-two-stream-parity-v1"
     if (not mode.is_file() or mode.read_bytes() != expected_mode
             or not provisioned.is_file() or provisioned.read_bytes() != b"\x01"):
         raise BenchmarkError(f"StrangeQ journal mode or provision marker is invalid at {cluster}")
     locations = ("raft-journal-0", "raft-journal-1") if dual_stream else ("raft-journal",)
-    active = [cluster / subdir / "active.raft-journal" for subdir in locations]
-    if (set(cluster.rglob("active.raft-journal")) != set(active)
-            or any(not file.is_file() or file.stat().st_size == 0 or file.is_symlink() for file in active)):
-        raise BenchmarkError(f"StrangeQ journal files do not match expected paths {active}")
+    journals = {cluster / name for name in locations}
+    if ({path.parent for path in cluster.rglob("segments.manifest")} != journals
+            or any(not any(file.is_file() and file.stat().st_size > 0
+                           for file in directory.glob("extent-*.raft-journal")) for directory in journals)
+            or any(path.parent not in journals for path in cluster.rglob("extent-*.raft-journal"))
+            or next(cluster.rglob("active.raft-journal"), None) is not None):
+        raise BenchmarkError(f"StrangeQ segmented journal files do not match expected paths {journals}")
     if os.path.lexists(cluster / "identity.json") or next(cluster.rglob("raft.db"), None) is not None:
         raise BenchmarkError(f"StrangeQ journal and per-group Bolt storage coexist at {cluster}")
     verify_journal_group(cluster, CATALOG_GROUP)

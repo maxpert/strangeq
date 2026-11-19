@@ -2,6 +2,7 @@ package clusterqueue
 
 import (
 	"bytes"
+	"errors"
 	"io"
 	"testing"
 
@@ -113,4 +114,35 @@ func TestCapturedJournalClaimOwnsTheCommittedReplyUntilEncoding(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, 2, source.reads)
 	require.Equal(t, want, reply, "the encoder must use captured attempts and bytes after later session state")
+}
+
+type failingJournalRetain struct {
+	*bytes.Reader
+	cause error
+}
+
+func (s failingJournalRetain) Retain() (io.ReaderAt, func(), error) {
+	return nil, nil, s.cause
+}
+
+func TestJournaledSessionPublishSurfacesStorageFailure(t *testing.T) {
+	for _, wantReply := range []bool{true, false} {
+		machine, session := claimBatchFixture(t, 2)
+		session.Kind = PublishMessage
+		session.Sequence = 1
+		session.Body = bytes.Repeat([]byte{0xfb}, 64<<10)
+		wire, err := EncodeCommand(session)
+		require.NoError(t, err)
+
+		cause := errors.New("journal body ownership unavailable")
+		body, encode, err := machine.ApplyJournaledReply(wire, wantReply, failingJournalRetain{bytes.NewReader(wire), cause})
+		require.ErrorIs(t, err, cause)
+		require.Empty(t, body)
+		require.Nil(t, encode)
+		queue := machine.state.Queues[queueName]
+		require.Empty(t, queue.Ready)
+		require.Zero(t, queue.Sessions[session.Session].Sequence)
+		require.NoError(t, apply(t, machine, session).Err(), "a recovered replica can apply the same sequence")
+		require.Len(t, queue.Ready, 1)
+	}
 }

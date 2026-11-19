@@ -136,6 +136,9 @@ func (m *Machine) publishBatch(q *queueState, body []byte, origin journalBodyOri
 			logical, _ = clusterpayload.EnvelopeSize(record)
 		}
 		published := m.publish(q, record, messageOrigin, logical)
+		if published.storageErr != nil {
+			return published
+		}
 		if published.Code != "" {
 			result.Code = published.Code
 			return result

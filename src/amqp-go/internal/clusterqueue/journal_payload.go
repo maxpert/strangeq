@@ -23,22 +23,54 @@ type journalBody struct {
 	size             int
 	checksum         uint32
 	assignmentDigest *[sha256.Size]byte
+	releaseSource    func()
 }
 
-func (origin journalBodyOrigin) message(id MessageID, body []byte) messageState {
+func (origin journalBodyOrigin) message(id MessageID, body []byte) (messageState, error) {
 	if origin.source == nil || len(body) < minJournalBodyBytes {
-		return messageState{ID: id, Body: bytes.Clone(body)}
+		return messageState{ID: id, Body: bytes.Clone(body)}, nil
 	}
 	cold := &journalBody{
 		journalBodyOrigin: origin,
 		size:              len(body),
 		checksum:          crc32.Checksum(body, journalBodyChecksum),
 	}
+	if source, ok := origin.source.(interface {
+		Retain() (io.ReaderAt, func(), error)
+	}); ok {
+		_, release, err := source.Retain()
+		if err != nil {
+			return messageState{}, err
+		}
+		// Encoders use the immutable reader. Their separate Group pin
+		// lasts through encoding even if an ACK releases this owner.
+		cold.releaseSource = release
+	}
 	if _, ok := origin.source.(assignmentJournalEntry); ok && len(body) <= maxAssignmentReferenceBody {
 		digest := sha256.Sum256(body)
 		cold.assignmentDigest = &digest
 	}
-	return messageState{ID: id, cold: cold}
+	return messageState{ID: id, cold: cold}, nil
+}
+
+func (m messageState) releaseJournalSource() {
+	if m.cold != nil && m.cold.releaseSource != nil {
+		m.cold.releaseSource()
+	}
+}
+
+// ReleaseJournalSources runs after captured readers have been joined.
+func (m *Machine) ReleaseJournalSources() {
+	for _, queue := range m.state.Queues {
+		for _, message := range queue.Ready {
+			message.releaseJournalSource()
+		}
+		for _, session := range queue.Sessions {
+			for _, message := range session.Flights {
+				message.releaseJournalSource()
+			}
+		}
+	}
 }
 
 func (b *journalBody) read(dst []byte) error {

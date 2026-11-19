@@ -18,7 +18,7 @@ func (g *Group) checkpointPressure() (due, force bool) {
 		max(scaleCheckpointThreshold(baseline, 4), scaleCheckpointThreshold(machine.CheckpointCostBytes(), 64)))
 	hardBytes := scaleCheckpointThreshold(baseline, 64)
 	hardEntries := scaleCheckpointThreshold(g.cfg.SnapshotEntries, 64)
-	return g.appliedLogBytes >= target,
+	return g.appliedLogBytes >= target || g.journalCheckpointNeeded(),
 		g.appliedLogBytes >= hardBytes || g.applied-g.snapshotIndex >= hardEntries
 }
 
@@ -27,4 +27,16 @@ func scaleCheckpointThreshold(value, multiplier uint64) uint64 {
 		return math.MaxUint64
 	}
 	return value * multiplier
+}
+
+// A shard with a small log can keep entire shared extents alive. Ask it to
+// checkpoint when applied entries fall well behind the append frontier.
+func (g *Group) journalCheckpointNeeded() bool {
+	if !g.journalInput || !g.cfg.BackgroundJournalCheckpoints || g.applied <= g.snapshotIndex {
+		return false
+	}
+	store := g.store.(*journalGroupStore)
+	reader, ok := store.node.reader.(*journalSegmentReader)
+	return ok && len(store.state.entries) != 0 &&
+		store.state.entries[0].offset < reader.store.checkpointFloor.Load()
 }

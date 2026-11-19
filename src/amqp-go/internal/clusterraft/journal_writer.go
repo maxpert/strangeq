@@ -93,8 +93,10 @@ func newJournalWriterWithBudget(file journalFile, end int64, nextSequence uint64
 		if limits.pendingBytes > budget.maxPendingBytes || limits.pendingRequests > budget.maxPendingRequests {
 			return nil, errors.New("raft journal writer exceeds node admission budget")
 		}
-		if err := budget.reserveFile(end); err != nil {
-			return nil, err
+		if _, segmented := file.(*journalSegmentOutput); !segmented {
+			if err := budget.reserveFile(end); err != nil {
+				return nil, err
+			}
 		}
 		w.mu, w.space, w.staging = &budget.mu, budget.space, budget.staging
 	}
@@ -230,6 +232,12 @@ func (w *journalWriter) run() {
 			return
 		}
 		w.complete(batch)
+		if segmented, ok := w.file.(*journalSegmentOutput); ok {
+			if err := segmented.maintain(false); err != nil && !errors.Is(err, errJournalBusy) {
+				w.fail(nil, err)
+				return
+			}
+		}
 	}
 	if err := w.sync(); err != nil {
 		w.fail(nil, err)
@@ -258,7 +266,7 @@ func (w *journalWriter) writeBatch(batch []journalRequest) error {
 			return fmt.Errorf("raft journal file limit at offset %d: %w", w.offset, errJournalTooLarge)
 		}
 		// A single writer already owns the full cap through its local offset.
-		if w.budget != nil {
+		if _, segmented := w.file.(*journalSegmentOutput); w.budget != nil && !segmented {
 			if err := w.budget.reserveFile(int64(len(frame))); err != nil {
 				return err
 			}

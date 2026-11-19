@@ -46,12 +46,14 @@ func (n *Node) storageIdentity() (name, mode string, err error) {
 	if n.cfg.ExperimentalJournalSmallBodyCompression {
 		name, mode = smallBodyJournalIdentityFile, "journal-assignments-small-compressed-bodies"
 	}
+	if n.cfg.ExperimentalRaftJournal {
+		mode = "segmented-" + mode
+	}
 	if n.cfg.ExperimentalRaftJournalDualStream {
 		mode += "-two-stream-parity-v1"
 	}
-	if n.cfg.ExperimentalRaftJournalDualStream || n.cfg.ExperimentalJournalSmallBodyCompression {
-		// Require the published mode for directories with a newer journal
-		// identity or a two-stream layout.
+	if n.cfg.ExperimentalRaftJournal {
+		// Existing journal identities must carry the segmented storage mode.
 		if exists, err := pathExists(n.path(name)); err != nil {
 			return "", "", err
 		} else if exists {

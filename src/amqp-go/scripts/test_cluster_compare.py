@@ -172,9 +172,10 @@ class PlacementTests(unittest.TestCase):
             identity = {"Peer": peer, "Cluster": root.name, "Shards": 1, "Seeds": seeds, "Nonce": ""}
             if journal:
                 (cluster / "raft-journal").mkdir(parents=True)
-                (cluster / "raft-journal" / "active.raft-journal").write_bytes(b"frame")
+                (cluster / "raft-journal" / "extent-0000000000000001.raft-journal").write_bytes(b"frame")
+                (cluster / "raft-journal" / "segments.manifest").write_bytes(b"manifest")
                 (cluster / "journal-provisioned-v1").write_bytes(b"\x01")
-                (cluster / "raft-storage-mode-v1").write_text("journal")
+                (cluster / "raft-storage-mode-v1").write_text("segmented-journal")
                 (cluster / "opened-18446744073709551615").write_bytes(b"\x01")
                 (cluster / "opened-1").write_bytes(b"\x01")
                 (cluster / "journal-identity-v1.json").write_text(json.dumps(identity))
@@ -253,10 +254,10 @@ class PlacementTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as scratch:
             context, _ = self.make_strangeq_cluster(Path(scratch), journal=True)
             for node in context[0][:-1]:
-                (node / "cluster/raft-storage-mode-v1").write_bytes(b"journal-ack-and-claim")
+                (node / "cluster/raft-storage-mode-v1").write_bytes(b"segmented-journal-ack-and-claim")
             with self.assertRaisesRegex(BenchmarkError, "journal mode"):
                 verify_strangeq_placement(context, case, journal=True, ack_and_claim=True)
-            (context[0][-1] / "cluster/raft-storage-mode-v1").write_bytes(b"journal-ack-and-claim")
+            (context[0][-1] / "cluster/raft-storage-mode-v1").write_bytes(b"segmented-journal-ack-and-claim")
             placement = verify_strangeq_placement(context, case, journal=True, ack_and_claim=True)
             self.assertEqual(placement[case.queue_names[0]]["voters"], [1, 2, 3])
             with self.assertRaisesRegex(BenchmarkError, "journal mode"):
@@ -268,7 +269,7 @@ class PlacementTests(unittest.TestCase):
             context, _ = self.make_strangeq_cluster(Path(scratch), journal=True)
             for node in context[0]:
                 cluster = node / "cluster"
-                (cluster / "raft-storage-mode-v1").write_bytes(b"journal-assignments-small-compressed-bodies")
+                (cluster / "raft-storage-mode-v1").write_bytes(b"segmented-journal-assignments-small-compressed-bodies")
                 (cluster / "journal-identity-v1.json").rename(cluster / "journal-small-body-identity-v1.json")
             options = dict(journal=True, assignments=True, body_compression=True, small_body_compression=True)
             placement = verify_strangeq_placement(context, case, **options)

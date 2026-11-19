@@ -30,7 +30,11 @@ func TestAssignmentReplicaMixedPage(t *testing.T) {
 		t.Fatalf("replica request did not preserve legacy request: %#v %#v %v", decodedRequest, decodedCoverage, err)
 	}
 	body := bytes.Repeat([]byte{0xcd}, 64<<10)
-	cold := (journalBodyOrigin{source: missingAssignmentSource{}, offset: 37}).message(9, body).delivery(5)
+	message, err := (journalBodyOrigin{source: missingAssignmentSource{}, offset: 37}).message(9, body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cold := message.delivery(5)
 	cold.Redelivered = true
 	inline := Delivery{MessageID: 12, Attempt: 6, Body: []byte("restored-inline")}
 	header := assignmentPageHeader{Through: 7, Count: 2}

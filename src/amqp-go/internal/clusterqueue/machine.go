@@ -117,6 +117,9 @@ const minDeferredReplyBytes = 32 << 10
 // payloads. The caller keeps journal sources readable until encoding finishes.
 func (m *Machine) ApplyJournaledReply(data []byte, wantReply bool, source io.ReaderAt) (inline []byte, encode func() ([]byte, error), err error) {
 	reply := m.applyCommand(data, wantReply, source)
+	if reply.storageErr != nil {
+		return nil, nil, reply.storageErr
+	}
 	if !wantReply {
 		return nil, nil, nil
 	}
@@ -129,6 +132,9 @@ func (m *Machine) ApplyJournaledReply(data []byte, wantReply bool, source io.Rea
 
 func (m *Machine) applyCommitted(data []byte, wantReply bool, source io.ReaderAt, encode func(QueueResponse) ([]byte, error)) ([]byte, error) {
 	reply := m.applyCommand(data, wantReply, source)
+	if reply.storageErr != nil {
+		return nil, reply.storageErr
+	}
 	if !wantReply {
 		return nil, nil
 	}
@@ -456,8 +462,11 @@ func (m *Machine) publish(q *queueState, body []byte, origin journalBodyOrigin, 
 	if q.LastMessage == math.MaxUint64 {
 		return failure(ErrIDsExhausted)
 	}
+	message, err := origin.message(q.LastMessage+1, body)
+	if err != nil {
+		return QueueResponse{storageErr: err}
+	}
 	q.LastMessage++
-	message := origin.message(q.LastMessage, body)
 	if logical > len(body) {
 		message.LogicalSize = logical
 		m.state.packingSavings += uint64(logical - len(body))
@@ -478,6 +487,7 @@ func (m *Machine) removeBody(message messageState) {
 	m.state.packingSavings -= size - uint64(message.bodySize())
 	if message.cold != nil {
 		m.state.coldBytes -= uint64(message.bodySize())
+		message.releaseJournalSource()
 	}
 	m.state.messages--
 }
@@ -533,9 +543,19 @@ func (m *Machine) operate(c QueueCommand, q *queueState, wantReply bool, origin 
 			return failure(ErrSequenceConflict)
 		}
 	} else {
+		var result outcome
+		if c.Kind == PublishMessage {
+			reply := m.publish(q, c.Body, origin, 0)
+			if reply.storageErr != nil {
+				return reply
+			}
+			result = outcome{Message: reply.Result.MessageID, Code: reply.Code}
+		} else {
+			result = m.applyOperation(c, q, sess)
+		}
 		sess.Sequence = c.Sequence
 		sess.LastKey = key
-		sess.Last = m.applyOperation(c, q, sess, origin)
+		sess.Last = result
 		switch c.Kind {
 		case AckMessage, RequeueMessage, DropMessage, SettleBatch, SetAssignmentCredit:
 			if sess.AutoAssign {
@@ -576,14 +596,11 @@ func (sess *sessionState) outcome() QueueResponse {
 	return QueueResponse{Queue: QueueInfo{Ready: last.Ready}, Result: Result{Delivery: message.delivery(last.Attempt)}}
 }
 
-func (m *Machine) applyOperation(c QueueCommand, q *queueState, sess *sessionState, origin journalBodyOrigin) outcome {
+func (m *Machine) applyOperation(c QueueCommand, q *queueState, sess *sessionState) outcome {
 	switch c.Kind {
 	case SetAssignmentCredit:
 		sess.RegisteredCredit = c.Prefetch
 		return outcome{}
-	case PublishMessage:
-		result := m.publish(q, c.Body, origin, 0)
-		return outcome{Message: result.Result.MessageID, Code: result.Code}
 	case ClaimMessage:
 		result := q.claim(sess)
 		result.Ready = uint64(len(q.Ready))

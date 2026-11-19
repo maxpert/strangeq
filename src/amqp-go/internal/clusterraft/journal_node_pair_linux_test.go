@@ -29,18 +29,17 @@ func (m *pairProofMachine) Snapshot() ([]byte, error) { return json.Marshal(m.va
 func (m *pairProofMachine) Restore(data []byte) error { return json.Unmarshal(data, &m.values) }
 
 type pairRangeWriteGate struct {
-	journalRangeSyncFile
 	enabled atomic.Bool
 	started chan struct{}
 	release chan struct{}
 }
 
-func (f *pairRangeWriteGate) writeAtSync(data []byte, offset int64) (int, error) {
+func (f *pairRangeWriteGate) writeAtSync(file *os.File, data []byte, offset int64) (int, error) {
 	if f.enabled.CompareAndSwap(true, false) {
 		close(f.started)
 		<-f.release
 	}
-	return f.journalRangeSyncFile.writeAtSync(data, offset)
+	return (journalRangeSyncFile{journalDataFile{file}}).writeAtSync(data, offset)
 }
 
 func TestNodeJournalPairHeldRangeWriteDoesNotBlockOtherStream(t *testing.T) {
@@ -51,12 +50,14 @@ func TestNodeJournalPairHeldRangeWriteDoesNotBlockOtherStream(t *testing.T) {
 	var releaseOnce sync.Once
 	release := func() { releaseOnce.Do(func() { close(gate.release) }) }
 	defer release()
-	node, err := openNodeJournalPair(root, true, 1, func(index int, file *os.File) journalFile {
+	quota := &journalSegmentQuota{limit: journalGroupMaxFileBytes, streams: 2}
+	node, err := openJournalPair(root, 1, func(dir string, index int, budget *journalBudget) (*journalGroupNode, error) {
+		hooks := journalSegmentHooks{sharedQuota: quota}
 		if index == 0 {
-			gate.journalRangeSyncFile = journalRangeSyncFile{journalDataFile{file}}
-			return gate
+			hooks.writeAt = gate.writeAtSync
 		}
-		return wrapRangeSyncJournalFile(file)
+		// The fixture's gated write performs the real RWF_SYNC syscall.
+		return openSegmentedGroupNode(dir, true, index != 0, journalServingExtentBytes, quota.limit, budget, hooks)
 	})
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = node.Close() })
@@ -149,13 +150,19 @@ func TestNodeJournalPairReportsEitherFailureAndRetainsBothOwners(t *testing.T) {
 	defer cancel()
 	root := t.TempDir()
 	failure := errors.New("injected stream 1 fence failure")
-	fault := &failedJournalSyncFile{cause: failure}
-	node, err := openNodeJournalPair(root, true, 1, func(index int, file *os.File) journalFile {
+	var failSync atomic.Bool
+	quota := &journalSegmentQuota{limit: journalGroupMaxFileBytes, streams: 2}
+	node, err := openJournalPair(root, 1, func(dir string, index int, budget *journalBudget) (*journalGroupNode, error) {
+		hooks := journalSegmentHooks{sharedQuota: quota}
 		if index == 1 {
-			fault.File = file
-			return fault
+			hooks.syncFile = func(file *os.File) error {
+				if failSync.Load() {
+					return failure
+				}
+				return syncJournalFile(file)
+			}
 		}
-		return wrapRangeSyncJournalFile(file)
+		return openSegmentedGroupNode(dir, true, index != 1, journalServingExtentBytes, quota.limit, budget, hooks)
 	})
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = node.Close() })
@@ -167,7 +174,7 @@ func TestNodeJournalPairReportsEitherFailureAndRetainsBothOwners(t *testing.T) {
 	t.Cleanup(func() { _ = group.Close() })
 	require.NoError(t, group.Campaign(ctx))
 	require.NoError(t, waitTestLocalWrites(ctx, group))
-	fault.enabled.Store(true)
+	failSync.Store(true)
 	_, err = group.Propose(ctx, []byte("not confirmed"))
 	require.ErrorIs(t, err, failure)
 	require.ErrorIs(t, node.Failure(), failure)

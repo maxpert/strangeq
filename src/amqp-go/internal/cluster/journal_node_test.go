@@ -133,7 +133,7 @@ func TestJournalNodeDiscoversGroupWithoutOpenedMarker(t *testing.T) {
 func TestJournalNodeRefusesMissingEstablishedActiveFile(t *testing.T) {
 	cfg := journalTestNodeConfig(t, true)
 	require.NoError(t, Initialize(cfg))
-	active := filepath.Join(cfg.Directory, "raft-journal", "active.raft-journal")
+	active := filepath.Join(cfg.Directory, "raft-journal", "extent-0000000000000001.raft-journal")
 	backup := filepath.Join(t.TempDir(), "test-journal")
 	require.NoError(t, os.Rename(active, backup))
 
@@ -141,8 +141,8 @@ func TestJournalNodeRefusesMissingEstablishedActiveFile(t *testing.T) {
 	if node != nil {
 		_ = node.Close()
 	}
-	require.ErrorContains(t, err, "lost its established persistent raft journal")
-	require.ErrorContains(t, Initialize(cfg), "lost its established persistent raft journal")
+	require.ErrorContains(t, err, "missing journal extent")
+	require.ErrorContains(t, Initialize(cfg), "missing journal extent")
 	require.NoFileExists(t, active, "startup must not recreate the missing authority")
 	if err := os.Rename(backup, active); err != nil {
 		t.Fatal(err)

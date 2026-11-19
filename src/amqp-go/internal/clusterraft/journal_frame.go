@@ -97,6 +97,8 @@ func scanJournal(r io.ReaderAt, actualSize, sealedSize int64, firstSequence uint
 		return journalScan{}, fmt.Errorf("%w: invalid segment extent or first sequence", errJournalCorrupt)
 	}
 	var header [journalFrameHeaderSize]byte
+	var payload []byte
+	var records []journalRecord
 	state := journalScan{nextSequence: firstSequence}
 	for state.end < actualSize {
 		remaining := actualSize - state.end
@@ -120,7 +122,15 @@ func scanJournal(r io.ReaderAt, actualSize, sealedSize int64, firstSequence uint
 		if remaining < frameSize {
 			break
 		}
-		payload := make([]byte, size+journalFrameTrailerSize)
+		needed := size + journalFrameTrailerSize
+		if cap(payload) < needed {
+			payload = make([]byte, needed)
+			// A larger frame can leave old slices outside the next decoded
+			// record count. Drop their references to the replaced buffer.
+			clear(records[:cap(records)])
+		} else {
+			payload = payload[:needed]
+		}
 		start := state.end + journalFrameHeaderSize
 		if err := readJournalAt(r, payload, start); err != nil {
 			return journalScan{}, err
@@ -130,7 +140,8 @@ func scanJournal(r io.ReaderAt, actualSize, sealedSize int64, firstSequence uint
 			binary.BigEndian.Uint32(trailer[:4]) != crc32.Checksum(body, journalChecksum) {
 			return journalScan{}, fmt.Errorf("%w: invalid frame trailer or payload at offset %d", errJournalCorrupt, state.end)
 		}
-		records, err := decodeJournalRecords(body, count, start, sequence)
+		var err error
+		records, err = decodeJournalRecords(records[:0], body, count, start, sequence)
 		if err != nil {
 			return journalScan{}, err
 		}
@@ -149,8 +160,10 @@ func scanJournal(r io.ReaderAt, actualSize, sealedSize int64, firstSequence uint
 	return state, nil
 }
 
-func decodeJournalRecords(body []byte, count int, start int64, sequence uint64) ([]journalRecord, error) {
-	records := make([]journalRecord, 0, count)
+func decodeJournalRecords(records []journalRecord, body []byte, count int, start int64, sequence uint64) ([]journalRecord, error) {
+	if cap(records) < count {
+		records = make([]journalRecord, 0, count)
+	}
 	var offset int
 	for range count {
 		if len(body)-offset < journalRecordHeaderSize {

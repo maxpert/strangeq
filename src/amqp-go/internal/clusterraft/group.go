@@ -174,6 +174,9 @@ func openGroup(config Config, openStore func(Config) (groupStore, *pb.Snapshot, 
 	}
 	defer func() {
 		if err != nil {
+			if machine, ok := config.Machine.(interface{ ReleaseJournalSources() }); ok {
+				machine.ReleaseJournalSources()
+			}
 			_ = store.close()
 		}
 	}()
@@ -325,7 +328,7 @@ func (g *Group) applyCommand(entry *pb.Entry) error {
 		}
 		var source io.ReaderAt = section
 		if g.cfg.AssignmentReplicaBodies {
-			source = &assignmentJournalSource{SectionReader: *section, index: entry.GetIndex(), term: entry.GetTerm()}
+			source = &assignmentJournalSource{journalCommandReader: section, index: entry.GetIndex(), term: entry.GetTerm()}
 		}
 		if captured, ok := machine.(deferredJournalReplyMachine); ok {
 			var encode func() ([]byte, error)
@@ -541,7 +544,18 @@ func (g *Group) Campaign(ctx context.Context) error {
 	return g.changeWithStorage(ctx, 0, true, g.node.Campaign)
 }
 func (g *Group) Tick(ctx context.Context) error {
-	return g.change(ctx, func() error { g.node.Tick(); return nil })
+	return g.change(ctx, func() error {
+		g.node.Tick()
+		// An idle shard might have no Ready work of its own while other
+		// shards rotate the journal files it references.
+		if g.appending == nil && g.journalCheckpointNeeded() {
+			if err := g.maintainCheckpoint(false); err != nil {
+				g.stop(err)
+				return err
+			}
+		}
+		return nil
+	})
 }
 
 func (g *Group) Step(ctx context.Context, message *pb.Message) error {
@@ -796,6 +810,9 @@ func (g *Group) Close() error {
 		g.checkpointWorkers.Wait()
 		g.replyWorkers.Wait()
 		g.mu.Lock()
+		if machine, ok := g.cfg.Machine.(interface{ ReleaseJournalSources() }); ok {
+			machine.ReleaseJournalSources()
+		}
 		g.appending, g.appendJobs = nil, nil
 		if g.routineCheckpoint != nil {
 			g.releaseRoutineCheckpoint(true)

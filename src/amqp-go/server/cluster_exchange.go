@@ -287,6 +287,8 @@ func (m *ClusterMachine) CaptureSnapshot() func([]byte) ([]byte, error) {
 	return captured.AppendSnapshot
 }
 
+func (m *ClusterMachine) ReleaseJournalSources() { m.queues.ReleaseJournalSources() }
+
 func (m *ClusterMachine) CheckpointCostBytes() uint64 {
 	return m.queues.EstimatedSnapshotBytes() + uint64(m.exchangeBytes)
 }

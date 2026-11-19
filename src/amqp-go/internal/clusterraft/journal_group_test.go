@@ -148,7 +148,7 @@ func TestJournalGroupsShareDurableFence(t *testing.T) {
 		default:
 		}
 	}
-	info, err := node.reader.Stat()
+	info, err := node.reader.(*os.File).Stat()
 	require.NoError(t, err)
 	shared := false
 	_, err = scanJournal(node.reader, info.Size(), -1, 1, func(batch []journalRecord) error {

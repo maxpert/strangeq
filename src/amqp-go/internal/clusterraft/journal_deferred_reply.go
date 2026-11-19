@@ -20,10 +20,16 @@ func (g *Group) completeCapturedReply(id key, store *journalGroupStore, encode f
 	slots := store.node.replySlots
 	select {
 	case slots <- struct{}{}:
+		unpin, err := g.pinJournalCapture()
+		if err != nil {
+			<-slots
+			return err
+		}
 		waiter := g.pending[id]
 		delete(g.pending, id)
 		g.replyWorkers.Go(func() {
 			defer func() { <-slots }()
+			defer unpin()
 			body, err := encode()
 			if err != nil {
 				g.mu.Lock()

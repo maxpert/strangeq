@@ -99,9 +99,16 @@ func (g *Group) startRoutineCheckpoint(store *journalGroupStore) error {
 	if machine, ok := g.cfg.Machine.(interface {
 		CaptureSnapshot() func([]byte) ([]byte, error)
 	}); ok {
+		unpin, err := g.pinJournalCapture()
+		if err != nil {
+			return err
+		}
 		captured := machine.CaptureSnapshot()
 		prefix := encodeSnapshot(g.configIndex, nil)
-		encode = func() ([]byte, error) { return captured(prefix) }
+		encode = func() ([]byte, error) {
+			defer unpin()
+			return captured(prefix)
+		}
 	} else {
 		snapshot.Data, err = g.checkpointData()
 		if err != nil {

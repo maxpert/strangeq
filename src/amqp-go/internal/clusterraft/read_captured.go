@@ -10,6 +10,7 @@ const captureJournalReplyBytes = 32 << 10
 func (g *Group) ReadCaptured(ctx context.Context, capture func(Machine) (func() ([]byte, error), int, error)) ([]byte, error) {
 	var encode func() ([]byte, error)
 	var held chan struct{}
+	var unpin func()
 	inline, err := g.Read(ctx, func(machine Machine) ([]byte, error) {
 		reply, size, err := capture(machine)
 		if err != nil {
@@ -19,6 +20,11 @@ func (g *Group) ReadCaptured(ctx context.Context, capture func(Machine) (func() 
 			slots := store.node.replySlots
 			select {
 			case slots <- struct{}{}:
+				unpin, err = g.pinJournalCapture()
+				if err != nil {
+					<-slots
+					return nil, err
+				}
 				g.replyWorkers.Add(1)
 				held, encode = slots, reply
 				return nil, nil
@@ -34,6 +40,7 @@ func (g *Group) ReadCaptured(ctx context.Context, capture func(Machine) (func() 
 	if held != nil {
 		defer func() {
 			<-held
+			unpin()
 			g.replyWorkers.Done()
 		}()
 	}

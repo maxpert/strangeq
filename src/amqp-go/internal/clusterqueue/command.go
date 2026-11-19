@@ -108,6 +108,7 @@ type Result struct {
 }
 
 type QueueResponse struct {
+	storageErr    error
 	Queue         QueueInfo   `json:",omitzero"`
 	Result        Result      `json:",omitzero"`
 	Count         uint64      `json:",omitempty"`

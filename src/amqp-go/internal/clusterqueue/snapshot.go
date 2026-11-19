@@ -177,6 +177,7 @@ func (m *Machine) Restore(data []byte) error {
 	if err := state.validate(m.assignments); err != nil {
 		return err
 	}
+	m.ReleaseJournalSources()
 	m.state = *state
 	return nil
 }
