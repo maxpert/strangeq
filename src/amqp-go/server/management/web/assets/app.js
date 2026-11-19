@@ -786,7 +786,7 @@
     var principal = document.getElementById("principal");
     var refresh = document.getElementById("refresh-status");
     if (nav) nav.hidden = !authed;
-    if (search) search.hidden = !authed || isCluster();
+    if (search) search.hidden = !authed;
     if (principal) principal.hidden = !authed;
     if (refresh) refresh.hidden = !authed;
   }
@@ -842,27 +842,7 @@
 
   function isCluster() { return state.capabilities.cluster === true; }
 
-  function applyClusterChrome() {
-    Array.prototype.forEach.call(document.querySelectorAll("#nav a[data-nav]"), function (a) {
-      a.hidden = isCluster() && a.dataset.nav !== "nodes";
-    });
-    var search = document.getElementById("global-search");
-    if (search) search.hidden = !state.authed || isCluster();
-    if (isCluster()) clusterObservationStatus(false);
-  }
-
-  function clusterObservationStatus(failed) {
-    var health = document.getElementById("health");
-    var text = document.getElementById("health-text");
-    if (health) health.dataset.state = "unknown";
-    if (text) text.textContent = failed ? "observation unavailable" : "cluster view";
-    state.health = null;
-    state.degraded = null;
-    renderBanner();
-  }
-
   function refreshHealth() {
-    if (isCluster() || !state.capabilitiesLoaded) return Promise.resolve();
     return api(API + "/health").then(function (r) {
       if (r.status === 200 || r.status === 503) applyHealth(r.data);
     }).catch(function () { /* health is best-effort */ });
@@ -1703,7 +1683,7 @@
     ]);
   }
 
-  /* The cluster management listener survives broker process outages. Never
+  /* Cluster observations extend the embedded broker management UI. Never
    * derive voter liveness from configured membership or process state. */
   function clusterUnknown(v) {
     return isNull(v) || v === "" ? h("span", { class: "null", text: "unknown" }) : stat(v);
@@ -1861,13 +1841,11 @@
         }
       });
       paintCluster(container, r.data);
-      clusterObservationStatus(false);
       state.displayed = "cluster";
     }).catch(function (err) {
       if (state.route !== route || !state.authed) throw err;
       state.cluster.readError = err.message || "request failed";
       clusterReadError(container, state.cluster.readError);
-      clusterObservationStatus(true);
       throw err;
     });
   }
@@ -3297,10 +3275,6 @@
 
   function render() {
     var route = parsePath(location.pathname, location.search);
-    if (isCluster() && route.screen !== "nodes" && route.screen !== "node") {
-      history.replaceState({}, "", "/nodes");
-      route = parsePath("/nodes", "");
-    }
     state.route = route;
     if (!state.authed) { renderLogin(); return; }
     setAuthedChrome(true);
@@ -3357,14 +3331,10 @@
   function startAuthenticatedView() {
     var version = loadVersion();
     var screen = parsePath(location.pathname, location.search).screen;
-    // The shared home/Nodes routes need the mode before choosing their API.
-    // Standalone deep links retain their immediate, capability-gated paint.
-    if (screen === "overview" || screen === "nodes" || screen === "node") {
-      version.then(function () { refreshHealth(); render(); });
-    } else {
-      render();
-      version.then(refreshHealth);
-    }
+    refreshHealth();
+    /* Nodes needs the cluster capability before choosing its data source. */
+    if (screen === "nodes" || screen === "node") version.then(render);
+    else render();
   }
 
   function ensureCapabilities() {
@@ -3425,8 +3395,8 @@
          * so any gated control is currently disabled. */
         if (state.authed && !capabilitiesEqual(before, state.capabilities)) {
           refreshCapabilityControls();
-          applyClusterChrome();
-          if ((before.cluster === true) !== isCluster() && state.route) render();
+          if ((before.cluster === true) !== isCluster() && state.route &&
+              (state.route.screen === "nodes" || state.route.screen === "node")) render();
         }
       }
     }).catch(function () { state.capabilitiesLoaded = false; /* version is best-effort */ });

@@ -12,6 +12,7 @@ import (
 
 	"github.com/maxpert/amqp-go/config"
 	"github.com/maxpert/amqp-go/internal/clusteradmin"
+	"github.com/maxpert/amqp-go/server"
 )
 
 type clusterObserverFunc func(context.Context) (clusteradmin.Status, error)
@@ -66,8 +67,13 @@ func TestClusterInspectionRoutesAndCapabilities(t *testing.T) {
 	if status.ClusterID != "three-node-demo" || len(status.Nodes) != 1 || status.CanControl {
 		t.Fatalf("unexpected status: %+v", status)
 	}
-	for _, path := range []string{"/api/overview", "/api/health", "/api/nodes", "/api/queues", "/api/metrics"} {
-		wantStatus(t, e.do(http.MethodGet, path, nil, basicAuthHeader()), http.StatusNotFound)
+	for path, code := range map[string]int{
+		"/api/overview": http.StatusOK, "/api/health": http.StatusServiceUnavailable,
+		"/api/nodes": http.StatusOK, "/api/queues": http.StatusOK,
+		"/api/exchanges": http.StatusOK, "/api/connections": http.StatusOK,
+		"/api/channels": http.StatusOK, "/api/metrics": http.StatusNotImplemented,
+	} {
+		wantStatus(t, e.do(http.MethodGet, path, nil, basicAuthHeader()), code)
 	}
 	wantStatus(t, e.do(http.MethodPost, "/api/strangeq/cluster/nodes/1/stop", nil, basicAuthHeader()), http.StatusNotFound)
 	wantStatus(t, e.do(http.MethodGet, "/api/strangeq/cluster", nil, nil), http.StatusUnauthorized)
@@ -78,11 +84,11 @@ func TestClusterInspectionRoutesAndCapabilities(t *testing.T) {
 	if err := json.Unmarshal(rec.Body.Bytes(), &version); err != nil {
 		t.Fatal(err)
 	}
-	if !version.Capabilities.Cluster || version.Capabilities.ClusterNodeControl || version.Capabilities.CloseConnection {
+	if !version.Capabilities.Cluster || version.Capabilities.ClusterNodeControl || !version.Capabilities.CloseConnection {
 		t.Fatalf("unexpected cluster capabilities: %+v", version.Capabilities)
 	}
-	if len(version.Endpoints) != 5 {
-		t.Fatalf("cluster-only endpoints = %v", version.Endpoints)
+	if len(version.Endpoints) < 20 {
+		t.Fatalf("broker endpoints missing alongside cluster inspection: %v", version.Endpoints)
 	}
 	// Existing standalone reports retain their exact key set, including no
 	// newly added false cluster capabilities.
@@ -224,6 +230,7 @@ func TestClusterErrorMapping(t *testing.T) {
 		code int
 	}{
 		{clusteradmin.ErrNodeNotFound, http.StatusNotFound},
+		{clusteradmin.ErrUseAnotherBroker, http.StatusConflict},
 		{fmt.Errorf("wrapped: %w", clusteradmin.ErrConflict), http.StatusConflict},
 		{clusteradmin.ErrUnavailable, http.StatusServiceUnavailable},
 		{context.DeadlineExceeded, http.StatusServiceUnavailable},
@@ -242,5 +249,107 @@ func TestClusterErrorMapping(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// An observer exposing other methods does not grant process-control authority.
+type dualClusterObserver struct {
+	calls int
+}
+
+func (*dualClusterObserver) Observe(context.Context) (clusteradmin.Status, error) {
+	return clusteradmin.Status{ClusterID: "local"}, nil
+}
+func (o *dualClusterObserver) SetRunning(context.Context, string, bool) error {
+	o.calls++
+	return nil
+}
+
+func TestClusterViewSelectsAggregateOrLocalWithoutGrantingControl(t *testing.T) {
+	o := clusterTestOptions(t)
+	local := &dualClusterObserver{}
+	o.Cluster = local
+	viewCalls := 0
+	o.ClusterView = clusterObserverFunc(func(context.Context) (clusteradmin.Status, error) {
+		viewCalls++
+		return clusteradmin.Status{ClusterID: "aggregate", CanControl: true}, nil
+	})
+	e := newClusterTestEnv(t, o)
+	for path, want := range map[string]string{
+		"/api/strangeq/cluster":            "aggregate",
+		"/api/strangeq/cluster?view=local": "local",
+	} {
+		rec := e.do(http.MethodGet, path, nil, basicAuthHeader())
+		wantStatus(t, rec, http.StatusOK)
+		var status clusteradmin.Status
+		if err := json.Unmarshal(rec.Body.Bytes(), &status); err != nil || status.ClusterID != want || status.CanControl {
+			t.Fatalf("%s = %s (%v)", path, rec.Body.String(), err)
+		}
+	}
+	if viewCalls != 1 {
+		t.Fatalf("local view called aggregate observer: %d calls", viewCalls)
+	}
+	for _, action := range []string{"start", "stop"} {
+		wantStatus(t, e.do(http.MethodPost, "/api/strangeq/cluster/nodes/1/"+action, nil, basicAuthHeader()), http.StatusNotFound)
+	}
+	if local.calls != 0 {
+		t.Fatal("observer inferred lifecycle control")
+	}
+}
+
+func TestClusterViewRequiresLocalSupervisorScope(t *testing.T) {
+	for _, change := range []func(*Options){
+		func(o *Options) { o.Cluster = nil },
+		func(o *Options) { o.Config.Management.Address = "0.0.0.0" },
+		func(o *Options) { o.Config.Management.Address = "" },
+		func(o *Options) { o.Config.Management.TrustedProxies = []string{"127.0.0.1"} },
+	} {
+		o := clusterTestOptions(t)
+		o.ClusterView = o.Cluster
+		change(&o)
+		m, err := New(o)
+		if m != nil {
+			_ = m.Close()
+		}
+		if err == nil {
+			t.Fatal("aggregate view accepted outside explicit local supervisor scope")
+		}
+	}
+}
+
+type panelClusterMachine struct{ machine server.ClusterMachine }
+
+func (m *panelClusterMachine) Submit(_ context.Context, _ string, data []byte) ([]byte, error) {
+	return m.machine.Apply(data), nil
+}
+func (m *panelClusterMachine) SubmitEachShard(_ context.Context, data []byte) ([][]byte, error) {
+	return [][]byte{m.machine.Apply(data)}, nil
+}
+
+func TestClusterPanelUsesUnifiedBrokerAlongsideClusterView(t *testing.T) {
+	o := clusterTestOptions(t)
+	o.Server = &server.Server{Broker: server.NewClusterBroker(&panelClusterMachine{})}
+	e := newClusterTestEnv(t, o)
+	wantStatus(t, e.do(http.MethodPut, "/api/queues/%2F/panel-jobs", []byte(`{"durable":true}`), basicAuthHeader()), http.StatusCreated)
+	wantStatus(t, e.do(http.MethodPut, "/api/exchanges/%2F/panel-events", []byte(`{"type":"direct","durable":true}`), basicAuthHeader()), http.StatusCreated)
+	for path, name := range map[string]string{
+		"/api/queues": "panel-jobs", "/api/exchanges": "panel-events",
+	} {
+		rec := e.do(http.MethodGet, path, nil, basicAuthHeader())
+		wantStatus(t, rec, http.StatusOK)
+		if !bytes.Contains(rec.Body.Bytes(), []byte(name)) {
+			t.Fatalf("%s did not read replicated broker entities: %s", path, rec.Body.String())
+		}
+	}
+	rec := e.do(http.MethodGet, "/api/overview", nil, basicAuthHeader())
+	wantStatus(t, rec, http.StatusOK)
+	var overview overviewResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &overview); err != nil || overview.ObjectTotals.Queues != 1 || overview.ObjectTotals.Exchanges != 6 || overview.SnapshotCoherent {
+		t.Fatalf("live cluster totals = %s (%v)", rec.Body.String(), err)
+	}
+	wantStatus(t, e.do(http.MethodGet, "/api/bindings", nil, basicAuthHeader()), http.StatusNotImplemented)
+	wantStatus(t, e.do(http.MethodGet, "/api/strangeq/cluster", nil, basicAuthHeader()), http.StatusOK)
+	if e.mgmt.panicCount.Load() != 0 {
+		t.Fatal("embedded cluster panel handlers panicked")
 	}
 }

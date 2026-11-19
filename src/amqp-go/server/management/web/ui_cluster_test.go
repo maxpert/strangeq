@@ -6,21 +6,23 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/chromedp/chromedp"
 )
 
-// This management fixture stays alive while its broker process is stopped.
-// It deliberately omits legacy health/overview endpoints and voter liveness
-// for one shard, so the UI must preserve the distinction from membership.
+// Cluster observations and process controls extend the same embedded
+// management UI and ordinary broker API. One shard omits voter liveness so
+// the Nodes screen must preserve the distinction from configured membership.
 type clusterUIFixture struct {
-	mu         sync.Mutex
-	stopped    bool
-	failRead   bool
-	canControl bool
-	legacy     int
-	actions    []string
-	csrf       string
+	mu           sync.Mutex
+	stopped      bool
+	failRead     bool
+	canControl   bool
+	standard     *stubAPI
+	actions      []string
+	csrf         string
+	versionDelay time.Duration
 }
 
 func (f *clusterUIFixture) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -31,6 +33,7 @@ func (f *clusterUIFixture) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.SetCookie(w, &http.Cookie{Name: "SQ_CSRF", Value: "cluster-token", Path: "/"})
 		writeJSON(w, 200, map[string]any{"name": "demo-admin"})
 	case "/api/strangeq/version":
+		time.Sleep(f.versionDelay)
 		writeJSON(w, 200, map[string]any{"version": "cluster-demo", "capabilities": map[string]any{"cluster": true, "cluster_node_control": true}})
 	case "/api/strangeq/cluster":
 		if f.failRead {
@@ -63,13 +66,13 @@ func (f *clusterUIFixture) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		f.stopped = strings.HasSuffix(r.URL.Path, "/stop")
 		w.WriteHeader(204)
 	default:
-		f.legacy++
-		http.NotFound(w, r)
+		f.standard.ServeHTTP(w, r)
 	}
 }
 
 func clusterUIServer(t *testing.T, f *clusterUIFixture) *httptest.Server {
 	t.Helper()
+	f.standard = newStub()
 	mux := http.NewServeMux()
 	mux.Handle("/api/", f)
 	mux.Handle("/", Handler())
@@ -83,13 +86,18 @@ func TestUI_ClusterObservationAndControls(t *testing.T) {
 	srv := clusterUIServer(t, f)
 	ctx, cancel := newTab(t)
 	defer cancel()
-	mustDo(t, ctx, chromedp.Navigate(srv.URL+"/"), chromedp.WaitVisible(chromedp.CSS("#cluster-nodes")))
-	if got := evalStr(t, ctx, `location.pathname`); got != "/nodes" {
-		t.Fatalf("cluster home route = %q, want /nodes", got)
+	mustDo(t, ctx, chromedp.Navigate(srv.URL+"/"), chromedp.WaitVisible(chromedp.CSS(".screen-overview")))
+	if got := evalStr(t, ctx, `location.pathname`); got != "/" {
+		t.Fatalf("cluster-capable home route = %q, want /", got)
 	}
-	if !evalBool(t, ctx, `Array.from(document.querySelectorAll('#nav a')).filter(a => !a.hidden).every(a => a.dataset.nav === 'nodes') && document.getElementById('global-search').hidden`) {
-		t.Fatal("cluster shell exposed standalone navigation")
+	if !evalBool(t, ctx, `Array.from(document.querySelectorAll('#nav a')).every(a => !a.hidden) && !document.getElementById('global-search').hidden`) {
+		t.Fatal("cluster capability hid existing navigation or search")
 	}
+	mustDo(t, ctx, chromedp.Click(chromedp.CSS("#nav a[data-nav=queues]")), chromedp.WaitVisible(chromedp.CSS(".screen-queues")))
+	if !evalBool(t, ctx, `location.pathname === '/queues' && document.querySelector('.screen-queues').textContent.includes('orders')`) {
+		t.Fatal("ordinary queue management did not coexist with cluster capability")
+	}
+	mustDo(t, ctx, chromedp.Click(chromedp.CSS("#nav a[data-nav=nodes]")), chromedp.WaitVisible(chromedp.CSS("#cluster-nodes")))
 	if got := evalStr(t, ctx, `document.querySelector('#cluster-groups tr[data-key="shard-1"] [data-col="active_voters"]').textContent`); got != "unknown" {
 		t.Fatalf("missing observed liveness = %q, want unknown", got)
 	}
@@ -123,18 +131,25 @@ func TestUI_ClusterObservationAndControls(t *testing.T) {
 	mustDo(t, ctx, chromedp.WaitVisible(chromedp.CSS(`#cluster-action-n1[aria-label="Stop node n1"]`)))
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	if len(f.actions) != 2 || f.csrf != "cluster-token" || f.legacy != 0 {
-		t.Fatalf("actions=%v csrf=%q unexpected legacy requests=%d", f.actions, f.csrf, f.legacy)
+	if len(f.actions) != 2 || f.csrf != "cluster-token" {
+		t.Fatalf("actions=%v csrf=%q", f.actions, f.csrf)
+	}
+	if !f.standard.pathSeen("overview", "/api/overview") || !f.standard.pathSeen("queues", "/api/queues") || !f.standard.pathSeen("health", "/api/health") {
+		t.Fatal("cluster-capable UI stopped using ordinary overview, queues, or health routes")
 	}
 }
 
 func TestUI_ClusterReadOnly(t *testing.T) {
-	srv := clusterUIServer(t, &clusterUIFixture{})
+	f := &clusterUIFixture{versionDelay: 200 * time.Millisecond}
+	srv := clusterUIServer(t, f)
 	ctx, cancel := newTab(t)
 	defer cancel()
 	mustDo(t, ctx, chromedp.Navigate(srv.URL+"/nodes"), chromedp.WaitVisible(chromedp.CSS("#cluster-nodes")))
 	if !evalBool(t, ctx, `document.querySelectorAll('#cluster-nodes button').length === 0 && document.getElementById('cluster-screen').textContent.includes('read only')`) {
 		t.Fatal("principal without can_control saw actionable node controls")
+	}
+	if f.standard.pathSeen("nodes", "/api/nodes") {
+		t.Fatal("initial Nodes link fetched standalone data before cluster capability arrived")
 	}
 }
 

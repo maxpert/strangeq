@@ -131,13 +131,11 @@ func buildRouter(s *Server) *router {
 	del("/api/strangeq/session", s.hSessionDelete)
 	get("/api/whoami", s.hWhoami)
 	if s.opts.Cluster != nil {
-		get("/api/strangeq/version", s.hVersion)
 		get("/api/strangeq/cluster", s.hCluster)
 		if s.opts.ClusterControl != nil {
 			post("/api/strangeq/cluster/nodes/{id}/start", s.hClusterNodeRunning(true))
 			post("/api/strangeq/cluster/nodes/{id}/stop", s.hClusterNodeRunning(false))
 		}
-		return rt
 	}
 	get("/api/overview", s.hOverview)
 	get("/api/strangeq/version", s.hVersion)

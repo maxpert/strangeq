@@ -2,10 +2,11 @@
 
 The optional management listener serves a web UI and an HTTP API. It is off
 by default and binds to loopback by default. Standalone brokers expose a
-subset of the RabbitMQ 4.4 management API. Raft brokers expose the
-[cluster Nodes panel](#cluster-administration).
+subset of the RabbitMQ 4.4 management API. Raft brokers add
+[cluster observations](#cluster-administration) to the Nodes screen in
+that same UI.
 
-The listener is separate from [telemetry](METRICS.md).
+A separately configured [Prometheus listener](METRICS.md) uses its own port.
 
 ## Enabling it
 
@@ -54,16 +55,16 @@ leaders, voters, learners, and commit and applied indexes. Active voter
 counts come from the locally observed leader. Other nodes can be reported
 as unknown. Catalog membership and recent activity describe different facts.
 
-`GET /api/strangeq/cluster` exposes the same observation. A broker's cluster
-listener serves the Nodes panel and its session, identity, and version
-endpoints. The standalone topology and resource APIs apply to standalone brokers.
+`GET /api/strangeq/cluster` exposes the same observation. The existing
+management listener also serves Overview, Queues, Exchanges, and the other
+broker screens. Optional capabilities reflect what the connected broker supports.
 
-The [three-node demo](../src/amqp-go/examples/cluster-demo/README.md) adds a
-loopback panel in a separate process. Its authenticated administrator can
-stop and start the three demo brokers. The supervisor holds each broker's
-identity and journal across restarts and allows one stopped broker at a time.
-On ordinary deployments, process lifecycle remains with the service manager
-or orchestrator.
+The [three-node demo](../src/amqp-go/examples/cluster-demo/README.md) adds
+Start and Stop to Nodes for its authenticated administrator. Each broker serves
+the embedded panel, and a private local supervisor restarts its own brokers
+with their existing identities and journals. Open another broker's management
+URL before stopping the broker serving your tab. On ordinary deployments,
+process lifecycle remains with the service manager or orchestrator.
 
 To enroll additional brokers, follow the
 [cluster configuration guide](CLUSTERING.md#pilot-start-locally-then-activate-peers).
@@ -287,7 +288,7 @@ unavailable).
 
 | Method | Path | Purpose |
 |--------|------|---------|
-| GET | `/api/metrics` | The Prometheus text exposition wrapped as `{"text": "..."}`. `200`; `501` when telemetry is disabled; `503` on a scrape failure. |
+| GET | `/api/metrics` | The Prometheus text exposition wrapped as `{"text": "..."}`. `200`; `501` when metrics collection is disabled; `503` on a scrape failure. |
 
 ### Nodes (synthetic, single node)
 
@@ -456,10 +457,11 @@ auth-gated `GET /api/metrics`.
 - a **raw text** view (`?view=raw`) of the exposition.
 - rates derived from **two samples**, with a pause/backoff control.
 
-Tiles with unknown values are counted in an "X of N unknown" notice. The screen reuses
-the telemetry process registry, so the two never drift. When telemetry is disabled the
-route answers `501` and the screen shows a truthful notice. See [METRICS.md](METRICS.md)
-for the metric families and their meanings.
+Tiles with unknown values are counted in an "X of N unknown" notice. The screen
+reads the broker's metrics registry through the management port. Production
+brokers enable collection with `telemetry.enabled`. The three-node demo serves
+its metrics on the embedded management port. See [METRICS.md](METRICS.md) for
+the metric families and their meanings.
 
 ## Honest divergences from RabbitMQ
 

@@ -33,9 +33,12 @@ type Options struct {
 	Logger        *zap.Logger
 	Metrics       ManagementMetricsSink // nil when telemetry is disabled
 
-	// Cluster selects the cluster-only inspection surface. Process control is
-	// available only through an explicitly injected, local controller.
+	// Cluster supplies this broker's local Raft observations alongside the
+	// regular management surface. ClusterView optionally aggregates demo-node
+	// observations through an explicitly injected local supervisor. Process
+	// control is available only through an explicitly injected controller.
 	Cluster        clusteradmin.Observer
+	ClusterView    clusteradmin.Observer
 	ClusterControl clusteradmin.Controller
 
 	Version, Commit, BuildDate, GoVersion string
@@ -112,8 +115,8 @@ func New(o Options) (*Server, error) {
 	if o.Config == nil {
 		return nil, errors.New("management: Options.Config is required")
 	}
-	if o.ClusterControl != nil && o.Cluster == nil {
-		return nil, errors.New("management: ClusterControl requires Cluster")
+	if (o.ClusterControl != nil || o.ClusterView != nil) && o.Cluster == nil {
+		return nil, errors.New("management: ClusterControl and ClusterView require Cluster")
 	}
 	cfg := o.Config
 	mcfg := cfg.Management
@@ -233,13 +236,13 @@ func authFailureLimit(cfg *config.AMQPConfig) int {
 
 func (s *Server) validateStartup() error {
 	m := s.mcfg
-	if s.opts.ClusterControl != nil {
+	if s.opts.ClusterControl != nil || s.opts.ClusterView != nil {
 		addr, err := netip.ParseAddr(m.Address)
 		if err != nil || !addr.Unmap().IsLoopback() {
-			return errors.New("management: cluster node control requires a numeric loopback management.address")
+			return errors.New("management: cluster supervision requires a numeric loopback management.address")
 		}
 		if len(m.TrustedProxies) != 0 {
-			return errors.New("management: cluster node control does not permit trusted proxies")
+			return errors.New("management: cluster supervision does not permit trusted proxies")
 		}
 	}
 	switch s.authMode() {

@@ -14,7 +14,11 @@ func (s *Server) canControlCluster(p *Principal) bool {
 }
 
 func (s *Server) hCluster(w http.ResponseWriter, r *http.Request) {
-	status, err := s.opts.Cluster.Observe(r.Context())
+	observer := s.opts.Cluster
+	if s.opts.ClusterView != nil && r.URL.Query().Get("view") != "local" {
+		observer = s.opts.ClusterView
+	}
+	status, err := observer.Observe(r.Context())
 	if err != nil {
 		s.writeAPIError(w, r, clusterAPIError(err))
 		return
@@ -77,6 +81,8 @@ func clusterAPIError(err error) *apiError {
 	switch {
 	case errors.Is(err, clusteradmin.ErrNodeNotFound):
 		return errNotFoundMsg("unknown cluster node")
+	case errors.Is(err, clusteradmin.ErrUseAnotherBroker):
+		return apiErr(http.StatusConflict, errConflict, "Open another broker’s management URL to stop the broker serving this panel.")
 	case errors.Is(err, clusteradmin.ErrStopBlocked):
 		return apiErr(http.StatusConflict, errConflict, "Restart any stopped broker and wait for the Raft groups to become ready before stopping a node.")
 	case errors.Is(err, clusteradmin.ErrConflict):

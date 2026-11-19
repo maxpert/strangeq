@@ -68,6 +68,7 @@ type cliOptions struct {
 	generateConfig    *string
 	healthcheck       *bool
 	initializeCluster *bool
+	demoSupervisor    *string
 }
 
 // newFlagSet defines the final CLI surface. Flag defaults are documentation
@@ -89,6 +90,7 @@ func newFlagSet() (*flag.FlagSet, *cliOptions) {
 	fs.String("management-address", "", "Management API bind address (default from config: 127.0.0.1)")
 	fs.Int("management-port", 0, "Management API port (default from config: 15672)")
 	o.initializeCluster = fs.Bool("initialize-cluster", false, "Initialize fresh data on an original cluster voter")
+	o.demoSupervisor = fs.String("demo-supervisor-socket", "", "Private Unix socket for the local cluster demo supervisor")
 	o.healthcheck = fs.Bool("healthcheck", false, "Probe the local /health endpoint and exit 0 (ready) or 1 (not ready)")
 
 	fs.Bool("tls", false, "Enable TLS (amqps)")
@@ -215,6 +217,18 @@ func main() {
 		log.Fatalf("Invalid configuration: %v", err)
 	}
 
+	var demoControl *clusteradmin.SupervisorClient
+	if *opts.demoSupervisor != "" {
+		if cfg.Cluster.ID == "" || cfg.Cluster.Local || !cfg.Cluster.AllowLoopbackPlaintext ||
+			!cfg.Management.Enabled || cfg.Server.Daemonize || *opts.initializeCluster {
+			log.Fatal("Demo supervision requires a foreground, addressed loopback broker with management enabled")
+		}
+		demoControl, err = clusteradmin.NewSupervisorClient(*opts.demoSupervisor, strconv.FormatUint(cfg.Cluster.NodeID, 10))
+		if err != nil {
+			log.Fatalf("Demo supervisor: %v", err)
+		}
+	}
+
 	printLoadReport(os.Stderr, report)
 	emitSecurityWarnings(os.Stderr, nil, cfg.SecurityWarnings())
 	for _, mechanism := range cfg.UnknownMechanisms() {
@@ -261,7 +275,7 @@ func main() {
 	// counters). The HTTP server is constructed only after Build returns, so
 	// /health cannot report ready while recovery is still replaying the WAL.
 	var collector *metrics.Collector
-	if cfg.Telemetry.Enabled {
+	if cfg.Telemetry.Enabled || demoControl != nil {
 		collector = metrics.NewCollector("amqp")
 		collector.SetBuildInfo(version, commit, runtime.Version())
 	}
@@ -332,15 +346,6 @@ func main() {
 			}
 		}()
 
-		pollerCtx, cancel := context.WithCancel(context.Background())
-		stopPoller = cancel
-		go collector.RunPoller(pollerCtx, metrics.PollerOptions{
-			Interval: 15 * time.Second,
-			Queues:   brokerQueueStats{b: amqpServer.Broker},
-			Alarms:   amqpServer.AlarmState,
-			Log:      amqpServer.Log,
-		})
-
 		base := "http://" + telemetryServer.Addr().String()
 		fmt.Printf("Telemetry server listening on %s\n", base)
 		fmt.Printf("  Prometheus metrics: %s/metrics\n", base)
@@ -349,6 +354,16 @@ func main() {
 			fmt.Printf("  Profiling index: %s/debug/pprof/\n", base)
 			fmt.Printf("  CPU profile: curl -o cpu.prof '%s/debug/pprof/profile?seconds=30'\n", base)
 		}
+	}
+	if collector != nil {
+		pollerCtx, cancel := context.WithCancel(context.Background())
+		stopPoller = cancel
+		go collector.RunPoller(pollerCtx, metrics.PollerOptions{
+			Interval: 15 * time.Second,
+			Queues:   brokerQueueStats{b: amqpServer.Broker},
+			Alarms:   amqpServer.AlarmState,
+			Log:      amqpServer.Log,
+		})
 	}
 
 	// Management (control-plane) HTTP surface: a SEPARATE listener from
@@ -387,7 +402,7 @@ func main() {
 		if clusterNode != nil {
 			clusterObserver = clusterNode
 		}
-		mgmtServer, err = management.New(management.Options{
+		managementOptions := management.Options{
 			Server:        amqpServer,
 			Config:        cfg,
 			Cluster:       clusterObserver,
@@ -400,10 +415,13 @@ func main() {
 			BuildDate:     date,
 			GoVersion:     runtime.Version(),
 			UIHandler:     web.HandlerWithOptions(web.Options{MetricsURL: metricsURL, Durability: cfg.Durability()}),
-			// Same-origin source for the SPA's Metrics screen (spec mgmt-07):
-			// nil when telemetry is disabled, so GET /api/metrics answers 501.
-			MetricsScrape: metricsScrapeFunc(telemetryServer),
-		})
+			MetricsScrape: metricsScrapeFunc(collector),
+		}
+		if demoControl != nil {
+			managementOptions.ClusterView = demoControl
+			managementOptions.ClusterControl = demoControl
+		}
+		mgmtServer, err = management.New(managementOptions)
 		if err != nil {
 			log.Fatalf("management: %v", err)
 		}

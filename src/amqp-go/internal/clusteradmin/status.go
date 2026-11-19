@@ -8,10 +8,11 @@ import (
 )
 
 var (
-	ErrNodeNotFound = errors.New("unknown cluster node")
-	ErrConflict     = errors.New("node action conflicts with its current state")
-	ErrStopBlocked  = errors.New("stopping the node would risk losing quorum")
-	ErrUnavailable  = errors.New("cluster observation or control unavailable")
+	ErrNodeNotFound     = errors.New("unknown cluster node")
+	ErrConflict         = errors.New("node action conflicts with its current state")
+	ErrStopBlocked      = errors.New("stopping the node would risk losing quorum")
+	ErrUseAnotherBroker = errors.New("use another broker's management URL to stop this broker")
+	ErrUnavailable      = errors.New("cluster observation or control unavailable")
 )
 
 type Observer interface {

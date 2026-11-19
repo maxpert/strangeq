@@ -65,10 +65,15 @@ func (s *Server) entityTotals() (server.EntityTotals, bool) {
 	if s.opts.Server != nil {
 		if snap, ok := any(s.opts.Server).(entitySnapshotter); ok {
 			t = snap.SnapshotEntityTotals()
-			if w, ok := any(s.opts.Server).(entityObserverWired); ok {
-				return t, w.EntityObserverWired()
+			if w, ok := any(s.opts.Server).(entityObserverWired); ok && w.EntityObserverWired() {
+				return t, true
 			}
-			return t, false
+			if s.opts.Cluster == nil {
+				return t, false
+			}
+			// Cluster brokers do not wire the standalone entity observer.
+			// Use their live UnifiedBroker reads below instead of its counters.
+			t = server.EntityTotals{}
 		}
 	}
 	// Fallback: independent reads. Server.Mutex.RLock and the metadata-store
@@ -313,14 +318,6 @@ type versionResponse struct {
 // capabilitiesReport reflects exactly which optional seams are present. It is
 // how a client learns which features are honest-empty (FR-API-006).
 func (s *Server) capabilitiesReport() capabilitiesJSON {
-	if s.opts.Cluster != nil {
-		return capabilitiesJSON{
-			TagCapabilities:    true,
-			Unauthenticated:    s.mcfg.AllowUnauthenticated || s.authMode() == "none",
-			Cluster:            true,
-			ClusterNodeControl: s.opts.ClusterControl != nil,
-		}
-	}
 	b := s.broker()
 	_, queueTotalsOK := b.(queueMessageTotals)
 	_, consumerOK := b.(consumerViews)
@@ -328,8 +325,10 @@ func (s *Server) capabilitiesReport() capabilitiesJSON {
 	_, channelOK := any(s.opts.Server).(channelViews)
 	_, snapOK := any(s.opts.Server).(entitySnapshotter)
 	snapCoherent := false
-	if w, ok := any(s.opts.Server).(entityObserverWired); ok {
-		snapCoherent = w.EntityObserverWired()
+	if s.opts.Server != nil {
+		if w, ok := any(s.opts.Server).(entityObserverWired); ok {
+			snapCoherent = w.EntityObserverWired()
+		}
 	}
 	return capabilitiesJSON{
 		QueueMessageTotals: queueTotalsOK,
@@ -344,6 +343,8 @@ func (s *Server) capabilitiesReport() capabilitiesJSON {
 		VHostScoping:       false,
 		CoherentSnapshot:   snapOK && snapCoherent,
 		Unauthenticated:    s.mcfg.AllowUnauthenticated || s.authMode() == "none",
+		Cluster:            s.opts.Cluster != nil,
+		ClusterNodeControl: s.opts.ClusterControl != nil,
 	}
 }
 

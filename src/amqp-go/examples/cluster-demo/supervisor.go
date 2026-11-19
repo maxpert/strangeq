@@ -25,18 +25,18 @@ type supervisedProcess struct {
 }
 
 type brokerNode struct {
-	id, amqp, peer, observeURL, configPath, logPath string
-	process                                         *supervisedProcess
-	detail                                          string
+	id, amqp, peer, managementURL, configPath, logPath string
+	process                                            *supervisedProcess
+	detail                                             string
 }
 
 type supervisor struct {
-	controlMu                   sync.Mutex
-	mu                          sync.Mutex
-	closed                      bool
-	binary, directory, password string
-	http                        *http.Client
-	nodes                       []*brokerNode
+	controlMu                           sync.Mutex
+	mu                                  sync.Mutex
+	closed                              bool
+	binary, directory, password, socket string
+	http                                *http.Client
+	nodes                               []*brokerNode
 }
 
 func (s *supervisor) SetRunning(ctx context.Context, id string, running bool) error {
@@ -130,7 +130,7 @@ func (s *supervisor) start(node *brokerNode) error {
 		return fmt.Errorf("%w: open broker log: %v", clusteradmin.ErrUnavailable, err)
 	}
 	defer logFile.Close()
-	cmd := exec.Command(s.binary, "--config", node.configPath)
+	cmd := exec.Command(s.binary, "--config", node.configPath, "--demo-supervisor-socket", s.socket)
 	cmd.Dir, cmd.Env = s.directory, brokerEnvironment()
 	cmd.Stdout, cmd.Stderr = logFile, logFile
 	if err := cmd.Start(); err != nil {
@@ -256,11 +256,11 @@ func compareDecimal(a, b string) int {
 }
 
 func (s *supervisor) fetch(ctx context.Context, node *brokerNode) clusteradmin.Status {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, node.observeURL, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, node.managementURL+"/api/strangeq/cluster?view=local", nil)
 	if err != nil {
 		return clusteradmin.Status{}
 	}
-	req.SetBasicAuth(observerUser, s.password)
+	req.SetBasicAuth(adminUser, s.password)
 	resp, err := s.http.Do(req)
 	if err != nil {
 		return clusteradmin.Status{}
