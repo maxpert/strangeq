@@ -23,7 +23,8 @@ func OpenNodeJournalWithRangeSync(dir string, create bool) (*NodeJournal, error)
 	return openNodeJournal(dir, create, true)
 }
 
-// JournalOptions selects append completion; zero values preserve full durability.
+// JournalOptions configures journal startup and append completion. Zero values
+// preserve full durability.
 // ProcessDurability is for an isolated one-voter owner. Its caller must invoke
 // RequireFullDurability before activating transport or admitting another member.
 // Linux selects versioned process recovery roots and requires a readable, nonempty
@@ -32,6 +33,9 @@ func OpenNodeJournalWithRangeSync(dir string, create bool) (*NodeJournal, error)
 type JournalOptions struct {
 	RangeSync         bool
 	ProcessDurability bool
+	// ValidateBeforeRecovery runs after acquiring ownership and before
+	// modifying recovery state. A journal pair runs it under stream 0's lock.
+	ValidateBeforeRecovery func() error
 }
 
 func OpenNodeJournalWithOptions(dir string, create bool, options JournalOptions) (*NodeJournal, error) {
@@ -47,6 +51,7 @@ func openNodeJournalOptions(dir string, create bool, options JournalOptions, dur
 	if err != nil {
 		return nil, err
 	}
+	hooks.validateBeforeRecovery = options.ValidateBeforeRecovery
 	store, err := openSegmentedGroupNode(dir, create, options.RangeSync, extent, journalGroupMaxFileBytes, nil, hooks)
 	if err != nil {
 		return nil, err

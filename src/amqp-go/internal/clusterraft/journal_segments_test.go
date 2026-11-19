@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"os"
+	"path/filepath"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -59,6 +60,34 @@ func requireJournalVirtualBody(t *testing.T, reader io.ReaderAt, location journa
 	actual := make([]byte, location.size)
 	require.NoError(t, readJournalAt(reader, actual, location.offset))
 	require.Equal(t, body, actual)
+}
+
+func TestJournalStartupValidationHoldsOwnerBeforeReadingRecoveryRoots(t *testing.T) {
+	dir := t.TempDir()
+	// Reaching root preparation before validation would fail on this root.
+	require.NoError(t, os.WriteFile(filepath.Join(dir, processPhysicalRoot), []byte("invalid root"), 0600))
+	refusal := errors.New("startup validation refused")
+	var probeErr error
+	out, reader, _, err := openJournalSegments(dir, true, journalServingExtentBytes, journalSegmentHooks{
+		validateBeforeRecovery: func() error {
+			probeOut, probeReader, _, err := openJournalSegments(dir, true, journalServingExtentBytes, journalSegmentHooks{}, nil)
+			probeErr = err
+			if err == nil {
+				_ = probeOut.Close()
+				_ = probeReader.Close()
+			}
+			return refusal
+		},
+	}, nil)
+	require.ErrorIs(t, err, refusal)
+	require.Nil(t, out)
+	require.Nil(t, reader)
+	require.ErrorContains(t, probeErr, "lock node raft journal", "validation must hold the lifetime journal lock")
+
+	require.NoError(t, os.Remove(filepath.Join(dir, processPhysicalRoot)))
+	node, err := OpenNodeJournal(dir, true)
+	require.NoError(t, err, "failed validation must release journal ownership")
+	require.NoError(t, node.Close())
 }
 
 func TestJournalSegmentRotationFencesPublicationAndKeepsVirtualOffsets(t *testing.T) {

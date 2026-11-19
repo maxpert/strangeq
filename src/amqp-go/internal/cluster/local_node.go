@@ -36,6 +36,7 @@ type peerTransport struct {
 func OpenLocal(cfg Config) (*Node, error) {
 	activation := cfg
 	cfg.local = true
+	cfg.localPeerEndpointConfigured = activation.Peer.Address != ""
 	if cfg.Directory == "" || cfg.NewMachine == nil {
 		return nil, errors.New("local node requires storage directory and machine")
 	}
@@ -83,14 +84,21 @@ func OpenLocal(cfg Config) (*Node, error) {
 	} else {
 		return nil, err
 	}
-	// Decide before opening storage or replaying groups: even an unreadable or
-	// invalid activation intent must never reopen this lineage in process mode.
-	intent, intentErr := os.ReadFile(filepath.Join(cfg.Directory, peerActivationFile))
-	if intentErr != nil && !errors.Is(intentErr, os.ErrNotExist) {
-		return nil, intentErr
-	}
-	if activation.Peer.Address != "" || intentErr == nil {
+	intentPath := filepath.Join(cfg.Directory, peerActivationFile)
+	if cfg.localPeerEndpointConfigured {
+		// The endpoint requires strict recovery even if activation is new.
 		cfg.ProcessDurability = false
+		intent, err := os.ReadFile(intentPath)
+		if err == nil {
+			var want peerActivation
+			if json.Unmarshal(intent, &want) != nil || want.Peer.ID != cfg.Peer.ID || !validAddress(want.Peer.Address) || want.Listen == "" {
+				return nil, errors.New("invalid persistent peer activation")
+			}
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return nil, err
+		}
+	} else if err := requireNoPeerActivation(intentPath); err != nil {
+		return nil, err
 	}
 	cfg.Seeds = []Peer{{ID: cfg.Peer.ID}}
 	cfg.Listen, cfg.Token, cfg.TLS = "", "", nil
@@ -99,27 +107,25 @@ func OpenLocal(cfg Config) (*Node, error) {
 	if err != nil {
 		return nil, err
 	}
-	if intentErr == nil {
-		var want peerActivation
-		if json.Unmarshal(intent, &want) != nil || want.Peer.ID != cfg.Peer.ID || !validAddress(want.Peer.Address) || want.Listen == "" {
-			_ = n.Close()
-			return nil, errors.New("invalid persistent peer activation")
-		}
-		if activation.Peer.Address == "" {
-			_ = n.Close()
-			return nil, errors.New("persistent peer activation requires peer credentials and matching endpoint configuration")
-		}
-	} else if !errors.Is(intentErr, os.ErrNotExist) {
-		_ = n.Close()
-		return nil, intentErr
-	}
-	if activation.Peer.Address != "" {
+	if cfg.localPeerEndpointConfigured {
 		if err := n.ActivatePeers(activation); err != nil {
 			_ = n.Close()
 			return nil, err
 		}
 	}
 	return n, nil
+}
+
+func requireNoPeerActivation(path string) error {
+	// A dangling link still occupies the intent path.
+	_, err := os.Lstat(path)
+	if err == nil {
+		return errors.New("persistent peer activation requires peer credentials and matching endpoint configuration")
+	}
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	return fmt.Errorf("check persistent peer activation: %w", err)
 }
 
 // Identity returns the immutable lineage and node ID for peer enrollment.

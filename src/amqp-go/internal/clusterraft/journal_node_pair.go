@@ -34,12 +34,16 @@ func OpenNodeJournalPairWithOptions(root string, create bool, peer uint64, optio
 	}
 
 	quota := &journalSegmentQuota{limit: journalGroupMaxFileBytes, streams: 2}
-	return openJournalPair(root, peer, func(dir string, _ int, budget *journalBudget) (*journalGroupNode, error) {
+	return openJournalPair(root, peer, func(dir string, index int, budget *journalBudget) (*journalGroupNode, error) {
 		hooks, extent, err := processRootServingOptions(dir, create, options)
 		if err != nil {
 			return nil, err
 		}
 		hooks.sharedQuota = quota
+		if index == 0 {
+			// Every pair owner holds stream 0 through recovery and activation.
+			hooks.validateBeforeRecovery = options.ValidateBeforeRecovery
+		}
 		store, err := openSegmentedGroupNode(dir, create, options.RangeSync, extent, journalGroupMaxFileBytes, budget, hooks)
 		if err == nil {
 			store.writer.durability = durability

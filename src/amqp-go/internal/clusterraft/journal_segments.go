@@ -33,6 +33,7 @@ type journalSegmentHooks struct {
 	publishManifest           func(install func() error) error
 	restoreCheckpoint         func(uint64, int64, map[uint64]*journalGroupState) error
 	recoveredSeal             func(uint64, int64)
+	validateBeforeRecovery    func() error
 }
 
 type journalSegmentStorage struct {
@@ -126,6 +127,12 @@ func openJournalSegmentsWithQuota(dir string, create bool, extentBytes, retained
 	}()
 	if err := lockGroupJournal(owner); err != nil {
 		return nil, nil, journalScan{}, err
+	}
+	if hooks.validateBeforeRecovery != nil {
+		if err := hooks.validateBeforeRecovery(); err != nil {
+			return nil, nil, journalScan{}, err
+		}
+		hooks.validateBeforeRecovery = nil
 	}
 	// A segmented node never initializes over another journal format.
 	if _, err := os.Lstat(filepath.Join(dir, journalActiveName)); !errors.Is(err, os.ErrNotExist) {

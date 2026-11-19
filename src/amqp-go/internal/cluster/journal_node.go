@@ -174,6 +174,12 @@ func (n *Node) prepareJournal() error {
 		}
 	}
 	opts := clusterraft.JournalOptions{RangeSync: n.cfg.ExperimentalRaftRangeSync, ProcessDurability: n.cfg.ProcessDurability}
+	if n.cfg.local && !n.cfg.localPeerEndpointConfigured {
+		// A previous owner may have activated after OpenLocal's preflight.
+		opts.ValidateBeforeRecovery = func() error {
+			return requireNoPeerActivation(n.path(peerActivationFile))
+		}
+	}
 	var owner nodeJournalOwner
 	if n.cfg.ExperimentalRaftJournalDualStream {
 		owner, err = clusterraft.OpenNodeJournalPairWithOptions(n.cfg.Directory, !established, n.cfg.Peer.ID, opts)

@@ -41,6 +41,7 @@ var ErrUncertain = errors.New("shard command outcome uncertain")
 
 type Config struct {
 	local                                   bool
+	localPeerEndpointConfigured             bool
 	ClusterID                               string
 	Peer                                    Peer
 	Seeds                                   []Peer
