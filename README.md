@@ -123,6 +123,10 @@ broker-process kill while the OS kernel remains alive. It does not promise
 OS-crash or power-loss recovery. Peer activation permanently upgrades that
 journal to full durability. See [durability details](docs/CLUSTERING.md#pilot-start-locally-then-activate-peers).
 
+A StrangeQ-only benchmark after peer activation measured median throughput
+gains of 28.8% at 1 KiB and 26.6% at 64 KiB on a single voter.
+[Activation benchmark](src/amqp-go/benchmark/CLUSTER_COMPARISON.md#post-activation-strangeq-comparison)
+
 ### Performance against RabbitMQ Classic
 
 The local journal and RabbitMQ Classic 4.4.0 ran on the same native ARM64 Linux

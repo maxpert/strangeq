@@ -252,6 +252,24 @@ process`, `--payload-profile high-entropy`, `--case 65536-10x10-10q`, `--duratio
 `--strangeq-dual-stream` and `--strangeq-assignments`. For the small-payload pair, use
 `--case 1024-1x1-1q --repeats 1`.
 
+## Post-activation StrangeQ comparison
+
+Three pairs per payload compared baseline `413d7d5` with `5c46fbe` on the same
+ARM64 Linux VM. Each run started in process mode, published 540 untimed 64 KiB
+messages to retain two journal segments, then activated peers with one voter.
+The timed queue used persistent publishes, one outstanding confirm, manual
+acknowledgments, and prefetch 100. Every run confirmed and delivered all 1,000
+messages with byte and sequence checks. Build order alternated across pairs.
+
+| Payload | Baseline confirms/s | Fixed confirms/s | Baseline deliveries/s | Fixed deliveries/s | Median paired gain |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 1 KiB | 336.64 | 433.62 | 336.47 | 433.50 | 28.8% |
+| 64 KiB | 295.55 | 374.02 | 295.47 | 373.92 | 26.6% |
+
+The rates are from the median-gain pair for each payload. Confirms and
+deliveries had the same median gains at the precision shown. These figures
+describe the post-activation workload with one voter and one publish in flight.
+
 ## Recorded ARM64 runs
 
 These historical normal-workload measurements precede the replicated dead-lettering

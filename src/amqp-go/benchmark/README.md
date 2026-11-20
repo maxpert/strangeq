@@ -6,6 +6,7 @@ separate connections, and consumers use manual acknowledgement with a QoS prefet
 this guide for a quick single-endpoint workload. For controlled single-node Classic and
 three-voter quorum comparisons, use the [comparison runner](CLUSTER_COMPARISON.md),
 which records topology, durability, payload profile, and paired evidence.
+The guide also records the [StrangeQ-only activation benchmark](CLUSTER_COMPARISON.md#post-activation-strangeq-comparison).
 
 ## Quick Start
 
@@ -67,12 +68,6 @@ count minus deliveries seen by the drain deadline. It can include a backlog stil
 waiting at that deadline. It is not proof of durable message loss. Confirm mode fails on
 negative or unresolved confirms, but it does not establish restart or failover safety.
 Check logs and require positive publish and delivery counts before accepting a run.
-
-## Head-to-head vs RabbitMQ
-
-The [comparison guide](CLUSTER_COMPARISON.md) separates single-node local-journal and
-replicated-cluster measurements and explains how to reproduce a controlled trial. The
-command below is a quick workload against one RabbitMQ endpoint.
 
 ## Running Against RabbitMQ
 

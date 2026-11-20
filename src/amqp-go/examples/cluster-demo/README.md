@@ -1,7 +1,7 @@
 # Three-node cluster demo
 
 From the repository root, run the launcher with the Go version listed in the
-[module file](../../go.mod). It builds the brokers and panel for your machine.
+[module file](../../go.mod). It builds StrangeQ and starts three brokers on loopback.
 
 ```sh
 ./src/amqp-go/examples/cluster-demo/run.sh
